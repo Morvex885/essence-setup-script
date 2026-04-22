@@ -1,0 +1,33 @@
+proxies:
+  - name: "vless-reality"
+    type: vless
+    server: 1.2.3.4
+    port: 443
+    uuid: "test-uuid-1234"
+    network: tcp
+    tls: true
+    reality-opts:
+      public-key: "testkey123"
+      short-id: "abcd"
+    servername: example.com
+
+  - name: "hy2-main"
+    type: hysteria2
+    server: 1.2.3.4
+    port: 8443
+    password: "testpass"
+    alpn:
+      - h3
+
+  - name: "awg-my-router"
+    type: wireguard
+    server: 1.2.3.4
+    port: 51820
+    private-key: "testprivkey"
+    public-key: "testpubkey"
+    ip: "10.0.0.2"
+
+---
+proxy-groups:
+  - name: auto
+    type: url-test

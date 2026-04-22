@@ -1,0 +1,87 @@
+{
+  "nodes": [
+    {
+      "name": "de-vps",
+      "ip": "1.2.3.4",
+      "port": 22,
+      "user": "root",
+      "auth": "key"
+    },
+    {
+      "name": "ru-vps",
+      "ip": "5.6.7.8",
+      "port": 2222,
+      "user": "admin",
+      "auth": "password",
+      "pass": "U2FsdGVkX1/o46gW17tlHzYLnFoGfBvacfhDIJSVJTc=",
+      "aliases": {
+        "vless-reality": "RU-VLESS"
+      }
+    }
+  ],
+  "groups": [
+    {
+      "name": "ROUTER",
+      "template": "default.yaml"
+    },
+    {
+      "name": "PC",
+      "template": "default.yaml"
+    },
+    {
+      "name": "MOBILE",
+      "template": "default.yaml"
+    }
+  ],
+  "clients": [
+    {
+      "name": "my-router",
+      "group": "ROUTER",
+      "inherit_nodes_from_group": true,
+      "credentials": {
+        "vless_uuid": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "hy2_password": "router-hy2-pass-0001"
+      }
+    },
+    {
+      "name": "my-pc",
+      "group": "PC",
+      "inherit_nodes_from_group": false,
+      "nodes": ["de-vps"],
+      "connections": [
+        {
+          "node": "de-vps",
+          "proxies": ["vless-reality"]
+        }
+      ],
+      "credentials": {
+        "vless_uuid": "11111111-2222-3333-4444-555555555555",
+        "hy2_password": "pc-hy2-pass-0002"
+      }
+    }
+  ],
+  "connections": [
+    {
+      "node": "de-vps",
+      "groups": [
+        {
+          "name": "ROUTER",
+          "proxies": ["vless-reality", "hy2-main"]
+        },
+        {
+          "name": "PC",
+          "proxies": ["vless-reality", "hy2-main"]
+        }
+      ]
+    },
+    {
+      "node": "ru-vps",
+      "groups": [
+        {
+          "name": "ROUTER",
+          "proxies": ["vless-reality"]
+        }
+      ]
+    }
+  ]
+}

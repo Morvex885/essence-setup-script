@@ -1,0 +1,62 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version from tag
+        id: ver
+        run: echo "VERSION=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Build release tarball
+        run: |
+          VERSION="${{ steps.ver.outputs.VERSION }}"
+          TARBALL="essence-setup-${VERSION}.tar.gz"
+
+          # Собираем дистрибутив в отдельную папку
+          mkdir -p dist/essence-setup/setup-essence/modules
+          mkdir -p dist/essence-setup/remote-control/modules
+          mkdir -p dist/essence-setup/remote-control/templates
+          mkdir -p dist/essence-setup/common
+          cp setup-essence/setup-essence.sh setup-essence/install-essence.sh dist/essence-setup/setup-essence/
+          cp setup-essence/modules/*.sh dist/essence-setup/setup-essence/modules/
+          cp remote-control/remote-control-essence.sh remote-control/install-remote-control.sh dist/essence-setup/remote-control/
+          cp remote-control/modules/*.sh dist/essence-setup/remote-control/modules/
+          cp remote-control/templates/*.yaml dist/essence-setup/remote-control/templates/ 2>/dev/null || true
+          cp common/common.sh dist/essence-setup/common/
+          cp VERSION dist/essence-setup/
+
+          # Архивируем с корнем essence-setup/ → при распаковке --strip-components=1
+          tar -czf "$TARBALL" -C dist essence-setup
+
+          sha256sum "$TARBALL" > "${TARBALL}.sha256"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.VERSION }}
+          name: "Essence ${{ steps.ver.outputs.VERSION }}"
+          files: |
+            essence-setup-${{ steps.ver.outputs.VERSION }}.tar.gz
+            essence-setup-${{ steps.ver.outputs.VERSION }}.tar.gz.sha256
+          generate_release_notes: true
+          body: |
+            ## Установка
+
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/Morvex885/essence-setup/main/setup-essence/install-essence.sh | sudo bash
+            ```
+
+            ## Обновление
+            Запустите `essence-setup` и выберите пункт **Обновить**.
+            Или повторно выполните команду установки.

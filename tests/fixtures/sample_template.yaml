@@ -1,0 +1,29 @@
+mixed-port: 7890
+allow-lan: true
+mode: rule
+
+# --- ROUTER ---
+redir-port: 7892
+tproxy-port: 7893
+# --- ROUTER ---
+
+# --- PC/MOBILE ---
+tun:
+  enable: true
+  stack: system
+# --- PC/MOBILE ---
+
+dns:
+  enable: true
+  listen: 0.0.0.0:53
+
+proxies:
+
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - DIRECT
+
+rules:
+  - MATCH,PROXY
