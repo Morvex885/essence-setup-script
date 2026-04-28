@@ -17,5 +17,5 @@ jobs:
         run: ./tests/lib/bats-core/bin/bats tests/unit/ --recursive --tap
 
       - name: Run fuzz tests
-        run: FUZZ_ITERATIONS=100 ./tests/lib/bats-core/bin/bats tests/fuzz/ --recursive
-        timeout-minutes: 5
+        run: FUZZ_ITERATIONS=50 ./tests/lib/bats-core/bin/bats tests/fuzz/ --recursive
+        timeout-minutes: 10

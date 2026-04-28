@@ -61,13 +61,23 @@
 
 Запустите Remote Control — он сам загрузит серверные скрипты на VPS при первом подключении к ноде.
 
+**Linux / macOS — установка:**
+```bash
+curl -fsSL https://raw.githubusercontent.com/Morvex885/essence-setup-script/main/remote-control/install-remote-control.sh | sudo bash
+remote-control-essence
+```
+
 **Windows:**
+
+Скачайте [последний релиз](https://github.com/Morvex885/essence-setup-script/releases/latest) или клонируйте репозиторий, затем запустите:
 ```cmd
 remote-control.cmd
 ```
 
-**Linux / macOS:**
+**Из исходников (для разработки):**
 ```bash
+git clone https://github.com/Morvex885/essence-setup-script.git
+cd essence-setup-script
 bash remote-control/remote-control-essence.sh
 ```
 
