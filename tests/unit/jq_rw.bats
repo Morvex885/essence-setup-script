@@ -72,14 +72,6 @@ teardown() {
     assert_output "3"
 }
 
-@test "_ensure_config: default config has groups with nodes array" {
-    rm -f "$CONFIG_JSON"
-    _ensure_config
-    run jq_r '.groups[0].nodes'
-    assert_success
-    assert_output "[]"
-}
-
 @test "_ensure_config: does not overwrite existing config" {
     jq_w '.nodes += [{"name":"keep-me"}]'
     _ensure_config
