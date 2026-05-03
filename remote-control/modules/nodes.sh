@@ -196,10 +196,9 @@ rename_node() {
         return
     fi
 
-    # Обновляем имя во всех местах: nodes, groups.nodes, connections[].node, clients.nodes, clients.connections[].node
+    # Обновляем имя во всех местах: nodes, connections[].node, clients.nodes, clients.connections[].node
     jq_w --arg old "$_old_name" --arg new "$_new_name" '
         .nodes |= map(if .name==$old then .name=$new else . end) |
-        .groups |= map(.nodes |= map(if .==$old then $new else . end)) |
         .connections |= map(if .node==$old then .node=$new else . end) |
         .clients |= map(
             (if .nodes then .nodes |= map(if .==$old then $new else . end) else . end) |
@@ -287,10 +286,9 @@ delete_node() {
                 fi
             fi
 
-            # Удаляем ноду и все ссылки: nodes, groups.nodes, connections.node, clients.nodes, clients.connections.node
+            # Удаляем ноду и все ссылки: nodes, connections.node, clients.nodes, clients.connections.node
             jq_w --arg n "$_name" '
                 .nodes |= [.[] | select(.name!=$n)] |
-                .groups |= map(.nodes |= [.[] | select(.!=$n)]) |
                 .connections |= [.[] | select(.node!=$n)] |
                 .clients |= map(
                     (if .nodes then .nodes |= [.[] | select(.!=$n)] else . end) |

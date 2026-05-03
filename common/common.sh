@@ -131,14 +131,19 @@ gen_free_port() {
 
 _ensure_config() {
     mkdir -p "$(dirname "$CONFIG_JSON")"
-    [[ -f "$CONFIG_JSON" ]] || echo '{"nodes":[],"groups":[{"name":"ROUTER","template":"default.yaml","nodes":[]},{"name":"PC","template":"default.yaml","nodes":[]},{"name":"MOBILE","template":"default.yaml","nodes":[]}],"clients":[],"connections":[]}' > "$CONFIG_JSON"
+    [[ -f "$CONFIG_JSON" ]] || echo '{"nodes":[],"groups":[{"name":"ROUTER","template":"default.yaml"},{"name":"PC","template":"default.yaml"},{"name":"MOBILE","template":"default.yaml"}],"clients":[],"connections":[]}' > "$CONFIG_JSON"
 }
 
 jq_r() { jq -r "$@" "$CONFIG_JSON" | tr -d '\r'; }
 
 jq_w() {
     local tmp="${CONFIG_JSON}.tmp.$$"
-    jq "$@" "$CONFIG_JSON" > "$tmp" && mv "$tmp" "$CONFIG_JSON"
+    if ! jq "$@" "$CONFIG_JSON" > "$tmp"; then
+        rm -f "$tmp"
+        warn "Не удалось обновить конфиг (jq error)"
+        return 1
+    fi
+    mv "$tmp" "$CONFIG_JSON"
 }
 
 # ─── Рамка меню ─────────────────────────────────────────────────────────────
@@ -224,7 +229,7 @@ toggle_select() {
 }
 
 # ─── Проверка обновлений (фоновая) ───────────────────────────────────────────
-_REPO="Morvex885/essence-setup"
+_REPO="Morvex885/essence-setup-script"
 _UPDATE_TMP=""
 
 check_update_start() {
