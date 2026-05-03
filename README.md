@@ -12,6 +12,8 @@
 
 Поддерживаемые протоколы: **VLESS Reality** (TCP, xHTTP, gRPC), **Hysteria2**, **AmneziaWG**, **WARP**, **Каскады нод**.
 
+<img width="1746" height="1000" alt="image" src="https://github.com/user-attachments/assets/038a7816-7fb4-44e2-965f-2a84a09667f8" />
+
 ## Компоненты
 
 | Компонент | Описание | Документация |
