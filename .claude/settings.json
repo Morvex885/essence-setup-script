@@ -15,6 +15,16 @@
       "Bash(jq:*)",
       "Bash(wc -l:*)",
       "Bash(xargs grep:*)",
+      "Bash(cd:*)",
+      "Bash(git rev-parse:*)",
+      "Bash(git clone --depth 1 https://github.com/MetaCubeX/Meta-Docs.git:*)",
+      "Bash(git -C .claude/cache/mihomo-wiki rev-parse:*)",
+      "Bash(git -C .claude/cache/mihomo-wiki fetch:*)",
+      "Bash(git -C .claude/cache/mihomo-wiki reset --hard origin/main:*)",
+      "Bash(git -C .claude/cache/mihomo-wiki log:*)",
+      "Bash(git -C .claude/cache/mihomo-wiki ls-files:*)",
+      "Bash(find .claude/cache/mihomo-wiki:*)",
+      "Bash(touch .claude/cache/mihomo-wiki/.last-pull:*)",
       "WebFetch(domain:docs.amnezia.org)",
       "WebFetch(domain:wiki.metacubex.one)"
     ]

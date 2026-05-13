@@ -110,6 +110,7 @@ Fuzz проверяет **инварианты**: round-trip (`decode(encode(x))
 - `remote-control/.remote-data/` — пользовательский `config.json` с зашифрованными credentials и токенами.
 - `remote-control/templates/custom.yaml` — пользовательский шаблон.
 - `.claude/settings.local.json` — личные permission-оверрайды Claude Code. Общий `.claude/settings.json` (с хуком `bash -n` и базовыми permission'ами для тестов/jq) и `.claude/commands/` коммитятся для всех контрибьюторов.
+- `.claude/cache/` — кэш сабагента [mihomo-wiki](.claude/agents/mihomo-wiki.md) (shallow-клон Meta-Docs), пересоздаётся автоматически.
 
 ## Чувствительные данные
 

@@ -1,3 +1,4 @@
 .claude/settings.local.json
+.claude/cache/
 remote-control/.remote-data/
 remote-control/templates/custom.yaml
