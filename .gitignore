@@ -1,3 +1,3 @@
-.claude/
+.claude/settings.local.json
 remote-control/.remote-data/
 remote-control/templates/custom.yaml

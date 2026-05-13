@@ -1,0 +1,37 @@
+{
+  "env": {
+    "ENABLE_PROMPT_CACHING_1H": "1"
+  },
+  "permissions": {
+    "allow": [
+      "Bash(bash -n:*)",
+      "Bash(bash tests/run_tests.sh:*)",
+      "Bash(bash tests/lib/bats-core/bin/bats:*)",
+      "Bash(./tests/lib/bats-core/bin/bats:*)",
+      "Bash(tests/lib/bats-core/bin/bats:*)",
+      "Bash(bats:*)",
+      "Bash(FUZZ_ITERATIONS=*)",
+      "Bash(git submodule:*)",
+      "Bash(jq:*)",
+      "Bash(wc -l:*)",
+      "Bash(xargs grep:*)",
+      "WebFetch(domain:docs.amnezia.org)",
+      "WebFetch(domain:wiki.metacubex.one)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "shell": "bash",
+            "command": "f=$(jq -r '.tool_input.file_path // empty'); case \"$f\" in *.sh) bash -n \"$f\" || exit 2;; esac",
+            "statusMessage": "bash -n check"
+          }
+        ]
+      }
+    ]
+  }
+}
