@@ -117,13 +117,17 @@ main() {
     cp "$tmp_dir/pkg/VERSION"                                   "$INSTALL_DIR/"
     cp "$tmp_dir/pkg/remote-control/modules/"*.sh               "$INSTALL_DIR/modules/"
     cp "$tmp_dir/pkg/remote-control/templates/"*.yaml           "$INSTALL_DIR/templates/" 2>/dev/null || true
-    cp "$tmp_dir/pkg/common/common.sh"                          "$INSTALL_DIR/common/"
-    cp "$tmp_dir/pkg/common/ensure-deps.sh"                     "$INSTALL_DIR/common/"
+    cp -r "$tmp_dir/pkg/common/."                               "$INSTALL_DIR/common/"
 
     # Включаем setup-essence — нужен для загрузки на серверы через upload_scripts
     mkdir -p "$INSTALL_DIR/setup-essence/modules"
     cp "$tmp_dir/pkg/setup-essence/setup-essence.sh"              "$INSTALL_DIR/setup-essence/"
     cp "$tmp_dir/pkg/setup-essence/modules/"*.sh                 "$INSTALL_DIR/setup-essence/modules/"
+
+    for _need in common/common.sh common/cert.sh common/listener-users.sh \
+                 common/protocols/vless-tcp.sh common/protocols/hy2.sh; do
+        [[ -f "$INSTALL_DIR/$_need" ]] || error "Релиз-tarball повреждён: нет ${_need}. Сообщите об этом в issue."
+    done
 
     chmod +x "$INSTALL_DIR/remote-control-essence.sh" \
               "$INSTALL_DIR/install-remote-control.sh" \

@@ -122,8 +122,12 @@ main() {
     cp "$tmp_dir/pkg/setup-essence/install-essence.sh"    "$INSTALL_DIR/"
     cp "$tmp_dir/pkg/VERSION"                           "$INSTALL_DIR/"
     cp "$tmp_dir/pkg/setup-essence/modules/"*.sh         "$INSTALL_DIR/modules/"
-    cp "$tmp_dir/pkg/common/common.sh"                  "$INSTALL_DIR/common/"
-    cp "$tmp_dir/pkg/common/ensure-deps.sh"             "$INSTALL_DIR/common/"
+    cp -r "$tmp_dir/pkg/common/."                       "$INSTALL_DIR/common/"
+
+    for _need in common/common.sh common/cert.sh common/listener-users.sh \
+                 common/protocols/vless-tcp.sh common/protocols/hy2.sh; do
+        [[ -f "$INSTALL_DIR/$_need" ]] || error "Релиз-tarball повреждён: нет ${_need}. Сообщите об этом в issue."
+    done
 
     chmod +x "$INSTALL_DIR/setup-essence.sh" \
               "$INSTALL_DIR/install-essence.sh" \
