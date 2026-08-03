@@ -136,8 +136,12 @@ matches() {
                 name=$(mutate_inject "$name" DICT_SHELL_INJECTION)
                 ;;
         esac
-        # Empty string is inherently rejected by the regex; non-empty with bad chars too
-        [[ -z "$name" ]] && continue
+        # Bash cannot carry NUL and command substitution strips trailing newlines.
+        # Retry if a fuzz token disappeared and left an otherwise valid name.
+        if [[ -z "$name" || "$name" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+            i=$((i - 1))
+            continue
+        fi
         run matches "$name"
         assert_failure
     done

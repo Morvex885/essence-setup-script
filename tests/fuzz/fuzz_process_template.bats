@@ -21,6 +21,7 @@ random_template() {
     local groups=("ROUTER" "PC" "MOBILE" "TEST")
     local content=""
     local in_block=""
+    local i
 
     for ((i = 0; i < lines; i++)); do
         local dice=$((RANDOM % 10))

@@ -101,6 +101,7 @@ random_pick() {
 # Uses arrays to avoid ${str:N:1} byte-vs-char issues on non-UTF-8 locales.
 random_utf8() {
     local count=${1:-$((RANDOM % 20 + 1))}
+    local i
     local -a ascii_chars=(a b c d e f g h i j k l m n o p q r s t u v w x y z 0 1 2 3 4 5 6 7 8 9)
     local -a cyrillic_chars=(а б в г д е ж з и к л м н о п р с т у ф х ц ч ш щ э ю я)
     local -a cjk_chars=(漢 字 中 国 人 大 学 生 日 本 語)
