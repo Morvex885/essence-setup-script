@@ -30,8 +30,10 @@ ensure_dep jq openssl ssh
 # ─── Подключаем модули ───────────────────────────────────────────────────────
 if [[ -f "$SCRIPT_DIR/common/common.sh" ]]; then
     source "$SCRIPT_DIR/common/common.sh"
+    source "$SCRIPT_DIR/common/protocols/vless-xhttp.sh"
 elif [[ -f "$SCRIPT_DIR/../common/common.sh" ]]; then
     source "$SCRIPT_DIR/../common/common.sh"
+    source "$SCRIPT_DIR/../common/protocols/vless-xhttp.sh"
 fi
 source "$SCRIPT_DIR/modules/nodes.sh"
 source "$SCRIPT_DIR/modules/ssh.sh"

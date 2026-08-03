@@ -27,6 +27,7 @@ teardown() {
 fetch_proxies_isolated() {
     local client="$1" group="$2" nodes="$3"
     local cache_nodes="${4:-}"
+    local remote_fixture="${5:-$FIXTURES_DIR/sample_client_config.txt}"
     local stderr_file="$BATS_TEST_TMPDIR/fetch_stderr"
 
     bash -c "
@@ -43,12 +44,13 @@ fetch_proxies_isolated() {
         SSHPASS_AVAILABLE=false
         source '$PROJECT_ROOT/remote-control/modules/templates.sh'
         source '$PROJECT_ROOT/remote-control/modules/connections.sh'
+        source '$PROJECT_ROOT/common/protocols/vless-xhttp.sh'
         source '$PROJECT_ROOT/remote-control/modules/generate.sh'
 
         _reset_node_cache
         IFS=',' read -ra _cache_arr <<< '$cache_nodes'
         for n in \"\${_cache_arr[@]}\"; do
-            [[ -n \"\$n\" ]] && NODE_CONFIG_CACHE[\"\$n\"]=\"\$(cat '$FIXTURES_DIR/sample_client_config.txt')\"
+            [[ -n \"\$n\" ]] && NODE_CONFIG_CACHE[\"\$n\"]=\"\$(cat '$remote_fixture')\"
         done
 
         _fetch_proxies_for_client '$client' '$group' '$nodes'
@@ -144,4 +146,31 @@ fetch_proxies_isolated() {
     echo "$result_router" | grep -q 'uuid: aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
     # my-pc gets its uuid
     echo "$result_pc" | grep -q 'uuid: 11111111-2222-3333-4444-555555555555'
+}
+
+@test "fetch_proxies: xHTTP gets client UUID and firefox fingerprint" {
+    local xhttp_fixture="$BATS_TEST_TMPDIR/xhttp-client-config.txt"
+    cat > "$xhttp_fixture" <<'EOF'
+proxies:
+  - name: "vless-xhttp"
+    type: vless
+    server: 1.2.3.4
+    port: 443
+    uuid: original-xhttp-uuid
+    network: xhttp
+    tls: true
+    xhttp-opts:
+      path: "/xhttp"
+      mode: auto
+    client-fingerprint: chrome
+---
+EOF
+    jq_w '.connections[0].groups[0].proxies += ["vless-xhttp"]'
+
+    local result
+    result=$(fetch_proxies_isolated "my-router" "ROUTER" "de-vps" "de-vps" "$xhttp_fixture")
+    grep -qF 'uuid: aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' <<< "$result"
+    grep -qF 'client-fingerprint: firefox' <<< "$result"
+    ! grep -qF 'original-xhttp-uuid' <<< "$result"
+    ! grep -qF 'client-fingerprint: chrome' <<< "$result"
 }

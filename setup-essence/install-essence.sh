@@ -125,7 +125,8 @@ main() {
     cp -r "$tmp_dir/pkg/common/."                       "$INSTALL_DIR/common/"
 
     for _need in common/common.sh common/cert.sh common/listener-users.sh \
-                 common/protocols/vless-tcp.sh common/protocols/hy2.sh; do
+                 common/protocols/vless-tcp.sh common/protocols/vless-xhttp.sh \
+                 common/protocols/uri.sh common/protocols/hy2.sh; do
         [[ -f "$INSTALL_DIR/$_need" ]] || error "Релиз-tarball повреждён: нет ${_need}. Сообщите об этом в issue."
     done
 

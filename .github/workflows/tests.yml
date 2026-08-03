@@ -11,7 +11,26 @@ jobs:
           submodules: recursive
 
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y jq openssl
+        run: sudo apt-get update && sudo apt-get install -y jq openssl nginx curl
+
+      - name: Install latest stable Mihomo
+        run: |
+          download_url=$(curl -fsSL https://api.github.com/repos/MetaCubeX/mihomo/releases/latest \
+            | jq -r '[.assets[] | select(.name | test("^mihomo-linux-amd64-v3-.*\\.gz$"))][0].browser_download_url')
+          test -n "$download_url" && test "$download_url" != "null"
+          curl -fsSL "$download_url" -o /tmp/mihomo.gz
+          gzip -dc /tmp/mihomo.gz > /tmp/mihomo
+          chmod +x /tmp/mihomo
+          /tmp/mihomo -v
+
+      - name: Validate xHTTP with latest Mihomo and distro nginx
+        env:
+          MIHOMO_BIN: /tmp/mihomo
+          XHTTP_NGINX_OUTPUT: /tmp/nginx-xhttp.conf
+        run: bash tests/ci/validate_xhttp.sh
+
+      - name: Validate xHTTP nginx config with latest nginx
+        run: docker run --rm -v /tmp/nginx-xhttp.conf:/etc/nginx/nginx.conf:ro nginx:latest nginx -t
 
       - name: Run unit tests
         run: ./tests/lib/bats-core/bin/bats tests/unit/ --recursive --tap

@@ -379,6 +379,22 @@ _get_client_port() {
     fi
 }
 
+_load_xhttp_cascade_client_settings() {
+    local config="${1:-/etc/mihomo/config.yaml}" server_addr="$2"
+    XHTTP_CASCADE_PATH=$(_xhttp_listener_field path "$config")
+    XHTTP_CASCADE_TOPOLOGY=$(_xhttp_listener_topology "$config") || return 1
+    if [[ "$XHTTP_CASCADE_TOPOLOGY" == "nginx" ]]; then
+        XHTTP_CASCADE_SNI="${SITE_NAME:-$server_addr}"
+        XHTTP_CASCADE_PUBLIC_KEY=""
+        XHTTP_CASCADE_SHORT_ID=""
+    else
+        XHTTP_CASCADE_SNI="$SNI_DOMAIN"
+        XHTTP_CASCADE_PUBLIC_KEY="$PUBLIC_KEY"
+        XHTTP_CASCADE_SHORT_ID="$SHORT_ID"
+    fi
+    [[ -n "$XHTTP_CASCADE_PATH" && -n "$XHTTP_CASCADE_SNI" ]]
+}
+
 _attach_cascade_to_listener() {
     local cname="$1" marker="$2" exit_proxy_yaml="$3"
     # marker: vless-tcp | vless-xhttp | vless-grpc | hy2
@@ -419,19 +435,15 @@ _attach_cascade_to_listener() {
             ;;
         vless-xhttp)
             proto_label="VLESS xHTTP"
-            local xhttp_path xhttp_is_tls=false xhttp_sni xhttp_pubkey xhttp_sid
-            xhttp_path=$(sed -n "/^# --- vless-xhttp ---/,/^# --- \/vless-xhttp ---/p" /etc/mihomo/config.yaml \
-                | awk '/path:/{gsub(/"/, "", $2); print $2; exit}')
-            # TLS mode: certificate field present (no reality-config)
-            if sed -n "/^# --- vless-xhttp ---/,/^# --- \/vless-xhttp ---/p" /etc/mihomo/config.yaml \
-               | grep -q '    certificate:'; then
-                xhttp_is_tls=true
-                xhttp_sni="${SITE_NAME:-$SERVER_ADDR}"
-                xhttp_pubkey="" xhttp_sid=""
-            else
-                xhttp_sni="$SNI_DOMAIN"
-                xhttp_pubkey="$PUBLIC_KEY" xhttp_sid="$SHORT_ID"
-            fi
+            local xhttp_path xhttp_sni xhttp_pubkey xhttp_sid
+            _load_xhttp_cascade_client_settings /etc/mihomo/config.yaml "$SERVER_ADDR" || {
+                warn "Не удалось прочитать параметры xHTTP listener'а."
+                return
+            }
+            xhttp_path="$XHTTP_CASCADE_PATH"
+            xhttp_sni="$XHTTP_CASCADE_SNI"
+            xhttp_pubkey="$XHTTP_CASCADE_PUBLIC_KEY"
+            xhttp_sid="$XHTTP_CASCADE_SHORT_ID"
             echo ""
             info "Каскад:   $cname ($proto_label :$client_port)"
             info "Path:     $xhttp_path"
@@ -488,7 +500,7 @@ _attach_cascade_to_listener() {
         user_block+="      # /cascade-user:${cname}"
     fi
 
-    # Вставляем после последней записи users (перед proxy:/rule:/reality-config:/xhttp-config:/grpc-service-name:/certificate:)
+    # Вставляем после последней записи users (перед transport/TLS/routing полями listener'а)
     local _tmpfile
     _tmpfile=$(mktemp)
     awk -v ublock="$user_block" '

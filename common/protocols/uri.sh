@@ -1,6 +1,41 @@
 #!/bin/bash
 # ─── URI parsing for cascade exit-node ──────────────────────────────────────
 
+# RFC 3986 percent-encoding for URI query values and fragments.
+_uri_percent_encode() {
+    local input="$1" output="" char hex i
+    local LC_ALL=C
+    for ((i = 0; i < ${#input}; i++)); do
+        char="${input:i:1}"
+        case "$char" in
+            [a-zA-Z0-9.~_-]) output+="$char" ;;
+            *)
+                printf -v hex '%02X' "'$char"
+                output+="%${hex}"
+                ;;
+        esac
+    done
+    printf '%s' "$output"
+}
+
+# Strict percent-decoder. Malformed escapes and NUL are rejected.
+_uri_percent_decode() {
+    local input="$1" output="" prefix hex char
+    while [[ "$input" == *%* ]]; do
+        prefix="${input%%\%*}"
+        output+="$prefix"
+        input="${input#*%}"
+        [[ "$input" =~ ^([0-9A-Fa-f]{2})(.*)$ ]] || return 1
+        hex="${BASH_REMATCH[1]}"
+        input="${BASH_REMATCH[2]}"
+        [[ "$hex" != "00" ]] || return 1
+        printf -v char '%b' "\\x${hex}"
+        output+="$char"
+    done
+    output+="$input"
+    printf '%s' "$output"
+}
+
 # Extract server and port from any supported URI (vless://, hy2://, hysteria2://)
 # Sets: URI_SERVER, URI_PORT
 _parse_server_port_from_uri() {
@@ -56,6 +91,10 @@ _parse_vless_uri_to_exit() {
     local IFS='&'
     for param in $params; do
         local key="${param%%=*}" val="${param#*=}"
+        if ! val=$(_uri_percent_decode "$val"); then
+            warn "Некорректное percent-кодирование в VLESS URI"
+            return 1
+        fi
         case "$key" in
             sni)         C_SNI="$val" ;;
             pbk)         C_PUBKEY="$val" ;;
@@ -84,7 +123,7 @@ _parse_vless_uri_to_exit() {
         xhttp)
             [[ -z "$C_PATH" ]] && C_PATH="/"
             _build_vless_xhttp_exit_yaml "$proxy_name" "$C_SERVER" "$C_PORT" \
-                "$C_UUID" "$C_SNI" "$C_PATH" "$C_MODE" "$C_PUBKEY" "$C_SHORT_ID" "$C_FP"
+                "$C_UUID" "$C_SNI" "$C_PATH" "$C_MODE" "$C_PUBKEY" "$C_SHORT_ID" "firefox"
             ;;
         grpc)
             [[ -z "$C_SERVICE" ]] && C_SERVICE="grpc"
@@ -120,6 +159,10 @@ _parse_hy2_uri_to_exit() {
     local IFS='&'
     for param in $params; do
         local key="${param%%=*}" val="${param#*=}"
+        if ! val=$(_uri_percent_decode "$val"); then
+            warn "Некорректное percent-кодирование в Hysteria2 URI"
+            return 1
+        fi
         case "$key" in
             sni)           C_SNI="$val" ;;
             insecure)      C_INSECURE="$val" ;;

@@ -30,11 +30,11 @@ _build_vless_xhttp_listener_yaml() {
 EOF
 }
 
-# Listener YAML with nginx TLS (server-side)
-# Args: name listen port username uuid path cert key proxy
-_build_vless_xhttp_tls_listener_yaml() {
+# Plain listener behind nginx TLS termination (server-side)
+# Args: name listen port username uuid path proxy
+_build_vless_xhttp_nginx_listener_yaml() {
     local name="$1" listen="$2" port="$3" username="$4" uuid="$5"
-    local path="$6" cert="$7" key="$8" proxy="$9"
+    local path="$6" proxy="$7"
     cat <<EOF
   - name: $name
     type: vless
@@ -48,10 +48,18 @@ _build_vless_xhttp_tls_listener_yaml() {
     xhttp-config:
       path: "$path"
       mode: auto
-    certificate: $cert
-    private-key: $key
+    allow-insecure: true
     proxy: $proxy
 EOF
+}
+
+# Backward-compatible name for callers from an older installed module.
+# Certificate/key arguments are intentionally ignored: nginx owns public TLS.
+_build_vless_xhttp_tls_listener_yaml() {
+    local name="$1" listen="$2" port="$3" username="$4" uuid="$5"
+    local path="$6" proxy="$9"
+    _build_vless_xhttp_nginx_listener_yaml \
+        "$name" "$listen" "$port" "$username" "$uuid" "$path" "$proxy"
 }
 
 # Client proxy YAML (unified: Reality if public_key, else TLS)
@@ -78,7 +86,7 @@ _build_vless_xhttp_client_yaml() {
         echo "      public-key: \"$public_key\""
         echo "      short-id: \"$short_id\""
     fi
-    echo "    client-fingerprint: chrome"
+    echo "    client-fingerprint: firefox"
 }
 
 # Client URI (unified: Reality if public_key, else TLS)
@@ -87,14 +95,19 @@ _build_vless_xhttp_uri() {
     local uuid="$1" server="$2" port="$3" sni="$4" path="$5"
     local public_key="${6:-}" short_id="${7:-}" fragment="${8:-VLESS xHTTP}"
 
-    local security_params
+    local security_params encoded_sni encoded_path encoded_public_key encoded_short_id encoded_fragment
+    encoded_sni=$(_uri_percent_encode "$sni") || return 1
+    encoded_path=$(_uri_percent_encode "$path") || return 1
+    encoded_public_key=$(_uri_percent_encode "$public_key") || return 1
+    encoded_short_id=$(_uri_percent_encode "$short_id") || return 1
+    encoded_fragment=$(_uri_percent_encode "$fragment") || return 1
     if [[ -n "$public_key" ]]; then
-        security_params="security=reality&sni=${sni}&fp=chrome&pbk=${public_key}&sid=${short_id}"
+        security_params="security=reality&sni=${encoded_sni}&fp=firefox&pbk=${encoded_public_key}&sid=${encoded_short_id}"
     else
-        security_params="security=tls&sni=${sni}&fp=chrome"
+        security_params="security=tls&sni=${encoded_sni}&fp=firefox"
     fi
 
-    echo "vless://${uuid}@${server}:${port}?encryption=none&${security_params}&type=xhttp&path=${path}&mode=auto#${fragment}"
+    echo "vless://${uuid}@${server}:${port}?encryption=none&${security_params}&type=xhttp&path=${encoded_path}&mode=auto#${encoded_fragment}"
 }
 
 # Exit proxy YAML (cascade outbound)
@@ -102,7 +115,7 @@ _build_vless_xhttp_uri() {
 _build_vless_xhttp_exit_yaml() {
     local name="$1" server="$2" port="$3" uuid="$4" sni="$5"
     local path="$6" mode="${7:-auto}"
-    local public_key="${8:-}" short_id="${9:-}" fingerprint="${10:-chrome}"
+    local public_key="${8:-}" short_id="${9:-}"
 
     echo "  - name: $name"
     echo "    type: vless"
@@ -121,7 +134,23 @@ _build_vless_xhttp_exit_yaml() {
         echo "      public-key: $public_key"
         echo "      short-id: $short_id"
     fi
-    echo "    client-fingerprint: $fingerprint"
+    echo "    client-fingerprint: firefox"
+}
+
+# Normalize an extracted proxy block used by remote-control. Non-xHTTP blocks
+# are returned byte-for-byte; xHTTP always receives the known-good fingerprint.
+_normalize_vless_xhttp_proxy_yaml() {
+    local block
+    block=$(cat)
+    if ! grep -q '^    network: xhttp$' <<< "$block"; then
+        printf '%s\n' "$block"
+        return
+    fi
+    if grep -q '^    client-fingerprint:' <<< "$block"; then
+        sed 's/^    client-fingerprint:.*/    client-fingerprint: firefox/' <<< "$block"
+    else
+        printf '%s\n    client-fingerprint: firefox\n' "$block"
+    fi
 }
 
 # Interactive: manual input for exit-node

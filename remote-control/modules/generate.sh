@@ -506,6 +506,9 @@ _fetch_proxies_for_client() {
                         vless)
                             [[ -n "$_client_vless_uuid" ]] && \
                                 block=$(echo "$block" | sed "s/    uuid: .*/    uuid: $_client_vless_uuid/")
+                            if declare -F _normalize_vless_xhttp_proxy_yaml >/dev/null; then
+                                block=$(printf '%s\n' "$block" | _normalize_vless_xhttp_proxy_yaml)
+                            fi
                             ;;
                         hysteria2)
                             [[ -n "$_client_hy2_pass" ]] && \

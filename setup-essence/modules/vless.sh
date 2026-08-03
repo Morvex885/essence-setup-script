@@ -553,43 +553,450 @@ VLESSTCPEOF
 
 # ─── Добавить VLESS xHTTP ───────────────────────────────────────────────────
 
-_add_xhttp_nginx_location() {
-    local path="$1" port="$2"
-    local nginx_file="/etc/nginx/sites-available/$SITE_NAME"
+_xhttp_mihomo_config_path() { printf '%s' "${XHTTP_MIHOMO_CONFIG:-/etc/mihomo/config.yaml}"; }
+_xhttp_client_config_path() { printf '%s' "${XHTTP_CLIENT_CONFIG:-/etc/mihomo/client-config.txt}"; }
+_xhttp_nginx_file_path() { printf '%s' "${XHTTP_NGINX_FILE:-/etc/nginx/sites-available/$SITE_NAME}"; }
+_xhttp_cert_dir_path() { printf '%s' "${XHTTP_CERT_DIR:-/etc/mihomo/certs/xhttp}"; }
 
-    [[ -f "$nginx_file" ]] || { warn "Nginx конфиг $nginx_file не найден"; return 1; }
+_xhttp_listener_block() {
+    local config="${1:-$(_xhttp_mihomo_config_path)}"
+    sed -n '/^# --- vless-xhttp ---$/,/^# --- \/vless-xhttp ---$/p' "$config" 2>/dev/null
+}
 
-    # Удаляем старый блок если есть
-    sed -i '/# --- xhttp-nginx ---/,/# --- \/xhttp-nginx ---/d' "$nginx_file"
+# Outputs: nginx | reality. Supports both the old certificate listener and the
+# new allow-insecure listener behind nginx.
+_xhttp_listener_topology() {
+    local config="${1:-$(_xhttp_mihomo_config_path)}" block
+    block=$(_xhttp_listener_block "$config")
+    [[ -n "$block" ]] || return 1
+    if grep -q '^    reality-config:' <<< "$block"; then
+        printf '%s\n' reality
+    elif grep -qE '^    (allow-insecure: true|certificate:)' <<< "$block"; then
+        printf '%s\n' nginx
+    else
+        return 1
+    fi
+}
 
-    # Вставляем location перед "location / {" в SSL server блоке (после listen.*8443)
+_xhttp_listener_field() {
+    local field="$1" config="${2:-$(_xhttp_mihomo_config_path)}"
+    _xhttp_listener_block "$config" | awk -v key="$field" '
+        $1 == key ":" {
+            value=$2
+            gsub(/^"|"$/, "", value)
+            print value
+            exit
+        }
+    '
+}
+
+_xhttp_render_nginx_config() {
+    local source_file="$1" output_file="$2" path="$3" port="$4"
     awk -v path="$path" -v port="$port" '
-        /listen.*8443/{in_ssl=1}
-        in_ssl && /location \/ \{/ && !done {
+        function emit() {
             print "    # --- xhttp-nginx ---"
             print "    location " path " {"
-            print "        proxy_pass https://127.0.0.1:" port ";"
+            print "        proxy_pass http://127.0.0.1:" port ";"
             print "        proxy_http_version 1.1;"
-            print "        proxy_ssl_verify off;"
             print "        proxy_set_header Host \044host;"
             print "        proxy_set_header X-Forwarded-For \044proxy_add_x_forwarded_for;"
             print "        proxy_read_timeout 315s;"
             print "        proxy_send_timeout 300s;"
             print "        proxy_buffering off;"
+            print "        proxy_request_buffering off;"
             print "        client_max_body_size 0;"
             print "        client_body_timeout 300s;"
             print "    }"
             print "    # --- /xhttp-nginx ---"
-            print ""
             done=1
         }
-        {print}
-    ' "$nginx_file" > /tmp/nginx_xhttp_tmp.conf
-    mv /tmp/nginx_xhttp_tmp.conf "$nginx_file"
+        /# --- xhttp-nginx ---/ {
+            if (!done) emit()
+            skipping=1
+            next
+        }
+        skipping && /# --- \/xhttp-nginx ---/ { skipping=0; next }
+        skipping { next }
+        /listen.*8443/ { in_ssl=1 }
+        in_ssl && /location \/ \{/ && !done { emit() }
+        { print }
+        END { if (!done) exit 42 }
+    ' "$source_file" > "$output_file"
+}
 
-    nginx -t || { warn "Nginx конфиг невалиден после добавления xHTTP location"; return 1; }
-    systemctl reload nginx
-    success "Nginx location для xHTTP добавлен"
+_xhttp_migrate_listener_config() {
+    local source_file="$1" output_file="$2" topology="$3"
+    if [[ "$topology" != "nginx" ]]; then
+        cp -a "$source_file" "$output_file"
+        return
+    fi
+
+    local has_allow=false
+    _xhttp_listener_block "$source_file" | grep -q '^    allow-insecure: true' && has_allow=true
+    awk -v has_allow="$has_allow" '
+        /^# --- vless-xhttp ---$/ { in_xhttp=1 }
+        in_xhttp && /^    certificate:/ {
+            if (has_allow != "true" && !added) {
+                print "    allow-insecure: true"
+                added=1
+            }
+            next
+        }
+        in_xhttp && /^    private-key:/ { next }
+        in_xhttp && /^    allow-insecure:/ {
+            if (!added) print "    allow-insecure: true"
+            added=1
+            next
+        }
+        /^# --- \/vless-xhttp ---$/ {
+            if (!added) print "    allow-insecure: true"
+            in_xhttp=0
+        }
+        { print }
+    ' "$source_file" > "$output_file"
+}
+
+_xhttp_upsert_listener_config() {
+    local source_file="$1" output_file="$2" listener_yaml="$3"
+    local listener_file
+    listener_file=$(mktemp) || return 1
+    printf '%s\n' '# --- vless-xhttp ---' "$listener_yaml" '# --- /vless-xhttp ---' > "$listener_file"
+    awk -v insert_file="$listener_file" '
+        /^# --- vless-xhttp ---$/ { skipping=1; next }
+        skipping && /^# --- \/vless-xhttp ---$/ { skipping=0; next }
+        skipping { next }
+        /^rule-providers:/ && !inserted {
+            while ((getline line < insert_file) > 0) print line
+            close(insert_file)
+            print ""
+            inserted=1
+        }
+        { print }
+        END { if (!inserted) exit 42 }
+    ' "$source_file" > "$output_file"
+    local status=$?
+    rm -f "$listener_file"
+    return "$status"
+}
+
+_xhttp_normalize_client_config() {
+    local source_file="$1" output_file="$2"
+    awk '
+        function flush_proxy(    is_xhttp) {
+            if (proxy == "") return
+            is_xhttp = (proxy ~ /(^|\n)    network: xhttp(\n|$)/)
+            if (is_xhttp) {
+                if (proxy ~ /(^|\n)    client-fingerprint:/) {
+                    gsub(/    client-fingerprint: [^\n]*/, "    client-fingerprint: firefox", proxy)
+                } else {
+                    sub(/\n$/, "\n    client-fingerprint: firefox\n", proxy)
+                }
+            }
+            printf "%s", proxy
+            proxy=""
+        }
+        {
+            line=$0
+            if (line ~ /^URI:[[:space:]]*vless:\/\// && line ~ /[?&]type=xhttp([&#]|$)/) {
+                if (line ~ /[?&]fp=/) gsub(/fp=[^&#]*/, "fp=firefox", line)
+            }
+            if (line ~ /^  - name:/) {
+                flush_proxy()
+                proxy=line ORS
+                next
+            }
+            if (proxy != "") {
+                if (line ~ /^---/ || line ~ /^proxies:$/) {
+                    flush_proxy()
+                    print line
+                } else {
+                    proxy=proxy line ORS
+                }
+                next
+            }
+            print line
+        }
+        END { flush_proxy() }
+    ' "$source_file" > "$output_file"
+}
+
+_xhttp_append_client_section() {
+    local file="$1" topology="$2" client_port="$3" path="$4" uuid="$5"
+    local client_sni transport_label client_uri client_yaml
+    if [[ "$topology" == "nginx" ]]; then
+        client_sni="$SITE_NAME"
+        transport_label="xhttp (через nginx, без Reality)"
+        client_uri=$(_build_vless_xhttp_uri "$uuid" "$CLIENT_SERVER" "$client_port" \
+            "$SITE_NAME" "$path" "" "" "VLESS xHTTP") || return 1
+        client_yaml=$(_build_vless_xhttp_client_yaml "VLESS xHTTP" "$CLIENT_SERVER" \
+            "$client_port" "$uuid" "$SITE_NAME" "$path") || return 1
+    else
+        client_sni="$SNI_DOMAIN"
+        transport_label="xhttp"
+        client_uri=$(_build_vless_xhttp_uri "$uuid" "$CLIENT_SERVER" "$client_port" \
+            "$SNI_DOMAIN" "$path" "$PUBLIC_KEY" "$SHORT_ID" "VLESS xHTTP") || return 1
+        client_yaml=$(_build_vless_xhttp_client_yaml "VLESS xHTTP" "$CLIENT_SERVER" \
+            "$client_port" "$uuid" "$SNI_DOMAIN" "$path" "$PUBLIC_KEY" "$SHORT_ID") || return 1
+    fi
+
+    {
+        printf '\n--- VLESS xHTTP ---\n'
+        printf 'Transport:    %s\n' "$transport_label"
+        printf 'Server:       %s\n' "$CLIENT_SERVER"
+        printf 'Port:         %s\n' "$client_port"
+        printf 'SNI:          %s\n' "$client_sni"
+        printf 'UUID:         %s\n' "$uuid"
+        if [[ "$topology" == "reality" ]]; then
+            printf 'Public key:   %s\nShort ID:     %s\n' "$PUBLIC_KEY" "$SHORT_ID"
+        fi
+        printf 'Path:         %s\n\n' "$path"
+        printf 'URI: %s\n\n%s\n' "$client_uri" "$client_yaml"
+        printf '%s\n' '--- /VLESS xHTTP ---'
+    } >> "$file"
+}
+
+_xhttp_atomic_install() {
+    local candidate="$1" target="$2" mode="${3:-600}"
+    if [[ -e "$target" ]]; then
+        chmod --reference="$target" "$candidate" 2>/dev/null || return 1
+        chown --reference="$target" "$candidate" 2>/dev/null || return 1
+    else
+        chmod "$mode" "$candidate" || return 1
+    fi
+    mv -f "$candidate" "$target"
+}
+
+_xhttp_restore_file() {
+    local backup="$1" target="$2" existed="$3" restore_tmp
+    if [[ "$existed" == "true" ]]; then
+        restore_tmp=$(mktemp "$(dirname "$target")/.xhttp-restore.XXXXXX") || return 1
+        cp -a "$backup" "$restore_tmp" || { rm -f "$restore_tmp"; return 1; }
+        mv -f "$restore_tmp" "$target"
+    else
+        rm -f "$target"
+    fi
+}
+
+_xhttp_mihomo_validate() { "${XHTTP_MIHOMO_BIN:-/usr/local/bin/mihomo}" -t -f "$1"; }
+_xhttp_nginx_validate() { nginx -t; }
+_xhttp_service_is_active() { systemctl is-active --quiet "$1"; }
+_xhttp_service_restart() { systemctl restart "$1"; }
+_xhttp_service_reload() { systemctl reload "$1"; }
+_xhttp_service_stop() { systemctl stop "$1"; }
+
+_xhttp_restore_service_state() {
+    local service="$1" was_active="$2"
+    if [[ "$was_active" == "true" ]]; then
+        _xhttp_service_restart "$service" >/dev/null 2>&1 || true
+    else
+        _xhttp_service_stop "$service" >/dev/null 2>&1 || true
+    fi
+}
+
+_xhttp_probe() {
+    local topology="$1" client_port="$2" path="$3" uuid="$4"
+    local probe_dir probe_port proxy_yaml pid status=1 http_code=""
+    probe_dir=$(mktemp -d) || return 1
+    probe_port=$(gen_free_port 20000 30000)
+
+    if [[ "$topology" == "nginx" ]]; then
+        proxy_yaml=$(_build_vless_xhttp_client_yaml "xHTTP probe" "$CLIENT_SERVER" \
+            "$client_port" "$uuid" "$SITE_NAME" "$path") || { rm -rf "$probe_dir"; return 1; }
+    else
+        proxy_yaml=$(_build_vless_xhttp_client_yaml "xHTTP probe" "$CLIENT_SERVER" \
+            "$client_port" "$uuid" "$SNI_DOMAIN" "$path" "$PUBLIC_KEY" "$SHORT_ID") \
+            || { rm -rf "$probe_dir"; return 1; }
+    fi
+
+    {
+        printf 'mixed-port: %s\nallow-lan: false\nmode: rule\nlog-level: warning\n' "$probe_port"
+        printf '%s\n' "$proxy_yaml"
+        printf '%s\n' \
+            'proxy-groups:' \
+            '  - name: PROBE' \
+            '    type: select' \
+            '    proxies:' \
+            '      - "xHTTP probe"' \
+            'rules:' \
+            '  - MATCH,PROBE'
+    } > "$probe_dir/config.yaml"
+
+    "${XHTTP_MIHOMO_BIN:-/usr/local/bin/mihomo}" -d "$probe_dir" -f "$probe_dir/config.yaml" \
+        > "$probe_dir/mihomo.log" 2>&1 &
+    pid=$!
+    local attempt
+    for attempt in {1..10}; do
+        if ! kill -0 "$pid" 2>/dev/null; then break; fi
+        http_code=$(curl -sS -o /dev/null -w '%{http_code}' \
+            --proxy "http://127.0.0.1:$probe_port" --max-time 20 \
+            "${XHTTP_PROBE_URL:-https://www.gstatic.com/generate_204}" 2>/dev/null) || true
+        if [[ "$http_code" == "204" ]]; then
+            status=0
+            break
+        fi
+        sleep 1
+    done
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    if [[ "$status" -ne 0 ]]; then
+        warn "xHTTP probe не прошёл (HTTP ${http_code:-нет ответа})."
+        [[ -s "$probe_dir/mihomo.log" ]] && tail -n 10 "$probe_dir/mihomo.log" >&2
+    fi
+    rm -rf "$probe_dir"
+    return "$status"
+}
+
+_xhttp_rollback_transaction() {
+    local tx_dir="$1" mihomo_config="$2" client_config="$3" nginx_file="$4"
+    local had_mihomo="$5" had_client="$6" had_nginx="$7"
+    local topology="$8" mihomo_was_active="$9" nginx_was_active="${10}"
+    _xhttp_restore_file "$tx_dir/mihomo" "$mihomo_config" "$had_mihomo" || true
+    _xhttp_restore_file "$tx_dir/client" "$client_config" "$had_client" || true
+    if [[ "$topology" == "nginx" ]]; then
+        _xhttp_restore_file "$tx_dir/nginx" "$nginx_file" "$had_nginx" || true
+    fi
+    _xhttp_restore_service_state mihomo "$mihomo_was_active"
+    [[ "$topology" == "nginx" ]] && _xhttp_restore_service_state nginx "$nginx_was_active"
+}
+
+# Args: topology listen listener_port client_port path reinstall
+_install_vless_xhttp_transaction() {
+    local topology="$1" listen="$2" listener_port="$3" client_port="$4" path="$5"
+    local reinstall="${6:-false}"
+    local mihomo_config client_config nginx_file cert_dir tx_dir
+    mihomo_config=$(_xhttp_mihomo_config_path)
+    client_config=$(_xhttp_client_config_path)
+    nginx_file=$(_xhttp_nginx_file_path)
+    cert_dir=$(_xhttp_cert_dir_path)
+
+    [[ -f "$mihomo_config" ]] || { warn "Mihomo конфиг не найден: $mihomo_config"; return 1; }
+    if [[ "$topology" == "nginx" && ! -f "$nginx_file" ]]; then
+        warn "Nginx конфиг не найден: $nginx_file"
+        return 1
+    fi
+
+    local old_umask had_mihomo=true had_client=false had_nginx=false
+    local mihomo_was_active=false nginx_was_active=false
+    old_umask=$(umask)
+    umask 077
+    tx_dir=$(mktemp -d) || { umask "$old_umask"; return 1; }
+    umask "$old_umask"
+    cp -a "$mihomo_config" "$tx_dir/mihomo" || { rm -rf "$tx_dir"; return 1; }
+    if [[ -e "$client_config" ]]; then
+        had_client=true
+        cp -a "$client_config" "$tx_dir/client" || { rm -rf "$tx_dir"; return 1; }
+    fi
+    if [[ "$topology" == "nginx" ]]; then
+        had_nginx=true
+        cp -a "$nginx_file" "$tx_dir/nginx" || { rm -rf "$tx_dir"; return 1; }
+    fi
+    _xhttp_service_is_active mihomo && mihomo_was_active=true
+    [[ "$topology" == "nginx" ]] && _xhttp_service_is_active nginx && nginx_was_active=true
+
+    local config_candidate client_candidate nginx_candidate="" listener_yaml first_uuid
+    config_candidate=$(mktemp "$(dirname "$mihomo_config")/.config.xhttp.XXXXXX") \
+        || { rm -rf "$tx_dir"; return 1; }
+    client_candidate=$(mktemp "$(dirname "$client_config")/.client-config.xhttp.XXXXXX") \
+        || { rm -f "$config_candidate"; rm -rf "$tx_dir"; return 1; }
+
+    if [[ "$reinstall" == "true" ]] && grep -q '^# --- vless-xhttp ---$' "$mihomo_config"; then
+        _xhttp_migrate_listener_config "$mihomo_config" "$config_candidate" "$topology" || {
+            rm -f "$config_candidate" "$client_candidate"; rm -rf "$tx_dir"; return 1;
+        }
+        first_uuid=$(_xhttp_listener_block "$mihomo_config" | awk '/^[[:space:]]+uuid:/{print $2; exit}')
+    else
+        first_uuid="$UUID"
+        if [[ "$topology" == "nginx" ]]; then
+            listener_yaml=$(_build_vless_xhttp_nginx_listener_yaml \
+                "VLESS xHTTP" "$listen" "$listener_port" "user1" "$UUID" "$path" "outbound")
+        else
+            listener_yaml=$(_build_vless_xhttp_listener_yaml \
+                "VLESS xHTTP" "$listen" "$listener_port" "user1" "$UUID" "$path" \
+                "$REALITY_DEST" "$PRIVATE_KEY" "$SHORT_ID" "$SNI_DOMAIN" "outbound")
+        fi
+        _xhttp_upsert_listener_config "$mihomo_config" "$config_candidate" "$listener_yaml" || {
+            rm -f "$config_candidate" "$client_candidate"; rm -rf "$tx_dir"; return 1;
+        }
+    fi
+    [[ -n "$first_uuid" ]] || first_uuid="$UUID"
+
+    if [[ "$reinstall" == "true" && -f "$client_config" ]]; then
+        _xhttp_normalize_client_config "$client_config" "$client_candidate" || {
+            rm -f "$config_candidate" "$client_candidate"; rm -rf "$tx_dir"; return 1;
+        }
+    else
+        [[ -f "$client_config" ]] && cp -a "$client_config" "$client_candidate" || : > "$client_candidate"
+        sed -i '/^--- VLESS xHTTP ---$/,/^--- \/VLESS xHTTP ---$/d' "$client_candidate"
+        _xhttp_append_client_section "$client_candidate" "$topology" "$client_port" "$path" "$first_uuid" || {
+            rm -f "$config_candidate" "$client_candidate"; rm -rf "$tx_dir"; return 1;
+        }
+    fi
+
+    if [[ "$topology" == "nginx" ]]; then
+        nginx_candidate=$(mktemp "$(dirname "$nginx_file")/.nginx.xhttp.XXXXXX") || {
+            rm -f "$config_candidate" "$client_candidate"; rm -rf "$tx_dir"; return 1;
+        }
+        _xhttp_render_nginx_config "$nginx_file" "$nginx_candidate" "$path" "$listener_port" || {
+            warn "Не удалось подготовить nginx location для xHTTP."
+            rm -f "$config_candidate" "$client_candidate" "$nginx_candidate"; rm -rf "$tx_dir"; return 1;
+        }
+    fi
+
+    if ! _xhttp_mihomo_validate "$config_candidate"; then
+        warn "Mihomo отклонил новый xHTTP конфиг. Файлы не изменены."
+        rm -f "$config_candidate" "$client_candidate" "$nginx_candidate"; rm -rf "$tx_dir"
+        return 1
+    fi
+
+    if ! _xhttp_atomic_install "$config_candidate" "$mihomo_config" 600 \
+        || ! _xhttp_atomic_install "$client_candidate" "$client_config" 600 \
+        || { [[ "$topology" == "nginx" ]] && ! _xhttp_atomic_install "$nginx_candidate" "$nginx_file" 644; }; then
+        warn "Не удалось атомарно обновить xHTTP файлы. Выполняю rollback."
+        _xhttp_rollback_transaction "$tx_dir" "$mihomo_config" "$client_config" "$nginx_file" \
+            "$had_mihomo" "$had_client" "$had_nginx" "$topology" "$mihomo_was_active" "$nginx_was_active"
+        rm -f "$config_candidate" "$client_candidate" "$nginx_candidate"; rm -rf "$tx_dir"
+        return 1
+    fi
+
+    if [[ "$topology" == "nginx" ]] && ! _xhttp_nginx_validate; then
+        warn "Nginx отклонил новый xHTTP конфиг. Выполняю rollback."
+        _xhttp_rollback_transaction "$tx_dir" "$mihomo_config" "$client_config" "$nginx_file" \
+            "$had_mihomo" "$had_client" "$had_nginx" "$topology" "$mihomo_was_active" "$nginx_was_active"
+        rm -rf "$tx_dir"
+        return 1
+    fi
+
+    if ! _xhttp_service_restart mihomo >/dev/null 2>&1 \
+        || ! _xhttp_service_is_active mihomo; then
+        warn "Mihomo не запустился с новым xHTTP конфигом. Выполняю rollback."
+        _xhttp_rollback_transaction "$tx_dir" "$mihomo_config" "$client_config" "$nginx_file" \
+            "$had_mihomo" "$had_client" "$had_nginx" "$topology" "$mihomo_was_active" "$nginx_was_active"
+        rm -rf "$tx_dir"
+        return 1
+    fi
+    if [[ "$topology" == "nginx" ]]; then
+        if ! _xhttp_service_reload nginx >/dev/null 2>&1 || ! _xhttp_service_is_active nginx; then
+            warn "Nginx не применил новый xHTTP конфиг. Выполняю rollback."
+            _xhttp_rollback_transaction "$tx_dir" "$mihomo_config" "$client_config" "$nginx_file" \
+                "$had_mihomo" "$had_client" "$had_nginx" "$topology" "$mihomo_was_active" "$nginx_was_active"
+            rm -rf "$tx_dir"
+            return 1
+        fi
+    fi
+
+    if ! _xhttp_probe "$topology" "$client_port" "$path" "$first_uuid"; then
+        warn "Проверка реального xHTTP соединения не прошла. Выполняю rollback."
+        _xhttp_rollback_transaction "$tx_dir" "$mihomo_config" "$client_config" "$nginx_file" \
+            "$had_mihomo" "$had_client" "$had_nginx" "$topology" "$mihomo_was_active" "$nginx_was_active"
+        rm -rf "$tx_dir"
+        return 1
+    fi
+
+    if [[ "$topology" == "nginx" && "$cert_dir" == */mihomo/certs/xhttp ]]; then
+        rm -rf "$cert_dir"
+    fi
+    rm -rf "$tx_dir"
+    return 0
 }
 
 _remove_xhttp_nginx_location() {
@@ -605,16 +1012,51 @@ _remove_xhttp_nginx_location() {
 _add_vless_xhttp() {
     _check_base || return
     _check_reality || return
-
-    if grep -q '# --- vless-xhttp ---' /etc/mihomo/config.yaml 2>/dev/null; then
-        warn "VLESS xHTTP уже установлен."
-        confirm_yn "Переустановить?" || return
-    fi
-
     _load_reality_conf
 
-    local XHTTP_LISTEN XHTTP_PORT client_port xhttp_via_nginx=false
+    local mihomo_config client_config
+    mihomo_config=$(_xhttp_mihomo_config_path)
+    client_config=$(_xhttp_client_config_path)
+    local XHTTP_LISTEN XHTTP_PORT client_port topology
     local XHTTP_PATH="/$(openssl rand -hex 8)"
+
+    if grep -q '^# --- vless-xhttp ---$' "$mihomo_config" 2>/dev/null; then
+        warn "VLESS xHTTP уже установлен."
+        confirm_yn "Переустановить?" || return
+
+        topology=$(_xhttp_listener_topology "$mihomo_config") || {
+            warn "Не удалось распознать существующую топологию xHTTP. Конфиги не изменены."
+            return
+        }
+        XHTTP_LISTEN=$(_xhttp_listener_field listen "$mihomo_config")
+        XHTTP_PORT=$(_xhttp_listener_field port "$mihomo_config")
+        XHTTP_PATH=$(_xhttp_listener_field path "$mihomo_config")
+        client_port=$(sed -n '/^--- VLESS xHTTP ---$/,/^--- \/VLESS xHTTP ---$/p' "$client_config" 2>/dev/null \
+            | awk '/^Port:/{print $2; exit}')
+        if [[ -z "$client_port" ]]; then
+            if [[ "$XHTTP_LISTEN" == "127.0.0.1" ]]; then client_port=443; else client_port="$XHTTP_PORT"; fi
+        fi
+        if [[ -z "$XHTTP_LISTEN" || -z "$XHTTP_PORT" || -z "$XHTTP_PATH" ]]; then
+            warn "Существующий xHTTP listener неполный. Конфиги не изменены."
+            return
+        fi
+
+        echo ""
+        info "Сохраняю топологию, порты, path, пользователей, каскады и routing."
+        info "Порт:  $client_port (listener $XHTTP_LISTEN:$XHTTP_PORT)"
+        info "Path:  $XHTTP_PATH"
+        info "Проверяю кандидаты и реальное xHTTP соединение..."
+        if _install_vless_xhttp_transaction "$topology" "$XHTTP_LISTEN" "$XHTTP_PORT" \
+            "$client_port" "$XHTTP_PATH" true; then
+            success "VLESS xHTTP безопасно переустановлен"
+        else
+            warn "Переустановка xHTTP отменена; предыдущая конфигурация и сервисы восстановлены."
+            return
+        fi
+        return
+    fi
+
+    local xhttp_via_nginx=false
 
     echo ""
     echo -e "  Порт для xHTTP:"
@@ -649,6 +1091,7 @@ _add_vless_xhttp() {
                 warn "Вариант 'через nginx' доступен только в режиме с сайтом-заглушкой (self-steal или SNI+сайт)."; return
             fi
             xhttp_via_nginx=true
+            topology="nginx"
             XHTTP_LISTEN="127.0.0.1"
             XHTTP_PORT=8445
             if ! is_port_free 8445; then
@@ -668,6 +1111,7 @@ _add_vless_xhttp() {
             warn "Неверный выбор."; return
             ;;
     esac
+    [[ "$xhttp_via_nginx" == "false" ]] && topology="reality"
 
     echo ""
     info "Порт:  $client_port"
@@ -679,93 +1123,18 @@ _add_vless_xhttp() {
     echo ""
     confirm_yn "Всё верно?" || { info "Отменено."; return; }
 
-    info "Добавляю VLESS xHTTP..."
-
-    # Удаляем старый блок если есть
-    sed -i '/^# --- vless-xhttp ---/,/^# --- \/vless-xhttp ---/d' /etc/mihomo/config.yaml
-
-    local _listener_yaml
-    if [[ "$xhttp_via_nginx" == "true" ]]; then
-        # Симлинк на серты nginx (SAFE_PATHS в systemd unit разрешает /etc/nginx/ssl)
-        mkdir -p /etc/mihomo/certs
-        rm -rf /etc/mihomo/certs/xhttp
-        ln -sf "/etc/nginx/ssl/$SITE_NAME" /etc/mihomo/certs/xhttp
-
-        local _cert_dir="/etc/mihomo/certs/xhttp"
-        _listener_yaml=$(_build_vless_xhttp_tls_listener_yaml \
-            "VLESS xHTTP" "$XHTTP_LISTEN" "$XHTTP_PORT" \
-            "user1" "$UUID" "$XHTTP_PATH" \
-            "$_cert_dir/fullchain.pem" "$_cert_dir/privkey.pem" "outbound")
-
-        # Добавляем nginx location
-        _add_xhttp_nginx_location "$XHTTP_PATH" "$XHTTP_PORT"
-    else
-        _listener_yaml=$(_build_vless_xhttp_listener_yaml \
-            "VLESS xHTTP" "$XHTTP_LISTEN" "$XHTTP_PORT" \
-            "user1" "$UUID" "$XHTTP_PATH" \
-            "$REALITY_DEST" "$PRIVATE_KEY" "$SHORT_ID" "$SNI_DOMAIN" "outbound")
+    info "Добавляю и проверяю VLESS xHTTP..."
+    if ! _install_vless_xhttp_transaction "$topology" "$XHTTP_LISTEN" "$XHTTP_PORT" \
+        "$client_port" "$XHTTP_PATH" false; then
+        warn "VLESS xHTTP не установлен; исходные файлы и сервисы восстановлены."
+        return
     fi
 
-    printf '%s\n' "# --- vless-xhttp ---" "$_listener_yaml" "# --- /vless-xhttp ---" > /tmp/_inject_tmp.yaml
-
-    awk '/^rule-providers:/{
-        while ((getline line < "/tmp/_inject_tmp.yaml") > 0) print line
-        print ""
-    }
-    {print}' /etc/mihomo/config.yaml > /tmp/mihomo_tmp.yaml
-    mv /tmp/mihomo_tmp.yaml /etc/mihomo/config.yaml
-    rm -f /tmp/_inject_tmp.yaml
-
-    # UFW (только для кастомных портов)
     if [[ "$client_port" != "443" ]]; then
         ufw allow "${client_port}/tcp" > /dev/null 2>&1
         success "Порт $client_port открыт"
     fi
-
-    # Перезапуск
-    systemctl restart mihomo &>/dev/null
-    sleep 3
-
-    if systemctl is-active --quiet mihomo; then
-        success "VLESS xHTTP добавлен"
-    else
-        warn "Mihomo не запустился. Лог:"
-        journalctl -u mihomo -n 20 --no-pager
-    fi
-
-    # Клиентский конфиг
-    if [[ -f /etc/mihomo/client-config.txt ]]; then
-        sed -i '/^--- VLESS xHTTP ---/,/^--- \/VLESS xHTTP ---/d' /etc/mihomo/client-config.txt
-    fi
-
-    local _client_uri _client_yaml _client_sni _transport_label
-    if [[ "$xhttp_via_nginx" == "true" ]]; then
-        _client_sni="$SITE_NAME"
-        _transport_label="xhttp (через nginx, без Reality)"
-        _client_uri=$(_build_vless_xhttp_uri "$UUID" "$CLIENT_SERVER" "$client_port" "$SITE_NAME" "$XHTTP_PATH" "" "" "VLESS xHTTP")
-        _client_yaml=$(_build_vless_xhttp_client_yaml "VLESS xHTTP" "$CLIENT_SERVER" "$client_port" "$UUID" "$SITE_NAME" "$XHTTP_PATH")
-    else
-        _client_sni="$SNI_DOMAIN"
-        _transport_label="xhttp"
-        _client_uri=$(_build_vless_xhttp_uri "$UUID" "$CLIENT_SERVER" "$client_port" "$SNI_DOMAIN" "$XHTTP_PATH" "$PUBLIC_KEY" "$SHORT_ID" "VLESS xHTTP")
-        _client_yaml=$(_build_vless_xhttp_client_yaml "VLESS xHTTP" "$CLIENT_SERVER" "$client_port" "$UUID" "$SNI_DOMAIN" "$XHTTP_PATH" "$PUBLIC_KEY" "$SHORT_ID")
-    fi
-
-    cat >> /etc/mihomo/client-config.txt << VLESSXHTTPEOF
-
---- VLESS xHTTP ---
-Transport:    $_transport_label
-Server:       $CLIENT_SERVER
-Port:         $client_port
-SNI:          $_client_sni
-UUID:         $UUID
-$(  [[ -n "$PUBLIC_KEY" && "$xhttp_via_nginx" != "true" ]] && printf "Public key:   %s\nShort ID:     %s\n" "$PUBLIC_KEY" "$SHORT_ID" )Path:         $XHTTP_PATH
-
-URI: $_client_uri
-
-$_client_yaml
---- /VLESS xHTTP ---
-VLESSXHTTPEOF
+    success "VLESS xHTTP добавлен и проверен"
 
     echo ""
     echo -e "  Сервер: ${CYAN}$CLIENT_SERVER:$client_port${NC}"
