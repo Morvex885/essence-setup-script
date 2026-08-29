@@ -51,7 +51,7 @@ WORKER REPORT:
 4. **Подбор BATS** — по правилам [.claude/commands/preflight.md](../commands/preflight.md): модуль `X.sh` → `tests/unit/*X*.bats`. Запускать через `tests/lib/bats-core/bin/bats tests/unit/<файл>.bats` (или `bash tests/run_tests.sh --unit` если фильтр невозможен — но **не** `--all` для одного шага).
 5. **Конвенции** — проверить:
    - Голые `echo` для пользовательского вывода (должен быть `info`/`success`/`warn`/`error` из [common/common.sh](../../common/common.sh)).
-   - Кросс-импорт `setup-essence/` ↔ `remote-control/` (см. [CLAUDE.md](../../CLAUDE.md) — запрещён).
+   - Кросс-импорт `setup-essence/` ↔ `remote-control/` (см. [AGENTS.md](../../AGENTS.md) — запрещён).
    - Дублирование YAML-билдеров вне [common/protocols/](../../common/protocols/).
    - `jq -r ... > file` вместо `jq_w` для `config.json` — потеря CRLF-trim и атомарности.
    - Wildcard `*)` в `case`-меню, который молча принимает ввод (должен звать `error`).
