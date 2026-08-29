@@ -1,4 +1,4 @@
-# CLAUDE.md
+# AGENTS.md
 
 Bash-проект для настройки прокси-сервера на ядре mihomo. Серверная часть в [setup-essence/](setup-essence/), локальная — в [remote-control/](remote-control/), общий слой — в [common/](common/), тесты — BATS в [tests/](tests/). Общий обзор и протоколы: [README.md](README.md), [docs/essence.md](docs/essence.md), [docs/remote-control.md](docs/remote-control.md).
 

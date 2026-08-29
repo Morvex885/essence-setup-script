@@ -21,7 +21,7 @@ model: opus
 Перед декомпозицией обязательно исследовать codebase, чтобы план опирался на существующие helper'ы и не нарушал границ.
 
 Источники:
-- [CLAUDE.md](../../CLAUDE.md) — границы импорта, конвенции, helper'ы.
+- [AGENTS.md](../../AGENTS.md) — границы импорта, конвенции, helper'ы.
 - [common/common.sh](../../common/common.sh) — основные обёртки: `info`/`success`/`warn`/`error`, `confirm_yn`, `jq_r`/`jq_w`, `is_port_free`/`gen_free_port`, `check_update_start`/`latest_version`, `box_*`, `hyperlink`.
 - [common/ensure-deps.sh](../../common/ensure-deps.sh) — `ensure_dep`, `detect_pm`, `pkg_name_for`, `pm_install`.
 - [common/cert.sh](../../common/cert.sh) — `ensure_acme_installed`, `issue_cert`, `install_cert`.
@@ -34,7 +34,7 @@ model: opus
 Цели разведки:
 1. **Найти аналог** — если задача похожа на существующий модуль/функцию, план должен переиспользовать паттерн.
 2. **Найти helper'ы** — не предлагать писать новую обёртку, если есть готовая в `common/`.
-3. **Уважить границы импорта** из [CLAUDE.md](../../CLAUDE.md):
+3. **Уважать границы импорта** из [AGENTS.md](../../AGENTS.md):
    - `common/` не делает `source` из `setup-essence/` или `remote-control/`.
    - `setup-essence/` и `remote-control/` импортируют из `common/`, но **не друг из друга**.
    - YAML-билдеры — только в `common/protocols/`, не дублировать.
@@ -93,7 +93,7 @@ model: opus
 - **Не более 7 шагов**. Если получается больше — сгруппируй шаги или сузь scope (вернись с `CLARIFY`).
 - **Никакого Edit/Write**. Tools — только Read, Grep, Glob, Bash (на read-only команды: `git log`, `git diff`, `bash -n` для проверки своих гипотез).
 - **Не пиши код в плане**. План — это спецификация, не реализация. Worker напишет код.
-- **Учитывай конвенции** из [CLAUDE.md](../../CLAUDE.md):
+- **Учитывай конвенции** из [AGENTS.md](../../AGENTS.md):
   - UI и пользовательские сообщения — на русском.
   - ANSI-цвета и префиксы — только `[*] [✓] [!] [✗]` через `info`/`success`/`warn`/`error`.
   - `set -euo pipefail` есть в установщиках, нет в основных entrypoints — не предлагай добавлять туда `set -e`.
