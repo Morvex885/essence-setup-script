@@ -13,10 +13,6 @@ setup() {
     _pass_key() { echo "aaaa1111bbbb2222cccc3333dddd4444eeee5555ffff6666aabb7788ccdd99ee"; }
     load_fixture_config
 
-    # Re-encode password with deterministic key
-    local encoded
-    encoded=$(node_pass_encode "testpass123")
-    jq_w --arg p "$encoded" '.nodes[1].pass = $p'
 }
 
 teardown() {
@@ -30,18 +26,17 @@ fetch_proxies_isolated() {
     local remote_fixture="${5:-$FIXTURES_DIR/sample_client_config.txt}"
     local stderr_file="$BATS_TEST_TMPDIR/fetch_stderr"
 
-    bash -c "
+    "${BASH:-bash}" -c "
         source '$PROJECT_ROOT/common/common.sh'
         error() { echo \"\$*\" >&2; return 1; }
+        export CONFIG_DIR='$BATS_TEST_TMPDIR'
         export CONFIG_JSON='$CONFIG_JSON'
-        export SCRIPT_DIR='$BATS_TEST_TMPDIR'
+        export SECRETS_JSON='$SECRETS_JSON'
+        export STATE_DIR='$BATS_TEST_TMPDIR'
         export TEMPLATES_DIR='$TEMPLATES_DIR'
+        export SCRIPT_DIR='$BATS_TEST_TMPDIR'
+        source '$PROJECT_ROOT/remote-control/modules/state.sh'
         source '$PROJECT_ROOT/remote-control/modules/nodes.sh'
-        _pass_key() { echo 'aaaa1111bbbb2222cccc3333dddd4444eeee5555ffff6666aabb7788ccdd99ee'; }
-        ssh_run() { return 1; }
-        scp_run() { return 0; }
-        upload_scripts() { return 0; }
-        SSHPASS_AVAILABLE=false
         source '$PROJECT_ROOT/remote-control/modules/templates.sh'
         source '$PROJECT_ROOT/remote-control/modules/connections.sh'
         source '$PROJECT_ROOT/common/protocols/vless-xhttp.sh'
@@ -50,7 +45,7 @@ fetch_proxies_isolated() {
         _reset_node_cache
         IFS=',' read -ra _cache_arr <<< '$cache_nodes'
         for n in \"\${_cache_arr[@]}\"; do
-            [[ -n \"\$n\" ]] && NODE_CONFIG_CACHE[\"\$n\"]=\"\$(cat '$remote_fixture')\"
+            [[ -n \"\$n\" ]] && _node_config_cache_set \"\$n\" \"\$(cat '$remote_fixture')\"
         done
 
         _fetch_proxies_for_client '$client' '$group' '$nodes'

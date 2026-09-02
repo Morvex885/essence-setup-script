@@ -3,7 +3,10 @@
 
 groups_list() {
     _ensure_config
-    mapfile -t GRP_LIST < <(jq_r '.groups[].name')
+    GRP_LIST=()
+    while IFS= read -r group_name; do
+        GRP_LIST+=("$group_name")
+    done < <(jq_r '.groups[].name')
 }
 
 _group_client_count() {
@@ -60,9 +63,9 @@ groups_menu() {
         read -rp "Выберите: " GRP_CHOICE
 
         case "$GRP_CHOICE" in
-            a) add_group ;;
-            d) delete_group ;;
-            t) assign_template_to_group ;;
+            a) state_action "add_group" add_group ;;
+            d) state_action "delete_group" delete_group ;;
+            t) state_action "assign_template" assign_template_to_group ;;
             0) return ;;
             *) warn "Неверный выбор." ;;
         esac
@@ -163,18 +166,13 @@ assign_template_to_group() {
     current_tpl=$(_template_name_for_group "$group")
     info "Текущий шаблон: $current_tpl"
 
-    # Список шаблонов
+    # Пользовательские и встроенные шаблоны.
     echo ""
     echo -e "  Доступные шаблоны:"
     local templates=()
-    while IFS= read -r f; do
-        templates+=("$(basename "$f")")
-    done < <(find "$TEMPLATES_DIR" -maxdepth 1 -name '*.yaml' -type f 2>/dev/null | sort)
-
-    if [[ ${#templates[@]} -eq 0 ]]; then
-        warn "Нет шаблонов в $TEMPLATES_DIR/"
-        return
-    fi
+    while IFS= read -r template_name; do
+        [[ -n "$template_name" ]] && templates+=("$template_name")
+    done < <(_list_templates)
 
     local i=1
     for t in "${templates[@]}"; do
@@ -207,7 +205,10 @@ _create_new_template() {
     local group="$1"
 
     read -rp "Имя нового шаблона (без .yaml): " TPL_NAME
-    [[ -z "$TPL_NAME" ]] && { warn "Имя не указано."; return; }
+    if [[ -z "$TPL_NAME" || ! "$TPL_NAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        warn "Имя может содержать только буквы, цифры, точку, - и _"
+        return
+    fi
 
     local new_file="$TEMPLATES_DIR/${TPL_NAME}.yaml"
     if [[ -f "$new_file" ]]; then
@@ -215,13 +216,15 @@ _create_new_template() {
         return
     fi
 
-    # Копируем default.yaml как основу
-    local default_tpl="$TEMPLATES_DIR/default.yaml"
-    if [[ -f "$default_tpl" ]]; then
-        cp "$default_tpl" "$new_file"
+    # Копируем доступный default.yaml как основу.
+    mkdir -p "$TEMPLATES_DIR" || return 1
+    local default_tpl
+    default_tpl=$(_find_template "default.yaml")
+    if [[ -n "$default_tpl" ]]; then
+        cp "$default_tpl" "$new_file" || return 1
         info "Скопирован default.yaml как основа"
     else
-        touch "$new_file"
+        : > "$new_file"
         warn "default.yaml не найден — создан пустой шаблон"
     fi
 

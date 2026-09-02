@@ -22,12 +22,12 @@ setup_test_env() {
     export SCRIPT_DIR="$BATS_TEST_TMPDIR"
     mkdir -p "$TEMPLATES_DIR" "$GENERATED_DIR"
 
-    # Write minimal valid config matching _ensure_config structure
+    # Write minimal schema-v2 config matching production defaults.
     cat > "$CONFIG_JSON" <<'EOF'
-{"nodes":[],"groups":[{"name":"ROUTER","template":"default.yaml"},{"name":"PC","template":"default.yaml"},{"name":"MOBILE","template":"default.yaml"}],"clients":[],"connections":[]}
+{"schema_version":2,"nodes":[],"groups":[{"name":"ROUTER","template":"default.yaml"},{"name":"PC","template":"default.yaml"},{"name":"MOBILE","template":"default.yaml"}],"clients":[],"connections":[]}
 EOF
-}
 
+}
 teardown_test_env() {
     [[ -d "${BATS_TEST_TMPDIR:-}" ]] && rm -rf "$BATS_TEST_TMPDIR"
 }
@@ -41,9 +41,12 @@ source_common() {
     error() { echo -e "  ${RED}[✗]${NC} $*" >&2; return 1; }
 }
 
-# Source a remote-control module (requires common.sh already loaded)
+# Remote-control modules depend on state.sh for schema-v2 paths and secrets.
 source_module() {
     local module="$1"
+    if [[ "$module" != "state.sh" ]]; then
+        source "$PROJECT_ROOT/remote-control/modules/state.sh"
+    fi
     source "$PROJECT_ROOT/remote-control/modules/$module"
 }
 
@@ -62,6 +65,9 @@ FIXTURES_DIR="$TESTS_DIR/fixtures"
 
 load_fixture_config() {
     cp "$FIXTURES_DIR/sample_config.json" "$CONFIG_JSON"
+    if declare -F node_secret_set >/dev/null 2>&1; then
+        node_secret_set "22222222222222222222222222222222" "testpass123"
+    fi
 }
 
 load_fixture_template() {

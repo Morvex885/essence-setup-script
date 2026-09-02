@@ -101,7 +101,7 @@ teardown() {
 @test "publish warns without host node" {
     jq_w 'del(.subscription_host)'
     run subscription_publish "phone"
-    assert_output --partial "Host-нода не задана"
+    assert_output --partial "Хост-нода подписок не задана"
 }
 
 @test "publish warns without generated config" {

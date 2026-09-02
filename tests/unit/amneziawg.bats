@@ -57,6 +57,14 @@ teardown() {
     teardown_test_env
 }
 
+_file_mode() {
+    case "${OSTYPE:-}" in
+        darwin*) stat -f '%Lp' "$1" ;;
+        *) stat -c '%a' "$1" ;;
+    esac
+}
+
+
 _mock_script() {
     local name="$1"
     shift
@@ -371,7 +379,8 @@ EOF
     grep -q '^apt-get install -y gnupg$' "$MOCK_CALLS"
     ! grep -q "linux-headers-$MOCK_KERNEL" "$MOCK_CALLS"
     grep -q '^apt-get install -y amneziawg$' "$MOCK_CALLS"
-    mapfile -t source_states < <(grep '^apt-update-amnezia-source=' "$MOCK_CALLS")
+    source_states=()
+    while IFS= read -r value; do source_states+=("$value"); done < <(grep '^apt-update-amnezia-source=' "$MOCK_CALLS")
     assert_equal "${source_states[0]}" 'apt-update-amnezia-source=absent'
     assert_equal "${source_states[1]}" 'apt-update-amnezia-source=present'
     [[ -f "$AWG_APT_KEYRING" ]]
@@ -416,7 +425,8 @@ EOF
     grep -q "^apt-get install -y linux-headers-$MOCK_KERNEL$" "$MOCK_CALLS"
     ! grep -q '^apt-get install --reinstall' "$MOCK_CALLS"
     [[ -d "$AWG_MODULES_ROOT/$MOCK_KERNEL/build" ]]
-    mapfile -t source_states < <(grep '^apt-update-amnezia-source=' "$MOCK_CALLS")
+    source_states=()
+    while IFS= read -r value; do source_states+=("$value"); done < <(grep '^apt-update-amnezia-source=' "$MOCK_CALLS")
     assert_equal "${source_states[0]}" 'apt-update-amnezia-source=absent'
     assert_equal "${source_states[1]}" 'apt-update-amnezia-source=present'
 }
@@ -453,7 +463,8 @@ EOF
 
     run _awg_install_repository
     assert_success
-    mapfile -t events < <(grep -E '^(apt-wait|apt-get)' "$MOCK_CALLS")
+    events=()
+    while IFS= read -r value; do events+=("$value"); done < <(grep -E '^(apt-wait|apt-get)' "$MOCK_CALLS")
     assert_equal "${events[0]}" 'apt-wait'
     assert_equal "${events[1]}" 'apt-get update'
     assert_equal "${events[2]}" 'apt-wait'
@@ -489,7 +500,8 @@ EOF
 
     run _awg_ensure_packages
     assert_success
-    mapfile -t events < <(grep -E '^(apt-wait|apt-get)' "$MOCK_CALLS")
+    events=()
+    while IFS= read -r value; do events+=("$value"); done < <(grep -E '^(apt-wait|apt-get)' "$MOCK_CALLS")
     assert_equal "${events[0]}" 'apt-wait'
     assert_equal "${events[1]}" 'apt-get update'
     assert_equal "${events[2]}" 'apt-wait'
@@ -683,7 +695,7 @@ EOF
     ! grep -q '^ufw allow' "$MOCK_CALLS"
     cmp -s "$AWG_CLIENT_CONFIG" "$BATS_TEST_TMPDIR/client.before"
     [[ -f "$AWG_CONF" ]]
-    [[ "$(stat -c '%a' "$AWG_CONF")" == 600 ]]
+    [[ "$(_file_mode "$AWG_CONF")" == 600 ]]
 }
 
 @test "systemd failure does not perform late UFW or client-config changes" {
@@ -711,7 +723,7 @@ EOF
     [[ ! -s "$MOCK_STATE/ufw.rules" ]]
     [[ ! -e "$MOCK_STATE/active.awg-quick_awg0" ]]
     [[ -f "$AWG_CONF" ]]
-    [[ "$(stat -c '%a' "$AWG_CONF")" == 600 ]]
+    [[ "$(_file_mode "$AWG_CONF")" == 600 ]]
 }
 
 @test "reinstall failure restores old config, keys, peers, clients, firewall and service state" {

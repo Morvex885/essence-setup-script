@@ -79,9 +79,9 @@ teardown() {
         local pass
         local strategy=$((RANDOM % 3))
         case $strategy in
-            0) pass=$(mutate_inject "$base" DICT_SHELL_INJECTION) ;;
-            1) pass=$(mutate_inject "$base" DICT_FORMAT_STRINGS) ;;
-            2) pass=$(mutate_inject "$base" DICT_PATH_TRAVERSAL) ;;
+            0) pass=$(mutate_inject "$base" "${DICT_SHELL_INJECTION[@]}") ;;
+            1) pass=$(mutate_inject "$base" "${DICT_FORMAT_STRINGS[@]}") ;;
+            2) pass=$(mutate_inject "$base" "${DICT_PATH_TRAVERSAL[@]}") ;;
         esac
         # Skip null-byte passwords — bash can't handle them in variables
         [[ "$pass" == *$'\x00'* ]] && continue
