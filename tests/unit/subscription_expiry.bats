@@ -67,7 +67,7 @@ _run_cleanup() {
     _run_cleanup
 
     # Only valid token remains in expiry.list
-    run wc -l < "$SUB_DIR/expiry.list"
+    run sh -c "wc -l < '$SUB_DIR/expiry.list' | tr -d ' '"
     assert_output "1"
     run grep -c "$valid" "$SUB_DIR/expiry.list"
     assert_output "1"

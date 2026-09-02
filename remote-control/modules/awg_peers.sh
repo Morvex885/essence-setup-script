@@ -87,7 +87,7 @@ awg_peers_menu() {
 
         [[ "$_pick" == "0" ]] && return
         if [[ "$_pick" =~ ^[0-9]+$ ]] && (( _pick >= 1 && _pick <= ${#_node_names[@]} )); then
-            _awg_peers_node "$_pick"
+            state_action "awg_peers" _awg_peers_node "$_pick"
         else
             warn "Неверный выбор."
         fi

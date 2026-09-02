@@ -73,6 +73,7 @@
 ## Требования
 
 - Debian / Ubuntu (с `apt`)
+- Bash 3.2+
 - Root-доступ
 - Домен с A-записью, указывающей на IP сервера (для VLESS Reality в Self-Steal и для Subscription hosting)
 

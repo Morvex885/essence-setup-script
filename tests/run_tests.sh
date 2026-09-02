@@ -1,5 +1,10 @@
 #!/bin/bash
 # ─── Test runner for essence-setup ─────────────────────────────────────────────
+if (( BASH_VERSINFO[0] < 3 || ( BASH_VERSINFO[0] == 3 && BASH_VERSINFO[1] < 2) )); then
+    printf '  [✗] Требуется Bash 3.2 или новее.\n' >&2
+    exit 1
+fi
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -23,26 +28,20 @@ MODE="${1:---all}"
 
 case "$MODE" in
     --unit)
-        echo "Running unit tests..."
-        "$BATS" "$SCRIPT_DIR/unit/" --recursive
+        "${BASH:-bash}" "$BATS" "$SCRIPT_DIR/unit/" --recursive
         ;;
     --fuzz)
-        echo "Running fuzz tests (FUZZ_ITERATIONS=${FUZZ_ITERATIONS:-100})..."
-        "$BATS" "$SCRIPT_DIR/fuzz/" --recursive
+        "${BASH:-bash}" "$BATS" "$SCRIPT_DIR/fuzz/" --recursive
         ;;
     --all)
-        echo "Running unit tests..."
-        "$BATS" "$SCRIPT_DIR/unit/" --recursive
+        "${BASH:-bash}" "$BATS" "$SCRIPT_DIR/unit/" --recursive
         echo ""
-        echo "Running fuzz tests (FUZZ_ITERATIONS=${FUZZ_ITERATIONS:-100})..."
-        "$BATS" "$SCRIPT_DIR/fuzz/" --recursive
+        "${BASH:-bash}" "$BATS" "$SCRIPT_DIR/fuzz/" --recursive
         ;;
     --ci)
-        echo "Running unit tests (TAP output)..."
-        "$BATS" "$SCRIPT_DIR/unit/" --recursive --tap
+        "${BASH:-bash}" "$BATS" "$SCRIPT_DIR/unit/" --recursive --tap
         echo ""
-        echo "Running fuzz tests (FUZZ_ITERATIONS=100)..."
-        FUZZ_ITERATIONS=100 "$BATS" "$SCRIPT_DIR/fuzz/" --recursive --tap
+        FUZZ_ITERATIONS=100 "${BASH:-bash}" "$BATS" "$SCRIPT_DIR/fuzz/" --recursive --tap
         ;;
     *)
         echo "Usage: $0 [--unit|--fuzz|--all|--ci]"

@@ -66,7 +66,7 @@ teardown() {
 @test "inherit: client with no headers gets group headers" {
     subscription_group_set_header "MOBILE" "User-Agent" "clash-meta"
     subscription_group_set_header "MOBILE" "X-Profile" "default"
-    run bash -c "source '$PROJECT_ROOT/common/common.sh'; error() { return 1; }; export CONFIG_JSON='$CONFIG_JSON'; source '$PROJECT_ROOT/remote-control/modules/subscription.sh'; _resolve_headers phone | jq length"
+    run "${BASH:-bash}" -c "source '$PROJECT_ROOT/common/common.sh'; error() { return 1; }; export CONFIG_JSON='$CONFIG_JSON'; source '$PROJECT_ROOT/remote-control/modules/subscription.sh'; _resolve_headers phone | jq length"
     assert_output "2"
 }
 
@@ -75,7 +75,7 @@ teardown() {
     subscription_group_set_header "MOBILE" "X-Profile" "default"
     subscription_set_header "phone" "X-Profile" "mobile"
 
-    run bash -c "source '$PROJECT_ROOT/common/common.sh'; error() { return 1; }; export CONFIG_JSON='$CONFIG_JSON'; source '$PROJECT_ROOT/remote-control/modules/subscription.sh'; _resolve_headers phone | jq -r '.[] | select(.name==\"X-Profile\") | .value'"
+    run "${BASH:-bash}" -c "source '$PROJECT_ROOT/common/common.sh'; error() { return 1; }; export CONFIG_JSON='$CONFIG_JSON'; source '$PROJECT_ROOT/remote-control/modules/subscription.sh'; _resolve_headers phone | jq -r '.[] | select(.name==\"X-Profile\") | .value'"
     assert_output "mobile"
 }
 
@@ -83,18 +83,18 @@ teardown() {
     subscription_group_set_header "MOBILE" "User-Agent" "clash-meta"
     subscription_set_header "phone" "X-Custom" "value"
 
-    run bash -c "source '$PROJECT_ROOT/common/common.sh'; error() { return 1; }; export CONFIG_JSON='$CONFIG_JSON'; source '$PROJECT_ROOT/remote-control/modules/subscription.sh'; _resolve_headers phone | jq length"
+    run "${BASH:-bash}" -c "source '$PROJECT_ROOT/common/common.sh'; error() { return 1; }; export CONFIG_JSON='$CONFIG_JSON'; source '$PROJECT_ROOT/remote-control/modules/subscription.sh'; _resolve_headers phone | jq length"
     assert_output "2"
 }
 
 @test "inherit: group empty, client has headers" {
     subscription_set_header "phone" "X-Custom" "value"
-    run bash -c "source '$PROJECT_ROOT/common/common.sh'; error() { return 1; }; export CONFIG_JSON='$CONFIG_JSON'; source '$PROJECT_ROOT/remote-control/modules/subscription.sh'; _resolve_headers phone | jq length"
+    run "${BASH:-bash}" -c "source '$PROJECT_ROOT/common/common.sh'; error() { return 1; }; export CONFIG_JSON='$CONFIG_JSON'; source '$PROJECT_ROOT/remote-control/modules/subscription.sh'; _resolve_headers phone | jq length"
     assert_output "1"
 }
 
 @test "inherit: both empty" {
-    run bash -c "source '$PROJECT_ROOT/common/common.sh'; error() { return 1; }; export CONFIG_JSON='$CONFIG_JSON'; source '$PROJECT_ROOT/remote-control/modules/subscription.sh'; _resolve_headers phone | jq length"
+    run "${BASH:-bash}" -c "source '$PROJECT_ROOT/common/common.sh'; error() { return 1; }; export CONFIG_JSON='$CONFIG_JSON'; source '$PROJECT_ROOT/remote-control/modules/subscription.sh'; _resolve_headers phone | jq length"
     assert_output "0"
 }
 
@@ -143,27 +143,44 @@ teardown() {
 
 @test "inherit: defaults included in resolved headers" {
     _ensure_default_headers
-    run bash -c "source '$PROJECT_ROOT/common/common.sh'; error() { return 1; }; export CONFIG_JSON='$CONFIG_JSON'; source '$PROJECT_ROOT/remote-control/modules/subscription.sh'; _resolve_headers phone | jq length"
+    run "${BASH:-bash}" -c "source '$PROJECT_ROOT/common/common.sh'; error() { return 1; }; export CONFIG_JSON='$CONFIG_JSON'; source '$PROJECT_ROOT/remote-control/modules/subscription.sh'; _resolve_headers phone | jq length"
     assert_output "2"
 }
 
 @test "inherit: group overrides default by name" {
     _ensure_default_headers
     subscription_group_set_header "MOBILE" "profile-update-interval" "6"
-    run bash -c "source '$PROJECT_ROOT/common/common.sh'; error() { return 1; }; export CONFIG_JSON='$CONFIG_JSON'; source '$PROJECT_ROOT/remote-control/modules/subscription.sh'; _resolve_headers phone | jq -r '.[] | select(.name==\"profile-update-interval\") | .value'"
+    run "${BASH:-bash}" -c "source '$PROJECT_ROOT/common/common.sh'; error() { return 1; }; export CONFIG_JSON='$CONFIG_JSON'; source '$PROJECT_ROOT/remote-control/modules/subscription.sh'; _resolve_headers phone | jq -r '.[] | select(.name==\"profile-update-interval\") | .value'"
     assert_output "6"
+}
+
+@test "subscription host lookup restores the complete selected-node context" {
+    NODE_ID=selected-id NODE_NAME=selected NODE_IDENTITY=selected-key NODE_TAG=DE
+    SERVER_IP=192.0.2.1 SERVER_PORT=2222 SERVER_USER=admin
+    SERVER_PASS=secret SERVER_AUTH=password
+    _sub_save_ssh_ctx
+
+    NODE_ID=host-id NODE_NAME=host NODE_IDENTITY=host-key NODE_TAG=US
+    SERVER_IP=192.0.2.2 SERVER_PORT=22 SERVER_USER=root
+    SERVER_PASS= SERVER_AUTH=key
+    _sub_restore_ssh_ctx
+
+    [[ "$NODE_ID/$NODE_NAME/$NODE_IDENTITY/$NODE_TAG" == \
+       "selected-id/selected/selected-key/DE" ]]
+    [[ "$SERVER_IP/$SERVER_PORT/$SERVER_USER/$SERVER_PASS/$SERVER_AUTH" == \
+       "192.0.2.1/2222/admin/secret/password" ]]
 }
 
 @test "inherit: client overrides group which overrides default (chain)" {
     _ensure_default_headers
     subscription_group_set_header "MOBILE" "profile-update-interval" "6"
     subscription_set_header "phone" "profile-update-interval" "1"
-    run bash -c "source '$PROJECT_ROOT/common/common.sh'; error() { return 1; }; export CONFIG_JSON='$CONFIG_JSON'; source '$PROJECT_ROOT/remote-control/modules/subscription.sh'; _resolve_headers phone | jq -r '.[] | select(.name==\"profile-update-interval\") | .value'"
+    run "${BASH:-bash}" -c "source '$PROJECT_ROOT/common/common.sh'; error() { return 1; }; export CONFIG_JSON='$CONFIG_JSON'; source '$PROJECT_ROOT/remote-control/modules/subscription.sh'; _resolve_headers phone | jq -r '.[] | select(.name==\"profile-update-interval\") | .value'"
     assert_output "1"
 }
 
 @test "annotated: default source labelled" {
     _ensure_default_headers
-    run bash -c "source '$PROJECT_ROOT/common/common.sh'; error() { return 1; }; export CONFIG_JSON='$CONFIG_JSON'; source '$PROJECT_ROOT/remote-control/modules/subscription.sh'; _resolve_headers_annotated phone | grep -c '|default$' || true"
+    run "${BASH:-bash}" -c "source '$PROJECT_ROOT/common/common.sh'; error() { return 1; }; export CONFIG_JSON='$CONFIG_JSON'; source '$PROJECT_ROOT/remote-control/modules/subscription.sh'; _resolve_headers_annotated phone | grep -c '|default$' || true"
     assert_output "2"
 }
