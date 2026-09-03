@@ -76,8 +76,18 @@ _sub_get_nginx_group() {
     echo "${g:-www-data}"
 }
 
+_subscription_config_ready() {
+    local path="${1:-}"
+    [[ -f "$path" && -r "$path" ]] || return 1
+    grep -q '[^[:space:]]' "$path"
+}
+
 _sub_upload_config() {
     local src="$1" token="$2" sub_dir="$3" nginx_group="${4:-www-data}" client="${5:-}"
+    if ! _subscription_config_ready "$src"; then
+        warn "YAML-конфигурация отсутствует или пуста — загрузка отменена."
+        return 1
+    fi
     local snippets_dir="$SUB_SNIPPETS_DIR"
     local yaml_tmp="${sub_dir}/.${token}.yaml.tmp"
     local yaml_dst="${sub_dir}/${token}.yaml"
@@ -150,12 +160,23 @@ _sub_upload_batch() {
     local count=$(( ${#triplets[@]} / 3 ))
     [[ $count -eq 0 ]] && return 0
 
+    local i=0
+    while [[ $i -lt ${#triplets[@]} ]]; do
+        local src="${triplets[$i]}"
+        if ! _subscription_config_ready "$src"; then
+            warn "YAML-конфигурация отсутствует или пуста — загрузка отменена."
+            return 1
+        fi
+        i=$((i + 3))
+    done
+
     local snippets_dir="$SUB_SNIPPETS_DIR"
     local yaml_tmp_dir snip_tmp_dir
     yaml_tmp_dir=$(mktemp -d)
     snip_tmp_dir=$(mktemp -d)
 
-    local i=0 tokens=()
+    local tokens=()
+    i=0
     while [[ $i -lt ${#triplets[@]} ]]; do
         local src="${triplets[$i]}" token="${triplets[$((i+1))]}" client="${triplets[$((i+2))]}"
         cp "$src" "$yaml_tmp_dir/.${token}.yaml.tmp"
@@ -372,19 +393,19 @@ subscription_publish() {
     client_group=$(jq_r --arg n "$client" '.clients[] | select(.name==$n) | .group // empty')
     [[ -z "$client_group" ]] && { warn "Клиент '$client' не найден."; return; }
 
+    # Генерируем конфиг если нет или он пуст
+    local config_file
+    config_file=$(_client_config_file "$client")
+    if ! _subscription_config_ready "$config_file"; then
+        warn "Конфиг для '$client' не найден или пуст. Сначала сгенерируйте конфиги."
+        return
+    fi
+
     # Проверяем host
     local host_node base_url
     host_node=$(jq_r '.subscription_host.node // empty')
     base_url=$(jq_r '.subscription_host.base_url // empty')
     [[ -z "$host_node" ]] && { warn "Хост-нода подписок не задана. Используйте пункт «Выбрать хост-ноду»."; return; }
-
-    # Генерируем конфиг если нет
-    local config_file
-    config_file=$(_client_config_file "$client")
-    if [[ ! -f "$config_file" ]]; then
-        warn "Конфиг для '$client' не найден. Сначала сгенерируйте конфиги."
-        return
-    fi
 
     # Токен: новый или существующий
     local token
@@ -609,17 +630,11 @@ subscription_publish_all() {
         all_clients+=("$client_name")
     done < <(jq_r '.clients[].name')
 
-    _sub_load_host || return
-
-    local sub_dir nginx_group
-    sub_dir=$(_sub_get_dir)
-    nginx_group=$(_sub_get_nginx_group)
-
     local triplets=() ok=0 new_tokens=() skipped=0 published=()
     for client in "${all_clients[@]}"; do
         local config_file
         config_file=$(_client_config_file "$client")
-        if [[ ! -f "$config_file" ]]; then
+        if ! _subscription_config_ready "$config_file"; then
             skipped=$((skipped + 1))
             continue
         fi
@@ -637,8 +652,15 @@ subscription_publish_all() {
 
     if [[ ${#triplets[@]} -eq 0 ]]; then
         info "Нет конфигов для публикации."
-        _sub_done; return
+        [[ $skipped -gt 0 ]] && info "Пропущено (конфиг отсутствует или пуст): $skipped"
+        return
     fi
+
+    _sub_load_host || return
+
+    local sub_dir nginx_group
+    sub_dir=$(_sub_get_dir)
+    nginx_group=$(_sub_get_nginx_group)
 
     if _sub_upload_batch "$sub_dir" "$nginx_group" "${triplets[@]}"; then
         # Сохраняем токены новых клиентов
@@ -650,8 +672,7 @@ subscription_publish_all() {
             i=$((i + 2))
         done
         success "Опубликовано: $ok"
-        [[ $skipped -gt 0 ]] && info "Пропущено (нет конфига): $skipped"
-        [[ ${#new_tokens[@]} -gt 0 ]] && info "Новых подписок: $(( ${#new_tokens[@]} / 2 ))"
+        [[ $skipped -gt 0 ]] && info "Пропущено (конфиг отсутствует или пуст): $skipped"
 
         local base_url
         base_url=$(jq_r '.subscription_host.base_url // empty')
@@ -982,8 +1003,13 @@ _subscription_prompt_refresh() {
     host_node=$(jq_r '.subscription_host.node // empty')
     [[ -z "$host_node" ]] && return
 
-    local gen_count
-    gen_count=$(find "$GENERATED_DIR" -type f -name config.yaml 2>/dev/null | wc -l)
+    local gen_count=0 generated_config
+    while IFS= read -r generated_config; do
+        [[ -z "$generated_config" ]] && continue
+        if _subscription_config_ready "$generated_config"; then
+            gen_count=$((gen_count + 1))
+        fi
+    done < <(find "$GENERATED_DIR" -type f -name config.yaml 2>/dev/null)
     [[ $gen_count -eq 0 ]] && return
 
     echo ""

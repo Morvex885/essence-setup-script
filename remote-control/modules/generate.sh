@@ -358,6 +358,24 @@ _ensure_all_awg_peers() {
     done
 }
 
+_render_client_config() {
+    local processed_template="$1"
+    local proxy_entries="$2"
+    local found_anchor=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        printf '%s\n' "$line"
+        if [[ "$line" == "proxies:" ]]; then
+            found_anchor=1
+            if [[ -n "$proxy_entries" ]]; then
+                printf '%s\n' "$proxy_entries"
+            fi
+        fi
+    done <<< "$processed_template"
+
+    [[ -z "$proxy_entries" || "$found_anchor" -eq 1 ]]
+}
+
 _generate_group() {
     local group="$1"
     local tpl_name
@@ -439,7 +457,10 @@ _generate_group() {
         fi
 
         local client_dir="$GENERATED_DIR/$group/$client_name"
-        mkdir -p "$client_dir"
+        if ! mkdir -p "$client_dir"; then
+            warn "$client_name — config.yaml не сгенерирован"
+            continue
+        fi
 
         # Получаем прокси из кеша
         local proxy_entries=""
@@ -450,7 +471,7 @@ _generate_group() {
         # Проверяем уникальность имён прокси
         if [[ -n "$proxy_entries" ]]; then
             local dup_names
-            dup_names=$(echo "$proxy_entries" | grep -oP '(?<=- name: ")[^"]+' | sort | uniq -d)
+            dup_names=$(printf '%s\n' "$proxy_entries" | sed -n 's/^  - name: "\([^"]*\)"$/\1/p' | sort | uniq -d)
             if [[ -n "$dup_names" ]]; then
                 warn "$client_name: повторяющиеся имена прокси:" >&2
                 while IFS= read -r dn; do
@@ -461,13 +482,33 @@ _generate_group() {
             fi
         fi
 
-        local config="$processed"
-        if [[ -n "$proxy_entries" ]]; then
-            config=$(echo "$config" | awk -v proxies="$proxy_entries" '/^proxies:$/ { print; print proxies; next } 1')
+        local config=""
+        if ! config=$(_render_client_config "$processed" "$proxy_entries"); then
+            warn "$client_name — config.yaml не сгенерирован"
+            continue
         fi
 
         # Убираем дублирующиеся пустые строки (артефакты удалённых блоков)
-        echo "$config" | cat -s > "$client_dir/config.yaml"
+        local config_tmp=""
+        if ! config_tmp=$(umask 077; mktemp "$client_dir/.config.yaml.XXXXXX"); then
+            warn "$client_name — config.yaml не сгенерирован"
+            continue
+        fi
+        if ! cat -s > "$config_tmp" <<< "$config"; then
+            rm -f "$config_tmp"
+            warn "$client_name — config.yaml не сгенерирован"
+            continue
+        fi
+        if ! grep -q '[^[:space:]]' "$config_tmp"; then
+            rm -f "$config_tmp"
+            warn "$client_name — config.yaml не сгенерирован"
+            continue
+        fi
+        if ! mv "$config_tmp" "$client_dir/config.yaml"; then
+            rm -f "$config_tmp"
+            warn "$client_name — config.yaml не сгенерирован"
+            continue
+        fi
 
         success "$client_name — сгенерирован"
     done
