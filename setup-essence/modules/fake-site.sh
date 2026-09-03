@@ -96,7 +96,10 @@ _randomhtml() {
         local selected_number=$((RANDOM % 8 + 1))
         RandomHTML="${selected_number}.html"
     else
-        mapfile -t templates < <(find . -maxdepth 1 -type d -not -path . | sed 's|./||')
+        local templates=()
+        while IFS= read -r template; do
+            templates+=("$template")
+        done < <(find . -maxdepth 1 -type d -not -path . | sed 's|./||')
         RandomHTML="${templates[$RANDOM % ${#templates[@]}]}"
     fi
 

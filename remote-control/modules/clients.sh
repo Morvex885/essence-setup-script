@@ -38,9 +38,9 @@ clients_menu() {
         read -rp "Выберите: " CL_CHOICE
 
         case "$CL_CHOICE" in
-            a) add_client ;;
-            e) edit_client ;;
-            d) delete_client ;;
+            a) state_action "add_client" add_client ;;
+            e) state_action "edit_client" edit_client ;;
+            d) state_action "delete_client" delete_client ;;
             0) return ;;
             *) warn "Неверный выбор." ;;
         esac
@@ -75,7 +75,9 @@ _list_clients_display() {
 
 clients_list() {
     CLIENTS=()
-    mapfile -t CLIENTS < <(jq_r '.clients[] | .name')
+    while IFS= read -r client_name; do
+        CLIENTS+=("$client_name")
+    done < <(jq_r '.clients[] | .name')
 }
 
 add_client() {
@@ -179,7 +181,7 @@ edit_client() {
         local custom_conns_count
         custom_conns_count=$(jq_r --arg n "$target" '.clients[] | select(.name==$n) | .connections // [] | length')
         info "Ноды: свои (${custom_nodes:-нет})"
-        [[ "$custom_conns_count" -gt 0 ]] && info "Кастомные подключения: $custom_conns_count нод"
+        [[ "$custom_conns_count" -gt 0 ]] && info "Собственные подключения: $custom_conns_count нод"
         echo ""
         echo -e "  ${GREEN}1)${NC} Вернуть ноды от группы"
         echo -e "  ${GREEN}2)${NC} Изменить свои ноды"
@@ -269,13 +271,13 @@ _change_client_group() {
     local client_conns_count
     client_conns_count=$(jq_r --arg n "$target" '.clients[] | select(.name==$n) | .connections // [] | length')
     if [[ "$client_conns_count" -gt 0 ]]; then
-        warn "У клиента есть $client_conns_count кастомных подключений — они сохранятся, но проверьте актуальность через пункт '3)'."
+        warn "У клиента есть $client_conns_count собственных подключений — они сохранятся, но проверьте актуальность через пункт '3)'."
     fi
 
     local gh_count
     gh_count=$(jq_r --arg g "$current_group" '.groups[] | select(.name==$g) | .subscription_headers // [] | length')
     if [[ "$gh_count" -gt 0 ]]; then
-        warn "Групповые subscription headers (${gh_count}) старой группы больше не будут применяться."
+        warn "Заголовки подписок старой группы (${gh_count}) больше не будут применяться."
     fi
 
     echo ""
@@ -283,23 +285,22 @@ _change_client_group() {
 
     # Собираем affected_nodes ДО изменения JSON
     local affected_nodes=()
-    declare -A _aff_seen=()
     local _csv _n
     local -a _arr
 
     _csv=$(_group_nodes_csv "$current_group")
     IFS=',' read -ra _arr <<< "$_csv"
     for _n in "${_arr[@]}"; do
-        [[ -z "$_n" || -n "${_aff_seen[$_n]+x}" ]] && continue
-        _aff_seen[$_n]=1
+        [[ -z "$_n" ]] && continue
+        array_contains "$_n" "${affected_nodes[@]}" && continue
         affected_nodes+=("$_n")
     done
 
     _csv=$(_group_nodes_csv "$new_group")
     IFS=',' read -ra _arr <<< "$_csv"
     for _n in "${_arr[@]}"; do
-        [[ -z "$_n" || -n "${_aff_seen[$_n]+x}" ]] && continue
-        _aff_seen[$_n]=1
+        [[ -z "$_n" ]] && continue
+        array_contains "$_n" "${affected_nodes[@]}" && continue
         affected_nodes+=("$_n")
     done
 
@@ -307,11 +308,12 @@ _change_client_group() {
         _csv=$(jq_r --arg n "$target" '.clients[] | select(.name==$n) | .nodes // [] | join(",")')
         IFS=',' read -ra _arr <<< "$_csv"
         for _n in "${_arr[@]}"; do
-            [[ -z "$_n" || -n "${_aff_seen[$_n]+x}" ]] && continue
-            _aff_seen[$_n]=1
+            [[ -z "$_n" ]] && continue
+            array_contains "$_n" "${affected_nodes[@]}" && continue
             affected_nodes+=("$_n")
         done
     fi
+
 
     # Путь старой папки клиента (не группы!) — снимается до jq_w, т.к. после
     # изменения group этот же клиент будет смотреть в новую подпапку.
@@ -397,10 +399,11 @@ _set_custom_nodes() {
         warn "Нет нод."
         return
     fi
-
-    # Текущие ноды клиента (если есть)
+    # Текущие ноды клиента нужны для сохранения выбранных флагов.
     local current_nodes
-    current_nodes=$(jq_r --arg n "$client_name" '.clients[] | select(.name==$n) | .nodes // [] | join(",")')
+    current_nodes=$(jq_r --arg n "$client_name" \
+        '.clients[] | select(.name==$n) | .nodes // [] | join(",")')
+
 
     local node_names=() node_labels=() node_flags=()
     while IFS=$'\t' read -r nname nip; do
@@ -413,7 +416,12 @@ _set_custom_nodes() {
         fi
     done < <(jq_r '.nodes[] | "\(.name)\t\(.ip)"')
 
-    toggle_select "Ноды для ${CYAN}$client_name${NC}" node_labels node_flags
+    TOGGLE_SELECT_ITEMS=("${node_labels[@]}")
+    TOGGLE_SELECT_FLAGS=("${node_flags[@]}")
+    toggle_select "Ноды для ${CYAN}$client_name${NC}"
+    node_flags=("${TOGGLE_SELECT_FLAGS[@]}")
+    TOGGLE_SELECT_ITEMS=()
+    TOGGLE_SELECT_FLAGS=()
 
     local selected_nodes=()
     local i=0
@@ -470,7 +478,12 @@ delete_client() {
     local _i
     for (( _i=0; _i<${#CLIENTS[@]}; _i++ )); do _flags+=("0"); done
 
-    toggle_select "Выберите клиентов для удаления" CLIENTS _flags
+    TOGGLE_SELECT_ITEMS=("${CLIENTS[@]}")
+    TOGGLE_SELECT_FLAGS=("${_flags[@]}")
+    toggle_select "Выберите клиентов для удаления"
+    _flags=("${TOGGLE_SELECT_FLAGS[@]}")
+    TOGGLE_SELECT_ITEMS=()
+    TOGGLE_SELECT_FLAGS=()
 
     local -a TARGETS=()
     for (( _i=0; _i<${#CLIENTS[@]}; _i++ )); do
@@ -481,14 +494,8 @@ delete_client() {
         info "Ничего не выбрано."
         return
     fi
-
-    echo ""
-    echo -e "  Будут удалены: ${YELLOW}${TARGETS[*]}${NC}"
-    confirm_yn "Подтвердить удаление (${#TARGETS[@]})?" || { info "Отменено."; return; }
-
-    # План: NODE_PEERS[node]=" c1 c2 ..." (только AWG-peers) + AFFECTED_NODES
-    local -A NODE_PEERS=()
-    local -A _AFFECTED=()
+    # Собираем списки peers по нодам и затронутых нод.
+    local -a _peer_nodes=() _peer_lists=() _affected_nodes=()
     local _cname _nodes_csv _nn
     local -a _cnodes
 
@@ -498,28 +505,42 @@ delete_client() {
         IFS=',' read -ra _cnodes <<< "$_nodes_csv"
         for _nn in "${_cnodes[@]}"; do
             [[ -z "$_nn" ]] && continue
-            _AFFECTED["$_nn"]=1
+            if ! array_contains "$_nn" "${_affected_nodes[@]}"; then
+                _affected_nodes+=("$_nn")
+            fi
             if _client_has_awg_on_node "$_cname" "$_nn"; then
-                NODE_PEERS["$_nn"]+=" $_cname"
+                local _peer_idx=-1 _peer_i
+                for (( _peer_i=0; _peer_i<${#_peer_nodes[@]}; _peer_i++ )); do
+                    if [[ "${_peer_nodes[$_peer_i]}" == "$_nn" ]]; then
+                        _peer_idx=$_peer_i
+                        break
+                    fi
+                done
+                if [[ $_peer_idx -ge 0 ]]; then
+                    _peer_lists[$_peer_idx]+=" $_cname"
+                else
+                    _peer_nodes+=("$_nn")
+                    _peer_lists+=(" $_cname")
+                fi
             fi
         done
     done
-
     # Batch AWG peer removal — один SSH на ноду, разделитель `;` чтобы
     # отсутствие одного peer не рвало цепочку (remove_awg_peer_by_name
     # возвращает 1 для уже удалённых)
-    if [[ ${#NODE_PEERS[@]} -gt 0 ]] && confirm_yn "Удалить AWG peers на нодах (${#NODE_PEERS[@]})?"; then
-        local _peers_list _peer _cmd
-        for _nn in "${!NODE_PEERS[@]}"; do
+    if [[ ${#_peer_nodes[@]} -gt 0 ]] && confirm_yn "Удалить AWG peers на нодах (${#_peer_nodes[@]})?"; then
+        local _peers_list _peer _cmd _node_peer_idx
+        for (( _node_peer_idx=0; _node_peer_idx<${#_peer_nodes[@]}; _node_peer_idx++ )); do
+            _nn="${_peer_nodes[$_node_peer_idx]}"
             if ! node_load_by_name "$_nn"; then
                 warn "$_nn: не удалось подключиться — AWG peers не удалены."
                 continue
             fi
-            if [[ -z "${SCRIPTS_UPLOADED[$_nn]+x}" ]]; then
+            if ! array_contains "$_nn" "${SCRIPTS_UPLOADED[@]}"; then
                 upload_scripts
-                SCRIPTS_UPLOADED[$_nn]=1
+                SCRIPTS_UPLOADED+=("$_nn")
             fi
-            _peers_list="${NODE_PEERS[$_nn]# }"
+            _peers_list="${_peer_lists[$_node_peer_idx]# }"
             info "Удаляю AWG peers на $_nn: $_peers_list"
             _cmd="source ${REMOTE_DIR}/modules/amneziawg.sh"
             for _peer in $_peers_list; do
@@ -559,16 +580,16 @@ delete_client() {
 
     # Listener-sync — один SSH на затронутую ноду (после batch-удаления из JSON,
     # чтобы _build_node_users_cmd собрал уже финальный состав пользователей)
-    for _nn in "${!_AFFECTED[@]}"; do
+    for _nn in "${_affected_nodes[@]}"; do
         if ! node_load_by_name "$_nn"; then continue; fi
 
         local _remaining_users
         _remaining_users=$(_build_node_users_cmd "$_nn")
         [[ -z "$_remaining_users" ]] && continue
 
-        if [[ -z "${SCRIPTS_UPLOADED[$_nn]+x}" ]]; then
+        if ! array_contains "$_nn" "${SCRIPTS_UPLOADED[@]}"; then
             upload_scripts
-            SCRIPTS_UPLOADED[$_nn]=1
+            SCRIPTS_UPLOADED+=("$_nn")
         fi
 
         if ssh_run -- "$_remaining_users" 2>/dev/null; then
@@ -640,6 +661,7 @@ _build_node_users_cmd() {
         case "$marker_type" in
             vless-tcp)   _users="$vless_tcp_users" ;;
             vless-xhttp) _users="$vless_xhttp_users" ;;
+
             vless-grpc)  _users="$vless_grpc_users" ;;
             hy2)         _users="$hy2_users" ;;
         esac
@@ -647,7 +669,6 @@ _build_node_users_cmd() {
         cmd+="; _sync_listener_users $(printf '%q' "$marker_type") $(printf '%q' "$_users") 2>/dev/null"
         has_any=true
     done
-
     $has_any && cmd+="; systemctl restart mihomo"
 
     echo "$cmd"
@@ -659,7 +680,9 @@ _configure_client_connections() {
 
     # Получаем ноды клиента
     local client_nodes=()
-    mapfile -t client_nodes < <(jq_r --arg n "$client_name" '.clients[] | select(.name==$n) | .nodes // [] | .[]')
+    while IFS= read -r node_name; do
+        client_nodes+=("$node_name")
+    done < <(jq_r --arg n "$client_name" '.clients[] | select(.name==$n) | .nodes // [] | .[]')
 
     if [[ ${#client_nodes[@]} -eq 0 ]]; then
         warn "У клиента нет нод. Сначала назначьте ноды."
@@ -674,7 +697,7 @@ _configure_client_connections() {
         has_custom=$(jq_r --arg c "$client_name" --arg n "$nname" \
             '.clients[] | select(.name==$c) | .connections // [] | .[] | select(.node==$n) | "yes"')
         local marker=""
-        [[ "$has_custom" == "yes" ]] && marker=" ${YELLOW}(кастомные)${NC}" || marker=" ${DIM}(от группы)${NC}"
+        [[ "$has_custom" == "yes" ]] && marker=" ${YELLOW}(собственные)${NC}" || marker=" ${DIM}(от группы)${NC}"
         echo -e "  ${GREEN}${i})${NC} $nname${marker}"
         i=$((i + 1))
     done
@@ -725,7 +748,7 @@ _configure_client_connections() {
 
     echo ""
     if [[ "$using_custom" == "true" ]]; then
-        info "Текущие подключения: ${YELLOW}кастомные${NC}"
+        info "Текущие подключения: ${YELLOW}собственные${NC}"
     else
         info "Текущие подключения: от группы"
     fi
@@ -749,7 +772,12 @@ _configure_client_connections() {
 
     case "$CONN_CHOICE" in
         1)
-            toggle_select "${CYAN}$client_name -> $selected_node${NC}" disc_arr flags
+            TOGGLE_SELECT_ITEMS=("${disc_arr[@]}")
+            TOGGLE_SELECT_FLAGS=("${flags[@]}")
+            toggle_select "${CYAN}$client_name -> $selected_node${NC}"
+            flags=("${TOGGLE_SELECT_FLAGS[@]}")
+            TOGGLE_SELECT_ITEMS=()
+            TOGGLE_SELECT_FLAGS=()
 
             local selected=()
             local i=0

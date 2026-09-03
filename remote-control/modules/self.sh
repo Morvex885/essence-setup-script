@@ -3,7 +3,7 @@
 
 # ─── Пароль для доступа к скрипту ────────────────────────────────────────────
 
-_script_pass_file() { echo "$CONFIG_DIR/.auth"; }
+_script_pass_file() { echo "${SCRIPT_AUTH_FILE:-$CONFIG_DIR/.auth}"; }
 
 _hash_pass() {
     local salt
@@ -18,6 +18,18 @@ _verify_pass() {
     local input_hash
     input_hash=$(openssl passwd -6 -salt "$salt" "$input")
     [[ "$input_hash" == "$stored" ]]
+}
+
+_write_script_password() {
+    local passfile="$1" password="$2" tmp
+    mkdir -p "$(dirname "$passfile")" || return 1
+    tmp=$(umask 077; mktemp "${passfile}.tmp.XXXXXX") || return 1
+    if ! _hash_pass "$password" > "$tmp" ||
+       ! chmod 600 "$tmp" ||
+       ! mv "$tmp" "$passfile"; then
+        rm -f "$tmp"
+        return 1
+    fi
 }
 
 check_script_password() {
@@ -65,8 +77,10 @@ set_script_password() {
                 [[ -z "$_new" ]] && { warn "Пароль не может быть пустым."; return; }
                 read -rsp "  Повторите: " _confirm; echo ""
                 [[ "$_new" != "$_confirm" ]] && { warn "Пароли не совпадают."; return; }
-                _hash_pass "$_new" > "$passfile"
-                chmod 600 "$passfile"
+                _write_script_password "$passfile" "$_new" || {
+                    warn "Не удалось атомарно сохранить пароль."
+                    return 1
+                }
                 success "Пароль изменён"
                 ;;
             2)
@@ -85,8 +99,10 @@ set_script_password() {
         [[ -z "$_new" ]] && { warn "Пароль не может быть пустым."; return; }
         read -rsp "  Повторите: " _confirm; echo ""
         [[ "$_new" != "$_confirm" ]] && { warn "Пароли не совпадают."; return; }
-        _hash_pass "$_new" > "$passfile"
-        chmod 600 "$passfile"
+        _write_script_password "$passfile" "$_new" || {
+            warn "Не удалось атомарно сохранить пароль."
+            return 1
+        }
         success "Пароль установлен"
     fi
 }
@@ -101,9 +117,6 @@ check_deps() {
     if [[ ${#missing[@]} -gt 0 ]]; then
         error "Не найдены утилиты: ${missing[*]}\nУстановите:\n  Linux:   sudo apt install ${missing[*]}\n  macOS:   brew install ${missing[*]}\n  Windows: winget install ${missing[*]}"
     fi
-
-    _ensure_config
-    chmod 600 "$CONFIG_JSON"
     check_update_start
 }
 

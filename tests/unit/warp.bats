@@ -271,7 +271,7 @@ apply_reregistered_profile() {
     printf '%s\n' 'new account' > "$directory/wgcf-account.toml"
     printf '%s\n' 'new profile' > "$directory/wgcf-profile.conf"
 
-    run bash -c "cd '$directory' && source '$PROJECT_ROOT/setup-essence/modules/warp.sh' && _warp_restore_account_files '$directory/account.backup' '$directory/profile.backup' 1"
+    run "${BASH:-bash}" -c "cd '$directory' && source '$PROJECT_ROOT/setup-essence/modules/warp.sh' && _warp_restore_account_files '$directory/account.backup' '$directory/profile.backup' 1"
     assert_success
     run cat "$directory/wgcf-account.toml"
     assert_output "old account"

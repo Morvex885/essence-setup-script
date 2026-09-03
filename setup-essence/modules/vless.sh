@@ -756,10 +756,14 @@ _xhttp_append_client_section() {
 }
 
 _xhttp_atomic_install() {
-    local candidate="$1" target="$2" mode="${3:-600}"
+    local candidate="$1" target="$2" mode="${3:-600}" target_mode
     if [[ -e "$target" ]]; then
-        chmod --reference="$target" "$candidate" 2>/dev/null || return 1
-        chown --reference="$target" "$candidate" 2>/dev/null || return 1
+        case "${OSTYPE:-}" in
+            darwin*) target_mode=$(stat -f '%Lp' "$target") ;;
+            *) target_mode=$(stat -c '%a' "$target") ;;
+        esac
+        [[ -n "$target_mode" ]] || return 1
+        chmod "$target_mode" "$candidate" || return 1
     else
         chmod "$mode" "$candidate" || return 1
     fi
@@ -926,7 +930,11 @@ _install_vless_xhttp_transaction() {
         }
     else
         [[ -f "$client_config" ]] && cp -a "$client_config" "$client_candidate" || : > "$client_candidate"
-        sed -i '/^--- VLESS xHTTP ---$/,/^--- \/VLESS xHTTP ---$/d' "$client_candidate"
+        local cleaned_client_candidate="${client_candidate}.clean"
+        sed '/^--- VLESS xHTTP ---$/,/^--- \/VLESS xHTTP ---$/d' "$client_candidate" > "$cleaned_client_candidate" &&
+            mv "$cleaned_client_candidate" "$client_candidate" || {
+            rm -f "$config_candidate" "$client_candidate" "$cleaned_client_candidate"; rm -rf "$tx_dir"; return 1;
+        }
         _xhttp_append_client_section "$client_candidate" "$topology" "$client_port" "$path" "$first_uuid" || {
             rm -f "$config_candidate" "$client_candidate"; rm -rf "$tx_dir"; return 1;
         }
@@ -1003,7 +1011,9 @@ _remove_xhttp_nginx_location() {
     if ! _load_reality_conf 2>/dev/null; then return; fi
     local nginx_file="/etc/nginx/sites-available/$SITE_NAME"
     if [[ -f "$nginx_file" ]] && grep -q '# --- xhttp-nginx ---' "$nginx_file" 2>/dev/null; then
-        sed -i '/# --- xhttp-nginx ---/,/# --- \/xhttp-nginx ---/d' "$nginx_file"
+        local cleaned_nginx_file="${nginx_file}.clean.$$"
+        sed '/# --- xhttp-nginx ---/,/# --- \/xhttp-nginx ---/d' "$nginx_file" > "$cleaned_nginx_file" &&
+            mv "$cleaned_nginx_file" "$nginx_file" || { rm -f "$cleaned_nginx_file"; return 1; }
         nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null
         info "Nginx location для xHTTP удалён"
     fi

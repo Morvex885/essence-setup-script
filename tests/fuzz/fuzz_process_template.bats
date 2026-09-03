@@ -146,7 +146,7 @@ EOF
         local prefix
         prefix=$(random_ascii $((RANDOM % 10 + 3)))
         local injection
-        injection=$(random_pick DICT_SHELL_INJECTION)
+        injection=$(random_pick "${DICT_SHELL_INJECTION[@]}")
         local suffix
         suffix=$(random_ascii $((RANDOM % 10 + 3)))
         local line="${prefix}${injection}${suffix}"

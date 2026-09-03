@@ -1,5 +1,10 @@
 #!/bin/bash
 
+if (( BASH_VERSINFO[0] < 3 || ( BASH_VERSINFO[0] == 3 && BASH_VERSINFO[1] < 2) )); then
+    printf '  [✗] Требуется Bash 3.2 или новее.\n' >&2
+    exit 1
+fi
+
 # ─── Определяем директорию скрипта ──────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 

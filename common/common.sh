@@ -23,6 +23,28 @@ hyperlink() {
     printf '\033]8;;%s\033\\%s\033]8;;\033\\' "$url" "$text"
 }
 
+# Компонуемый EXIT cleanup для процессов, которые используют несколько модулей.
+_EXIT_CLEANUP_FUNCTIONS=()
+_run_exit_cleanups() {
+    local exit_status=$? i cleanup
+    trap - EXIT
+    for ((i = ${#_EXIT_CLEANUP_FUNCTIONS[@]} - 1; i >= 0; i--)); do
+        cleanup="${_EXIT_CLEANUP_FUNCTIONS[$i]}"
+        "$cleanup" >/dev/null 2>&1 || true
+    done
+    return "$exit_status"
+}
+
+register_exit_cleanup() {
+    local cleanup="$1" existing
+    declare -F "$cleanup" >/dev/null 2>&1 || return 1
+    for existing in "${_EXIT_CLEANUP_FUNCTIONS[@]}"; do
+        [[ "$existing" == "$cleanup" ]] && return 0
+    done
+    _EXIT_CLEANUP_FUNCTIONS+=("$cleanup")
+    trap _run_exit_cleanups EXIT
+}
+
 # ─── Y/N подтверждение с валидацией ─────────────────────────────────────────
 # confirm_yn "Текст вопроса" [Y|N]
 # Второй аргумент — дефолт (Y или N). По умолчанию N.
@@ -127,27 +149,71 @@ gen_free_port() {
     return 1
 }
 
+# Ограниченный по времени запуск с fallback для macOS без coreutils timeout.
+run_with_timeout() {
+    local seconds="$1"
+    shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$seconds" "$@"
+        return $?
+    fi
+    if command -v gtimeout >/dev/null 2>&1; then
+        gtimeout "$seconds" "$@"
+        return $?
+    fi
+    "$@" &
+    local child=$! watcher rc
+    ( sleep "$seconds"; kill "$child" 2>/dev/null ) >/dev/null 2>&1 &
+    watcher=$!
+    wait "$child"
+    rc=$?
+    kill "$watcher" 2>/dev/null || true
+    wait "$watcher" 2>/dev/null || true
+    return "$rc"
+}
+
 # ─── JSON-конфиг (jq) ───────────────────────────────────────────────────────
 
 _ensure_config() {
     mkdir -p "$(dirname "$CONFIG_JSON")"
-    [[ -f "$CONFIG_JSON" ]] || echo '{"nodes":[],"groups":[{"name":"ROUTER","template":"default.yaml"},{"name":"PC","template":"default.yaml"},{"name":"MOBILE","template":"default.yaml"}],"clients":[],"connections":[]}' > "$CONFIG_JSON"
+    [[ -f "$CONFIG_JSON" ]] && return 0
+    local tmp
+    tmp=$(umask 077; mktemp "${CONFIG_JSON}.tmp.XXXXXX") || return 1
+    cat > "$tmp" <<'EOF'
+{"schema_version":2,"nodes":[],"groups":[{"name":"ROUTER","template":"default.yaml"},{"name":"PC","template":"default.yaml"},{"name":"MOBILE","template":"default.yaml"}],"clients":[],"connections":[]}
+EOF
+    chmod 600 "$tmp" && mv "$tmp" "$CONFIG_JSON" || {
+        rm -f "$tmp"
+        return 1
+    }
 }
 
 jq_r() { jq -r "$@" "$CONFIG_JSON" | tr -d '\r'; }
 
 jq_w() {
-    local tmp="${CONFIG_JSON}.tmp.$$"
+    local tmp
+    tmp=$(umask 077; mktemp "${CONFIG_JSON}.tmp.XXXXXX") || return 1
     if ! jq "$@" "$CONFIG_JSON" > "$tmp"; then
         rm -f "$tmp"
         warn "Не удалось обновить конфиг (jq error)"
         return 1
     fi
-    mv "$tmp" "$CONFIG_JSON"
+    if declare -F config_persist_candidate >/dev/null 2>&1; then
+        if ! config_persist_candidate "$tmp"; then
+            rm -f "$tmp"
+            warn "Не удалось сохранить представление конфига"
+            return 1
+        fi
+    fi
+    if ! mv "$tmp" "$CONFIG_JSON"; then
+        rm -f "$tmp"
+        warn "Не удалось заменить конфиг"
+        return 1
+    fi
 }
 
 # ─── Рамка меню ─────────────────────────────────────────────────────────────
-BOX_W=42
+BOX_W=68
 box_top() { echo -e "${CYAN}╔$(printf '═%.0s' $(seq 1 $BOX_W))╗${NC}"; }
 box_mid() { echo -e "${CYAN}╠$(printf '═%.0s' $(seq 1 $BOX_W))╣${NC}"; }
 box_bot() { echo -e "${CYAN}╚$(printf '═%.0s' $(seq 1 $BOX_W))╝${NC}"; }
@@ -197,31 +263,45 @@ success_box() {
     echo -e "${GREEN}╚$(printf '═%.0s' $(seq 1 $SUCCESS_BOX_W))╝${NC}"
 }
 
+# Проверить наличие элемента в индексированном массиве.
+# array_contains <needle> <array elements...>
+array_contains() {
+    local needle="$1"
+    shift
+    local item
+    for item in "$@"; do
+        [[ "$item" == "$needle" ]] && return 0
+    done
+    return 1
+}
+
 # ─── Toggle-выбор ───────────────────────────────────────────────────────────
-# toggle_select <header> <items_array_name> <flags_array_name>
-# Модифицирует flags_array на месте. Каждый флаг 0 или 1.
+# toggle_select <header>
+# Массивы TOGGLE_SELECT_ITEMS и TOGGLE_SELECT_FLAGS задаются вызывающим кодом
+# заранее. Флаги модифицируются на месте; каждый флаг — 0 или 1.
+TOGGLE_SELECT_ITEMS=()
+TOGGLE_SELECT_FLAGS=()
 toggle_select() {
     local header="$1"
-    local -n _ts_items=$2
-    local -n _ts_flags=$3
     while true; do
         echo ""
         echo -e "  $header:"
-        local i=1
-        for item in "${_ts_items[@]}"; do
-            if [[ "${_ts_flags[$((i-1))]}" == "1" ]]; then
-                echo -e "  ${GREEN}${i})${NC} [x] $item"
+        local i=0
+        while [[ $i -lt ${#TOGGLE_SELECT_ITEMS[@]} ]]; do
+            local item="${TOGGLE_SELECT_ITEMS[$i]}"
+            if [[ "${TOGGLE_SELECT_FLAGS[$i]}" == "1" ]]; then
+                echo -e "  ${GREEN}$((i + 1)))${NC} [x] $item"
             else
-                echo -e "  ${GREEN}${i})${NC} [ ] $item"
+                echo -e "  ${GREEN}$((i + 1)))${NC} [ ] $item"
             fi
             i=$((i + 1))
         done
         echo ""
         read -rp "Переключить (номер) или Enter для сохранения: " TOGGLE
         [[ -z "$TOGGLE" ]] && break
-        if [[ "$TOGGLE" =~ ^[0-9]+$ ]] && (( TOGGLE >= 1 && TOGGLE <= ${#_ts_items[@]} )); then
+        if [[ "$TOGGLE" =~ ^[0-9]+$ ]] && (( TOGGLE >= 1 && TOGGLE <= ${#TOGGLE_SELECT_ITEMS[@]} )); then
             local idx=$((TOGGLE - 1))
-            [[ "${_ts_flags[$idx]}" == "1" ]] && _ts_flags[$idx]=0 || _ts_flags[$idx]=1
+            [[ "${TOGGLE_SELECT_FLAGS[$idx]}" == "1" ]] && TOGGLE_SELECT_FLAGS[$idx]=0 || TOGGLE_SELECT_FLAGS[$idx]=1
         else
             warn "Неверный номер."
         fi
@@ -232,9 +312,19 @@ toggle_select() {
 _REPO="Morvex885/essence-setup-script"
 _UPDATE_TMP=""
 
+_cleanup_update_tmp() {
+    [[ -z "${_UPDATE_TMP:-}" ]] || rm -f "$_UPDATE_TMP"
+    _UPDATE_TMP=""
+}
+
 check_update_start() {
-    _UPDATE_TMP=$(mktemp)
-    trap 'rm -f "$_UPDATE_TMP"' EXIT
+    _cleanup_update_tmp
+    _UPDATE_TMP=$(umask 077; mktemp) || return 1
+    register_exit_cleanup _cleanup_update_tmp || {
+        rm -f "$_UPDATE_TMP"
+        _UPDATE_TMP=""
+        return 1
+    }
     local token="${GITHUB_TOKEN:-}"
     local curl_args=(-fsSL --connect-timeout 3 --max-time 5)
     [[ -n "$token" ]] && curl_args+=(-H "Authorization: token $token")
