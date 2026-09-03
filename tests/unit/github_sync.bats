@@ -54,8 +54,9 @@ _file_mode() {
     rm -rf "$REMOTE"
     printf '{"storage_version":1,"encryption":"none"}\n' > "$GITHUB_WORKTREE/storage.json"
     git -C "$GITHUB_WORKTREE" add storage.json
-    run github_sync_flush
-    assert_failure
+    if github_sync_flush; then
+        return 1
+    fi
     [[ $GITHUB_SYNC_STATUS == pending ]]
     run git -C "$GITHUB_WORKTREE" log -1 --format='%an <%ae>'
     assert_output 'Essence Remote Control <remote-control@localhost>'
@@ -71,8 +72,9 @@ _file_mode() {
     printf '{"storage_version":1,"encryption":"none","revision":2}\n' \
         > "$GITHUB_WORKTREE/storage.json"
     git --git-dir="$GITHUB_STORE" remote set-url origin "$BATS_TEST_TMPDIR/missing.git"
-    run github_sync_flush
-    assert_failure
+    if github_sync_flush; then
+        return 1
+    fi
     [[ "$GITHUB_SYNC_STATUS" == pending ]]
     local pending_head
     pending_head=$(git --git-dir="$GITHUB_STORE" rev-parse main)
@@ -195,8 +197,7 @@ _file_mode() {
     git --git-dir="$GITHUB_STORE" show-ref --verify --quiet \
         "refs/heads/session/$old_session"
 
-    run github_config_close
-    assert_success
+    github_config_close
     [[ -z "$GITHUB_SESSION_ID" ]]
     [[ -z "$GITHUB_WORKTREE" ]]
     [[ ! -d "$old_worktree" ]]
