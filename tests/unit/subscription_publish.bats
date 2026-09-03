@@ -179,3 +179,61 @@ teardown() {
     run _sub_get_dir
     assert_output "/custom/path"
 }
+
+@test "publish rejects a whitespace-only config without token or SCP" {
+    printf ' \n\t\n' > "$GENERATED_DIR/MOBILE/phone/config.yaml"
+    scp_run() {
+        echo "unexpected scp" >&2
+        return 1
+    }
+
+    run subscription_publish "phone"
+    assert_success
+    assert_output --partial "Конфиг для 'phone' не найден или пуст. Сначала сгенерируйте конфиги."
+    refute_output --partial "unexpected scp"
+
+    run jq_r '.clients[] | select(.name=="phone") | .subscription.token // "empty"'
+    assert_output "empty"
+}
+
+@test "publish_all skips whitespace-only clients and publishes valid clients" {
+    jq_w '.clients += [{"name":"tablet","group":"MOBILE"}]'
+    mkdir -p "$GENERATED_DIR/MOBILE/tablet"
+    printf ' \n\t\n' > "$GENERATED_DIR/MOBILE/tablet/config.yaml"
+
+    run subscription_publish_all
+    assert_success
+    assert_output --partial "Пропущено (конфиг отсутствует или пуст): 1"
+
+    run jq_r '.clients[] | select(.name=="phone") | .subscription.token // "empty"'
+    refute_output "empty"
+    run jq_r '.clients[] | select(.name=="tablet") | .subscription.token // "empty"'
+    assert_output "empty"
+}
+
+@test "auto-refresh does not prompt when all generated configs are blank" {
+    printf ' \n\t\n' > "$GENERATED_DIR/MOBILE/phone/config.yaml"
+    confirm_yn() {
+        echo "unexpected prompt" >&2
+        return 1
+    }
+
+    run _subscription_prompt_refresh
+    assert_success
+    refute_output --partial "unexpected prompt"
+}
+
+@test "low-level batch upload rejects a whitespace-only source before SCP" {
+    local blank_config="$BATS_TEST_TMPDIR/blank.yaml"
+    printf ' \n\t\n' > "$blank_config"
+    scp_run() {
+        echo "unexpected scp" >&2
+        return 1
+    }
+
+    run _sub_upload_batch "/var/lib/essence-sub" "www-data" \
+        "$blank_config" "token-1" "phone"
+    assert_failure
+    assert_output --partial "YAML-конфигурация отсутствует или пуста — загрузка отменена."
+    refute_output --partial "unexpected scp"
+}
