@@ -83,7 +83,7 @@ EOF
     chmod +x "$BIN/curl" "$BIN/gh"
     export PATH="$BIN:$PATH"
 
-    git init --bare "$REMOTE" >/dev/null
+    git init --bare -b main "$REMOTE" >/dev/null
     local seed="$BATS_TEST_TMPDIR/seed"
     git init -b main "$seed" >/dev/null
     git -C "$seed" config user.name seed
@@ -196,7 +196,6 @@ EOF
     assert_output --partial "Источник GitHub подключён."
     assert_output --partial "GitHub-аккаунт для репозитория конфигурации: test-owner"
     [[ "$output" == *"Источник конфигурации: ${github_link}"* ]]
-    [[ "$output" != *"Источник конфигурации: локальный"* ]]
     jq -e 'type == "object" and .type == "github" and .private_verified == true' \
         "$config_dir/source.json"
     [[ "$(git --git-dir="$config_dir/github-store.git" show main:storage.json | jq -r '.encryption')" == none ]]

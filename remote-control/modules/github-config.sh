@@ -810,7 +810,9 @@ github_sync_init() {
         local tree commit
         if ! tree=$(printf '' | git --git-dir="$GITHUB_STORE" mktree 2>&1) ||
            ! commit=$(printf 'Initial empty state\n' |
-                git --git-dir="$GITHUB_STORE" commit-tree "$tree" 2>&1) ||
+                git -c user.name='Essence Remote Control' \
+                    -c user.email='remote-control@localhost' \
+                    --git-dir="$GITHUB_STORE" commit-tree "$tree" 2>&1) ||
            ! git_output=$(git --git-dir="$GITHUB_STORE" update-ref \
                 "$local_ref" "$commit" 2>&1); then
             _github_record_error "создание локальной ветки конфигурации" \

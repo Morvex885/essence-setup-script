@@ -7,7 +7,8 @@ setup() {
     source_module 'github-config.sh'
     export REMOTE="$BATS_TEST_TMPDIR/remote.git"
     export GITHUB_REMOTE="$REMOTE" GITHUB_STORE="$BATS_TEST_TMPDIR/store.git" GITHUB_SESSIONS_DIR="$BATS_TEST_TMPDIR/sessions"
-    git init --bare "$REMOTE" >/dev/null
+    export GIT_CONFIG_GLOBAL="$BATS_TEST_TMPDIR/gitconfig"
+    git init --bare -b main "$REMOTE" >/dev/null
 }
 teardown() { teardown_test_env; }
 
