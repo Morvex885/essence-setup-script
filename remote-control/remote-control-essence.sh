@@ -118,17 +118,9 @@ _materialize_script_auth_from_state() {
 
 # ─── Текущая нода (глобальные переменные) ────────────────────────────────────
 NODE_NAME=""
-_config_source_materialize_github() {
-    local logical="${1:-$CONFIG_DIR/runtime-vault.json}"
-    local runtime="${2:-$CONFIG_DIR/github-runtime}"
+_config_source_materialize_state() {
+    local logical="${1:?logical state}" runtime="${2:-$CONFIG_DIR/github-runtime}"
     local name
-    [[ -n "${GITHUB_WORKTREE:-}" && -d "$GITHUB_WORKTREE" ]] || return 1
-    if ! github_config_open "$GITHUB_WORKTREE" "$logical"; then
-        _github_record_error "чтение конфигурации GitHub" \
-            "Не удалось проверить или расшифровать состояние репозитория."
-        return 1
-    fi
-    _materialize_script_auth_from_state "$logical" || return 1
     rm -rf "$runtime"
     mkdir -p "$runtime/templates" "$runtime/ssh/identities" || return 1
     jq -e '.config' "$logical" > "$runtime/config.json" || return 1
@@ -158,6 +150,18 @@ _config_source_materialize_github() {
     SSH_IDENTITIES_DIR="$runtime/ssh/identities"; SSH_KNOWN_HOSTS="$runtime/ssh/known_hosts"
     SCRIPT_AUTH_FILE="$CONFIG_DIR/.auth"
     state_validate true >/dev/null
+}
+
+_config_source_materialize_github() {
+    local logical="${1:-$CONFIG_DIR/runtime-vault.json}"
+    [[ -n "${GITHUB_WORKTREE:-}" && -d "$GITHUB_WORKTREE" ]] || return 1
+    if ! github_config_open "$GITHUB_WORKTREE" "$logical"; then
+        _github_record_error "чтение конфигурации GitHub" \
+            "Не удалось проверить или расшифровать состояние репозитория."
+        return 1
+    fi
+    _materialize_script_auth_from_state "$logical" || return 1
+    _config_source_materialize_state "$logical" "${2:-$CONFIG_DIR/github-runtime}"
 }
 
 
@@ -228,11 +232,10 @@ _github_enable_rollback() {
 github_enable_local() {
     [[ $CONFIG_SOURCE == local ]] || return 0
     _github_clear_error
-    local source_backup source_had_file=false tmp_state=""
-    if ! _github_prompt_storage_mode; then
-        _github_record_error "выбор способа хранения" "Выбор источника GitHub отменён."
+    if ! _github_select_account; then
         return 1
     fi
+    local source_backup source_had_file=false tmp_state="" tracked
     if [[ -z ${CONFIG_DIR:-} ]] || ! mkdir -p "$CONFIG_DIR"; then
         _github_record_error "подготовка локальной конфигурации" \
             "Не удалось подготовить каталог конфигурации."
@@ -252,84 +255,135 @@ github_enable_local() {
             return 1
         }
     fi
-    if ! mkdir -p "$CONFIG_DIR" "$TEMPLATES_DIR" "$SSH_IDENTITIES_DIR" \
-        "$(dirname "$SSH_KNOWN_HOSTS")"; then
-        _github_record_error "подготовка локальной конфигурации" \
-            "Не удалось создать служебные каталоги."
-        _github_enable_rollback "$source_backup" "$source_had_file"
-        return 1
-    fi
-    if [[ ! -f "$CONFIG_JSON" ]] &&
-       ! printf '%s\n' '{"schema_version":2,"nodes":[],"groups":[],"clients":[],"connections":[]}' \
-           > "$CONFIG_JSON"; then
-        _github_record_error "подготовка локальной конфигурации" \
-            "Не удалось создать config.json."
-        _github_enable_rollback "$source_backup" "$source_had_file"
-        return 1
-    fi
-    if [[ ! -f "$SECRETS_JSON" ]] &&
-       ! printf '%s\n' '{"schema_version":1,"node_passwords":{}}' > "$SECRETS_JSON"; then
-        _github_record_error "подготовка локальной конфигурации" \
-            "Не удалось создать файл с защищёнными данными."
-        _github_enable_rollback "$source_backup" "$source_had_file"
-        return 1
-    fi
-    if [[ ! -f "$STATE_MANIFEST" ]] &&
-       ! printf '%s\n' '{"schema_version":2,"portability":{"status":"ready","issues":[]},"templates":{}}' \
-           > "$STATE_MANIFEST"; then
-        _github_record_error "подготовка локальной конфигурации" \
-            "Не удалось создать служебное описание конфигурации."
-        _github_enable_rollback "$source_backup" "$source_had_file"
-        return 1
-    fi
-    github_sync_init true || {
+    github_sync_init true onboarding || {
         _github_enable_rollback "$source_backup" "$source_had_file"
         return 1
     }
-    if [[ $GITHUB_STORAGE_MODE == age ]] && {
-        _github_ensure_deps age || ! github_config_age_init
-    }; then
-        _github_record_error "настройка шифрования конфигурации" \
-            "Не удалось подготовить ключи шифрования."
-        _github_enable_rollback "$source_backup" "$source_had_file"
-        return 1
-    fi
-    CONFIG_SOURCE=github
-    if ! _github_initial_portable_onboarding; then
-        _github_record_error "подготовка переносимой конфигурации" \
-            "Не удалось подготовить локальные файлы для хранения в GitHub."
-        _github_enable_rollback "$source_backup" "$source_had_file"
-        return 1
-    fi
-    tmp_state=$(umask 077; mktemp "$CONFIG_DIR/.vault.XXXXXX") || {
-        _github_record_error "подготовка конфигурации к отправке" \
-            "Не удалось создать защищённый временный файл."
+    tracked=$(git -C "$GITHUB_WORKTREE" ls-files) || {
+        _github_record_error "проверка существующего репозитория GitHub" \
+            "Не удалось проверить содержимое репозитория GitHub. Репозиторий не изменён."
         _github_enable_rollback "$source_backup" "$source_had_file"
         return 1
     }
-    if ! github_config_serialize "$tmp_state" "$CONFIG_JSON" ||
-       ! github_config_checkpoint "$tmp_state"; then
-        _github_record_error "подготовка конфигурации к отправке" \
-            "Не удалось собрать конфигурацию для репозитория GitHub."
-        _github_enable_rollback "$source_backup" "$source_had_file" "$tmp_state"
-        return 1
-    fi
-    rm -f "$tmp_state"
-    tmp_state=""
-    github_sync_flush || {
-        GITHUB_SYNC_STATUS=pending
-        warn "Изменения сохранены локально и не отправлены."
-    }
-    if ! _config_source_materialize_github; then
-        _github_record_error "проверка подключённого источника" \
-            "Не удалось открыть конфигурацию из репозитория GitHub после подключения."
-        _github_enable_rollback "$source_backup" "$source_had_file"
-        return 1
+
+    if [[ -z "$tracked" ]]; then
+        if ! _github_prompt_storage_mode; then
+            _github_record_error "выбор способа хранения" "Выбор источника GitHub отменён."
+            _github_enable_rollback "$source_backup" "$source_had_file"
+            return 1
+        fi
+        if [[ $GITHUB_STORAGE_MODE == age ]] && {
+            _github_ensure_deps age || ! github_config_age_init
+        }; then
+            _github_record_error "настройка шифрования конфигурации" \
+                "Не удалось подготовить ключи шифрования."
+            _github_enable_rollback "$source_backup" "$source_had_file"
+            return 1
+        fi
+        CONFIG_SOURCE=github
+        if ! _github_initial_portable_onboarding; then
+            _github_record_error "подготовка переносимой конфигурации" \
+                "Не удалось подготовить локальные файлы для хранения в GitHub."
+            _github_enable_rollback "$source_backup" "$source_had_file"
+            return 1
+        fi
+        tmp_state=$(umask 077; mktemp "$CONFIG_DIR/.vault.XXXXXX") || {
+            _github_record_error "подготовка конфигурации к отправке" \
+                "Не удалось создать защищённый временный файл."
+            _github_enable_rollback "$source_backup" "$source_had_file"
+            return 1
+        }
+        if ! github_config_serialize "$tmp_state" "$CONFIG_JSON" ||
+           ! github_config_checkpoint "$tmp_state"; then
+            _github_record_error "подготовка конфигурации к отправке" \
+                "Не удалось собрать конфигурацию для репозитория GitHub."
+            _github_enable_rollback "$source_backup" "$source_had_file" "$tmp_state"
+            return 1
+        fi
+        github_sync_flush || {
+            GITHUB_SYNC_STATUS=pending
+            warn "Изменения сохранены локально и не отправлены."
+        }
+        if ! _materialize_script_auth_from_state "$tmp_state" ||
+           ! _config_source_materialize_state "$tmp_state"; then
+            _github_record_error "проверка подключённого источника" \
+                "Не удалось открыть конфигурацию из репозитория GitHub после подключения."
+            _github_enable_rollback "$source_backup" "$source_had_file" "$tmp_state"
+            return 1
+        fi
+    else
+        case $'\n'"$tracked"$'\n' in
+            *$'\nstorage.json\n'*) ;;
+            *)
+                _github_record_error "проверка существующего репозитория GitHub" \
+                    "В репозитории есть данные, но отсутствует корректная конфигурация Essence. Репозиторий не изменён."
+                _github_enable_rollback "$source_backup" "$source_had_file"
+                return 1
+                ;;
+        esac
+        if [[ $GITHUB_STORAGE_MODE == age ]] && ! _github_ensure_deps age; then
+            _github_record_error "чтение существующей конфигурации GitHub" \
+                "Не удалось проверить или расшифровать существующую конфигурацию. Репозиторий не изменён."
+            _github_enable_rollback "$source_backup" "$source_had_file"
+            return 1
+        fi
+        tmp_state=$(umask 077; mktemp "$CONFIG_DIR/.vault.XXXXXX") || {
+            _github_record_error "чтение существующей конфигурации GitHub" \
+                "Не удалось проверить или расшифровать существующую конфигурацию. Репозиторий не изменён."
+            _github_enable_rollback "$source_backup" "$source_had_file"
+            return 1
+        }
+        if ! github_config_open "$GITHUB_WORKTREE" "$tmp_state"; then
+            _github_record_error "чтение существующей конфигурации GitHub" \
+                "Не удалось проверить или расшифровать существующую конфигурацию. Репозиторий не изменён."
+            _github_enable_rollback "$source_backup" "$source_had_file" "$tmp_state"
+            return 1
+        fi
+        if ! _github_prompt_existing_config_action; then
+            _github_record_error "выбор версии конфигурации" "Подключение GitHub отменено."
+            _github_enable_rollback "$source_backup" "$source_had_file" "$tmp_state"
+            return 1
+        fi
+        CONFIG_SOURCE=github
+        if [[ "$GITHUB_EXISTING_ACTION" == remote ]]; then
+            if ! _materialize_script_auth_from_state "$tmp_state" ||
+               ! _config_source_materialize_state "$tmp_state"; then
+                _github_record_error "проверка подключённого источника" \
+                    "Не удалось открыть конфигурацию из репозитория GitHub после подключения."
+                _github_enable_rollback "$source_backup" "$source_had_file" "$tmp_state"
+                return 1
+            fi
+        else
+            if ! _github_initial_portable_onboarding; then
+                _github_record_error "подготовка переносимой конфигурации" \
+                    "Не удалось подготовить локальные файлы для хранения в GitHub."
+                _github_enable_rollback "$source_backup" "$source_had_file" "$tmp_state"
+                return 1
+            fi
+            if ! github_config_serialize "$tmp_state" "$CONFIG_JSON" ||
+               ! github_config_checkpoint "$tmp_state"; then
+                _github_record_error "подготовка конфигурации к отправке" \
+                    "Не удалось собрать конфигурацию для репозитория GitHub."
+                _github_enable_rollback "$source_backup" "$source_had_file" "$tmp_state"
+                return 1
+            fi
+            github_sync_flush || {
+                GITHUB_SYNC_STATUS=pending
+                warn "Изменения сохранены локально и не отправлены."
+            }
+            if ! _materialize_script_auth_from_state "$tmp_state" ||
+               ! _config_source_materialize_state "$tmp_state"; then
+                _github_record_error "проверка подключённого источника" \
+                    "Не удалось открыть конфигурацию из репозитория GitHub после подключения."
+                _github_enable_rollback "$source_backup" "$source_had_file" "$tmp_state"
+                return 1
+            fi
+        fi
     fi
     export CONFIG_SOURCE CONFIG_JSON SECRETS_JSON STATE_MANIFEST TEMPLATES_DIR
     export SSH_IDENTITIES_DIR SSH_KNOWN_HOSTS SCRIPT_AUTH_FILE STATE_DIR
     if ! github_source_metadata_write; then
-        _github_enable_rollback "$source_backup" "$source_had_file"
+        _github_enable_rollback "$source_backup" "$source_had_file" "$tmp_state"
         return 1
     fi
     if [[ "$CONFIG_SOURCE" != github ]] ||
@@ -337,10 +391,10 @@ github_enable_local() {
        ! github_source_metadata_valid "$CONFIG_DIR/source.json"; then
         _github_record_error "проверка подключённого источника" \
             "Не удалось сохранить или проверить настройки источника GitHub."
-        _github_enable_rollback "$source_backup" "$source_had_file"
+        _github_enable_rollback "$source_backup" "$source_had_file" "$tmp_state"
         return 1
     fi
-    rm -f "$source_backup"
+    rm -f "$tmp_state" "$source_backup"
     success "Источник GitHub подключён."
 }
 
@@ -383,6 +437,7 @@ github_source_menu() {
         box_line " I) Импортировать ключ восстановления" " ${YELLOW}I)${NC} Импортировать ключ восстановления"
     fi
     box_line " E) Использовать локальную конфигурацию без синхронизации с GitHub" " ${RED}E)${NC} Использовать локальную конфигурацию без синхронизации с GitHub"
+    box_line " D) Удалить репозиторий GitHub" " ${RED}D)${NC} Удалить репозиторий GitHub"
     box_line " 0) Назад"
     box_bot
     echo ""
@@ -428,6 +483,26 @@ github_source_menu() {
         E|e)
             github_config_switch_local &&
                 success "Используется локальная конфигурация; синхронизация с GitHub отключена."
+            ;;
+        D|d)
+            local _repo_to_delete
+            _repo_to_delete=$(_github_repo)
+            warn "Будет удалён репозиторий GitHub: $_repo_to_delete."
+            warn "Конфигурация останется локально, синхронизация будет отключена."
+            if confirm_yn "Удалить репозиторий $_repo_to_delete?" N; then
+                if github_repository_delete "$_repo_to_delete"; then
+                    success "Репозиторий $_repo_to_delete удалён. Конфигурация сохранена локально, синхронизация отключена."
+                else
+                    _github_report_last_error "Не удалось удалить репозиторий GitHub"
+                    if [[ "$GITHUB_LAST_STAGE" == "удаление репозитория GitHub" ]]; then
+                        if github_repository_open_settings "$_repo_to_delete"; then
+                            info "Открыта страница настроек $_repo_to_delete. Завершите удаление в Danger Zone."
+                        else
+                            warn "Откройте страницу настроек и завершите удаление в Danger Zone: $(hyperlink "https://github.com/$_repo_to_delete/settings")"
+                        fi
+                    fi
+                fi
+            fi
             ;;
         0|"") return 0 ;;
         *) warn "Неверный выбор." ;;
