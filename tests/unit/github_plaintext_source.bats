@@ -418,6 +418,40 @@ EOF
     assert_output --partial "Источник GitHub подключён."
     git --git-dir="$REMOTE" show-ref --verify --quiet refs/heads/main
 }
+@test "encrypted GitHub source initializes empty private repository and restarts" {
+    git --git-dir="$REMOTE" update-ref -d refs/heads/main
+    _install_fake_age
+
+    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    run bash -c 'printf "Y\n1\n1\naccess-pass\naccess-pass\n0\n" | "$0"' \
+        "$APP/remote-control-essence.sh"
+    assert_success
+    local config_dir="$HOME/.config/remote-control-essence"
+    assert_output --partial "Источник GitHub подключён."
+    jq -e '.type == "github" and .private_verified == true' \
+        "$config_dir/source.json"
+    [[ "$(git --git-dir="$config_dir/github-store.git" show main:storage.json |
+        jq -r '.encryption')" == age ]]
+    local rel
+    for rel in recipient.txt unlock.age state.json.age; do
+        git --git-dir="$config_dir/github-store.git" cat-file -e "main:$rel"
+    done
+    for rel in config.json secrets.json manifest.json; do
+        ! git --git-dir="$config_dir/github-store.git" cat-file -e "main:$rel"
+    done
+    [[ -f "$config_dir/github-runtime/config.json" ]]
+
+    run bash -c 'printf "access-pass\nn\n0\n" | "$0"' \
+        "$APP/remote-control-essence.sh"
+    assert_success
+    assert_output --partial "синхронизировано"
+
+    run bash -c 'printf "access-pass\nn\nY\n0\n0\n" | "$0"' \
+        "$APP/remote-control-essence.sh"
+    assert_success
+    assert_output --partial "Сменить пароль доступа"
+}
 
 @test "script password hash persists through GitHub and protects the next process" {
     run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
@@ -498,6 +532,8 @@ EOF
 
     local updater="$BATS_TEST_TMPDIR/age-existing"
     git clone "$REMOTE" "$updater" >/dev/null
+    git -C "$updater" config user.name updater
+    git -C "$updater" config user.email updater@example.invalid
     mkdir -p "$updater/templates" "$updater/ssh"
     jq -n --slurpfile config "$config_dir/config.json" \
         --slurpfile secrets "$config_dir/secrets.json" \
@@ -519,10 +555,25 @@ EOF
     git -C "$updater" add -A
     git -C "$updater" commit -m encrypted-state >/dev/null
     git -C "$updater" push origin main >/dev/null
+    mv "$BIN/age" "$BIN/age.package"
+    mv "$BIN/age-keygen" "$BIN/age-keygen.package"
+    cat > "$BIN/brew" <<'EOF'
+#!/bin/bash
+[[ "$1" == install && "$2" == age ]] || exit 1
+cp "$BIN/age.package" "$BIN/age"
+cp "$BIN/age-keygen.package" "$BIN/age-keygen"
+chmod +x "$BIN/age" "$BIN/age-keygen"
+: > "$AGE_INSTALL_MARKER"
+EOF
+    chmod +x "$BIN/brew"
+    export PM=brew AGE_INSTALL_MARKER="$BATS_TEST_TMPDIR/age-install-marker"
+
 
     run bash -c 'printf "Y\n1\naccess-pass\nn\n1\n0\n" | "$0"' \
         "$APP/remote-control-essence.sh"
     assert_success
+    assert_output --partial "Отсутствует age — устанавливаем age через brew"
+    [[ -f "$AGE_INSTALL_MARKER" ]]
     assert_output --partial "режим хранения: зашифровано паролем"
     [[ "$output" != *"Зашифровать паролем"* ]]
     [[ "$output" != *"Хранить без шифрования"* ]]

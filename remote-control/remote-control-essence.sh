@@ -273,7 +273,7 @@ github_enable_local() {
             return 1
         fi
         if [[ $GITHUB_STORAGE_MODE == age ]] && {
-            _github_ensure_deps age || ! github_config_age_init
+            ! _github_ensure_deps age || ! github_config_age_init
         }; then
             _github_record_error "настройка шифрования конфигурации" \
                 "Не удалось подготовить ключи шифрования."
@@ -321,7 +321,8 @@ github_enable_local() {
                 return 1
                 ;;
         esac
-        if [[ $GITHUB_STORAGE_MODE == age ]] && ! _github_ensure_deps age; then
+        if ! _github_storage_read ||
+           { [[ $GITHUB_STORAGE_MODE == age ]] && ! _github_ensure_deps age; }; then
             _github_record_error "чтение существующей конфигурации GitHub" \
                 "Не удалось проверить или расшифровать существующую конфигурацию. Репозиторий не изменён."
             _github_enable_rollback "$source_backup" "$source_had_file"

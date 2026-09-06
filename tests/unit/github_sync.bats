@@ -165,7 +165,7 @@ _file_mode() {
     github_sync_init true onboarding
     [[ "$(git -C "$GITHUB_WORKTREE" rev-parse HEAD)" == "$remote_oid" ]]
     [[ "$(git --git-dir="$GITHUB_STORE" rev-parse main)" == "$remote_oid" ]]
-    [[ "$(git --git-dir="$GITHUB_STORE" rev-parse refs/archive/onboarding-*)" == "$local_oid" ]]
+    [[ "$(git --git-dir="$GITHUB_STORE" for-each-ref --format='%(objectname)' 'refs/archive/onboarding-*')" == "$local_oid" ]]
     [[ "$(git --git-dir="$REMOTE" rev-parse main)" == "$remote_oid" ]]
 }
 
@@ -189,7 +189,7 @@ _file_mode() {
     empty_oid=$(git --git-dir="$GITHUB_STORE" rev-parse main)
     [[ "$empty_oid" != "$cached_oid" ]]
     [[ -z "$(git -C "$GITHUB_WORKTREE" ls-files)" ]]
-    [[ "$(git --git-dir="$GITHUB_STORE" rev-parse refs/archive/onboarding-*)" == "$cached_oid" ]]
+    [[ "$(git --git-dir="$GITHUB_STORE" for-each-ref --format='%(objectname)' 'refs/archive/onboarding-*')" == "$cached_oid" ]]
     github_config_close
 
     local missing="$BATS_TEST_TMPDIR/missing.git" before
