@@ -183,10 +183,15 @@ fi
 EOF
     cat > "$BIN/age" <<'EOF'
 #!/bin/bash
-out="" input=""
+out="" input="" decrypting=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -d|-p) shift ;;
+        -d) decrypting=true; shift ;;
+        -p)
+            if [[ "$decrypting" == true && -n "${AGE_PASSWORD_DECRYPT_MARKER:-}" ]]; then
+                printf '%s\n' unlock >> "$AGE_PASSWORD_DECRYPT_MARKER"
+            fi
+            shift ;;
         -r|-i) shift 2 ;;
         -o) out="$2"; shift 2 ;;
         *) input="$1"; shift ;;
@@ -567,6 +572,8 @@ chmod +x "$BIN/age" "$BIN/age-keygen"
 EOF
     chmod +x "$BIN/brew"
     export PM=brew AGE_INSTALL_MARKER="$BATS_TEST_TMPDIR/age-install-marker"
+    export AGE_PASSWORD_DECRYPT_MARKER="$BATS_TEST_TMPDIR/age-password-decrypts"
+    : > "$AGE_PASSWORD_DECRYPT_MARKER"
     local original_path="$PATH"
     local isolated_bin="$BATS_TEST_TMPDIR/no-age-bin" path_dir candidate name
     mkdir -p "$isolated_bin"
@@ -594,12 +601,9 @@ EOF
     assert_output --partial "режим хранения: зашифровано паролем"
     [[ "$output" != *"Зашифровать паролем"* ]]
     [[ "$output" != *"Хранить без шифрования"* ]]
-    local prompt="Введите пароль доступа к конфигурации" password_prompts=0 remaining="$output"
-    while [[ "$remaining" == *"$prompt"* ]]; do
-        password_prompts=$((password_prompts + 1))
-        remaining=${remaining#*"$prompt"}
-    done
-    [[ "$password_prompts" == 1 ]]
+    local password_decrypts
+    password_decrypts=$(wc -l < "$AGE_PASSWORD_DECRYPT_MARKER" | tr -d ' ')
+    [[ "$password_decrypts" == 1 ]]
     [[ "$(jq -r '.marker' "$config_dir/github-runtime/config.json")" == remote ]]
     [[ "$(jq -r '.marker' "$config_dir/config.json")" == local ]]
 }
