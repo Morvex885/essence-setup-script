@@ -195,8 +195,9 @@ _file_mode() {
     local missing="$BATS_TEST_TMPDIR/missing.git" before
     before=$(git --git-dir="$GITHUB_STORE" rev-parse main)
     GITHUB_REMOTE="$missing"
-    run github_sync_init true onboarding
-    assert_failure
+    if github_sync_init true onboarding; then
+        return 1
+    fi
     [[ "$GITHUB_LAST_STAGE" == "загрузка репозитория GitHub" ]]
     [[ "$(git --git-dir="$GITHUB_STORE" rev-parse main)" == "$before" ]]
 }
