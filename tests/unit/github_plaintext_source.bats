@@ -594,9 +594,11 @@ EOF
     assert_output --partial "режим хранения: зашифровано паролем"
     [[ "$output" != *"Зашифровать паролем"* ]]
     [[ "$output" != *"Хранить без шифрования"* ]]
-    local password_prompts
-    password_prompts=$(printf '%s' "$output" |
-        grep -o 'Введите пароль доступа к конфигурации' | wc -l | tr -d ' ')
+    local prompt="Введите пароль доступа к конфигурации" password_prompts=0 remaining="$output"
+    while [[ "$remaining" == *"$prompt"* ]]; do
+        password_prompts=$((password_prompts + 1))
+        remaining=${remaining#*"$prompt"}
+    done
     [[ "$password_prompts" == 1 ]]
     [[ "$(jq -r '.marker' "$config_dir/github-runtime/config.json")" == remote ]]
     [[ "$(jq -r '.marker' "$config_dir/config.json")" == local ]]
