@@ -567,10 +567,27 @@ chmod +x "$BIN/age" "$BIN/age-keygen"
 EOF
     chmod +x "$BIN/brew"
     export PM=brew AGE_INSTALL_MARKER="$BATS_TEST_TMPDIR/age-install-marker"
+    local original_path="$PATH"
+    local isolated_bin="$BATS_TEST_TMPDIR/no-age-bin" path_dir candidate name
+    mkdir -p "$isolated_bin"
+    while IFS= read -r path_dir; do
+        [[ -d "$path_dir" ]] || continue
+        for candidate in "$path_dir"/*; do
+            [[ -f "$candidate" && -x "$candidate" ]] || continue
+            name=${candidate##*/}
+            case "$name" in age|age-keygen) continue ;; esac
+            [[ -e "$isolated_bin/$name" ]] ||
+                ln -s "$candidate" "$isolated_bin/$name"
+        done
+    done < <(tr ':' '\n' <<< "$PATH")
+    export PATH="$BIN:$isolated_bin"
+    ! command -v age >/dev/null 2>&1
+
 
 
     run bash -c 'printf "Y\n1\naccess-pass\nn\n1\n0\n" | "$0"' \
         "$APP/remote-control-essence.sh"
+    export PATH="$original_path"
     assert_success
     assert_output --partial "Отсутствует age — устанавливаем age через brew"
     [[ -f "$AGE_INSTALL_MARKER" ]]
