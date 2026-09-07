@@ -77,6 +77,71 @@ _github_ensure_deps() {
         [[ "$mode" != age ]] || _github_require "$AGE_BIN"
     fi
 }
+_github_select_account() {
+    local gh="${GH_BIN:-gh}" login answer switch_stderr switch_output
+    if ! _github_ensure_deps; then
+        _github_record_error "проверка зависимостей" \
+            "Не удалось подготовить GitHub CLI для выбора аккаунта."
+        return 1
+    fi
+    if ! _github_require "$gh"; then
+        _github_record_error "проверка зависимостей" \
+            "Не найдена команда GitHub CLI: $gh."
+        return 1
+    fi
+    while :; do
+        if ! login=$(NO_COLOR=1 GH_PROMPT_DISABLED=1 "$gh" api user --jq .login 2>&1); then
+            _github_record_error "определение пользователя GitHub" \
+                "${login}. Выполните: gh auth login." true
+            return 1
+        fi
+        login=$(printf '%s' "$login" | tr -d '\r\n')
+        [[ -n "$login" ]] || {
+            _github_record_error "определение пользователя GitHub" \
+                "GitHub CLI не вернул имя активного аккаунта." true
+            return 1
+        }
+        info "GitHub-аккаунт для репозитория конфигурации: $login"
+        echo -e "  ${GREEN}1)${NC} Использовать этот аккаунт"
+        echo -e "  ${CYAN}2)${NC} Выбрать другой аккаунт"
+        echo -e "  ${RED}0)${NC} Отмена"
+        if ! read -rp "  Выберите действие: " answer; then
+            _github_record_error "выбор аккаунта GitHub" \
+                "Выбор аккаунта GitHub отменён."
+            return 1
+        fi
+        case "$answer" in
+            1)
+                GITHUB_OWNER="$login"
+                export GITHUB_OWNER
+                return 0
+                ;;
+            2)
+                switch_stderr=$(umask 077; mktemp "${TMPDIR:-/tmp}/github-switch.XXXXXX") || {
+                    _github_record_error "переключение аккаунта GitHub" \
+                        "Не удалось подготовить безопасную диагностику переключения аккаунта." true
+                    return 1
+                }
+                if ! NO_COLOR=1 "$gh" auth switch --hostname github.com \
+                    2>"$switch_stderr"; then
+                    switch_output=$(cat "$switch_stderr")
+                    rm -f "$switch_stderr"
+                    _github_record_error "переключение аккаунта GitHub" \
+                        "${switch_output:-Не удалось переключить аккаунт GitHub.} Выполните: gh auth login." true
+                    return 1
+                fi
+                rm -f "$switch_stderr"
+                ;;
+            0)
+                _github_record_error "выбор аккаунта GitHub" \
+                    "Выбор аккаунта GitHub отменён."
+                return 1
+                ;;
+            *) warn "Неверный выбор." ;;
+        esac
+    done
+}
+
 
 _github_run_with_timeout() {
     run_with_timeout "$@"
@@ -114,6 +179,29 @@ _github_prompt_storage_mode() {
         echo -e "  ${CYAN}2)${NC} Хранить без шифрования"
         read -rp "  Выберите 1 или 2: " answer
         case "$answer" in 1) GITHUB_STORAGE_MODE=age; return 0;; 2) GITHUB_STORAGE_MODE=none; return 0;; esac
+    done
+}
+_github_prompt_existing_config_action() {
+    local answer mode_label
+    case "${GITHUB_STORAGE_MODE:-}" in
+        age) mode_label="зашифровано паролем" ;;
+        none) mode_label="без шифрования" ;;
+        *) return 1 ;;
+    esac
+    info "В GitHub уже сохранена конфигурация (режим хранения: $mode_label)."
+    while :; do
+        echo "  1) Загрузить конфигурацию из GitHub"
+        echo "  2) Заменить конфигурацию в GitHub текущей локальной"
+        echo "  0) Отмена"
+        if ! IFS= read -rp "  Выберите действие: " answer; then
+            return 1
+        fi
+        case "$answer" in
+            1) GITHUB_EXISTING_ACTION=remote; return 0 ;;
+            2) GITHUB_EXISTING_ACTION=local; return 0 ;;
+            0) return 1 ;;
+            *) warn "Неверный выбор." ;;
+        esac
     done
 }
 _github_prompt_remember_unlock() {
@@ -567,6 +655,42 @@ github_config_open() {
 }
 
 _github_repo() { printf '%s/%s' "${GITHUB_OWNER:?}" "$GITHUB_REPO_NAME"; }
+github_repository_delete() {
+    local repo="${1:-}" gh="${GH_BIN:-gh}" output
+    if [[ ! "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+        _github_record_error "удаление репозитория GitHub" \
+            "Указан некорректный репозиторий GitHub."
+        return 1
+    fi
+    if ! github_config_switch_local; then
+        _github_record_error "сохранение локальной конфигурации перед удалением" \
+            "Не удалось сохранить конфигурацию локально."
+        return 1
+    fi
+    if ! _github_ensure_deps "" "https://github.com/$repo.git"; then
+        _github_record_error "проверка зависимостей" \
+            "Не удалось подготовить GitHub CLI."
+        return 1
+    fi
+    if ! _github_require "$gh"; then
+        _github_record_error "проверка зависимостей" \
+            "Не найдена команда GitHub CLI: $gh."
+        return 1
+    fi
+    if ! output=$(NO_COLOR=1 GH_PROMPT_DISABLED=1 "$gh" repo delete "$repo" --yes 2>&1); then
+        _github_record_error "удаление репозитория GitHub" "$output" true
+        return 1
+    fi
+}
+
+github_repository_open_settings() {
+    local repo="${1:-}" gh="${GH_BIN:-gh}"
+    [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 1
+    _github_require "$gh" || return 1
+    NO_COLOR=1 GH_PROMPT_DISABLED=1 "$gh" browse --settings --repo "$repo" \
+        >/dev/null 2>&1
+}
+
 github_source_metadata_valid() {
     local file="${1:-}"
     [[ -f "$file" ]] || return 1
@@ -609,8 +733,20 @@ legacy_local_source_metadata_valid() {
 }
 
 
+_github_archive_oid() {
+    local oid="${1:-}" label="${2:-archive}" archive_ref
+    [[ -n "$oid" ]] || return 0
+    archive_ref="refs/archive/${label}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    git --git-dir="$GITHUB_STORE" update-ref "$archive_ref" "$oid"
+}
+
 github_sync_init() {
-    local announce_account="${1:-false}"
+    local allow_create="${1:-false}"
+    local init_mode="${2:-resume}"
+    case "$init_mode" in
+        resume|onboarding) ;;
+        *) _github_record_error "подготовка локального репозитория" "Неизвестный режим инициализации GitHub."; return 1 ;;
+    esac
     # github_enable_local may initialize the transport before calling
     # config_source_startup. Reuse that live worktree instead of attempting
     # to create the same session branch a second time.
@@ -649,20 +785,29 @@ github_sync_init() {
             _github_record_error "определение пользователя GitHub" "$login" true
             return 1
         fi
+        login=$(printf '%s' "$login" | tr -d '\r\n')
         [[ -n "$GITHUB_OWNER" ]] || GITHUB_OWNER="$login"
         if [[ "$login" != "$GITHUB_OWNER" ]]; then
             _github_record_error "проверка пользователя GitHub" \
                 "GitHub CLI подключён как $login, ожидался пользователь $GITHUB_OWNER."
             return 1
         fi
-        if [[ "$announce_account" == true ]]; then
-            info "GitHub-аккаунт для репозитория конфигурации: $login"
-        fi
         repo="$GITHUB_OWNER/$GITHUB_REPO_NAME"
         if ! remote_view=$(NO_COLOR=1 GH_PROMPT_DISABLED=1 "$gh" repo view "$repo" --json visibility 2>&1); then
             if [[ "$remote_view" != *"not found"* &&
                   "$remote_view" != *"Could not resolve to a Repository"* ]]; then
                 _github_record_error "проверка приватного репозитория" "$remote_view" true
+                return 1
+            fi
+            if [[ "$allow_create" != true ]]; then
+                _github_record_error "проверка приватного репозитория" \
+                    "Репозиторий $repo не найден."
+                return 1
+            fi
+            info "Репозиторий $repo не найден."
+            if ! confirm_yn "Создать приватный репозиторий $repo?" N; then
+                _github_record_error "создание приватного репозитория" \
+                    "Создание репозитория $repo отменено."
                 return 1
             fi
             if ! create_output=$(NO_COLOR=1 GH_PROMPT_DISABLED=1 "$gh" repo create "$repo" \
@@ -716,7 +861,61 @@ github_sync_init() {
     remote_ref="refs/remotes/origin/$GITHUB_BRANCH"
     fetch_output=$(GIT_TERMINAL_PROMPT=0 _github_run_with_timeout 30 \
         git --git-dir="$GITHUB_STORE" fetch --no-tags origin "$GITHUB_BRANCH" 2>&1) || fetch_ok=false
-    if [[ "$fetch_ok" == true ]] &&
+
+    if [[ "$init_mode" == onboarding ]]; then
+        if [[ "$fetch_ok" == true ]] &&
+           git --git-dir="$GITHUB_STORE" show-ref --verify --quiet "$remote_ref"; then
+            remote_oid=$(git --git-dir="$GITHUB_STORE" rev-parse "$remote_ref") || return 1
+            if git --git-dir="$GITHUB_STORE" show-ref --verify --quiet "$local_ref"; then
+                local_oid=$(git --git-dir="$GITHUB_STORE" rev-parse "$local_ref") || return 1
+                if [[ "$local_oid" != "$remote_oid" ]] &&
+                   ! git --git-dir="$GITHUB_STORE" merge-base --is-ancestor \
+                        "$local_ref" "$remote_ref"; then
+                    if ! _github_archive_oid "$local_oid" onboarding; then
+                        _github_record_error "сохранение локальной истории перед подключением" \
+                            "Не удалось сохранить локальную ветку перед выбором версии конфигурации."
+                        return 1
+                    fi
+                fi
+            fi
+            if ! git --git-dir="$GITHUB_STORE" update-ref "$local_ref" "$remote_ref"; then
+                _github_record_error "обновление локальной копии репозитория" \
+                    "Не удалось подготовить локальную ветку конфигурации."
+                return 1
+            fi
+            GITHUB_SYNC_STATUS=clean
+        else
+            if ! remote_refs=$(_github_run_with_timeout 15 git ls-remote \
+                "$GITHUB_REMOTE" "refs/heads/$GITHUB_BRANCH" 2>/dev/null); then
+                if [[ "$GITHUB_REMOTE" == https://github.com/* ]]; then
+                    _github_record_error "загрузка репозитория GitHub" "$fetch_output" true
+                else
+                    _github_record_error "загрузка репозитория GitHub" "$fetch_output"
+                fi
+                return 1
+            fi
+            if [[ -n "$remote_refs" ]]; then
+                if [[ "$GITHUB_REMOTE" == https://github.com/* ]]; then
+                    _github_record_error "загрузка репозитория GitHub" "$fetch_output" true
+                else
+                    _github_record_error "загрузка репозитория GitHub" "$fetch_output"
+                fi
+                return 1
+            fi
+            local previous_oid=""
+            if git --git-dir="$GITHUB_STORE" show-ref --verify --quiet "$local_ref"; then
+                previous_oid=$(git --git-dir="$GITHUB_STORE" rev-parse "$local_ref") || return 1
+                if ! _github_archive_oid "$previous_oid" onboarding; then
+                    _github_record_error "сохранение локальной истории перед подключением" \
+                        "Не удалось сохранить локальную ветку перед выбором версии конфигурации."
+                    return 1
+                fi
+            fi
+            git --git-dir="$GITHUB_STORE" update-ref -d "$local_ref" || return 1
+            git --git-dir="$GITHUB_STORE" update-ref -d "$remote_ref" || return 1
+            GITHUB_SYNC_STATUS=clean
+        fi
+    elif [[ "$fetch_ok" == true ]] &&
        git --git-dir="$GITHUB_STORE" show-ref --verify --quiet "$remote_ref"; then
         remote_oid=$(git --git-dir="$GITHUB_STORE" rev-parse "$remote_ref") || return 1
         if ! git --git-dir="$GITHUB_STORE" show-ref --verify --quiet "$local_ref"; then
@@ -753,20 +952,17 @@ github_sync_init() {
             if remote_refs=$(_github_run_with_timeout 15 git ls-remote \
                 "$GITHUB_REMOTE" "refs/heads/$GITHUB_BRANCH" 2>/dev/null) &&
                [[ -z "$remote_refs" ]]; then
-                local previous_oid="" archive_ref
+                local previous_oid=""
                 if git --git-dir="$GITHUB_STORE" show-ref --verify --quiet "$local_ref"; then
                     previous_oid=$(git --git-dir="$GITHUB_STORE" rev-parse "$local_ref")
                 elif git --git-dir="$GITHUB_STORE" show-ref --verify --quiet "$remote_ref"; then
                     previous_oid=$(git --git-dir="$GITHUB_STORE" rev-parse "$remote_ref")
                 fi
-                if [[ -n "$previous_oid" ]]; then
-                    archive_ref="refs/archive/remote-switch-$(date -u +%Y%m%dT%H%M%SZ)-$$"
-                    if ! git --git-dir="$GITHUB_STORE" update-ref \
-                        "$archive_ref" "$previous_oid"; then
-                        _github_record_error "сохранение истории прежнего репозитория" \
-                            "Не удалось сохранить прежнюю локальную ветку перед сменой репозитория."
-                        return 1
-                    fi
+                if [[ -n "$previous_oid" ]] &&
+                   ! _github_archive_oid "$previous_oid" remote-switch; then
+                    _github_record_error "сохранение истории прежнего репозитория" \
+                        "Не удалось сохранить прежнюю локальную ветку перед сменой репозитория."
+                    return 1
                 fi
                 git --git-dir="$GITHUB_STORE" update-ref -d "$local_ref" || return 1
                 git --git-dir="$GITHUB_STORE" update-ref -d "$remote_ref" || return 1

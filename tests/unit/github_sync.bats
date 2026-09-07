@@ -125,6 +125,83 @@ _file_mode() {
     [[ "$(git --git-dir="$GITHUB_STORE" show main:storage.json | jq -r '.revision')" == 2 ]]
 }
 
+@test "onboarding archives divergent cached main and opens remote head" {
+    local seed="$BATS_TEST_TMPDIR/seed"
+    git init --bare -b main "$REMOTE" >/dev/null
+    git init -b main "$seed" >/dev/null
+    git -C "$seed" config user.name seed
+    git -C "$seed" config user.email seed@example.invalid
+    printf '{"storage_version":1,"encryption":"none","revision":"base"}\n' \
+        > "$seed/storage.json"
+    git -C "$seed" add storage.json
+    git -C "$seed" commit -m base >/dev/null
+    git -C "$seed" remote add origin "$REMOTE"
+    git -C "$seed" push origin main >/dev/null
+
+    github_sync_init
+    local base_oid
+    base_oid=$(git --git-dir="$GITHUB_STORE" rev-parse main)
+    github_config_close
+    local tree local_oid
+    tree=$(git --git-dir="$GITHUB_STORE" rev-parse "$base_oid^{tree}")
+    local_oid=$(printf 'offline local state\n' |
+        git -c user.name='Essence Remote Control' \
+            -c user.email='remote-control@localhost' \
+            --git-dir="$GITHUB_STORE" commit-tree "$tree" -p "$base_oid")
+    git --git-dir="$GITHUB_STORE" update-ref refs/heads/main "$local_oid"
+
+    local updater="$BATS_TEST_TMPDIR/updater"
+    git clone "$REMOTE" "$updater" >/dev/null
+    git -C "$updater" config user.name updater
+    git -C "$updater" config user.email updater@example.invalid
+    printf '{"storage_version":1,"encryption":"none","revision":"remote"}\n' \
+        > "$updater/storage.json"
+    git -C "$updater" add storage.json
+    git -C "$updater" commit -m remote >/dev/null
+    git -C "$updater" push origin main >/dev/null
+    local remote_oid
+    remote_oid=$(git --git-dir="$REMOTE" rev-parse main)
+
+    github_sync_init true onboarding
+    [[ "$(git -C "$GITHUB_WORKTREE" rev-parse HEAD)" == "$remote_oid" ]]
+    [[ "$(git --git-dir="$GITHUB_STORE" rev-parse main)" == "$remote_oid" ]]
+    [[ "$(git --git-dir="$GITHUB_STORE" for-each-ref --format='%(objectname)' 'refs/archive/onboarding-*')" == "$local_oid" ]]
+    [[ "$(git --git-dir="$REMOTE" rev-parse main)" == "$remote_oid" ]]
+}
+
+@test "onboarding confirms empty remote and rejects network errors" {
+    local seed="$BATS_TEST_TMPDIR/seed"
+    git init -b main "$seed" >/dev/null
+    git -C "$seed" config user.name seed
+    git -C "$seed" config user.email seed@example.invalid
+    git -C "$seed" commit --allow-empty -m cached >/dev/null
+    git -C "$seed" remote add origin "$REMOTE"
+    git -C "$seed" push origin main >/dev/null
+
+    github_sync_init
+    local cached_oid
+    cached_oid=$(git --git-dir="$GITHUB_STORE" rev-parse main)
+    github_config_close
+    git --git-dir="$REMOTE" update-ref -d refs/heads/main
+
+    github_sync_init true onboarding
+    local empty_oid
+    empty_oid=$(git --git-dir="$GITHUB_STORE" rev-parse main)
+    [[ "$empty_oid" != "$cached_oid" ]]
+    [[ -z "$(git -C "$GITHUB_WORKTREE" ls-files)" ]]
+    [[ "$(git --git-dir="$GITHUB_STORE" for-each-ref --format='%(objectname)' 'refs/archive/onboarding-*')" == "$cached_oid" ]]
+    github_config_close
+
+    local missing="$BATS_TEST_TMPDIR/missing.git" before
+    before=$(git --git-dir="$GITHUB_STORE" rev-parse main)
+    GITHUB_REMOTE="$missing"
+    if github_sync_init true onboarding; then
+        return 1
+    fi
+    [[ "$GITHUB_LAST_STAGE" == "загрузка репозитория GitHub" ]]
+    [[ "$(git --git-dir="$GITHUB_STORE" rev-parse main)" == "$before" ]]
+}
+
 @test "switching repository updates origin and never pushes new data to old remote" {
     github_sync_init
     printf '{"storage_version":1,"encryption":"none","revision":1}\n' \
