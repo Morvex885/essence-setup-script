@@ -192,22 +192,27 @@ jq_r() { jq -r "$@" "$CONFIG_JSON" | tr -d '\r'; }
 
 jq_w() {
     local tmp
+    CONFIG_PERSIST_LAST_ERROR=""
     tmp=$(umask 077; mktemp "${CONFIG_JSON}.tmp.XXXXXX") || return 1
     if ! jq "$@" "$CONFIG_JSON" > "$tmp"; then
         rm -f "$tmp"
-        warn "Не удалось обновить конфиг (jq error)"
+        CONFIG_PERSIST_LAST_ERROR="Не удалось обновить конфиг (jq error)"
+        warn "$CONFIG_PERSIST_LAST_ERROR"
         return 1
     fi
     if declare -F config_persist_candidate >/dev/null 2>&1; then
         if ! config_persist_candidate "$tmp"; then
             rm -f "$tmp"
-            warn "Не удалось сохранить представление конфига"
+            CONFIG_PERSIST_LAST_ERROR="${CONFIG_PERSIST_LAST_ERROR:-Не удалось сохранить представление конфига}"
+            warn "$CONFIG_PERSIST_LAST_ERROR"
             return 1
         fi
+        return 0
     fi
     if ! mv "$tmp" "$CONFIG_JSON"; then
         rm -f "$tmp"
-        warn "Не удалось заменить конфиг"
+        CONFIG_PERSIST_LAST_ERROR="Не удалось заменить конфиг"
+        warn "$CONFIG_PERSIST_LAST_ERROR"
         return 1
     fi
 }
