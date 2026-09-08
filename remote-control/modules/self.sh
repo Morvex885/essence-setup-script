@@ -10,11 +10,17 @@ _hash_pass() {
     salt=$(openssl rand -hex 8)
     openssl passwd -6 -salt "$salt" "$1"
 }
+_script_password_hash_salt() {
+    local stored="$1"
+    [[ "$stored" =~ ^\$6\$(rounds=[0-9]+\$)?([./A-Za-z0-9]+)\$[./A-Za-z0-9]+$ ]] || return 1
+    printf '%s%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+}
+
 
 _verify_pass() {
     local stored="$1" input="$2"
     local salt
-    salt=$(echo "$stored" | cut -d'$' -f3)
+    salt=$(_script_password_hash_salt "$stored") || return 1
     local input_hash
     input_hash=$(openssl passwd -6 -salt "$salt" "$input")
     [[ "$input_hash" == "$stored" ]]

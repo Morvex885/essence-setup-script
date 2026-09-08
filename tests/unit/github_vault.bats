@@ -540,7 +540,11 @@ while (($#)); do
 done
 if [[ -n "$out" ]]; then
     printf 'partial-ciphertext\n' > "$out"
-    (stat -f '%Lp' "$out" 2>/dev/null || stat -c '%a' "$out") > "$PARTIAL_MODE_MARKER"
+    if [[ "${OSTYPE:-}" == darwin* ]]; then
+        stat -f '%Lp' "$out"
+    else
+        stat -c '%a' "$out"
+    fi > "$PARTIAL_MODE_MARKER"
 else
     printf 'partial-ciphertext\n'
 fi
@@ -583,11 +587,19 @@ while (($#)); do
 done
 if [[ "$decrypt" == true ]]; then
     printf 'AGE-SECRET-KEY-TEST\n' > "$out"
-    (stat -f '%Lp' "$out" 2>/dev/null || stat -c '%a' "$out") >> "$PARTIAL_MODE_MARKER"
+    if [[ "${OSTYPE:-}" == darwin* ]]; then
+        stat -f '%Lp' "$out"
+    else
+        stat -c '%a' "$out"
+    fi > "$PARTIAL_MODE_MARKER"
     exit 0
 fi
 printf 'partial-unlock\n' > "$out"
-(stat -f '%Lp' "$out" 2>/dev/null || stat -c '%a' "$out") >> "$PARTIAL_MODE_MARKER"
+if [[ "${OSTYPE:-}" == darwin* ]]; then
+    stat -f '%Lp' "$out"
+else
+    stat -c '%a' "$out"
+fi > "$PARTIAL_MODE_MARKER"
 exit 74
 EOF
     chmod +x "$age" || return 1
@@ -631,7 +643,11 @@ while (($#)); do
     if [[ "$1" == -o ]]; then out="${2:-}"; shift 2; else shift; fi
 done
 printf 'partial-unlock\n' > "$out"
-(stat -f '%Lp' "$out" 2>/dev/null || stat -c '%a' "$out") > "$PARTIAL_MODE_MARKER"
+if [[ "${OSTYPE:-}" == darwin* ]]; then
+    stat -f '%Lp' "$out"
+else
+    stat -c '%a' "$out"
+fi > "$PARTIAL_MODE_MARKER"
 exit 75
 EOF
     chmod +x "$keygen" "$age" || return 1

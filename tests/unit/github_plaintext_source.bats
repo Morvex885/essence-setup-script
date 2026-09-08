@@ -197,20 +197,34 @@ _runtime_fingerprint() {
     printf 'd %s .\n' "$(_file_mode "$root")" || return 1
     while IFS= read -r path; do
         rel="${path#"$root"/}"
-        mode=$(_file_mode "$path") || return 1
-        if [[ -d "$path" ]]; then
-            printf 'd %s %s\n' "$mode" "$rel" || return 1
-        elif [[ -f "$path" ]]; then
-            hash=$(_hash_file "$path") || return 1
-            printf 'f %s %s %s\n' "$mode" "$hash" "$rel" || return 1
-        elif [[ -L "$path" ]]; then
-            printf 'l %s %s %s\n' "$mode" "$(readlink "$path")" "$rel" || return 1
+        if [[ -L "$path" ]]; then
+            printf 'l %s %s\n' "$(readlink "$path")" "$rel" || return 1
         else
-            printf 'x %s %s\n' "$mode" "$rel" || return 1
+            mode=$(_file_mode "$path") || return 1
+            if [[ -d "$path" ]]; then
+                printf 'd %s %s\n' "$mode" "$rel" || return 1
+            elif [[ -f "$path" ]]; then
+                hash=$(_hash_file "$path") || return 1
+                printf 'f %s %s %s\n' "$mode" "$hash" "$rel" || return 1
+            else
+                printf 'x %s %s\n' "$mode" "$rel" || return 1
+            fi
         fi
     done < <(find "$root" -mindepth 1 -print | LC_ALL=C sort)
 }
 
+
+@test "runtime fingerprint records symlinks without dereferencing them" {
+    local root="$BATS_TEST_TMPDIR/fingerprint-root"
+    mkdir -p "$root" || return 1
+    printf 'fingerprint-target\n' > "$root/target" || return 1
+    ln -s target "$root/link" || return 1
+
+    run _runtime_fingerprint "$root"
+    assert_success
+    assert_output --partial $'l target link'
+    ! printf '%s\n' "$output" | grep -Eq '^f [0-9]+ [0-9a-f]+ link$'
+}
 _materialization_temp_inventory() {
     local config_dir="$1"
     find "$config_dir" -mindepth 1 -maxdepth 1 \
@@ -343,6 +357,24 @@ exec "$REAL_CHMOD" "$@"
 EOF
     cat > "$BIN/mv" <<'EOF'
 #!/bin/bash
+if [[ "${MATERIALIZE_FAULT:-}" == auth-rollback &&
+      "${1:-}" == "$MATERIALIZE_CONFIG_DIR"/.auth.backup.* &&
+      "${2:-}" == "$MATERIALIZE_CONFIG_DIR/.auth" ]]; then
+    printf 'auth-restore-fail\n' >> "$MATERIALIZE_FAULT_MARKER"
+    exit 89
+fi
+if [[ "${MATERIALIZE_FAULT:-}" == runtime-rollback &&
+      "${1:-}" == "$MATERIALIZE_CONFIG_DIR"/.github-runtime.publish.* &&
+      "${2:-}" == "$MATERIALIZE_RUNTIME" ]]; then
+    printf 'publish-fail\n' >> "$MATERIALIZE_FAULT_MARKER"
+    exit 86
+fi
+if [[ "${MATERIALIZE_FAULT:-}" == runtime-rollback &&
+      "${1:-}" == "$MATERIALIZE_CONFIG_DIR"/.github-runtime.retired.* &&
+      "${2:-}" == "$MATERIALIZE_RUNTIME" ]]; then
+    printf 'runtime-restore-fail\n' >> "$MATERIALIZE_FAULT_MARKER"
+    exit 87
+fi
 if [[ "${MATERIALIZE_FAULT:-}" == mv ]]; then
     for arg in "$@"; do
         if [[ "$arg" == *github-runtime* ]]; then
@@ -355,6 +387,14 @@ exec "$REAL_MV" "$@"
 EOF
     cat > "$BIN/rm" <<'EOF'
 #!/bin/bash
+if [[ "${MATERIALIZE_FAULT:-}" == auth-rollback ]]; then
+    for arg in "$@"; do
+        if [[ "$arg" == "$MATERIALIZE_CONFIG_DIR/.auth" ]]; then
+            printf 'auth-rm\n' >> "$MATERIALIZE_FAULT_MARKER"
+            exit 88
+        fi
+    done
+fi
 if [[ "${MATERIALIZE_FAULT:-}" == auth-rm ]]; then
     for arg in "$@"; do
         if [[ "$arg" == "$MATERIALIZE_CONFIG_DIR/.auth" ]]; then
@@ -600,6 +640,58 @@ _prepare_existing_plaintext_vault() {
     assert_output --partial "Пароли нод при этом не меняются"
     [[ "$output" == *$'\033[1;33mI)\033[0m Импортировать ключ восстановления'* ]] || return 1
 }
+
+@test "encrypted GitHub menu reports empty diagnostics for every failed action" {
+    _install_fake_age
+    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    run bash -c 'printf "Y\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+
+    local updater="$BATS_TEST_TMPDIR/empty-diagnostic-age-updater"
+    git clone "$REMOTE" "$updater" >/dev/null
+    git -C "$updater" config user.name updater
+    git -C "$updater" config user.email updater@example.invalid
+    jq -n --slurpfile config "$updater/config.json" \
+        --slurpfile secrets "$updater/secrets.json" \
+        --slurpfile manifest "$updater/manifest.json" \
+        --rawfile template "$updater/templates/default.yaml" '
+        {
+          vault_version:1,
+          minimum_remote_control_version:"0.0.0",
+          portability:$manifest[0].portability,
+          access:$manifest[0].access,
+          config:$config[0],
+          secrets:$secrets[0],
+          templates:{"default.yaml":(($manifest[0].templates["default.yaml"] // {}) + {content:$template})},
+          ssh:{identities:{},known_hosts:""}
+        }
+    ' > "$updater/state.json.age"
+    printf '%s\n' '{"storage_version":1,"encryption":"age"}' > "$updater/storage.json"
+    printf '%s\n' age1testrecipient > "$updater/recipient.txt"
+    printf '%s\n' AGE-SECRET-KEY-TEST > "$updater/unlock.age"
+    rm -f "$updater/config.json" "$updater/secrets.json" "$updater/manifest.json"
+    rm -rf "$updater/templates" "$updater/ssh"
+    git -C "$updater" add -A
+    git -C "$updater" commit -m empty-diagnostic-encrypted-state >/dev/null
+    git -C "$updater" push origin main >/dev/null
+
+    cat >> "$APP/modules/github-config.sh" <<'EOF'
+github_config_rewrap_master() { _github_clear_error; return 1; }
+github_config_rotate_vault_key() { _github_clear_error; return 1; }
+github_config_import_recovery() { _github_clear_error; return 1; }
+github_config_switch_local() { _github_clear_error; return 1; }
+EOF
+
+    run bash -c 'printf "access-pass\nn\nY\nR\nY\nV\nY\nI\n/tmp/missing-recovery-key\nY\nE\n0\n" | "$0"' \
+        "$APP/remote-control-essence.sh"
+    assert_success
+    assert_output --partial "Не удалось изменить пароль доступа."
+    assert_output --partial "Не удалось создать новый ключ шифрования."
+    assert_output --partial "Не удалось импортировать ключ восстановления."
+    assert_output --partial "Не удалось перейти на локальную конфигурацию."
+    assert_output --partial "Выход."
+}
 @test "ready GitHub state with nodes does not show deferred SSH action" {
     run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
     assert_success
@@ -754,6 +846,16 @@ EOF
     assert_success
     assert_output --partial "Essence Remote Management"
     [[ "$output" != *"Доступ запрещён."* ]] || return 1
+
+    local rounds_hash config_dir="$HOME/.config/remote-control-essence"
+    rounds_hash=$(openssl passwd -6 -salt 'rounds=100000$fixture' secret-pass) || return 1
+    _publish_remote_access_hash "$rounds_hash" || return 1
+
+    run bash -c 'printf "secret-pass\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    assert_output --partial "Essence Remote Management"
+    [[ "$output" != *"Доступ запрещён."* ]] || return 1
+    [[ "$(cat "$config_dir/.auth")" == "$rounds_hash" ]] || return 1
 }
 @test "existing plaintext vault can load remote without changing local files" {
     _prepare_existing_plaintext_vault
@@ -1312,6 +1414,7 @@ EOF
     _establish_materialization_source
     _install_materialization_fault_wrappers
     _publish_remote_access_null auth-null || return 1
+
     local old_runtime old_auth_hash old_auth_mode old_temps new_runtime new_temps
     local marker="$BATS_TEST_TMPDIR/materialize-auth-rm.calls" failures=0
     old_runtime=$(_runtime_fingerprint "$MATERIALIZE_RUNTIME") || return 1
@@ -1345,6 +1448,51 @@ EOF
 
     [[ "$failures" -eq 0 ]] || return 1
 }
+@test "failed runtime restore preserves the retired runtime backup" {
+    _establish_materialization_source
+    _install_materialization_fault_wrappers
+    _publish_plain_marker runtime-rollback || return 1
+    local old_runtime retired marker="$BATS_TEST_TMPDIR/materialize-runtime-rollback.calls"
+    old_runtime=$(_runtime_fingerprint "$MATERIALIZE_RUNTIME") || return 1
+    rm -f "$marker" || return 1
+
+    run env MATERIALIZE_FAULT=runtime-rollback MATERIALIZE_FAULT_MARKER="$marker" \
+        bash -c 'printf "secret-pass\n0\n" | "$0"' \
+        "$APP/remote-control-essence.sh"
+    assert_failure
+    [[ "$(cat "$marker")" == $'publish-fail\nruntime-restore-fail' ]] || return 1
+    retired=$(find "$MATERIALIZE_CONFIG_DIR" -mindepth 1 -maxdepth 1 \
+        -name '.github-runtime.retired.*' -print)
+    [[ "$(printf '%s\n' "$retired" | sed '/^$/d' | wc -l | tr -d ' ')" == 1 ]] || return 1
+    [[ "$(_runtime_fingerprint "$retired")" == "$old_runtime" ]] || return 1
+    [[ ! -e "$MATERIALIZE_RUNTIME" ]] || return 1
+    assert_output --partial "Резервные копии сохранены в $MATERIALIZE_CONFIG_DIR."
+}
+
+@test "failed auth restore preserves the auth backup after runtime rollback" {
+    _establish_materialization_source
+    _install_materialization_fault_wrappers
+    _publish_remote_access_null auth-rollback || return 1
+    local old_runtime old_auth_hash old_auth_mode backup marker="$BATS_TEST_TMPDIR/materialize-auth-rollback.calls"
+    old_runtime=$(_runtime_fingerprint "$MATERIALIZE_RUNTIME") || return 1
+    old_auth_hash=$(_hash_file "$MATERIALIZE_CONFIG_DIR/.auth") || return 1
+    old_auth_mode=$(_file_mode "$MATERIALIZE_CONFIG_DIR/.auth") || return 1
+    rm -f "$marker" || return 1
+
+    run env MATERIALIZE_FAULT=auth-rollback MATERIALIZE_FAULT_MARKER="$marker" \
+        bash -c 'printf "secret-pass\n0\n" | "$0"' \
+        "$APP/remote-control-essence.sh"
+    assert_failure
+    [[ "$(cat "$marker")" == $'auth-rm\nauth-restore-fail' ]] || return 1
+    [[ "$(_runtime_fingerprint "$MATERIALIZE_RUNTIME")" == "$old_runtime" ]] || return 1
+    backup=$(find "$MATERIALIZE_CONFIG_DIR" -mindepth 1 -maxdepth 1 \
+        -name '.auth.backup.*' -print)
+    [[ "$(printf '%s\n' "$backup" | sed '/^$/d' | wc -l | tr -d ' ')" == 1 ]] || return 1
+    [[ "$(_hash_file "$backup")" == "$old_auth_hash" ]] || return 1
+    [[ "$(_file_mode "$backup")" == "$old_auth_mode" ]] || return 1
+    [[ "$old_auth_mode" == 600 ]] || return 1
+    assert_output --partial "Резервные копии сохранены в $MATERIALIZE_CONFIG_DIR."
+}
 
 @test "startup ensures the complete local dependency set and starts one update check" {
     local deps_log="$BATS_TEST_TMPDIR/ensure-deps.calls"
@@ -1368,6 +1516,12 @@ EOF
     for dep in jq openssl ssh scp base64; do
         count=$(grep -c "^${dep}$" "$deps_log" 2>/dev/null || true)
         [[ "$count" -eq 1 ]] || failures=$((failures + 1))
+    done
+    for ((count=0; count<50; count++)); do
+        if [[ -f "$update_log" ]] && grep -q '^update$' "$update_log"; then
+            break
+        fi
+        sleep 0.1
     done
     count=$(grep -c '^update$' "$update_log" 2>/dev/null || true)
     [[ "$count" -eq 1 ]] || failures=$((failures + 1))

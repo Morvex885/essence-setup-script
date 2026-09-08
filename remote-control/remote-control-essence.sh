@@ -110,7 +110,7 @@ _materialize_script_auth_from_state() {
         fi
         return 0
     fi
-    if [[ ! "$password_hash" =~ ^\$6\$[./A-Za-z0-9]+\$[./A-Za-z0-9]+$ ]]; then
+    if ! _script_password_hash_salt "$password_hash" >/dev/null; then
         _github_record_error "восстановление пароля запуска" \
             "Хеш пароля запуска в состоянии GitHub имеет некорректный формат."
         return 1
@@ -139,7 +139,7 @@ _config_source_materialize_state() {
     local old_manifest="${STATE_MANIFEST:-}" old_templates="${TEMPLATES_DIR:-}"
     local old_identities="${SSH_IDENTITIES_DIR:-}" old_hosts="${SSH_KNOWN_HOSTS:-}"
     local old_auth_file="${SCRIPT_AUTH_FILE:-}" had_runtime=false had_auth=false
-    local rollback_ok=true
+    local rollback_ok=true rollback_backup_preserved=false
     stage=$(umask 077; mktemp -d "$CONFIG_DIR/.github-runtime.stage.XXXXXX") || {
         _github_record_error "подготовка рабочего состояния" \
             "Не удалось создать защищённый каталог staging."
@@ -296,12 +296,25 @@ _config_source_materialize_state() {
         rollback_ok=true
         if [[ "$had_runtime" == true ]] && ! mv "$retired" "$runtime"; then
             rollback_ok=false
+            rollback_backup_preserved=true
         fi
-        rm -rf "$publish" "$retired" || rollback_ok=false
-        rm -f "$auth_backup" || rollback_ok=false
+        if ! rm -rf "$publish"; then
+            rollback_ok=false
+        fi
+        if [[ "$rollback_backup_preserved" != true && -n "$retired" ]] &&
+           ! rm -rf "$retired"; then
+            rollback_ok=false
+        fi
+        if [[ -n "$auth_backup" ]] && ! rm -f "$auth_backup"; then
+            rollback_ok=false
+            rollback_backup_preserved=true
+        fi
         if [[ "$rollback_ok" == true ]]; then
             _github_record_error "публикация рабочего состояния" \
                 "Не удалось атомарно опубликовать новое рабочее состояние."
+        elif [[ "$rollback_backup_preserved" == true ]]; then
+            _github_record_error "откат публикации рабочего состояния" \
+                "Не удалось восстановить прежнее рабочее состояние после ошибки публикации. Резервные копии сохранены в $CONFIG_DIR."
         else
             _github_record_error "откат публикации рабочего состояния" \
                 "Не удалось восстановить прежнее рабочее состояние после ошибки публикации."
@@ -312,20 +325,34 @@ _config_source_materialize_state() {
     if ! _materialize_script_auth_from_state "$logical"; then
         local auth_stage="${GITHUB_LAST_STAGE:-}" auth_detail="${GITHUB_LAST_ERROR:-}"
         rollback_ok=true
-        rm -rf "$runtime" || rollback_ok=false
-        if [[ "$had_runtime" == true ]] && ! mv "$retired" "$runtime"; then
+        rollback_backup_preserved=false
+        if ! rm -rf "$runtime"; then
             rollback_ok=false
+            rollback_backup_preserved=true
+        else
+            if [[ "$had_runtime" == true ]] && ! mv "$retired" "$runtime"; then
+                rollback_ok=false
+                rollback_backup_preserved=true
+            fi
         fi
         if [[ "$had_auth" == true ]]; then
-            mv "$auth_backup" "$SCRIPT_AUTH_FILE" || rollback_ok=false
-        else
-            rm -f "$SCRIPT_AUTH_FILE" || rollback_ok=false
+            if ! mv "$auth_backup" "$SCRIPT_AUTH_FILE"; then
+                rollback_ok=false
+                rollback_backup_preserved=true
+            fi
+        elif ! rm -f "$SCRIPT_AUTH_FILE"; then
+            rollback_ok=false
         fi
-        rm -rf "$publish" "$retired" || rollback_ok=false
-        rm -f "$auth_backup" || rollback_ok=false
+        if [[ "$rollback_backup_preserved" != true ]]; then
+            [[ -z "$retired" ]] || { rm -rf "$retired" || rollback_ok=false; }
+            [[ -z "$auth_backup" ]] || { rm -f "$auth_backup" || rollback_ok=false; }
+        fi
         if [[ "$rollback_ok" == true ]]; then
             GITHUB_LAST_STAGE="$auth_stage"
             GITHUB_LAST_ERROR="$auth_detail"
+        elif [[ "$rollback_backup_preserved" == true ]]; then
+            _github_record_error "откат рабочего состояния и пароля" \
+                "Не удалось полностью восстановить рабочее состояние после ошибки пароля запуска. Резервные копии сохранены в $CONFIG_DIR."
         else
             _github_record_error "откат рабочего состояния и пароля" \
                 "Не удалось полностью восстановить рабочее состояние после ошибки пароля запуска."
@@ -670,8 +697,12 @@ github_source_menu() {
             elif github_config_rewrap_master; then
                 success "Пароль доступа изменён; ключ шифрования остался прежним."
             else
-                [[ -n "${GITHUB_LAST_ERROR:-}" ]] &&
+                if [[ -n "${GITHUB_LAST_ERROR:-}" ]]; then
                     _github_report_last_error "Не удалось изменить пароль доступа"
+                else
+                    warn "Не удалось изменить пароль доступа."
+                fi
+                return 1
             fi
             ;;
         V|v)
@@ -680,8 +711,12 @@ github_source_menu() {
             elif github_config_rotate_vault_key; then
                 success "Новый ключ создан; текущая конфигурация зашифрована заново."
             else
-                [[ -n "${GITHUB_LAST_ERROR:-}" ]] &&
+                if [[ -n "${GITHUB_LAST_ERROR:-}" ]]; then
                     _github_report_last_error "Не удалось создать новый ключ шифрования"
+                else
+                    warn "Не удалось создать новый ключ шифрования."
+                fi
+                return 1
             fi
             ;;
         I|i)
@@ -692,8 +727,12 @@ github_source_menu() {
                 if github_config_import_recovery "$_recovery"; then
                     success "Ключ восстановления импортирован для текущего сеанса."
                 else
-                    [[ -n "${GITHUB_LAST_ERROR:-}" ]] &&
+                    if [[ -n "${GITHUB_LAST_ERROR:-}" ]]; then
                         _github_report_last_error "Не удалось импортировать ключ восстановления"
+                    else
+                        warn "Не удалось импортировать ключ восстановления."
+                    fi
+                    return 1
                 fi
             fi
             ;;
@@ -701,8 +740,12 @@ github_source_menu() {
             if github_config_switch_local; then
                 success "Используется локальная конфигурация; синхронизация с GitHub отключена."
             else
-                [[ -n "${GITHUB_LAST_ERROR:-}" ]] &&
+                if [[ -n "${GITHUB_LAST_ERROR:-}" ]]; then
                     _github_report_last_error "Не удалось перейти на локальную конфигурацию"
+                else
+                    warn "Не удалось перейти на локальную конфигурацию."
+                fi
+                return 1
             fi
             ;;
         D|d)
