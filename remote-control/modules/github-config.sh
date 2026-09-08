@@ -17,11 +17,16 @@ GITHUB_WORKTREE="${GITHUB_WORKTREE:-}"
 GITHUB_REMOTE="${GITHUB_REMOTE:-}"
 GITHUB_LAST_STAGE="${GITHUB_LAST_STAGE:-}"
 GITHUB_LAST_ERROR="${GITHUB_LAST_ERROR:-}"
+GITHUB_LAST_HINT="${GITHUB_LAST_HINT:-}"
 GITHUB_LAST_AUTH_RELEVANT="${GITHUB_LAST_AUTH_RELEVANT:-false}"
+GITHUB_SESSION_REMOTE="${GITHUB_SESSION_REMOTE:-}"
+GITHUB_SESSION_BRANCH="${GITHUB_SESSION_BRANCH:-}"
+GITHUB_SESSION_ORIGIN="${GITHUB_SESSION_ORIGIN:-}"
 
 _github_clear_error() {
     GITHUB_LAST_STAGE=""
     GITHUB_LAST_ERROR=""
+    GITHUB_LAST_HINT=""
     GITHUB_LAST_AUTH_RELEVANT=false
 }
 
@@ -29,41 +34,74 @@ _github_safe_error() {
     local message="${1:-}"
     message=$(printf '%s' "$message" |
         LC_ALL=C tr -cd '\11\12\15\40-\176\200-\377' |
-        tr '\r\n' '  ' |
+        tr '\r' ' ' |
+        awk 'BEGIN { first=1 } {
+            if (!first) printf " __GH_NL__ "
+            printf "%s", $0
+            first=0
+        } END { print "" }' |
         sed -E \
-            -e 's#(https?://)[^/@[:space:]]+:[^/@[:space:]]+@#\1[скрыто]@#g' \
-            -e 's/(github_pat_|gh[pousr]_)[A-Za-z0-9_]+/[скрыто]/g' \
-            -e 's/([Aa]uthorization:[[:space:]]*(Bearer|token)[[:space:]]+)[^[:space:]]+/\1[скрыто]/g' \
-            -e 's/([Tt]oken|[Pp]assword|[Pp]asswd|[Ss]ecret)([=:][[:space:]]*)[^[:space:]]+/\1\2[скрыто]/g')
+            -e 's#([Hh][Tt][Tt][Pp][Ss]?://)[^/@[:space:]]+:[^/@[:space:]]+@#\1[скрыто]@#g' \
+            -e 's/([Gg][Ii][Tt][Hh][Uu][Bb]_[Pp][Aa][Tt]_|[Gg][Hh][PpOoUuSsRr]_)[[:space:]]*(__GH_NL__[[:space:]]*)?[A-Za-z0-9_]+/[скрыто]/g' \
+            -e 's/([Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn][[:space:]]*:[[:space:]]*(__GH_NL__[[:space:]]*)?([Bb][Ee][Aa][Rr][Ee][Rr]|[Tt][Oo][Kk][Ee][Nn])[[:space:]]+)[^[:space:]]+/\1[скрыто]/g' \
+            -e 's/(([Bb][Ee][Aa][Rr][Ee][Rr]|[Tt][Oo][Kk][Ee][Nn])[[:space:]]+(__GH_NL__[[:space:]]+)?)[^[:space:]]+/\1[скрыто]/g' \
+            -e 's/(([Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Pp][Aa][Ss][Ss][Ww][Dd]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Tt][Oo][Kk][Ee][Nn])([[:space:]]|__GH_NL__)*[=:]([[:space:]]|__GH_NL__)*)[^[:space:]]+([[:space:]]+__GH_NL__[[:space:]]+[^[:space:]]+)?/\1[скрыто]/g' \
+            -e 's/(([Bb][Ee][Aa][Rr][Ee][Rr]|[Tt][Oo][Kk][Ee][Nn])[[:space:]]+(__GH_NL__[[:space:]]+)?)[^[:space:]]+/\1[скрыто]/g' \
+            -e 's/[[:space:]]*__GH_NL__[[:space:]]*/ /g')
     message="${message:0:500}"
     printf '%s\n' "${message:-операция завершилась с ошибкой без дополнительного сообщения}"
 }
 
 _github_record_error() {
-    GITHUB_LAST_STAGE="$1"
+    GITHUB_LAST_STAGE=$(_github_safe_error "${1:-}")
     GITHUB_LAST_ERROR=$(_github_safe_error "${2:-}")
     GITHUB_LAST_AUTH_RELEVANT="${3:-false}"
+    if [[ -n "${4:-}" ]]; then
+        GITHUB_LAST_HINT=$(_github_safe_error "$4")
+    else
+        GITHUB_LAST_HINT=""
+    fi
+}
+_github_ensure_error() {
+    if [[ -z ${GITHUB_LAST_ERROR:-} ]]; then
+        _github_record_error "$1" "${2:-}" "${3:-false}" "${4:-}"
+    fi
+    return 1
 }
 
 _github_auth_failure_confirmed() {
-    local gh="${GH_BIN:-gh}" output
-    command -v "$gh" >/dev/null 2>&1 || return 1
-    if output=$(NO_COLOR=1 GH_PROMPT_DISABLED=1 "$gh" auth status \
-        --hostname github.com 2>&1); then
-        return 1
-    fi
-    printf '%s' "$output" |
-        grep -Eiq '(not logged|not authenticated|authentication|log in|login|token.*(invalid|expired))'
+    local output="${1:-}"
+    printf '%s\n' "$output" | grep -Eiq \
+        '(^|[^0-9])401([^0-9]|$)|bad credentials|not logged|not authenticated|authentication (failed|required)|token[^[:alnum:]]*(is )?(invalid|expired|revoked)'
 }
 _github_should_show_auth_hint() {
-    [[ ${GITHUB_LAST_AUTH_RELEVANT:-false} == true ]] || return 1
-    _github_auth_failure_confirmed
+    [[ ${GITHUB_LAST_AUTH_RELEVANT:-false} == true ]]
+}
+_github_report_last_error() {
+    local prefix
+    prefix=$(_github_safe_error "${1:-Не удалось выполнить операцию GitHub}")
+    warn "${prefix} (этап: ${GITHUB_LAST_STAGE:-неизвестный этап}): ${GITHUB_LAST_ERROR:-причина не указана}"
+    if [[ -n ${GITHUB_LAST_HINT:-} ]]; then
+        warn "$GITHUB_LAST_HINT"
+    elif _github_should_show_auth_hint; then
+        warn "GitHub CLI сообщает, что вход не выполнен. Выполните: gh auth login --hostname github.com"
+    fi
 }
 
-
-_github_die() { warn "$*" 2>/dev/null || printf '%s\n' "$*" >&2; return 1; }
-_github_require() { command -v "$1" >/dev/null 2>&1 || { _github_die "Не найдено: $1"; return 1; }; }
-_github_mkdir_secure() { umask 077; local dir; for dir in "$@"; do mkdir -p "$dir"; chmod 700 "$dir"; done; }
+_github_require() { command -v "$1" >/dev/null 2>&1; }
+_github_mkdir_secure() {
+    umask 077
+    local dir
+    for dir in "$@"; do
+        if [[ -e "$dir" || -L "$dir" ]]; then
+            [[ -d "$dir" && ! -L "$dir" ]] || return 1
+        else
+            mkdir -p "$dir" || return 1
+        fi
+        [[ -d "$dir" && ! -L "$dir" ]] || return 1
+        chmod 700 "$dir" || return 1
+    done
+}
 _github_ensure_deps() {
     local mode="${1:-}" remote="${2:-${GITHUB_REMOTE:-}}"
     if declare -F ensure_dep >/dev/null 2>&1; then
@@ -79,6 +117,7 @@ _github_ensure_deps() {
 }
 _github_select_account() {
     local gh="${GH_BIN:-gh}" login answer switch_stderr switch_output
+    _github_clear_error
     if ! _github_ensure_deps; then
         _github_record_error "проверка зависимостей" \
             "Не удалось подготовить GitHub CLI для выбора аккаунта."
@@ -91,14 +130,15 @@ _github_select_account() {
     fi
     while :; do
         if ! login=$(NO_COLOR=1 GH_PROMPT_DISABLED=1 "$gh" api user --jq .login 2>&1); then
-            _github_record_error "определение пользователя GitHub" \
-                "${login}. Выполните: gh auth login." true
+            local auth_relevant=false
+            _github_auth_failure_confirmed "$login" && auth_relevant=true
+            _github_record_error "определение пользователя GitHub" "$login" "$auth_relevant"
             return 1
         fi
         login=$(printf '%s' "$login" | tr -d '\r\n')
         [[ -n "$login" ]] || {
             _github_record_error "определение пользователя GitHub" \
-                "GitHub CLI не вернул имя активного аккаунта." true
+                "GitHub CLI не вернул имя активного аккаунта."
             return 1
         }
         info "GitHub-аккаунт для репозитория конфигурации: $login"
@@ -119,7 +159,7 @@ _github_select_account() {
             2)
                 switch_stderr=$(umask 077; mktemp "${TMPDIR:-/tmp}/github-switch.XXXXXX") || {
                     _github_record_error "переключение аккаунта GitHub" \
-                        "Не удалось подготовить безопасную диагностику переключения аккаунта." true
+                        "Не удалось подготовить безопасную диагностику переключения аккаунта."
                     return 1
                 }
                 if ! NO_COLOR=1 "$gh" auth switch --hostname github.com \
@@ -127,7 +167,7 @@ _github_select_account() {
                     switch_output=$(cat "$switch_stderr")
                     rm -f "$switch_stderr"
                     _github_record_error "переключение аккаунта GitHub" \
-                        "${switch_output:-Не удалось переключить аккаунт GitHub.} Выполните: gh auth login." true
+                        "${switch_output:-Не удалось переключить аккаунт GitHub.}"
                     return 1
                 fi
                 rm -f "$switch_stderr"
@@ -148,28 +188,73 @@ _github_run_with_timeout() {
 }
 
 _github_validate_tree() {
-    local root="$1" mode="$2" path rel name
-    while IFS= read -r path; do
-        [[ "$path" == "$root/.git" || "$path" == "$root/.git/"* ]] && continue
+    local root="$1" mode="${2:-auto}" list path rel name kind
+    if [[ ! -d "$root" || -L "$root" ]]; then
+        _github_record_error "проверка файлов репозитория GitHub" \
+            "Корень рабочей копии GitHub не является обычным каталогом."
+        return 1
+    fi
+    if [[ -e "$root/.git" || -L "$root/.git" ]]; then
+        if [[ -L "$root/.git" ]] ||
+           { [[ ! -f "$root/.git" ]] && [[ ! -d "$root/.git" ]]; }; then
+            _github_record_error "проверка файлов репозитория GitHub" \
+                "Служебный путь .git имеет недопустимый тип."
+            return 1
+        fi
+    fi
+    list=$(umask 077; mktemp "${TMPDIR:-/tmp}/github-tree.XXXXXX") || {
+        _github_record_error "проверка файлов репозитория GitHub" \
+            "Не удалось подготовить безопасный список файлов."
+        return 1
+    }
+    if ! find "$root" -mindepth 1 -path "$root/.git" -prune -o -print0 > "$list"; then
+        rm -f "$list"
+        _github_record_error "проверка файлов репозитория GitHub" \
+            "Не удалось перечислить файлы рабочей копии GitHub."
+        return 1
+    fi
+    while IFS= read -r -d '' path; do
         rel="${path#"$root"/}"
-        case "$mode:$rel" in
-            age:storage.json|age:recipient.txt|age:unlock.age|age:state.json.age)
+        if [[ -L "$path" ]]; then
+            kind=link
+        elif [[ -f "$path" ]]; then
+            kind=file
+        elif [[ -d "$path" ]]; then
+            kind=dir
+        else
+            kind=special
+        fi
+        case "$mode:$kind:$rel" in
+            auto:file:storage.json|auto:file:recipient.txt|auto:file:unlock.age|auto:file:state.json.age|\
+            auto:file:config.json|auto:file:secrets.json|auto:file:manifest.json|auto:file:ssh/known_hosts|\
+            age:file:storage.json|age:file:recipient.txt|age:file:unlock.age|age:file:state.json.age|\
+            none:file:storage.json|none:file:config.json|none:file:secrets.json|none:file:manifest.json|none:file:ssh/known_hosts)
                 ;;
-            none:storage.json|none:config.json|none:secrets.json|none:manifest.json|none:ssh/known_hosts)
+            auto:dir:templates|auto:dir:ssh|auto:dir:ssh/identities|\
+            none:dir:templates|none:dir:ssh|none:dir:ssh/identities)
                 ;;
-            none:templates/*.yaml)
+            auto:file:templates/*.yaml|none:file:templates/*.yaml)
                 name="${rel#templates/}"
-                [[ "$name" =~ ^[A-Za-z0-9._-]+\.yaml$ ]] || return 1
+                [[ "$name" =~ ^[A-Za-z0-9._-]+\.yaml$ ]] || kind=invalid
                 ;;
-            none:ssh/identities/*|none:ssh/identities/*.pub)
+            auto:file:ssh/identities/*|none:file:ssh/identities/*)
                 name="${rel#ssh/identities/}"
-                [[ "$name" =~ ^[0-9a-fA-F]{32}(\.pub)?$ ]] || return 1
+                [[ "$name" =~ ^[0-9a-fA-F]{32}(\.pub)?$ ]] || kind=invalid
                 ;;
-            *)
-                return 1
-                ;;
+            *) kind=invalid ;;
         esac
-    done < <(find "$root" -type f -print 2>/dev/null)
+        if [[ "$kind" == invalid || "$kind" == link || "$kind" == special ]]; then
+            rm -f "$list"
+            _github_record_error "проверка файлов репозитория GitHub" \
+                "В хранилище конфигурации GitHub обнаружен недопустимый путь: $rel"
+            return 1
+        fi
+    done < "$list"
+    if ! rm -f "$list"; then
+        _github_record_error "проверка файлов репозитория GitHub" \
+            "Не удалось удалить временный список файлов."
+        return 1
+    fi
 }
 
 _github_prompt_storage_mode() {
@@ -214,105 +299,286 @@ _github_prompt_remember_unlock() {
 }
 
 _github_storage_init() {
-    local mode=${1:-${GITHUB_STORAGE_MODE:-}}
-    [[ $mode == age || $mode == none ]] || return 1
+    local mode=${1:-${GITHUB_STORAGE_MODE:-}} tmp
+    [[ $mode == age || $mode == none ]] || {
+        _github_record_error "подготовка параметров хранения GitHub" \
+            "Указан неподдерживаемый режим хранения конфигурации GitHub."
+        return 1
+    }
+    _github_validate_tree "$GITHUB_WORKTREE" auto || return 1
+    if [[ -L "$GITHUB_WORKTREE/storage.json" ]] ||
+       { [[ -e "$GITHUB_WORKTREE/storage.json" ]] &&
+         ! _github_exact_regular_file "$GITHUB_WORKTREE/storage.json"; }; then
+        _github_record_error "сохранение параметров хранения GitHub" \
+            "Путь storage.json имеет недопустимый тип."
+        return 1
+    fi
+    tmp=$(umask 077; mktemp "$GITHUB_WORKTREE/.storage.json.XXXXXX") || return 1
+    if ! printf '{"storage_version":1,"encryption":"%s"}\n' "$mode" > "$tmp" ||
+       ! chmod 644 "$tmp" || ! mv "$tmp" "$GITHUB_WORKTREE/storage.json"; then
+        rm -f "$tmp"
+        _github_record_error "сохранение параметров хранения GitHub" \
+            "Не удалось атомарно сохранить параметры хранения конфигурации GitHub."
+        return 1
+    fi
     GITHUB_STORAGE_MODE=$mode
-    printf '{"storage_version":1,"encryption":"%s"}\n' "$mode" > "$GITHUB_WORKTREE/storage.json"
-    chmod 644 "$GITHUB_WORKTREE/storage.json"
 }
 _github_storage_read() {
-    [[ -s "$GITHUB_WORKTREE/storage.json" ]] || return 1
+    _github_validate_tree "$GITHUB_WORKTREE" auto || return 1
+    _github_exact_regular_file "$GITHUB_WORKTREE/storage.json" &&
+        [[ -s "$GITHUB_WORKTREE/storage.json" ]] || {
+        _github_record_error "чтение параметров хранения GitHub" \
+            "Не удалось прочитать параметры хранения конфигурации GitHub."
+        return 1
+    }
     GITHUB_STORAGE_MODE=$(jq -er '
         select(type=="object" and .storage_version == 1 and
             (.encryption == "age" or .encryption == "none")) | .encryption
-    ' "$GITHUB_WORKTREE/storage.json" 2>/dev/null) || return 1
+    ' "$GITHUB_WORKTREE/storage.json" 2>/dev/null) || {
+        _github_record_error "проверка параметров хранения GitHub" \
+            "Параметры хранения конфигурации GitHub имеют некорректный формат."
+        return 1
+    }
 }
 github_config_prompt_master() {
+    _github_clear_error
     local first second
-    read -rsp "Введите пароль доступа к зашифрованной конфигурации: " first; printf '\n'
-    [[ -n "$first" ]] || return 1
-    read -rsp "Повторите пароль доступа: " second; printf '\n'
-    [[ "$first" == "$second" ]] || return 1
+    if ! read -rsp "Введите пароль доступа к зашифрованной конфигурации: " first; then
+        printf '\n'
+        _github_record_error "ввод пароля шифрования" "Не удалось прочитать пароль доступа."
+        return 1
+    fi
+    printf '\n'
+    [[ -n "$first" ]] || {
+        _github_record_error "ввод пароля шифрования" \
+            "Пароль доступа не может быть пустым."
+        return 1
+    }
+    if ! read -rsp "Повторите пароль доступа: " second; then
+        printf '\n'
+        _github_record_error "ввод пароля шифрования" "Не удалось прочитать пароль доступа."
+        return 1
+    fi
+    printf '\n'
+    [[ "$first" == "$second" ]] || {
+        _github_record_error "ввод пароля шифрования" \
+            "Введённые пароли доступа не совпадают."
+        return 1
+    }
     GITHUB_MASTER_PASSWORD="$first"
 }
 github_config_age_init() {
-    _github_require "$AGE_BIN" || return 1
+    _github_clear_error
+    if ! _github_require "$AGE_BIN"; then
+        _github_record_error "проверка зависимостей" "Не найдена команда age: $AGE_BIN."
+        return 1
+    fi
     github_config_prompt_master || return 1
-    if ! _github_mkdir_secure "$GITHUB_CREDENTIALS_DIR"; then
+    if ! _github_mkdir_secure "$GITHUB_CREDENTIALS_DIR" ||
+       ! _github_validate_tree "$GITHUB_WORKTREE" auto; then
         unset GITHUB_MASTER_PASSWORD
+        _github_ensure_error "подготовка локального ключа" \
+            "Не удалось подготовить защищённые пути ключа."
         return 1
     fi
-    local identity="$CONFIG_DIR/github-identity.tmp" recipient
-    rm -f "$identity"
-    umask 077
-    if command -v "$AGE_KEYGEN_BIN" >/dev/null 2>&1; then
-        "$AGE_KEYGEN_BIN" > "$identity" 2>/dev/null || {
-            rm -f "$identity"
-            unset GITHUB_MASTER_PASSWORD
-            return 1
-        }
-    elif ! "$AGE_BIN" -gen-key > "$identity" 2>/dev/null &&
-         ! "$AGE_BIN" -keygen > "$identity" 2>/dev/null; then
-        rm -f "$identity"
+    local identity recipient recipient_tmp unlock_tmp backup path failed=false
+    local had_recipient=false had_unlock=false
+    local old_identity="${GITHUB_IDENTITY:-}" old_recipient="${GITHUB_RECIPIENT:-}"
+    identity=$(_github_new_private_path "$CONFIG_DIR/.github-identity.XXXXXX") || {
         unset GITHUB_MASTER_PASSWORD
         return 1
-    fi
-    recipient=$(sed -n 's/^# public key: *//p' "$identity" | tr -d '\r\n')
-    [[ -n "$recipient" ]] || {
+    }
+    recipient_tmp=$(umask 077; mktemp "$GITHUB_WORKTREE/.recipient.XXXXXX") || {
         rm -f "$identity"
         unset GITHUB_MASTER_PASSWORD
         return 1
     }
-    GITHUB_RECIPIENT="$recipient"; export GITHUB_RECIPIENT GITHUB_IDENTITY="$identity"
-    if ! printf '%s\n' "$recipient" > "$GITHUB_WORKTREE/recipient.txt" ||
-       ! chmod 644 "$GITHUB_WORKTREE/recipient.txt"; then
-        rm -f "$identity" "$GITHUB_WORKTREE/recipient.txt"
+    unlock_tmp=$(_github_new_private_path "$GITHUB_WORKTREE/.unlock.XXXXXX") || {
+        _github_remove_private_path "$identity"
+        rm -f "$recipient_tmp"
         unset GITHUB_MASTER_PASSWORD
         return 1
+    }
+    if command -v "$AGE_KEYGEN_BIN" >/dev/null 2>&1; then
+        (umask 077; "$AGE_KEYGEN_BIN" > "$identity" 2>/dev/null) || failed=true
+    else
+        (umask 077; "$AGE_BIN" -gen-key > "$identity" 2>/dev/null) ||
+            (umask 077; "$AGE_BIN" -keygen > "$identity" 2>/dev/null) ||
+            failed=true
     fi
-    if ! printf '%s\n%s\n' "$GITHUB_MASTER_PASSWORD" "$GITHUB_MASTER_PASSWORD" |
-        "$AGE_BIN" -p -o "$GITHUB_WORKTREE/unlock.age" "$identity"; then
-        rm -f "$identity" "$GITHUB_WORKTREE/unlock.age" "$GITHUB_WORKTREE/recipient.txt"
-        unset GITHUB_MASTER_PASSWORD
-        return 1
+    recipient=$(sed -n 's/^# public key: *//p' "$identity" 2>/dev/null |
+        tr -d '\r\n') || failed=true
+    [[ -n "$recipient" ]] || failed=true
+    if [[ "$failed" != true ]] &&
+       { ! printf '%s\n' "$recipient" > "$recipient_tmp" ||
+         ! chmod 644 "$recipient_tmp" ||
+         ! _github_exact_regular_file "$identity" ||
+         ! chmod 600 "$identity" ||
+         ! (umask 077
+             printf '%s\n%s\n' "$GITHUB_MASTER_PASSWORD" "$GITHUB_MASTER_PASSWORD" |
+                 "$AGE_BIN" -p -o "$unlock_tmp" "$identity" >/dev/null 2>&1
+         ) ||
+         ! _github_exact_regular_file "$unlock_tmp" ||
+         ! chmod 600 "$unlock_tmp"; }; then
+        failed=true
     fi
     unset GITHUB_MASTER_PASSWORD
-    chmod 600 "$GITHUB_WORKTREE/unlock.age" "$identity"
+    if [[ "$failed" == true ]]; then
+        _github_remove_private_path "$identity"
+        _github_remove_private_path "$unlock_tmp"
+        rm -f "$recipient_tmp"
+        GITHUB_IDENTITY="$old_identity"
+        GITHUB_RECIPIENT="$old_recipient"
+        _github_record_error "шифрование ключа конфигурации" \
+            "Не удалось подготовить атомарный комплект ключей age."
+        return 1
+    fi
+    backup=$(umask 077; mktemp -d "$CONFIG_DIR/.age-init-backup.XXXXXX") || {
+        _github_remove_private_path "$identity"
+        _github_remove_private_path "$unlock_tmp"
+        rm -f "$recipient_tmp"
+        GITHUB_IDENTITY="$old_identity"
+        GITHUB_RECIPIENT="$old_recipient"
+        return 1
+    }
+    for path in recipient.txt unlock.age; do
+        if [[ -e "$GITHUB_WORKTREE/$path" || -L "$GITHUB_WORKTREE/$path" ]]; then
+            case "$path" in
+                recipient.txt) had_recipient=true ;;
+                unlock.age) had_unlock=true ;;
+            esac
+            if ! cp -p "$GITHUB_WORKTREE/$path" "$backup/$path"; then
+                failed=true
+                break
+            fi
+        fi
+    done
+    if [[ "$failed" != true ]] &&
+       { ! mv "$recipient_tmp" "$GITHUB_WORKTREE/recipient.txt" ||
+         ! mv "$unlock_tmp" "$GITHUB_WORKTREE/unlock.age"; }; then
+        failed=true
+    fi
+    if [[ "$failed" == true ]]; then
+        _github_remove_private_path "$unlock_tmp"
+        _github_remove_private_path "$identity"
+        rm -f "$recipient_tmp"
+        if [[ -e "$backup/recipient.txt" ]]; then
+            mv "$backup/recipient.txt" "$GITHUB_WORKTREE/recipient.txt" || return 1
+        elif [[ "$had_recipient" != true ]]; then
+            rm -f "$GITHUB_WORKTREE/recipient.txt" || return 1
+        fi
+        if [[ -e "$backup/unlock.age" ]]; then
+            mv "$backup/unlock.age" "$GITHUB_WORKTREE/unlock.age" || return 1
+        elif [[ "$had_unlock" != true ]]; then
+            rm -f "$GITHUB_WORKTREE/unlock.age" || return 1
+        fi
+        rm -rf "$backup" || return 1
+        GITHUB_IDENTITY="$old_identity"
+        GITHUB_RECIPIENT="$old_recipient"
+        _github_record_error "сохранение параметров шифрования" \
+            "Не удалось опубликовать комплект ключей age."
+        return 1
+    fi
+    _github_remove_private_path "$unlock_tmp" ||
+        warn "Защищённый staging-каталог ключа требует ручной очистки."
+    GITHUB_IDENTITY="$identity"
+    GITHUB_RECIPIENT="$recipient"
+    export GITHUB_IDENTITY GITHUB_RECIPIENT
+    if ! rm -rf "$backup"; then
+        warn "Комплект ключей создан, но защищённая резервная копия требует ручной очистки: $backup"
+    fi
 }
 github_config_unlock() {
+    _github_clear_error
     local attempts=3 pass id="${GITHUB_UNLOCK_FILE:-}" check
-    if [[ -s "${GITHUB_IDENTITY:-}" ]]; then
-        local imported="$GITHUB_IDENTITY"
-        "$AGE_KEYGEN_BIN" -y "$imported" >/dev/null 2>&1 || {
-            rm -f "$imported"; unset GITHUB_IDENTITY
-        }
-        if [[ -s "${GITHUB_IDENTITY:-}" ]]; then
-            check=$(umask 077; mktemp "$CONFIG_DIR/.unlock-check.XXXXXX") || return 1
-            if "$AGE_BIN" -d -i "$GITHUB_IDENTITY" -o "$check" "$GITHUB_WORKTREE/unlock.age" >/dev/null 2>&1; then
-                rm -f "$check"
-                if _github_prompt_remember_unlock; then github_config_remember "$GITHUB_IDENTITY"; fi
-                return 0
+    local original_identity="${GITHUB_IDENTITY:-}" imported_valid=false
+    if _github_exact_regular_file "$original_identity" &&
+       [[ -s "$original_identity" ]] &&
+       "$AGE_KEYGEN_BIN" -y "$original_identity" >/dev/null 2>&1; then
+        imported_valid=true
+    fi
+    if [[ "$imported_valid" == true ]]; then
+        if ! check=$(_github_new_private_path "$CONFIG_DIR/.unlock-check.XXXXXX"); then
+            _github_record_error "расшифровка конфигурации GitHub" \
+                "Не удалось создать защищённый временный файл."
+            return 1
+        fi
+        if (umask 077
+            "$AGE_BIN" -d -i "$original_identity" -o "$check" \
+                "$GITHUB_WORKTREE/unlock.age" >/dev/null 2>&1
+        ) && _github_exact_regular_file "$check"; then
+            _github_remove_private_path "$check"
+            if _github_prompt_remember_unlock; then
+                if ! github_config_remember "$original_identity"; then
+                    warn "Не удалось сохранить ключ расшифровки на этом устройстве; текущий сеанс продолжится без сохранённого ключа."
+                    _github_clear_error
+                fi
             fi
-            rm -f "$check" "$imported"; unset GITHUB_IDENTITY
-        fi
-    fi
-    if [[ -s "$id" ]]; then
-        check=$(umask 077; mktemp "$CONFIG_DIR/.unlock-check.XXXXXX") || return 1
-        if "$AGE_BIN" -d -i "$id" -o "$check" "$GITHUB_WORKTREE/unlock.age" >/dev/null 2>&1; then
-            rm -f "$check"; GITHUB_IDENTITY="$id"; export GITHUB_IDENTITY; return 0
-        fi
-        rm -f "$check" "$id"; warn "Сохранённый ключ расшифровки недействителен и будет удалён."
-    fi
-    while (( attempts > 0 )); do
-        read -rsp "Введите пароль доступа к конфигурации (осталось попыток: $attempts): " pass; printf '\n'
-        check=$(umask 077; mktemp "$CONFIG_DIR/.unlock-check.XXXXXX") || return 1
-        if [[ -n "$pass" ]] && printf '%s\n' "$pass" | "$AGE_BIN" -d -p -o "$check" "$GITHUB_WORKTREE/unlock.age" >/dev/null 2>&1; then
-            GITHUB_IDENTITY="$check"; export GITHUB_IDENTITY
-            if _github_prompt_remember_unlock; then github_config_remember "$GITHUB_IDENTITY"; fi
+            GITHUB_IDENTITY="$original_identity"
+            export GITHUB_IDENTITY
             return 0
         fi
-        rm -f "$check"; attempts=$((attempts - 1))
+        _github_remove_private_path "$check"
+    fi
+    if [[ "$id" != "$original_identity" ]] &&
+       _github_exact_regular_file "$id" && [[ -s "$id" ]]; then
+        if ! check=$(_github_new_private_path "$CONFIG_DIR/.unlock-check.XXXXXX"); then
+            _github_record_error "расшифровка конфигурации GitHub" \
+                "Не удалось создать защищённый временный файл."
+            return 1
+        fi
+        if (umask 077
+            "$AGE_BIN" -d -i "$id" -o "$check" \
+                "$GITHUB_WORKTREE/unlock.age" >/dev/null 2>&1
+        ) && _github_exact_regular_file "$check"; then
+            _github_remove_private_path "$check"
+            GITHUB_IDENTITY="$id"
+            export GITHUB_IDENTITY
+            return 0
+        fi
+        _github_remove_private_path "$check"
+        warn "Сохранённый ключ расшифровки не подходит к текущему хранилищу."
+    fi
+    while (( attempts > 0 )); do
+        if ! read -rsp "Введите пароль доступа к конфигурации (осталось попыток: $attempts): " pass; then
+            printf '\n'
+            GITHUB_IDENTITY="$original_identity"
+            export GITHUB_IDENTITY
+            _github_record_error "расшифровка конфигурации GitHub" \
+                "Не удалось прочитать пароль доступа."
+            return 1
+        fi
+        printf '\n'
+        if ! check=$(_github_new_private_path "$CONFIG_DIR/.unlock-check.XXXXXX"); then
+            GITHUB_IDENTITY="$original_identity"
+            export GITHUB_IDENTITY
+            _github_record_error "расшифровка конфигурации GitHub" \
+                "Не удалось создать защищённый временный файл."
+            return 1
+        fi
+        if [[ -n "$pass" ]] &&
+           (umask 077
+               printf '%s\n' "$pass" |
+                   "$AGE_BIN" -d -p -o "$check" "$GITHUB_WORKTREE/unlock.age" \
+                       >/dev/null 2>&1
+           ) && _github_exact_regular_file "$check"; then
+            GITHUB_IDENTITY="$check"
+            export GITHUB_IDENTITY
+            if _github_prompt_remember_unlock; then
+                if ! github_config_remember "$GITHUB_IDENTITY"; then
+                    warn "Не удалось сохранить ключ расшифровки на этом устройстве; текущий сеанс продолжится без сохранённого ключа."
+                    _github_clear_error
+                fi
+            fi
+            return 0
+        fi
+        _github_remove_private_path "$check"
+        attempts=$((attempts - 1))
     done
+    GITHUB_IDENTITY="$original_identity"
+    export GITHUB_IDENTITY
+    _github_record_error "расшифровка конфигурации GitHub" \
+        "Не удалось разблокировать конфигурацию: пароль или ключ восстановления не подошёл."
     return 1
 }
 
@@ -321,57 +587,179 @@ _github_sha256() {
     else shasum -a 256 "$1" | cut -d' ' -f1
     fi
 }
-# Build logical state from the active runtime. state.sh may provide a richer
-# serializer; this fallback intentionally only reads files and never evals them.
+# Build logical state from the active runtime.
 github_config_serialize() {
     local out=${1:?output path} cfg=${2:-${CONFIG_JSON:?CONFIG_JSON is unset}}
-    local secrets=${SECRETS_JSON:-${CONFIG_DIR:-.}/secrets.json} manifest=${STATE_MANIFEST:-${CONFIG_DIR:-.}/manifest.json}
-    local known=${SSH_KNOWN_HOSTS:-${CONFIG_DIR:-.}/ssh/known_hosts} known_data="" tmp name content pub
-    [[ -f "$known" ]] && known_data=$(cat "$known")
-    [[ -f "$secrets" && -f "$manifest" ]] || return 1
-    jq -n --argjson config "$(cat "$cfg")" --slurpfile sec "$secrets" \
-      --slurpfile man "$manifest" --arg known "$known_data" --arg minimum "${CURRENT_VERSION:-0.0.0}" \
-      '{vault_version:1,minimum_remote_control_version:$minimum,portability:($man[0].portability // {status:"ready",issues:[]}),access:($man[0].access // {script_password_hash:null}),config:$config,secrets:($sec[0] // {node_passwords:{}}),templates:($man[0].templates // {}),ssh:{identities:{},known_hosts:$known}}' > "$out" || return 1
-    tmp="${out}.tmp.$$"
-    local used template source builtin_hash snapshot_hash
-    local used_templates="default.yaml "
+    local secrets=${SECRETS_JSON:-${CONFIG_DIR:-.}/secrets.json}
+    local manifest=${STATE_MANIFEST:-${CONFIG_DIR:-.}/manifest.json}
+    local known=${SSH_KNOWN_HOSTS:-${CONFIG_DIR:-.}/ssh/known_hosts}
+    local tmp next template_list identity_list template name source pub
+    local snapshot_hash builtin_hash
+    _github_exact_regular_file "$cfg" || return 1
+    _github_exact_regular_file "$secrets" || return 1
+    _github_exact_regular_file "$manifest" || return 1
+    if [[ -e "$known" || -L "$known" ]]; then
+        _github_exact_regular_file "$known" || return 1
+    fi
+    tmp=$(umask 077; mktemp "${out}.tmp.XXXXXX") || return 1
+    next=$(umask 077; mktemp "${out}.tmp.XXXXXX") || {
+        rm -f "$tmp"
+        return 1
+    }
+    template_list=$(umask 077; mktemp "${out}.templates.XXXXXX") || {
+        rm -f "$tmp" "$next"
+        return 1
+    }
+    identity_list=$(umask 077; mktemp "${out}.identities.XXXXXX") || {
+        rm -f "$tmp" "$next" "$template_list"
+        return 1
+    }
+    local -a known_args
+    if _github_exact_regular_file "$known"; then
+        known_args=(--rawfile known "$known")
+    else
+        known_args=(--arg known "")
+    fi
+    if ! jq -n --slurpfile config "$cfg" --slurpfile sec "$secrets" \
+        --slurpfile man "$manifest" "${known_args[@]}" \
+        --arg minimum "${CURRENT_VERSION:-0.0.0}" \
+        '{vault_version:1,minimum_remote_control_version:$minimum,
+          portability:($man[0].portability // {status:"ready",issues:[]}),
+          access:($man[0].access // {script_password_hash:null}),
+          config:$config[0],secrets:($sec[0] // {node_passwords:{}}),
+          templates:($man[0].templates // {}),
+          ssh:{identities:{},known_hosts:$known}}' > "$tmp" ||
+       ! printf '%s\n' default.yaml > "$template_list" ||
+       ! jq -r '(.groups // [])[]? | (.template // "default.yaml")' \
+            "$cfg" >> "$template_list" ||
+       ! jq -r '(.nodes // [])[]? |
+            select(.auth == "key" and (.identity // "system") != "system") |
+            .identity' "$cfg" > "$identity_list"; then
+        rm -f "$tmp" "$next" "$template_list" "$identity_list"
+        return 1
+    fi
+    LC_ALL=C sort -u "$template_list" > "$next" || {
+        rm -f "$tmp" "$next" "$template_list" "$identity_list"
+        return 1
+    }
+    if ! mv "$next" "$template_list"; then
+        rm -f "$tmp" "$next" "$template_list" "$identity_list"
+        return 1
+    fi
+    next=$(umask 077; mktemp "${out}.tmp.XXXXXX") || {
+        rm -f "$tmp" "$template_list" "$identity_list"
+        return 1
+    }
     while IFS= read -r template; do
-        [[ -n "$template" ]] && used_templates+="$template "
-    done < <(jq -r '(.groups // [])[]? | (.template // "default.yaml")' "$cfg" 2>/dev/null)
-    for template in $used_templates; do
+        [[ "$template" =~ ^[A-Za-z0-9._-]+\.yaml$ ]] || {
+            rm -f "$tmp" "$next" "$template_list" "$identity_list"
+            return 1
+        }
         name="$TEMPLATES_DIR/$template"
         source=custom
-        if [[ ! -f "$name" && -f "$BUILTIN_TEMPLATES_DIR/$template" ]]; then
-            name="$BUILTIN_TEMPLATES_DIR/$template"
+        if ! _github_exact_regular_file "$name" &&
+           _github_exact_regular_file "${BUILTIN_TEMPLATES_DIR:-}/$template"; then
+            name="${BUILTIN_TEMPLATES_DIR:-}/$template"
             source=builtin
         fi
-        [[ -f "$name" ]] || { [[ ${CONFIG_SOURCE:-local} == github ]] && return 1; continue; }
-        if [[ "$source" == custom && -f "$BUILTIN_TEMPLATES_DIR/$template" ]] && cmp -s "$name" "$BUILTIN_TEMPLATES_DIR/$template"; then source=builtin; fi
-        snapshot_hash=$(_github_sha256 "$name")
+        if ! _github_exact_regular_file "$name"; then
+            if [[ ${CONFIG_SOURCE:-local} == github ]]; then
+                rm -f "$tmp" "$next" "$template_list" "$identity_list"
+                return 1
+            fi
+            continue
+        fi
+        if [[ "$source" == custom ]] &&
+           _github_exact_regular_file "${BUILTIN_TEMPLATES_DIR:-}/$template" &&
+           cmp -s "$name" "${BUILTIN_TEMPLATES_DIR:-}/$template"; then
+            source=builtin
+        fi
+        snapshot_hash=$(_github_sha256 "$name") || {
+            rm -f "$tmp" "$next" "$template_list" "$identity_list"
+            return 1
+        }
         builtin_hash=null
-        if [[ "$source" == custom && -f "$BUILTIN_TEMPLATES_DIR/$template" ]]; then
-            builtin_hash=$(_github_sha256 "$BUILTIN_TEMPLATES_DIR/$template")
+        if [[ "$source" == custom ]] &&
+           _github_exact_regular_file "${BUILTIN_TEMPLATES_DIR:-}/$template"; then
+            builtin_hash=$(_github_sha256 "${BUILTIN_TEMPLATES_DIR:-}/$template") || {
+                rm -f "$tmp" "$next" "$template_list" "$identity_list"
+                return 1
+            }
         fi
-        jq --arg n "$template" --rawfile c "$name" --arg source "$source" \
+        if ! jq --arg n "$template" --rawfile c "$name" --arg source "$source" \
             --arg hash "$snapshot_hash" --arg builtin "$builtin_hash" \
-            '.templates += {($n): {content:$c,source:$source,snapshot_sha256:$hash,ignored_builtin_sha256:(if $builtin=="null" then null else $builtin end)}}' \
-            "$out" > "$tmp" && mv "$tmp" "$out" || return 1
-    done
-    for name in "$SSH_IDENTITIES_DIR"/*; do
-        [[ -f "$name" && "$name" != *.pub ]] || continue
-        pub="${name}.pub"
-        if [[ -f "$pub" ]]; then
-            jq --arg n "$(basename "$name")" --rawfile p "$name" --rawfile q "$pub" '.ssh.identities += {($n): {private:$p,public:$q}}' "$out" > "$tmp" && mv "$tmp" "$out"
-        else
-            jq --arg n "$(basename "$name")" --rawfile p "$name" '.ssh.identities += {($n): {private:$p,public:null}}' "$out" > "$tmp" && mv "$tmp" "$out"
+            '.templates += {($n): {content:$c,source:$source,
+             snapshot_sha256:$hash,
+             ignored_builtin_sha256:(if $builtin=="null" then null else $builtin end)}}' \
+            "$tmp" > "$next" || ! mv "$next" "$tmp"; then
+            rm -f "$tmp" "$next" "$template_list" "$identity_list"
+            return 1
         fi
-    done
-    chmod 600 "$out"
+        next=$(umask 077; mktemp "${out}.tmp.XXXXXX") || {
+            rm -f "$tmp" "$template_list" "$identity_list"
+            return 1
+        }
+    done < "$template_list"
+    LC_ALL=C sort -u "$identity_list" > "$next" || {
+        rm -f "$tmp" "$next" "$template_list" "$identity_list"
+        return 1
+    }
+    if ! mv "$next" "$identity_list"; then
+        rm -f "$tmp" "$next" "$template_list" "$identity_list"
+        return 1
+    fi
+    next=$(umask 077; mktemp "${out}.tmp.XXXXXX") || {
+        rm -f "$tmp" "$template_list" "$identity_list"
+        return 1
+    }
+    while IFS= read -r name; do
+        [[ "$name" =~ ^[0-9a-fA-F]{32}$ ]] || {
+            rm -f "$tmp" "$next" "$template_list" "$identity_list"
+            return 1
+        }
+        pub="$SSH_IDENTITIES_DIR/$name.pub"
+        if ! _github_exact_regular_file "$SSH_IDENTITIES_DIR/$name" ||
+           ! _github_exact_regular_file "$pub" ||
+           ! jq --arg n "$name" --rawfile p "$SSH_IDENTITIES_DIR/$name" \
+                --rawfile q "$pub" \
+                '.ssh.identities += {($n): {private:$p,public:$q}}' \
+                "$tmp" > "$next" ||
+           ! mv "$next" "$tmp"; then
+            rm -f "$tmp" "$next" "$template_list" "$identity_list"
+            return 1
+        fi
+        next=$(umask 077; mktemp "${out}.tmp.XXXXXX") || {
+            rm -f "$tmp" "$template_list" "$identity_list"
+            return 1
+        }
+    done < "$identity_list"
+    if ! github_config_validate "$tmp" || ! chmod 600 "$tmp" ||
+       ! mv "$tmp" "$out"; then
+        rm -f "$tmp" "$next" "$template_list" "$identity_list"
+        return 1
+    fi
+    rm -f "$next" "$template_list" "$identity_list" ||
+        warn "Снимок создан, но временные файлы сериализации требуют ручной очистки."
 }
 github_config_validate() {
     local state=${1:?state json}
-    jq -e 'type=="object" and .vault_version==1 and (.config|type=="object") and (.secrets|type=="object") and (.templates|type=="object") and (.ssh|type=="object") and ((.portability.status=="ready") or (.portability.status=="needs_setup")) and (.portability.issues|type=="array")' "$state" >/dev/null 2>&1 || return 1
-    jq -e '((.config.nodes // []) | map(.id) | length == (map(.) | unique | length)) and ((.config.nodes // []) | map(.name) | length == (map(.) | unique | length)) and all((.config.nodes // [])[]; (.id|type=="string") and (.name|type=="string"))' "$state" >/dev/null 2>&1 || return 1
+    _github_exact_regular_file "$state" || return 1
+    jq -e 'type=="object" and .vault_version==1 and
+        (.config|type=="object") and (.secrets|type=="object") and
+        (.templates|type=="object") and (.ssh|type=="object") and
+        ((.portability.status=="ready") or (.portability.status=="needs_setup")) and
+        (.portability.issues|type=="array")' "$state" >/dev/null 2>&1 || return 1
+    jq -e '
+        ((.config.nodes // []) | map(.id) | length == (map(.) | unique | length)) and
+        ((.config.nodes // []) | map(.name) | length == (map(.) | unique | length)) and
+        all((.config.nodes // [])[];
+            (.id|type=="string") and (.name|type=="string") and
+            (if .auth == "key" and (.identity // "system") != "system"
+             then (.identity|type=="string") and
+                  (. as $node | $identities[$node.identity] != null)
+             else true end))
+    ' --argjson identities "$(jq -c '.ssh.identities // {}' "$state")" \
+        "$state" >/dev/null 2>&1 || return 1
     jq -e '
         all((.templates // {}) | to_entries[];
             (.key | test("^[A-Za-z0-9._-]+[.]yaml$")) and
@@ -386,276 +774,1036 @@ github_config_validate() {
 }
 
 _github_plain_write() {
-    local state=$1 w=$GITHUB_WORKTREE name stage backup path
+    local state=$1 w=$GITHUB_WORKTREE name stage backup path restore list
+    local failed=false
     local -a paths=(config.json secrets.json manifest.json ssh templates)
     github_config_validate "$state" || return 1
+    _github_validate_tree "$w" auto || return 1
     stage=$(umask 077; mktemp -d "$w/.plain-write.XXXXXX") || return 1
-    mkdir -p "$stage/templates" "$stage/ssh/identities" || {
-        rm -rf "$stage"
-        return 1
-    }
-    if ! jq -e '.config' "$state" > "$stage/config.json" ||
-       ! jq -e '.secrets' "$state" > "$stage/secrets.json" ||
-       ! jq -e '{vault_version,minimum_remote_control_version,portability,access,templates}' \
-            "$state" > "$stage/manifest.json" ||
-       ! jq -j '.ssh.known_hosts // ""' "$state" > "$stage/ssh/known_hosts"; then
-        rm -rf "$stage"
-        return 1
-    fi
-    while IFS= read -r name; do
-        jq -j --arg n "$name" '.templates[$n].content' "$state" \
-            > "$stage/templates/$name" || {
-            rm -rf "$stage"
-            return 1
-        }
-    done < <(jq -r '.templates // {} | keys[]' "$state")
-    while IFS= read -r name; do
-        if ! jq -j --arg n "$name" '.ssh.identities[$n].private' "$state" \
-                > "$stage/ssh/identities/$name" ||
-           ! jq -j --arg n "$name" '.ssh.identities[$n].public' "$state" \
-                > "$stage/ssh/identities/$name.pub"; then
-            rm -rf "$stage"
-            return 1
-        fi
-    done < <(jq -r '.ssh.identities // {} | keys[]' "$state")
-    chmod 700 "$stage" "$stage/templates" "$stage/ssh" "$stage/ssh/identities" &&
-        chmod 600 "$stage/secrets.json" "$stage/ssh/known_hosts" || {
-        rm -rf "$stage"
-        return 1
-    }
-    chmod 600 "$stage/ssh/identities/"* 2>/dev/null || true
-    chmod 644 "$stage/config.json" "$stage/manifest.json" "$stage/templates/"* \
-        "$stage/ssh/identities/"*.pub 2>/dev/null || true
-
     backup=$(umask 077; mktemp -d "$w/.plain-backup.XXXXXX") || {
         rm -rf "$stage"
         return 1
     }
-    for path in "${paths[@]}"; do
-        if [[ -e "$w/$path" ]] && ! mv "$w/$path" "$backup/$path"; then
-            for path in "${paths[@]}"; do
-                [[ -e "$backup/$path" ]] && mv "$backup/$path" "$w/$path" 2>/dev/null || true
-            done
+    list=$(umask 077; mktemp "$stage/.entries.XXXXXX") || {
+        rm -rf "$stage" "$backup"
+        return 1
+    }
+    if ! mkdir -p "$stage/templates" "$stage/ssh/identities" ||
+       ! jq -e '.config' "$state" > "$stage/config.json" ||
+       ! jq -e '.secrets' "$state" > "$stage/secrets.json" ||
+       ! jq -e '{vault_version,minimum_remote_control_version,portability,access,templates}' \
+            "$state" > "$stage/manifest.json" ||
+       ! jq -j '.ssh.known_hosts // ""' "$state" > "$stage/ssh/known_hosts" ||
+       ! jq -r '.templates // {} | keys[]' "$state" > "$list"; then
+        rm -rf "$stage" "$backup"
+        return 1
+    fi
+    while IFS= read -r name; do
+        [[ "$name" =~ ^[A-Za-z0-9._-]+\.yaml$ ]] || {
+            rm -rf "$stage" "$backup"
+            return 1
+        }
+        if ! jq -j --arg n "$name" '.templates[$n].content' "$state" \
+                > "$stage/templates/$name" ||
+           ! chmod 644 "$stage/templates/$name"; then
             rm -rf "$stage" "$backup"
             return 1
         fi
+    done < "$list"
+    if ! jq -r '.ssh.identities // {} | keys[]' "$state" > "$list"; then
+        rm -rf "$stage" "$backup"
+        return 1
+    fi
+    while IFS= read -r name; do
+        [[ "$name" =~ ^[0-9a-fA-F]{32}$ ]] || {
+            rm -rf "$stage" "$backup"
+            return 1
+        }
+        if ! jq -j --arg n "$name" '.ssh.identities[$n].private' "$state" \
+                > "$stage/ssh/identities/$name" ||
+           ! jq -j --arg n "$name" '.ssh.identities[$n].public' "$state" \
+                > "$stage/ssh/identities/$name.pub" ||
+           ! chmod 600 "$stage/ssh/identities/$name" ||
+           ! chmod 644 "$stage/ssh/identities/$name.pub"; then
+            rm -rf "$stage" "$backup"
+            return 1
+        fi
+    done < "$list"
+    if ! rm -f "$list" ||
+       ! chmod 700 "$stage" "$stage/templates" "$stage/ssh" "$stage/ssh/identities" ||
+       ! chmod 600 "$stage/secrets.json" "$stage/ssh/known_hosts" ||
+       ! chmod 644 "$stage/config.json" "$stage/manifest.json"; then
+        rm -rf "$stage" "$backup"
+        return 1
+    fi
+    for path in "${paths[@]}"; do
+        if [[ -e "$w/$path" || -L "$w/$path" ]]; then
+            if ! mv "$w/$path" "$backup/$path"; then
+                failed=true
+                break
+            fi
+        fi
     done
+    if [[ "$failed" == true ]]; then
+        for restore in "${paths[@]}"; do
+            if [[ -e "$backup/$restore" || -L "$backup/$restore" ]]; then
+                mv "$backup/$restore" "$w/$restore" || return 1
+            fi
+        done
+        rm -rf "$stage" "$backup" || return 1
+        return 1
+    fi
     for path in "${paths[@]}"; do
         if ! mv "$stage/$path" "$w/$path"; then
-            local restore
-            for restore in "${paths[@]}"; do rm -rf "$w/$restore"; done
-            for restore in "${paths[@]}"; do
-                [[ -e "$backup/$restore" ]] &&
-                    mv "$backup/$restore" "$w/$restore" 2>/dev/null || true
-            done
-            rm -rf "$stage" "$backup"
-            return 1
+            failed=true
+            break
         fi
     done
-    rmdir "$stage" 2>/dev/null || rm -rf "$stage"
-    rm -rf "$backup"
-    chmod 700 "$w"
+    if [[ "$failed" == true ]] || ! chmod 700 "$w"; then
+        for restore in "${paths[@]}"; do
+            if [[ -e "$w/$restore" || -L "$w/$restore" ]]; then
+                rm -rf "$w/$restore" || return 1
+            fi
+        done
+        for restore in "${paths[@]}"; do
+            if [[ -e "$backup/$restore" || -L "$backup/$restore" ]]; then
+                mv "$backup/$restore" "$w/$restore" || return 1
+            fi
+        done
+        rm -rf "$stage" "$backup" || return 1
+        return 1
+    fi
+    if ! rmdir "$stage" || ! rm -rf "$backup"; then
+        warn "Снимок опубликован, но временные каталоги требуют ручной очистки."
+    fi
 }
 _github_plain_read() {
-    local w=$GITHUB_WORKTREE out=$1 name content pub
-    [[ -f "$w/config.json" && -f "$w/secrets.json" && -f "$w/manifest.json" ]] || return 1
+    local w=$GITHUB_WORKTREE out=$1 name id tmp next
+    _github_validate_tree "$w" none || return 1
+    _github_validate_tracked_tree none || return 1
+    _github_exact_regular_file "$w/config.json" || return 1
+    _github_exact_regular_file "$w/secrets.json" || return 1
+    _github_exact_regular_file "$w/manifest.json" || return 1
+    tmp=$(umask 077; mktemp "${out}.tmp.XXXXXX") || return 1
+    next=$(umask 077; mktemp "${out}.tmp.XXXXXX") || {
+        rm -f "$tmp"
+        return 1
+    }
     local -a known_args
-    if [[ -f "$w/ssh/known_hosts" ]]; then
+    if _github_exact_regular_file "$w/ssh/known_hosts"; then
         known_args=(--rawfile known "$w/ssh/known_hosts")
     else
         known_args=(--arg known "")
     fi
-    jq -n --argjson config "$(cat "$w/config.json")" \
-      --argjson secrets "$(cat "$w/secrets.json")" --slurpfile man "$w/manifest.json" \
-      "${known_args[@]}" \
-      '{vault_version:1,minimum_remote_control_version:($man[0].minimum_remote_control_version // "0.0.0"),portability:($man[0].portability // {status:"ready",issues:[]}),access:($man[0].access // {script_password_hash:null}),config:$config,secrets:$secrets,templates:($man[0].templates // {}),ssh:{identities:{},known_hosts:$known}}' > "$out" || return 1
-    local tmp="${out}.tmp.$$"
+    if ! jq -n --slurpfile config "$w/config.json" \
+        --slurpfile secrets "$w/secrets.json" --slurpfile man "$w/manifest.json" \
+        "${known_args[@]}" \
+        '{vault_version:1,
+          minimum_remote_control_version:($man[0].minimum_remote_control_version // "0.0.0"),
+          portability:($man[0].portability // {status:"ready",issues:[]}),
+          access:($man[0].access // {script_password_hash:null}),
+          config:$config[0],secrets:$secrets[0],
+          templates:($man[0].templates // {}),
+          ssh:{identities:{},known_hosts:$known}}' > "$tmp"; then
+        rm -f "$tmp" "$next"
+        return 1
+    fi
     for name in "$w/templates/"*.yaml; do
-        [[ -f "$name" ]] || continue
-        jq --arg n "$(basename "$name")" -j --rawfile c "$name" \
-            '.templates[$n].content=$c' "$out" > "$tmp" || {
-            rm -f "$tmp"; return 1;
+        [[ -e "$name" ]] || continue
+        _github_exact_regular_file "$name" || {
+            rm -f "$tmp" "$next"
+            return 1
         }
-        mv -f "$tmp" "$out" || return 1
+        if ! jq --arg n "$(basename "$name")" -j --rawfile c "$name" \
+            '.templates[$n].content=$c' "$tmp" > "$next" ||
+           ! mv "$next" "$tmp"; then
+            rm -f "$tmp" "$next"
+            return 1
+        fi
+        next=$(umask 077; mktemp "${out}.tmp.XXXXXX") || {
+            rm -f "$tmp"
+            return 1
+        }
     done
     for name in "$w/ssh/identities/"*.pub; do
-        [[ -f "$name" ]] || continue
-        [[ -f "${name%.pub}" ]] || return 1
+        [[ -e "$name" ]] || continue
+        _github_exact_regular_file "$name" || {
+            rm -f "$tmp" "$next"
+            return 1
+        }
+        _github_exact_regular_file "${name%.pub}" || {
+            rm -f "$tmp" "$next"
+            return 1
+        }
     done
     for name in "$w/ssh/identities/"*; do
-        [[ -f "$name" && "$name" != *.pub ]] || continue
-        content="${name##*/}"
-        [[ "$content" =~ ^[0-9a-fA-F]{32}$ ]] || return 1
-        jq --arg n "$content" -j --rawfile p "$name" --rawfile q "$name.pub" \
-            '.ssh.identities[$n]={private:$p,public:$q}' "$out" > "$tmp" || {
-            rm -f "$tmp"; return 1;
+        [[ -e "$name" && "$name" != *.pub ]] || continue
+        _github_exact_regular_file "$name" || {
+            rm -f "$tmp" "$next"
+            return 1
         }
-        mv -f "$tmp" "$out" || return 1
+        id="${name##*/}"
+        [[ "$id" =~ ^[0-9a-fA-F]{32}$ ]] || {
+            rm -f "$tmp" "$next"
+            return 1
+        }
+        if ! jq --arg n "$id" -j --rawfile p "$name" --rawfile q "$name.pub" \
+            '.ssh.identities[$n]={private:$p,public:$q}' "$tmp" > "$next" ||
+           ! mv "$next" "$tmp"; then
+            rm -f "$tmp" "$next"
+            return 1
+        fi
+        next=$(umask 077; mktemp "${out}.tmp.XXXXXX") || {
+            rm -f "$tmp"
+            return 1
+        }
     done
-    rm -f "$tmp"
-    github_config_validate "$out"
+    if ! github_config_validate "$tmp" || ! chmod 600 "$tmp" ||
+       ! mv "$tmp" "$out"; then
+        rm -f "$tmp" "$next"
+        return 1
+    fi
+    rm -f "$next" ||
+        warn "Снимок прочитан, но временный файл требует ручной очистки."
 }
+_github_checkpoint_rollback_storage() {
+    [[ "${1:-false}" == true ]] || return 0
+    if ! rm -f "$GITHUB_WORKTREE/storage.json"; then
+        _github_record_error "откат параметров хранения GitHub" \
+            "Не удалось удалить storage.json после ошибки сохранения снимка."
+        return 1
+    fi
+}
+
 github_config_checkpoint() {
+    _github_clear_error
     local state=${1:-${CONFIG_DIR:-.}/runtime-state.json}
-    local generated_state=false
+    local generated_state=false created_storage=false age_output age_tmp
     if [[ ! -f "$state" ]]; then
-        state=$(umask 077; mktemp "$CONFIG_DIR/.runtime-state.XXXXXX") || return 1
+        if ! state=$(umask 077; mktemp "$CONFIG_DIR/.runtime-state.XXXXXX"); then
+            _github_record_error "подготовка снимка конфигурации GitHub" \
+                "Не удалось создать защищённый временный снимок конфигурации."
+            return 1
+        fi
         generated_state=true
-        github_config_serialize "$state" "${CONFIG_JSON:?}" || {
+        if ! github_config_serialize "$state" "${CONFIG_JSON:-}"; then
             rm -f "$state"
+            _github_ensure_error "подготовка снимка конфигурации GitHub" \
+                "Не удалось собрать переносимый снимок конфигурации."
             return 1
-        }
-    fi
-    [[ -f "$GITHUB_WORKTREE/storage.json" ]] ||
-        _github_storage_init "${GITHUB_STORAGE_MODE:-none}" || {
-            [[ "$generated_state" == true ]] && rm -f "$state"
-            return 1
-        }
-    if [[ ${GITHUB_STORAGE_MODE:-none} == none ]]; then
-        _github_plain_write "$state"
+        fi
     else
-        [[ -n ${GITHUB_RECIPIENT:-} ]] || {
-            [[ "$generated_state" == true ]] && rm -f "$state"
+        _github_exact_regular_file "$state" || {
+            _github_record_error "проверка снимка конфигурации GitHub" \
+                "Снимок конфигурации имеет недопустимый тип."
             return 1
         }
-        "$AGE_BIN" -r "$GITHUB_RECIPIENT" -o "$GITHUB_WORKTREE/state.json.age" "$state" || {
-            [[ "$generated_state" == true ]] && rm -f "$state"
-            return 1
-        }
-        chmod 600 "$GITHUB_WORKTREE/state.json.age"
     fi
-    local rc=$?
-    [[ "$generated_state" == true ]] && rm -f "$state"
-    return "$rc"
+    if [[ "$generated_state" != true ]] && ! github_config_validate "$state"; then
+        _github_record_error "проверка снимка конфигурации GitHub" \
+            "Снимок конфигурации имеет некорректную структуру."
+        return 1
+    fi
+    _github_validate_tree "$GITHUB_WORKTREE" auto || {
+        [[ "$generated_state" == true ]] && rm -f "$state"
+        return 1
+    }
+    if [[ ! -e "$GITHUB_WORKTREE/storage.json" ]]; then
+        if ! _github_storage_init "${GITHUB_STORAGE_MODE:-none}"; then
+            [[ "$generated_state" == true ]] && rm -f "$state"
+            _github_ensure_error "сохранение снимка конфигурации GitHub" \
+                "Не удалось сохранить параметры хранения конфигурации GitHub."
+            return 1
+        fi
+        created_storage=true
+    else
+        _github_exact_regular_file "$GITHUB_WORKTREE/storage.json" || {
+            [[ "$generated_state" == true ]] && rm -f "$state"
+            return 1
+        }
+    fi
+    if [[ ${GITHUB_STORAGE_MODE:-none} == none ]]; then
+        if ! _github_plain_write "$state"; then
+            [[ "$generated_state" == true ]] && rm -f "$state"
+            _github_ensure_error "сохранение снимка конфигурации GitHub" \
+                "Не удалось сохранить снимок в рабочей копии GitHub."
+            _github_checkpoint_rollback_storage "$created_storage" || return 1
+            return 1
+        fi
+    else
+        if [[ -z ${GITHUB_RECIPIENT:-} ]]; then
+            [[ "$generated_state" == true ]] && rm -f "$state"
+            _github_record_error "сохранение снимка конфигурации GitHub" \
+                "Не удалось определить recipient для шифрования конфигурации."
+            _github_checkpoint_rollback_storage "$created_storage" || return 1
+            return 1
+        fi
+        age_tmp=$(_github_new_private_path "$GITHUB_WORKTREE/.state.json.age.XXXXXX") || {
+            [[ "$generated_state" == true ]] && rm -f "$state"
+            _github_record_error "подготовка шифрования снимка GitHub" \
+                "Не удалось создать защищённый staging-каталог."
+            _github_checkpoint_rollback_storage "$created_storage"
+            return 1
+        }
+        if ! age_output=$(umask 077; "$AGE_BIN" -r "$GITHUB_RECIPIENT" \
+                -o "$age_tmp" "$state" 2>&1) ||
+           ! _github_exact_regular_file "$age_tmp" ||
+           ! chmod 600 "$age_tmp" ||
+           ! mv "$age_tmp" "$GITHUB_WORKTREE/state.json.age"; then
+            _github_remove_private_path "$age_tmp"
+            [[ "$generated_state" == true ]] && rm -f "$state"
+            _github_record_error "сохранение снимка конфигурации GitHub" \
+                "Не удалось атомарно зашифровать снимок конфигурации GitHub."
+            _github_checkpoint_rollback_storage "$created_storage" || return 1
+            return 1
+        fi
+        _github_remove_private_path "$age_tmp" ||
+            warn "Защищённый staging-каталог снимка требует ручной очистки."
+    fi
+    if [[ "$generated_state" == true ]] && ! rm -f "$state"; then
+        warn "Снимок опубликован, но временное логическое состояние требует ручной очистки: $state"
+    fi
+    return 0
 }
 config_persist_candidate() {
-    [[ ${CONFIG_SOURCE:-local} == github ]] || return 0
-    local candidate="${1:-}" original="${CONFIG_JSON:-}" serialized
-    [[ -f "$candidate" && -n "$original" ]] || return 1
-    serialized=$(umask 077; mktemp "$CONFIG_DIR/.candidate-state.XXXXXX") || return 1
+    _github_clear_error
+    CONFIG_PERSIST_LAST_ERROR=""
+    local candidate="${1:-}" original="${CONFIG_JSON:-}"
+    local serialized backup="" had_original=false old_status="${GITHUB_SYNC_STATUS:-}"
+    if ! _github_exact_regular_file "$candidate" || [[ -z "$original" ]]; then
+        _github_record_error "проверка изменённой конфигурации" \
+            "Временный файл изменённой конфигурации или текущий CONFIG_JSON недоступен."
+        CONFIG_PERSIST_LAST_ERROR="Не удалось сохранить изменение (этап: $GITHUB_LAST_STAGE): $GITHUB_LAST_ERROR"
+        return 1
+    fi
+    if [[ ${CONFIG_SOURCE:-local} != github ]]; then
+        if ! mv "$candidate" "$original"; then
+            _github_record_error "публикация изменённой конфигурации" \
+                "Не удалось атомарно заменить локальный config.json."
+            CONFIG_PERSIST_LAST_ERROR="Не удалось сохранить изменение (этап: $GITHUB_LAST_STAGE): $GITHUB_LAST_ERROR"
+            return 1
+        fi
+        return 0
+    fi
+    serialized=$(umask 077; mktemp "$CONFIG_DIR/.candidate-state.XXXXXX") || {
+        _github_record_error "подготовка снимка конфигурации GitHub" \
+            "Не удалось создать защищённый временный снимок конфигурации."
+        CONFIG_PERSIST_LAST_ERROR="Не удалось сохранить изменение в GitHub (этап: $GITHUB_LAST_STAGE): $GITHUB_LAST_ERROR"
+        return 1
+    }
     CONFIG_JSON="$candidate"
     if ! state_validate true >/dev/null 2>&1; then
-        if [[ "${CONFIG_PERSIST_ALLOW_NEEDS_SETUP:-0}" != "1" ]] ||
+        if [[ "${CONFIG_PERSIST_ALLOW_NEEDS_SETUP:-0}" != 1 ]] ||
            ! state_validate false >/dev/null 2>&1; then
             CONFIG_JSON="$original"
             rm -f "$serialized"
+            _github_ensure_error "проверка изменённой конфигурации" \
+                "Изменённая конфигурация не прошла проверку переносимого состояния."
+            CONFIG_PERSIST_LAST_ERROR="Не удалось сохранить изменение в GitHub (этап: $GITHUB_LAST_STAGE): $GITHUB_LAST_ERROR"
             return 1
         fi
     fi
-    if ! github_config_serialize "$serialized" "$candidate" ||
-       ! github_config_checkpoint "$serialized"; then
+    if ! github_config_serialize "$serialized" "$candidate"; then
         CONFIG_JSON="$original"
         rm -f "$serialized"
+        _github_ensure_error "подготовка снимка конфигурации GitHub" \
+            "Не удалось собрать переносимый снимок конфигурации."
+        CONFIG_PERSIST_LAST_ERROR="Не удалось сохранить изменение в GitHub (этап: $GITHUB_LAST_STAGE): $GITHUB_LAST_ERROR"
         return 1
     fi
     CONFIG_JSON="$original"
-    rm -f "$serialized"
+    if [[ -e "$original" || -L "$original" ]]; then
+        if ! _github_exact_regular_file "$original"; then
+            rm -f "$serialized"
+            _github_record_error "публикация изменённой конфигурации" \
+                "Текущий config.json имеет недопустимый тип."
+            CONFIG_PERSIST_LAST_ERROR="Не удалось сохранить изменение в GitHub (этап: $GITHUB_LAST_STAGE): $GITHUB_LAST_ERROR"
+            return 1
+        fi
+        had_original=true
+        backup=$(umask 077; mktemp "$CONFIG_DIR/.persist-config.XXXXXX") || {
+            rm -f "$serialized"
+            return 1
+        }
+        if ! cp "$original" "$backup" || ! chmod 600 "$backup"; then
+            rm -f "$serialized" "$backup"
+            return 1
+        fi
+    fi
+    if ! mv "$candidate" "$original"; then
+        rm -f "$serialized" "$backup"
+        _github_record_error "публикация изменённой конфигурации" \
+            "Не удалось атомарно заменить рабочий config.json."
+        CONFIG_PERSIST_LAST_ERROR="Не удалось сохранить изменение в GitHub (этап: $GITHUB_LAST_STAGE): $GITHUB_LAST_ERROR"
+        return 1
+    fi
+    if ! github_config_checkpoint "$serialized"; then
+        if [[ "$had_original" == true ]]; then
+            mv "$backup" "$original" || return 1
+        else
+            rm -f "$original" || return 1
+        fi
+        GITHUB_SYNC_STATUS="$old_status"
+        rm -f "$serialized" "$backup"
+        _github_ensure_error "сохранение снимка конфигурации GitHub" \
+            "Не удалось сохранить снимок в рабочей копии GitHub."
+        CONFIG_PERSIST_LAST_ERROR="Не удалось сохранить изменение в GitHub (этап: $GITHUB_LAST_STAGE): $GITHUB_LAST_ERROR"
+        return 1
+    fi
+    GITHUB_SYNC_STATUS=pending
+    export GITHUB_SYNC_STATUS
+    if ! rm -f "$serialized" "$backup"; then
+        warn "Конфигурация сохранена, но защищённые временные файлы требуют ручной очистки."
+    fi
+    CONFIG_PERSIST_LAST_ERROR=""
+    _github_clear_error
     return 0
 }
-github_config_remember() {
-    local id="${1:-}"
-    [[ -s "$id" ]] || return 1
-    _github_mkdir_secure "$GITHUB_CREDENTIALS_DIR" || return 1
-    cp "$id" "$GITHUB_UNLOCK_FILE" || return 1
-    chmod 600 "$GITHUB_UNLOCK_FILE"
+_github_exact_regular_file() {
+    [[ -f "${1:-}" && ! -L "${1:-}" ]]
 }
-github_config_forget() { rm -f "$GITHUB_UNLOCK_FILE"; }
+_github_new_private_path() {
+    local pattern="${1:?temporary path pattern}" parent staging
+    parent="${pattern%/*}"
+    [[ "$parent" != "$pattern" && -d "$parent" && ! -L "$parent" ]] || return 1
+    staging=$(umask 077; mktemp -d "$parent/.github-private.XXXXXX") || return 1
+    if ! chmod 700 "$staging"; then
+        rm -rf "$staging"
+        return 1
+    fi
+    printf '%s\n' "$staging/output"
+}
+_github_remove_private_path() {
+    local path="${1:-}" parent
+    [[ -n "$path" ]] || return 0
+    parent="${path%/*}"
+    if [[ "${path##*/}" == output && "${parent##*/}" == .github-private.* &&
+          -d "$parent" && ! -L "$parent" ]]; then
+        rm -f "$path" && rmdir "$parent"
+    else
+        rm -f "$path"
+    fi
+}
+_github_remove_ephemeral_identity() {
+    local identity="${1:-}"
+    case "$identity" in
+        "$CONFIG_DIR"/.github-private.*/output)
+            _github_remove_private_path "$identity"
+            ;;
+        "$CONFIG_DIR"/.unlock-check.*|"$CONFIG_DIR"/.recovery-key.*|\
+        "$CONFIG_DIR"/github-identity.tmp*|"$CONFIG_DIR"/.github-identity.*)
+            rm -f "$identity"
+            ;;
+    esac
+}
+
+
+_github_canonical_path() {
+    local path="${1:-}" parent base physical
+    [[ -n "$path" ]] || return 1
+    case "$path" in
+        /*) ;;
+        *) path="$PWD/$path" ;;
+    esac
+    if [[ -d "$path" ]]; then
+        (cd -P "$path" 2>/dev/null && pwd -P)
+        return
+    fi
+    parent=$(dirname "$path") || return 1
+    base=$(basename "$path") || return 1
+    [[ -d "$parent" ]] || return 1
+    physical=$(cd -P "$parent" 2>/dev/null && pwd -P) || return 1
+    printf '%s/%s\n' "${physical%/}" "$base"
+}
+
+_github_recovery_path_is_managed() {
+    local candidate managed root
+    candidate=$(_github_canonical_path "${1:-}") || return 0
+    for root in "${CONFIG_DIR:-}" "${GITHUB_STORE:-}" "${GITHUB_SESSIONS_DIR:-}" \
+        "${GITHUB_CREDENTIALS_DIR:-}" "${GITHUB_WORKTREE:-}" "${STATE_DIR:-}" \
+        "${TEMPLATES_DIR:-}" "${SSH_IDENTITIES_DIR:-}"; do
+        [[ -n "$root" ]] || continue
+        managed=$(_github_canonical_path "$root") || continue
+        case "$candidate" in
+            "$managed"|"$managed"/*) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+_github_atomic_private_copy() {
+    local source="$1" target="$2" parent base tmp
+    _github_exact_regular_file "$source" || return 1
+    [[ ! -L "$target" ]] || return 1
+    if [[ -e "$target" ]] && ! _github_exact_regular_file "$target"; then
+        return 1
+    fi
+    parent=$(dirname "$target") || return 1
+    base=$(basename "$target") || return 1
+    [[ -d "$parent" ]] || return 1
+    tmp=$(umask 077; mktemp "$parent/.${base}.tmp.XXXXXX") || return 1
+    if ! cp "$source" "$tmp" || ! chmod 600 "$tmp" || ! mv "$tmp" "$target"; then
+        rm -f "$tmp"
+        return 1
+    fi
+}
+
+github_config_remember() {
+    _github_clear_error
+    local id="${1:-}"
+    _github_exact_regular_file "$id" && [[ -s "$id" ]] || {
+        _github_record_error "сохранение ключа расшифровки" \
+            "Ключ расшифровки недоступен."
+        return 1
+    }
+    if ! _github_mkdir_secure "$GITHUB_CREDENTIALS_DIR"; then
+        _github_record_error "сохранение ключа расшифровки" \
+            "Не удалось создать защищённый каталог credentials."
+        return 1
+    fi
+    if ! _github_atomic_private_copy "$id" "$GITHUB_UNLOCK_FILE"; then
+        _github_record_error "сохранение ключа расшифровки" \
+            "Не удалось атомарно сохранить ключ расшифровки на этом устройстве."
+        return 1
+    fi
+}
+github_config_forget() {
+    _github_clear_error
+    if ! rm -f "$GITHUB_UNLOCK_FILE"; then
+        _github_record_error "удаление ключа расшифровки" \
+            "Не удалось удалить сохранённый ключ расшифровки."
+        return 1
+    fi
+}
 github_config_export_recovery() {
-    local target="${1:-}"
-    [[ -n "$target" && "$target" != "$GITHUB_WORKTREE"/* && "$target" != "$CONFIG_DIR"/* ]] || return 1
-    [[ -s "${GITHUB_IDENTITY:-}" ]] || return 1
-    cp "$GITHUB_IDENTITY" "$target" || return 1
-    chmod 600 "$target"
+    _github_clear_error
+    local target="${1:-}" canonical_identity canonical_target
+    if [[ -z "$target" || -L "$target" ]] ||
+       _github_recovery_path_is_managed "$target"; then
+        _github_record_error "экспорт ключа восстановления" \
+            "Файл ключа восстановления недоступен или расположен внутри служебного каталога."
+        return 1
+    fi
+    if ! _github_exact_regular_file "${GITHUB_IDENTITY:-}" ||
+       [[ ! -s "${GITHUB_IDENTITY:-}" ]]; then
+        _github_record_error "экспорт ключа восстановления" \
+            "Ключ расшифровки недоступен для экспорта."
+        return 1
+    fi
+    canonical_identity=$(_github_canonical_path "$GITHUB_IDENTITY") || return 1
+    canonical_target=$(_github_canonical_path "$target") || {
+        _github_record_error "экспорт ключа восстановления" \
+            "Каталог назначения ключа восстановления недоступен."
+        return 1
+    }
+    if [[ "$canonical_target" == "$canonical_identity" ]] ||
+       ! _github_atomic_private_copy "$GITHUB_IDENTITY" "$target"; then
+        _github_record_error "экспорт ключа восстановления" \
+            "Не удалось атомарно сохранить копию ключа восстановления."
+        return 1
+    fi
 }
 github_config_import_recovery() {
-    local source="${1:-}" check
-    [[ -s "$source" && "$source" != "$GITHUB_WORKTREE"/* && "$source" != "$CONFIG_DIR"/* ]] || return 1
-    check=$(umask 077; mktemp "$CONFIG_DIR/.recovery-key.XXXXXX") || return 1
-    cp "$source" "$check" && chmod 600 "$check" || { rm -f "$check"; return 1; }
-    "$AGE_KEYGEN_BIN" -y "$check" >/dev/null 2>&1 || { rm -f "$check"; return 1; }
-    GITHUB_IDENTITY="$check"; export GITHUB_IDENTITY
+    _github_clear_error
+    local source="${1:-}" check old_identity="${GITHUB_IDENTITY:-}"
+    if [[ -z "$source" || -L "$source" ]] ||
+       ! _github_exact_regular_file "$source" || [[ ! -s "$source" ]] ||
+       _github_recovery_path_is_managed "$source"; then
+        _github_record_error "импорт ключа восстановления" \
+            "Файл ключа восстановления не найден, имеет недопустимый тип или расположен внутри служебного каталога."
+        return 1
+    fi
+    if ! check=$(umask 077; mktemp "$CONFIG_DIR/.recovery-key.XXXXXX"); then
+        _github_record_error "импорт ключа восстановления" \
+            "Не удалось создать защищённую временную копию ключа."
+        return 1
+    fi
+    if ! cp "$source" "$check" || ! chmod 600 "$check"; then
+        rm -f "$check"
+        GITHUB_IDENTITY="$old_identity"
+        _github_record_error "импорт ключа восстановления" \
+            "Не удалось скопировать ключ восстановления во временный файл."
+        return 1
+    fi
+    if ! "$AGE_KEYGEN_BIN" -y "$check" >/dev/null 2>&1; then
+        rm -f "$check"
+        GITHUB_IDENTITY="$old_identity"
+        _github_record_error "импорт ключа восстановления" \
+            "Файл не содержит корректный секретный ключ age."
+        return 1
+    fi
+    GITHUB_IDENTITY="$check"
+    export GITHUB_IDENTITY
     return 0
 }
 github_config_rewrap_master() {
-    [[ ${GITHUB_STORAGE_MODE:-none} == age && -s "$GITHUB_WORKTREE/unlock.age" ]] || return 1
-    local old new tmp
-    info "Изменится только пароль доступа; ключ шифрования и текущие данные останутся прежними."
-    warn "Старые версии в истории GitHub могут по-прежнему открываться прежним паролем."
-    read -rsp "Текущий пароль доступа: " old; printf '\n'
-    read -rsp "Новый пароль доступа: " new; printf '\n'
-    [[ -n "$new" ]] || return 1
-    read -rsp "Повторите новый пароль доступа: " _new; printf '\n'
-    [[ "$new" == "$_new" ]] || return 1
-    tmp=$(umask 077; mktemp "$CONFIG_DIR/.rewrap.XXXXXX") || return 1
-    if ! printf '%s\n' "$old" | "$AGE_BIN" -d -p -o "$tmp" "$GITHUB_WORKTREE/unlock.age" >/dev/null 2>&1; then rm -f "$tmp"; return 1; fi
-    if ! printf '%s\n%s\n' "$new" "$new" | "$AGE_BIN" -p -o "$GITHUB_WORKTREE/unlock.age" "$tmp" >/dev/null 2>&1; then rm -f "$tmp"; return 1; fi
-    rm -f "$tmp"
-    github_sync_flush
+    _github_clear_error
+    if [[ ${GITHUB_STORAGE_MODE:-none} != age ]] ||
+       ! _github_exact_regular_file "$GITHUB_WORKTREE/unlock.age" ||
+       [[ ! -s "$GITHUB_WORKTREE/unlock.age" ]]; then
+        _github_record_error "проверка зашифрованной конфигурации" \
+            "Файл unlock.age недоступен."
+        return 1
+    fi
+    local old new _new identity_tmp unlock_tmp backup old_head=""
+    local failure_stage failure_detail
+    old_head=$(git -C "$GITHUB_WORKTREE" rev-parse HEAD 2>/dev/null) || old_head=""
+    if ! read -rsp "Текущий пароль доступа: " old; then
+        printf '\n'
+        _github_record_error "ввод нового пароля" "Не удалось прочитать пароль доступа."
+        return 1
+    fi
+    printf '\n'
+    if ! read -rsp "Новый пароль доступа: " new; then
+        printf '\n'
+        _github_record_error "ввод нового пароля" "Не удалось прочитать пароль доступа."
+        return 1
+    fi
+    printf '\n'
+    if [[ -z "$new" ]]; then
+        _github_record_error "ввод нового пароля" \
+            "Новый пароль доступа не может быть пустым."
+        return 1
+    fi
+    if ! read -rsp "Повторите новый пароль доступа: " _new; then
+        printf '\n'
+        _github_record_error "ввод нового пароля" "Не удалось прочитать пароль доступа."
+        return 1
+    fi
+    printf '\n'
+    if [[ "$new" != "$_new" ]]; then
+        _github_record_error "ввод нового пароля" \
+            "Введённые новые пароли не совпадают."
+        return 1
+    fi
+    identity_tmp=$(_github_new_private_path "$CONFIG_DIR/.rewrap-identity.XXXXXX") || {
+        _github_record_error "подготовка смены пароля" \
+            "Не удалось создать защищённый временный файл."
+        return 1
+    }
+    unlock_tmp=$(_github_new_private_path "$GITHUB_WORKTREE/.rewrap-unlock.XXXXXX") || {
+        _github_remove_private_path "$identity_tmp"
+        return 1
+    }
+    backup=$(umask 077; mktemp "$CONFIG_DIR/.rewrap-backup.XXXXXX") || {
+        _github_remove_private_path "$identity_tmp"
+        _github_remove_private_path "$unlock_tmp"
+        return 1
+    }
+    if ! cp "$GITHUB_WORKTREE/unlock.age" "$backup" ||
+       ! chmod 600 "$backup" ||
+       ! (umask 077
+           printf '%s\n' "$old" |
+               "$AGE_BIN" -d -p -o "$identity_tmp" \
+                   "$GITHUB_WORKTREE/unlock.age" >/dev/null 2>&1
+       ) ||
+       ! _github_exact_regular_file "$identity_tmp" ||
+       ! chmod 600 "$identity_tmp"; then
+        _github_remove_private_path "$identity_tmp"
+        _github_remove_private_path "$unlock_tmp"
+        rm -f "$backup"
+        _github_record_error "расшифровка ключа конфигурации" \
+            "Текущий пароль доступа неверен или файл unlock.age повреждён."
+        return 1
+    fi
+    if ! (umask 077
+            printf '%s\n%s\n' "$new" "$new" |
+                "$AGE_BIN" -p -o "$unlock_tmp" "$identity_tmp" >/dev/null 2>&1
+         ) ||
+       ! _github_exact_regular_file "$unlock_tmp" ||
+       ! chmod 600 "$unlock_tmp" ||
+       ! mv "$unlock_tmp" "$GITHUB_WORKTREE/unlock.age"; then
+        _github_remove_private_path "$identity_tmp"
+        _github_remove_private_path "$unlock_tmp"
+        rm -f "$backup"
+        _github_record_error "шифрование ключа конфигурации" \
+            "Не удалось атомарно зашифровать ключ новым паролем."
+        return 1
+    fi
+    _github_remove_private_path "$unlock_tmp" ||
+        warn "Защищённый staging-каталог нового ключа требует ручной очистки."
+    if ! github_sync_flush; then
+        if [[ "${GITHUB_LAST_STAGE:-}" == "отправка конфигурации в GitHub" ]]; then
+            GITHUB_SYNC_STATUS=pending
+            _github_report_last_error "Новый пароль сохранён локально, но не отправлен в GitHub"
+            _github_remove_private_path "$identity_tmp" ||
+                warn "Временный ключ смены пароля требует ручной очистки."
+            rm -f "$backup" ||
+                warn "Резервная копия смены пароля требует ручной очистки."
+            _github_clear_error
+            return 0
+        fi
+        failure_stage="${GITHUB_LAST_STAGE:-}"
+        failure_detail="${GITHUB_LAST_ERROR:-}"
+        if [[ -n "$old_head" ]] &&
+           ! git -C "$GITHUB_WORKTREE" reset --hard "$old_head" >/dev/null 2>&1; then
+            _github_record_error "откат смены пароля" \
+                "Не удалось восстановить Git-состояние после ошибки публикации."
+            return 1
+        fi
+        if ! mv "$backup" "$GITHUB_WORKTREE/unlock.age"; then
+            _github_record_error "откат смены пароля" \
+                "Не удалось восстановить прежний unlock.age."
+            return 1
+        fi
+        _github_remove_private_path "$identity_tmp" ||
+            warn "Временный ключ неудачной смены пароля требует ручной очистки."
+        GITHUB_LAST_STAGE="$failure_stage"
+        GITHUB_LAST_ERROR="$failure_detail"
+        _github_ensure_error "публикация нового пароля" \
+            "Не удалось опубликовать ключ с новым паролем."
+        return 1
+    fi
+    _github_remove_private_path "$identity_tmp" ||
+        warn "Новый пароль сохранён, но временный ключ требует ручной очистки."
+    if ! rm -f "$backup"; then
+        warn "Новый пароль сохранён, но резервная копия требует ручной очистки."
+    fi
 }
 github_config_rotate_vault_key() {
-    [[ ${GITHUB_STORAGE_MODE:-none} == age ]] || return 1
+    _github_clear_error
+    if [[ ${GITHUB_STORAGE_MODE:-none} != age ]]; then
+        _github_record_error "создание нового ключа шифрования" \
+            "Текущая конфигурация не использует шифрование age."
+        return 1
+    fi
     warn "Будет создан новый ключ, и текущая конфигурация будет зашифрована заново. Пароли нод не изменятся."
     warn "Старые версии в истории GitHub останутся доступны по прежнему ключу."
     confirm_yn "Создать новый ключ шифрования?" N || return 1
-    github_config_age_init || return 1
-    github_config_checkpoint || return 1
-    github_sync_flush
+    local backup path failure_stage failure_detail failure_hint failure_auth
+    local old_identity="${GITHUB_IDENTITY:-}" old_recipient="${GITHUB_RECIPIENT:-}"
+    local old_status="${GITHUB_SYNC_STATUS:-clean}" new_identity old_head=""
+    old_head=$(git -C "$GITHUB_WORKTREE" rev-parse HEAD 2>/dev/null) || old_head=""
+    backup=$(umask 077; mktemp -d "$CONFIG_DIR/.vault-rotation.XXXXXX") || return 1
+    for path in recipient.txt unlock.age state.json.age; do
+        if ! _github_exact_regular_file "$GITHUB_WORKTREE/$path" ||
+           ! cp -p "$GITHUB_WORKTREE/$path" "$backup/$path"; then
+            rm -rf "$backup"
+            _github_record_error "подготовка ротации ключа" \
+                "Не удалось сохранить атомарную резервную копию комплекта age."
+            return 1
+        fi
+    done
+    if github_config_age_init && github_config_checkpoint; then
+        if github_sync_flush; then
+            rm -rf "$backup" ||
+                warn "Новый ключ опубликован, но резервная копия требует ручной очистки: $backup"
+            if [[ "$old_identity" != "${GITHUB_IDENTITY:-}" ]] &&
+               ! _github_remove_ephemeral_identity "$old_identity"; then
+                warn "Прежний временный ключ требует ручной очистки."
+            fi
+            return 0
+        fi
+        if [[ "${GITHUB_LAST_STAGE:-}" == "отправка конфигурации в GitHub" ]]; then
+            GITHUB_SYNC_STATUS=pending
+            _github_report_last_error "Новый ключ сохранён локально, но не отправлен в GitHub"
+            rm -rf "$backup" ||
+                warn "Резервная копия ротации требует ручной очистки: $backup"
+            if [[ "$old_identity" != "${GITHUB_IDENTITY:-}" ]] &&
+               ! _github_remove_ephemeral_identity "$old_identity"; then
+                warn "Прежний временный ключ требует ручной очистки."
+            fi
+            _github_clear_error
+            return 0
+        fi
+    fi
+    failure_stage="${GITHUB_LAST_STAGE:-}"
+    failure_detail="${GITHUB_LAST_ERROR:-}"
+    failure_hint="${GITHUB_LAST_HINT:-}"
+    failure_auth="${GITHUB_LAST_AUTH_RELEVANT:-false}"
+    new_identity="${GITHUB_IDENTITY:-}"
+    if [[ -n "$old_head" ]] &&
+       ! git -C "$GITHUB_WORKTREE" reset --hard "$old_head" >/dev/null 2>&1; then
+        _github_record_error "откат ротации ключа" \
+            "Не удалось восстановить Git-состояние прежнего комплекта age."
+        return 1
+    fi
+    for path in recipient.txt unlock.age state.json.age; do
+        if ! mv "$backup/$path" "$GITHUB_WORKTREE/$path"; then
+            _github_record_error "откат ротации ключа" \
+                "Не удалось восстановить прежний файл комплекта age: $path"
+            return 1
+        fi
+    done
+    rm -rf "$backup" ||
+        warn "Резервная копия неудачной ротации требует ручной очистки: $backup"
+    if [[ -n "$new_identity" && "$new_identity" != "$old_identity" ]]; then
+        _github_remove_ephemeral_identity "$new_identity" ||
+            warn "Новый временный ключ не удалось удалить после отката."
+    fi
+    GITHUB_IDENTITY="$old_identity"
+    GITHUB_RECIPIENT="$old_recipient"
+    GITHUB_SYNC_STATUS="$old_status"
+    GITHUB_LAST_STAGE="$failure_stage"
+    GITHUB_LAST_ERROR="$failure_detail"
+    GITHUB_LAST_HINT="$failure_hint"
+    GITHUB_LAST_AUTH_RELEVANT="$failure_auth"
+    _github_ensure_error "ротация ключа конфигурации" \
+        "Не удалось завершить ротацию ключа age."
+    return 1
 }
 github_config_switch_local() {
-    [[ ${CONFIG_SOURCE:-local} == github && -f ${CONFIG_JSON:-} ]] || return 1
-    state_validate true >/dev/null 2>&1 || return 1
-    local staging backup stamp
-    stamp=$(date -u +%Y%m%dT%H%M%SZ)
-    staging="$CONFIG_DIR/.local-switch.$$.tmp"
-    backup="$CONFIG_DIR/import-backups/$stamp"
-    rm -rf "$staging"; mkdir -p "$staging/templates" "$staging/ssh/identities" "$backup"
-    cp "$CONFIG_JSON" "$staging/config.json" && cp "$SECRETS_JSON" "$staging/secrets.json" &&
-        cp "$STATE_MANIFEST" "$staging/manifest.json" || return 1
-    cp -R "$TEMPLATES_DIR/." "$staging/templates/" 2>/dev/null || true
-    cp -R "$SSH_IDENTITIES_DIR/." "$staging/ssh/identities/" 2>/dev/null || true
-    cp "$SSH_KNOWN_HOSTS" "$staging/ssh/known_hosts" 2>/dev/null || :
-    for path in config.json secrets.json manifest.json; do
-        [[ -e "$CONFIG_DIR/$path" ]] && mv "$CONFIG_DIR/$path" "$backup/$path"
+    _github_clear_error
+    if [[ ${CONFIG_SOURCE:-local} != github || -z "${GITHUB_WORKTREE:-}" ||
+          ! -d "$GITHUB_WORKTREE" || ! -f ${CONFIG_JSON:-} ]]; then
+        _github_record_error "проверка конфигурации перед отключением GitHub" \
+            "Источник GitHub или его рабочая конфигурация недоступны."
+        return 1
+    fi
+    if ! _github_validate_tree "$STATE_DIR" none ||
+       ! state_validate true >/dev/null 2>&1; then
+        _github_ensure_error "проверка конфигурации перед отключением GitHub" \
+            "Конфигурация GitHub не прошла проверку переносимого состояния."
+        return 1
+    fi
+    local staging backup archive stamp path failure_stage failure_detail
+    local old_source="$CONFIG_SOURCE" old_state="$STATE_DIR" old_config="$CONFIG_JSON"
+    local old_secrets="$SECRETS_JSON" old_manifest="$STATE_MANIFEST"
+    local old_templates="$TEMPLATES_DIR" old_identities="$SSH_IDENTITIES_DIR"
+    local old_hosts="$SSH_KNOWN_HOSTS" old_auth="$SCRIPT_AUTH_FILE"
+    local -a paths=(config.json secrets.json manifest.json templates ssh)
+    local -a backup_paths=(config.json secrets.json manifest.json templates ssh source.json)
+    local -a moved=() published=()
+    local backup_failed=false
+    if { [[ -e "$CONFIG_DIR/import-backups" || -L "$CONFIG_DIR/import-backups" ]] &&
+         [[ ! -d "$CONFIG_DIR/import-backups" || -L "$CONFIG_DIR/import-backups" ]]; } ||
+       ! mkdir -p "$CONFIG_DIR/import-backups" ||
+       ! chmod 700 "$CONFIG_DIR/import-backups"; then
+        _github_record_error "подготовка локальной копии" \
+            "Не удалось подготовить защищённый каталог резервных копий."
+        return 1
+    fi
+    staging=$(umask 077; mktemp -d "$CONFIG_DIR/.local-switch-stage.XXXXXX") || {
+        _github_record_error "подготовка локальной копии" \
+            "Не удалось создать защищённый staging-каталог."
+        return 1
+    }
+    backup=$(umask 077; mktemp -d "$CONFIG_DIR/.local-switch-backup.XXXXXX") || {
+        rm -rf "$staging"
+        return 1
+    }
+    if ! mkdir -p "$staging/templates" "$staging/ssh/identities" ||
+       ! cp "$CONFIG_JSON" "$staging/config.json" ||
+       ! cp "$SECRETS_JSON" "$staging/secrets.json" ||
+       ! cp "$STATE_MANIFEST" "$staging/manifest.json" ||
+       ! cp -Rp "$TEMPLATES_DIR/." "$staging/templates/" ||
+       ! cp -Rp "$SSH_IDENTITIES_DIR/." "$staging/ssh/identities/"; then
+        rm -rf "$staging" "$backup"
+        _github_record_error "подготовка локальной копии" \
+            "Не удалось полностью скопировать рабочее состояние GitHub."
+        return 1
+    fi
+    if _github_exact_regular_file "$SSH_KNOWN_HOSTS"; then
+        if ! cp "$SSH_KNOWN_HOSTS" "$staging/ssh/known_hosts"; then
+            rm -rf "$staging" "$backup"
+            return 1
+        fi
+    elif ! : > "$staging/ssh/known_hosts"; then
+        rm -rf "$staging" "$backup"
+        return 1
+    fi
+    if ! chmod 700 "$staging" "$staging/templates" "$staging/ssh" \
+            "$staging/ssh/identities" ||
+       ! chmod 600 "$staging/config.json" "$staging/secrets.json" \
+            "$staging/manifest.json" "$staging/ssh/known_hosts"; then
+        rm -rf "$staging" "$backup"
+        _github_record_error "защита локальной копии" \
+            "Не удалось установить безопасные права локальной копии."
+        return 1
+    fi
+    for path in "$staging"/templates/*.yaml; do
+        [[ -e "$path" ]] || continue
+        chmod 644 "$path" || { rm -rf "$staging" "$backup"; return 1; }
     done
-    [[ -d "$CONFIG_DIR/templates" ]] && mv "$CONFIG_DIR/templates" "$backup/templates"
-    [[ -d "$CONFIG_DIR/ssh" ]] && mv "$CONFIG_DIR/ssh" "$backup/ssh"
-    mv "$staging/config.json" "$CONFIG_DIR/config.json" && mv "$staging/secrets.json" "$CONFIG_DIR/secrets.json" &&
-        mv "$staging/manifest.json" "$CONFIG_DIR/manifest.json" && mv "$staging/templates" "$CONFIG_DIR/templates" &&
-        mv "$staging/ssh" "$CONFIG_DIR/ssh" || return 1
-    rm -f "$CONFIG_DIR/source.json" || return 1
-    rmdir "$staging" 2>/dev/null || rm -rf "$staging"
-    github_config_close >/dev/null 2>&1 || true
-    CONFIG_SOURCE=local; STATE_DIR="$CONFIG_DIR"; CONFIG_JSON="$CONFIG_DIR/config.json"
+    for path in "$staging"/ssh/identities/*; do
+        [[ -e "$path" ]] || continue
+        case "$path" in
+            *.pub) chmod 644 "$path" || { rm -rf "$staging" "$backup"; return 1; } ;;
+            *) chmod 600 "$path" || { rm -rf "$staging" "$backup"; return 1; } ;;
+        esac
+    done
+    if ! _github_validate_tree "$staging" none; then
+        rm -rf "$staging" "$backup"
+        return 1
+    fi
+    CONFIG_SOURCE=local
+    STATE_DIR="$staging"; CONFIG_JSON="$staging/config.json"
+    SECRETS_JSON="$staging/secrets.json"; STATE_MANIFEST="$staging/manifest.json"
+    TEMPLATES_DIR="$staging/templates"; SSH_IDENTITIES_DIR="$staging/ssh/identities"
+    SSH_KNOWN_HOSTS="$staging/ssh/known_hosts"
+    if ! state_validate true >/dev/null 2>&1; then
+        CONFIG_SOURCE="$old_source"; STATE_DIR="$old_state"; CONFIG_JSON="$old_config"
+        SECRETS_JSON="$old_secrets"; STATE_MANIFEST="$old_manifest"
+        TEMPLATES_DIR="$old_templates"; SSH_IDENTITIES_DIR="$old_identities"
+        SSH_KNOWN_HOSTS="$old_hosts"; SCRIPT_AUTH_FILE="$old_auth"
+        rm -rf "$staging" "$backup"
+        _github_ensure_error "проверка локальной копии" \
+            "Подготовленная локальная копия не прошла проверку."
+        return 1
+    fi
+    CONFIG_SOURCE="$old_source"; STATE_DIR="$old_state"; CONFIG_JSON="$old_config"
+    SECRETS_JSON="$old_secrets"; STATE_MANIFEST="$old_manifest"
+    TEMPLATES_DIR="$old_templates"; SSH_IDENTITIES_DIR="$old_identities"
+    SSH_KNOWN_HOSTS="$old_hosts"; SCRIPT_AUTH_FILE="$old_auth"
+    for path in "${backup_paths[@]}"; do
+        if [[ -e "$CONFIG_DIR/$path" || -L "$CONFIG_DIR/$path" ]]; then
+            case "$path" in
+                config.json|secrets.json|manifest.json|source.json)
+                    if ! _github_exact_regular_file "$CONFIG_DIR/$path"; then
+                        backup_failed=true
+                        break
+                    fi
+                    ;;
+                templates|ssh)
+                    if [[ ! -d "$CONFIG_DIR/$path" || -L "$CONFIG_DIR/$path" ]]; then
+                        backup_failed=true
+                        break
+                    fi
+                    ;;
+            esac
+            if ! mv "$CONFIG_DIR/$path" "$backup/$path"; then
+                backup_failed=true
+                break
+            fi
+            moved+=("$path")
+        fi
+    done
+    if [[ "$backup_failed" == true ]]; then
+        for path in "${moved[@]}"; do
+            mv "$backup/$path" "$CONFIG_DIR/$path" || {
+                _github_record_error "откат резервного копирования" \
+                    "Не удалось восстановить прежний локальный путь: $path"
+                return 1
+            }
+        done
+        rm -rf "$staging" "$backup"
+        _github_record_error "резервное копирование локального состояния" \
+            "Не удалось атомарно убрать прежние локальные пути."
+        return 1
+    fi
+    for path in "${paths[@]}"; do
+        if ! mv "$staging/$path" "$CONFIG_DIR/$path"; then
+            break
+        fi
+        published+=("$path")
+    done
+    if ((${#published[@]} != ${#paths[@]})); then
+        for path in "${published[@]}"; do
+            rm -rf "$CONFIG_DIR/$path" || return 1
+        done
+        for path in "${moved[@]}"; do
+            mv "$backup/$path" "$CONFIG_DIR/$path" || return 1
+        done
+        rm -rf "$staging" "$backup"
+        _github_record_error "публикация локального состояния" \
+            "Не удалось опубликовать полный комплект локальных файлов."
+        return 1
+    fi
+    if ! github_config_close; then
+        failure_stage="${GITHUB_LAST_STAGE:-}"
+        failure_detail="${GITHUB_LAST_ERROR:-}"
+        for path in "${published[@]}"; do
+            rm -rf "$CONFIG_DIR/$path" || return 1
+        done
+        for path in "${moved[@]}"; do
+            mv "$backup/$path" "$CONFIG_DIR/$path" || return 1
+        done
+        rm -rf "$staging" "$backup"
+        GITHUB_LAST_STAGE="$failure_stage"
+        GITHUB_LAST_ERROR="$failure_detail"
+        return 1
+    fi
+    CONFIG_SOURCE=local
+    STATE_DIR="$CONFIG_DIR"; CONFIG_JSON="$CONFIG_DIR/config.json"
     SECRETS_JSON="$CONFIG_DIR/secrets.json"; STATE_MANIFEST="$CONFIG_DIR/manifest.json"
     TEMPLATES_DIR="$CONFIG_DIR/templates"; SSH_IDENTITIES_DIR="$CONFIG_DIR/ssh/identities"
     SSH_KNOWN_HOSTS="$CONFIG_DIR/ssh/known_hosts"; SCRIPT_AUTH_FILE="$CONFIG_DIR/.auth"
-    GITHUB_WORKTREE=""; GITHUB_IDENTITY=""; GITHUB_RECIPIENT=""
     GITHUB_REMOTE=""; GITHUB_OWNER=""
+    if stamp=$(date -u +%Y%m%dT%H%M%SZ); then
+        archive="$CONFIG_DIR/import-backups/$stamp-${backup##*.}"
+    fi
+    if [[ -n "${archive:-}" ]] && mv "$backup" "$archive"; then
+        :
+    else
+        warn "Прежняя локальная копия сохранена во временном каталоге: $backup"
+    fi
+    rmdir "$staging" 2>/dev/null ||
+        warn "Staging-каталог локального переключения требует ручной очистки."
     _github_clear_error
-    export CONFIG_SOURCE STATE_DIR CONFIG_JSON SECRETS_JSON STATE_MANIFEST TEMPLATES_DIR SSH_IDENTITIES_DIR SSH_KNOWN_HOSTS SCRIPT_AUTH_FILE
+    export CONFIG_SOURCE STATE_DIR CONFIG_JSON SECRETS_JSON STATE_MANIFEST
+    export TEMPLATES_DIR SSH_IDENTITIES_DIR SSH_KNOWN_HOSTS SCRIPT_AUTH_FILE
     export GITHUB_WORKTREE GITHUB_IDENTITY GITHUB_RECIPIENT GITHUB_REMOTE GITHUB_OWNER
 }
 github_config_open() {
+    _github_clear_error
     local root="${1:?worktree}" out="${2:-${CONFIG_DIR:-.}/runtime-state.json}"
-    GITHUB_WORKTREE="$root"
-    _github_storage_read || return 1
-    _github_validate_tracked_tree || return 1
-    if [[ $GITHUB_STORAGE_MODE == none ]]; then
-        _github_plain_read "$out" || return 1
-    else
-        [[ -s "$root/recipient.txt" && -s "$root/state.json.age" ]] || return 1
-        GITHUB_RECIPIENT=$(tr -d '\r\n' < "$root/recipient.txt")
-        github_config_unlock || return 1
-        local id="${GITHUB_IDENTITY:-}"
-        [[ -s "$id" ]] || return 1
-        "$AGE_BIN" -d -i "$id" -o "$out" "$root/state.json.age" || return 1
-        github_config_validate "$out" || { rm -f "$out"; return 1; }
+    local id decrypt_tmp
+    if [[ ! -d "$root" || -L "$root" ]]; then
+        _github_record_error "подготовка рабочей копии конфигурации" \
+            "Рабочая копия конфигурации GitHub недоступна."
+        return 1
     fi
-    chmod 600 "$out"; return 0
+    GITHUB_WORKTREE="$root"
+    _github_validate_tree "$root" auto || return 1
+    _github_validate_tracked_tree auto || return 1
+    _github_storage_read || return 1
+    _github_validate_tree "$root" "$GITHUB_STORAGE_MODE" || return 1
+    _github_validate_tracked_tree "$GITHUB_STORAGE_MODE" || return 1
+    if [[ $GITHUB_STORAGE_MODE == none ]]; then
+        if ! _github_plain_read "$out"; then
+            _github_ensure_error "чтение конфигурации GitHub" \
+                "Не удалось прочитать незашифрованную конфигурацию GitHub."
+            return 1
+        fi
+    else
+        if ! _github_exact_regular_file "$root/recipient.txt" ||
+           ! _github_exact_regular_file "$root/unlock.age" ||
+           ! _github_exact_regular_file "$root/state.json.age" ||
+           [[ ! -s "$root/recipient.txt" || ! -s "$root/unlock.age" ||
+              ! -s "$root/state.json.age" ]]; then
+            _github_record_error "чтение конфигурации GitHub" \
+                "Зашифрованная конфигурация GitHub неполна."
+            return 1
+        fi
+        GITHUB_RECIPIENT=$(tr -d '\r\n' < "$root/recipient.txt")
+        if [[ -z "$GITHUB_RECIPIENT" ]]; then
+            _github_record_error "чтение конфигурации GitHub" \
+                "Зашифрованная конфигурация GitHub не содержит recipient."
+            return 1
+        fi
+        github_config_unlock || return 1
+        id="${GITHUB_IDENTITY:-}"
+        if ! _github_exact_regular_file "$id" || [[ ! -s "$id" ]]; then
+            _github_record_error "расшифровка конфигурации GitHub" \
+                "Не удалось разблокировать конфигурацию: пароль или ключ восстановления не подошёл."
+            return 1
+        fi
+        decrypt_tmp=$(_github_new_private_path "${out}.tmp.XXXXXX") || {
+            _github_record_error "расшифровка конфигурации GitHub" \
+                "Не удалось создать защищённый временный файл состояния."
+            return 1
+        }
+        if ! (umask 077
+                "$AGE_BIN" -d -i "$id" -o "$decrypt_tmp" \
+                    "$root/state.json.age" >/dev/null 2>&1
+             ) ||
+           ! _github_exact_regular_file "$decrypt_tmp" ||
+           ! github_config_validate "$decrypt_tmp" ||
+           ! chmod 600 "$decrypt_tmp" ||
+           ! mv "$decrypt_tmp" "$out"; then
+            _github_remove_private_path "$decrypt_tmp"
+            _github_ensure_error "расшифровка конфигурации GitHub" \
+                "Не удалось атомарно расшифровать конфигурацию GitHub."
+            return 1
+        fi
+        _github_remove_private_path "$decrypt_tmp" ||
+            warn "Защищённый staging-каталог расшифровки требует ручной очистки."
+    fi
 }
 
 _github_repo() { printf '%s/%s' "${GITHUB_OWNER:?}" "$GITHUB_REPO_NAME"; }
 github_repository_delete() {
+    _github_clear_error
     local repo="${1:-}" gh="${GH_BIN:-gh}" output
     if [[ ! "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
         _github_record_error "удаление репозитория GitHub" \
@@ -663,7 +1811,7 @@ github_repository_delete() {
         return 1
     fi
     if ! github_config_switch_local; then
-        _github_record_error "сохранение локальной конфигурации перед удалением" \
+        _github_ensure_error "сохранение локальной конфигурации перед удалением" \
             "Не удалось сохранить конфигурацию локально."
         return 1
     fi
@@ -678,27 +1826,44 @@ github_repository_delete() {
         return 1
     fi
     if ! output=$(NO_COLOR=1 GH_PROMPT_DISABLED=1 "$gh" repo delete "$repo" --yes 2>&1); then
-        _github_record_error "удаление репозитория GitHub" "$output" true
+        _github_record_error "удаление репозитория GitHub" "$output"
         return 1
     fi
 }
-
 github_repository_open_settings() {
+    _github_clear_error
     local repo="${1:-}" gh="${GH_BIN:-gh}"
-    [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 1
-    _github_require "$gh" || return 1
-    NO_COLOR=1 GH_PROMPT_DISABLED=1 "$gh" browse --settings --repo "$repo" \
-        >/dev/null 2>&1
+    if [[ ! "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+        _github_record_error "открытие настроек репозитория GitHub" \
+            "Указан некорректный репозиторий GitHub."
+        return 1
+    fi
+    if ! _github_require "$gh"; then
+        _github_record_error "проверка зависимостей" \
+            "Не найдена команда GitHub CLI: $gh."
+        return 1
+    fi
+    if ! NO_COLOR=1 GH_PROMPT_DISABLED=1 "$gh" browse --settings --repo "$repo" \
+        >/dev/null 2>&1; then
+        _github_record_error "открытие настроек репозитория GitHub" \
+            "Не удалось открыть настройки репозитория GitHub."
+        return 1
+    fi
 }
-
 github_source_metadata_valid() {
     local file="${1:-}"
     [[ -f "$file" ]] || return 1
-    jq -e 'type=="object" and .type=="github" and .private_verified == true and
-        (.repo | strings | test("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")) and
-        (.branch | strings | length > 0)' "$file" >/dev/null 2>&1
+    jq -e '
+        type == "object" and
+        (keys | sort) == ["branch", "private_verified", "repo", "type"] and
+        .type == "github" and
+        (.repo | type == "string" and test("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")) and
+        (.branch | type == "string" and length > 0 and test("^[A-Za-z0-9._/-]+$")) and
+        .private_verified == true
+    ' "$file" >/dev/null 2>&1
 }
 github_source_metadata_write() {
+    _github_clear_error
     local tmp repo
     if [[ -z "${GITHUB_OWNER:-}" || -z "${GITHUB_REPO_NAME:-}" ||
           -z "${GITHUB_BRANCH:-}" ]] || ! mkdir -p "$CONFIG_DIR"; then
@@ -707,11 +1872,11 @@ github_source_metadata_write() {
         return 1
     fi
     repo="$GITHUB_OWNER/$GITHUB_REPO_NAME"
-    tmp=$(umask 077; mktemp "$CONFIG_DIR/.source.XXXXXX") || {
+    if ! tmp=$(umask 077; mktemp "$CONFIG_DIR/.source.XXXXXX"); then
         _github_record_error "сохранение настроек источника" \
             "Не удалось сохранить параметры репозитория GitHub."
         return 1
-    }
+    fi
     if ! jq -n --arg repo "$repo" --arg branch "$GITHUB_BRANCH" \
         '{type:"github",repo:$repo,branch:$branch,private_verified:true}' > "$tmp" ||
        ! github_source_metadata_valid "$tmp" ||
@@ -739,20 +1904,44 @@ _github_archive_oid() {
     archive_ref="refs/archive/${label}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
     git --git-dir="$GITHUB_STORE" update-ref "$archive_ref" "$oid"
 }
+_github_session_target_guard() {
+    local actual expected
+    if [[ -z "${GITHUB_WORKTREE:-}" && -z "${GITHUB_SESSION_ID:-}" ]]; then
+        return 0
+    fi
+    if [[ -z "${GITHUB_SESSION_REMOTE:-}" ||
+          -z "${GITHUB_SESSION_BRANCH:-}" ||
+          "${GITHUB_REMOTE:-}" != "$GITHUB_SESSION_REMOTE" ||
+          "${GITHUB_BRANCH:-}" != "$GITHUB_SESSION_BRANCH" ]]; then
+        _github_record_error "проверка цели рабочей сессии GitHub" \
+            "Запрошенный репозиторий или ветка не совпадает с неизменяемой целью текущей сессии."
+        return 1
+    fi
+    actual=$(git --git-dir="$GITHUB_STORE" remote get-url origin 2>/dev/null) || {
+        _github_record_error "проверка цели рабочей сессии GitHub" \
+            "Не удалось проверить origin текущей сессии."
+        return 1
+    }
+    expected="${GITHUB_SESSION_ORIGIN:-$GITHUB_SESSION_REMOTE}"
+    if [[ "$actual" != "$expected" ]]; then
+        _github_record_error "проверка цели рабочей сессии GitHub" \
+            "Origin локального хранилища не совпадает с неизменяемой целью текущей сессии."
+        return 1
+    fi
+}
+
 
 github_sync_init() {
     local allow_create="${1:-false}"
     local init_mode="${2:-resume}"
+    _github_clear_error
     case "$init_mode" in
         resume|onboarding) ;;
         *) _github_record_error "подготовка локального репозитория" "Неизвестный режим инициализации GitHub."; return 1 ;;
     esac
-    # github_enable_local may initialize the transport before calling
-    # config_source_startup. Reuse that live worktree instead of attempting
-    # to create the same session branch a second time.
-    _github_clear_error
     if [[ -n "${GITHUB_WORKTREE:-}" && -d "$GITHUB_WORKTREE" ]] &&
        git -C "$GITHUB_WORKTREE" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        _github_session_target_guard || return 1
         return 0
     fi
     if ! _github_ensure_deps "" "$GITHUB_REMOTE"; then
@@ -764,9 +1953,9 @@ github_sync_init() {
         return 1
     fi
 
-    local repo remote_view login setup_output create_output
+    local repo remote_view remote_view_lc login setup_output create_output
     local git_output fetch_output fetch_ok=true local_oid="" remote_oid=""
-    local current_origin="" remote_changed=false
+    local current_origin="" remote_changed=false auth_failure=false
     local gh="${GH_BIN:-gh}"
     if [[ "$GITHUB_REMOTE" != /* && "$GITHUB_REMOTE" != *.git && "$GITHUB_REMOTE" != file://* ]]; then
         if ! _github_ensure_deps; then
@@ -778,25 +1967,38 @@ github_sync_init() {
             return 1
         fi
         if ! setup_output=$(NO_COLOR=1 GH_PROMPT_DISABLED=1 "$gh" auth setup-git 2>&1); then
-            _github_record_error "настройка Git для GitHub CLI" "$setup_output" true
+            _github_auth_failure_confirmed "$setup_output" && auth_failure=true
+            _github_record_error "настройка Git для GitHub CLI" "$setup_output" "$auth_failure"
             return 1
         fi
+        auth_failure=false
         if ! login=$(NO_COLOR=1 GH_PROMPT_DISABLED=1 "$gh" api user --jq .login 2>&1); then
-            _github_record_error "определение пользователя GitHub" "$login" true
+            _github_auth_failure_confirmed "$login" && auth_failure=true
+            _github_record_error "определение пользователя GitHub" "$login" "$auth_failure"
             return 1
         fi
         login=$(printf '%s' "$login" | tr -d '\r\n')
+        if [[ -z "$login" ]]; then
+            _github_record_error "определение пользователя GitHub" \
+                "GitHub API вернул пустое имя пользователя."
+            return 1
+        fi
         [[ -n "$GITHUB_OWNER" ]] || GITHUB_OWNER="$login"
         if [[ "$login" != "$GITHUB_OWNER" ]]; then
             _github_record_error "проверка пользователя GitHub" \
-                "GitHub CLI подключён как $login, ожидался пользователь $GITHUB_OWNER."
+                "GitHub CLI подключён как $login, ожидался пользователь $GITHUB_OWNER." true \
+                "Переключите активный аккаунт GitHub: gh auth switch --hostname github.com --user $GITHUB_OWNER"
             return 1
         fi
         repo="$GITHUB_OWNER/$GITHUB_REPO_NAME"
         if ! remote_view=$(NO_COLOR=1 GH_PROMPT_DISABLED=1 "$gh" repo view "$repo" --json visibility 2>&1); then
-            if [[ "$remote_view" != *"not found"* &&
-                  "$remote_view" != *"Could not resolve to a Repository"* ]]; then
-                _github_record_error "проверка приватного репозитория" "$remote_view" true
+            remote_view_lc=$(printf '%s' "$remote_view" | tr '[:upper:]' '[:lower:]')
+            if [[ "$remote_view_lc" != *"not found"* &&
+                  "$remote_view_lc" != *"could not resolve to a repository"* ]]; then
+                auth_failure=false
+                _github_auth_failure_confirmed "$remote_view" && auth_failure=true
+                _github_record_error "проверка приватного репозитория" \
+                    "$remote_view" "$auth_failure"
                 return 1
             fi
             if [[ "$allow_create" != true ]]; then
@@ -812,12 +2014,16 @@ github_sync_init() {
             fi
             if ! create_output=$(NO_COLOR=1 GH_PROMPT_DISABLED=1 "$gh" repo create "$repo" \
                 --private --description "Essence Remote Control configuration" 2>&1); then
-                _github_record_error "создание приватного репозитория" "$create_output" true
+                auth_failure=false
+                _github_auth_failure_confirmed "$create_output" && auth_failure=true
+                _github_record_error "создание приватного репозитория" \
+                    "$create_output" "$auth_failure"
                 return 1
             fi
             remote_view='{"visibility":"PRIVATE"}'
         fi
-        if [[ "$remote_view" != *PRIVATE* ]]; then
+        if ! printf '%s' "$remote_view" |
+            jq -e '.visibility == "PRIVATE"' >/dev/null 2>&1; then
             _github_record_error "проверка приватного репозитория" \
                 "Репозиторий $repo должен быть приватным."
             return 1
@@ -832,7 +2038,7 @@ github_sync_init() {
     fi
     GITHUB_SESSION_ID=${GITHUB_SESSION_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM}
     local dir="$GITHUB_SESSIONS_DIR/$GITHUB_SESSION_ID" remote_ref remote_refs
-    if ! mkdir -p "$dir"; then
+    if ! _github_mkdir_secure "$dir"; then
         _github_record_error "подготовка локального хранилища" \
             "Не удалось создать каталог рабочей сессии."
         return 1
@@ -865,9 +2071,15 @@ github_sync_init() {
     if [[ "$init_mode" == onboarding ]]; then
         if [[ "$fetch_ok" == true ]] &&
            git --git-dir="$GITHUB_STORE" show-ref --verify --quiet "$remote_ref"; then
-            remote_oid=$(git --git-dir="$GITHUB_STORE" rev-parse "$remote_ref") || return 1
+            if ! remote_oid=$(git --git-dir="$GITHUB_STORE" rev-parse "$remote_ref" 2>&1); then
+                _github_record_error "чтение локальной версии конфигурации" "$remote_oid"
+                return 1
+            fi
             if git --git-dir="$GITHUB_STORE" show-ref --verify --quiet "$local_ref"; then
-                local_oid=$(git --git-dir="$GITHUB_STORE" rev-parse "$local_ref") || return 1
+                if ! local_oid=$(git --git-dir="$GITHUB_STORE" rev-parse "$local_ref" 2>&1); then
+                    _github_record_error "чтение локальной версии конфигурации" "$local_oid"
+                    return 1
+                fi
                 if [[ "$local_oid" != "$remote_oid" ]] &&
                    ! git --git-dir="$GITHUB_STORE" merge-base --is-ancestor \
                         "$local_ref" "$remote_ref"; then
@@ -888,7 +2100,7 @@ github_sync_init() {
             if ! remote_refs=$(_github_run_with_timeout 15 git ls-remote \
                 "$GITHUB_REMOTE" "refs/heads/$GITHUB_BRANCH" 2>/dev/null); then
                 if [[ "$GITHUB_REMOTE" == https://github.com/* ]]; then
-                    _github_record_error "загрузка репозитория GitHub" "$fetch_output" true
+                    _github_record_error "загрузка репозитория GitHub" "$fetch_output"
                 else
                     _github_record_error "загрузка репозитория GitHub" "$fetch_output"
                 fi
@@ -896,7 +2108,7 @@ github_sync_init() {
             fi
             if [[ -n "$remote_refs" ]]; then
                 if [[ "$GITHUB_REMOTE" == https://github.com/* ]]; then
-                    _github_record_error "загрузка репозитория GitHub" "$fetch_output" true
+                    _github_record_error "загрузка репозитория GitHub" "$fetch_output"
                 else
                     _github_record_error "загрузка репозитория GitHub" "$fetch_output"
                 fi
@@ -904,20 +2116,32 @@ github_sync_init() {
             fi
             local previous_oid=""
             if git --git-dir="$GITHUB_STORE" show-ref --verify --quiet "$local_ref"; then
-                previous_oid=$(git --git-dir="$GITHUB_STORE" rev-parse "$local_ref") || return 1
+                if ! previous_oid=$(git --git-dir="$GITHUB_STORE" rev-parse "$local_ref" 2>&1); then
+                    _github_record_error "чтение локальной версии конфигурации" "$previous_oid"
+                    return 1
+                fi
                 if ! _github_archive_oid "$previous_oid" onboarding; then
                     _github_record_error "сохранение локальной истории перед подключением" \
                         "Не удалось сохранить локальную ветку перед выбором версии конфигурации."
                     return 1
                 fi
             fi
-            git --git-dir="$GITHUB_STORE" update-ref -d "$local_ref" || return 1
-            git --git-dir="$GITHUB_STORE" update-ref -d "$remote_ref" || return 1
+            if ! git_output=$(git --git-dir="$GITHUB_STORE" update-ref -d "$local_ref" 2>&1); then
+                _github_record_error "обновление локальной копии репозитория" "$git_output"
+                return 1
+            fi
+            if ! git_output=$(git --git-dir="$GITHUB_STORE" update-ref -d "$remote_ref" 2>&1); then
+                _github_record_error "обновление локальной копии репозитория" "$git_output"
+                return 1
+            fi
             GITHUB_SYNC_STATUS=clean
         fi
     elif [[ "$fetch_ok" == true ]] &&
        git --git-dir="$GITHUB_STORE" show-ref --verify --quiet "$remote_ref"; then
-        remote_oid=$(git --git-dir="$GITHUB_STORE" rev-parse "$remote_ref") || return 1
+        if ! remote_oid=$(git --git-dir="$GITHUB_STORE" rev-parse "$remote_ref" 2>&1); then
+            _github_record_error "чтение локальной версии конфигурации" "$remote_oid"
+            return 1
+        fi
         if ! git --git-dir="$GITHUB_STORE" show-ref --verify --quiet "$local_ref"; then
             if ! git_output=$(git --git-dir="$GITHUB_STORE" update-ref \
                 "$local_ref" "$remote_ref" 2>&1); then
@@ -927,7 +2151,10 @@ github_sync_init() {
             GITHUB_SYNC_STATUS=clean
             local_oid="$remote_oid"
         else
-            local_oid=$(git --git-dir="$GITHUB_STORE" rev-parse "$local_ref") || return 1
+            if ! local_oid=$(git --git-dir="$GITHUB_STORE" rev-parse "$local_ref" 2>&1); then
+                _github_record_error "чтение локальной версии конфигурации" "$local_oid"
+                return 1
+            fi
         fi
         if [[ -n "$local_oid" && "$local_oid" == "$remote_oid" ]]; then
             GITHUB_SYNC_STATUS=clean
@@ -954,9 +2181,15 @@ github_sync_init() {
                [[ -z "$remote_refs" ]]; then
                 local previous_oid=""
                 if git --git-dir="$GITHUB_STORE" show-ref --verify --quiet "$local_ref"; then
-                    previous_oid=$(git --git-dir="$GITHUB_STORE" rev-parse "$local_ref")
+                    if ! previous_oid=$(git --git-dir="$GITHUB_STORE" rev-parse "$local_ref" 2>&1); then
+                        _github_record_error "чтение локальной версии конфигурации" "$previous_oid"
+                        return 1
+                    fi
                 elif git --git-dir="$GITHUB_STORE" show-ref --verify --quiet "$remote_ref"; then
-                    previous_oid=$(git --git-dir="$GITHUB_STORE" rev-parse "$remote_ref")
+                    if ! previous_oid=$(git --git-dir="$GITHUB_STORE" rev-parse "$remote_ref" 2>&1); then
+                        _github_record_error "чтение локальной версии конфигурации" "$previous_oid"
+                        return 1
+                    fi
                 fi
                 if [[ -n "$previous_oid" ]] &&
                    ! _github_archive_oid "$previous_oid" remote-switch; then
@@ -964,12 +2197,18 @@ github_sync_init() {
                         "Не удалось сохранить прежнюю локальную ветку перед сменой репозитория."
                     return 1
                 fi
-                git --git-dir="$GITHUB_STORE" update-ref -d "$local_ref" || return 1
-                git --git-dir="$GITHUB_STORE" update-ref -d "$remote_ref" || return 1
+                if ! git_output=$(git --git-dir="$GITHUB_STORE" update-ref -d "$local_ref" 2>&1); then
+                    _github_record_error "обновление локальной копии репозитория" "$git_output"
+                    return 1
+                fi
+                if ! git_output=$(git --git-dir="$GITHUB_STORE" update-ref -d "$remote_ref" 2>&1); then
+                    _github_record_error "обновление локальной копии репозитория" "$git_output"
+                    return 1
+                fi
                 info "Репозиторий GitHub изменён: прежняя история сохранена локально, новый пустой репозиторий будет инициализирован отдельно."
             else
                 if [[ "$GITHUB_REMOTE" == https://github.com/* ]]; then
-                    _github_record_error "загрузка нового репозитория GitHub" "$fetch_output" true
+                    _github_record_error "загрузка нового репозитория GitHub" "$fetch_output"
                 else
                     _github_record_error "загрузка нового репозитория GitHub" "$fetch_output"
                 fi
@@ -979,8 +2218,14 @@ github_sync_init() {
         GITHUB_SYNC_STATUS=offline
         if git --git-dir="$GITHUB_STORE" show-ref --verify --quiet "$local_ref"; then
             if git --git-dir="$GITHUB_STORE" show-ref --verify --quiet "$remote_ref"; then
-                local_oid=$(git --git-dir="$GITHUB_STORE" rev-parse "$local_ref") || return 1
-                remote_oid=$(git --git-dir="$GITHUB_STORE" rev-parse "$remote_ref") || return 1
+                if ! local_oid=$(git --git-dir="$GITHUB_STORE" rev-parse "$local_ref" 2>&1); then
+                    _github_record_error "чтение локальной версии конфигурации" "$local_oid"
+                    return 1
+                fi
+                if ! remote_oid=$(git --git-dir="$GITHUB_STORE" rev-parse "$remote_ref" 2>&1); then
+                    _github_record_error "чтение локальной версии конфигурации" "$remote_oid"
+                    return 1
+                fi
                 if git --git-dir="$GITHUB_STORE" merge-base --is-ancestor "$remote_ref" "$local_ref" &&
                    [[ "$local_oid" != "$remote_oid" ]]; then
                     GITHUB_SYNC_STATUS=pending
@@ -995,7 +2240,7 @@ github_sync_init() {
             :
         else
             if [[ "$GITHUB_REMOTE" == https://github.com/* ]]; then
-                _github_record_error "загрузка репозитория GitHub" "$fetch_output" true
+                _github_record_error "загрузка репозитория GitHub" "$fetch_output"
             else
                 _github_record_error "загрузка репозитория GitHub" "$fetch_output"
             fi
@@ -1027,53 +2272,109 @@ github_sync_init() {
             "Не удалось ограничить доступ к служебным файлам."
         return 1
     fi
-    export GITHUB_WORKTREE GITHUB_SESSION_ID
+    GITHUB_SESSION_REMOTE="$GITHUB_REMOTE"
+    GITHUB_SESSION_BRANCH="$GITHUB_BRANCH"
+    GITHUB_SESSION_ORIGIN=$(git --git-dir="$GITHUB_STORE" remote get-url origin 2>/dev/null) || {
+        _github_record_error "фиксация цели рабочей сессии GitHub" \
+            "Не удалось сохранить origin созданной сессии."
+        return 1
+    }
+    export GITHUB_WORKTREE GITHUB_SESSION_ID GITHUB_SESSION_REMOTE GITHUB_SESSION_BRANCH
+    export GITHUB_SESSION_ORIGIN
 }
 github_sync_status() {
     printf '%s\n' "${GITHUB_SYNC_STATUS:-clean}"
 }
 
 _github_validate_tracked_tree() {
-    local path rel tracked
-    tracked=$(git -C "$GITHUB_WORKTREE" ls-files) || return 1
-    [[ -z "$tracked" ]] && return 0
-    while IFS= read -r path; do
-        rel="$path"
-        case "$rel" in
-            storage.json) ;;
-            recipient.txt|unlock.age|state.json.age)
-                [[ ${GITHUB_STORAGE_MODE:-none} == age ]] || return 1 ;;
-            config.json|secrets.json|manifest.json)
-                [[ ${GITHUB_STORAGE_MODE:-none} == none ]] || return 1 ;;
-            templates/*.yaml|ssh/known_hosts|ssh/identities/[0-9a-fA-F]*|ssh/identities/[0-9a-fA-F]*.pub)
-                [[ ${GITHUB_STORAGE_MODE:-none} == none ]] || return 1 ;;
-            *) warn "В хранилище конфигурации GitHub обнаружен недопустимый файл: $rel"; return 1 ;;
-        esac
-    done <<< "$tracked"
+    local mode="${1:-${GITHUB_STORAGE_MODE:-auto}}" list entry meta rel
+    local index_mode stage name valid
+    list=$(umask 077; mktemp "${TMPDIR:-/tmp}/github-index.XXXXXX") || {
+        _github_record_error "проверка файлов репозитория GitHub" \
+            "Не удалось подготовить безопасный список индекса Git."
+        return 1
+    }
+    if ! git -C "$GITHUB_WORKTREE" ls-files --stage -z > "$list"; then
+        rm -f "$list"
+        _github_record_error "проверка файлов репозитория GitHub" \
+            "Не удалось проверить список файлов репозитория GitHub."
+        return 1
+    fi
+    while IFS= read -r -d '' entry; do
+        meta="${entry%%	*}"
+        rel="${entry#*	}"
+        index_mode="${meta%% *}"
+        stage="${meta##* }"
+        valid=false
+        if [[ "$stage" == 0 ]] &&
+           { [[ "$index_mode" == 100644 ]] || [[ "$index_mode" == 100755 ]]; }; then
+            case "$mode:$rel" in
+                auto:storage.json|auto:recipient.txt|auto:unlock.age|auto:state.json.age|\
+                auto:config.json|auto:secrets.json|auto:manifest.json|auto:ssh/known_hosts|\
+                age:storage.json|age:recipient.txt|age:unlock.age|age:state.json.age|\
+                none:storage.json|none:config.json|none:secrets.json|none:manifest.json|none:ssh/known_hosts)
+                    valid=true ;;
+                auto:templates/*.yaml|none:templates/*.yaml)
+                    name="${rel#templates/}"
+                    [[ "$name" =~ ^[A-Za-z0-9._-]+\.yaml$ ]] && valid=true ;;
+                auto:ssh/identities/*|none:ssh/identities/*)
+                    name="${rel#ssh/identities/}"
+                    [[ "$name" =~ ^[0-9a-fA-F]{32}(\.pub)?$ ]] && valid=true ;;
+            esac
+        fi
+        if [[ "$valid" != true ]]; then
+            rm -f "$list"
+            _github_record_error "проверка файлов репозитория GitHub" \
+                "В индексе GitHub обнаружен недопустимый путь или тип: $rel"
+            return 1
+        fi
+    done < "$list"
+    if ! rm -f "$list"; then
+        _github_record_error "проверка файлов репозитория GitHub" \
+            "Не удалось удалить временный список индекса Git."
+        return 1
+    fi
 }
 _github_stage_allowlist() {
     local -a paths=(storage.json) existing=()
     local path
-    _github_validate_tracked_tree || return 1
+    _github_validate_tracked_tree "${GITHUB_STORAGE_MODE:-none}" || return 1
+    _github_validate_tree "$GITHUB_WORKTREE" "${GITHUB_STORAGE_MODE:-none}" || return 1
     if [[ ${GITHUB_STORAGE_MODE:-none} == age ]]; then
         paths+=(recipient.txt unlock.age state.json.age)
     else
         paths+=(config.json secrets.json manifest.json ssh templates)
     fi
     for path in "${paths[@]}"; do
-        [[ -e "$GITHUB_WORKTREE/$path" || -n "$(git -C "$GITHUB_WORKTREE" ls-files -- "$path" 2>/dev/null)" ]] && existing+=("$path")
+        if [[ -e "$GITHUB_WORKTREE/$path" || -L "$GITHUB_WORKTREE/$path" ]] ||
+           [[ -n "$(git -C "$GITHUB_WORKTREE" ls-files -- "$path" 2>/dev/null)" ]]; then
+            existing+=("$path")
+        fi
     done
-    git -C "$GITHUB_WORKTREE" add -A -- "${existing[@]}"
+    ((${#existing[@]} == 0)) ||
+        git -C "$GITHUB_WORKTREE" add -A -- "${existing[@]}"
 }
 
 github_sync_flush() {
-    [[ -n "${GITHUB_WORKTREE:-}" && -d "$GITHUB_WORKTREE" ]] || return 1
-    local had_files=false commit_output push_output head
-    [[ -n "$(git -C "$GITHUB_WORKTREE" ls-files 2>/dev/null)" ]] && had_files=true
-    _github_stage_allowlist || {
+    _github_clear_error
+    if [[ -z "${GITHUB_WORKTREE:-}" || ! -d "$GITHUB_WORKTREE" ]]; then
+        _github_record_error "подготовка рабочей копии конфигурации" \
+            "Рабочая копия конфигурации GitHub недоступна."
         GITHUB_SYNC_STATUS=pending
         return 1
-    }
+    fi
+    if ! _github_session_target_guard; then
+        GITHUB_SYNC_STATUS=pending
+        return 1
+    fi
+    local had_files=false commit_output push_output head head_output
+    [[ -n "$(git -C "$GITHUB_WORKTREE" ls-files 2>/dev/null)" ]] && had_files=true
+    if ! _github_stage_allowlist; then
+        _github_ensure_error "подготовка файлов к отправке" \
+            "Не удалось подготовить разрешённые файлы конфигурации для commit."
+        GITHUB_SYNC_STATUS=pending
+        return 1
+    fi
     if ! git -C "$GITHUB_WORKTREE" diff --cached --quiet; then
         if ! commit_output=$(git -C "$GITHUB_WORKTREE" \
             -c user.name='Essence Remote Control' \
@@ -1088,11 +2389,12 @@ github_sync_flush() {
         GITHUB_SYNC_STATUS=clean
         return 0
     fi
-
-    head=$(git -C "$GITHUB_WORKTREE" rev-parse HEAD 2>/dev/null) || {
+    if ! head_output=$(git -C "$GITHUB_WORKTREE" rev-parse HEAD 2>&1); then
+        _github_record_error "чтение локальной версии конфигурации" "$head_output"
         GITHUB_SYNC_STATUS=pending
         return 1
-    }
+    fi
+    head="$head_output"
     # Preserve every committed mutation on the local main ref before network
     # I/O, so a new process can recover it even when push is unavailable.
     if ! git --git-dir="$GITHUB_STORE" update-ref "refs/heads/$GITHUB_BRANCH" "$head"; then
@@ -1105,46 +2407,228 @@ github_sync_flush() {
         git --git-dir="$GITHUB_STORE" push origin \
         "refs/heads/session/$GITHUB_SESSION_ID:refs/heads/$GITHUB_BRANCH" 2>&1); then
         if [[ "$GITHUB_REMOTE" == https://github.com/* ]]; then
-            _github_record_error "отправка конфигурации в GitHub" "$push_output" true
+            _github_record_error "отправка конфигурации в GitHub" "$push_output"
         else
             _github_record_error "отправка конфигурации в GitHub" "$push_output"
         fi
         GITHUB_SYNC_STATUS=pending
         return 1
     fi
-    git --git-dir="$GITHUB_STORE" update-ref \
-        "refs/remotes/origin/$GITHUB_BRANCH" "$head" >/dev/null 2>&1 || true
+    if ! git --git-dir="$GITHUB_STORE" update-ref \
+            "refs/remotes/origin/$GITHUB_BRANCH" "$head" >/dev/null 2>&1; then
+        warn "Push завершён, но локальный tracking-ref требует обновления при следующей синхронизации."
+    fi
     GITHUB_SYNC_STATUS=clean
     return 0
 }
 
 github_sync_fetch() {
-    [[ -n "${GITHUB_STORE:-}" ]] || return 1
-    if ! github_sync_flush; then
-        warn "Есть неотправленные локальные изменения. Сначала отправьте их в GitHub."
+    _github_clear_error
+    if [[ -z "${GITHUB_STORE:-}" || ! -d "$GITHUB_STORE" ]]; then
+        _github_record_error "подготовка локального хранилища" \
+            "Локальное GitHub-хранилище не настроено."
         return 1
     fi
-    declare -F config_source_startup >/dev/null 2>&1 || return 1
-    github_config_close || return 1
+    if [[ -n "${GITHUB_WORKTREE:-}" && -d "$GITHUB_WORKTREE" ]] &&
+       ! github_sync_flush; then
+        _github_ensure_error "подготовка файлов к отправке" \
+            "Не удалось отправить локальные изменения перед загрузкой."
+        return 1
+    fi
+    if ! declare -F config_source_startup >/dev/null 2>&1; then
+        _github_record_error "повторное открытие источника GitHub" \
+            "Функция открытия источника конфигурации недоступна."
+        return 1
+    fi
+    local old_worktree="${GITHUB_WORKTREE:-}" old_session="${GITHUB_SESSION_ID:-}"
+    local old_identity="${GITHUB_IDENTITY:-}" old_recipient="${GITHUB_RECIPIENT:-}"
+    local old_session_remote="${GITHUB_SESSION_REMOTE:-}"
+    local old_session_branch="${GITHUB_SESSION_BRANCH:-}"
+    local old_session_origin="${GITHUB_SESSION_ORIGIN:-}"
+    local old_status="${GITHUB_SYNC_STATUS:-clean}"
+    local old_state_dir="${STATE_DIR:-}" runtime_snapshot="" has_runtime_snapshot=false
+    local new_worktree new_session new_identity new_recipient
+    local new_session_remote new_session_branch new_session_origin new_status
+    local failure_stage failure_detail failure_hint failure_auth
+    if declare -F _config_source_materialize_state >/dev/null 2>&1; then
+        runtime_snapshot=$(umask 077; mktemp "$CONFIG_DIR/.fetch-runtime.XXXXXX") || {
+            _github_record_error "резервное копирование рабочего состояния" \
+                "Не удалось создать защищённый снимок перед загрузкой."
+            return 1
+        }
+        if ! github_config_serialize "$runtime_snapshot" "${CONFIG_JSON:-}"; then
+            rm -f "$runtime_snapshot"
+            _github_ensure_error "резервное копирование рабочего состояния" \
+                "Не удалось сохранить рабочее состояние перед загрузкой."
+            return 1
+        fi
+        has_runtime_snapshot=true
+    fi
+    GITHUB_WORKTREE=""
+    GITHUB_SESSION_ID=""
+    GITHUB_IDENTITY=""
+    GITHUB_RECIPIENT=""
+    GITHUB_SESSION_REMOTE=""
+    GITHUB_SESSION_BRANCH=""
+    GITHUB_SESSION_ORIGIN=""
     if ! config_source_startup; then
-        warn "Не удалось заново открыть конфигурацию после загрузки из GitHub."
+        failure_stage="${GITHUB_LAST_STAGE:-}"
+        failure_detail="${GITHUB_LAST_ERROR:-}"
+        failure_hint="${GITHUB_LAST_HINT:-}"
+        failure_auth="${GITHUB_LAST_AUTH_RELEVANT:-false}"
+        if [[ -n "${GITHUB_WORKTREE:-}" || -n "${GITHUB_SESSION_ID:-}" ]] &&
+           ! github_config_close; then
+            _github_report_last_error "Не удалось очистить неудачную новую GitHub-сессию"
+        fi
+        if [[ "$has_runtime_snapshot" == true ]] &&
+           ! _config_source_materialize_state "$runtime_snapshot" "$old_state_dir"; then
+            failure_stage="откат рабочего состояния после загрузки"
+            failure_detail="Не удалось восстановить runtime и пароль после ошибки повторного открытия."
+        fi
+        rm -f "$runtime_snapshot" ||
+            warn "Снимок неудачной загрузки требует ручной очистки."
+        GITHUB_WORKTREE="$old_worktree"; GITHUB_SESSION_ID="$old_session"
+        GITHUB_IDENTITY="$old_identity"; GITHUB_RECIPIENT="$old_recipient"
+        GITHUB_SESSION_REMOTE="$old_session_remote"
+        GITHUB_SESSION_BRANCH="$old_session_branch"
+        GITHUB_SESSION_ORIGIN="$old_session_origin"
+        GITHUB_SYNC_STATUS="$old_status"
+        GITHUB_LAST_STAGE="$failure_stage"; GITHUB_LAST_ERROR="$failure_detail"
+        GITHUB_LAST_HINT="$failure_hint"; GITHUB_LAST_AUTH_RELEVANT="$failure_auth"
+        _github_ensure_error "повторное открытие источника GitHub" \
+            "Не удалось заново открыть конфигурацию после загрузки из GitHub."
         return 1
     fi
-    success "Конфигурация загружена из GitHub и открыта на этом компьютере."
+    if [[ -z "${GITHUB_WORKTREE:-}" || -z "${GITHUB_SESSION_ID:-}" ]]; then
+        if [[ "$has_runtime_snapshot" == true ]] &&
+           ! _config_source_materialize_state "$runtime_snapshot" "$old_state_dir"; then
+            rm -f "$runtime_snapshot" ||
+                warn "Снимок неудачной загрузки требует ручной очистки."
+            GITHUB_WORKTREE="$old_worktree"; GITHUB_SESSION_ID="$old_session"
+            GITHUB_IDENTITY="$old_identity"; GITHUB_RECIPIENT="$old_recipient"
+            GITHUB_SESSION_REMOTE="$old_session_remote"
+            GITHUB_SESSION_BRANCH="$old_session_branch"
+            GITHUB_SESSION_ORIGIN="$old_session_origin"
+            GITHUB_SYNC_STATUS="$old_status"
+            _github_record_error "откат рабочего состояния после загрузки" \
+                "Повторное открытие не создало сессию, а прежнее runtime-состояние восстановить не удалось."
+            return 1
+        fi
+        GITHUB_WORKTREE="$old_worktree"; GITHUB_SESSION_ID="$old_session"
+        GITHUB_IDENTITY="$old_identity"; GITHUB_RECIPIENT="$old_recipient"
+        GITHUB_SESSION_REMOTE="$old_session_remote"
+        GITHUB_SESSION_BRANCH="$old_session_branch"
+        GITHUB_SESSION_ORIGIN="$old_session_origin"
+        GITHUB_SYNC_STATUS="$old_status"
+        rm -f "$runtime_snapshot" ||
+            warn "Снимок загрузки требует ручной очистки."
+        _github_clear_error
+        return 0
+    fi
+    new_worktree="$GITHUB_WORKTREE"; new_session="$GITHUB_SESSION_ID"
+    new_identity="${GITHUB_IDENTITY:-}"; new_recipient="${GITHUB_RECIPIENT:-}"
+    new_session_remote="${GITHUB_SESSION_REMOTE:-}"
+    new_session_branch="${GITHUB_SESSION_BRANCH:-}"
+    new_session_origin="${GITHUB_SESSION_ORIGIN:-}"
+    new_status="${GITHUB_SYNC_STATUS:-clean}"
+    GITHUB_WORKTREE="$old_worktree"; GITHUB_SESSION_ID="$old_session"
+    GITHUB_IDENTITY="$old_identity"; GITHUB_RECIPIENT="$old_recipient"
+    GITHUB_SESSION_REMOTE="$old_session_remote"
+    GITHUB_SESSION_BRANCH="$old_session_branch"
+    GITHUB_SESSION_ORIGIN="$old_session_origin"
+    GITHUB_SYNC_STATUS="$old_status"
+    if [[ -n "$old_worktree" || -n "$old_session" ]] && ! github_config_close; then
+        failure_stage="${GITHUB_LAST_STAGE:-}"
+        failure_detail="${GITHUB_LAST_ERROR:-}"
+        failure_hint="${GITHUB_LAST_HINT:-}"
+        failure_auth="${GITHUB_LAST_AUTH_RELEVANT:-false}"
+        GITHUB_WORKTREE="$new_worktree"; GITHUB_SESSION_ID="$new_session"
+        GITHUB_IDENTITY="$new_identity"; GITHUB_RECIPIENT="$new_recipient"
+        GITHUB_SESSION_REMOTE="$new_session_remote"
+        GITHUB_SESSION_BRANCH="$new_session_branch"
+        GITHUB_SESSION_ORIGIN="$new_session_origin"
+        GITHUB_SYNC_STATUS="$new_status"
+        if ! github_config_close; then
+            _github_report_last_error "Не удалось очистить новую GitHub-сессию после ошибки замены"
+        fi
+        if [[ "$has_runtime_snapshot" == true ]] &&
+           ! _config_source_materialize_state "$runtime_snapshot" "$old_state_dir"; then
+            failure_stage="откат рабочего состояния после загрузки"
+            failure_detail="Не удалось восстановить runtime и пароль после ошибки закрытия прежней сессии."
+        fi
+        rm -f "$runtime_snapshot" ||
+            warn "Снимок неудачной загрузки требует ручной очистки."
+        GITHUB_WORKTREE="$old_worktree"; GITHUB_SESSION_ID="$old_session"
+        GITHUB_IDENTITY="$old_identity"; GITHUB_RECIPIENT="$old_recipient"
+        GITHUB_SESSION_REMOTE="$old_session_remote"
+        GITHUB_SESSION_BRANCH="$old_session_branch"
+        GITHUB_SESSION_ORIGIN="$old_session_origin"
+        GITHUB_SYNC_STATUS="$old_status"
+        GITHUB_LAST_STAGE="$failure_stage"; GITHUB_LAST_ERROR="$failure_detail"
+        GITHUB_LAST_HINT="$failure_hint"; GITHUB_LAST_AUTH_RELEVANT="$failure_auth"
+        return 1
+    fi
+    GITHUB_WORKTREE="$new_worktree"; GITHUB_SESSION_ID="$new_session"
+    GITHUB_IDENTITY="$new_identity"; GITHUB_RECIPIENT="$new_recipient"
+    GITHUB_SESSION_REMOTE="$new_session_remote"
+    GITHUB_SESSION_BRANCH="$new_session_branch"
+    GITHUB_SESSION_ORIGIN="$new_session_origin"
+    GITHUB_SYNC_STATUS="$new_status"
+    export GITHUB_WORKTREE GITHUB_SESSION_ID GITHUB_IDENTITY GITHUB_RECIPIENT
+    export GITHUB_SESSION_REMOTE GITHUB_SESSION_BRANCH GITHUB_SESSION_ORIGIN
+    export GITHUB_SYNC_STATUS
+    rm -f "$runtime_snapshot" ||
+        warn "Снимок завершённой загрузки требует ручной очистки."
 }
 
 state_action() {
     local label=$1 fn=$2
     shift 2
-    declare -F "$fn" >/dev/null 2>&1 || return 1
+    if [[ ${CONFIG_SOURCE:-local} == github ]]; then
+        _github_clear_error
+    fi
+    if ! declare -F "$fn" >/dev/null 2>&1; then
+        if [[ ${CONFIG_SOURCE:-local} == github ]]; then
+            _github_record_error "изменение локальной конфигурации" \
+                "Функция изменения конфигурации недоступна."
+        fi
+        return 1
+    fi
     "$fn" "$@"
     local rc=$?
-    [[ $rc -eq 0 ]] || return "$rc"
+    if [[ $rc -ne 0 ]]; then
+        if [[ ${CONFIG_SOURCE:-local} == github && -z ${GITHUB_LAST_ERROR:-} ]]; then
+            _github_record_error "изменение локальной конфигурации" \
+                "Не удалось выполнить изменение конфигурации."
+        fi
+        return "$rc"
+    fi
     if [[ ${CONFIG_SOURCE:-local} == github ]]; then
-        state_validate true >/dev/null || return 1
-        state_checkpoint || return 1
-        github_config_checkpoint || { GITHUB_SYNC_STATUS=pending; return 1; }
-        github_sync_flush || true
+        if ! state_validate true >/dev/null 2>&1; then
+            _github_ensure_error "проверка изменённой конфигурации" \
+                "Изменённая конфигурация не прошла проверку переносимого состояния."
+            _github_report_last_error "Не удалось сохранить изменение в GitHub"
+            return 1
+        fi
+        if ! state_checkpoint; then
+            _github_ensure_error "сохранение локальной точки восстановления" \
+                "Не удалось сохранить локальную точку восстановления конфигурации."
+            _github_report_last_error "Не удалось сохранить изменение в GitHub"
+            return 1
+        fi
+        if ! github_config_checkpoint; then
+            GITHUB_SYNC_STATUS=pending
+            _github_ensure_error "сохранение снимка конфигурации GitHub" \
+                "Не удалось обновить снимок в рабочей копии GitHub."
+            _github_report_last_error "Не удалось сохранить изменение в GitHub"
+            return 1
+        fi
+        if ! github_sync_flush; then
+            _github_report_last_error "Не удалось отправить изменение в GitHub"
+            warn "Изменения сохранены локально и ожидают отправки."
+            GITHUB_SYNC_STATUS=pending
+            return 0
+        fi
     else
         state_checkpoint || true
     fi
@@ -1152,26 +2636,59 @@ state_action() {
 }
 
 github_config_close() {
-    local rc=0 session_dir="" identity="${GITHUB_IDENTITY:-}"
-    [[ -n ${GITHUB_WORKTREE:-} ]] && session_dir="${GITHUB_WORKTREE%/worktree}"
-    if [[ -n ${GITHUB_WORKTREE:-} ]]; then
-        git --git-dir="$GITHUB_STORE" worktree remove --force "$GITHUB_WORKTREE" \
-            >/dev/null 2>&1 || rc=1
+    _github_clear_error
+    local session_dir="" identity="${GITHUB_IDENTITY:-}" close_output restore_output
+    local worktree="${GITHUB_WORKTREE:-}" session="${GITHUB_SESSION_ID:-}"
+    [[ -n "$worktree" ]] && session_dir="${worktree%/worktree}"
+    if [[ -n "$worktree" && -d "$worktree" ]]; then
+        if ! close_output=$(git --git-dir="$GITHUB_STORE" worktree remove --force \
+                "$worktree" 2>&1); then
+            _github_record_error "закрытие рабочей сессии GitHub" "$close_output"
+            return 1
+        fi
     fi
-    if [[ -n ${GITHUB_SESSION_ID:-} && -d ${GITHUB_STORE:-} ]]; then
-        git --git-dir="$GITHUB_STORE" update-ref -d \
-            "refs/heads/session/$GITHUB_SESSION_ID" >/dev/null 2>&1 || rc=1
+    if [[ -n "$session" && -d ${GITHUB_STORE:-} ]]; then
+        if ! close_output=$(git --git-dir="$GITHUB_STORE" update-ref -d \
+                "refs/heads/session/$session" 2>&1); then
+            if [[ -n "$worktree" && ! -e "$worktree" ]] &&
+               { ! restore_output=$(git --git-dir="$GITHUB_STORE" worktree add \
+                    "$worktree" "session/$session" 2>&1) ||
+                 ! chmod 700 "$session_dir" "$worktree"; }; then
+                _github_record_error "откат закрытия рабочей сессии GitHub" \
+                    "${restore_output:-Не удалось восстановить рабочую копию после ошибки удаления ссылки.}"
+            else
+                _github_record_error "удаление ссылки рабочей сессии GitHub" "$close_output"
+            fi
+            return 1
+        fi
     fi
-    [[ -z "$session_dir" ]] || rmdir "$session_dir" 2>/dev/null || true
-    if [[ -n "$identity" && "$identity" != "${GITHUB_UNLOCK_FILE:-}" ]]; then
-        rm -f "$identity" || rc=1
+    if [[ -n "$session_dir" && -d "$session_dir" ]] &&
+       ! rmdir "$session_dir" 2>/dev/null; then
+        _github_record_error "очистка каталога рабочей сессии GitHub" \
+            "Не удалось удалить пустой каталог завершённой сессии."
+        return 1
+    fi
+    if ! _github_remove_ephemeral_identity "$identity"; then
+        GITHUB_WORKTREE=""
+        GITHUB_SESSION_ID=""
+        GITHUB_SESSION_REMOTE=""
+        GITHUB_SESSION_BRANCH=""
+        GITHUB_SESSION_ORIGIN=""
+        export GITHUB_WORKTREE GITHUB_SESSION_ID
+        export GITHUB_SESSION_REMOTE GITHUB_SESSION_BRANCH GITHUB_SESSION_ORIGIN
+        _github_record_error "очистка временного ключа GitHub" \
+            "Не удалось удалить временный ключ расшифровки."
+        return 1
     fi
     GITHUB_WORKTREE=""
     GITHUB_SESSION_ID=""
     GITHUB_IDENTITY=""
     GITHUB_RECIPIENT=""
+    GITHUB_SESSION_REMOTE=""
+    GITHUB_SESSION_BRANCH=""
+    GITHUB_SESSION_ORIGIN=""
     unset GITHUB_MASTER_PASSWORD
     export GITHUB_WORKTREE GITHUB_SESSION_ID GITHUB_IDENTITY GITHUB_RECIPIENT
-    return "$rc"
+    export GITHUB_SESSION_REMOTE GITHUB_SESSION_BRANCH GITHUB_SESSION_ORIGIN
 }
 

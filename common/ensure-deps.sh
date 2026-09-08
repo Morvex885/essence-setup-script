@@ -35,10 +35,17 @@ detect_pm() {
 pkg_name_for() {
     local bin="$1"
     case "$bin:$PM" in
-        ssh:apt|ssh:apk)                           echo "openssh-client" ;;
-        ssh:dnf|ssh:yum)                           echo "openssh-clients" ;;
-        ssh:pacman|ssh:brew|ssh:zypper|ssh:termux) echo "openssh" ;;
+        ssh:apt|ssh:apk|scp:apt|scp:apk)
+            echo "openssh-client" ;;
+        ssh:dnf|ssh:yum|scp:dnf|scp:yum)
+            echo "openssh-clients" ;;
+        ssh:pacman|ssh:brew|ssh:zypper|ssh:termux|\
+        scp:pacman|scp:brew|scp:zypper|scp:termux)
+            echo "openssh" ;;
         openssl:termux)                            echo "openssl-tool" ;;
+        base64:apt|base64:dnf|base64:yum|base64:pacman|base64:zypper|\
+        base64:apk|base64:brew|base64:termux)
+            echo "coreutils" ;;
         *) echo "$bin" ;;
     esac
 }
