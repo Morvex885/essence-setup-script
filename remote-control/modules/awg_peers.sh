@@ -183,7 +183,10 @@ _awg_peers_node() {
                     continue
                 fi
                 info "Создаю peers: ${missing_peers[*]}..."
-                upload_scripts
+                if ! upload_scripts; then
+                    warn "Не удалось загрузить скрипты для ноды '${NODE_NAME}'."
+                    continue
+                fi
                 local peers_cmd="source ${REMOTE_DIR}/modules/amneziawg.sh"
                 for p in "${missing_peers[@]}"; do
                     peers_cmd="$peers_cmd && add_awg_peer_auto $(printf '%q' "$p")"
@@ -210,7 +213,10 @@ _awg_peers_node() {
                         continue
                     fi
                     if confirm_yn "Удалить peer $target?"; then
-                        upload_scripts
+                        if ! upload_scripts; then
+                            warn "Не удалось загрузить скрипты для ноды '${NODE_NAME}'."
+                            continue
+                        fi
                         if ssh_run -- "source ${REMOTE_DIR}/modules/amneziawg.sh && remove_awg_peer_by_name $(printf '%q' "$target")"; then
                             success "Peer $target удалён"
                         else
@@ -233,7 +239,10 @@ _awg_peers_node() {
                 done
                 echo -e "  Будут удалены: ${YELLOW}${orphans[*]}${NC}"
                 if confirm_yn "Продолжить?"; then
-                    upload_scripts
+                    if ! upload_scripts; then
+                        warn "Не удалось загрузить скрипты для ноды '${NODE_NAME}'."
+                        continue
+                    fi
                     local del_cmd="source ${REMOTE_DIR}/modules/amneziawg.sh"
                     for p in "${orphans[@]}"; do
                         del_cmd="$del_cmd && remove_awg_peer_by_name $(printf '%q' "$p")"

@@ -19,6 +19,50 @@
 | **s) Subscription hosting** | HTTPS-хостинг подписок через nginx (`/sub/<token>`) |
 | **u) Удалить** | Полное удаление всех компонентов |
 
+### Telegram Proxy — WEB и MTProto
+
+Telegram Proxy состоит из двух независимых компонентов, которые используют общий
+секрет, необязательный tag и MTProxy backend:
+
+| Компонент | Входные порты | Назначение |
+|---|---|---|
+| **WEB relay** | TCP/443 через nginx, HTTP-01 на TCP/80 | Telegram WEB/WebSocket relay |
+| **MTProto** | TCP/2398 | Клиентский MTProto |
+| **Общий backend** | TCP/8080, TCP/8081 | Внутренние relay/health/readiness endpoints |
+| **Статистика** | TCP/8888 | Только локальный backend stats; публичный доступ закрыт |
+
+WEB требует hostname с DNS A-записью на публичный IPv4 и email для Let's Encrypt.
+Установка WEB сначала проверяет provider firewall, готовит backend и relay, затем
+получает сертификат и только после успешного `nginx -t` публикует конфигурацию.
+Отмена выбора decoy-сайта или ошибка ACME откатывает файлы, users, units,
+nginx, nftables и UFW к снимку до операции.
+
+MTProto-only не требует hostname и сертификата, но provider firewall должен
+разрешать TCP/2398. В combined-режиме WEB и MTProto можно удалять отдельно:
+удаление WEB оставляет MTProto, tag и общий backend; удаление MTProto оставляет
+WEB. `remove-all --force` удаляет оба компонента только после явного вызова.
+
+Локальный CLI:
+
+```text
+telegram-proxy web install|restart|update|remove [--force]
+telegram-proxy mtproto install|restart|refresh-ip|remove [--force]
+telegram-proxy status [--json]
+telegram-proxy connection
+telegram-proxy diagnostics
+telegram-proxy rotate-secret [--force]
+telegram-proxy tag show|set|clear [--force для clear]
+telegram-proxy remove-all --force
+```
+
+`status --json` — один JSON-объект без secret и tag. `connection` — единственная
+команда, печатающая raw secret и ссылки; `tag show` печатает tag явно.
+Диагностика редактирует secret, tag, Authorization и request credentials.
+После rotate-secret оба включённых consumer'а проверяются; при ошибке старые
+env/profiles и runtime возвращаются. Upstream relay собирается только из
+зафиксированной ревизии `f7a6acc4d536a787d442fd7df3ba4ebfd728f406`; mutable
+ветки не используются.
+
 ### VLESS Reality — подменю
 
 | Пункт | Описание |

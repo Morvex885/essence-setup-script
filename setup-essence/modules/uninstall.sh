@@ -3,8 +3,19 @@
 
 uninstall() {
     echo ""
-    warn "Будет удалено: mihomo, wgcf, nginx конфиг, сертификаты, сайт-заглушка, acme.sh, подписки, firewall правила."
-    confirm_yn "Вы уверены?" || { info "Отменено."; return; }
+    warn "Будет удалено: mihomo, wgcf, nginx конфиг, сертификаты, сайт-заглушка, acme.sh, подписки, Telegram Proxy, firewall правила."
+    confirm_yn "Удалить все установленные компоненты?" || return 0
+
+    # Shared Telegram backend is removed before Nginx/certificate cleanup.
+    if [[ -f "${TPROXY_CONF:-/etc/tproxy-server/essence.conf}" ||
+          -e "${TPROXY_ENV_FILE:-/etc/mtproxy/mtproxy.env}" ||
+          -e "${TPROXY_RELAY_SOURCE_PATH:-/opt/tproxy-server-source}" ||
+          -e "${TPROXY_MTPROXY_SOURCE_DIR:-/opt/MTProxy}" ]]; then
+        if ! TPROXY_INTERNAL_CALL=true telegram_proxy_remove_all --force; then
+            warn "Не удалось удалить Telegram Proxy. Остальные компоненты не удалялись."
+            return 1
+        fi
+    fi
 
     # VLESS транспорты — закрываем кастомные порты
     if [[ -f /etc/mihomo/config.yaml ]]; then

@@ -87,6 +87,26 @@ Remote Control совместим с системным Bash 3.2 в macOS; Homeb
 
 ---
 
+### Telegram Proxy на нодах
+
+Из меню выбранной ноды доступны те же WEB/MTProto операции, что и локальный
+CLI: install, restart, WEB update, remove component, remove-all, status,
+connection, diagnostics, rotate-secret и tag. Для batch-операций список нод
+сохраняет исходный порядок, одновременно выполняется не более четырёх worker'ов.
+
+Перед каждой операцией проверяется `VERSION`; при missing/stale marker скрипты
+загружаются заново. Ошибка upload останавливает удалённую destructive action и
+не обновляет cache. Удаление и установка требуют явного подтверждения; `--force`
+передаётся только операциям, которым он разрешён. `restart` и `status` не
+получают `--force`.
+
+Креды worker'а (включая пароль SSH, имя и tag) передаются через одноразовый
+файл с base64-полями и `umask 077`; plaintext в FIFO и result files не пишется.
+Вывод редактируется до сохранения. Итог batch возвращает `0`, если все успешны,
+`1` при ошибке, `3` если есть только skipped-ноды и `4` при degraded health.
+`status --json` принимает только валидный объект состояния; malformed output
+помечается как FAILED.
+
 ## Концепции
 
 ### Ноды

@@ -153,12 +153,18 @@ gen_free_port() {
 run_with_timeout() {
     local seconds="$1"
     shift
+    local timeout_help
     if command -v timeout >/dev/null 2>&1; then
-        timeout "$seconds" "$@"
+        timeout_help=$(timeout --help 2>&1)
+        if [[ "$timeout_help" == *--foreground* ]]; then
+            timeout --foreground --signal=TERM --kill-after=5 "$seconds" "$@"
+        else
+            timeout "$seconds" "$@"
+        fi
         return $?
     fi
     if command -v gtimeout >/dev/null 2>&1; then
-        gtimeout "$seconds" "$@"
+        gtimeout --foreground --signal=TERM --kill-after=5 "$seconds" "$@"
         return $?
     fi
     "$@" &

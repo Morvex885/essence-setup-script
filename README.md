@@ -40,8 +40,9 @@
 - **Decoy-сайты** — рандомизированные HTML-шаблоны (Simple Web Templates, SNI Templates, Nothing Templates) с анти-fingerprint обфускацией
 - **Хостинг подписок** — HTTPS-публикация через nginx (отдельный `/sub/<token>`), два режима (совместный SNI с VLESS на 443 или отдельный порт), ограничение запросов и автоочистка просроченных подписок
 - **TLS-сертификаты** — acme.sh + Let's Encrypt с автоматическим обновлением
-- **IPv6 toggle** — включение/отключение системно
-- **Полное удаление** — очистка всех компонентов (mihomo, AWG, WARP, nginx-конфиги, сертификаты, firewall-правила, sysctl)
+- **Telegram Proxy** — независимые компоненты WEB relay и MTProto backend; pinned upstream revision, атомарные секреты, systemd credentials, nginx TLS и rollback при сбое
+- **Telegram-порты** — WEB: 443/80, relay: 8080/8081, MTProto: 2398, закрытый stats: 8888; доступ к backend-портам ограничивается nftables/UFW
+- **Telegram CLI** — `telegram-proxy status [--json]`, `connection`, `diagnostics`, `rotate-secret`, `tag`, `web`, `mtproto`, `remove-all`; credentials выводятся только через `connection`
 
 ### Локальная часть (Remote Control)
 

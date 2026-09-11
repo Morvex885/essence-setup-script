@@ -18,6 +18,13 @@ elif [[ -f "$SCRIPT_DIR/../common/common.sh" ]]; then
     source "$SCRIPT_DIR/../common/cert.sh"
     _proto_dir="$SCRIPT_DIR/../common/protocols"
 fi
+if [[ -f "$_proto_dir/../ensure-deps.sh" ]]; then
+    source "$_proto_dir/../ensure-deps.sh"
+elif [[ -f "$SCRIPT_DIR/common/ensure-deps.sh" ]]; then
+    source "$SCRIPT_DIR/common/ensure-deps.sh"
+elif [[ -f "$SCRIPT_DIR/../common/ensure-deps.sh" ]]; then
+    source "$SCRIPT_DIR/../common/ensure-deps.sh"
+fi
 # Подключаем protocol builders
 for _f in "$_proto_dir"/*.sh; do
     [[ -f "$_f" ]] && source "$_f"
@@ -31,6 +38,7 @@ source "$SCRIPT_DIR/modules/warp.sh"
 source "$SCRIPT_DIR/modules/amneziawg.sh"
 source "$SCRIPT_DIR/modules/cascade.sh"
 source "$SCRIPT_DIR/modules/subscription.sh"
+source "$SCRIPT_DIR/modules/telegram-proxy.sh"
 source "$SCRIPT_DIR/modules/uninstall.sh"
 
 # ─── Проверка root ───────────────────────────────────────────────────────────
@@ -119,6 +127,16 @@ show_menu() {
             box_center "$_rline" "${DIM}${_rline}${NC}"
         fi
     fi
+    if _telegram_proxy_component_enabled web; then
+        box_center "WEB: active" "${GREEN}WEB: active${NC}"
+    else
+        box_center "WEB: inactive" "${DIM}WEB: inactive${NC}"
+    fi
+    if _telegram_proxy_component_enabled mtproto; then
+        box_center "MTProto: active" "${GREEN}MTProto: active${NC}"
+    else
+        box_center "MTProto: inactive" "${DIM}MTProto: inactive${NC}"
+    fi
     # Протоколы
     if [[ -f /etc/mihomo/config.yaml ]]; then
         local _vless=() _other=()
@@ -154,12 +172,20 @@ show_menu() {
     echo -e "  ${CYAN}8)${NC} Показать клиентский конфиг"
     echo -e "  ${CYAN}9)${NC} Показать серверный конфиг"
     echo -e "  ${CYAN}10)${NC} Обновить скрипты"
-    echo -e "  ${GREEN}s)${NC} Subscription hosting"
+    echo -e "  ${CYAN}s)${NC} Subscription hosting"
+    echo -e "  ${CYAN}t)${NC} Telegram Proxy"
     echo -e "  ${RED}u)${NC} Удалить всё установленное"
     echo -e "  ${NC}0)${NC} Выход"
     echo ""
-    read -rp "Выберите пункт [0-10, s, u]: " CHOICE
+    read -rp "Выберите пункт [0-10, s, t, u]: " CHOICE
 }
+
+# ─── Точка входа ─────────────────────────────────────────────────────────────
+if [[ "${1:-}" == "telegram-proxy" ]]; then
+    shift
+    telegram_proxy_cli "$@"
+    exit $?
+fi
 
 # ─── Точка входа ─────────────────────────────────────────────────────────────
 INITIAL_CHOICE="${1:-}"
@@ -182,8 +208,9 @@ while true; do
         9) show_server_config ;;
         10) self_update; CURRENT_VERSION=$(tr -d '\r' < "$SCRIPT_DIR/VERSION" 2>/dev/null || tr -d '\r' < "$SCRIPT_DIR/../VERSION" 2>/dev/null || echo "none") ;;
         s|S) subscription_menu ;;
-        u) uninstall ;;
-        0) echo "Выход."; exit 0 ;;
+        t|T) telegram_proxy_menu ;;
+        u|U) uninstall || exit $? ;;
+        0) exit 0 ;;
         *) warn "Неверный выбор: $CHOICE" ;;
     esac
 done

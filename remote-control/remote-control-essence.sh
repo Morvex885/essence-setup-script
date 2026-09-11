@@ -32,7 +32,7 @@ elif [[ -f "$SCRIPT_DIR/../common/ensure-deps.sh" ]]; then
 else
     echo "  [✗] Не найден common/ensure-deps.sh" >&2; exit 1
 fi
-ensure_dep jq openssl ssh scp base64
+ensure_dep jq openssl ssh scp base64 curl
 
 # ─── Подключаем модули ───────────────────────────────────────────────────────
 if [[ -f "$SCRIPT_DIR/common/common.sh" ]]; then
@@ -52,6 +52,7 @@ fi
 
 source "$SCRIPT_DIR/modules/nodes.sh"
 source "$SCRIPT_DIR/modules/ssh.sh"
+source "$SCRIPT_DIR/modules/telegram-proxy.sh"
 source "$SCRIPT_DIR/modules/self.sh"
 source "$SCRIPT_DIR/modules/groups.sh"
 source "$SCRIPT_DIR/modules/clients.sh"
@@ -827,6 +828,7 @@ menu_nodes() {
         box_mid
         box_line " F) Сгенерировать конфиги" " ${GREEN}F)${NC} Сгенерировать конфиги"
         box_line " S) Подписки" " ${GREEN}S)${NC} Подписки"
+        box_line " b) Telegram Proxy" " ${CYAN}b)${NC} Telegram Proxy"
         box_mid
         if [[ $CONFIG_SOURCE == github ]]; then
             local _github_status _github_url _github_link
@@ -868,6 +870,8 @@ menu_nodes() {
             generate_menu
         elif [[ "$_pick" == "W" || "$_pick" == "w" ]]; then
             awg_peers_menu
+        elif [[ "$_pick" == "b" || "$_pick" == "B" ]]; then
+            telegram_proxy_remote_menu
         elif [[ "$_pick" == "S" || "$_pick" == "s" ]]; then
             subscription_menu
         elif [[ "$_pick" == "Y" || "$_pick" == "y" ]]; then
@@ -892,7 +896,10 @@ menu_operations() {
     # Проверяем соединение и загружаем скрипты при первом входе
     echo ""
     ssh_connect || return
-    upload_scripts
+    if ! upload_scripts; then
+        warn "Не удалось загрузить скрипты для ноды '${NODE_NAME}'."
+        return 1
+    fi
 
     while true; do
         echo ""
@@ -901,6 +908,7 @@ menu_operations() {
         box_center "$_node" "${GREEN}${_node}${NC}"
         box_mid
         box_line " 1) Открыть меню сервера" " ${GREEN}1)${NC} Открыть меню сервера"
+        box_line " b) Telegram Proxy" " ${CYAN}b)${NC} Telegram Proxy"
         box_mid
         box_line " h) Настройка SSH ключа на ноде" " ${YELLOW}h)${NC} Настройка SSH ключа на ноде"
         box_line " u) Обновить скрипты на сервере" " ${CYAN}u)${NC} Обновить скрипты на сервере"
@@ -914,10 +922,19 @@ menu_operations() {
                 run_remote
                 echo ""
                 echo -e "  ${DIM}── SSH-сессия завершена ──────────────────${NC}"
-                confirm_yn "Продолжить работу с ${NODE_NAME}?" Y || return
+                if ! confirm_yn "Продолжить работу с ${NODE_NAME}?" Y; then
+                    return
+                fi
+                ;;
+            b|B)
+                TELEGRAM_PROXY_NODE_SCOPED=true telegram_proxy_remote_menu
                 ;;
             h|H)        state_action "ssh_hardening" ssh_hardening ;;
-            u|U)        upload_scripts ;;
+            u|U)
+                if ! upload_scripts; then
+                    warn "Не удалось загрузить скрипты для ноды '${NODE_NAME}'."
+                fi
+                ;;
 
             0)          return ;;
             *)          warn "Неверный выбор: $CHOICE" ;;

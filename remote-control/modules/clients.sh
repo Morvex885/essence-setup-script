@@ -537,7 +537,10 @@ delete_client() {
                 continue
             fi
             if ! array_contains "$_nn" "${SCRIPTS_UPLOADED[@]}"; then
-                upload_scripts
+                if ! upload_scripts; then
+                    warn "$_nn: не удалось загрузить скрипты; AWG peers не удалены."
+                    continue
+                fi
                 SCRIPTS_UPLOADED+=("$_nn")
             fi
             _peers_list="${_peer_lists[$_node_peer_idx]# }"
@@ -588,7 +591,10 @@ delete_client() {
         [[ -z "$_remaining_users" ]] && continue
 
         if ! array_contains "$_nn" "${SCRIPTS_UPLOADED[@]}"; then
-            upload_scripts
+            if ! upload_scripts; then
+                warn "$_nn: не удалось загрузить скрипты; listeners не изменены."
+                continue
+            fi
             SCRIPTS_UPLOADED+=("$_nn")
         fi
 

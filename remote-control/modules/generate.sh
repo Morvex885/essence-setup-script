@@ -339,7 +339,10 @@ _ensure_all_awg_peers() {
         # Создаём все недостающие peers за один SSH
         info "Создаю AWG peers на $nname: ${missing[*]}..."
         if ! array_contains "$nname" "${SCRIPTS_UPLOADED[@]}"; then
-            upload_scripts
+            if ! upload_scripts; then
+                warn "$nname: не удалось загрузить скрипты; peers не изменены."
+                continue
+            fi
             SCRIPTS_UPLOADED+=("$nname")
         fi
 
@@ -712,7 +715,10 @@ _sync_node_listeners() {
 
     # Загружаем скрипты если ещё не загружены
     if ! array_contains "$nname" "${SCRIPTS_UPLOADED[@]}"; then
-        upload_scripts
+        if ! upload_scripts; then
+            warn "$nname: не удалось загрузить скрипты; listeners не изменены."
+            return 1
+        fi
         SCRIPTS_UPLOADED+=("$nname")
     fi
 

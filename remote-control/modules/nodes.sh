@@ -25,6 +25,7 @@ node_pass_encode() {
 }
 
 node_load() {
+    CURRENT_NODE_INDEX="$1"
     local idx=$(($1 - 1))
     if (( idx < 0 )); then
         warn "Неверный индекс ноды: $1"
@@ -492,13 +493,19 @@ delete_node() {
         if confirm_yn "Удалить ноду '${_name}'?"; then
             # Удаление всех компонентов на сервере
             if confirm_yn "Удалить все компоненты essence на сервере?"; then
-                node_load "$_idx"
-                info "Подключаемся к серверу для удаления..."
-                if ssh_run -- "echo ok" &>/dev/null; then
-                    upload_scripts
-                    run_remote 10
+                if ! node_load "$_idx"; then
+                    warn "Не удалось загрузить ноду '${_name}'. Удаление на сервере не выполнено."
                 else
-                    warn "Не удалось подключиться — удаление на сервере не выполнено"
+                    info "Подключаемся к серверу для удаления..."
+                    if ssh_run -- "echo ok" &>/dev/null; then
+                        if upload_scripts; then
+                            run_remote 10
+                        else
+                            warn "Не удалось загрузить скрипты для ноды '${_name}'. Удаление на сервере не выполнено."
+                        fi
+                    else
+                        warn "Не удалось подключиться — удаление на сервере не выполнено"
+                    fi
                 fi
             fi
 
