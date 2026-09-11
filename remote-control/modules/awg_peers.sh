@@ -40,53 +40,44 @@ awg_peers_menu() {
     while true; do
         local node_count
         node_count=$(nodes_count)
-
         echo ""
         box_top
-        box_center "AWG Peers"
-        box_bot
-
+        box_center "AWG-подключения"
+        box_mid
         if [[ "$node_count" -eq 0 ]]; then
-            echo ""
-            echo -e "  ${DIM}Нет нод${NC}"
-            echo ""
-            echo -e "  ${NC}0)${NC} Назад"
-            echo ""
-            read -rp "  Выберите: " _pick
-            [[ "$_pick" == "0" ]] && return
-            continue
+            box_line " Нет нод" " ${DIM}Нет нод${NC}"
+            menu_item 0 "Назад" NC
+            box_bot
+            return 0
         fi
 
-        # Обзор: для каждой ноды показываем кол-во peers
-        echo ""
-        local i=1
-        local _node_names=() _node_ips=()
+        local i=1 idx nname nip has_awg_conn
+        local -a _node_names=() _node_ips=()
         while IFS=$'\t' read -r nname nip; do
             _node_names+=("$nname")
             _node_ips+=("$nip")
-            i=$((i + 1))
         done < <(jq_r '.nodes[] | "\(.name)\t\(.ip)"')
-
         for (( idx=0; idx<${#_node_names[@]}; idx++ )); do
-            local nname="${_node_names[$idx]}"
-            local nip="${_node_ips[$idx]}"
-
-            # Проверяем AWG на ноде (без SSH — только по наличию awg-* в connections)
-            local has_awg_conn
+            nname="${_node_names[$idx]}"
+            nip="${_node_ips[$idx]}"
             has_awg_conn=$(jq_r --arg n "$nname" '[.connections[] | select(.node==$n) | .groups[].proxies[] | select(. == "AWG" or startswith("awg-"))] | length')
             if [[ "$has_awg_conn" -gt 0 ]]; then
-                echo -e "  ${GREEN}$((idx+1)))${NC} $nname ${DIM}$nip${NC}"
+                box_line " $((idx+1))) $nname $nip" " ${CYAN}$((idx+1)))${NC} $nname ${DIM}$nip${NC}"
             else
-                echo -e "  ${GREEN}$((idx+1)))${NC} $nname ${DIM}$nip — нет AWG подключений${NC}"
+                box_line " $((idx+1))) $nname $nip — нет AWG подключений" \
+                    " ${CYAN}$((idx+1)))${NC} $nname ${DIM}$nip — нет AWG подключений${NC}"
             fi
+            i=$((i + 1))
         done
+        menu_item 0 "Назад" NC
+        box_bot
         echo ""
-        echo -e "  ${NC}0)${NC} Назад"
-        echo ""
-        read -rp "  Выберите ноду: " _pick
-
-        [[ "$_pick" == "0" ]] && return
-        if [[ "$_pick" =~ ^[0-9]+$ ]] && (( _pick >= 1 && _pick <= ${#_node_names[@]} )); then
+        if ! IFS= read -rp "  Выберите ноду: " _pick; then
+            return 0
+        fi
+        _pick="${_pick%$'\r'}"
+        [[ "$_pick" == 0 ]] && return 0
+        if menu_index_valid "$_pick" "${#_node_names[@]}"; then
             state_action "awg_peers" _awg_peers_node "$_pick"
         else
             warn "Неверный выбор."
@@ -118,64 +109,58 @@ _awg_peers_node() {
     expected_peers=$(_awg_expected_peers "$nname")
 
     while true; do
-        echo ""
-        echo -e "  ${CYAN}Peers на ${nname}:${NC}"
-
-        # Показать существующие
-        local all_peers=()
-        local peer_status=()
-
-        # Существующие peers
+        local all_peers=() peer_status=() missing_peers=() orphan_count=0
+        local idx p s
         while IFS= read -r p; do
             [[ -z "$p" ]] && continue
             all_peers+=("$p")
-            if echo "$expected_peers" | grep -qxF "$p"; then
+            if printf '%s\n' "$expected_peers" | grep -qxF "$p"; then
                 peer_status+=("used")
             else
                 peer_status+=("orphan")
             fi
         done <<< "$existing_peers"
 
-        # Недостающие peers
-        local missing_peers=()
         while IFS= read -r p; do
             [[ -z "$p" ]] && continue
-            if ! echo "$existing_peers" | grep -qxF "$p"; then
+            if ! printf '%s\n' "$existing_peers" | grep -qxF "$p"; then
                 missing_peers+=("$p")
                 all_peers+=("$p")
                 peer_status+=("missing")
             fi
         done <<< "$expected_peers"
+        for s in "${peer_status[@]}"; do
+            [[ "$s" == orphan ]] && orphan_count=$((orphan_count + 1))
+        done
 
+        echo ""
+        box_top
+        box_center "Peers: $nname"
+        box_mid
         if [[ ${#all_peers[@]} -eq 0 ]]; then
-            echo -e "  ${DIM}Нет peers${NC}"
+            box_line " Нет peers" " ${DIM}Нет peers${NC}"
         else
-            local i=1
             for (( idx=0; idx<${#all_peers[@]}; idx++ )); do
-                local p="${all_peers[$idx]}"
-                local s="${peer_status[$idx]}"
+                p="${all_peers[$idx]}"
+                s="${peer_status[$idx]}"
                 case "$s" in
-                    used)    echo -e "  ${GREEN}${i})${NC} [${GREEN}✓${NC}] $p" ;;
-                    orphan)  echo -e "  ${GREEN}${i})${NC} [${YELLOW}!${NC}] $p ${YELLOW}— не привязан${NC}" ;;
-                    missing) echo -e "  ${GREEN}${i})${NC} [${RED}-${NC}] $p ${RED}— не создан${NC}" ;;
+                    used) box_line " $((idx+1))) [✓] $p" " ${GREEN}$((idx+1)))${NC} [${GREEN}✓${NC}] $p" ;;
+                    orphan) box_line " $((idx+1))) [!] $p — не привязан" " ${GREEN}$((idx+1)))${NC} [${YELLOW}!${NC}] $p ${YELLOW}— не привязан${NC}" ;;
+                    missing) box_line " $((idx+1))) [-] $p — не создан" " ${GREEN}$((idx+1)))${NC} [${RED}-${NC}] $p ${RED}— не создан${NC}" ;;
                 esac
-                i=$((i + 1))
             done
         fi
-
+        box_mid
+        [[ ${#missing_peers[@]} -gt 0 ]] && menu_item c "Создать недостающие peers (${#missing_peers[@]})" GREEN
+        menu_item d "Удалить peer" RED
+        [[ $orphan_count -gt 0 ]] && menu_item x "Удалить неиспользуемые ($orphan_count)" YELLOW
+        menu_item 0 "Назад" NC
+        box_bot
         echo ""
-        [[ ${#missing_peers[@]} -gt 0 ]] && echo -e "  ${GREEN}c)${NC} Создать недостающие peers (${#missing_peers[@]})"
-        echo -e "  ${RED}d)${NC} Удалить peer"
-
-        # Подсчёт orphans
-        local orphan_count=0
-        for s in "${peer_status[@]}"; do [[ "$s" == "orphan" ]] && orphan_count=$((orphan_count + 1)); done
-        [[ $orphan_count -gt 0 ]] && echo -e "  ${YELLOW}x)${NC} Удалить неиспользуемые ($orphan_count)"
-
-        echo -e "  ${NC}0)${NC} Назад"
-        echo ""
-        read -rp "  Выберите: " _choice
-
+        if ! IFS= read -rp "  Выберите действие: " _choice; then
+            return 0
+        fi
+        _choice="${_choice%$'\r'}"
         case "$_choice" in
             c|C)
                 if [[ ${#missing_peers[@]} -eq 0 ]]; then

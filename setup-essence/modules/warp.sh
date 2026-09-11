@@ -352,33 +352,37 @@ _warp_apply_reregistered_profile() {
 # ─── WARP ────────────────────────────────────────────────────────────────────
 
 warp_menu() {
-    echo ""
-    box_top
-    box_center "WARP"
-    box_bot
-    echo ""
-    if grep -q '# --- warp ---' /etc/mihomo/config.yaml 2>/dev/null; then
-        echo -e "  Статус: ${GREEN}установлен${NC}"
-    else
-        echo -e "  Статус: ${RED}не установлен${NC}"
-    fi
-    echo ""
-    echo -e "  ${GREEN}1)${NC} Установить WARP"
-    echo -e "  ${YELLOW}2)${NC} Обновить ключ"
-    echo -e "  ${YELLOW}3)${NC} Перерегистрировать аккаунт WARP"
-    echo -e "  ${RED}4)${NC} Удалить WARP"
-    echo -e "  ${NC}0)${NC} Назад"
-    echo ""
-    read -rp "Выберите действие [0-4]: " WARP_CHOICE
-
-    case "$WARP_CHOICE" in
-        1) install_warp ;;
-        2) update_warp ;;
-        3) reregister_warp ;;
-        4) uninstall_warp ;;
-        0) return ;;
-        *) warn "Неверный выбор." ;;
-    esac
+    while true; do
+        echo ""
+        box_top
+        box_center "WARP"
+        box_mid
+        if grep -q '# --- warp ---' /etc/mihomo/config.yaml 2>/dev/null; then
+            box_line " Статус: установлен" " Статус: ${GREEN}установлен${NC}"
+        else
+            box_line " Статус: не установлен" " Статус: ${RED}не установлен${NC}"
+        fi
+        box_mid
+        menu_item 1 "Установить WARP" GREEN
+        menu_item 2 "Обновить ключ" YELLOW
+        menu_item 3 "Перерегистрировать аккаунт WARP" YELLOW
+        menu_item 4 "Удалить WARP" RED
+        menu_item 0 "Назад" NC
+        box_bot
+        echo ""
+        if ! IFS= read -rp "  Выберите действие: " WARP_CHOICE; then
+            return 0
+        fi
+        WARP_CHOICE="${WARP_CHOICE%$'\r'}"
+        case "$WARP_CHOICE" in
+            1) install_warp || warn "Установка WARP завершилась ошибкой. Повторите действие из меню." ;;
+            2) update_warp || warn "Обновление WARP завершилось ошибкой. Повторите действие из меню." ;;
+            3) reregister_warp || warn "Перерегистрация WARP завершилась ошибкой. Повторите действие из меню." ;;
+            4) uninstall_warp || warn "Удаление WARP завершилось ошибкой." ;;
+            0) return 0 ;;
+            *) warn "Неверный выбор." ;;
+        esac
+    done
 }
 
 install_warp() {
@@ -409,7 +413,11 @@ install_warp() {
         info "Определяю последнюю версию wgcf..."
         WGCF_VERSION=$(curl -s https://api.github.com/repos/ViRb3/wgcf/releases/latest \
             | grep '"tag_name"' | cut -d'"' -f4 | tr -d 'v')
-        [[ -z "$WGCF_VERSION" ]] && error "Не удалось получить версию wgcf с GitHub."
+        if [[ -z "$WGCF_VERSION" ]]; then
+            cd /root
+            warn "Не удалось получить версию wgcf с GitHub."
+            return 1
+        fi
         local wgcf_arch
         case "$(uname -m)" in
             aarch64|arm64) wgcf_arch="arm64" ;;
@@ -417,26 +425,40 @@ install_warp() {
             *)             wgcf_arch="amd64" ;;
         esac
         info "Скачиваю wgcf v${WGCF_VERSION} (${wgcf_arch})..."
-        curl -sLo "$WGCF_DIR/wgcf" \
-            "https://github.com/ViRb3/wgcf/releases/download/v${WGCF_VERSION}/wgcf_${WGCF_VERSION}_linux_${wgcf_arch}" \
-            || { rm -f "$WGCF_DIR/wgcf"; error "Не удалось скачать wgcf"; }
+        if ! curl -sLo "$WGCF_DIR/wgcf" \
+            "https://github.com/ViRb3/wgcf/releases/download/v${WGCF_VERSION}/wgcf_${WGCF_VERSION}_linux_${wgcf_arch}"; then
+            rm -f "$WGCF_DIR/wgcf"
+            cd /root
+            warn "Не удалось скачать wgcf"
+            return 1
+        fi
         chmod +x "$WGCF_DIR/wgcf"
         success "wgcf скачан"
     fi
 
-    _warp_prepare_account "$WARP_LICENSE" || error "Ошибка регистрации WARP"
+    if ! _warp_prepare_account "$WARP_LICENSE"; then
+        cd /root
+        warn "Ошибка регистрации WARP"
+        return 1
+    fi
 
     info "Генерирую WireGuard конфиг..."
-    _warp_generate_profile || error "Ошибка генерации WireGuard-конфига WARP"
+    if ! _warp_generate_profile; then
+        cd /root
+        warn "Ошибка генерации WireGuard-конфига WARP"
+        return 1
+    fi
 
     if ! parse_wgcf_profile_keys wgcf-profile.conf; then
-        error "Не удалось распарсить корректные ключи WARP из wgcf-profile.conf"
+        cd /root
+        warn "Не удалось распарсить корректные ключи WARP из wgcf-profile.conf"
         return 1
     fi
     WARP_PRIVATE_KEY="$WGCF_PROFILE_PRIVATE_KEY"
     WARP_PUBLIC_KEY="$WGCF_PROFILE_PUBLIC_KEY"
     if ! parse_wgcf_profile_addresses wgcf-profile.conf; then
-        error "Не удалось найти корректный IPv4-адрес WARP в wgcf-profile.conf"
+        cd /root
+        warn "Не удалось найти корректный IPv4-адрес WARP в wgcf-profile.conf"
         return 1
     fi
     WARP_IP="$WGCF_IPV4_ADDRESS"
@@ -448,12 +470,15 @@ install_warp() {
 
     if ! _warp_apply_config "$warp_config_mode" "$WARP_PRIVATE_KEY" "$WARP_IP" "$WARP_IPV6" "$WARP_PUBLIC_KEY"; then
         cd /root
-        error "Конфигурация WARP не применена."
+        warn "Конфигурация WARP не применена."
         return 1
     fi
 
-    _warp_store_profile wgcf-profile.conf /etc/mihomo/wgcf-profile.conf \
-        || error "Не удалось сохранить профиль WARP в /etc/mihomo"
+    if ! _warp_store_profile wgcf-profile.conf /etc/mihomo/wgcf-profile.conf; then
+        cd /root
+        warn "Не удалось сохранить профиль WARP в /etc/mihomo"
+        return 1
+    fi
     cd /root
     success "WARP настроен: IPv4=$WARP_IP${WARP_IPV6:+, IPv6=$WARP_IPV6}"
     success "WARP добавлен в группу outbound"
@@ -637,95 +662,75 @@ uninstall_warp() {
     fi
     echo ""
 }
-
 update_warp() {
     echo ""
-
     if [[ ! -f /etc/mihomo/config.yaml ]]; then
         warn "Mihomo не установлен. Сначала выполните установку (пункт 1)."
-        return
+        return 1
     fi
-
     if ! grep -q '# --- warp ---' /etc/mihomo/config.yaml; then
         warn "WARP не настроен. Сначала выполните установку WARP (пункт 4 → 1)."
-        return
+        return 1
     fi
 
-    WGCF_DIR="/root/wgcf"
+    local WGCF_DIR="/root/wgcf" WGCF_VERSION wgcf_arch
     if [[ ! -f "$WGCF_DIR/wgcf" ]] || ! "$WGCF_DIR/wgcf" --version > /dev/null 2>&1; then
         rm -f "$WGCF_DIR/wgcf"
         info "Определяю последнюю версию wgcf..."
-        local WGCF_VERSION wgcf_arch
-        WGCF_VERSION=$(curl -s https://api.github.com/repos/ViRb3/wgcf/releases/latest \
-            | grep '"tag_name"' | cut -d'"' -f4 | tr -d 'v')
-        [[ -z "$WGCF_VERSION" ]] && error "Не удалось получить версию wgcf с GitHub."
+        WGCF_VERSION=$(curl -s https://api.github.com/repos/ViRb3/wgcf/releases/latest |
+            grep '"tag_name"' | cut -d'"' -f4 | tr -d 'v')
+        if [[ -z "$WGCF_VERSION" ]]; then
+            warn "Не удалось получить версию wgcf с GitHub."
+            return 1
+        fi
         case "$(uname -m)" in
             aarch64|arm64) wgcf_arch="arm64" ;;
-            armv7l|armv7)  wgcf_arch="armv7" ;;
-            *)             wgcf_arch="amd64" ;;
+            armv7l|armv7) wgcf_arch="armv7" ;;
+            *) wgcf_arch="amd64" ;;
         esac
         info "wgcf не найден, скачиваю v${WGCF_VERSION} (${wgcf_arch})..."
-        mkdir -p "$WGCF_DIR"
-        curl -sLo "$WGCF_DIR/wgcf" \
-            "https://github.com/ViRb3/wgcf/releases/download/v${WGCF_VERSION}/wgcf_${WGCF_VERSION}_linux_${wgcf_arch}" \
-            || { rm -f "$WGCF_DIR/wgcf"; error "Не удалось скачать wgcf"; }
-        chmod +x "$WGCF_DIR/wgcf"
-        success "wgcf скачан"
+        mkdir -p "$WGCF_DIR" || return 1
+        if ! curl -sLo "$WGCF_DIR/wgcf" \
+            "https://github.com/ViRb3/wgcf/releases/download/v${WGCF_VERSION}/wgcf_${WGCF_VERSION}_linux_${wgcf_arch}"; then
+            rm -f "$WGCF_DIR/wgcf"
+            warn "Не удалось скачать wgcf"
+            return 1
+        fi
+        chmod +x "$WGCF_DIR/wgcf" || return 1
     fi
 
-    echo ""
+    local original_dir="$PWD"
     read -rp "WARP+ лицензионный ключ (Enter = бесплатный WARP): " NEW_WARP_LICENSE
-    echo ""
-
-    cd "$WGCF_DIR"
-
-    _warp_prepare_account "$NEW_WARP_LICENSE" || error "Ошибка регистрации WARP"
-
-    info "Генерирую новый WireGuard конфиг..."
-    _warp_generate_profile || error "Ошибка генерации WireGuard-конфига WARP"
-
-    if ! parse_wgcf_profile_keys wgcf-profile.conf; then
-        error "Не удалось распарсить корректные ключи WARP из wgcf-profile.conf"
+    cd "$WGCF_DIR" || return 1
+    if ! _warp_prepare_account "$NEW_WARP_LICENSE" ||
+       ! _warp_generate_profile ||
+       ! parse_wgcf_profile_keys wgcf-profile.conf ||
+       ! parse_wgcf_profile_addresses wgcf-profile.conf; then
+        cd "$original_dir"
+        warn "Не удалось подготовить новый WARP-профиль."
         return 1
     fi
     NEW_PRIVATE_KEY="$WGCF_PROFILE_PRIVATE_KEY"
     NEW_PUBLIC_KEY="$WGCF_PROFILE_PUBLIC_KEY"
-    if ! parse_wgcf_profile_addresses wgcf-profile.conf; then
-        error "Не удалось найти корректный IPv4-адрес WARP в wgcf-profile.conf"
-        return 1
-    fi
     NEW_WARP_IP="$WGCF_IPV4_ADDRESS"
     NEW_WARP_IPV6="$WGCF_IPV6_ADDRESS"
-
-    if [[ -z "$NEW_WARP_IPV6" ]]; then
-        warn "IPv6-адрес WARP отсутствует; будет создан корректный IPv4-only proxy."
-    fi
-
-    info "Новый WARP IP:         $NEW_WARP_IP"
-    [[ -n "$NEW_WARP_IPV6" ]] && info "Новый WARP IPv6:       $NEW_WARP_IPV6"
-    info "Новый WARP Public key: $NEW_PUBLIC_KEY"
-
-    if ! _warp_apply_config update "$NEW_PRIVATE_KEY" "$NEW_WARP_IP" "$NEW_WARP_IPV6" "$NEW_PUBLIC_KEY"; then
-        cd /root
-        error "Новый WARP-конфиг не применён."
+    if ! _warp_apply_config update "$NEW_PRIVATE_KEY" "$NEW_WARP_IP" "$NEW_WARP_IPV6" "$NEW_PUBLIC_KEY" ||
+       ! _warp_store_profile wgcf-profile.conf /etc/mihomo/wgcf-profile.conf; then
+        cd "$original_dir"
+        warn "Новый WARP-конфиг не применён."
         return 1
     fi
-
-    _warp_store_profile wgcf-profile.conf /etc/mihomo/wgcf-profile.conf \
-        || error "Не удалось сохранить профиль WARP в /etc/mihomo"
-    cd /root
+    cd "$original_dir"
 
     info "Перезапускаю Mihomo..."
     systemctl restart mihomo &>/dev/null
     sleep 3
-
     if systemctl is-active --quiet mihomo; then
         success "Mihomo перезапущен с новым WARP конфигом"
     else
         warn "Mihomo не запустился. Лог:"
         journalctl -u mihomo -n 20 --no-pager
     fi
-
     echo ""
     echo -e "  WARP IP:         ${CYAN}$NEW_WARP_IP${NC}"
     [[ -n "$NEW_WARP_IPV6" ]] && echo -e "  WARP IPv6:       ${CYAN}$NEW_WARP_IPV6${NC}"

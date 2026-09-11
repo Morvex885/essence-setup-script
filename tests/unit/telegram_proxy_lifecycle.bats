@@ -126,14 +126,13 @@ EOF
     CURRENT_VERSION=1.2.3
     REMOTE_DIR=/root/essence-setup
     TELEGRAM_PROXY_REMOTE_DIR="$REMOTE_DIR"
+    SETUP_DIR="$PROJECT_ROOT/setup-essence"
+    COMMON_DIR="$PROJECT_ROOT/common"
+    VERSION_PATH="$PROJECT_ROOT/VERSION"
     source "$PROJECT_ROOT/remote-control/modules/telegram-proxy.sh"
+    _telegram_proxy_remote_scripts_match() { return 0; }
     node_load() { NODE_NAME="node-$1"; SERVER_IP=127.0.0.1; SERVER_PORT=22; SERVER_USER=root; SERVER_AUTH=key; SERVER_PASS=; return 0; }
-    ssh_run() {
-        case "$*" in
-            *VERSION*) printf '%s\n' 1.2.3; return 0 ;;
-            *) return 1 ;;
-        esac
-    }
+    ssh_run() { return 1; }
     run telegram_proxy_remote_batch web restart false 1 2
     [ "$status" -eq 1 ]
     [[ "$output" == *FAILED* ]]

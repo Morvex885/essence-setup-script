@@ -59,6 +59,22 @@ write_web_state() {
     _telegram_proxy_render_profiles "$_valid_secret"
     _telegram_proxy_state_write
 }
+write_both_state() {
+    write_web_state
+    TELEGRAM_MTPROTO_ENABLED=true
+    TELEGRAM_MTPROTO_IPV4=8.8.8.8
+    TELEGRAM_UFW_MTPROTO_PREVIOUS=absent
+    _telegram_proxy_state_write
+}
+
+_run_telegram_menu() {
+    telegram_proxy_menu < "$1"
+    echo MENU_RETURNED
+}
+
+_menu_journal() {
+    printf '%s\n' "$*" >> "$BATS_TEST_TMPDIR/menu-journal"
+}
 
 @test "validators accept managed values and reject unsafe inputs" {
     run _telegram_proxy_valid_hostname web.example.com
@@ -194,4 +210,160 @@ EOF
     [[ "$output" != *"0123456789abcdef0123456789abcdef"* ]]
     [[ "$output" != *"abcdefabcdefabcdefabcdefabcdefab"* ]]
     [[ "$output" == *"REDACTED"* ]]
+}
+@test "Telegram menu: root rejects invalid and Enter, then handles status, 0 and EOF" {
+    write_web_state
+    telegram_proxy_status() {
+        _menu_journal status
+        return 0
+    }
+
+    local input="$BATS_TEST_TMPDIR/menu-input"
+    printf 'x\n\n1\n0\n' > "$input"
+    run _run_telegram_menu "$input"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *MENU_RETURNED* ]]
+    [ "$(cat "$BATS_TEST_TMPDIR/menu-journal")" = status ]
+
+    : > "$input"
+    run _run_telegram_menu "$input"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *MENU_RETURNED* ]]
+}
+
+@test "Telegram menu: WEB management keeps submenu after failure and accepts uppercase keys" {
+    write_web_state
+    telegram_proxy_web_cli() {
+        _menu_journal "web:$1"
+        [[ "$1" == restart ]] && return 1
+        return 0
+    }
+    telegram_proxy_status() {
+        _menu_journal status
+        return 0
+    }
+
+    local input="$BATS_TEST_TMPDIR/menu-input"
+    printf '3\nrestart\nR\nU\n0\n1\n0\n' > "$input"
+    run _run_telegram_menu "$input"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *MENU_RETURNED* ]]
+    printf 'web:restart\nweb:update\nstatus\n' > "$BATS_TEST_TMPDIR/menu-expected"
+    cmp -s "$BATS_TEST_TMPDIR/menu-expected" "$BATS_TEST_TMPDIR/menu-journal"
+}
+
+@test "Telegram menu: MTProto management routes uppercase actions and remains open after failure" {
+    write_mtproto_state
+    telegram_proxy_mtproto_cli() {
+        _menu_journal "mtproto:$1"
+        [[ "$1" == refresh-ip ]] && return 1
+        return 0
+    }
+    telegram_proxy_status() {
+        _menu_journal status
+        return 0
+    }
+
+    local input="$BATS_TEST_TMPDIR/menu-input"
+    printf '4\nI\nR\n0\n1\n0\n' > "$input"
+    run _run_telegram_menu "$input"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *MENU_RETURNED* ]]
+    printf 'mtproto:refresh-ip\nmtproto:restart\nstatus\n' > "$BATS_TEST_TMPDIR/menu-expected"
+    cmp -s "$BATS_TEST_TMPDIR/menu-expected" "$BATS_TEST_TMPDIR/menu-journal"
+}
+
+@test "Telegram menu: installation state changes open component management on next root redraw" {
+    write_web_state
+    telegram_proxy_mtproto_cli() {
+        _menu_journal "mtproto:$1"
+        if [[ "$1" == install ]]; then
+            write_both_state
+        fi
+        return 0
+    }
+
+    local input="$BATS_TEST_TMPDIR/menu-input"
+    printf '4\n4\nR\n0\n0\n' > "$input"
+    run _run_telegram_menu "$input"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *MENU_RETURNED* ]]
+    printf 'mtproto:install\nmtproto:restart\n' > "$BATS_TEST_TMPDIR/menu-expected"
+    cmp -s "$BATS_TEST_TMPDIR/menu-expected" "$BATS_TEST_TMPDIR/menu-journal"
+}
+
+@test "Telegram menu: disappearing WEB context returns to parent menu" {
+    write_both_state
+    telegram_proxy_web_cli() {
+        _menu_journal "web:$1"
+        if [[ "$1" == remove ]]; then
+            write_mtproto_state
+        fi
+        return 0
+    }
+    telegram_proxy_status() {
+        _menu_journal status
+        return 0
+    }
+
+    local input="$BATS_TEST_TMPDIR/menu-input"
+    printf '3\nD\n1\n0\n' > "$input"
+    run _run_telegram_menu "$input"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *MENU_RETURNED* ]]
+    printf 'web:remove\nstatus\n' > "$BATS_TEST_TMPDIR/menu-expected"
+    cmp -s "$BATS_TEST_TMPDIR/menu-expected" "$BATS_TEST_TMPDIR/menu-journal"
+}
+
+@test "Telegram menu: tag submenu persists across actions and handler failure" {
+    write_web_state
+    telegram_proxy_tag_clear() {
+        _menu_journal tag:clear
+        return 1
+    }
+    telegram_proxy_tag_show() {
+        _menu_journal tag:show
+        return 0
+    }
+    telegram_proxy_tag_set() {
+        _menu_journal tag:set
+        return 0
+    }
+
+    local input="$BATS_TEST_TMPDIR/menu-input"
+    printf '6\nD\nS\nE\n0\n0\n' > "$input"
+    run _run_telegram_menu "$input"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *MENU_RETURNED* ]]
+    printf 'tag:clear\ntag:show\ntag:set\n' > "$BATS_TEST_TMPDIR/menu-expected"
+    cmp -s "$BATS_TEST_TMPDIR/menu-expected" "$BATS_TEST_TMPDIR/menu-journal"
+}
+
+@test "Telegram menu: remove-all confirmation routes only after explicit approval" {
+    write_both_state
+    confirm_yn() {
+        _menu_journal confirm
+        return "${MENU_CONFIRM_RC:-0}"
+    }
+    telegram_proxy_remove_all() {
+        _menu_journal remove-all
+        return 0
+    }
+    local input="$BATS_TEST_TMPDIR/menu-input"
+
+    MENU_CONFIRM_RC=1
+    printf '8\n0\n' > "$input"
+    run _run_telegram_menu "$input"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *MENU_RETURNED* ]]
+    printf 'confirm\n' > "$BATS_TEST_TMPDIR/menu-expected"
+    cmp -s "$BATS_TEST_TMPDIR/menu-expected" "$BATS_TEST_TMPDIR/menu-journal"
+
+    rm -f "$BATS_TEST_TMPDIR/menu-journal"
+    MENU_CONFIRM_RC=0
+    printf '8\n0\n' > "$input"
+    run _run_telegram_menu "$input"
+    [ "$status" -eq 0 ]
+    printf 'confirm\nremove-all\n' > "$BATS_TEST_TMPDIR/menu-expected"
+    cmp -s "$BATS_TEST_TMPDIR/menu-expected" "$BATS_TEST_TMPDIR/menu-journal"
 }

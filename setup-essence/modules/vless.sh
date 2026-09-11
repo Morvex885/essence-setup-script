@@ -15,7 +15,7 @@ _load_reality_conf() {
 
 _check_reality() {
     if ! _load_reality_conf; then
-        warn "Reality не настроен. Сначала выберите пункт 'r' для настройки Reality."
+        warn "Reality не настроен. Откройте VLESS Reality и выберите «1) Настроить Reality»."
         return 1
     fi
 }
@@ -31,16 +31,27 @@ setup_reality() {
     fi
 
     # ─── Выбор режима Reality ─────────────────────────────────────────────────
-    echo ""
-    echo -e "  Режим Reality:"
-    echo -e "  ${GREEN}1)${NC} Self-Steal ${DIM}(рекомендуется)${NC}"
-    echo -e "  ${GREEN}2)${NC} SNI (указать домен-маскировку)"
-    echo ""
-    read -rp "Выберите [1]: " REALITY_MODE
-    REALITY_MODE="${REALITY_MODE:-1}"
-    if ! [[ "$REALITY_MODE" =~ ^[12]$ ]]; then
-        warn "Неверный выбор."; return
-    fi
+    while true; do
+        echo ""
+        box_top
+        box_center "Режим Reality"
+        box_mid
+        menu_item 1 "Self-Steal (рекомендуется)" GREEN
+        menu_item 2 "SNI (указать домен-маскировку)" GREEN
+        menu_item 0 "Отмена" NC
+        box_bot
+        echo ""
+        if ! IFS= read -rp "  Выберите действие [Enter = 1]: " REALITY_MODE; then
+            return 1
+        fi
+        REALITY_MODE="${REALITY_MODE%$'\r'}"
+        REALITY_MODE="${REALITY_MODE:-1}"
+        if [[ "$REALITY_MODE" == 1 || "$REALITY_MODE" == 2 ]]; then
+            break
+        fi
+        [[ "$REALITY_MODE" == 0 ]] && return 1
+        warn "Неверный выбор."
+    done
 
     local DOMAIN="" EMAIL="" SNI_DOMAIN="" REALITY_DEST=""
     local HAS_SITE="true" SITE_NAME="" IS_IP_CERT="false"
@@ -171,12 +182,21 @@ setup_reality() {
         STEP=$((STEP + 1))
         echo ""
         info "Шаг $STEP/$TOTAL_STEPS: Установка nginx..."
-        apt_wait
-        DEBIAN_FRONTEND=noninteractive apt-get update -q
+        if ! apt_wait ||
+           ! DEBIAN_FRONTEND=noninteractive apt-get update -q; then
+            warn "Не удалось подготовить apt для nginx."
+            return 1
+        fi
         if [[ "$REALITY_MODE" == "sni" ]]; then
-            DEBIAN_FRONTEND=noninteractive apt-get install -y -q nginx libnginx-mod-stream || error "Не удалось установить nginx"
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -q nginx libnginx-mod-stream || {
+                warn "Не удалось установить nginx"
+                return 1
+            }
         else
-            DEBIAN_FRONTEND=noninteractive apt-get install -y -q nginx || error "Не удалось установить nginx"
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -q nginx || {
+                warn "Не удалось установить nginx"
+                return 1
+            }
         fi
         systemctl enable nginx
         success "Nginx установлен"
@@ -185,9 +205,11 @@ setup_reality() {
         STEP=$((STEP + 1))
         echo ""
         info "Шаг $STEP/$TOTAL_STEPS: Создание сайта-заглушки..."
-        mkdir -p /var/www/"$SITE_NAME"
-        mkdir -p /etc/nginx/ssl/"$SITE_NAME"
-        setup_fake_site "/var/www/$SITE_NAME"
+        mkdir -p /var/www/"$SITE_NAME" /etc/nginx/ssl/"$SITE_NAME" || return 1
+        if ! setup_fake_site "/var/www/$SITE_NAME"; then
+            warn "Сайт-заглушка не создан."
+            return 1
+        fi
 
         # ─── Шаг: Nginx HTTP (для acme.sh) ──────────────────────────────────
         STEP=$((STEP + 1))
@@ -211,29 +233,45 @@ server {
 NGINXEOF
 
         ln -sf /etc/nginx/sites-available/"$SITE_NAME" /etc/nginx/sites-enabled/"$SITE_NAME"
-        nginx -t || error "Nginx конфиг невалиден"
-        systemctl restart nginx || error "Nginx не запустился"
+        if ! nginx -t; then
+            warn "Nginx конфиг невалиден"
+            return 1
+        fi
+        if ! systemctl restart nginx; then
+            warn "Nginx не запустился"
+            return 1
+        fi
         sleep 1
-        systemctl is-active --quiet nginx || error "Nginx не активен после запуска"
+        if ! systemctl is-active --quiet nginx; then
+            warn "Nginx не активен после запуска"
+            return 1
+        fi
         success "Nginx запущен на порту 80"
 
         # ─── Шаг: acme.sh ───────────────────────────────────────────────────
         STEP=$((STEP + 1))
         echo ""
         info "Шаг $STEP/$TOTAL_STEPS: Установка acme.sh..."
-        ensure_acme_installed "$EMAIL"
+        if ! ensure_acme_installed "$EMAIL"; then
+            return 1
+        fi
         success "acme.sh готов (CA: Let's Encrypt)"
 
         # ─── Шаг: Сертификат ────────────────────────────────────────────────
         STEP=$((STEP + 1))
         echo ""
         info "Шаг $STEP/$TOTAL_STEPS: Получение SSL сертификата для $SITE_NAME..."
-        issue_cert "$SITE_NAME" "/var/www/$SITE_NAME" "$IS_IP_CERT"
+        if ! issue_cert "$SITE_NAME" "/var/www/$SITE_NAME" "$IS_IP_CERT"; then
+            return 1
+        fi
         info "Закрываю порт 80..."
         ufw deny 80/tcp > /dev/null
         success "Порт 80 закрыт"
 
-        install_cert "$SITE_NAME"
+        if ! install_cert "$SITE_NAME"; then
+            warn "Не удалось установить сертификат."
+            return 1
+        fi
         success "Сертификат получен и установлен"
 
         # ─── Шаг: Nginx SSL ─────────────────────────────────────────────────
@@ -360,8 +398,10 @@ stream {
 STREAMEOF
         fi
 
-        nginx -t || error "Nginx конфиг невалиден"
-        systemctl restart nginx || error "Nginx не запустился после настройки SSL"
+        if ! nginx -t || ! systemctl restart nginx; then
+            warn "Nginx не прошёл проверку или не запустился после настройки SSL"
+            return 1
+        fi
         sleep 1
 
         local http_code
@@ -370,7 +410,8 @@ STREAMEOF
             success "Сайт-заглушка (127.0.0.1:8443) работает (HTTP $http_code)"
         else
             if [[ "$REALITY_MODE" == "self-steal" ]]; then
-                error "Nginx на 8443 вернул HTTP $http_code — Reality не будет работать."
+                warn "Nginx на 8443 вернул HTTP $http_code — Reality не будет работать."
+                return 1
             else
                 warn "Nginx на 8443 вернул HTTP $http_code"
             fi
@@ -395,7 +436,8 @@ STREAMEOF
     SHORT_ID=$(openssl rand -hex 8)
 
     if [[ -z "$PUBLIC_KEY" || -z "$PRIVATE_KEY" ]]; then
-        error "Не удалось сгенерировать X25519 ключи через openssl"
+        warn "Не удалось сгенерировать X25519 ключи через openssl"
+        return 1
     fi
 
     # Удаляем старый VLESS listener без маркеров (миграция со старого формата)
@@ -450,7 +492,10 @@ _vless_port_input() {
     local default_port="$1"
     local port
 
-    read -rp "Порт [Enter = $default_port]: " port
+    if ! IFS= read -rp "Порт [Enter = $default_port]: " port; then
+        return 1
+    fi
+    port="${port%$'\r'}"
     [[ -z "$port" ]] && port="$default_port"
 
     while true; do
@@ -461,8 +506,11 @@ _vless_port_input() {
         else
             break
         fi
-        read -rp "Новый порт: " port
-        [[ -z "$port" ]] && { warn "Порт не указан"; return; }
+        if ! IFS= read -rp "Новый порт: " port; then
+            return 1
+        fi
+        port="${port%$'\r'}"
+        [[ -z "$port" ]] && { warn "Порт не указан"; return 1; }
     done
 
     VLESS_PORT="$port"
@@ -801,7 +849,10 @@ _xhttp_probe() {
     local topology="$1" client_port="$2" path="$3" uuid="$4"
     local probe_dir probe_port proxy_yaml pid status=1 http_code=""
     probe_dir=$(mktemp -d) || return 1
-    probe_port=$(gen_free_port 20000 30000)
+    probe_port=$(gen_free_port 20000 30000) || {
+        rm -rf "$probe_dir"
+        return 1
+    }
 
     if [[ "$topology" == "nginx" ]]; then
         proxy_yaml=$(_build_vless_xhttp_client_yaml "xHTTP probe" "$CLIENT_SERVER" \
@@ -1068,59 +1119,67 @@ _add_vless_xhttp() {
 
     local xhttp_via_nginx=false
 
-    echo ""
-    echo -e "  Порт для xHTTP:"
-    echo -e "  ${GREEN}1)${NC} 443 (Reality) — занимает порт, нельзя совместить с TCP"
-    if [[ "$HAS_SITE" == "true" ]]; then
-        echo -e "  ${GREEN}2)${NC} 443 (TLS, nginx) — совместно с TCP (нужен сайт-заглушка)"
-    fi
-    echo -e "  ${GREEN}3)${NC} Свой порт (Reality)"
-    echo -e "  ${NC}0)${NC} Назад"
-    echo ""
-    read -rp "Выберите [1]: " PORT_CHOICE
-    PORT_CHOICE="${PORT_CHOICE:-1}"
-
-    case "$PORT_CHOICE" in
-        1)
-            if grep -q '# --- vless-tcp ---' /etc/mihomo/config.yaml 2>/dev/null; then
-                warn "Порт 443 уже занят VLESS TCP. Используйте вариант 2 (через nginx) или 3 (другой порт)."; return
-            fi
-            if grep -q '# --- vless-grpc ---' /etc/mihomo/config.yaml 2>/dev/null; then
-                local _gp
-                _gp=$(awk '/# --- vless-grpc ---/{f=1} f && /port:/{print $2; exit}' /etc/mihomo/config.yaml)
-                if [[ "$_gp" == "$MIHOMO_PORT" ]]; then
-                    warn "Порт 443 уже занят VLESS gRPC."; return
+    while true; do
+        echo ""
+        box_top
+        box_center "Порт для xHTTP"
+        box_mid
+        menu_item 1 "443 (Reality) — занимает порт, нельзя совместить с TCP" GREEN
+        [[ "$HAS_SITE" == "true" ]] &&
+            menu_item 2 "443 (TLS, nginx) — совместно с TCP" GREEN
+        menu_item 3 "Свой порт (Reality)" GREEN
+        menu_item 0 "Назад" NC
+        box_bot
+        echo ""
+        if ! IFS= read -rp "  Выберите действие [Enter = 1]: " PORT_CHOICE; then
+            return 1
+        fi
+        PORT_CHOICE="${PORT_CHOICE%$'\r'}"
+        PORT_CHOICE="${PORT_CHOICE:-1}"
+        case "$PORT_CHOICE" in
+            1)
+                if grep -q '# --- vless-tcp ---' /etc/mihomo/config.yaml 2>/dev/null; then
+                    warn "Порт 443 уже занят VLESS TCP. Используйте вариант 2 (через nginx) или 3 (другой порт)."
+                    return 1
                 fi
-            fi
-            XHTTP_LISTEN="$MIHOMO_LISTEN"
-            XHTTP_PORT="$MIHOMO_PORT"
-            client_port=443
-            ;;
-        2)
-            if [[ "$HAS_SITE" != "true" ]]; then
-                warn "Вариант 'через nginx' доступен только в режиме с сайтом-заглушкой (self-steal или SNI+сайт)."; return
-            fi
-            xhttp_via_nginx=true
-            topology="nginx"
-            XHTTP_LISTEN="127.0.0.1"
-            XHTTP_PORT=8445
-            if ! is_port_free 8445; then
-                XHTTP_PORT=$(gen_free_port 20000 30000)
-            fi
-            client_port=443
-            ;;
-        3)
-            local DEFAULT_PORT=$(gen_free_port 10000 65535)
-            _vless_port_input "$DEFAULT_PORT"
-            XHTTP_LISTEN="0.0.0.0"
-            XHTTP_PORT="$VLESS_PORT"
-            client_port="$XHTTP_PORT"
-            ;;
-        0) return ;;
-        *)
-            warn "Неверный выбор."; return
-            ;;
-    esac
+                if grep -q '# --- vless-grpc ---' /etc/mihomo/config.yaml 2>/dev/null; then
+                    local _gp
+                    _gp=$(awk '/# --- vless-grpc ---/{f=1} f && /port:/{print $2; exit}' /etc/mihomo/config.yaml)
+                    [[ "$_gp" == "$MIHOMO_PORT" ]] && { warn "Порт 443 уже занят VLESS gRPC."; return 1; }
+                fi
+                XHTTP_LISTEN="$MIHOMO_LISTEN"
+                XHTTP_PORT="$MIHOMO_PORT"
+                client_port=443
+                break
+                ;;
+            2)
+                if [[ "$HAS_SITE" != "true" ]]; then
+                    warn "Вариант через nginx доступен только при установленном сайте-заглушке."
+                    continue
+                fi
+                xhttp_via_nginx=true
+                topology="nginx"
+                XHTTP_LISTEN="127.0.0.1"
+                XHTTP_PORT=8445
+                if ! is_port_free 8445; then
+                    XHTTP_PORT=$(gen_free_port 20000 30000) || return 1
+                fi
+                client_port=443
+                break
+                ;;
+            3)
+                local DEFAULT_PORT
+                DEFAULT_PORT=$(gen_free_port 10000 65535) || return 1
+                _vless_port_input "$DEFAULT_PORT" || return 1
+                XHTTP_LISTEN="0.0.0.0"
+                XHTTP_PORT="$VLESS_PORT"
+                client_port="$XHTTP_PORT"
+                break
+                ;;
+            0) return 0 ;;
+            *) warn "Неверный выбор." ;;
+        esac
+    done
     [[ "$xhttp_via_nginx" == "false" ]] && topology="reality"
 
     echo ""
@@ -1173,43 +1232,51 @@ _add_vless_grpc() {
     local GRPC_LISTEN GRPC_PORT client_port
     local GRPC_SERVICE="grpc-$(openssl rand -hex 4)"
 
-    echo ""
-    echo -e "  Порт для gRPC:"
-    echo -e "  ${GREEN}1)${NC} 443 (Reality) — занимает порт, нельзя совместить с TCP/xHTTP"
-    echo -e "  ${GREEN}2)${NC} Свой порт (Reality)"
-    echo -e "  ${NC}0)${NC} Назад"
-    echo ""
-    read -rp "Выберите [1]: " PORT_CHOICE
-    PORT_CHOICE="${PORT_CHOICE:-1}"
-
-    case "$PORT_CHOICE" in
-        1)
-            if grep -q '# --- vless-tcp ---' /etc/mihomo/config.yaml 2>/dev/null; then
-                warn "Порт 443 уже занят VLESS TCP. Выберите другой порт или удалите TCP."; return
-            fi
-            if grep -q '# --- vless-xhttp ---' /etc/mihomo/config.yaml 2>/dev/null; then
-                local _xp
-                _xp=$(awk '/# --- vless-xhttp ---/{f=1} f && /port:/{print $2; exit}' /etc/mihomo/config.yaml)
-                if [[ "$_xp" == "$MIHOMO_PORT" ]]; then
-                    warn "Порт 443 уже занят VLESS xHTTP. Выберите другой порт или удалите xHTTP."; return
+    while true; do
+        echo ""
+        box_top
+        box_center "Порт для gRPC"
+        box_mid
+        menu_item 1 "443 (Reality) — занимает порт, нельзя совместить с TCP/xHTTP" GREEN
+        menu_item 2 "Свой порт (Reality)" GREEN
+        menu_item 0 "Назад" NC
+        box_bot
+        echo ""
+        if ! IFS= read -rp "  Выберите действие [Enter = 1]: " PORT_CHOICE; then
+            return 1
+        fi
+        PORT_CHOICE="${PORT_CHOICE%$'\r'}"
+        PORT_CHOICE="${PORT_CHOICE:-1}"
+        case "$PORT_CHOICE" in
+            1)
+                if grep -q '# --- vless-tcp ---' /etc/mihomo/config.yaml 2>/dev/null; then
+                    warn "Порт 443 уже занят VLESS TCP. Выберите другой порт или удалите TCP."
+                    return 1
                 fi
-            fi
-            GRPC_LISTEN="$MIHOMO_LISTEN"
-            GRPC_PORT="$MIHOMO_PORT"
-            client_port=443
-            ;;
-        2)
-            local DEFAULT_PORT=$(gen_free_port 10000 65535)
-            _vless_port_input "$DEFAULT_PORT"
-            GRPC_LISTEN="0.0.0.0"
-            GRPC_PORT="$VLESS_PORT"
-            client_port="$GRPC_PORT"
-            ;;
-        0) return ;;
-        *)
-            warn "Неверный выбор."; return
-            ;;
-    esac
+                if grep -q '# --- vless-xhttp ---' /etc/mihomo/config.yaml 2>/dev/null; then
+                    local _xp
+                    _xp=$(awk '/# --- vless-xhttp ---/{f=1} f && /port:/{print $2; exit}' /etc/mihomo/config.yaml)
+                    [[ "$_xp" == "$MIHOMO_PORT" ]] &&
+                        { warn "Порт 443 уже занят VLESS xHTTP. Выберите другой порт или удалите xHTTP."; return 1; }
+                fi
+                GRPC_LISTEN="$MIHOMO_LISTEN"
+                GRPC_PORT="$MIHOMO_PORT"
+                client_port=443
+                break
+                ;;
+            2)
+                local DEFAULT_PORT
+                DEFAULT_PORT=$(gen_free_port 10000 65535) || return 1
+                _vless_port_input "$DEFAULT_PORT" || return 1
+                GRPC_LISTEN="0.0.0.0"
+                GRPC_PORT="$VLESS_PORT"
+                client_port="$GRPC_PORT"
+                break
+                ;;
+            0) return 0 ;;
+            *) warn "Неверный выбор." ;;
+        esac
+    done
 
     echo ""
     info "Порт:         $client_port"
@@ -1291,46 +1358,52 @@ VLESSGRPCEOF
 # ─── Удалить транспорт ───────────────────────────────────────────────────────
 
 _remove_vless_transport() {
-    echo ""
-
-    # Собираем список установленных транспортов
-    local items=() labels=()
+    local items=() labels=() xhttp_port grpc_port i DEL_CHOICE selected
     if grep -q '# --- vless-tcp ---' /etc/mihomo/config.yaml 2>/dev/null; then
         items+=("tcp")
         labels+=("VLESS TCP (порт 443)")
     fi
     if grep -q '# --- vless-xhttp ---' /etc/mihomo/config.yaml 2>/dev/null; then
-        local xhttp_port
         xhttp_port=$(awk '/^--- VLESS xHTTP ---/{f=1} f && /^Port:/{print $2; exit}' /etc/mihomo/client-config.txt 2>/dev/null)
         items+=("xhttp")
         labels+=("VLESS xHTTP (порт ${xhttp_port:-?})")
     fi
     if grep -q '# --- vless-grpc ---' /etc/mihomo/config.yaml 2>/dev/null; then
-        local grpc_port
         grpc_port=$(awk '/^--- VLESS gRPC ---/{f=1} f && /^Port:/{print $2; exit}' /etc/mihomo/client-config.txt 2>/dev/null)
         items+=("grpc")
         labels+=("VLESS gRPC (порт ${grpc_port:-?})")
     fi
-
     if [[ ${#items[@]} -eq 0 ]]; then
-        warn "Нет установленных VLESS транспортов."
-        return
+        echo ""
+        box_top
+        box_center "Удаление VLESS"
+        box_mid
+        box_line " Нет установленных VLESS транспортов" " ${DIM}Нет установленных VLESS транспортов${NC}"
+        box_bot
+        return 1
     fi
-
-    local i
-    for i in "${!items[@]}"; do
-        echo -e "  ${GREEN}$((i+1)))${NC} ${labels[$i]}"
+    while true; do
+        echo ""
+        box_top
+        box_center "Удаление VLESS"
+        box_mid
+        for i in "${!items[@]}"; do
+            menu_item "$((i + 1))" "${labels[$i]}" RED
+        done
+        menu_item 0 "Отмена" NC
+        box_bot
+        echo ""
+        if ! IFS= read -rp "  Выберите транспорт: " DEL_CHOICE; then
+            return 1
+        fi
+        DEL_CHOICE="${DEL_CHOICE%$'\r'}"
+        [[ "$DEL_CHOICE" == 0 ]] && return 1
+        if menu_index_valid "$DEL_CHOICE" "${#items[@]}"; then
+            selected="${items[$((DEL_CHOICE-1))]}"
+            break
+        fi
+        warn "Неверный выбор."
     done
-
-    echo ""
-    read -rp "Выберите транспорт для удаления [0 = назад]: " DEL_CHOICE
-
-    if [[ "$DEL_CHOICE" == "0" || -z "$DEL_CHOICE" ]]; then return; fi
-    if ! [[ "$DEL_CHOICE" =~ ^[0-9]+$ ]] || (( DEL_CHOICE < 1 || DEL_CHOICE > ${#items[@]} )); then
-        warn "Неверный выбор."; return
-    fi
-
-    local selected="${items[$((DEL_CHOICE-1))]}"
 
     # Проверяем cascade-user перед удалением
     local _marker_name
@@ -1402,69 +1475,78 @@ _remove_vless_transport() {
 # ─── Статус VLESS ────────────────────────────────────────────────────────────
 
 _vless_status() {
-    echo ""
+    local found=false xp gp
     if [[ -f /etc/mihomo/reality.conf ]]; then
         _load_reality_conf
-        echo -e "  Reality: ${GREEN}настроен${NC} (${CYAN}$MODE${NC})"
-        echo -e "  SNI:     ${CYAN}$SNI_DOMAIN${NC}"
-        echo -e "  Сервер:  ${CYAN}$CLIENT_SERVER${NC}"
+        box_line " Reality: настроен (${MODE})" " ${GREEN}Reality: настроен${NC} (${CYAN}${MODE}${NC})"
+        box_line " SNI: ${SNI_DOMAIN}"
+        box_line " Сервер: ${CLIENT_SERVER}"
     else
-        echo -e "  Reality: ${RED}не настроен${NC}"
+        box_line " Reality: не настроен" " ${DIM}Reality: не настроен${NC}"
     fi
-
-    echo ""
-    local found=false
     if grep -q '# --- vless-tcp ---' /etc/mihomo/config.yaml 2>/dev/null; then
-        echo -e "  TCP:     ${GREEN}установлен${NC} (порт 443)"
+        box_line " TCP: установлен (порт 443)" " ${GREEN}TCP: установлен${NC} (порт 443)"
         found=true
     fi
     if grep -q '# --- vless-xhttp ---' /etc/mihomo/config.yaml 2>/dev/null; then
-        local xp
         xp=$(awk '/^--- VLESS xHTTP ---/{f=1} f && /^Port:/{print $2; exit}' /etc/mihomo/client-config.txt 2>/dev/null)
-        echo -e "  xHTTP:   ${GREEN}установлен${NC} (порт ${xp:-?})"
+        box_line " xHTTP: установлен (порт ${xp:-?})" " ${GREEN}xHTTP: установлен${NC} (порт ${xp:-?})"
         found=true
     fi
     if grep -q '# --- vless-grpc ---' /etc/mihomo/config.yaml 2>/dev/null; then
-        local gp
         gp=$(awk '/^--- VLESS gRPC ---/{f=1} f && /^Port:/{print $2; exit}' /etc/mihomo/client-config.txt 2>/dev/null)
-        echo -e "  gRPC:    ${GREEN}установлен${NC} (порт ${gp:-?})"
+        box_line " gRPC: установлен (порт ${gp:-?})" " ${GREEN}gRPC: установлен${NC} (порт ${gp:-?})"
         found=true
     fi
-    if [[ "$found" == "false" ]]; then
-        echo -e "  Транспорты: ${RED}не установлены${NC}"
-    fi
-    echo ""
+    [[ "$found" == false ]] && box_line " Транспорты: не установлены" " ${DIM}Транспорты: не установлены${NC}"
 }
 
 # ─── Меню VLESS ──────────────────────────────────────────────────────────────
 
 vless_menu() {
     _check_base || return
-
     while true; do
         echo ""
         box_top
         box_center "VLESS Reality"
-        box_bot
+        box_mid
         _vless_status
-        echo -e "  ${GREEN}1)${NC} Настроить Reality"
-        echo -e "  ${GREEN}2)${NC} Добавить TCP"
-        echo -e "  ${GREEN}3)${NC} Добавить xHTTP"
-        echo -e "  ${GREEN}4)${NC} Добавить gRPC"
-        echo -e "  ${RED}d)${NC} Удалить транспорт"
-        echo -e "  ${CYAN}s)${NC} Статус"
-        echo -e "  ${NC}0)${NC} Назад"
+        box_mid
+        menu_item 1 "Настроить Reality" GREEN
+        menu_item 2 "Добавить TCP" GREEN
+        [[ "$HAS_SITE" == true ]] && menu_item 3 "Добавить xHTTP" GREEN ||
+            menu_item 3 "Добавить xHTTP (недоступно без сайта)" NC
+        menu_item 4 "Добавить gRPC" GREEN
+        menu_item d "Удалить транспорт" RED
+        menu_item s "Статус" CYAN
+        menu_item 0 "Назад" NC
+        box_bot
         echo ""
-        read -rp "Выберите [0]: " VLESS_CHOICE
-
+        if ! IFS= read -rp "  Выберите действие: " VLESS_CHOICE; then
+            return 0
+        fi
+        VLESS_CHOICE="${VLESS_CHOICE%$'\r'}"
         case "$VLESS_CHOICE" in
             1) setup_reality ;;
             2) _add_vless_tcp ;;
-            3) _add_vless_xhttp ;;
+            3)
+                if [[ "$HAS_SITE" == true ]]; then
+                    _add_vless_xhttp
+                else
+                    warn "Неверный выбор."
+                fi
+                ;;
             4) _add_vless_grpc ;;
             d|D) _remove_vless_transport ;;
-            s|S) _vless_status ;;
-            0|"") return ;;
+            s|S)
+                echo ""
+                box_top
+                box_center "Статус VLESS"
+                box_mid
+                _vless_status
+                box_bot
+                ;;
+            0) return 0 ;;
             *) warn "Неверный выбор." ;;
         esac
     done

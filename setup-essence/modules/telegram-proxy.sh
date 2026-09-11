@@ -2007,62 +2007,223 @@ telegram_proxy_remove_all() {
     return "$rc"
 }
 
-telegram_proxy_menu() {
-    local choice action
+_telegram_proxy_menu_warn_failure() {
+    warn "Операция Telegram Proxy завершилась с ошибкой. Повторите действие из меню."
+}
+
+_telegram_proxy_web_menu() {
+    local choice
     while true; do
+        if ! _telegram_proxy_component_enabled web; then
+            return 0
+        fi
         echo ""
-        echo "Telegram Proxy"
-        _telegram_proxy_component_enabled web &&
-            echo "  WEB: active" || echo "  WEB: inactive"
-        _telegram_proxy_component_enabled mtproto &&
-            echo "  MTProto: active" || echo "  MTProto: inactive"
-        echo "  1) Status"
-        echo "  2) Connection"
-        echo "  3) WEB: install/restart/update/remove"
-        echo "  4) MTProto: install/restart/refresh-ip/remove"
-        echo "  5) Rotate secret"
-        echo "  6) Tag: show/set/clear"
-        echo "  7) Diagnostics"
-        echo "  8) Remove all"
-        echo "  0) Назад"
-        read -rp "Выберите [0-8]: " choice
+        box_top
+        box_center "Управление WEB"
+        box_mid
+        menu_item r "Перезапустить WEB" YELLOW
+        menu_item u "Обновить WEB" YELLOW
+        menu_item d "Удалить WEB" RED
+        menu_item 0 "Назад" NC
+        box_bot
+        echo ""
+        if ! IFS= read -rp "  Выберите действие: " choice; then
+            return 0
+        fi
+        choice="${choice%$'\r'}"
         case "$choice" in
-            1) telegram_proxy_status ;;
-            2) telegram_proxy_connection ;;
-            3)
-                if _telegram_proxy_component_enabled web; then
-                    read -rp "Действие WEB [restart/update/remove]: " action
-                else
-                    action=install
+            r|R)
+                if ! telegram_proxy_web_cli restart; then
+                    _telegram_proxy_menu_warn_failure
                 fi
-                telegram_proxy_web_cli "$action"
                 ;;
-            4)
-                if _telegram_proxy_component_enabled mtproto; then
-                    read -rp "Действие MTProto [restart/refresh-ip/remove]: " action
-                else
-                    action=install
+            u|U)
+                if ! telegram_proxy_web_cli update; then
+                    _telegram_proxy_menu_warn_failure
                 fi
-                telegram_proxy_mtproto_cli "$action"
                 ;;
-            5) telegram_proxy_rotate_secret ;;
-            6)
-                read -rp "Действие tag [show/set/clear]: " action
-                case "$action" in
-                    show) telegram_proxy_tag_show ;;
-                    set) telegram_proxy_tag_set ;;
-                    clear) telegram_proxy_tag_clear ;;
-                    *) warn "Неверное действие tag." ;;
-                esac
-                ;;
-            7) telegram_proxy_diagnostics ;;
-            8)
-                if confirm_yn "Удалить все компоненты Telegram Proxy?" N; then
-                    TPROXY_INTERNAL_CALL=true telegram_proxy_remove_all --force ||
-                        warn "Не удалось удалить все компоненты Telegram Proxy."
+            d|D)
+                if ! telegram_proxy_web_cli remove; then
+                    _telegram_proxy_menu_warn_failure
                 fi
                 ;;
             0) return 0 ;;
+            *) warn "Неверный выбор." ;;
+        esac
+    done
+}
+
+_telegram_proxy_mtproto_menu() {
+    local choice
+    while true; do
+        if ! _telegram_proxy_component_enabled mtproto; then
+            return 0
+        fi
+        echo ""
+        box_top
+        box_center "Управление MTProto"
+        box_mid
+        menu_item r "Перезапустить MTProto" YELLOW
+        menu_item i "Обновить IP-адрес" YELLOW
+        menu_item d "Удалить MTProto" RED
+        menu_item 0 "Назад" NC
+        box_bot
+        echo ""
+        if ! IFS= read -rp "  Выберите действие: " choice; then
+            return 0
+        fi
+        choice="${choice%$'\r'}"
+        case "$choice" in
+            r|R)
+                if ! telegram_proxy_mtproto_cli restart; then
+                    _telegram_proxy_menu_warn_failure
+                fi
+                ;;
+            i|I)
+                if ! telegram_proxy_mtproto_cli refresh-ip; then
+                    _telegram_proxy_menu_warn_failure
+                fi
+                ;;
+            d|D)
+                if ! telegram_proxy_mtproto_cli remove; then
+                    _telegram_proxy_menu_warn_failure
+                fi
+                ;;
+            0) return 0 ;;
+            *) warn "Неверный выбор." ;;
+        esac
+    done
+}
+
+_telegram_proxy_tag_menu() {
+    local choice
+    while true; do
+        echo ""
+        box_top
+        box_center "Тег Telegram Proxy"
+        box_mid
+        menu_item s "Показать тег" CYAN
+        menu_item e "Изменить тег" YELLOW
+        menu_item d "Удалить тег" RED
+        menu_item 0 "Назад" NC
+        box_bot
+        echo ""
+        if ! IFS= read -rp "  Выберите действие: " choice; then
+            return 0
+        fi
+        choice="${choice%$'\r'}"
+        case "$choice" in
+            s|S)
+                if ! telegram_proxy_tag_show; then
+                    _telegram_proxy_menu_warn_failure
+                fi
+                ;;
+            e|E)
+                if ! telegram_proxy_tag_set; then
+                    _telegram_proxy_menu_warn_failure
+                fi
+                ;;
+            d|D)
+                if ! telegram_proxy_tag_clear; then
+                    _telegram_proxy_menu_warn_failure
+                fi
+                ;;
+            0) return 0 ;;
+            *) warn "Неверный выбор." ;;
+        esac
+    done
+}
+
+
+telegram_proxy_menu() {
+    local choice web_enabled mtproto_enabled
+    while true; do
+        web_enabled=false
+        mtproto_enabled=false
+        _telegram_proxy_component_enabled web && web_enabled=true
+        _telegram_proxy_component_enabled mtproto && mtproto_enabled=true
+
+        echo ""
+        box_top
+        box_center "Telegram Proxy"
+        if [[ "$web_enabled" == true ]]; then
+            box_line " WEB: включён" " ${GREEN}WEB: включён${NC}"
+        else
+            box_line " WEB: выключен" " ${DIM}WEB: выключен${NC}"
+        fi
+        if [[ "$mtproto_enabled" == true ]]; then
+            box_line " MTProto: включён" " ${GREEN}MTProto: включён${NC}"
+        else
+            box_line " MTProto: выключен" " ${DIM}MTProto: выключен${NC}"
+        fi
+        box_mid
+        menu_item 1 "Общий статус" CYAN
+        menu_item 2 "Подключение" CYAN
+        if [[ "$web_enabled" == true ]]; then
+            menu_item 3 "Управление WEB" CYAN
+        else
+            menu_item 3 "Установить WEB" GREEN
+        fi
+        if [[ "$mtproto_enabled" == true ]]; then
+            menu_item 4 "Управление MTProto" CYAN
+        else
+            menu_item 4 "Установить MTProto" GREEN
+        fi
+        menu_item 5 "Сменить секрет подключения" RED
+        menu_item 6 "Тег Telegram Proxy" CYAN
+        menu_item 7 "Диагностика" CYAN
+        menu_item 8 "Удалить всё" RED
+        menu_item 0 "Назад" NC
+        box_bot
+        echo ""
+        if ! IFS= read -rp "  Выберите действие: " choice; then
+            return 0
+        fi
+        choice="${choice%$'\r'}"
+        case "$choice" in
+            0) return 0 ;;
+            1)
+                if ! telegram_proxy_status; then
+                    _telegram_proxy_menu_warn_failure
+                fi
+                ;;
+            2)
+                if ! telegram_proxy_connection; then
+                    _telegram_proxy_menu_warn_failure
+                fi
+                ;;
+            3)
+                if [[ "$web_enabled" == true ]]; then
+                    _telegram_proxy_web_menu
+                elif ! telegram_proxy_web_cli install; then
+                    _telegram_proxy_menu_warn_failure
+                fi
+                ;;
+            4)
+                if [[ "$mtproto_enabled" == true ]]; then
+                    _telegram_proxy_mtproto_menu
+                elif ! telegram_proxy_mtproto_cli install; then
+                    _telegram_proxy_menu_warn_failure
+                fi
+                ;;
+            5)
+                if ! telegram_proxy_rotate_secret; then
+                    _telegram_proxy_menu_warn_failure
+                fi
+                ;;
+            6) _telegram_proxy_tag_menu ;;
+            7)
+                if ! telegram_proxy_diagnostics; then
+                    _telegram_proxy_menu_warn_failure
+                fi
+                ;;
+            8)
+                if confirm_yn "Удалить все компоненты Telegram Proxy?" N; then
+                    if ! TPROXY_INTERNAL_CALL=true telegram_proxy_remove_all --force; then
+                        warn "Не удалось удалить все компоненты Telegram Proxy."
+                    fi
+                fi
+                ;;
             *) warn "Неверный выбор." ;;
         esac
     done

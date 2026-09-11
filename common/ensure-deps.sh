@@ -75,11 +75,14 @@ pm_install() {
             local waited=0
             while $S fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/lib/dpkg/lock >/dev/null 2>&1; do
                 (( waited == 0 )) && info "Ожидаем освобождения apt-лока..."
-                sleep 2; waited=$((waited + 2))
-                (( waited >= 120 )) && error "apt заблокирован более 2 минут."
+                sleep 2
+                waited=$((waited + 2))
+                if (( waited >= 120 )); then
+                    warn "apt заблокирован более 2 минут."
+                    return 1
+                fi
             done
-            _run_pm $S env DEBIAN_FRONTEND=noninteractive apt-get update -q \
-                || warn "apt-get update завершился с ошибкой — продолжаем"
+            _run_pm $S env DEBIAN_FRONTEND=noninteractive apt-get update -q || return 1
             _run_pm $S env DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
                 -o Dpkg::Options::=--force-confold "$pkg"
             ;;
@@ -97,15 +100,21 @@ ensure_dep() {
     local bin
     for bin in "$@"; do
         command -v "$bin" &>/dev/null && continue
-
-        [[ -z "$PM" ]] && error "Не найден поддерживаемый пакетный менеджер (apt/dnf/yum/pacman/zypper/apk/brew/termux). Установите ${bin} вручную."
-
+        if [[ -z "$PM" ]]; then
+            warn "Не найден поддерживаемый пакетный менеджер для ${bin}."
+            return 1
+        fi
         local pkg
         pkg=$(pkg_name_for "$bin")
         info "Отсутствует ${bin} — устанавливаем ${pkg} через ${PM}..."
-        pm_install "$pkg" \
-            || error "Не удалось автоматически установить ${pkg} через ${PM}. Установите вручную и повторите запуск."
-        command -v "$bin" &>/dev/null || error "${bin} не появился в PATH после установки ${pkg}."
+        if ! pm_install "$pkg"; then
+            warn "Не удалось автоматически установить ${pkg} через ${PM}."
+            return 1
+        fi
+        if ! command -v "$bin" &>/dev/null; then
+            warn "${bin} не появился в PATH после установки ${pkg}."
+            return 1
+        fi
         success "${pkg} установлен"
     done
 }

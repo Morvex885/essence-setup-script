@@ -499,7 +499,8 @@ delete_node() {
                     info "Подключаемся к серверу для удаления..."
                     if ssh_run -- "echo ok" &>/dev/null; then
                         if upload_scripts; then
-                            run_remote 10
+                            info "В меню сервера выберите u — удалить всё установленное."
+                            run_remote
                         else
                             warn "Не удалось загрузить скрипты для ноды '${_name}'. Удаление на сервере не выполнено."
                         fi
