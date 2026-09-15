@@ -107,20 +107,28 @@ _ssh_base_options() {
 }
 
 ssh_run() {
-    local extra=()
-    while [[ $# -gt 0 && "$1" != "--" ]]; do extra+=("$1"); shift; done
+    local extra=() tty=false option
+    while [[ $# -gt 0 && "$1" != "--" ]]; do
+        option="$1"
+        extra+=("$option")
+        [[ "$option" == "-t" || "$option" == "-tt" ]] && tty=true
+        shift
+    done
     [[ "${1:-}" == "--" ]] && shift
     _ssh_base_options || return 1
-    local rc timeout_seconds="${SSH_RUN_TIMEOUT:-30}"
+    local rc timeout_seconds="${SSH_RUN_TIMEOUT:-30}" runner=()
     [[ "$timeout_seconds" =~ ^[0-9]+$ ]] || timeout_seconds=30
+    if [[ "$tty" != true ]]; then
+        runner=(run_with_timeout "$timeout_seconds")
+    fi
     if _setup_askpass; then
         DISPLAY=dummy SSH_ASKPASS="$_ASKPASS_FILE" SSH_ASKPASS_REQUIRE=force \
-            run_with_timeout "$timeout_seconds" ssh "${SSH_BASE_OPTIONS[@]}" "${extra[@]}" \
+            "${runner[@]}" ssh "${SSH_BASE_OPTIONS[@]}" "${extra[@]}" \
             "${SERVER_USER}@${SERVER_IP}" "$@"
         rc=$?
         _cleanup_askpass
     else
-        run_with_timeout "$timeout_seconds" ssh "${SSH_BASE_OPTIONS[@]}" "${extra[@]}" \
+        "${runner[@]}" ssh "${SSH_BASE_OPTIONS[@]}" "${extra[@]}" \
             "${SERVER_USER}@${SERVER_IP}" "$@"
         rc=$?
     fi

@@ -139,11 +139,19 @@ setup_subscription() {
                 break
                 ;;
             2)
-                read -rp "Введите порт [2096]: " SUB_PORT
-                SUB_PORT="${SUB_PORT:-2096}"
-                SUB_LISTEN="0.0.0.0:${SUB_PORT}"
-                SUB_MODE="standalone"
-                break
+                while true; do
+                    if ! IFS= read -rp "Введите порт [2096]: " SUB_PORT; then
+                        return 1
+                    fi
+                    SUB_PORT="${SUB_PORT%$'\r'}"
+                    SUB_PORT="${SUB_PORT:-2096}"
+                    if menu_index_valid "$SUB_PORT" 65535; then
+                        SUB_LISTEN="0.0.0.0:${SUB_PORT}"
+                        SUB_MODE="standalone"
+                        break 2
+                    fi
+                    warn "Порт должен быть числом от 1 до 65535."
+                done
                 ;;
             0) return 1 ;;
             *) warn "Неверный выбор." ;;
@@ -163,16 +171,52 @@ setup_subscription() {
     echo ""
     confirm_yn "Всё верно?" || { info "Отменено."; return; }
 
-    local TOTAL_STEPS=4 STEP=0
+    local TOTAL_STEPS=3 STEP=0
+
+    # ─── Подготовка и раннее сохранение состояния ────────────────────────────
+    DEFAULT_EMAIL="user$(openssl rand -hex 4)@$(openssl rand -hex 3).com"
+    read -rp "Email для acme.sh [Enter = $DEFAULT_EMAIL]: " SUB_EMAIL
+    [[ -z "$SUB_EMAIL" ]] && SUB_EMAIL="$DEFAULT_EMAIL"
+
+    local NGINX_GROUP
+    NGINX_GROUP=$(ps -o group= -C nginx 2>/dev/null | sort -u | grep -v '^root$' | head -1)
+    [[ -z "$NGINX_GROUP" ]] && NGINX_GROUP=$(awk '/^[[:space:]]*user[[:space:]]+/{print $2; exit}' /etc/nginx/nginx.conf 2>/dev/null | tr -d ';')
+    NGINX_GROUP="${NGINX_GROUP:-www-data}"
+    if ! getent group "$NGINX_GROUP" >/dev/null 2>&1; then
+        warn "Группа nginx '$NGINX_GROUP' не найдена в системе"
+        return 1
+    fi
+    info "Nginx-группа: $NGINX_GROUP"
+
+    local sub_conf_tmp
+    sub_conf_tmp=$(umask 077; mktemp "${SUB_CONF}.tmp.XXXXXX") || {
+        warn "Не удалось сохранить конфигурацию подписок."
+        return 1
+    }
+    if ! cat > "$sub_conf_tmp" << EOF
+SUB_PORT=${SUB_PORT}
+SUB_HOSTNAME=${SUB_HOSTNAME}
+SUB_BASE_URL=${SUB_BASE_URL}
+SUB_DIR=${SUB_DIR}
+SUB_LISTEN=${SUB_LISTEN}
+SUB_MODE=${SUB_MODE}
+NGINX_GROUP=${NGINX_GROUP}
+EOF
+    then
+        rm -f "$sub_conf_tmp"
+        warn "Не удалось сохранить конфигурацию подписок."
+        return 1
+    fi
+    if ! mv "$sub_conf_tmp" "$SUB_CONF"; then
+        rm -f "$sub_conf_tmp"
+        warn "Не удалось сохранить конфигурацию подписок."
+        return 1
+    fi
 
     # ─── Шаг: Сертификат ─────────────────────────────────────────────────────
     STEP=$((STEP + 1))
     echo ""
     info "Шаг $STEP/$TOTAL_STEPS: Получение SSL сертификата для $SUB_HOSTNAME..."
-
-    DEFAULT_EMAIL="user$(openssl rand -hex 4)@$(openssl rand -hex 3).com"
-    read -rp "Email для acme.sh [Enter = $DEFAULT_EMAIL]: " SUB_EMAIL
-    [[ -z "$SUB_EMAIL" ]] && SUB_EMAIL="$DEFAULT_EMAIL"
 
     if ! ensure_acme_installed "$SUB_EMAIL"; then
         return 1
@@ -223,16 +267,6 @@ SUBHTTPEOF
         return 1
     fi
 
-    # Определяем группу nginx-воркера (www-data на Debian/Ubuntu, nginx на RHEL/Alpine, http на Arch)
-    local NGINX_GROUP
-    NGINX_GROUP=$(ps -o group= -C nginx 2>/dev/null | sort -u | grep -v '^root$' | head -1)
-    [[ -z "$NGINX_GROUP" ]] && NGINX_GROUP=$(awk '/^[[:space:]]*user[[:space:]]+/{print $2; exit}' /etc/nginx/nginx.conf 2>/dev/null | tr -d ';')
-    NGINX_GROUP="${NGINX_GROUP:-www-data}"
-    if ! getent group "$NGINX_GROUP" >/dev/null 2>&1; then
-        warn "Группа nginx '$NGINX_GROUP' не найдена в системе"
-        return 1
-    fi
-    info "Nginx-группа: $NGINX_GROUP"
 
     chown "root:${NGINX_GROUP}" "$SUB_DIR"
     chmod 2750 "$SUB_DIR"
@@ -356,21 +390,6 @@ EOF
     systemctl enable --now essence-sub-cleanup.timer
     success "Автоочистка настроена (каждые 5 мин)"
 
-    # ─── Шаг: Сохранение конфига ─────────────────────────────────────────────
-    STEP=$((STEP + 1))
-    echo ""
-    info "Шаг $STEP/$TOTAL_STEPS: Сохранение конфигурации..."
-
-    cat > "$SUB_CONF" << EOF
-SUB_PORT=${SUB_PORT}
-SUB_HOSTNAME=${SUB_HOSTNAME}
-SUB_BASE_URL=${SUB_BASE_URL}
-SUB_DIR=${SUB_DIR}
-SUB_LISTEN=${SUB_LISTEN}
-SUB_MODE=${SUB_MODE}
-NGINX_GROUP=${NGINX_GROUP}
-EOF
-
     success "Subscription hosting настроен!"
     echo ""
     info "Base URL: ${SUB_BASE_URL}/sub/<token>"
@@ -390,6 +409,8 @@ remove_subscription() {
     # nginx
     rm -f /etc/nginx/sites-enabled/essence-sub
     rm -f /etc/nginx/sites-available/essence-sub
+    rm -f /etc/nginx/sites-enabled/essence-sub-http
+    rm -f /etc/nginx/sites-available/essence-sub-http
 
     # stream-блок (SNI-режим)
     if [[ "$SUB_MODE" == "sni" ]]; then

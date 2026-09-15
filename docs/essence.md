@@ -63,7 +63,7 @@ telegram-proxy remove-all --force
 
 `status --json` — один JSON-объект без secret и tag. `connection` — единственная
 команда, печатающая raw secret и ссылки; `tag show` печатает tag явно.
-Диагностика редактирует secret, tag, Authorization и request credentials.
+Диагностика скрывает secret, tag, Authorization и request credentials.
 После rotate-secret оба включённых consumer'а проверяются; при ошибке старые
 env/profiles и runtime возвращаются. Upstream relay собирается только из
 зафиксированной ревизии `f7a6acc4d536a787d442fd7df3ba4ebfd728f406`; mutable

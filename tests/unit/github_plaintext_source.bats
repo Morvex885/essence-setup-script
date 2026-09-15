@@ -537,6 +537,19 @@ _prepare_existing_plaintext_vault() {
     [[ "$output" != *"Не удалось открыть источник GitHub"* ]] || return 1
 }
 
+@test "menu operations accepts CRLF and opens scoped Telegram menu" {
+    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    local config_dir="$HOME/.config/remote-control-essence"
+    jq '.nodes = [{id:"33333333333333333333333333333333",name:"fixture-node",ip:"127.0.0.1",port:22,user:"root",auth:"key",identity:"system",secret_id:null,tag:"",aliases:{}}]' \
+        "$config_dir/config.json" > "$config_dir/config.tmp"
+    mv "$config_dir/config.tmp" "$config_dir/config.json"
+
+    run bash -c 'printf "1\r\nb\r\n0\r\n0\r\n0\r\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    [[ "$output" != *"Неверный выбор."* ]]
+}
+
 @test "plaintext GitHub source persists and restarts from installed layout" {
     run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
     assert_success
@@ -1633,17 +1646,20 @@ EOF
     git config --global url."file://$alternate_remote".insteadOf \
         "https://github.com/alternate-owner/essence-remote-control-config.git"
     run bash -c 'printf "2\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    local old_remote_head
+    old_remote_head=$(git --git-dir="$REMOTE" rev-parse main)
     printf '%s\n' alternate-owner > "$GH_ACTIVE_LOGIN_FILE"
     export GH_SWITCH_LOGIN=alternate-owner
 
     run bash -c 'printf "1\n2\nn\n0\n" | "$0"' "$APP/remote-control-essence.sh"
-    assert_output --partial "Выбран аккаунт GitHub: alternate-owner"
-    assert_output --partial "Использовать alternate-owner для конфигурации"
-    assert_output --partial "Отмена — ничего не менять"
+    assert_success
     local config_dir="$HOME/.config/remote-control-essence"
     jq -e '.repo == "alternate-owner/essence-remote-control-config"' "$config_dir/source.json"
     [[ "$(git --git-dir="$config_dir/github-store.git" config --get remote.origin.url)" == \
         "https://github.com/alternate-owner/essence-remote-control-config.git" ]] || return 1
-    [[ "$(git --git-dir="$REMOTE" rev-parse main)" != \
+    [[ "$(git --git-dir="$alternate_remote" rev-parse main)" == \
         "$(git --git-dir="$config_dir/github-store.git" rev-parse refs/heads/main)" ]] || return 1
+    [[ "$(git --git-dir="$REMOTE" rev-parse main)" == "$old_remote_head" ]] || return 1
+    [[ ! -e "$config_dir/account-switch" ]] || return 1
 }

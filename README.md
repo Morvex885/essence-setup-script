@@ -43,6 +43,8 @@
 - **Telegram Proxy** — независимые компоненты WEB relay и MTProto backend; pinned upstream revision, атомарные секреты, systemd credentials, nginx TLS и rollback при сбое
 - **Telegram-порты** — WEB: 443/80, relay: 8080/8081, MTProto: 2398, закрытый stats: 8888; доступ к backend-портам ограничивается nftables/UFW
 - **Telegram CLI** — `telegram-proxy status [--json]`, `connection`, `diagnostics`, `rotate-secret`, `tag`, `web`, `mtproto`, `remove-all`; credentials выводятся только через `connection`
+- **IPv6 toggle** — включение/отключение IPv6 на сервере
+- **Полное удаление** — удаление всех установленных компонентов
 
 ### Локальная часть (Remote Control)
 

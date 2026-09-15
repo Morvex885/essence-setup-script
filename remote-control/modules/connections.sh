@@ -43,12 +43,18 @@ connections_menu() {
         case "$CONN_CHOICE" in
             0) return 0 ;;
             r|R)
-                [[ "$node_count" -gt 0 ]] && state_action "rename_connections" _rename_connections ||
+                if [[ "$node_count" -gt 0 ]]; then
+                    state_action "rename_connections" _rename_connections
+                else
                     warn "Неверный выбор."
+                fi
                 ;;
             s|S)
-                [[ "$node_count" -gt 0 ]] && state_action "sync_connections" _sync_all_connections ||
+                if [[ "$node_count" -gt 0 ]]; then
+                    state_action "sync_connections" _sync_all_connections
+                else
                     warn "Неверный выбор."
+                fi
                 ;;
             *)
                 if menu_index_valid "$CONN_CHOICE" "$node_count"; then

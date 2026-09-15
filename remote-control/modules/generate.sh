@@ -39,7 +39,11 @@ edit_template() {
             template="$TEMPLATES_DIR/${TPL_NAME}.yaml"
             [[ -f "$template" ]] && { warn "Шаблон '${TPL_NAME}.yaml' уже существует."; return 1; }
             source=$(_find_template "default.yaml")
-            [[ -n "$source" ]] && cp "$source" "$template" || : > "$template"
+            if [[ -n "$source" ]]; then
+                cp "$source" "$template" || return 1
+            else
+                : > "$template" || return 1
+            fi
         elif menu_index_valid "$TPL_CHOICE" "${#templates[@]}"; then
             source=$(_find_template "${templates[$((TPL_CHOICE - 1))]}")
             [[ -n "$source" ]] || { warn "Шаблон не найден."; return 1; }
@@ -120,7 +124,9 @@ generate_by_group() {
         for _ex in "${_group_nodes[@]}"; do [[ "$_ex" == "$_cn" ]] && _already=true; done
         $_already || _group_nodes+=("$_cn")
     done < <(jq_r --arg g "$SELECTED_GROUP" '.clients[] | select(.group==$g and .inherit_nodes_from_group==false) | .nodes // [] | .[]')
-    [[ ${#_group_nodes[@]} -gt 0 ]] && _sync_listeners_on_nodes "${_group_nodes[@]}"
+    if [[ ${#_group_nodes[@]} -gt 0 ]]; then
+        _sync_listeners_on_nodes "${_group_nodes[@]}" || return 1
+    fi
 
     _subscription_prompt_refresh
 }
@@ -184,7 +190,9 @@ generate_all() {
     done
 
     # Синхронизация per-client users на нодах
-    _sync_listeners_on_nodes "${all_unique_nodes[@]}"
+    if ! _sync_listeners_on_nodes "${all_unique_nodes[@]}"; then
+        return 1
+    fi
 
     echo ""
     success "Все конфиги обновлены."
@@ -742,30 +750,30 @@ _sync_node_listeners() {
         sync_cmd+=" && _sync_listener_users 'hy2' $(printf '%q' "$hy2_users")"
         has_changes=true
     fi
-
-    if ! $has_changes; then
-        return 0
-    fi
-
     # Restart mihomo после sync
     sync_cmd+=" && systemctl restart mihomo"
 
     if ssh_run -- "$sync_cmd" 2>/dev/null; then
         success "$nname — listeners обновлены"
-    else
-        warn "$nname — не удалось обновить listeners"
+        return 0
     fi
+    warn "$nname — не удалось обновить listeners"
+    return 1
 }
 
 # Синхронизирует listeners на всех указанных нодах
 _sync_listeners_on_nodes() {
-    local nodes=("$@")
+    local nodes=("$@") nname rc=0
 
     echo ""
     info "Синхронизация users на нодах..."
 
     for nname in "${nodes[@]}"; do
-        array_contains "$nname" "${NODE_CONFIG_FAILED[@]}" && continue
-        _sync_node_listeners "$nname"
+        if array_contains "$nname" "${NODE_CONFIG_FAILED[@]}"; then
+            rc=1
+            continue
+        fi
+        _sync_node_listeners "$nname" || rc=1
     done
+    return "$rc"
 }

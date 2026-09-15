@@ -22,6 +22,7 @@ teardown() {
 
 @test "apt_wait returns failure when the lock recovery menu is cancelled" {
     fuser() { return 0; }
+    sleep() { return 0; }
     _apt_lock_menu() { return 1; }
     run apt_wait
     assert_failure

@@ -140,10 +140,12 @@ select_group() {
         box_top
         box_center "Выбор группы"
         box_mid
-        local g count
+        local g count i=1
         for g in "${GRP_LIST[@]}"; do
             count=$(_group_client_count "$g")
-            box_line " ${g} — ${count} клиентов" " ${GREEN}${g}${NC} ${DIM}— ${count} клиентов${NC}"
+            box_line " ${i}) ${g} — ${count} клиентов" \
+                " ${GREEN}${i})${NC} ${g} ${DIM}— ${count} клиентов${NC}"
+            i=$((i + 1))
         done
         menu_item 0 "Отмена" NC
         box_bot
@@ -217,16 +219,19 @@ assign_template_to_group() {
 _create_new_template() {
     local group="$1"
 
-    read -rp "Имя нового шаблона (без .yaml): " TPL_NAME
+    if ! IFS= read -rp "Имя нового шаблона (без .yaml): " TPL_NAME; then
+        return 1
+    fi
+    TPL_NAME="${TPL_NAME%$'\r'}"
     if [[ -z "$TPL_NAME" || ! "$TPL_NAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
         warn "Имя может содержать только буквы, цифры, точку, - и _"
-        return
+        return 1
     fi
 
     local new_file="$TEMPLATES_DIR/${TPL_NAME}.yaml"
     if [[ -f "$new_file" ]]; then
         warn "Шаблон '${TPL_NAME}.yaml' уже существует."
-        return
+        return 1
     fi
 
     # Копируем доступный default.yaml как основу.
@@ -237,7 +242,7 @@ _create_new_template() {
         cp "$default_tpl" "$new_file" || return 1
         info "Скопирован default.yaml как основа"
     else
-        : > "$new_file"
+        : > "$new_file" || return 1
         warn "default.yaml не найден — создан пустой шаблон"
     fi
 
@@ -252,6 +257,6 @@ _create_new_template() {
 
     # Назначаем группе
     jq_w --arg g "$group" --arg t "${TPL_NAME}.yaml" \
-        '.groups |= map(if .name==$g then .template=$t else . end)'
+        '.groups |= map(if .name==$g then .template=$t else . end)' || return 1
     success "Группа $group: шаблон — ${TPL_NAME}.yaml"
 }

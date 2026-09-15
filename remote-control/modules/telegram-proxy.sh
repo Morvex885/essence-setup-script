@@ -648,7 +648,7 @@ telegram_proxy_remote_batch() {
                 [[ "${source_queued[$src]:-0}" != 1 || -e "$dir/r$src.done" ]] &&
                     complete=$((complete + 1))
             done
-            (( complete == worker_count )) && break
+            (( complete == count )) && break
             sleep 0.1
             barrier_wait=$((barrier_wait + 1))
         done
@@ -670,8 +670,8 @@ telegram_proxy_remote_batch() {
         fi
         if [[ -f "$dir/o$j" ]]; then
             outputs[$j]=$(cat "$dir/o$j" 2>/dev/null)
-        else
-            outputs[$j]=""
+        elif [[ -z "${outputs[$j]:-}" ]]; then
+            outputs[$j]="worker did not publish a result"
         fi
         rc="${results[$j]:-1}"
         code="${rc%%|*}"

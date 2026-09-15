@@ -44,7 +44,7 @@ source "$SCRIPT_DIR/modules/uninstall.sh"
 if [[ $EUID -ne 0 ]]; then
     warn "Запустите скрипт от root: sudo bash $0"
     if [[ -t 0 && -t 1 ]]; then
-        startup_recovery_menu "Требуются права root" false >/dev/null
+        startup_recovery_menu "Требуются права root" false || true
     fi
     exit 1
 fi

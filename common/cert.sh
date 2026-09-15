@@ -4,9 +4,19 @@
 ACME=~/.acme.sh/acme.sh
 
 ensure_acme_installed() {
-    local email="$1"
+    local email="$1" installer
     if [[ ! -f ~/.acme.sh/acme.sh ]]; then
-        if ! curl -s https://get.acme.sh | sh -s email="$email"; then
+        installer=$(umask 077; mktemp "${TMPDIR:-/tmp}/essence-acme.XXXXXX") || {
+            warn "Не удалось установить acme.sh."
+            return 1
+        }
+        if ! curl -fsS https://get.acme.sh -o "$installer" ||
+           ! sh "$installer" "email=$email"; then
+            rm -f "$installer"
+            warn "Не удалось установить acme.sh."
+            return 1
+        fi
+        if ! rm -f "$installer"; then
             warn "Не удалось установить acme.sh."
             return 1
         fi

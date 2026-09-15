@@ -125,18 +125,21 @@ _install_mihomo_binary() {
             fi
             ;;
     esac
-    info "Архитектура CPU: $arch"
-
-    if ! curl -fLo /tmp/mihomo.gz \
+    local download_dir
+    download_dir=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/essence-mihomo.XXXXXX") || {
+        warn "Не удалось подготовить временный каталог для Mihomo."
+        return 1
+    }
+    if ! curl -fLo "$download_dir/mihomo.gz" \
         "https://github.com/MetaCubeX/mihomo/releases/download/${latest}/mihomo-linux-${arch}-${latest}.gz" ||
-       ! gunzip -f /tmp/mihomo.gz ||
-       ! mv /tmp/mihomo /usr/local/bin/mihomo ||
+       ! gunzip -f "$download_dir/mihomo.gz" ||
+       ! mv "$download_dir/mihomo" /usr/local/bin/mihomo ||
        ! chmod +x /usr/local/bin/mihomo; then
-        rm -f /tmp/mihomo.gz /tmp/mihomo
+        rm -rf -- "$download_dir"
         warn "Не удалось скачать или установить бинарник Mihomo."
         return 1
     fi
-    success "Mihomo установлен: $(/usr/local/bin/mihomo -v 2>&1 | head -1)"
+    rm -rf -- "$download_dir"
 }
 
 _write_config_skeleton() {

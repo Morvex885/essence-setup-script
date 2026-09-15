@@ -87,7 +87,7 @@ _apt_lock_menu() {
                 box_line "    PID ${pid}  ${pname}"
             done
         else
-            box_line " ${DIM}Процессы не определены${NC}" " ${DIM}Процессы не определены${NC}"
+            box_line " Процессы не определены" " ${DIM}Процессы не определены${NC}"
         fi
         box_mid
         menu_item 1 "Завершить процесс и продолжить" GREEN
@@ -509,7 +509,7 @@ toggle_select() {
         box_top
         box_center "$header"
         box_mid
-        box_line " ${DIM}Нет вариантов для выбора${NC}" " ${DIM}Нет вариантов для выбора${NC}"
+        box_line " Нет вариантов для выбора" " ${DIM}Нет вариантов для выбора${NC}"
         menu_item 0 "Отмена" NC
         box_bot
         return 1

@@ -5,6 +5,7 @@ setup() {
     load '../helpers/test_helper'
     setup_test_env
     source_common
+    source_module groups.sh
 }
 
 teardown() {
@@ -36,8 +37,12 @@ teardown() {
 @test "toggle_select EOF cancels without changing flags" {
     TOGGLE_SELECT_ITEMS=('alpha')
     TOGGLE_SELECT_FLAGS=(1)
-    toggle_select 'Choose' <<< ''
-    [[ "$?" -eq 1 ]]
+    if toggle_select 'Choose' </dev/null; then
+        rc=0
+    else
+        rc=$?
+    fi
+    [[ "$rc" -eq 1 ]]
     [[ "${TOGGLE_SELECT_FLAGS[0]}" == 1 ]]
 }
 
@@ -51,4 +56,24 @@ teardown() {
     BOX_W=4
     output=$(box_line 'abcdef')
     [[ "$(printf '%s\n' "$output" | wc -l | tr -d ' ')" -eq 2 ]]
+}
+
+@test "select_group redraws stable indexes and chooses second group" {
+    local input="$BATS_TEST_TMPDIR/group-input" screen="$BATS_TEST_TMPDIR/group-screen"
+    BOX_W=70
+    printf '2\n' > "$input"
+    select_group < "$input" > "$screen"
+    [[ "$SELECTED_GROUP" == PC ]]
+    [[ "$(cat "$screen")" == *"1)"*"ROUTER"* ]]
+    [[ "$(cat "$screen")" == *"2)"*"PC"* ]]
+    [[ "$(cat "$screen")" == *"3)"*"MOBILE"* ]]
+}
+
+@test "select_group rejects zero and EOF" {
+    if select_group <<< '0'; then
+        return 1
+    fi
+    if select_group </dev/null; then
+        return 1
+    fi
 }

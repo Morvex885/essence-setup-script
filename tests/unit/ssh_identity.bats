@@ -58,6 +58,31 @@ teardown() { teardown_test_env; }
     assert_output --partial 'H) Завершить отложенную SSH-настройку нод'
     [[ "$output" != *"Y →"* ]]
 }
+@test "interactive SSH is not killed by operation timeout" {
+    local fake_ssh="$BATS_TEST_TMPDIR/ssh" marker="$BATS_TEST_TMPDIR/ssh-complete"
+    cat > "$fake_ssh" <<'EOF'
+#!/bin/bash
+sleep 2
+printf '%s\n' complete > "$SSH_FAKE_MARKER"
+EOF
+    chmod 755 "$fake_ssh"
+    export SSH_FAKE_MARKER="$marker" PATH="$BATS_TEST_TMPDIR:$PATH"
+
+    export CONFIG_SOURCE=local SERVER_AUTH=key SERVER_PASS= SSH_RUN_TIMEOUT=1
+    run ssh_run -t -- true
+    assert_success
+    [[ "$(cat "$marker")" == complete ]]
+    [[ -z "${SERVER_PASS:-}" ]]
+    [[ ! -e "${_ASKPASS_FILE:-}" && ! -e "${_PASS_FILE:-}" ]]
+
+    rm -f "$marker"
+    export SERVER_AUTH=password SERVER_PASS='password-secret'
+    run ssh_run -- true
+    [[ "$status" -eq 124 || "$status" -eq 143 ]]
+    [[ ! -e "$marker" ]]
+    [[ "$output" != *password-secret* ]]
+    [[ ! -e "${_ASKPASS_FILE:-}" && ! -e "${_PASS_FILE:-}" ]]
+}
 
 _run_failed_add_node() {
     state_open_local

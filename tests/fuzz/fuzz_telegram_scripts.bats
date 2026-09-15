@@ -22,17 +22,40 @@ setup() {
     printf '%s\n' '# deps' > "$COMMON_DIR/ensure-deps.sh"
     printf '%s\n' '# protocol' > "$COMMON_DIR/protocols/uri.sh"
     mkdir -p "$BATS_TEST_TMPDIR/bin"
+    local real_sha256sum real_shasum
+    real_sha256sum=$(type -P sha256sum 2>/dev/null || :)
+    real_shasum=$(type -P shasum 2>/dev/null || :)
+    [[ -n "$real_sha256sum" || -n "$real_shasum" ]] || {
+        printf '%s\n' 'sha256sum or shasum is required' >&2
+        return 1
+    }
+    export TEST_REAL_SHA256SUM="$real_sha256sum" TEST_REAL_SHASUM="$real_shasum"
     cat > "$BATS_TEST_TMPDIR/bin/sha256sum" <<'EOF'
 #!/bin/bash
 if [[ "${1:-}" == --check ]]; then
+    if [[ -n "${TEST_REAL_SHA256SUM:-}" ]]; then
+        "$TEST_REAL_SHA256SUM" --check --status </dev/null >/dev/null 2>&1
+        if [[ "$?" -eq 0 ]]; then
+            exec "$TEST_REAL_SHA256SUM" "$@"
+        fi
+        checker=("$TEST_REAL_SHA256SUM")
+    else
+        checker=("$TEST_REAL_SHASUM" -a 256)
+    fi
     status=0
     while read -r expected file; do
-        actual=$(shasum -a 256 "$file" | cut -d' ' -f1) || { status=1; continue; }
+        actual=$("${checker[@]}" "$file" | cut -d' ' -f1) || {
+            status=1
+            continue
+        }
         [[ "$actual" == "$expected" ]] || status=1
     done
     exit "$status"
 fi
-exec shasum -a 256 "$@"
+if [[ -n "${TEST_REAL_SHA256SUM:-}" ]]; then
+    exec "$TEST_REAL_SHA256SUM" "$@"
+fi
+exec "$TEST_REAL_SHASUM" -a 256 "$@"
 EOF
     chmod 755 "$BATS_TEST_TMPDIR/bin/sha256sum"
     export PATH="$BATS_TEST_TMPDIR/bin:$PATH"
@@ -59,8 +82,8 @@ _sync_fixture() {
 }
 
 @test "checksum manifest round-trips random script groups and detects remote drift" {
-    local iterations="${FUZZ_ITERATIONS:-20}" i group file remote_file manifest
-    for ((i=0; i<iterations; i++)); do
+    local iterations="${FUZZ_ITERATIONS:-20}" iteration group file remote_file manifest
+    for ((iteration=0; iteration<iterations; iteration++)); do
         group=$((RANDOM % 3))
         case "$group" in
             0)

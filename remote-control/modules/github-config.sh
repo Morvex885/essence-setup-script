@@ -140,19 +140,24 @@ _github_load_active_login() {
 }
 
 _github_switch_active_account() {
-    local login="${1:-}" gh="${GH_BIN:-gh}" switch_stderr switch_output
-    [[ "$login" =~ ^[A-Za-z0-9-]+$ ]] || {
-        _github_record_error "переключение аккаунта GitHub" \
-            "Указано некорректное имя аккаунта GitHub."
-        return 1
-    }
+    local login="${1-}" gh="${GH_BIN:-gh}" switch_stderr switch_output
+    local -a switch_args
+    if (( $# > 0 )); then
+        [[ "$login" =~ ^[A-Za-z0-9-]+$ ]] || {
+            _github_record_error "переключение аккаунта GitHub" \
+                "Указано некорректное имя аккаунта GitHub."
+            return 1
+        }
+        switch_args=(auth switch --hostname github.com --user "$login")
+    else
+        switch_args=(auth switch --hostname github.com)
+    fi
     switch_stderr=$(umask 077; mktemp "${TMPDIR:-/tmp}/github-switch.XXXXXX") || {
         _github_record_error "переключение аккаунта GitHub" \
             "Не удалось подготовить безопасную диагностику переключения аккаунта."
         return 1
     }
-    if ! NO_COLOR=1 "$gh" auth switch --hostname github.com --user "$login" \
-        2>"$switch_stderr"; then
+    if ! NO_COLOR=1 "$gh" "${switch_args[@]}" 2>"$switch_stderr"; then
         switch_output=$(cat "$switch_stderr")
         rm -f "$switch_stderr"
         _github_record_error "переключение аккаунта GitHub" \
@@ -204,22 +209,7 @@ _github_select_account() {
                 return 0
                 ;;
             2)
-                local gh="${GH_BIN:-gh}" switch_stderr switch_output
-                switch_stderr=$(umask 077; mktemp "${TMPDIR:-/tmp}/github-switch.XXXXXX") || {
-                    _github_record_error "переключение аккаунта GitHub" \
-                        "Не удалось подготовить безопасную диагностику переключения аккаунта."
-                    return 1
-                }
-                if ! NO_COLOR=1 "$gh" auth switch --hostname github.com \
-                    2>"$switch_stderr"; then
-                    switch_output=$(cat "$switch_stderr")
-                    rm -f "$switch_stderr"
-                    _github_record_error "переключение аккаунта GitHub" \
-                        "${switch_output:-Не удалось переключить аккаунт GitHub.}"
-                    return 1
-                fi
-                rm -f "$switch_stderr"
-                _github_load_active_login || return 1
+                _github_switch_active_account || return 1
                 login="$GITHUB_ACTIVE_LOGIN"
                 ;;
             0)
@@ -2806,11 +2796,11 @@ _github_stage_allowlist() {
 }
 
 _github_sync_commit() {
-    local had_files=false commit_output head_output
+    local had_files=false commit_output head_output update_store_ref=true
     [[ -n "$(git -C "$GITHUB_WORKTREE" ls-files 2>/dev/null)" ]] && had_files=true
     _github_stage_allowlist || return 1
     if git -C "$GITHUB_WORKTREE" diff --cached --quiet; then
-        [[ "$GITHUB_SYNC_STATUS" == pending ]] || return 0
+        [[ "$GITHUB_SYNC_STATUS" == pending ]] || update_store_ref=false
     else
         commit_output=$(git -C "$GITHUB_WORKTREE" \
             -c user.name='Essence Remote Control' \
@@ -2825,6 +2815,7 @@ _github_sync_commit() {
         return 1
     }
     GITHUB_LAST_COMMIT_HEAD="$head_output"
+    [[ "$update_store_ref" == true ]] || return 0
     git --git-dir="$GITHUB_STORE" update-ref "refs/heads/$GITHUB_BRANCH" "$head_output" || {
         _github_record_error "сохранение локальной точки восстановления" \
             "Не удалось закрепить локальный commit конфигурации."

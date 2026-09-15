@@ -14,6 +14,12 @@ setup() {
     VERSION_PATH="$PROJECT_ROOT/VERSION"
     NODE_NAME='node-1'; SERVER_IP='127.0.0.1'; SERVER_PORT=22
     SERVER_USER='root'; SERVER_AUTH='key'; SERVER_PASS=''
+    UPLOAD_JOURNAL="$BATS_TEST_TMPDIR/uploads"
+    : > "$UPLOAD_JOURNAL"
+    upload_scripts() {
+        printf '%s\n' "$*" >> "$UPLOAD_JOURNAL"
+        return 0
+    }
     reset_ssh_mocks
     node_load() {
         NODE_NAME='node-1'; SERVER_IP='127.0.0.1'; SERVER_PORT=22
@@ -33,14 +39,14 @@ EOF
     REMOTE_MATCH_RC=0
     run ensure_remote_scripts_current
     [ "$status" -eq 0 ]
-    [ "${#UPLOAD_CALLS[@]}" -eq 0 ]
+    [ ! -s "$UPLOAD_JOURNAL" ]
 }
 
 @test "mismatching script manifest is read-only and blocks action" {
     REMOTE_MATCH_RC=10
     run ensure_remote_scripts_current
     [ "$status" -eq 1 ]
-    [ "${#UPLOAD_CALLS[@]}" -eq 0 ]
+    [ ! -s "$UPLOAD_JOURNAL" ]
 }
 
 @test "single action uses nested server CLI and default scoped timeout" {
@@ -209,7 +215,7 @@ EOF
     }
     telegram_proxy_remote_batch mtproto install true 1 >/dev/null
     local action_call
-    action_call=$(sed -n '/setup-essence.sh mtproto install/p' "$calls")
+    action_call=$(sed -n '/setup-essence.sh telegram-proxy mtproto install/p' "$calls")
     [[ "$action_call" == *'mtproto install --force'* ]]
     [[ "$action_call" != *' -t '* ]]
 }
@@ -323,21 +329,21 @@ invoke_remote_menu() {
 
 @test "Telegram menu: invalid and cancelled component selector do not call remote" {
     load_remote_menu_fixture
-    local input="$BATS_TEST_TMPDIR/input" output="$BATS_TEST_TMPDIR/output"
+    local input="$BATS_TEST_TMPDIR/input" menu_output="$BATS_TEST_TMPDIR/output"
     printf '%s' $'4\nunknown\n\n0\n0\n' > "$input"
-    run invoke_remote_menu "$input" "$output"
+    run invoke_remote_menu "$input" "$menu_output"
     [ "$status" -eq 0 ]
-    [[ "$(cat "$output")" == *MENU_RETURNED* ]]
+    [[ "$(cat "$menu_output")" == *MENU_RETURNED* ]]
     [ ! -s "$REMOTE_MENU_JOURNAL" ]
 }
 
 @test "Telegram menu: cancelled WEB install does not report operation failure" {
     load_remote_menu_fixture
-    local input="$BATS_TEST_TMPDIR/input" output="$BATS_TEST_TMPDIR/output"
+    local input="$BATS_TEST_TMPDIR/input" menu_output="$BATS_TEST_TMPDIR/output"
     printf '%s' $'1\nweb\nW\n0\n0\n' > "$input"
-    run invoke_remote_menu "$input" "$output"
+    run invoke_remote_menu "$input" "$menu_output"
     [ "$status" -eq 0 ]
-    [[ "$(cat "$output")" == *MENU_RETURNED* ]]
+    [[ "$(cat "$menu_output")" == *MENU_RETURNED* ]]
     [ ! -s "$REMOTE_MENU_JOURNAL" ]
 }
 
@@ -384,7 +390,7 @@ invoke_remote_menu() {
     run invoke_remote_menu "$input" "$output"
     [ "$status" -eq 0 ]
     [ ! -s "$REMOTE_MENU_JOURNAL" ]
-    [ "${#UPLOAD_CALLS[@]}" -eq 0 ]
+    [ ! -s "$UPLOAD_JOURNAL" ]
 }
 
 @test "Telegram menu: remove all sends one force after confirmation" {

@@ -1,4 +1,5 @@
 #!/usr/bin/env bats
+BATS_TEST_TIMEOUT="${BATS_TEST_TIMEOUT:-30}"
 
 setup() {
     load '../helpers/test_helper'
@@ -375,9 +376,9 @@ EOF
     git -C "$GITHUB_WORKTREE" init -q || return 1
     git -C "$GITHUB_WORKTREE" add templates/default.yaml || return 1
 
-    run run_with_timeout 2 github_config_open "$GITHUB_WORKTREE" "$out"
+    run github_config_open "$GITHUB_WORKTREE" "$out"
     assert_failure
-    [[ "$status" -ne 137 && "$status" -ne 143 ]] || return 1
+    [ "$status" -eq 1 ]
     [[ "$(cat "$outside")" == "EXTERNAL-TEMPLATE-MUST-NOT-BE-READ" ]] || return 1
     [[ "$(cat "$out")" == "prior-open-output" ]] || return 1
     ! grep -Fq 'EXTERNAL-TEMPLATE-MUST-NOT-BE-READ' "$out" || return 1
@@ -389,9 +390,9 @@ EOF
     printf 'EXTERNAL-TARGET-UNCHANGED\n' > "$outside" || return 1
     ln -s "$outside" "$GITHUB_WORKTREE/templates/untracked.yaml" || return 1
 
-    run run_with_timeout 2 github_config_checkpoint "$CONFIG_DIR/state.json"
+    run github_config_checkpoint "$CONFIG_DIR/state.json"
     assert_failure
-    [[ "$status" -ne 137 && "$status" -ne 143 ]] || return 1
+    [ "$status" -eq 1 ]
     [[ -L "$GITHUB_WORKTREE/templates/untracked.yaml" ]] || return 1
     [[ "$(cat "$outside")" == "EXTERNAL-TARGET-UNCHANGED" ]] || return 1
 }
@@ -405,17 +406,15 @@ EOF
     rm "$GITHUB_WORKTREE/templates/default.yaml" || return 1
     ln -s "$outside" "$GITHUB_WORKTREE/templates/default.yaml" || return 1
 
-    run run_with_timeout 2 github_config_open "$GITHUB_WORKTREE" "$out"
-    [[ "$status" -ne 0 ]] || failures=$((failures + 1))
-    [[ "$status" -ne 137 && "$status" -ne 143 ]] || failures=$((failures + 1))
+    run github_config_open "$GITHUB_WORKTREE" "$out"
+    [[ "$status" -eq 1 ]] || failures=$((failures + 1))
     [[ "$(cat "$out")" == "prior-cross-output" ]] || failures=$((failures + 1))
     [[ "$(cat "$outside")" == "CROSS-CHECK-TARGET-UNCHANGED" ]] || failures=$((failures + 1))
 
     git -C "$GITHUB_WORKTREE" init -q || return 1
     git -C "$GITHUB_WORKTREE" add templates/default.yaml || return 1
-    run run_with_timeout 2 github_config_checkpoint "$CONFIG_DIR/state.json"
-    [[ "$status" -ne 0 ]] || failures=$((failures + 1))
-    [[ "$status" -ne 137 && "$status" -ne 143 ]] || failures=$((failures + 1))
+    run github_config_checkpoint "$CONFIG_DIR/state.json"
+    [[ "$status" -eq 1 ]] || failures=$((failures + 1))
     [[ -L "$GITHUB_WORKTREE/templates/default.yaml" ]] || failures=$((failures + 1))
     [[ "$(cat "$outside")" == "CROSS-CHECK-TARGET-UNCHANGED" ]] || failures=$((failures + 1))
 
@@ -428,22 +427,19 @@ EOF
     printf 'prior-open-output\n' > "$out" || return 1
     mkfifo "$GITHUB_WORKTREE/templates/unexpected.pipe" || return 1
 
-    run run_with_timeout 2 github_config_open "$GITHUB_WORKTREE" "$out"
-    [[ "$status" -ne 0 ]] || failures=$((failures + 1))
-    [[ "$status" -ne 137 && "$status" -ne 143 ]] || failures=$((failures + 1))
+    run github_config_open "$GITHUB_WORKTREE" "$out"
+    [[ "$status" -eq 1 ]] || failures=$((failures + 1))
     [[ "$(cat "$out")" == "prior-open-output" ]] || failures=$((failures + 1))
 
-    run run_with_timeout 2 github_config_checkpoint "$CONFIG_DIR/state.json"
-    [[ "$status" -ne 0 ]] || failures=$((failures + 1))
-    [[ "$status" -ne 137 && "$status" -ne 143 ]] || failures=$((failures + 1))
+    run github_config_checkpoint "$CONFIG_DIR/state.json"
+    [[ "$status" -eq 1 ]] || failures=$((failures + 1))
     [[ -p "$GITHUB_WORKTREE/templates/unexpected.pipe" ]] || failures=$((failures + 1))
 
     rm -f "$GITHUB_WORKTREE/templates/unexpected.pipe" || return 1
     mkdir -p "$GITHUB_WORKTREE/templates/nested" || return 1
     printf 'unexpected\n' > "$GITHUB_WORKTREE/templates/nested/file.yaml" || return 1
-    run run_with_timeout 2 github_config_checkpoint "$CONFIG_DIR/state.json"
-    [[ "$status" -ne 0 ]] || failures=$((failures + 1))
-    [[ "$status" -ne 137 && "$status" -ne 143 ]] || failures=$((failures + 1))
+    run github_config_checkpoint "$CONFIG_DIR/state.json"
+    [[ "$status" -eq 1 ]] || failures=$((failures + 1))
     [[ -f "$GITHUB_WORKTREE/templates/nested/file.yaml" ]] || failures=$((failures + 1))
 
     [[ "$failures" -eq 0 ]]

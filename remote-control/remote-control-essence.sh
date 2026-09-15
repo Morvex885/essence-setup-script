@@ -468,7 +468,7 @@ github_config_snapshot_cached() {
 
 github_source_change_account() {
     local mode="${1:-menu}" initial_login="${2:-}"
-    local old_repo old_name branch old_store old_sessions
+    local old_repo old_name branch old_store old_sessions new_repo old_storage
     local old_worktree old_remote old_branch old_owner old_session
     local old_identity old_recipient old_session_remote old_session_branch old_session_origin
     local target_owner logical="$CONFIG_DIR/account-switch/old-state.json"
@@ -1270,6 +1270,7 @@ menu_operations() {
         if ! IFS= read -rp "  Выберите пункт: " CHOICE; then
             return 0
         fi
+        CHOICE="${CHOICE%$'\r'}"
 
         case "$CHOICE" in
             1)

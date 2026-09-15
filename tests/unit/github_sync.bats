@@ -172,6 +172,19 @@ _assert_local_switch_rolled_back() {
     assert_output 'Essence Remote Control <remote-control@localhost>'
 }
 
+@test "no-diff commit records HEAD before direct push" {
+    _seed_live_revision 1
+    local existing_head
+    existing_head=$(git -C "$GITHUB_WORKTREE" rev-parse HEAD) || return 1
+    GITHUB_LAST_COMMIT_HEAD=stale
+    GITHUB_SYNC_STATUS=clean
+
+    _github_sync_commit || return 1
+    [[ "$GITHUB_LAST_COMMIT_HEAD" == "$existing_head" ]] || return 1
+    _github_sync_push "$GITHUB_LAST_COMMIT_HEAD" || return 1
+    [[ "$(git --git-dir="$REMOTE" rev-parse main)" == "$existing_head" ]]
+}
+
 @test "commit failure keeps staged state pending and same-process retry pushes it" {
     _seed_live_revision 1
     local old_remote old_local old_head rc=0
