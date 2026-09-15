@@ -2,65 +2,69 @@
 # ─── Генерация клиентских конфигов ─────────────────────────────────────────
 
 edit_template() {
-    local templates=()
+    local templates=() template_name
     while IFS= read -r template_name; do
         [[ -n "$template_name" ]] && templates+=("$template_name")
     done < <(_list_templates)
-
-    echo ""
-    echo -e "  Выберите шаблон для редактирования:"
-    local i=1 t
-    for t in "${templates[@]}"; do
-        echo -e "  ${GREEN}${i})${NC} $t"
-        i=$((i + 1))
-    done
-    echo -e "  ${GREEN}n)${NC} Создать новый шаблон"
-    echo ""
-    read -rp "Выберите: " TPL_CHOICE
-
-    local template="" source=""
-    mkdir -p "$TEMPLATES_DIR" || return 1
-    if [[ "$TPL_CHOICE" == "n" || "$TPL_CHOICE" == "N" ]]; then
-        read -rp "Имя нового шаблона (без .yaml): " TPL_NAME
-        if [[ -z "$TPL_NAME" || ! "$TPL_NAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
-            warn "Имя может содержать только буквы, цифры, точку, - и _"
-            return
-        fi
-
-        template="$TEMPLATES_DIR/${TPL_NAME}.yaml"
-        if [[ -f "$template" ]]; then
-            warn "Шаблон '${TPL_NAME}.yaml' уже существует."
-            return
-        fi
-        source=$(_find_template "default.yaml")
-        if [[ -n "$source" ]]; then
-            cp "$source" "$template" || return 1
-            info "Скопирован default.yaml как основа"
+    while true; do
+        echo ""
+        box_top
+        box_center "Редактирование шаблона"
+        box_mid
+        if [[ ${#templates[@]} -eq 0 ]]; then
+            box_line " Нет шаблонов" " ${DIM}Нет шаблонов${NC}"
         else
-            : > "$template"
+            for (( i=0; i<${#templates[@]}; i++ )); do
+                box_line " $((i+1))) ${templates[$i]}" \
+                    " ${GREEN}$((i+1)))${NC} ${templates[$i]}"
+            done
         fi
-    elif [[ "$TPL_CHOICE" =~ ^[0-9]+$ ]] &&
-         (( TPL_CHOICE >= 1 && TPL_CHOICE <= ${#templates[@]} )); then
-        local selected="${templates[$((TPL_CHOICE - 1))]}"
-        source=$(_find_template "$selected")
-        [[ -n "$source" ]] || { warn "Шаблон не найден."; return 1; }
-        template="$TEMPLATES_DIR/$selected"
-        if [[ "$source" != "$template" ]]; then
-            cp "$source" "$template" || return 1
+        menu_item n "Создать новый шаблон" GREEN
+        menu_item 0 "Отмена" NC
+        box_bot
+        echo ""
+        local TPL_CHOICE
+        if ! IFS= read -rp "  Выберите: " TPL_CHOICE; then
+            return 1
         fi
-    else
-        warn "Неверный выбор."
-        return
-    fi
-
-    if command -v nano > /dev/null 2>&1; then
-        nano "$template"
-    elif command -v vi > /dev/null 2>&1; then
-        vi "$template"
-    else
-        warn "Редактор не найден. Отредактируйте вручную:"
-        info "$template"
-    fi
+        TPL_CHOICE="${TPL_CHOICE%$'\r'}"
+        local template="" source=""
+        mkdir -p "$TEMPLATES_DIR" || return 1
+        if [[ "$TPL_CHOICE" == n || "$TPL_CHOICE" == N ]]; then
+            read -rp "Имя нового шаблона (без .yaml): " TPL_NAME
+            if [[ -z "$TPL_NAME" || ! "$TPL_NAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
+                warn "Имя может содержать только буквы, цифры, точку, - и _"
+                return 1
+            fi
+            template="$TEMPLATES_DIR/${TPL_NAME}.yaml"
+            [[ -f "$template" ]] && { warn "Шаблон '${TPL_NAME}.yaml' уже существует."; return 1; }
+            source=$(_find_template "default.yaml")
+            if [[ -n "$source" ]]; then
+                cp "$source" "$template" || return 1
+            else
+                : > "$template" || return 1
+            fi
+        elif menu_index_valid "$TPL_CHOICE" "${#templates[@]}"; then
+            source=$(_find_template "${templates[$((TPL_CHOICE - 1))]}")
+            [[ -n "$source" ]] || { warn "Шаблон не найден."; return 1; }
+            template="$TEMPLATES_DIR/${templates[$((TPL_CHOICE - 1))]}"
+            [[ "$source" == "$template" ]] || cp "$source" "$template" || return 1
+        elif [[ "$TPL_CHOICE" == 0 ]]; then
+            return 1
+        else
+            warn "Неверный выбор."
+            continue
+        fi
+        if command -v nano > /dev/null 2>&1; then
+            nano "$template"
+        elif command -v vi > /dev/null 2>&1; then
+            vi "$template"
+        else
+            warn "Редактор не найден. Отредактируйте вручную:"
+            info "$template"
+        fi
+        return 0
+    done
 }
 
 generate_menu() {
@@ -68,34 +72,34 @@ generate_menu() {
         echo ""
         box_top
         box_center "Генерация конфигов"
-        box_bot
-
-        # Показываем группы и их шаблоны
+        box_mid
         groups_list
         if [[ ${#GRP_LIST[@]} -gt 0 ]]; then
-            echo ""
+            local g tpl client_count
             for g in "${GRP_LIST[@]}"; do
-                local tpl
                 tpl=$(_template_name_for_group "$g")
-                local client_count
                 client_count=$(jq_r --arg g "$g" '[.clients[] | select(.group==$g)] | length')
-                echo -e "  ${CYAN}$g${NC} ${DIM}— $tpl, $client_count клиентов${NC}"
+                box_line " ${g}: ${tpl}, ${client_count} клиентов"
             done
+        else
+            box_line " Нет групп" " ${DIM}Нет групп${NC}"
         fi
-
+        box_mid
+        menu_item g "По группе" GREEN
+        menu_item a "Всем клиентам" GREEN
+        menu_item t "Редактировать шаблон" YELLOW
+        menu_item 0 "Назад" NC
+        box_bot
         echo ""
-        echo -e "  ${GREEN}g)${NC} По группе"
-        echo -e "  ${GREEN}a)${NC} Всем клиентам"
-        echo -e "  ${YELLOW}t)${NC} Редактировать шаблон"
-        echo -e "  ${NC}0)${NC} Назад"
-        echo ""
-        read -rp "Выберите: " GEN_CHOICE
-
+        if ! IFS= read -rp "  Выберите действие: " GEN_CHOICE; then
+            return 0
+        fi
+        GEN_CHOICE="${GEN_CHOICE%$'\r'}"
         case "$GEN_CHOICE" in
             g|G) generate_by_group ;;
             a|A) generate_all ;;
             t|T) state_action "edit_template" edit_template ;;
-            0) return ;;
+            0) return 0 ;;
             *) warn "Неверный выбор." ;;
         esac
     done
@@ -120,7 +124,9 @@ generate_by_group() {
         for _ex in "${_group_nodes[@]}"; do [[ "$_ex" == "$_cn" ]] && _already=true; done
         $_already || _group_nodes+=("$_cn")
     done < <(jq_r --arg g "$SELECTED_GROUP" '.clients[] | select(.group==$g and .inherit_nodes_from_group==false) | .nodes // [] | .[]')
-    [[ ${#_group_nodes[@]} -gt 0 ]] && _sync_listeners_on_nodes "${_group_nodes[@]}"
+    if [[ ${#_group_nodes[@]} -gt 0 ]]; then
+        _sync_listeners_on_nodes "${_group_nodes[@]}" || return 1
+    fi
 
     _subscription_prompt_refresh
 }
@@ -184,7 +190,9 @@ generate_all() {
     done
 
     # Синхронизация per-client users на нодах
-    _sync_listeners_on_nodes "${all_unique_nodes[@]}"
+    if ! _sync_listeners_on_nodes "${all_unique_nodes[@]}"; then
+        return 1
+    fi
 
     echo ""
     success "Все конфиги обновлены."
@@ -339,7 +347,10 @@ _ensure_all_awg_peers() {
         # Создаём все недостающие peers за один SSH
         info "Создаю AWG peers на $nname: ${missing[*]}..."
         if ! array_contains "$nname" "${SCRIPTS_UPLOADED[@]}"; then
-            upload_scripts
+            if ! upload_scripts; then
+                warn "$nname: не удалось загрузить скрипты; peers не изменены."
+                continue
+            fi
             SCRIPTS_UPLOADED+=("$nname")
         fi
 
@@ -712,7 +723,10 @@ _sync_node_listeners() {
 
     # Загружаем скрипты если ещё не загружены
     if ! array_contains "$nname" "${SCRIPTS_UPLOADED[@]}"; then
-        upload_scripts
+        if ! upload_scripts; then
+            warn "$nname: не удалось загрузить скрипты; listeners не изменены."
+            return 1
+        fi
         SCRIPTS_UPLOADED+=("$nname")
     fi
 
@@ -736,30 +750,30 @@ _sync_node_listeners() {
         sync_cmd+=" && _sync_listener_users 'hy2' $(printf '%q' "$hy2_users")"
         has_changes=true
     fi
-
-    if ! $has_changes; then
-        return 0
-    fi
-
     # Restart mihomo после sync
     sync_cmd+=" && systemctl restart mihomo"
 
     if ssh_run -- "$sync_cmd" 2>/dev/null; then
         success "$nname — listeners обновлены"
-    else
-        warn "$nname — не удалось обновить listeners"
+        return 0
     fi
+    warn "$nname — не удалось обновить listeners"
+    return 1
 }
 
 # Синхронизирует listeners на всех указанных нодах
 _sync_listeners_on_nodes() {
-    local nodes=("$@")
+    local nodes=("$@") nname rc=0
 
     echo ""
     info "Синхронизация users на нодах..."
 
     for nname in "${nodes[@]}"; do
-        array_contains "$nname" "${NODE_CONFIG_FAILED[@]}" && continue
-        _sync_node_listeners "$nname"
+        if array_contains "$nname" "${NODE_CONFIG_FAILED[@]}"; then
+            rc=1
+            continue
+        fi
+        _sync_node_listeners "$nname" || rc=1
     done
+    return "$rc"
 }

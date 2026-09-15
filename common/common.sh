@@ -56,8 +56,11 @@ confirm_yn() {
     [[ "$default" =~ ^[Yy]$ ]] && hint="Y/n"
 
     while true; do
-        read -rp "  ${prompt} [${hint}]: " _answer
-        _answer="${_answer:-$default}"
+        if ! IFS= read -rp "  ${prompt} [${hint}]: " _answer; then
+            return 1
+        fi
+        _answer="${_answer%$'\r'}"
+        [[ -z "$_answer" ]] && _answer="$default"
         case "$_answer" in
             [Yy]) return 0 ;;
             [Nn]) return 1 ;;
@@ -71,24 +74,35 @@ _apt_lock_menu() {
     while true; do
         echo ""
         warn "apt lock не освободился за 60с"
-        echo -e "  ${CYAN}Процессы, блокирующие apt:${NC}"
         local pids
         pids=$(fuser /var/lib/dpkg/lock-frontend 2>/dev/null)
-        for pid in $pids; do
-            local pname
-            pname=$(ps -p "$pid" -o comm= 2>/dev/null || echo "???")
-            echo -e "    PID ${YELLOW}${pid}${NC}  ${pname}"
-        done
+        box_top
+        box_center "Ожидание apt"
+        box_mid
+        box_line " Процессы, блокирующие apt:"
+        if [[ -n "$pids" ]]; then
+            local pid pname
+            for pid in $pids; do
+                pname=$(ps -p "$pid" -o comm= 2>/dev/null || echo "???")
+                box_line "    PID ${pid}  ${pname}"
+            done
+        else
+            box_line " Процессы не определены" " ${DIM}Процессы не определены${NC}"
+        fi
+        box_mid
+        menu_item 1 "Завершить процесс и продолжить" GREEN
+        menu_item 2 "Подождать ещё 60с" CYAN
+        menu_item 3 "Прервать установку" RED
+        box_bot
         echo ""
-        echo -e "  ${GREEN}1)${NC} Завершить процесс и продолжить"
-        echo -e "  ${CYAN}2)${NC} Подождать ещё 60с"
-        echo -e "  ${RED}3)${NC} Прервать установку"
-        echo ""
-        read -rp "  Выберите: " _choice
+        if ! IFS= read -rp "  Выберите действие: " _choice; then
+            return 1
+        fi
+        _choice="${_choice%$'\r'}"
         case "$_choice" in
             1)
+                local pid pname
                 for pid in $pids; do
-                    local pname
                     pname=$(ps -p "$pid" -o comm= 2>/dev/null || echo "???")
                     if confirm_yn "Завершить процесс ${pname} (PID ${pid})?"; then
                         kill "$pid" 2>/dev/null
@@ -107,7 +121,7 @@ _apt_lock_menu() {
                 warn "Lock всё ещё занят"
                 ;;
             2) return 0 ;;
-            3) error "Установка прервана пользователем." ;;
+            3) warn "Установка прервана пользователем."; return 1 ;;
             *) warn "Неверный выбор." ;;
         esac
     done
@@ -122,7 +136,7 @@ apt_wait() {
         sleep 2
         waited=$((waited + 2))
         if [[ $waited -ge $max_wait ]]; then
-            _apt_lock_menu
+            _apt_lock_menu || return 1
             waited=0
         fi
     done
@@ -136,7 +150,6 @@ is_port_free() {
     ! ss -tulpn 2>/dev/null | awk '{print $5}' | grep -qE ":${port}$"
 }
 
-# Сгенерировать свободный случайный порт в диапазоне [min, max]
 gen_free_port() {
     local min="$1" max="$2"
     local range=$((max - min + 1))
@@ -145,7 +158,7 @@ gen_free_port() {
         port=$((RANDOM % range + min))
         is_port_free "$port" && echo "$port" && return 0
     done
-    error "Не удалось найти свободный порт в диапазоне ${min}-${max}"
+    warn "Не удалось найти свободный порт в диапазоне ${min}-${max}" >&2
     return 1
 }
 
@@ -153,12 +166,18 @@ gen_free_port() {
 run_with_timeout() {
     local seconds="$1"
     shift
+    local timeout_help
     if command -v timeout >/dev/null 2>&1; then
-        timeout "$seconds" "$@"
+        timeout_help=$(timeout --help 2>&1)
+        if [[ "$timeout_help" == *--foreground* ]]; then
+            timeout --foreground --signal=TERM --kill-after=5 "$seconds" "$@"
+        else
+            timeout "$seconds" "$@"
+        fi
         return $?
     fi
     if command -v gtimeout >/dev/null 2>&1; then
-        gtimeout "$seconds" "$@"
+        gtimeout --foreground --signal=TERM --kill-after=5 "$seconds" "$@"
         return $?
     fi
     "$@" &
@@ -223,36 +242,232 @@ box_top() { echo -e "${CYAN}╔$(printf '═%.0s' $(seq 1 $BOX_W))╗${NC}"; }
 box_mid() { echo -e "${CYAN}╠$(printf '═%.0s' $(seq 1 $BOX_W))╣${NC}"; }
 box_bot() { echo -e "${CYAN}╚$(printf '═%.0s' $(seq 1 $BOX_W))╝${NC}"; }
 
-# Печатает строку внутри рамки с правильным паддингом.
-# $1 = видимый текст (без ANSI-кодов) — для подсчёта длины
-# $2 = цветной текст (с ANSI-кодами) — для вывода (необязательно)
-# Возвращает кол-во символов (не байтов), корректно для кириллицы/UTF-8
-# Длина строки в символах (UTF-8, не зависит от локали)
-# Считает байты через od, исключая continuation-байты (0x80-0xBF)
 _vis_len() {
     local count
     count=$(printf '%s' "$1" | od -An -tx1 | tr -s '[:space:]' '\n' | grep -c '^[0-7c-f]' || true)
     echo "${count:-0}"
 }
 
+menu_item() {
+    local key="$1"
+    local label="$2"
+    local color="${3:-CYAN}"
+    local color_value="${!color}"
+    box_line " ${key}) ${label}" " ${color_value}${key})${NC} ${label}"
+}
+
+menu_index_valid() {
+    local value="$1"
+    local count="$2"
+    local value_len count_len
+    [[ "$value" =~ ^[1-9][0-9]*$ ]] || return 1
+    [[ "$count" =~ ^[1-9][0-9]*$ ]] || return 1
+    value_len=${#value}
+    count_len=${#count}
+    (( value_len < count_len )) && return 0
+    (( value_len > count_len )) && return 1
+    [[ "$value" < "$count" || "$value" == "$count" ]]
+}
+
+startup_recovery_menu() {
+    local title="$1"
+    local allow_retry="${2:-true}"
+    while true; do
+        echo ""
+        box_top
+        box_center "Восстановление запуска"
+        box_mid
+        box_line " ${title}"
+        if [[ "$allow_retry" == true ]]; then
+            menu_item 1 "Повторить" GREEN
+        fi
+        menu_item 0 "Выход" NC
+        box_bot
+        echo ""
+        if ! IFS= read -rp "  Выберите действие: " _recovery_choice; then
+            return 1
+        fi
+        _recovery_choice="${_recovery_choice%$'\r'}"
+        if [[ "$allow_retry" == true && "$_recovery_choice" == 1 ]]; then
+            return 0
+        fi
+        [[ "$_recovery_choice" == 0 ]] && return 1
+        warn "Неверный выбор."
+    done
+}
+
+_box_wrap_emit() {
+    local content="$1"
+    local alignment="$2"
+    local visible_count="$3"
+    local total=$((BOX_W - visible_count))
+    (( total < 0 )) && total=0
+    local left=0 right="$total"
+    if [[ "$alignment" == center ]]; then
+        left=$((total / 2))
+        right=$((total - left))
+    fi
+    local close=""
+    [[ -n "$osc" ]] && close=$'\033]8;;\033\\'
+    [[ -n "$sgr" ]] && close="${close}"$'\033[0m'
+    printf '%b%*s%s%s%*s%b\n' \
+        "${CYAN}║${NC}" "$left" "" "$content" "$close" \
+        "$right" "" "${CYAN}║${NC}"
+}
+_box_wrap() {
+    local styled="$1"
+    local alignment="${2:-left}"
+    local LC_ALL=C
+    local decoded
+    printf -v decoded '%b' "$styled"
+    local ESC=$'\033' BEL=$'\a'
+    local i=0 n=${#decoded} byte token rest params uri hex char next_hex max_bytes j
+    local line="" line_len=0
+    local sgr="" osc="" line_sgr="" line_osc=""
+    local had_line=false
+    _box_wrap_newline() {
+        line="$line_sgr$line_osc"
+        line_len=0
+        line_sgr="$sgr"
+        line_osc="$osc"
+    }
+    _box_wrap_flush() {
+        _box_wrap_emit "$line" "$alignment" "$line_len"
+        line=""
+        line_len=0
+        line_sgr="$sgr"
+        line_osc="$osc"
+        had_line=true
+    }
+    _box_wrap_newline
+    while (( i < n )); do
+        byte="${decoded:i:1}"
+        if [[ "$byte" == "$ESC" ]]; then
+            token="$byte"
+            if [[ "${decoded:i+1:1}" == "[" ]]; then
+                token+="${decoded:i+1:1}"
+                i=$((i + 2))
+                while (( i < n )); do
+                    byte="${decoded:i:1}"
+                    token+="$byte"
+                    i=$((i + 1))
+                    [[ "$byte" == m ]] && break
+                done
+                if [[ "$token" == *m ]]; then
+                    line+="$token"
+                    rest="${token#$ESC[}"
+                    rest="${rest%m}"
+                    if [[ -z "$rest" || "$rest" == "0" ]]; then
+                        sgr=""
+                    elif [[ "$rest" == "0;"* ]]; then
+                        sgr="$token"
+                    else
+                        sgr="${sgr}${token}"
+                    fi
+                    continue
+                fi
+                line+="^["
+                i=$((i - ${#token} + 1))
+                line_len=$((line_len + 1))
+            elif [[ "${decoded:i+1:1}" == "]" && "${decoded:i+2:2}" == "8;" ]]; then
+                token+="${decoded:i+1:1}${decoded:i+2:2}"
+                i=$((i + 4))
+                while (( i < n )); do
+                    byte="${decoded:i:1}"
+                    token+="$byte"
+                    i=$((i + 1))
+                    [[ "$byte" == "$BEL" ]] && break
+                    if [[ "$byte" == "$ESC" && "${decoded:i:1}" == "\\" ]]; then
+                        token+="\\"
+                        i=$((i + 1))
+                        break
+                    fi
+                done
+                if [[ "$token" == *"$BEL" || "$token" == *"$ESC\\" ]]; then
+                    line+="$token"
+                    rest="${token#$ESC]8;}"
+                    if [[ "$rest" == *"$BEL" ]]; then
+                        rest="${rest%$BEL}"
+                    else
+                        rest="${rest%$ESC\\}"
+                    fi
+                    params="${rest%%;*}"
+                    uri="${rest#*;}"
+                    if [[ -n "$uri" ]]; then
+                        osc="$token"
+                    else
+                        osc=""
+                    fi
+                    continue
+                fi
+                line+="^["
+                i=$((i - ${#token} + 1))
+                line_len=$((line_len + 1))
+                continue
+            else
+                line+="^["
+                i=$((i + 1))
+                line_len=$((line_len + 1))
+                continue
+            fi
+        fi
+        if [[ "$byte" == $'\n' ]]; then
+            _box_wrap_flush
+            i=$((i + 1))
+            _box_wrap_newline
+            continue
+        fi
+        if (( line_len >= BOX_W )); then
+            _box_wrap_flush
+            _box_wrap_newline
+        fi
+        char="$byte"
+        max_bytes=0
+        hex=$(printf '%s' "$byte" | LC_ALL=C od -An -t x1 | tr -d ' \n')
+        case "$hex" in
+            C[2-9A-Fa-f]|c[2-9a-f]|D[0-3]|d[0-3]) max_bytes=1 ;;
+            E[0-9A-Fa-f]|e[0-9a-f]) max_bytes=2 ;;
+            F[0-4]|f[0-4]) max_bytes=3 ;;
+        esac
+        j=1
+        while (( j <= max_bytes && i + j < n )); do
+            next_hex=""
+            next_hex=$(printf '%s' "${decoded:i+j:1}" | LC_ALL=C od -An -t x1 | tr -d ' \n')
+            [[ "$next_hex" == [89ABabCDEFdef][0-9A-Fa-f] ]] || break
+            char+="${decoded:i+j:1}"
+            j=$((j + 1))
+        done
+        line+="$char"
+        line_len=$((line_len + 1))
+        i=$((i + j))
+    done
+    if [[ -n "$line" || "$had_line" == false ]]; then
+        _box_wrap_emit "$line" "$alignment" "$line_len"
+    fi
+}
+
 box_line() {
     local visible="$1"
     local colored="${2:-$1}"
-    local pad=$((BOX_W - $(_vis_len "$visible")))
-    (( pad < 0 )) && pad=0
-    printf "${CYAN}║${NC}%b%*s${CYAN}║${NC}\n" "$colored" "$pad" ""
+    if [[ "$visible" != *$'\n'* ]] && (( $(_vis_len "$visible") <= BOX_W )); then
+        local pad=$((BOX_W - $(_vis_len "$visible")))
+        printf "${CYAN}║${NC}%b%*s${CYAN}║${NC}\n" "$colored" "$pad" ""
+    else
+        _box_wrap "$colored" left
+    fi
 }
 
-# Печатает строку по центру внутри рамки.
-# $1 = видимый текст, $2 = цветной текст (необязательно)
 box_center() {
     local visible="$1"
     local colored="${2:-$1}"
-    local total=$((BOX_W - $(_vis_len "$visible")))
-    (( total < 0 )) && total=0
-    local lpad=$((total / 2))
-    local rpad=$((total - lpad))
-    printf "${CYAN}║${NC}%*s%b%*s${CYAN}║${NC}\n" "$lpad" "" "$colored" "$rpad" ""
+    if [[ "$visible" != *$'\n'* ]] && (( $(_vis_len "$visible") <= BOX_W )); then
+        local total=$((BOX_W - $(_vis_len "$visible")))
+        local lpad=$((total / 2))
+        local rpad=$((total - lpad))
+        printf "${CYAN}║${NC}%*s%b%*s${CYAN}║${NC}\n" "$lpad" "" "$colored" "$rpad" ""
+    else
+        _box_wrap "$colored" center
+    fi
 }
 
 # ─── Рамка успеха (зелёная, широкая) ────────────────────────────────────────
@@ -288,25 +503,45 @@ TOGGLE_SELECT_ITEMS=()
 TOGGLE_SELECT_FLAGS=()
 toggle_select() {
     local header="$1"
+    local i item choice
+    ((${#TOGGLE_SELECT_ITEMS[@]} > 0)) || {
+        echo ""
+        box_top
+        box_center "$header"
+        box_mid
+        box_line " Нет вариантов для выбора" " ${DIM}Нет вариантов для выбора${NC}"
+        menu_item 0 "Отмена" NC
+        box_bot
+        return 1
+    }
     while true; do
         echo ""
-        echo -e "  $header:"
-        local i=0
+        box_top
+        box_center "$header"
+        box_mid
+        i=0
         while [[ $i -lt ${#TOGGLE_SELECT_ITEMS[@]} ]]; do
-            local item="${TOGGLE_SELECT_ITEMS[$i]}"
+            item="${TOGGLE_SELECT_ITEMS[$i]}"
             if [[ "${TOGGLE_SELECT_FLAGS[$i]}" == "1" ]]; then
-                echo -e "  ${GREEN}$((i + 1)))${NC} [x] $item"
+                box_line " $((i + 1))) [x] ${item}" " ${GREEN}$((i + 1)))${NC} [x] ${item}"
             else
-                echo -e "  ${GREEN}$((i + 1)))${NC} [ ] $item"
+                box_line " $((i + 1))) [ ] ${item}" " ${GREEN}$((i + 1)))${NC} [ ] ${item}"
             fi
             i=$((i + 1))
         done
+        box_mid
+        menu_item 0 "Отмена" NC
+        box_bot
         echo ""
-        read -rp "Переключить (номер) или Enter для сохранения: " TOGGLE
-        [[ -z "$TOGGLE" ]] && break
-        if [[ "$TOGGLE" =~ ^[0-9]+$ ]] && (( TOGGLE >= 1 && TOGGLE <= ${#TOGGLE_SELECT_ITEMS[@]} )); then
-            local idx=$((TOGGLE - 1))
-            [[ "${TOGGLE_SELECT_FLAGS[$idx]}" == "1" ]] && TOGGLE_SELECT_FLAGS[$idx]=0 || TOGGLE_SELECT_FLAGS[$idx]=1
+        if ! IFS= read -rp "  Переключить номер [Enter = сохранить, 0 = отмена]: " choice; then
+            return 1
+        fi
+        choice="${choice%$'\r'}"
+        [[ -z "$choice" ]] && return 0
+        [[ "$choice" == 0 ]] && return 1
+        if menu_index_valid "$choice" "${#TOGGLE_SELECT_ITEMS[@]}"; then
+            i=$((choice - 1))
+            [[ "${TOGGLE_SELECT_FLAGS[$i]}" == "1" ]] && TOGGLE_SELECT_FLAGS[$i]=0 || TOGGLE_SELECT_FLAGS[$i]=1
         else
             warn "Неверный номер."
         fi
@@ -333,13 +568,19 @@ check_update_start() {
     local token="${GITHUB_TOKEN:-}"
     local curl_args=(-fsSL --connect-timeout 3 --max-time 5)
     [[ -n "$token" ]] && curl_args+=(-H "Authorization: token $token")
-    (
-        curl "${curl_args[@]}" \
-            "https://api.github.com/repos/${_REPO}/releases/latest" 2>/dev/null \
-        | grep -o '"tag_name": *"[^"]*"' \
-        | grep -o '"[^"]*"$' \
-        | tr -d '"' > "$_UPDATE_TMP"
-    ) &
+    if ! {
+        (
+            curl "${curl_args[@]}" \
+                "https://api.github.com/repos/${_REPO}/releases/latest" 2>/dev/null \
+            | grep -o '"tag_name": *"[^"]*"' \
+            | grep -o '"[^"]*"$' \
+            | tr -d '"' >&3
+        ) &
+    } 3>"$_UPDATE_TMP"; then
+        _cleanup_update_tmp
+        return 1
+    fi
+    return 0
 }
 
 # Возвращает тег последней версии (пусто если ещё не готово или ошибка)

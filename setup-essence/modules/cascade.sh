@@ -4,66 +4,57 @@
 # Маркеры: # --- cascade:<name> --- / # --- /cascade:<name> ---
 
 cascade_menu() {
-    echo ""
-    box_top
-    box_center "Cascade / Цепочка"
-    box_bot
-    echo ""
+    while true; do
+        echo ""
+        box_top
+        box_center "Cascade / Цепочка"
+        box_mid
 
-    # Список каскадов
-    local cascades=()
-    while IFS= read -r line; do
-        cascades+=("$line")
-    done < <(grep '^# --- cascade:' /etc/mihomo/config.yaml 2>/dev/null | sed 's/# --- cascade://;s/ ---//')
-
-    if [[ ${#cascades[@]} -gt 0 ]]; then
-        echo -e "  Каскады:"
-        for c in "${cascades[@]}"; do
-            local block srv srv_port status_mark shared_lbl
-            block=$(sed -n "/^# --- cascade:${c} ---/,/^# --- \/cascade:${c} ---/p" /etc/mihomo/config.yaml)
-            srv=$(echo "$block" | grep '    server:' | head -1 | awk '{print $2}')
-            srv_port=$(echo "$block" | grep '    port:' | head -1 | awk '{print $2}')
-            # Определяем через какой листенер
-            local _sl
-            _sl=$(echo "$block" | grep '^# shared-listener:' | awk '{print $3}')
-            if [[ -n "$_sl" ]]; then
-                local _sl_port
-                _sl_port=$(awk '/# --- '"$_sl"' ---/{f=1} f && /port:/{print $2; exit}' /etc/mihomo/config.yaml)
-                case "$_sl" in
-                    vless-tcp)   shared_lbl="VLESS TCP :${_sl_port}" ;;
-                    vless-xhttp) shared_lbl="VLESS xHTTP :${_sl_port}" ;;
-                    vless-grpc)  shared_lbl="VLESS gRPC :${_sl_port}" ;;
-                    hy2)         shared_lbl="Hysteria2 :${_sl_port}" ;;
-                    *)           shared_lbl="$_sl :${_sl_port}" ;;
-                esac
-            else
+        local cascades=() line c block srv srv_port status_mark shared_lbl _sl _sl_port _info
+        while IFS= read -r line; do
+            cascades+=("$line")
+        done < <(grep '^# --- cascade:' /etc/mihomo/config.yaml 2>/dev/null | sed 's/# --- cascade://;s/ ---//')
+        if [[ ${#cascades[@]} -gt 0 ]]; then
+            for c in "${cascades[@]}"; do
+                block=$(sed -n "/^# --- cascade:${c} ---/,/^# --- \/cascade:${c} ---/p" /etc/mihomo/config.yaml)
+                srv=$(printf '%s\n' "$block" | grep '    server:' | head -1 | awk '{print $2}')
+                srv_port=$(printf '%s\n' "$block" | grep '    port:' | head -1 | awk '{print $2}')
+                _sl=$(printf '%s\n' "$block" | grep '^# shared-listener:' | awk '{print $3}')
                 shared_lbl=""
-            fi
-            if [[ -n "$srv" ]] && timeout 3 bash -c "echo >/dev/tcp/${srv}/${srv_port}" 2>/dev/null; then
-                status_mark="${GREEN}✓${NC}"
-            else
-                status_mark="${RED}✗${NC}"
-            fi
-            local _info="${DIM}-> ${srv}:${srv_port}${NC}"
-            [[ -n "$shared_lbl" ]] && _info+="  ${DIM}(${shared_lbl})${NC}"
-            echo -e "    ${GREEN}*${NC} $c ${_info}  ${status_mark}"
-        done
-    else
-        echo -e "  Статус: ${RED}нет каскадов${NC}"
-    fi
-    echo ""
-    echo -e "  ${GREEN}1)${NC} Добавить каскад"
-    echo -e "  ${RED}2)${NC} Удалить каскад"
-    echo -e "  ${NC}0)${NC} Назад"
-    echo ""
-    read -rp "Выберите действие [0-2]: " CASCADE_CHOICE
-
-    case "$CASCADE_CHOICE" in
-        1) install_cascade ;;
-        2) remove_cascade_interactive ;;
-        0) return ;;
-        *) warn "Неверный выбор." ;;
-    esac
+                if [[ -n "$_sl" ]]; then
+                    _sl_port=$(awk '/# --- '"$_sl"' ---/{f=1} f && /port:/{print $2; exit}' /etc/mihomo/config.yaml)
+                    shared_lbl="$_sl :${_sl_port}"
+                fi
+                if [[ -n "$srv" ]] && timeout 3 bash -c "echo >/dev/tcp/${srv}/${srv_port}" 2>/dev/null; then
+                    status_mark="✓"
+                else
+                    status_mark="✗"
+                fi
+                _info=" ${c} → ${srv}:${srv_port}"
+                [[ -n "$shared_lbl" ]] && _info+=" (${shared_lbl})"
+                box_line "$_info  $status_mark" " ${GREEN}${c}${NC} ${DIM}→ ${srv}:${srv_port}${NC}${shared_lbl:+  ${DIM}(${shared_lbl})${NC}}  ${status_mark}"
+            done
+        else
+            box_line " Нет каскадов" " ${DIM}Нет каскадов${NC}"
+        fi
+        box_mid
+        menu_item 1 "Добавить каскад" GREEN
+        menu_item 2 "Удалить каскад" RED
+        menu_item 0 "Назад" NC
+        box_bot
+        echo ""
+        local CASCADE_CHOICE
+        if ! IFS= read -rp "  Выберите действие: " CASCADE_CHOICE; then
+            return 0
+        fi
+        CASCADE_CHOICE="${CASCADE_CHOICE%$'\r'}"
+        case "$CASCADE_CHOICE" in
+            1) install_cascade ;;
+            2) remove_cascade_interactive ;;
+            0) return 0 ;;
+            *) warn "Неверный выбор." ;;
+        esac
+    done
 }
 
 install_cascade() {

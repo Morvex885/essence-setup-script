@@ -2,24 +2,33 @@
 # ─── Генерация сайта-заглушки ────────────────────────────────────────────────
 
 setup_fake_site() {
-    local TARGET_DIR="$1"
-
-    echo ""
-    echo -e "  Тип шаблона:"
-    echo -e "  ${GREEN}1)${NC} Simple Web Templates   ${CYAN}(by eGamesAPI)${NC}"
-    echo -e "  ${GREEN}2)${NC} SNI Templates          ${CYAN}(by distillium)${NC}"
-    echo -e "  ${GREEN}3)${NC} Nothing Templates      ${CYAN}(by prettyleaf)${NC}"
-    echo -e "  ${NC}4)${NC} Случайный"
-    echo ""
-    read -rp "Выберите [Enter = 4]: " SOURCE_CHOICE
-
-    case "$SOURCE_CHOICE" in
-        1) _randomhtml "simple" "$TARGET_DIR" ;;
-        2) _randomhtml "sni"    "$TARGET_DIR" ;;
-        3) _randomhtml "nothing" "$TARGET_DIR" ;;
-        4|"") _randomhtml ""    "$TARGET_DIR" ;;
-        *) warn "Неверный выбор."; return ;;
-    esac
+    local TARGET_DIR="$1" SOURCE_CHOICE
+    while true; do
+        echo ""
+        box_top
+        box_center "Сайт-заглушка"
+        box_mid
+        menu_item 1 "Simple Web Templates (by eGamesAPI)" GREEN
+        menu_item 2 "SNI Templates (by distillium)" GREEN
+        menu_item 3 "Nothing Templates (by prettyleaf)" GREEN
+        menu_item 4 "Случайный" NC
+        menu_item 0 "Отмена" NC
+        box_bot
+        echo ""
+        if ! IFS= read -rp "  Выберите действие [Enter = 4]: " SOURCE_CHOICE; then
+            return 1
+        fi
+        SOURCE_CHOICE="${SOURCE_CHOICE%$'\r'}"
+        [[ -z "$SOURCE_CHOICE" ]] && SOURCE_CHOICE=4
+        case "$SOURCE_CHOICE" in
+            1) _randomhtml "simple" "$TARGET_DIR"; return $? ;;
+            2) _randomhtml "sni" "$TARGET_DIR"; return $? ;;
+            3) _randomhtml "nothing" "$TARGET_DIR"; return $? ;;
+            4) _randomhtml "" "$TARGET_DIR"; return $? ;;
+            0) return 1 ;;
+            *) warn "Неверный выбор." ;;
+        esac
+    done
 }
 
 _randomhtml() {
@@ -27,7 +36,7 @@ _randomhtml() {
     local target_dir="$2"
     local _saved_dir="$PWD"
 
-    cd /opt/ || { error "Не удалось перейти в /opt/"; }
+    cd /opt/ || { warn "Не удалось перейти в /opt/"; return 1; }
 
     rm -f main.zip 2>/dev/null
     rm -rf simple-web-templates-main/ sni-templates-main/ nothing-sni-main/ 2>/dev/null
@@ -57,37 +66,80 @@ _randomhtml() {
         attempt=$((attempt + 1))
         if [[ $attempt -ge 3 ]]; then
             warn "Не удалось скачать шаблон после 3 попыток."
-            echo ""
-            echo -e "  ${GREEN}1)${NC} Попробовать снова"
-            echo -e "  ${GREEN}2)${NC} Выбрать другой шаблон"
-            echo -e "  ${NC}0)${NC} Отмена"
-            echo ""
-            read -rp "Выберите [0-2]: " RETRY_CHOICE
-            case "$RETRY_CHOICE" in
-                1) attempt=0; continue ;;
-                2) cd "$_saved_dir"; setup_fake_site "$target_dir"; return ;;
-                *) info "Отменено."; cd "$_saved_dir"; return ;;
-            esac
+            while true; do
+                echo ""
+                box_top
+                box_center "Ошибка загрузки сайта"
+                box_mid
+                box_line " Не удалось скачать выбранный шаблон."
+                menu_item 1 "Попробовать снова" GREEN
+                menu_item 2 "Выбрать другой шаблон" YELLOW
+                menu_item 0 "Отмена" NC
+                box_bot
+                echo ""
+                if ! IFS= read -rp "  Выберите действие: " RETRY_CHOICE; then
+                    rm -f main.zip
+                    cd "$_saved_dir"
+                    return 1
+                fi
+                RETRY_CHOICE="${RETRY_CHOICE%$'\r'}"
+                case "$RETRY_CHOICE" in
+                    1) attempt=0; break ;;
+                    2)
+                        rm -f main.zip
+                        cd "$_saved_dir"
+                        setup_fake_site "$target_dir"
+                        return $?
+                        ;;
+                    0)
+                        rm -f main.zip
+                        cd "$_saved_dir"
+                        return 1
+                        ;;
+                    *) warn "Неверный выбор." ;;
+                esac
+            done
+            continue
         fi
         warn "Ошибка загрузки, повтор через 3 сек... $attempt/3"
         sleep 3
     done
 
-    unzip -o main.zip &>/dev/null || error "Не удалось распаковать архив шаблона"
+    if ! unzip -o main.zip &>/dev/null; then
+        rm -f main.zip
+        cd "$_saved_dir"
+        warn "Не удалось распаковать архив шаблона"
+        return 1
+    fi
     rm -f main.zip
 
     local template_dir
     if [[ "$selected_url" == *"eGamesAPI"* ]]; then
         template_dir="simple-web-templates-main"
-        cd "$template_dir" || { error "Не удалось войти в $template_dir"; }
+        cd "$template_dir" || {
+            rm -f main.zip
+            cd "$_saved_dir"
+            warn "Не удалось войти в $template_dir"
+            return 1
+        }
         rm -rf assets ".gitattributes" "README.md" "_config.yml" 2>/dev/null
     elif [[ "$selected_url" == *"nothing-sni"* ]]; then
         template_dir="nothing-sni-main"
-        cd "$template_dir" || { error "Не удалось войти в $template_dir"; }
+        cd "$template_dir" || {
+            rm -f main.zip
+            cd "$_saved_dir"
+            warn "Не удалось войти в $template_dir"
+            return 1
+        }
         rm -rf .github README.md 2>/dev/null
     else
         template_dir="sni-templates-main"
-        cd "$template_dir" || { error "Не удалось войти в $template_dir"; }
+        cd "$template_dir" || {
+            rm -f main.zip
+            cd "$_saved_dir"
+            warn "Не удалось войти в $template_dir"
+            return 1
+        }
         rm -rf assets "README.md" "index.html" 2>/dev/null
     fi
 
@@ -158,7 +210,9 @@ _randomhtml() {
         cp "${RandomHTML}" "$target_dir/index.html"
         success "Шаблон скопирован в $target_dir/index.html"
     else
-        error "Шаблон '$RandomHTML' не найден в распакованном архиве"
+        cd "$_saved_dir"
+        warn "Шаблон '$RandomHTML' не найден в распакованном архиве"
+        return 1
     fi
 
     cd /opt/

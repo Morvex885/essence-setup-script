@@ -10,50 +10,60 @@ connections_menu() {
     while true; do
         local node_count
         node_count=$(nodes_count)
-
         if [[ "$node_count" -gt 0 && "$_conn_synced" -eq 0 ]]; then
             _sync_all_connections
             _conn_synced=1
         fi
-
         echo ""
         box_top
         box_center "Подключения нод для групп"
-        box_bot
-
+        box_mid
         if [[ "$node_count" -eq 0 ]]; then
-            echo ""
-            echo -e "  ${DIM}Нет нод${NC}"
+            box_line " Нет нод" " ${DIM}Нет нод${NC}"
         else
-            # Обзор: нода × группа → кол-во подключений
             _show_connections_overview
-            echo ""
-            local i=1
+            local i=1 nname nip
             while IFS=$'\t' read -r nname nip; do
-                echo -e "  ${GREEN}${i})${NC} $nname ${DIM}$nip${NC}"
+                box_line " ${i}) ${nname} ${nip}" " ${CYAN}${i})${NC} ${nname} ${DIM}${nip}${NC}"
                 i=$((i + 1))
             done < <(jq_r '.nodes[] | "\(.name)\t\(.ip)"')
         fi
-        echo ""
+        box_mid
         if [[ "$node_count" -gt 0 ]]; then
-            echo -e "  ${YELLOW}r)${NC} Переименовать подключения"
-            echo -e "  ${CYAN}s)${NC} Синхронизировать с нодами"
+            menu_item r "Переименовать подключения" YELLOW
+            menu_item s "Синхронизировать с нодами" CYAN
         fi
-        echo -e "  ${NC}0)${NC} Назад"
+        menu_item 0 "Назад" NC
+        box_bot
         echo ""
-        read -rp "  Выберите ноду: " CONN_CHOICE
-
-        if [[ "$CONN_CHOICE" == "0" ]]; then
-            return
-        elif [[ "$CONN_CHOICE" == "r" || "$CONN_CHOICE" == "R" ]]; then
-            state_action "rename_connections" _rename_connections
-        elif [[ "$CONN_CHOICE" == "s" || "$CONN_CHOICE" == "S" ]]; then
-            state_action "sync_connections" _sync_all_connections
-        elif [[ "$CONN_CHOICE" =~ ^[0-9]+$ ]] && (( CONN_CHOICE >= 1 && CONN_CHOICE <= node_count )); then
-            state_action "configure_connections" _configure_node_connections "$CONN_CHOICE"
-        else
-            warn "Неверный выбор."
+        if ! IFS= read -rp "  Выберите ноду: " CONN_CHOICE; then
+            return 0
         fi
+        CONN_CHOICE="${CONN_CHOICE%$'\r'}"
+        case "$CONN_CHOICE" in
+            0) return 0 ;;
+            r|R)
+                if [[ "$node_count" -gt 0 ]]; then
+                    state_action "rename_connections" _rename_connections
+                else
+                    warn "Неверный выбор."
+                fi
+                ;;
+            s|S)
+                if [[ "$node_count" -gt 0 ]]; then
+                    state_action "sync_connections" _sync_all_connections
+                else
+                    warn "Неверный выбор."
+                fi
+                ;;
+            *)
+                if menu_index_valid "$CONN_CHOICE" "$node_count"; then
+                    state_action "configure_connections" _configure_node_connections "$CONN_CHOICE"
+                else
+                    warn "Неверный выбор."
+                fi
+                ;;
+        esac
     done
 }
 
@@ -157,34 +167,25 @@ _sync_all_connections() {
 _show_connections_overview() {
     groups_list
     [[ ${#GRP_LIST[@]} -eq 0 ]] && return
-
-    echo ""
+    local nname _nip g cnt total color plain colored
     while IFS=$'\t' read -r nname _nip; do
-        local line="  ${nname}"
-        # Паддинг до 12 символов
-        local pad=$((12 - ${#nname}))
-        (( pad > 0 )) && line+=$(printf '%*s' "$pad" "")
-
-        local total
         total=$(_node_disc_count_get "$nname")
+        box_line " ${nname}"
         for g in "${GRP_LIST[@]}"; do
-            local cnt
             cnt=$(jq_r --arg n "$nname" --arg g "$g" \
                 '.connections[] | select(.node==$n) | .groups[] | select(.name==$g) | .proxies | length')
             cnt="${cnt:-0}"
-            local color
-            if [[ "$total" == "?" ]]; then
-                color="$DIM"
-            elif [[ "$cnt" -eq 0 ]]; then
+            if [[ "$total" == "?" || "$cnt" -eq 0 ]]; then
                 color="$DIM"
             elif [[ "$cnt" -ge "$total" ]]; then
                 color="$GREEN"
             else
                 color="$YELLOW"
             fi
-            line+=" ${g}: ${color}${cnt}/${total}${NC} "
+            plain="    ${g}: ${cnt}/${total}"
+            colored="    ${!color}${g}: ${cnt}/${total}${NC}"
+            box_line "$plain" "$colored"
         done
-        echo -e "$line"
     done < <(jq_r '.nodes[] | "\(.name)\t\(.ip)"')
 }
 
@@ -256,18 +257,20 @@ _batch_assign_connections() {
     shift
     local -a batch_disc=("$@")
 
-    # Шаг 1: выбрать подключения
     local flags=()
+    local d
     for d in "${batch_disc[@]}"; do
         flags+=(0)
     done
 
     TOGGLE_SELECT_ITEMS=("${batch_disc[@]}")
     TOGGLE_SELECT_FLAGS=("${flags[@]}")
-    toggle_select "${CYAN}$nname${NC} — подключения"
+    toggle_select "$nname — подключения"
+    local toggle_rc=$?
     flags=("${TOGGLE_SELECT_FLAGS[@]}")
     TOGGLE_SELECT_ITEMS=()
     TOGGLE_SELECT_FLAGS=()
+    (( toggle_rc == 0 )) || return 1
 
     local selected_csv=""
     local i=0
@@ -281,21 +284,23 @@ _batch_assign_connections() {
 
     if [[ -z "$selected_csv" ]]; then
         warn "Ничего не выбрано."
-        return
+        return 1
     fi
 
-    # Шаг 2: выбрать группы
     local grp_flags=()
+    local g
     for g in "${GRP_LIST[@]}"; do
         grp_flags+=(0)
     done
 
     TOGGLE_SELECT_ITEMS=("${GRP_LIST[@]}")
     TOGGLE_SELECT_FLAGS=("${grp_flags[@]}")
-    toggle_select "${CYAN}$nname${NC} — группы"
+    toggle_select "$nname — группы"
+    toggle_rc=$?
     grp_flags=("${TOGGLE_SELECT_FLAGS[@]}")
     TOGGLE_SELECT_ITEMS=()
     TOGGLE_SELECT_FLAGS=()
+    (( toggle_rc == 0 )) || return 1
 
     local applied=0
     i=0

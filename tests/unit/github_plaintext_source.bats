@@ -66,7 +66,11 @@ if [[ "$1" == auth && "$2" == switch ]]; then
         printf '%s\n' 'switch failed: token=ghp_SwitchSecret123' >&2
         exit 1
     fi
-    printf '%s\n' alternate-owner > "$GH_ACTIVE_LOGIN_FILE"
+    if [[ "$5" == --user && -n "$6" ]]; then
+        printf '%s\n' "$6" > "$GH_ACTIVE_LOGIN_FILE"
+    else
+        printf '%s\n' "${GH_SWITCH_LOGIN:-alternate-owner}" > "$GH_ACTIVE_LOGIN_FILE"
+    fi
     [[ -z "${GH_SWITCH_MARKER:-}" ]] || touch "$GH_SWITCH_MARKER"
     exit 0
 fi
@@ -126,7 +130,16 @@ if [[ "$1" == repo && "$2" == view ]]; then
         printf '%s\n' 'repository not found' >&2
         exit 1
     fi
-    printf '%s\n' '{"visibility":"PRIVATE"}'
+    if [[ "${GH_MODE:-success}" == public && ! -f "${GH_PRIVATE_MARKER:-}" ]]; then
+        printf '%s\n' '{"visibility":"PUBLIC"}'
+    else
+        printf '%s\n' '{"visibility":"PRIVATE"}'
+    fi
+    exit 0
+fi
+if [[ "$1" == repo && "$2" == edit ]]; then
+    [[ -z "${GH_EDIT_MARKER:-}" ]] || touch "$GH_EDIT_MARKER"
+    [[ -z "${GH_PRIVATE_MARKER:-}" ]] || touch "$GH_PRIVATE_MARKER"
     exit 0
 fi
 if [[ "$1" == repo && "$2" == create ]]; then
@@ -524,6 +537,19 @@ _prepare_existing_plaintext_vault() {
     [[ "$output" != *"Не удалось открыть источник GitHub"* ]] || return 1
 }
 
+@test "menu operations accepts CRLF and opens scoped Telegram menu" {
+    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    local config_dir="$HOME/.config/remote-control-essence"
+    jq '.nodes = [{id:"33333333333333333333333333333333",name:"fixture-node",ip:"127.0.0.1",port:22,user:"root",auth:"key",identity:"system",secret_id:null,tag:"",aliases:{}}]' \
+        "$config_dir/config.json" > "$config_dir/config.tmp"
+    mv "$config_dir/config.tmp" "$config_dir/config.json"
+
+    run bash -c 'printf "1\r\nb\r\n0\r\n0\r\n0\r\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    [[ "$output" != *"Неверный выбор."* ]]
+}
+
 @test "plaintext GitHub source persists and restarts from installed layout" {
     run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
     assert_success
@@ -535,7 +561,7 @@ _prepare_existing_plaintext_vault() {
     local config_dir="$HOME/.config/remote-control-essence"
     local github_link=$'\033]8;;https://github.com/test-owner/essence-remote-control-config\033\\GitHub\033]8;;\033\\'
     assert_output --partial "Источник GitHub подключён."
-    assert_output --partial "GitHub-аккаунт для репозитория конфигурации: test-owner"
+    assert_output --partial "Выбран аккаунт GitHub: test-owner"
     [[ "$output" == *"Источник конфигурации: ${github_link}"* ]] || return 1
     jq -e 'type == "object" and .type == "github" and .private_verified == true' \
         "$config_dir/source.json"
@@ -557,7 +583,7 @@ _prepare_existing_plaintext_vault() {
 
     assert_success
     assert_output --partial "Источник конфигурации: ${github_link} • синхронизировано"
-    [[ "$output" != *"GitHub-аккаунт для репозитория конфигурации: test-owner"* ]] || return 1
+    [[ "$output" != *"Выбран аккаунт GitHub: test-owner"* ]] || return 1
     [[ "$output" != *"Завершить отложенную SSH-настройку"* ]] || return 1
     assert_output --partial "Источник конфигурации GitHub"
     assert_output --partial "Состояние синхронизации: синхронизировано"
@@ -1027,7 +1053,7 @@ EOF
     run env GH_MODE=fail bash -c 'printf "Y\n1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
     assert_success
     assert_output --partial "Не удалось подключить GitHub (этап: проверка приватного репозитория): permission denied"
-    assert_output --partial "GitHub-аккаунт для репозитория конфигурации: test-owner"
+    assert_output --partial "Выбран аккаунт GitHub: test-owner"
     [[ "$output" != *"gh auth login"* ]] || return 1
     [[ "$output" == *"Источник конфигурации: локальный"* ]] || return 1
     [[ "$output" != *"Источник GitHub подключён."* ]] || return 1
@@ -1552,4 +1578,88 @@ EOF
     assert_failure
     assert_output --partial "Не удалось открыть источник конфигурации."
     [[ "$output" != *"этап: проверка настроек источника GitHub"* ]] || return 1
+}
+
+@test "startup mismatch uses the account picker and can return to saved owner" {
+    run bash -c 'printf "2\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    local config_dir="$HOME/.config/remote-control-essence"
+    printf '%s\n' alternate-owner > "$GH_ACTIVE_LOGIN_FILE"
+    export GH_SWITCH_LOGIN=test-owner GH_CALLS_FILE="$BATS_TEST_TMPDIR/gh-calls"
+    : > "$GH_CALLS_FILE"
+
+    run bash -c 'printf "2\n1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    assert_output --partial "Конфигурация подключена к GitHub-аккаунту test-owner, а сейчас выбран alternate-owner."
+    assert_output --partial "Ничего не изменено. Выберите аккаунт, с которым продолжить."
+    assert_output --partial "Выбран аккаунт GitHub: alternate-owner"
+    assert_output --partial "Использовать alternate-owner для конфигурации"
+    assert_output --partial "Сначала скрипт проверит репозиторий этого аккаунта."
+    assert_output --partial "Выбран аккаунт GitHub: test-owner"
+    assert_output --partial "Продолжить с test-owner (текущий источник)"
+    assert_output --partial "Отмена — ничего не менять"
+    [[ "$(cat "$GH_ACTIVE_LOGIN_FILE")" == test-owner ]] || return 1
+    local calls
+    calls=$(cat "$GH_CALLS_FILE")
+    [[ "$calls" == *$'api user --jq .login\nauth switch --hostname github.com\napi user --jq .login'* ]] ||
+        return 1
+    [[ "$calls" != *"repo view alternate-owner/"* ]] || return 1
+}
+
+@test "startup mismatch cancellation preserves source runtime store and login" {
+    run bash -c 'printf "2\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    local config_dir="$HOME/.config/remote-control-essence"
+    local source_hash runtime_hash store_head store_origin
+    source_hash=$(_hash_file "$config_dir/source.json")
+    runtime_hash=$(_hash_file "$config_dir/github-runtime/config.json")
+    store_head=$(git --git-dir="$config_dir/github-store.git" rev-parse refs/heads/main)
+    store_origin=$(git --git-dir="$config_dir/github-store.git" config --get remote.origin.url)
+    printf '%s\n' alternate-owner > "$GH_ACTIVE_LOGIN_FILE"
+    export GH_CALLS_FILE="$BATS_TEST_TMPDIR/gh-calls"
+    : > "$GH_CALLS_FILE"
+
+    run bash -c 'printf "0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_failure
+    assert_output --partial "Смена аккаунта GitHub отменена."
+    [[ "$(_hash_file "$config_dir/source.json")" == "$source_hash" ]] || return 1
+    [[ "$(_hash_file "$config_dir/github-runtime/config.json")" == "$runtime_hash" ]] || return 1
+    [[ "$(git --git-dir="$config_dir/github-store.git" rev-parse refs/heads/main)" == "$store_head" ]] ||
+        return 1
+    [[ "$(git --git-dir="$config_dir/github-store.git" config --get remote.origin.url)" == "$store_origin" ]] ||
+        return 1
+    [[ "$(cat "$GH_ACTIVE_LOGIN_FILE")" == alternate-owner ]] || return 1
+    [[ ! -e "$config_dir/account-switch" ]] || return 1
+    [[ "$(cat "$GH_CALLS_FILE")" != *"repo view "* ]] || return 1
+}
+
+@test "startup mismatch switches owner through the target transaction" {
+    local alternate_remote="$BATS_TEST_TMPDIR/alternate.git"
+    local alternate_seed="$BATS_TEST_TMPDIR/alternate-seed"
+    git init --bare -b main "$alternate_remote" >/dev/null
+    git init -b main "$alternate_seed" >/dev/null
+    git -C "$alternate_seed" config user.name seed
+    git -C "$alternate_seed" config user.email seed@example.invalid
+    git -C "$alternate_seed" commit --allow-empty -m seed >/dev/null
+    git -C "$alternate_seed" remote add origin "$alternate_remote"
+    git -C "$alternate_seed" push origin main >/dev/null
+    git config --global url."file://$alternate_remote".insteadOf \
+        "https://github.com/alternate-owner/essence-remote-control-config.git"
+    run bash -c 'printf "2\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    local old_remote_head
+    old_remote_head=$(git --git-dir="$REMOTE" rev-parse main)
+    printf '%s\n' alternate-owner > "$GH_ACTIVE_LOGIN_FILE"
+    export GH_SWITCH_LOGIN=alternate-owner
+
+    run bash -c 'printf "1\n2\nn\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    local config_dir="$HOME/.config/remote-control-essence"
+    jq -e '.repo == "alternate-owner/essence-remote-control-config"' "$config_dir/source.json"
+    [[ "$(git --git-dir="$config_dir/github-store.git" config --get remote.origin.url)" == \
+        "https://github.com/alternate-owner/essence-remote-control-config.git" ]] || return 1
+    [[ "$(git --git-dir="$alternate_remote" rev-parse main)" == \
+        "$(git --git-dir="$config_dir/github-store.git" rev-parse refs/heads/main)" ]] || return 1
+    [[ "$(git --git-dir="$REMOTE" rev-parse main)" == "$old_remote_head" ]] || return 1
+    [[ ! -e "$config_dir/account-switch" ]] || return 1
 }

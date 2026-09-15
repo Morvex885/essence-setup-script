@@ -115,36 +115,87 @@ _github_ensure_deps() {
         [[ "$mode" != age ]] || _github_require "$AGE_BIN"
     fi
 }
+_github_load_active_login() {
+    local gh="${GH_BIN:-gh}" output
+    _github_clear_error
+    if ! _github_require "$gh"; then
+        _github_record_error "проверка зависимостей" \
+            "Не найдена команда GitHub CLI: $gh."
+        return 1
+    fi
+    if ! output=$(NO_COLOR=1 GH_PROMPT_DISABLED=1 "$gh" api user --jq .login 2>&1); then
+        local auth_relevant=false
+        _github_auth_failure_confirmed "$output" && auth_relevant=true
+        _github_record_error "определение пользователя GitHub" "$output" "$auth_relevant"
+        return 1
+    fi
+    output=$(printf '%s' "$output" | tr -d '\r\n')
+    [[ "$output" =~ ^[A-Za-z0-9-]+$ ]] || {
+        _github_record_error "определение пользователя GitHub" \
+            "GitHub CLI не вернул имя активного аккаунта."
+        return 1
+    }
+    GITHUB_ACTIVE_LOGIN="$output"
+    export GITHUB_ACTIVE_LOGIN
+}
+
+_github_switch_active_account() {
+    local login="${1-}" gh="${GH_BIN:-gh}" switch_stderr switch_output
+    local -a switch_args
+    if (( $# > 0 )); then
+        [[ "$login" =~ ^[A-Za-z0-9-]+$ ]] || {
+            _github_record_error "переключение аккаунта GitHub" \
+                "Указано некорректное имя аккаунта GitHub."
+            return 1
+        }
+        switch_args=(auth switch --hostname github.com --user "$login")
+    else
+        switch_args=(auth switch --hostname github.com)
+    fi
+    switch_stderr=$(umask 077; mktemp "${TMPDIR:-/tmp}/github-switch.XXXXXX") || {
+        _github_record_error "переключение аккаунта GitHub" \
+            "Не удалось подготовить безопасную диагностику переключения аккаунта."
+        return 1
+    }
+    if ! NO_COLOR=1 "$gh" "${switch_args[@]}" 2>"$switch_stderr"; then
+        switch_output=$(cat "$switch_stderr")
+        rm -f "$switch_stderr"
+        _github_record_error "переключение аккаунта GitHub" \
+            "${switch_output:-Не удалось переключить аккаунт GitHub.}"
+        return 1
+    fi
+    rm -f "$switch_stderr"
+    _github_load_active_login
+}
+
 _github_select_account() {
-    local gh="${GH_BIN:-gh}" login answer switch_stderr switch_output
+    local initial_login="${1:-}" current_owner="${2:-}" login answer option_one
     _github_clear_error
     if ! _github_ensure_deps; then
         _github_record_error "проверка зависимостей" \
             "Не удалось подготовить GitHub CLI для выбора аккаунта."
         return 1
     fi
-    if ! _github_require "$gh"; then
-        _github_record_error "проверка зависимостей" \
-            "Не найдена команда GitHub CLI: $gh."
+    if [[ -n "$initial_login" ]]; then
+        login="$initial_login"
+    elif ! _github_load_active_login; then
         return 1
+    else
+        login="$GITHUB_ACTIVE_LOGIN"
     fi
     while :; do
-        if ! login=$(NO_COLOR=1 GH_PROMPT_DISABLED=1 "$gh" api user --jq .login 2>&1); then
-            local auth_relevant=false
-            _github_auth_failure_confirmed "$login" && auth_relevant=true
-            _github_record_error "определение пользователя GitHub" "$login" "$auth_relevant"
-            return 1
+        info "Выбран аккаунт GitHub: $login"
+        if [[ -n "$current_owner" && "$current_owner" == "$login" ]]; then
+            option_one="Продолжить с $login (текущий источник)"
+        else
+            option_one="Использовать $login для конфигурации"
         fi
-        login=$(printf '%s' "$login" | tr -d '\r\n')
-        [[ -n "$login" ]] || {
-            _github_record_error "определение пользователя GitHub" \
-                "GitHub CLI не вернул имя активного аккаунта."
-            return 1
-        }
-        info "GitHub-аккаунт для репозитория конфигурации: $login"
-        echo -e "  ${GREEN}1)${NC} Использовать этот аккаунт"
-        echo -e "  ${CYAN}2)${NC} Выбрать другой аккаунт"
-        echo -e "  ${RED}0)${NC} Отмена"
+        echo -e "  ${GREEN}1)${NC} $option_one"
+        if [[ -n "$current_owner" && "$current_owner" != "$login" ]]; then
+            echo -e "  ${DIM}Сначала скрипт проверит репозиторий этого аккаунта.${NC}"
+        fi
+        echo -e "  ${CYAN}2)${NC} Выбрать другой аккаунт GitHub"
+        echo -e "  ${RED}0)${NC} Отмена — ничего не менять"
         if ! read -rp "  Выберите действие: " answer; then
             _github_record_error "выбор аккаунта GitHub" \
                 "Выбор аккаунта GitHub отменён."
@@ -153,24 +204,13 @@ _github_select_account() {
         case "$answer" in
             1)
                 GITHUB_OWNER="$login"
-                export GITHUB_OWNER
+                GITHUB_ACTIVE_LOGIN="$login"
+                export GITHUB_OWNER GITHUB_ACTIVE_LOGIN
                 return 0
                 ;;
             2)
-                switch_stderr=$(umask 077; mktemp "${TMPDIR:-/tmp}/github-switch.XXXXXX") || {
-                    _github_record_error "переключение аккаунта GitHub" \
-                        "Не удалось подготовить безопасную диагностику переключения аккаунта."
-                    return 1
-                }
-                if ! NO_COLOR=1 "$gh" auth switch --hostname github.com \
-                    2>"$switch_stderr"; then
-                    switch_output=$(cat "$switch_stderr")
-                    rm -f "$switch_stderr"
-                    _github_record_error "переключение аккаунта GitHub" \
-                        "${switch_output:-Не удалось переключить аккаунт GitHub.}"
-                    return 1
-                fi
-                rm -f "$switch_stderr"
+                _github_switch_active_account || return 1
+                login="$GITHUB_ACTIVE_LOGIN"
                 ;;
             0)
                 _github_record_error "выбор аккаунта GitHub" \
@@ -267,7 +307,7 @@ _github_prompt_storage_mode() {
     done
 }
 _github_prompt_existing_config_action() {
-    local answer mode_label
+    local allow_local="${1:-true}" answer mode_label
     case "${GITHUB_STORAGE_MODE:-}" in
         age) mode_label="зашифровано паролем" ;;
         none) mode_label="без шифрования" ;;
@@ -276,14 +316,17 @@ _github_prompt_existing_config_action() {
     info "В GitHub уже сохранена конфигурация (режим хранения: $mode_label)."
     while :; do
         echo "  1) Загрузить конфигурацию из GitHub"
-        echo "  2) Заменить конфигурацию в GitHub текущей локальной"
+        if [[ "$allow_local" == true ]]; then
+            echo "  2) Заменить конфигурацию в GitHub текущей локальной"
+        fi
         echo "  0) Отмена"
         if ! IFS= read -rp "  Выберите действие: " answer; then
             return 1
         fi
         case "$answer" in
             1) GITHUB_EXISTING_ACTION=remote; return 0 ;;
-            2) GITHUB_EXISTING_ACTION=local; return 0 ;;
+            2) [[ "$allow_local" == true ]] || { warn "Неверный выбор."; continue; }
+               GITHUB_EXISTING_ACTION=local; return 0 ;;
             0) return 1 ;;
             *) warn "Неверный выбор." ;;
         esac
@@ -1888,6 +1931,359 @@ github_source_metadata_write() {
         return 1
     fi
 }
+GITHUB_ACCOUNT_SWITCH_DIR="${GITHUB_ACCOUNT_SWITCH_DIR:-${CONFIG_DIR:-.}/account-switch}"
+GITHUB_ACCOUNT_SWITCH_MARKER="${GITHUB_ACCOUNT_SWITCH_MARKER:-$GITHUB_ACCOUNT_SWITCH_DIR/transaction.json}"
+
+_github_account_switch_root_valid() {
+    local root="${GITHUB_ACCOUNT_SWITCH_DIR:-}"
+    [[ -n "$root" && -d "$root" && ! -L "$root" ]]
+}
+
+_github_account_switch_path_is_managed() {
+    local path="${1:-}" root="${GITHUB_ACCOUNT_SWITCH_DIR:-}"
+    [[ -n "$root" && "$path" == "$root/"* || "$path" == "$root" ]] || return 1
+    case "$path" in
+        "$root"|"$root/old-store.git"|"$root/target-store.git"|"$root/target-sessions"|\
+        "$root/target-sessions/"*|"$root/cached-sessions"|"$root/cached-sessions/"*|\
+        "$root/old-source.json"|"$root/old-state.json"|"$root/target-state.json"|\
+        "$root/transaction.json"|"$root"/.transaction.*)
+            return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+github_account_switch_marker_valid() {
+    local file="${1:-}"
+    _github_exact_regular_file "$file" || return 1
+    find "$file" -prune -type f -perm 600 >/dev/null 2>&1 || return 1
+    jq -e '
+        type == "object" and .version == 1 and
+        (keys | sort) == ["branch","expected_head","initial_login","new_repo","old_repo",
+            "old_state_available","phase","repo_created","repo_privatized","version"] and
+        (.phase | type == "string" and
+            test("^(prepared|push_unknown|target_committed|local_committed)$")) and
+        (.old_repo | type == "string" and test("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")) and
+        (.new_repo | type == "string" and test("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")) and
+        (.branch | type == "string" and length > 0 and test("^[A-Za-z0-9._/-]+$")) and
+        (.initial_login | type == "string" and test("^[A-Za-z0-9-]+$")) and
+        (.expected_head == null or
+            (.expected_head | type == "string" and test("^[0-9a-f]{40}([0-9a-f]{24})?$"))) and
+        (.old_state_available | type == "boolean") and
+        (.repo_created | type == "boolean") and
+        (.repo_privatized | type == "boolean")
+    ' "$file" >/dev/null 2>&1
+}
+
+_github_account_switch_write_marker() {
+    local phase="${1:?phase}" expected_head="${2:-}" old_state_available="${3:-false}"
+    local repo_created="${4:-false}" repo_privatized="${5:-false}" tmp
+    _github_mkdir_secure "$GITHUB_ACCOUNT_SWITCH_DIR" || return 1
+    [[ "$old_state_available" == true || "$old_state_available" == false ]] || return 1
+    [[ "$repo_created" == true || "$repo_created" == false ]] || return 1
+    [[ "$repo_privatized" == true || "$repo_privatized" == false ]] || return 1
+    tmp=$(umask 077; mktemp "$GITHUB_ACCOUNT_SWITCH_DIR/.transaction.XXXXXX") || return 1
+    if ! jq -n \
+        --arg phase "$phase" --arg old_repo "${GITHUB_ACCOUNT_SWITCH_OLD_REPO:-}" \
+        --arg new_repo "${GITHUB_ACCOUNT_SWITCH_NEW_REPO:-}" \
+        --arg branch "${GITHUB_ACCOUNT_SWITCH_BRANCH:-}" \
+        --arg initial_login "${GITHUB_ACCOUNT_SWITCH_INITIAL_LOGIN:-}" \
+        --arg expected_head "$expected_head" \
+        --argjson old_state_available "$old_state_available" \
+        --argjson repo_created "$repo_created" \
+        --argjson repo_privatized "$repo_privatized" \
+        '{
+            version: 1, phase: $phase, old_repo: $old_repo, new_repo: $new_repo,
+            branch: $branch, initial_login: $initial_login,
+            expected_head: (if $expected_head == "" then null else $expected_head end),
+            old_state_available: $old_state_available, repo_created: $repo_created,
+            repo_privatized: $repo_privatized
+        }' > "$tmp" ||
+       ! chmod 600 "$tmp" ||
+       ! github_account_switch_marker_valid "$tmp" ||
+       ! mv "$tmp" "$GITHUB_ACCOUNT_SWITCH_MARKER"; then
+        rm -f "$tmp"
+        return 1
+    fi
+}
+
+_github_account_switch_remove_path() {
+    local path="${1:-}"
+    _github_account_switch_path_is_managed "$path" || return 1
+    [[ -e "$path" || -L "$path" ]] || return 0
+    rm -rf "$path"
+}
+
+_github_account_switch_remove_file() {
+    local path="${1:-}"
+    _github_account_switch_path_is_managed "$path" || return 1
+    [[ -e "$path" || -L "$path" ]] || return 0
+    _github_exact_regular_file "$path" || return 1
+    rm -f "$path"
+}
+
+
+github_account_switch_begin() {
+    local old_repo="${1:-}" new_repo="${2:-}" branch="${3:-}" initial_login="${4:-}"
+    local entry worktree=""
+    [[ "$old_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ &&
+       "$new_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ &&
+       "$branch" =~ ^[A-Za-z0-9._/-]+$ &&
+       "$initial_login" =~ ^[A-Za-z0-9-]+$ ]] || {
+        _github_record_error "подготовка смены аккаунта GitHub" \
+            "Параметры транзакции смены аккаунта имеют некорректный формат."
+        return 1
+    }
+    if [[ -e "$GITHUB_ACCOUNT_SWITCH_MARKER" || -L "$GITHUB_ACCOUNT_SWITCH_MARKER" ]]; then
+        _github_record_error "подготовка смены аккаунта GitHub" \
+            "Обнаружена незавершённая или повреждённая смена аккаунта GitHub."
+        return 1
+    fi
+    _github_mkdir_secure "$GITHUB_ACCOUNT_SWITCH_DIR" || {
+        _github_record_error "подготовка смены аккаунта GitHub" \
+            "Не удалось подготовить защищённый каталог транзакции."
+        return 1
+    }
+    if [[ -n "${GITHUB_STORE:-}" && -d "$GITHUB_STORE" && ! -L "$GITHUB_STORE" ]]; then
+        git --git-dir="$GITHUB_STORE" worktree prune >/dev/null 2>&1 || {
+            _github_record_error "проверка активных сессий GitHub" \
+                "Не удалось очистить устаревшие регистрации рабочих копий."
+            return 1
+        }
+        while IFS= read -r entry; do
+            case "$entry" in
+                worktree\ *) worktree="${entry#worktree }" ;;
+                bare) worktree="" ;;
+                "")
+                    if [[ -n "$worktree" && "$worktree" != "${GITHUB_WORKTREE:-}" ]]; then
+                        _github_record_error "проверка активных сессий GitHub" \
+                            "Другой экземпляр уже использует рабочую копию GitHub. Закройте его и повторите смену аккаунта."
+                        return 1
+                    fi
+                    worktree=""
+                    ;;
+            esac
+        done < <(git --git-dir="$GITHUB_STORE" worktree list --porcelain 2>/dev/null)
+        if [[ -n "$worktree" && "$worktree" != "${GITHUB_WORKTREE:-}" ]]; then
+            _github_record_error "проверка активных сессий GitHub" \
+                "Другой экземпляр уже использует рабочую копию GitHub. Закройте его и повторите смену аккаунта."
+            return 1
+        fi
+    fi
+    GITHUB_ACCOUNT_SWITCH_OLD_REPO="$old_repo"
+    GITHUB_ACCOUNT_SWITCH_NEW_REPO="$new_repo"
+    GITHUB_ACCOUNT_SWITCH_BRANCH="$branch"
+    GITHUB_ACCOUNT_SWITCH_INITIAL_LOGIN="$initial_login"
+    GITHUB_ACCOUNT_SWITCH_REPO_CREATED=false
+    GITHUB_ACCOUNT_SWITCH_REPO_PRIVATIZED=false
+    export GITHUB_ACCOUNT_SWITCH_OLD_REPO GITHUB_ACCOUNT_SWITCH_NEW_REPO
+    export GITHUB_ACCOUNT_SWITCH_BRANCH GITHUB_ACCOUNT_SWITCH_INITIAL_LOGIN
+    export GITHUB_ACCOUNT_SWITCH_REPO_CREATED GITHUB_ACCOUNT_SWITCH_REPO_PRIVATIZED
+    _github_account_switch_write_marker prepared "" false false false || {
+        _github_record_error "подготовка смены аккаунта GitHub" \
+            "Не удалось записать защищённую транзакцию смены аккаунта."
+        return 1
+    }
+}
+
+github_account_switch_finalize() {
+    local desired_state="${1:-}" external_committed="${2:-false}"
+    local expected_head="${3:-}" marker phase old_state_available repo_created repo_privatized
+    local target_origin
+    marker="$GITHUB_ACCOUNT_SWITCH_MARKER"
+    github_account_switch_marker_valid "$marker" || {
+        _github_record_error "локальная финализация смены аккаунта GitHub" "Маркер транзакции недоступен."
+        return 1
+    }
+    phase=$(jq -er '.phase' "$marker") || {
+        _github_record_error "локальная финализация смены аккаунта GitHub" "Не удалось прочитать фазу транзакции."
+        return 1
+    }
+    _github_exact_regular_file "$desired_state" || {
+        _github_record_error "локальная финализация смены аккаунта GitHub" "Снимок целевой конфигурации недоступен."
+        return 1
+    }
+    github_config_validate "$desired_state" || {
+        _github_record_error "локальная финализация смены аккаунта GitHub" "Снимок целевой конфигурации имеет некорректную структуру."
+        return 1
+    }
+    case "$phase" in
+        prepared|push_unknown|target_committed) ;;
+        local_committed) return 0 ;;
+        *) _github_record_error "локальная финализация смены аккаунта GitHub" "Неизвестная фаза транзакции."; return 1 ;;
+    esac
+    if [[ "$external_committed" == true && "$phase" == prepared ]]; then
+        _github_record_error "локальная финализация смены аккаунта GitHub" "Публикация не подтверждена."
+        return 1
+    fi
+    old_state_available=$(jq -r '.old_state_available' "$marker") || return 1
+    repo_created=$(jq -r '.repo_created' "$marker") || return 1
+    repo_privatized=$(jq -r '.repo_privatized' "$marker") || return 1
+    if [[ -d "$GITHUB_ACCOUNT_SWITCH_DIR/target-store.git" &&
+          ! -L "$GITHUB_ACCOUNT_SWITCH_DIR/target-store.git" ]]; then
+        _github_account_switch_remove_path "$GITHUB_ACCOUNT_SWITCH_DIR/old-store.git" || {
+            _github_record_error "локальная финализация смены аккаунта GitHub" "Не удалось подготовить резерв прежнего хранилища."
+            return 1
+        }
+        if [[ -d "$GITHUB_STORE" && ! -L "$GITHUB_STORE" ]] &&
+           ! mv "$GITHUB_STORE" "$GITHUB_ACCOUNT_SWITCH_DIR/old-store.git"; then
+            _github_record_error "локальная финализация смены аккаунта GitHub" "Не удалось переместить прежнее хранилище GitHub."
+            return 1
+        fi
+        if ! mv "$GITHUB_ACCOUNT_SWITCH_DIR/target-store.git" "$GITHUB_STORE"; then
+            _github_record_error "локальная финализация смены аккаунта GitHub" "Не удалось установить новое хранилище GitHub."
+            return 1
+        fi
+    else
+        target_origin=$(git --git-dir="$GITHUB_STORE" remote get-url origin 2>/dev/null) || {
+            _github_record_error "локальная финализация смены аккаунта GitHub" "Не удалось проверить установленное хранилище GitHub."
+            return 1
+        }
+        [[ "$target_origin" == "https://github.com/${GITHUB_ACCOUNT_SWITCH_NEW_REPO}.git" &&
+           -d "$GITHUB_ACCOUNT_SWITCH_DIR/old-store.git" ]] || {
+            _github_record_error "локальная финализация смены аккаунта GitHub" "Хранилище транзакции не соответствует выбранному репозиторию."
+            return 1
+        }
+    fi
+    if [[ "$external_committed" == true ]]; then
+        _github_account_switch_write_marker target_committed "$expected_head" \
+            "$old_state_available" "$repo_created" "$repo_privatized" || {
+            _github_record_error "локальная финализация смены аккаунта GitHub" "Не удалось зафиксировать подтверждённую отправку."
+            return 1
+        }
+    fi
+    return 0
+}
+
+github_account_switch_commit_local() {
+    local marker="$GITHUB_ACCOUNT_SWITCH_MARKER"
+    local phase old_state_available repo_created repo_privatized
+    github_account_switch_marker_valid "$marker" || return 1
+    phase=$(jq -er '.phase' "$marker") || return 1
+    [[ "$phase" == prepared || "$phase" == target_committed ]] || return 1
+    old_state_available=$(jq -r '.old_state_available' "$marker") || return 1
+    repo_created=$(jq -r '.repo_created' "$marker") || return 1
+    repo_privatized=$(jq -r '.repo_privatized' "$marker") || return 1
+    _github_account_switch_write_marker local_committed "" \
+        "$old_state_available" "$repo_created" "$repo_privatized"
+}
+
+github_account_switch_rollback() {
+    local phase marker old_repo initial_login cleanup_ok=true switch_error=""
+    marker="$GITHUB_ACCOUNT_SWITCH_MARKER"
+    github_account_switch_marker_valid "$marker" || return 1
+    phase=$(jq -er '.phase' "$marker") || return 1
+    [[ "$phase" != target_committed && "$phase" != local_committed ]] || return 1
+    old_repo=$(jq -er '.old_repo' "$marker") || return 1
+    initial_login=$(jq -er '.initial_login' "$marker") || return 1
+    _github_account_switch_remove_path "$GITHUB_ACCOUNT_SWITCH_DIR/target-store.git" || cleanup_ok=false
+    _github_account_switch_remove_path "$GITHUB_ACCOUNT_SWITCH_DIR/target-sessions" || cleanup_ok=false
+    _github_account_switch_remove_path "$GITHUB_ACCOUNT_SWITCH_DIR/cached-sessions" || cleanup_ok=false
+    _github_account_switch_remove_file "$GITHUB_ACCOUNT_SWITCH_DIR/old-source.json" || cleanup_ok=false
+    _github_account_switch_remove_file "$GITHUB_ACCOUNT_SWITCH_DIR/old-state.json" || cleanup_ok=false
+    _github_account_switch_remove_file "$GITHUB_ACCOUNT_SWITCH_DIR/target-state.json" || cleanup_ok=false
+    if ! _github_switch_active_account "$initial_login"; then
+        switch_error="${GITHUB_LAST_ERROR:-Не удалось восстановить активный аккаунт GitHub.}"
+        cleanup_ok=false
+    fi
+    GITHUB_OWNER="${old_repo%%/*}"
+    GITHUB_ACTIVE_LOGIN="$initial_login"
+    export GITHUB_OWNER GITHUB_ACTIVE_LOGIN
+    if ! _github_account_switch_remove_file "$marker"; then
+        cleanup_ok=false
+    fi
+    rmdir "$GITHUB_ACCOUNT_SWITCH_DIR" 2>/dev/null || true
+    if [[ "$cleanup_ok" != true ]]; then
+        [[ -z "$switch_error" ]] || _github_record_error "восстановление аккаунта GitHub" "$switch_error"
+        return 1
+    fi
+}
+
+
+_github_account_switch_finish_target() {
+    local old_store="${GITHUB_STORE:-${CONFIG_DIR:-.}/github-store.git}"
+    local sessions="${GITHUB_SESSIONS_DIR:-${CONFIG_DIR:-.}/github-sessions}"
+    local branch new_repo target_state="$GITHUB_ACCOUNT_SWITCH_DIR/target-state.json"
+    branch=$(jq -er '.branch' "$GITHUB_ACCOUNT_SWITCH_MARKER") || return 1
+    new_repo=$(jq -er '.new_repo' "$GITHUB_ACCOUNT_SWITCH_MARKER") || return 1
+    GITHUB_STORE="$old_store"; GITHUB_SESSIONS_DIR="$sessions"
+    GITHUB_REMOTE="https://github.com/$new_repo.git"; GITHUB_BRANCH="$branch"
+    GITHUB_OWNER="${new_repo%%/*}"; GITHUB_REPO_NAME="${new_repo#*/}"
+    GITHUB_SESSION_ID=""; GITHUB_WORKTREE=""
+    if [[ -d "$GITHUB_ACCOUNT_SWITCH_DIR/target-store.git" ]]; then
+        github_account_switch_finalize "$target_state" false || return 1
+    fi
+    _github_session_open_cached "$old_store" "$sessions" "$branch" || return 1
+    declare -F _config_source_materialize_state >/dev/null 2>&1 || return 1
+    _config_source_materialize_state "$target_state" || return 1
+    declare -F github_source_metadata_write >/dev/null 2>&1 || return 1
+    github_source_metadata_write || return 1
+    github_account_switch_commit_local || return 1
+}
+
+github_account_switch_recover() {
+    local marker="$GITHUB_ACCOUNT_SWITCH_MARKER" expected head old_state_available
+    local repo_created repo_privatized target_store phase
+    if [[ ! -e "$marker" ]]; then
+        return 0
+    fi
+    github_account_switch_marker_valid "$marker" || {
+        _github_record_error "восстановление смены аккаунта GitHub" \
+            "Транзакция смены аккаунта GitHub повреждена и требует ручного вмешательства."
+        return 1
+    }
+    GITHUB_ACCOUNT_SWITCH_OLD_REPO=$(jq -er '.old_repo' "$marker") || return 1
+    GITHUB_ACCOUNT_SWITCH_NEW_REPO=$(jq -er '.new_repo' "$marker") || return 1
+    GITHUB_ACCOUNT_SWITCH_BRANCH=$(jq -er '.branch' "$marker") || return 1
+    GITHUB_ACCOUNT_SWITCH_INITIAL_LOGIN=$(jq -er '.initial_login' "$marker") || return 1
+    old_state_available=$(jq -r '.old_state_available' "$marker") || return 1
+    repo_created=$(jq -r '.repo_created' "$marker") || return 1
+    repo_privatized=$(jq -r '.repo_privatized' "$marker") || return 1
+    export GITHUB_ACCOUNT_SWITCH_OLD_REPO GITHUB_ACCOUNT_SWITCH_NEW_REPO
+    export GITHUB_ACCOUNT_SWITCH_BRANCH GITHUB_ACCOUNT_SWITCH_INITIAL_LOGIN
+    phase=$(jq -er '.phase' "$marker") || return 1
+    case "$phase" in
+        prepared)
+            github_account_switch_rollback
+            ;;
+        push_unknown)
+            expected=$(jq -er '.expected_head // empty' "$marker") || return 1
+            target_store="$GITHUB_ACCOUNT_SWITCH_DIR/target-store.git"
+            [[ -n "$expected" && -d "$target_store" && ! -L "$target_store" ]] || return 1
+            git --git-dir="$target_store" fetch --no-tags origin \
+                "$GITHUB_ACCOUNT_SWITCH_BRANCH:refs/remotes/origin/$GITHUB_ACCOUNT_SWITCH_BRANCH" \
+                >/dev/null 2>&1 || return 1
+            head=$(git --git-dir="$target_store" rev-parse \
+                "refs/remotes/origin/$GITHUB_ACCOUNT_SWITCH_BRANCH") || return 1
+            if [[ "$head" == "$expected" ]] ||
+               git --git-dir="$target_store" merge-base --is-ancestor "$expected" "$head"; then
+                _github_account_switch_write_marker target_committed "$head" \
+                    "$old_state_available" "$repo_created" "$repo_privatized" || return 1
+                if declare -F _config_source_materialize_state >/dev/null 2>&1; then
+                    _github_account_switch_finish_target || return 1
+                    github_account_switch_recover
+                fi
+            else
+                github_account_switch_rollback
+            fi
+            ;;
+        target_committed)
+            if declare -F _config_source_materialize_state >/dev/null 2>&1; then
+                _github_account_switch_finish_target || return 1
+                github_account_switch_recover
+            fi
+            ;;
+        local_committed)
+            _github_account_switch_remove_path "$GITHUB_ACCOUNT_SWITCH_DIR/old-store.git" || return 1
+            _github_account_switch_remove_path "$GITHUB_ACCOUNT_SWITCH_DIR/target-sessions" || return 1
+            _github_account_switch_remove_file "$marker" || return 1
+            _github_account_switch_remove_file "$GITHUB_ACCOUNT_SWITCH_DIR/old-source.json" || return 1
+            _github_account_switch_remove_file "$GITHUB_ACCOUNT_SWITCH_DIR/old-state.json" || return 1
+            _github_account_switch_remove_file "$GITHUB_ACCOUNT_SWITCH_DIR/target-state.json" || return 1
+            rmdir "$GITHUB_ACCOUNT_SWITCH_DIR" 2>/dev/null || true
+            ;;
+        *) return 1 ;;
+    esac
+}
 
 
 legacy_local_source_metadata_valid() {
@@ -1929,11 +2325,39 @@ _github_session_target_guard() {
         return 1
     fi
 }
+_github_session_open_cached() {
+    local store="${1:-}" sessions="${2:-}" branch="${3:-}" dir session git_output
+    [[ -d "$store" && -d "$store/objects" &&
+       "$branch" =~ ^[A-Za-z0-9._/-]+$ ]] || return 1
+    git --git-dir="$store" show-ref --verify --quiet "refs/heads/$branch" || return 1
+    _github_mkdir_secure "$sessions" || return 1
+    session="${GITHUB_SESSION_ID:-cached-$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM}"
+    dir="$sessions/$session"
+    _github_mkdir_secure "$dir" || return 1
+    if ! git_output=$(git --git-dir="$store" worktree add \
+        -b "session/$session" "$dir/worktree" "$branch" 2>&1); then
+        rmdir "$dir" 2>/dev/null || true
+        return 1
+    fi
+    chmod 700 "$dir" "$dir/worktree" || return 1
+    GITHUB_STORE="$store"
+    GITHUB_SESSIONS_DIR="$sessions"
+    GITHUB_SESSION_ID="$session"
+    GITHUB_WORKTREE="$dir/worktree"
+    GITHUB_BRANCH="$branch"
+    GITHUB_REMOTE=$(git --git-dir="$store" remote get-url origin 2>/dev/null || true)
+    GITHUB_SESSION_REMOTE="$GITHUB_REMOTE"
+    GITHUB_SESSION_BRANCH="$branch"
+    GITHUB_SESSION_ORIGIN="$GITHUB_REMOTE"
+    export GITHUB_STORE GITHUB_SESSIONS_DIR GITHUB_SESSION_ID GITHUB_WORKTREE
+    export GITHUB_SESSION_REMOTE GITHUB_SESSION_BRANCH GITHUB_SESSION_ORIGIN
+}
 
 
 github_sync_init() {
     local allow_create="${1:-false}"
     local init_mode="${2:-resume}"
+    local allow_make_private="${3:-false}"
     _github_clear_error
     case "$init_mode" in
         resume|onboarding) ;;
@@ -2021,12 +2445,29 @@ github_sync_init() {
                 return 1
             fi
             remote_view='{"visibility":"PRIVATE"}'
+            GITHUB_ACCOUNT_SWITCH_REPO_CREATED=true
         fi
         if ! printf '%s' "$remote_view" |
             jq -e '.visibility == "PRIVATE"' >/dev/null 2>&1; then
-            _github_record_error "проверка приватного репозитория" \
-                "Репозиторий $repo должен быть приватным."
-            return 1
+            if [[ "$allow_make_private" != true ]] ||
+               ! confirm_yn "Репозиторий $repo публичный. Сделать его приватным?" N; then
+                _github_record_error "проверка приватного репозитория" \
+                    "Репозиторий $repo должен быть приватным."
+                return 1
+            fi
+            if ! git_output=$(NO_COLOR=1 GH_PROMPT_DISABLED=1 "$gh" repo edit "$repo" \
+                --visibility private --accept-visibility-change-consequences 2>&1); then
+                _github_record_error "изменение видимости репозитория" "$git_output"
+                return 1
+            fi
+            GITHUB_ACCOUNT_SWITCH_REPO_PRIVATIZED=true
+            if ! remote_view=$(NO_COLOR=1 GH_PROMPT_DISABLED=1 "$gh" repo view "$repo" \
+                --json visibility 2>&1) ||
+               ! printf '%s' "$remote_view" | jq -e '.visibility == "PRIVATE"' >/dev/null 2>&1; then
+                _github_record_error "проверка приватного репозитория" \
+                    "Не удалось подтвердить приватность репозитория $repo."
+                return 1
+            fi
         fi
         GITHUB_REMOTE="https://github.com/$repo.git"
     fi
@@ -2058,8 +2499,7 @@ github_sync_init() {
             fi
             remote_changed=true
         fi
-    elif ! git_output=$(git --git-dir="$GITHUB_STORE" remote add \
-        origin "$GITHUB_REMOTE" 2>&1); then
+    elif ! git_output=$(git --git-dir="$GITHUB_STORE" remote add origin "$GITHUB_REMOTE" 2>&1); then
         _github_record_error "настройка адреса репозитория" "$git_output"
         return 1
     fi
@@ -2353,6 +2793,46 @@ _github_stage_allowlist() {
     done
     ((${#existing[@]} == 0)) ||
         git -C "$GITHUB_WORKTREE" add -A -- "${existing[@]}"
+}
+
+_github_sync_commit() {
+    local had_files=false commit_output head_output update_store_ref=true
+    [[ -n "$(git -C "$GITHUB_WORKTREE" ls-files 2>/dev/null)" ]] && had_files=true
+    _github_stage_allowlist || return 1
+    if git -C "$GITHUB_WORKTREE" diff --cached --quiet; then
+        [[ "$GITHUB_SYNC_STATUS" == pending ]] || update_store_ref=false
+    else
+        commit_output=$(git -C "$GITHUB_WORKTREE" \
+            -c user.name='Essence Remote Control' \
+            -c user.email='remote-control@localhost' commit -m \
+            "remote-control: $([[ "$had_files" == false ]] && printf '%s' 'initialize state' || printf '%s' 'sync state')" 2>&1) || {
+            _github_record_error "сохранение локальных изменений Git" "$commit_output"
+            return 1
+        }
+    fi
+    head_output=$(git -C "$GITHUB_WORKTREE" rev-parse HEAD 2>&1) || {
+        _github_record_error "чтение локальной версии конфигурации" "$head_output"
+        return 1
+    }
+    GITHUB_LAST_COMMIT_HEAD="$head_output"
+    [[ "$update_store_ref" == true ]] || return 0
+    git --git-dir="$GITHUB_STORE" update-ref "refs/heads/$GITHUB_BRANCH" "$head_output" || {
+        _github_record_error "сохранение локальной точки восстановления" \
+            "Не удалось закрепить локальный commit конфигурации."
+        return 1
+    }
+}
+
+_github_sync_push() {
+    local expected_head="${1:-${GITHUB_LAST_COMMIT_HEAD:-}}" push_output
+    [[ "$expected_head" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]] || return 1
+    push_output=$(GIT_TERMINAL_PROMPT=0 _github_run_with_timeout 30 \
+        git --git-dir="$GITHUB_STORE" push origin \
+        "refs/heads/session/$GITHUB_SESSION_ID:refs/heads/$GITHUB_BRANCH" 2>&1) || {
+        _github_record_error "отправка конфигурации в GitHub" "$push_output"
+        return 1
+    }
+    GITHUB_SYNC_STATUS=clean
 }
 
 github_sync_flush() {

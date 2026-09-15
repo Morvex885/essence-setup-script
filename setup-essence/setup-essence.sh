@@ -18,6 +18,13 @@ elif [[ -f "$SCRIPT_DIR/../common/common.sh" ]]; then
     source "$SCRIPT_DIR/../common/cert.sh"
     _proto_dir="$SCRIPT_DIR/../common/protocols"
 fi
+if [[ -f "$_proto_dir/../ensure-deps.sh" ]]; then
+    source "$_proto_dir/../ensure-deps.sh"
+elif [[ -f "$SCRIPT_DIR/common/ensure-deps.sh" ]]; then
+    source "$SCRIPT_DIR/common/ensure-deps.sh"
+elif [[ -f "$SCRIPT_DIR/../common/ensure-deps.sh" ]]; then
+    source "$SCRIPT_DIR/../common/ensure-deps.sh"
+fi
 # Подключаем protocol builders
 for _f in "$_proto_dir"/*.sh; do
     [[ -f "$_f" ]] && source "$_f"
@@ -31,10 +38,16 @@ source "$SCRIPT_DIR/modules/warp.sh"
 source "$SCRIPT_DIR/modules/amneziawg.sh"
 source "$SCRIPT_DIR/modules/cascade.sh"
 source "$SCRIPT_DIR/modules/subscription.sh"
+source "$SCRIPT_DIR/modules/telegram-proxy.sh"
 source "$SCRIPT_DIR/modules/uninstall.sh"
 
-# ─── Проверка root ───────────────────────────────────────────────────────────
-[[ $EUID -ne 0 ]] && error "Запустите скрипт от root: sudo bash $0"
+if [[ $EUID -ne 0 ]]; then
+    warn "Запустите скрипт от root: sudo bash $0"
+    if [[ -t 0 && -t 1 ]]; then
+        startup_recovery_menu "Требуются права root" false || true
+    fi
+    exit 1
+fi
 
 # ─── Текущая версия + фоновая проверка обновления ────────────────────────────
 CURRENT_VERSION="none"
@@ -87,41 +100,43 @@ show_server_config() {
 
 # ─── Меню ────────────────────────────────────────────────────────────────────
 show_menu() {
-    local latest
+    local latest _domain _ver _upd _rmode _sni _rline _vless=() _other=() _vstr _pstr
     latest=$(latest_version)
 
     echo ""
-    local _domain
     _domain=$(grep '^DOMAIN=' /etc/mihomo/reality.conf 2>/dev/null | cut -d= -f2)
     box_top
     box_center "Essence Setup"
-    local _ver="версия: ${CURRENT_VERSION}"
+    _ver="версия: ${CURRENT_VERSION}"
     box_center "$_ver" "${DIM}${_ver}${NC}"
-    if [[ -n "$_domain" ]]; then
-        box_center "$_domain" "${CYAN}${_domain}${NC}"
-    fi
+    [[ -n "$_domain" ]] && box_line " Домен: ${_domain}"
     if has_update "$CURRENT_VERSION"; then
-        local _upd="↑ ${latest} — пункт 10"
-        box_center "$_upd" "${YELLOW}↑ ${latest} — пункт 10${NC}"
+        _upd="↑ ${latest} — пункт 10"
+        box_line "$_upd" "${YELLOW}${_upd}${NC}"
     fi
-    # Reality
     if [[ -f /etc/mihomo/reality.conf ]]; then
-        local _rmode _sni
         _rmode=$(grep '^MODE=' /etc/mihomo/reality.conf 2>/dev/null | cut -d= -f2)
         _sni=$(grep '^SNI_DOMAIN=' /etc/mihomo/reality.conf 2>/dev/null | cut -d= -f2)
         if [[ -n "$_rmode" && -n "$_sni" ]]; then
-            local _rline
             if [[ "$_rmode" == "self-steal" ]]; then
                 _rline="Reality: self-steal"
             else
                 _rline="Reality SNI: ${_sni}"
             fi
-            box_center "$_rline" "${DIM}${_rline}${NC}"
+            box_line "$_rline" "${DIM}${_rline}${NC}"
         fi
     fi
-    # Протоколы
+    if _telegram_proxy_component_enabled web; then
+        box_line " WEB: включён" " ${GREEN}WEB: включён${NC}"
+    else
+        box_line " WEB: выключен" " ${DIM}WEB: выключен${NC}"
+    fi
+    if _telegram_proxy_component_enabled mtproto; then
+        box_line " MTProto: включён" " ${GREEN}MTProto: включён${NC}"
+    else
+        box_line " MTProto: выключен" " ${DIM}MTProto: выключен${NC}"
+    fi
     if [[ -f /etc/mihomo/config.yaml ]]; then
-        local _vless=() _other=()
         grep -q '# --- vless-tcp ---' /etc/mihomo/config.yaml 2>/dev/null && _vless+=("TCP")
         grep -q '# --- vless-xhttp ---' /etc/mihomo/config.yaml 2>/dev/null && _vless+=("xHTTP")
         grep -q '# --- vless-grpc ---' /etc/mihomo/config.yaml 2>/dev/null && _vless+=("gRPC")
@@ -130,36 +145,43 @@ show_menu() {
         grep -q '# --- warp ---' /etc/mihomo/config.yaml 2>/dev/null && _other+=("WARP")
         if [[ ${#_vless[@]} -gt 0 || ${#_other[@]} -gt 0 ]]; then
             local _parts=()
-            if [[ ${#_vless[@]} -gt 0 ]]; then
-                local _vstr
-                _vstr=$(IFS=', '; echo "${_vless[*]}")
-                _parts+=("VLESS: ${_vstr}")
-            fi
+            [[ ${#_vless[@]} -gt 0 ]] && _parts+=("VLESS: $(IFS=', '; echo "${_vless[*]}")")
             [[ ${#_other[@]} -gt 0 ]] && _parts+=("$(IFS=', '; echo "${_other[*]}")")
-            local _pstr
             _pstr=$(IFS=' | '; echo "${_parts[*]}")
             box_mid
-            box_center "$_pstr" "${GREEN}${_pstr}${NC}"
+            box_line " $_pstr" " ${GREEN}${_pstr}${NC}"
         fi
     fi
+    box_mid
+    menu_item 1 "Базовая установка" GREEN
+    menu_item 2 "VLESS Reality" GREEN
+    menu_item 3 "Hysteria2" GREEN
+    menu_item 4 "AmneziaWG 2.0" GREEN
+    menu_item 5 "IPv6" YELLOW
+    menu_item 6 "WARP" YELLOW
+    menu_item 7 "Каскады нод" YELLOW
+    menu_item 8 "Показать клиентский конфиг" CYAN
+    menu_item 9 "Показать серверный конфиг" CYAN
+    menu_item 10 "Обновить скрипты" YELLOW
+    menu_item s "Хостинг подписок" CYAN
+    menu_item t "Telegram Proxy" CYAN
+    menu_item u "Удалить всё установленное" RED
+    menu_item 0 "Выход" NC
     box_bot
     echo ""
-    echo -e "  ${GREEN}1)${NC} Базовая установка"
-    echo -e "  ${GREEN}2)${NC} VLESS Reality"
-    echo -e "  ${GREEN}3)${NC} Hysteria2"
-    echo -e "  ${GREEN}4)${NC} AmneziaWG 2.0"
-    echo -e "  ${YELLOW}5)${NC} IPv6"
-    echo -e "  ${YELLOW}6)${NC} WARP"
-    echo -e "  ${YELLOW}7)${NC} Каскады нод"
-    echo -e "  ${CYAN}8)${NC} Показать клиентский конфиг"
-    echo -e "  ${CYAN}9)${NC} Показать серверный конфиг"
-    echo -e "  ${CYAN}10)${NC} Обновить скрипты"
-    echo -e "  ${GREEN}s)${NC} Subscription hosting"
-    echo -e "  ${RED}u)${NC} Удалить всё установленное"
-    echo -e "  ${NC}0)${NC} Выход"
-    echo ""
-    read -rp "Выберите пункт [0-10, s, u]: " CHOICE
+    if ! IFS= read -rp "  Выберите действие: " CHOICE; then
+        return 1
+    fi
+    CHOICE="${CHOICE%$'\r'}"
+    return 0
 }
+
+# ─── Точка входа ─────────────────────────────────────────────────────────────
+if [[ "${1:-}" == "telegram-proxy" ]]; then
+    shift
+    telegram_proxy_cli "$@"
+    exit $?
+fi
 
 # ─── Точка входа ─────────────────────────────────────────────────────────────
 INITIAL_CHOICE="${1:-}"
@@ -168,7 +190,7 @@ while true; do
         CHOICE="$INITIAL_CHOICE"
         INITIAL_CHOICE=""
     else
-        show_menu
+        show_menu || exit 0
     fi
     case "$CHOICE" in
         1) install_base ;;
@@ -180,10 +202,15 @@ while true; do
         7) cascade_menu ;;
         8) show_client_config ;;
         9) show_server_config ;;
-        10) self_update; CURRENT_VERSION=$(tr -d '\r' < "$SCRIPT_DIR/VERSION" 2>/dev/null || tr -d '\r' < "$SCRIPT_DIR/../VERSION" 2>/dev/null || echo "none") ;;
+        10)
+            self_update
+            CURRENT_VERSION=$(tr -d '\r' < "$SCRIPT_DIR/VERSION" 2>/dev/null ||
+                tr -d '\r' < "$SCRIPT_DIR/../VERSION" 2>/dev/null || echo "none")
+            ;;
         s|S) subscription_menu ;;
-        u) uninstall ;;
-        0) echo "Выход."; exit 0 ;;
-        *) warn "Неверный выбор: $CHOICE" ;;
+        t|T) telegram_proxy_menu ;;
+        u|U) uninstall || warn "Удаление завершилось с ошибкой; меню остаётся доступно." ;;
+        0) exit 0 ;;
+        *) warn "Неверный выбор." ;;
     esac
 done

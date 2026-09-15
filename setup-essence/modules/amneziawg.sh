@@ -949,43 +949,47 @@ proxies:
 }
 
 awg_menu() {
-    echo ""
-    box_top
-    box_center "AmneziaWG"
-    box_bot
-    echo ""
-    if _awg_packages_installed; then
-        echo -e "  Пакеты:        ${GREEN}установлены${NC}"
-    else
-        echo -e "  Пакеты:        ${RED}не установлены${NC}"
-    fi
-    if [[ -f "$AWG_CONF" ]]; then
-        echo -e "  Конфигурация:  ${GREEN}создана${NC}"
-    else
-        echo -e "  Конфигурация:  ${RED}не создана${NC}"
-    fi
-    if systemctl is-active --quiet awg-quick@awg0 2>/dev/null && ip link show awg0 >/dev/null 2>&1; then
-        echo -e "  Сервис:        ${GREEN}активен (awg0)${NC}"
-    else
-        echo -e "  Сервис:        ${YELLOW}не активен${NC}"
-    fi
-    echo ""
-    echo -e "  ${GREEN}1)${NC} Установить AmneziaWG"
-    echo -e "  ${CYAN}2)${NC} Добавить клиента"
-    echo -e "  ${YELLOW}3)${NC} Удалить клиента"
-    echo -e "  ${RED}4)${NC} Удалить AmneziaWG"
-    echo -e "  ${NC}0)${NC} Назад"
-    echo ""
-    read -rp "Выберите действие [0-4]: " AWG_CHOICE
-
-    case "$AWG_CHOICE" in
-        1) install_awg || warn "Установка AmneziaWG завершилась ошибкой. Вы можете повторить её из этого меню." ;;
-        2) add_awg_peer || warn "Не удалось добавить клиента AmneziaWG." ;;
-        3) remove_awg_peer || warn "Не удалось удалить клиента AmneziaWG." ;;
-        4) uninstall_awg || warn "Не удалось удалить AmneziaWG." ;;
-        0) return ;;
-        *) warn "Неверный выбор." ;;
-    esac
+    while true; do
+        echo ""
+        box_top
+        box_center "AmneziaWG"
+        box_mid
+        if _awg_packages_installed; then
+            box_line " Пакеты: установлены" " Пакеты: ${GREEN}установлены${NC}"
+        else
+            box_line " Пакеты: не установлены" " Пакеты: ${RED}не установлены${NC}"
+        fi
+        if [[ -f "$AWG_CONF" ]]; then
+            box_line " Конфигурация: создана" " Конфигурация: ${GREEN}создана${NC}"
+        else
+            box_line " Конфигурация: не создана" " Конфигурация: ${RED}не создана${NC}"
+        fi
+        if systemctl is-active --quiet awg-quick@awg0 2>/dev/null && ip link show awg0 >/dev/null 2>&1; then
+            box_line " Сервис: активен (awg0)" " Сервис: ${GREEN}активен (awg0)${NC}"
+        else
+            box_line " Сервис: не активен" " Сервис: ${YELLOW}не активен${NC}"
+        fi
+        box_mid
+        menu_item 1 "Установить AmneziaWG" GREEN
+        menu_item 2 "Добавить клиента" CYAN
+        menu_item 3 "Удалить клиента" YELLOW
+        menu_item 4 "Удалить AmneziaWG" RED
+        menu_item 0 "Назад" NC
+        box_bot
+        echo ""
+        if ! IFS= read -rp "  Выберите действие: " AWG_CHOICE; then
+            return 0
+        fi
+        AWG_CHOICE="${AWG_CHOICE%$'\r'}"
+        case "$AWG_CHOICE" in
+            1) install_awg || warn "Установка AmneziaWG завершилась ошибкой. Повторите действие из меню." ;;
+            2) add_awg_peer || warn "Не удалось добавить клиента AmneziaWG." ;;
+            3) remove_awg_peer || warn "Не удалось удалить клиента AmneziaWG." ;;
+            4) uninstall_awg || warn "Не удалось удалить AmneziaWG." ;;
+            0) return 0 ;;
+            *) warn "Неверный выбор." ;;
+        esac
+    done
 }
 
 # ── Генерация обфускации (по аналогии с Amnezia-клиентом) ────────────────────
