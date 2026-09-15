@@ -399,56 +399,118 @@ EOF
 # ─── Удаление ───────────────────────────────────────────────────────────────
 
 remove_subscription() {
-    if ! _load_sub_conf; then
+    if [[ ! -f "$SUB_CONF" ]]; then
         warn "Subscription hosting не установлен."
-        return
+        return 0
+    fi
+    if ! _load_sub_conf; then
+        warn "Не удалось прочитать конфигурацию подписок."
+        return 1
     fi
 
     info "Удаляю subscription hosting..."
 
     # nginx
-    rm -f /etc/nginx/sites-enabled/essence-sub
-    rm -f /etc/nginx/sites-available/essence-sub
-    rm -f /etc/nginx/sites-enabled/essence-sub-http
-    rm -f /etc/nginx/sites-available/essence-sub-http
+    if ! rm -f \
+        /etc/nginx/sites-enabled/essence-sub \
+        /etc/nginx/sites-available/essence-sub \
+        /etc/nginx/sites-enabled/essence-sub-http \
+        /etc/nginx/sites-available/essence-sub-http
+    then
+        warn "Не удалось удалить nginx-конфигурацию подписок."
+        return 1
+    fi
 
     # stream-блок (SNI-режим)
     if [[ "$SUB_MODE" == "sni" ]]; then
-        sed -i "/${SUB_HOSTNAME}.*subscription;/d" /etc/nginx/nginx.conf
-        sed -i '/upstream subscription {/,/}/d' /etc/nginx/nginx.conf
+        if ! sed -i "/${SUB_HOSTNAME}.*subscription;/d" /etc/nginx/nginx.conf ||
+           ! sed -i '/upstream subscription {/,/}/d' /etc/nginx/nginx.conf
+        then
+            warn "Не удалось очистить nginx-конфигурацию подписок."
+            return 1
+        fi
     fi
 
     # limit_req_zone
-    sed -i '/zone=sub/d' /etc/nginx/nginx.conf
-
-    # ufw
-    if [[ "$SUB_MODE" == "standalone" ]]; then
-        ufw delete allow "${SUB_PORT}/tcp" > /dev/null 2>&1
+    if ! sed -i '/zone=sub/d' /etc/nginx/nginx.conf; then
+        warn "Не удалось очистить nginx-конфигурацию подписок."
+        return 1
     fi
 
-    nginx -t && systemctl reload nginx 2>/dev/null
+    # ufw
+    if [[ "$SUB_MODE" == "standalone" ]] &&
+       ! ufw delete allow "${SUB_PORT}/tcp" > /dev/null 2>&1
+    then
+        warn "Не удалось удалить правило firewall подписок."
+        return 1
+    fi
+
+    if ! nginx -t; then
+        warn "Nginx конфигурация не прошла проверку после удаления подписок."
+        return 1
+    fi
+    if ! systemctl reload nginx 2>/dev/null; then
+        warn "Не удалось перезагрузить Nginx после удаления подписок."
+        return 1
+    fi
 
     # cleanup timer
-    systemctl disable --now essence-sub-cleanup.timer 2>/dev/null
-    rm -f /etc/systemd/system/essence-sub-cleanup.service
-    rm -f /etc/systemd/system/essence-sub-cleanup.timer
-    rm -f /usr/local/bin/essence-sub-cleanup
-    systemctl daemon-reload
+    if [[ -e /etc/systemd/system/essence-sub-cleanup.timer ||
+          -L /etc/systemd/system/essence-sub-cleanup.timer ]] &&
+       ! systemctl disable --now essence-sub-cleanup.timer 2>/dev/null
+    then
+        warn "Не удалось остановить таймер очистки подписок."
+        return 1
+    fi
+    if ! rm -f \
+        /etc/systemd/system/essence-sub-cleanup.service \
+        /etc/systemd/system/essence-sub-cleanup.timer \
+        /usr/local/bin/essence-sub-cleanup
+    then
+        warn "Не удалось удалить автоочистку подписок."
+        return 1
+    fi
+    if ! systemctl daemon-reload; then
+        warn "Не удалось обновить конфигурацию systemd."
+        return 1
+    fi
 
     # cert
     local ACME=~/.acme.sh/acme.sh
-    if [[ -f "$ACME" ]]; then
-        $ACME --remove -d "$SUB_HOSTNAME" 2>/dev/null
+    local acme_conf="$HOME/.acme.sh/${SUB_HOSTNAME}/${SUB_HOSTNAME}.conf"
+    local acme_ecc_conf="$HOME/.acme.sh/${SUB_HOSTNAME}_ecc/${SUB_HOSTNAME}.conf"
+    if [[ -x "$ACME" ]]; then
+        if [[ -f "$acme_conf" ]] &&
+           ! "$ACME" --remove -d "$SUB_HOSTNAME" 2>/dev/null
+        then
+            warn "Не удалось удалить регистрацию сертификата подписок."
+            return 1
+        fi
+        if [[ -f "$acme_ecc_conf" ]] &&
+           ! "$ACME" --remove -d "$SUB_HOSTNAME" --ecc 2>/dev/null
+        then
+            warn "Не удалось удалить регистрацию сертификата подписок."
+            return 1
+        fi
     fi
-    rm -rf /etc/nginx/ssl/"$SUB_HOSTNAME"
-    rm -rf /var/www/"$SUB_HOSTNAME"
+    if ! rm -rf \
+        /etc/nginx/ssl/"$SUB_HOSTNAME" \
+        /var/www/"$SUB_HOSTNAME" \
+        "$SUB_DIR" \
+        /etc/nginx/snippets/essence-sub
+    then
+        warn "Не удалось удалить файлы подписок."
+        return 1
+    fi
 
     # данные и конфиг
-    rm -rf "$SUB_DIR"
-    rm -rf /etc/nginx/snippets/essence-sub
-    rm -f "$SUB_CONF"
+    if ! rm -f "$SUB_CONF"; then
+        warn "Не удалось удалить конфигурацию подписок."
+        return 1
+    fi
 
     success "Subscription hosting удалён"
+    return 0
 }
 
 # ─── Статус ─────────────────────────────────────────────────────────────────

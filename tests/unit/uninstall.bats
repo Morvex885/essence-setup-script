@@ -3,6 +3,8 @@
 setup() {
     load '../helpers/test_helper'
     setup_test_env
+    export HOME="$BATS_TEST_TMPDIR/home"
+    mkdir -p "$HOME"
     source_common
     export TPROXY_CONF="$BATS_TEST_TMPDIR/essence.conf"
     export TPROXY_ENV_FILE="$BATS_TEST_TMPDIR/mtproxy.env"

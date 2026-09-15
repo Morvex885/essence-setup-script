@@ -568,13 +568,19 @@ check_update_start() {
     local token="${GITHUB_TOKEN:-}"
     local curl_args=(-fsSL --connect-timeout 3 --max-time 5)
     [[ -n "$token" ]] && curl_args+=(-H "Authorization: token $token")
-    (
-        curl "${curl_args[@]}" \
-            "https://api.github.com/repos/${_REPO}/releases/latest" 2>/dev/null \
-        | grep -o '"tag_name": *"[^"]*"' \
-        | grep -o '"[^"]*"$' \
-        | tr -d '"' > "$_UPDATE_TMP"
-    ) &
+    if ! {
+        (
+            curl "${curl_args[@]}" \
+                "https://api.github.com/repos/${_REPO}/releases/latest" 2>/dev/null \
+            | grep -o '"tag_name": *"[^"]*"' \
+            | grep -o '"[^"]*"$' \
+            | tr -d '"' >&3
+        ) &
+    } 3>"$_UPDATE_TMP"; then
+        _cleanup_update_tmp
+        return 1
+    fi
+    return 0
 }
 
 # Возвращает тег последней версии (пусто если ещё не готово или ошибка)
