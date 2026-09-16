@@ -30,12 +30,24 @@ if ! printf '\n\ny\nn\n' | install_awg; then
     exit 1
 fi
 
-command -v awg >/dev/null 2>&1 || { warn "Smoke: awg не найден"; exit 1; }
-command -v awg-quick >/dev/null 2>&1 || { warn "Smoke: awg-quick не найден"; exit 1; }
-modinfo -k "$(uname -r)" amneziawg >/dev/null || { warn "Smoke: modinfo FAIL"; exit 1; }
+package candidate installed tools_version module_version
+for package in amneziawg amneziawg-tools amneziawg-dkms; do
+    candidate=$(LC_ALL=C apt-cache policy "$package" | awk '/Candidate:/ { print $2; exit }')
+    installed=$(dpkg-query -W -f='${Version}' "$package")
+    [[ -n "$candidate" && "$candidate" != "(none)" && "$installed" == "$candidate" ]] || {
+        warn "Smoke: $package не совпадает с APT candidate (установлено $installed, доступно $candidate)"
+        exit 1
+    }
+done
+tools_version=$(awg --version 2>&1 | awk 'match($0, /[0-9]+\.[0-9]+/) { print substr($0, RSTART, RLENGTH); exit }')
+module_version=$(modinfo -F version -k "$(uname -r)" amneziawg)
+dpkg --compare-versions "$tools_version" ge 3.1 || { warn "Smoke: awg-tools старее 3.1"; exit 1; }
+dpkg --compare-versions "$module_version" ge 3.1 || { warn "Smoke: DKMS-модуль старее 3.1"; exit 1; }
 systemctl is-active --quiet awg-quick@awg0 || { warn "Smoke: unit не активен"; exit 1; }
 ip link show awg0 >/dev/null 2>&1 || { warn "Smoke: интерфейс awg0 отсутствует"; exit 1; }
-success "Smoke install/start: OK"
+[[ "$(awg show awg0 random-trailers)" == "on" ]] || { warn "Smoke: random-trailers не включён"; exit 1; }
+[[ "$(awg show awg0 disable-cookies)" == "on" ]] || { warn "Smoke: disable-cookies не включён"; exit 1; }
+success "Smoke install/start: OK (AmneziaWG 3.1)"
 
 info "Smoke: remove (пакеты и PPA по политике проекта останутся)..."
 if ! printf 'y\n' | uninstall_awg; then

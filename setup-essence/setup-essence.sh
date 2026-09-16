@@ -156,7 +156,7 @@ show_menu() {
     menu_item 1 "Базовая установка" GREEN
     menu_item 2 "VLESS Reality" GREEN
     menu_item 3 "Hysteria2" GREEN
-    menu_item 4 "AmneziaWG 2.0" GREEN
+    menu_item 4 "AmneziaWG 3.1" GREEN
     menu_item 5 "IPv6" YELLOW
     menu_item 6 "WARP" YELLOW
     menu_item 7 "Каскады нод" YELLOW

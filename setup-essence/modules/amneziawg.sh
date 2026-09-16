@@ -100,7 +100,7 @@ _awg_detect_platform() {
     os_id=$(. "$AWG_OS_RELEASE"; printf '%s' "${ID:-}")
     version_id=$(. "$AWG_OS_RELEASE"; printf '%s' "${VERSION_ID:-}")
     case "${os_id}:${version_id}" in
-        debian:12|debian:13) AWG_APT_SUITE="focal" ;;
+        debian:12|debian:13) AWG_APT_SUITE="jammy" ;;
         ubuntu:22.04) AWG_APT_SUITE="jammy" ;;
         ubuntu:24.04) AWG_APT_SUITE="noble" ;;
         *)
@@ -493,7 +493,10 @@ _awg_show_module_diagnostics() {
 }
 
 _awg_ensure_packages() {
-    local candidate
+    local packages=("amneziawg" "amneziawg-tools" "amneziawg-dkms")
+    local candidates=() candidate installed package tools_output tools_version module_version
+    local i
+
     _awg_install_repository || { _awg_repo_abort; return 1; }
     _awg_apt_wait || {
         _awg_fail "Установка AWG прервана во время ожидания apt lock."
@@ -505,47 +508,80 @@ _awg_ensure_packages() {
         _awg_repo_abort
         return 1
     }
-    candidate=$(LC_ALL=C apt-cache policy amneziawg 2>/dev/null | awk '/Candidate:/ { print $2; exit }')
-    if [[ -z "$candidate" || "$candidate" == "(none)" ]]; then
-        _awg_fail "APT candidate для пакета amneziawg отсутствует (suite: $AWG_APT_SUITE, arch: $AWG_ARCH)."
-        _awg_repo_abort
-        return 1
-    fi
+    for i in "${!packages[@]}"; do
+        package="${packages[$i]}"
+        candidate=$(LC_ALL=C apt-cache policy "$package" 2>/dev/null \
+            | awk '/Candidate:/ { print $2; exit }')
+        if [[ -z "$candidate" || "$candidate" == "(none)" ]]; then
+            _awg_fail "APT candidate для пакета $package отсутствует (suite: $AWG_APT_SUITE, arch: $AWG_ARCH)."
+            _awg_repo_abort
+            return 1
+        fi
+        candidates[$i]="$candidate"
+    done
+
     _awg_apt_wait || {
         _awg_fail "Установка AWG прервана во время ожидания apt lock."
         _awg_repo_abort
         return 1
     }
-    DEBIAN_FRONTEND=noninteractive apt-get install -y amneziawg || {
-        _awg_fail "Не удалось установить метапакет amneziawg."
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}" || {
+        _awg_fail "Не удалось установить пакеты AmneziaWG 3.1."
         _awg_show_module_diagnostics
         _awg_repo_abort
         return 1
     }
+
+    for i in "${!packages[@]}"; do
+        package="${packages[$i]}"
+        installed=$(dpkg-query -W -f='${Version}' "$package" 2>/dev/null) || installed=""
+        if [[ -z "$installed" || "$installed" != "${candidates[$i]}" ]]; then
+            _awg_fail "Пакет $package не обновлён до актуального APT candidate: установлено ${installed:-?}, доступно ${candidates[$i]}."
+            _awg_repo_abort
+            return 1
+        fi
+    done
     if ! command -v awg >/dev/null 2>&1 || ! command -v awg-quick >/dev/null 2>&1; then
         _awg_fail "После установки не найдены awg и/или awg-quick."
         _awg_show_module_diagnostics
         _awg_repo_abort
         return 1
     fi
-    if ! modinfo -k "$AWG_KERNEL" amneziawg; then
-        _awg_fail "DKMS-модуль amneziawg не собран для ядра $AWG_KERNEL."
+
+    tools_output=$(awg --version 2>&1)
+    tools_version=$(printf '%s\n' "$tools_output" \
+        | awk 'match($0, /[0-9]+\.[0-9]+/) { print substr($0, RSTART, RLENGTH); exit }')
+    if [[ -z "$tools_version" ]] || ! dpkg --compare-versions "$tools_version" ge 3.1; then
+        _awg_fail "Инструменты AmneziaWG устарели: требуется версия не ниже 3.1 (обнаружено ${tools_version:-неизвестно})."
         _awg_show_module_diagnostics
         _awg_repo_abort
         return 1
     fi
-    if ! modprobe amneziawg; then
-        _awg_fail "Не удалось загрузить модуль amneziawg."
+    module_version=$(modinfo -F version -k "$AWG_KERNEL" amneziawg 2>/dev/null) || module_version=""
+    if [[ -z "$module_version" ]] || ! dpkg --compare-versions "$module_version" ge 3.1; then
+        _awg_fail "DKMS-модуль AmneziaWG устарел: требуется версия не ниже 3.1 (обнаружено ${module_version:-неизвестно})."
         _awg_show_module_diagnostics
         _awg_repo_abort
         return 1
     fi
+
     if ! command -v qrencode >/dev/null 2>&1; then
         _awg_apt_wait && DEBIAN_FRONTEND=noninteractive apt-get install -y qrencode || \
             warn "qrencode не установлен; PNG/ANSI QR-коды будут недоступны."
     fi
-    success "Пакеты AmneziaWG установлены, модуль загружен для $AWG_KERNEL"
+    success "Пакеты AmneziaWG 3.1 проверены для $AWG_KERNEL"
     return 0
+}
+
+_awg_module_loaded() {
+    grep -q '^amneziawg[[:space:]]' /proc/modules 2>/dev/null
+}
+
+_awg_reload_module() {
+    if _awg_module_loaded; then
+        modprobe -r amneziawg || return 1
+    fi
+    modprobe amneziawg
 }
 
 _awg_snapshot_path() {
@@ -652,17 +688,19 @@ _awg_prepare_mihomo_candidate() {
 }
 
 _awg_stage_server_config() {
-    local stage_dir="$1" server_private server_public psk old_umask
+    local stage_dir="$1" server_private server_public psk header_protection_key old_umask
     old_umask=$(umask)
     umask 077
     server_private=$(awg genkey) || { umask "$old_umask"; return 1; }
     server_public=$(printf '%s\n' "$server_private" | awg pubkey) || { umask "$old_umask"; return 1; }
     psk=$(awg genpsk) || { umask "$old_umask"; return 1; }
-    [[ -n "$server_private" && -n "$server_public" && -n "$psk" ]] || { umask "$old_umask"; return 1; }
+    header_protection_key=$(awg genkey) || { umask "$old_umask"; return 1; }
+    [[ -n "$server_private" && -n "$server_public" && -n "$psk" && -n "$header_protection_key" ]] || { umask "$old_umask"; return 1; }
     mkdir -p "$stage_dir" || { umask "$old_umask"; return 1; }
     printf '%s\n' "$server_private" > "$stage_dir/server_private.key" || { umask "$old_umask"; return 1; }
     printf '%s\n' "$server_public" > "$stage_dir/server_public.key" || { umask "$old_umask"; return 1; }
     printf '%s\n' "$psk" > "$stage_dir/psk.key" || { umask "$old_umask"; return 1; }
+    printf '%s\n' "$header_protection_key" > "$stage_dir/header_protection.key" || { umask "$old_umask"; return 1; }
     cat > "$stage_dir/awg0.conf" <<EOF
 [Interface]
 PrivateKey = $server_private
@@ -679,6 +717,15 @@ H1 = $AWG_H1
 H2 = $AWG_H2
 H3 = $AWG_H3
 H4 = $AWG_H4
+HeaderProtectionKey = $header_protection_key
+ContentPaddingAddition = $AWG_ContentPaddingAddition
+RekeyAfterTime = $AWG_RekeyAfterTime
+RekeyTimeout = $AWG_RekeyTimeout
+RejectAfterTime = $AWG_RejectAfterTime
+KeepaliveTimeout = $AWG_KeepaliveTimeout
+MaxHandshakeAttempts = $AWG_MaxHandshakeAttempts
+RandomTrailers = $AWG_RandomTrailers
+DisableCookies = $AWG_DisableCookies
 PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -I INPUT -m mark --mark 1 -j ACCEPT; ip rule add fwmark 1 table 100 || true; ip route add local 0.0.0.0/0 dev lo table 100 || true; iptables -t mangle -N MIHOMO_AWG || true; iptables -t mangle -F MIHOMO_AWG; iptables -t mangle -A MIHOMO_AWG -d ${AWG_SUBNET}.0/24 -j RETURN; iptables -t mangle -A MIHOMO_AWG -d 127.0.0.0/8 -j RETURN; iptables -t mangle -A MIHOMO_AWG -d 224.0.0.0/4 -j RETURN; iptables -t mangle -A MIHOMO_AWG -p tcp -j TPROXY --on-ip 127.0.0.1 --on-port $AWG_TPROXY_PORT --tproxy-mark 1; iptables -t mangle -A MIHOMO_AWG -p udp -j TPROXY --on-ip 127.0.0.1 --on-port $AWG_TPROXY_PORT --tproxy-mark 1; iptables -t mangle -A PREROUTING -i %i -j MIHOMO_AWG; iptables -t nat -A PREROUTING -i %i -p udp --dport 53 -j REDIRECT --to-ports 1053
 PostDown = iptables -D FORWARD -i %i -j ACCEPT || true; iptables -D INPUT -m mark --mark 1 -j ACCEPT || true; iptables -t mangle -D PREROUTING -i %i -j MIHOMO_AWG || true; iptables -t mangle -F MIHOMO_AWG || true; iptables -t mangle -X MIHOMO_AWG || true; iptables -t nat -D PREROUTING -i %i -p udp --dport 53 -j REDIRECT --to-ports 1053 || true; ip rule del fwmark 1 table 100 || true; ip route del local 0.0.0.0/0 dev lo table 100 || true
 EOF
@@ -790,6 +837,7 @@ _awg_rollback_install() {
         ufw allow "${old_port}/udp" >/dev/null 2>&1 || true
     fi
 
+    modprobe amneziawg >/dev/null 2>&1 || true
     _awg_restore_unit_state "$tx_dir" mihomo mihomo
     _awg_restore_unit_state "$tx_dir" awg-quick@awg0 awg
     warn "Исходное состояние восстановлено. Установленные пакеты AmneziaWG оставлены в системе."
@@ -805,8 +853,12 @@ _awg_abort_install() {
 }
 
 _awg_packages_installed() {
-    LC_ALL=C dpkg-query -W -f='${Status}' amneziawg 2>/dev/null | grep -q '^install ok installed$' \
-        && command -v awg >/dev/null 2>&1 \
+    local packages=("amneziawg" "amneziawg-tools" "amneziawg-dkms") package
+    for package in "${packages[@]}"; do
+        LC_ALL=C dpkg-query -W -f='${Status}' "$package" 2>/dev/null \
+            | grep -q '^install ok installed$' || return 1
+    done
+    command -v awg >/dev/null 2>&1 \
         && command -v awg-quick >/dev/null 2>&1
 }
 
@@ -830,21 +882,12 @@ _awg_create_peer() {
         echo "Подсеть заполнена — максимум 253 клиента" >&2
         return 1
     fi
-
     PEER_IP="${subnet}.${next_octet}"
 
-    # Генерация ключей
-    local client_priv client_pub psk
-    client_priv=$(awg genkey)
-    client_pub=$(echo "$client_priv" | awg pubkey)
-    psk=$(awg genpsk)
-
-    # Серверные параметры
-    local server_pub awg_port
-    server_pub=$(cat "$AWG_DIR/server_public.key")
-    awg_port=$(grep 'ListenPort' "$AWG_CONF" | awk '{print $3}')
-
+    # Сначала читаем полный набор 3.1: устаревший серверный конфиг нельзя менять.
     local Jc Jmin Jmax S1 S2 S3 S4 H1 H2 H3 H4
+    local HeaderProtectionKey ContentPaddingAddition RekeyAfterTime RekeyTimeout
+    local RejectAfterTime KeepaliveTimeout MaxHandshakeAttempts RandomTrailers DisableCookies
     Jc=$(grep '^Jc' "$AWG_CONF" | awk '{print $3}')
     Jmin=$(grep '^Jmin' "$AWG_CONF" | awk '{print $3}')
     Jmax=$(grep '^Jmax' "$AWG_CONF" | awk '{print $3}')
@@ -856,6 +899,33 @@ _awg_create_peer() {
     H2=$(grep '^H2' "$AWG_CONF" | awk '{print $3}')
     H3=$(grep '^H3' "$AWG_CONF" | awk '{print $3}')
     H4=$(grep '^H4' "$AWG_CONF" | awk '{print $3}')
+    HeaderProtectionKey=$(grep '^HeaderProtectionKey' "$AWG_CONF" | awk '{print $3}')
+    ContentPaddingAddition=$(grep '^ContentPaddingAddition' "$AWG_CONF" | awk '{print $3}')
+    RekeyAfterTime=$(grep '^RekeyAfterTime' "$AWG_CONF" | awk '{print $3}')
+    RekeyTimeout=$(grep '^RekeyTimeout' "$AWG_CONF" | awk '{print $3}')
+    RejectAfterTime=$(grep '^RejectAfterTime' "$AWG_CONF" | awk '{print $3}')
+    KeepaliveTimeout=$(grep '^KeepaliveTimeout' "$AWG_CONF" | awk '{print $3}')
+    MaxHandshakeAttempts=$(grep '^MaxHandshakeAttempts' "$AWG_CONF" | awk '{print $3}')
+    RandomTrailers=$(grep '^RandomTrailers' "$AWG_CONF" | awk '{print $3}')
+    DisableCookies=$(grep '^DisableCookies' "$AWG_CONF" | awk '{print $3}')
+    if [[ -z "$HeaderProtectionKey" || -z "$ContentPaddingAddition" \
+        || -z "$RekeyAfterTime" || -z "$RekeyTimeout" || -z "$RejectAfterTime" \
+        || -z "$KeepaliveTimeout" || -z "$MaxHandshakeAttempts" \
+        || -z "$RandomTrailers" || -z "$DisableCookies" ]]; then
+        _awg_fail "Конфигурация сервера устарела; переустановите AmneziaWG 3.1 перед добавлением клиента."
+        return 1
+    fi
+
+    # Генерация ключей
+    local client_priv client_pub psk
+    client_priv=$(awg genkey) || return 1
+    client_pub=$(printf '%s\n' "$client_priv" | awg pubkey) || return 1
+    psk=$(awg genpsk) || return 1
+
+    # Серверные параметры
+    local server_pub awg_port
+    server_pub=$(cat "$AWG_DIR/server_public.key")
+    awg_port=$(grep 'ListenPort' "$AWG_CONF" | awk '{print $3}')
 
     # Добавляем peer в серверный конфиг
     cat >> "$AWG_CONF" << PEEREOF
@@ -879,16 +949,18 @@ PEEREOF
     [[ -z "$SERVER_ADDR" ]] && SERVER_ADDR=$(curl -4 -s --max-time 5 ifconfig.me)
 
     local dns
-    dns=$(grep '^DNS' "$AWG_DIR/clients/"*.conf 2>/dev/null | head -1 | sed 's/.*= //')
+    dns=$(grep '^DNS' "$AWG_CLIENTS_DIR/"*.conf 2>/dev/null | head -1 | sed 's/.*= //')
     [[ -z "$dns" ]] && dns="1.1.1.1, 1.0.0.1"
 
     # Клиентский конфиг
-    local client_dir="/etc/mihomo/amnezia/${CLIENT_NAME}"
-    mkdir -p "$client_dir"
+    local client_dir="$AWG_CLIENTS_DIR/${CLIENT_NAME}"
+    local persistent_keepalive=$(( RANDOM % 11 + 25 ))
+    mkdir -p "$client_dir" || return 1
 
     PEER_CONF="[Interface]
 Address = ${PEER_IP}/32
 DNS = $dns
+MTU = 1280
 PrivateKey = $client_priv
 Jc = $Jc
 Jmin = $Jmin
@@ -901,15 +973,24 @@ H1 = $H1
 H2 = $H2
 H3 = $H3
 H4 = $H4
+HeaderProtectionKey = $HeaderProtectionKey
+ContentPaddingAddition = $ContentPaddingAddition
+RekeyAfterTime = $RekeyAfterTime
+RekeyTimeout = $RekeyTimeout
+RejectAfterTime = $RejectAfterTime
+KeepaliveTimeout = $KeepaliveTimeout
+MaxHandshakeAttempts = $MaxHandshakeAttempts
+RandomTrailers = $RandomTrailers
+DisableCookies = $DisableCookies
 
 [Peer]
 PublicKey = $server_pub
 PresharedKey = $psk
 AllowedIPs = 0.0.0.0/0, ::/0
 Endpoint = ${SERVER_ADDR}:${awg_port}
-PersistentKeepalive = 25"
+PersistentKeepalive = $persistent_keepalive"
 
-    echo "$PEER_CONF" > "$client_dir/${CLIENT_NAME}.conf"
+    printf '%s\n' "$PEER_CONF" > "$client_dir/${CLIENT_NAME}.conf" || return 1
     chmod 600 "$client_dir/${CLIENT_NAME}.conf"
 
     PEER_MIHOMO_CONF="--- Client proxy config Mihomo/Clash.Meta ---
@@ -920,6 +1001,7 @@ proxies:
     server: $SERVER_ADDR
     port: $awg_port
     ip: $PEER_IP
+    mtu: 1280
     dns: ['${dns// /}']
     public-key: $server_pub
     pre-shared-key: $psk
@@ -927,6 +1009,7 @@ proxies:
     udp: true
     persistent-keepalive: 25
     amnezia-wg-option:
+      version: 3
       jc: $Jc
       jmin: $Jmin
       jmax: $Jmax
@@ -937,9 +1020,18 @@ proxies:
       h1: $H1
       h2: $H2
       h3: $H3
-      h4: $H4"
+      h4: $H4
+      header-protection-key: $HeaderProtectionKey
+      content-padding-addition: $ContentPaddingAddition
+      rekey-after-time: $RekeyAfterTime
+      rekey-timeout: $RekeyTimeout
+      reject-after-time: $RejectAfterTime
+      keepalive-timeout: $KeepaliveTimeout
+      max-handshake-attempts: $MaxHandshakeAttempts
+      random-trailers: true
+      disable-cookies: true"
 
-    echo "$PEER_MIHOMO_CONF" > "$client_dir/mihomo-proxy.yaml"
+    printf '%s\n' "$PEER_MIHOMO_CONF" > "$client_dir/mihomo-proxy.yaml" || return 1
 
     # QR-код
     if command -v qrencode > /dev/null 2>&1; then
@@ -970,7 +1062,7 @@ awg_menu() {
             box_line " Сервис: не активен" " Сервис: ${YELLOW}не активен${NC}"
         fi
         box_mid
-        menu_item 1 "Установить AmneziaWG" GREEN
+        menu_item 1 "Установить / обновить AmneziaWG 3.1" GREEN
         menu_item 2 "Добавить клиента" CYAN
         menu_item 3 "Удалить клиента" YELLOW
         menu_item 4 "Удалить AmneziaWG" RED
@@ -995,40 +1087,38 @@ awg_menu() {
 # ── Генерация обфускации (по аналогии с Amnezia-клиентом) ────────────────────
 
 _awg_gen_params() {
-    # Jc, Jmin, Jmax
     AWG_Jc=$(( RANDOM % 3 + 4 ))       # 4-6
     AWG_Jmin=10
     AWG_Jmax=50
 
-    # S1-S4 с проверками уникальности
+    # S1-S4 и размеры handshake должны быть уникальны.
     while true; do
-        AWG_S1=$(( RANDOM % 135 + 15 ))  # 15-149
-        AWG_S2=$(( RANDOM % 135 + 15 ))
-        # S1+148 != S2+92 (чтобы init и response пакеты имели разный размер)
-        [[ "$AWG_S1" -ne "$AWG_S2" && $(( AWG_S1 + 148 )) -ne $(( AWG_S2 + 92 )) ]] && break
-    done
-    while true; do
-        AWG_S3=$(( RANDOM % 63 + 1 ))    # 1-63
-        [[ "$AWG_S3" -ne "$AWG_S1" && "$AWG_S3" -ne "$AWG_S2" ]] && break
-    done
-    while true; do
-        AWG_S4=$(( RANDOM % 19 + 1 ))    # 1-19
-        [[ "$AWG_S4" -ne "$AWG_S1" && "$AWG_S4" -ne "$AWG_S2" && "$AWG_S4" -ne "$AWG_S3" ]] && break
+        AWG_S1=$(( RANDOM % 138 + 12 ))  # 12-149
+        AWG_S2=$(( RANDOM % 138 + 12 ))  # 12-149
+        AWG_S3=$(( RANDOM % 52 + 12 ))   # 12-63
+        AWG_S4=12
+        [[ "$AWG_S1" -ne "$AWG_S2" && "$AWG_S1" -ne "$AWG_S3" \
+            && "$AWG_S2" -ne "$AWG_S3" && "$AWG_S1" -ne "$AWG_S4" \
+            && "$AWG_S2" -ne "$AWG_S4" && "$AWG_S3" -ne "$AWG_S4" \
+            && $(( AWG_S1 + 148 )) -ne $(( AWG_S2 + 92 )) \
+            && $(( AWG_S1 + 148 )) -ne $(( AWG_S3 + 64 )) \
+            && $(( AWG_S2 + 92 )) -ne $(( AWG_S3 + 64 )) ]] && break
     done
 
-    # H1-H4: восходящие непересекающиеся диапазоны [5, 2147483647]
-    local nums=()
-    while [[ ${#nums[@]} -lt 8 ]]; do
-        local n=$(( RANDOM * RANDOM + RANDOM + 5 ))
-        (( n < 5 )) && n=5
-        nums+=("$n")
-    done
-    IFS=$'\n' nums=($(printf '%s\n' "${nums[@]}" | sort -n)); unset IFS
+    # Header Protection 3.1 использует фиксированные H1-H4.
+    AWG_H1=1
+    AWG_H2=2
+    AWG_H3=3
+    AWG_H4=4
 
-    AWG_H1="${nums[0]}-${nums[1]}"
-    AWG_H2="${nums[2]}-${nums[3]}"
-    AWG_H3="${nums[4]}-${nums[5]}"
-    AWG_H4="${nums[6]}-${nums[7]}"
+    AWG_ContentPaddingAddition=10-100
+    AWG_RekeyAfterTime=100-120
+    AWG_RekeyTimeout=3-7
+    AWG_RejectAfterTime=150-180
+    AWG_KeepaliveTimeout=5-15
+    AWG_MaxHandshakeAttempts=15-20
+    AWG_RandomTrailers=on
+    AWG_DisableCookies=on
 }
 
 # ── Установка ────────────────────────────────────────────────────────────────
@@ -1045,7 +1135,7 @@ install_awg() {
         reinstall=1
         old_port=$(awk '/^ListenPort[[:space:]]*=/{print $3; exit}' "$AWG_CONF" 2>/dev/null)
         warn "AmneziaWG уже настроен."
-        confirm_yn "Переустановить? (текущие клиенты будут заменены после успешного запуска)" || {
+        confirm_yn "Переустановить AmneziaWG 3.1? (после успешного запуска клиентские конфиги будут перевыпущены)" || {
             info "Отменено."
             return 0
         }
@@ -1135,6 +1225,11 @@ install_awg() {
         }
     fi
     ip link del awg0 >/dev/null 2>&1 || true
+    _awg_reload_module || {
+        _awg_abort_install "$tx_dir" "$reinstall" "$stage_dir" "$AWG_PORT" "$old_port" \
+            "Не удалось перезагрузить модуль AmneziaWG 3.1."
+        return 1
+    }
     _awg_install_staged_config "$stage_dir" || {
         _awg_abort_install "$tx_dir" "$reinstall" "$stage_dir" "$AWG_PORT" "$old_port"             "Не удалось установить серверный конфиг AWG."
         return 1

@@ -32,7 +32,7 @@
   - **gRPC** через Reality
   Два режима: **Self-Steal** (свой домен + acme.sh) или **SNI** (маскировка под чужой SNI)
 - **Hysteria2** — QUIC с опциональным `obfs salamander` для маскировки пакетов
-- **AmneziaWG 2.0** — WireGuard с DPI-обфускацией (jitter, packet size, hash randomization), per-peer конфиги с QR-кодами
+- **AmneziaWG 3.1** — WireGuard с DPI-обфускацией (Header Protection, content padding, randomized timings, Random Trailers, Disable Cookies), per-peer конфиги с QR-кодами
 - **WARP** — Cloudflare WARP как исходящий прокси через `wgcf` (опционально WARP+)
 - **Каскады нод** — два типа:
   - **iptables DNAT** — прозрачная пересылка уже-зашифрованного трафика

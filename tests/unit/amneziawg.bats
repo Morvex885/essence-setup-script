@@ -22,11 +22,19 @@ setup() {
     export MOCK_BIN="$AWG_TEST_ROOT/mock-bin"
     export MOCK_STATE="$AWG_TEST_ROOT/mock-state"
     export MOCK_CALLS="$MOCK_STATE/calls"
-    export MOCK_ARCH=amd64 MOCK_KERNEL=6.1.0-test MOCK_HEADERS=1 MOCK_PACKAGE=1
+    export MOCK_ARCH=amd64 MOCK_KERNEL=6.1.0-test MOCK_HEADERS=1
+    export MOCK_AMNEZIAWG_CANDIDATE=3.1.20260812-1
+    export MOCK_TOOLS_CANDIDATE=3.1.20260812-1
+    export MOCK_DKMS_CANDIDATE=3.1.20260828-1
+    export MOCK_AMNEZIAWG_VERSION="$MOCK_AMNEZIAWG_CANDIDATE"
+    export MOCK_TOOLS_VERSION="$MOCK_TOOLS_CANDIDATE"
+    export MOCK_DKMS_VERSION="$MOCK_DKMS_CANDIDATE"
+    export MOCK_CANDIDATE="$MOCK_AMNEZIAWG_CANDIDATE"
+    export MOCK_HEADERS_CANDIDATE=6.1.0-test-1
     export AWG_KERNEL="$MOCK_KERNEL" AWG_HEADERS_PKG="linux-headers-$MOCK_KERNEL"
-    export MOCK_CANDIDATE=1.0.0 MOCK_HEADERS_CANDIDATE=6.1.0-test-1
     export MOCK_FINGERPRINT=75C9DD72C799870E310542E24166F2C257290828
     export MOCK_APT_UPDATE_FAIL=0 MOCK_APT_INSTALL_FAIL=0 MOCK_MODINFO_FAIL=0 MOCK_MODPROBE_FAIL=0
+    export MOCK_MODPROBE_REMOVE_FAIL=0 MOCK_GENKEY_COUNT=0
     export MOCK_APT_INSTALL_FAIL_PACKAGE="" MOCK_GPG_POST_INSTALL_MISSING=0
     export MOCK_HEADERS_POST_INSTALL_BUILD_MISSING=0
     export MOCK_MIHOMO_FAIL=0 MOCK_SYSTEMCTL_FAIL_UNIT="" MOCK_UFW_FAIL=0
@@ -75,16 +83,34 @@ _mock_script() {
 _write_awg_mocks() {
     cat > "$MOCK_BIN/dpkg" <<'EOF'
 #!/bin/bash
+if [[ "$1" == "--compare-versions" ]]; then
+  left_major=${2%%.*}; left_minor=${2#*.}; left_minor=${left_minor%%.*}
+  right_major=${4%%.*}; right_minor=${4#*.}; right_minor=${right_minor%%.*}
+  (( left_major > right_major || (left_major == right_major && left_minor >= right_minor) ))
+  exit $?
+fi
 [[ "$1" == "--print-architecture" ]] && { echo "${MOCK_ARCH}"; exit 0; }
 exit 0
 EOF
     cat > "$MOCK_BIN/dpkg-query" <<'EOF'
 #!/bin/bash
-case "$*" in
-  *linux-headers-*) [[ "$MOCK_HEADERS" == 1 ]] || exit 1 ;;
-  *amneziawg*) [[ "$MOCK_PACKAGE" == 1 ]] || exit 1 ;;
+package="${@: -1}"
+case "$package" in
+  linux-headers-*) [[ "${MOCK_HEADERS:-0}" == 1 ]] || exit 1 ;;
+  amneziawg) [[ "${MOCK_PACKAGE:-1}" == 1 ]] || exit 1 ;;
+  amneziawg-tools) [[ "${MOCK_TOOLS_PACKAGE:-1}" == 1 ]] || exit 1 ;;
+  amneziawg-dkms) [[ "${MOCK_DKMS_PACKAGE:-1}" == 1 ]] || exit 1 ;;
 esac
-echo 'install ok installed'
+if [[ "$*" == *'${Version}'* ]]; then
+  case "$package" in
+    amneziawg) echo "$MOCK_AMNEZIAWG_VERSION" ;;
+    amneziawg-tools) echo "$MOCK_TOOLS_VERSION" ;;
+    amneziawg-dkms) echo "$MOCK_DKMS_VERSION" ;;
+    *) echo '6.1.0-test-1' ;;
+  esac
+else
+  echo 'install ok installed'
+fi
 EOF
     cat > "$MOCK_BIN/uname" <<'EOF'
 #!/bin/bash
@@ -134,22 +160,29 @@ EOF
 echo "apt-cache $*" >> "$MOCK_CALLS"
 package="${@: -1}"
 echo "$package:"
-if [[ "$package" == "linux-headers-$MOCK_KERNEL" ]]; then
-  candidate="$MOCK_HEADERS_CANDIDATE"
-else
-  candidate="$MOCK_CANDIDATE"
-fi
+case "$package" in
+  linux-headers-*) candidate="$MOCK_HEADERS_CANDIDATE" ;;
+  amneziawg) candidate="${MOCK_AMNEZIAWG_CANDIDATE:-$MOCK_CANDIDATE}" ;;
+  amneziawg-tools) candidate="$MOCK_TOOLS_CANDIDATE" ;;
+  amneziawg-dkms) candidate="$MOCK_DKMS_CANDIDATE" ;;
+  *) candidate="$MOCK_CANDIDATE" ;;
+esac
 if [[ -n "$candidate" ]]; then echo "  Candidate: $candidate"; else echo '  Candidate: (none)'; fi
 EOF
     cat > "$MOCK_BIN/modinfo" <<'EOF'
 #!/bin/bash
 echo "modinfo $*" >> "$MOCK_CALLS"
 [[ "$MOCK_MODINFO_FAIL" == 1 ]] && exit 1
-echo 'filename: mock/amneziawg.ko'
+if [[ "$*" == *" -F version "* || "$*" == "-F version"* ]]; then
+  echo "$MOCK_DKMS_VERSION"
+else
+  echo 'filename: mock/amneziawg.ko'
+fi
 EOF
     cat > "$MOCK_BIN/modprobe" <<'EOF'
 #!/bin/bash
 echo "modprobe $*" >> "$MOCK_CALLS"
+[[ "$1" == "-r" && "$MOCK_MODPROBE_REMOVE_FAIL" == 1 ]] && exit 1
 [[ "$1" == "amneziawg" && "$MOCK_MODPROBE_FAIL" == 1 ]] && exit 1
 exit 0
 EOF
@@ -162,9 +195,25 @@ EOF
     cat > "$MOCK_BIN/awg" <<'EOF'
 #!/bin/bash
 case "$1" in
-  genkey) echo 'server-private' ;;
+  --version) echo "awg-tools v${MOCK_TOOLS_VERSION}" ;;
+  genkey)
+    count=0
+    [[ -f "$MOCK_STATE/genkey-count" ]] && count=$(<"$MOCK_STATE/genkey-count")
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$MOCK_STATE/genkey-count"
+    case "$count" in
+      1) echo 'server-private' ;;
+      2) echo 'header-protection-key' ;;
+      *) echo 'client-private' ;;
+    esac
+    ;;
   pubkey) read -r key; echo "public-$key" ;;
   genpsk) echo 'server-psk' ;;
+  show)
+    case "$3" in
+      random-trailers|disable-cookies) echo on ;;
+    esac
+    ;;
   *) exit 0 ;;
 esac
 EOF
@@ -230,6 +279,17 @@ echo "$cmd \$*" >> "\$MOCK_CALLS"
 exit 0
 EOF
     done
+    cat > "$MOCK_BIN/qrencode" <<'EOF'
+#!/bin/bash
+while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "-o" ]]; then
+        touch "$2"
+        shift 2
+    else
+        shift
+    fi
+done
+EOF
     cat > "$MOCK_BIN/fuser" <<'EOF'
 #!/bin/bash
 exit 1
@@ -273,7 +333,7 @@ _mock_install_environment() {
     _awg_preflight() {
         AWG_ARCH=amd64
         AWG_KERNEL="$MOCK_KERNEL"
-        AWG_APT_SUITE=focal
+        AWG_APT_SUITE=jammy
         AWG_MIHOMO_BIN="$MOCK_BIN/mihomo"
     }
     _awg_gen_free_port() {
@@ -281,8 +341,12 @@ _mock_install_environment() {
     }
     _awg_gen_params() {
         AWG_Jc=4 AWG_Jmin=10 AWG_Jmax=50
-        AWG_S1=20 AWG_S2=30 AWG_S3=5 AWG_S4=6
-        AWG_H1=10-20 AWG_H2=30-40 AWG_H3=50-60 AWG_H4=70-80
+        AWG_S1=20 AWG_S2=30 AWG_S3=15 AWG_S4=12
+        AWG_H1=1 AWG_H2=2 AWG_H3=3 AWG_H4=4
+        AWG_ContentPaddingAddition=10-100
+        AWG_RekeyAfterTime=100-120 AWG_RekeyTimeout=3-7
+        AWG_RejectAfterTime=150-180 AWG_KeepaliveTimeout=5-15
+        AWG_MaxHandshakeAttempts=15-20 AWG_RandomTrailers=on AWG_DisableCookies=on
     }
     is_port_free() { return 0; }
     confirm_yn() {
@@ -309,7 +373,7 @@ _run_bootstrap_failure() {
         install) export MOCK_APT_INSTALL_FAIL=1 ;;
         missing) export MOCK_GPG_POST_INSTALL_MISSING=1 ;;
     esac
-    AWG_APT_SUITE=focal AWG_ARCH=amd64 AWG_KERNEL="$MOCK_KERNEL"
+    AWG_APT_SUITE=jammy AWG_ARCH=amd64 AWG_KERNEL="$MOCK_KERNEL"
     _awg_install_repository
 }
 
@@ -321,7 +385,7 @@ _run_install_with_sentinel() {
     return 0
 }
 
-@test "platform mapping: Debian 12/13 use focal and Ubuntu uses jammy/noble" {
+@test "platform mapping: Debian 12/13 use jammy and Ubuntu uses jammy/noble" {
     local id version expected
     detect_platform() {
         _awg_detect_platform || return
@@ -333,8 +397,8 @@ _run_install_with_sentinel() {
         assert_success
         assert_output "$expected"
     done <<'EOF'
-debian|12|focal
-debian|13|focal
+debian|12|jammy
+debian|13|jammy
 ubuntu|22.04|jammy
 ubuntu|24.04|noble
 EOF
@@ -371,20 +435,20 @@ EOF
 @test "missing gpg installs gnupg before configuring the PPA" {
     _seed_old_repo_state
     _simulate_missing_gpg
-    AWG_APT_SUITE=focal AWG_ARCH=amd64 AWG_KERNEL="$MOCK_KERNEL"
+    AWG_APT_SUITE=jammy AWG_ARCH=amd64 AWG_KERNEL="$MOCK_KERNEL"
 
     run _awg_ensure_packages
     assert_success
     grep -q '^apt-get update$' "$MOCK_CALLS"
     grep -q '^apt-get install -y gnupg$' "$MOCK_CALLS"
     ! grep -q "linux-headers-$MOCK_KERNEL" "$MOCK_CALLS"
-    grep -q '^apt-get install -y amneziawg$' "$MOCK_CALLS"
+    grep -q '^apt-get install -y amneziawg amneziawg-tools amneziawg-dkms$' "$MOCK_CALLS"
     source_states=()
     while IFS= read -r value; do source_states+=("$value"); done < <(grep '^apt-update-amnezia-source=' "$MOCK_CALLS")
     assert_equal "${source_states[0]}" 'apt-update-amnezia-source=absent'
     assert_equal "${source_states[1]}" 'apt-update-amnezia-source=present'
     [[ -f "$AWG_APT_KEYRING" ]]
-    grep -qxF "Suites: focal" "$AWG_APT_SOURCE"
+    grep -qxF "Suites: jammy" "$AWG_APT_SOURCE"
     ! grep -Fq "$AWG_PPA_URI" "$AWG_APT_SOURCES_DIR/legacy.list"
     grep -qxF 'deb https://deb.debian.org/debian bookworm main' "$AWG_APT_SOURCES_DIR/legacy.list"
 }
@@ -406,7 +470,7 @@ EOF
 }
 
 @test "existing build-path is accepted without a dpkg headers package" {
-    export MOCK_HEADERS=0 AWG_APT_SUITE=focal AWG_ARCH=amd64
+    export MOCK_HEADERS=0 AWG_APT_SUITE=jammy AWG_ARCH=amd64
 
     run _awg_ensure_packages
     assert_success
@@ -417,7 +481,7 @@ EOF
 
 @test "missing headers package is installed for the exact running kernel" {
     rm -rf "$AWG_MODULES_ROOT/$MOCK_KERNEL/build"
-    export MOCK_HEADERS=0 AWG_APT_SUITE=focal AWG_ARCH=amd64
+    export MOCK_HEADERS=0 AWG_APT_SUITE=jammy AWG_ARCH=amd64
 
     run _awg_ensure_packages
     assert_success
@@ -433,7 +497,7 @@ EOF
 
 @test "installed headers package without build-path is reinstalled" {
     rm -rf "$AWG_MODULES_ROOT/$MOCK_KERNEL/build"
-    export MOCK_HEADERS=1 AWG_APT_SUITE=focal AWG_ARCH=amd64
+    export MOCK_HEADERS=1 AWG_APT_SUITE=jammy AWG_ARCH=amd64
 
     run _awg_ensure_packages
     assert_success
@@ -444,7 +508,7 @@ EOF
 @test "missing gpg and headers share one bootstrap update" {
     rm -rf "$AWG_MODULES_ROOT/$MOCK_KERNEL/build"
     rm -f "$MOCK_STATE/gpg.available"
-    export MOCK_HEADERS=0 AWG_APT_SUITE=focal AWG_ARCH=amd64
+    export MOCK_HEADERS=0 AWG_APT_SUITE=jammy AWG_ARCH=amd64
     _simulate_missing_gpg
 
     run _awg_ensure_packages
@@ -457,7 +521,7 @@ EOF
 @test "bootstrap waits for apt lock before update and every dependency install" {
     rm -rf "$AWG_MODULES_ROOT/$MOCK_KERNEL/build"
     rm -f "$MOCK_STATE/gpg.available"
-    export MOCK_HEADERS=0 AWG_APT_SUITE=focal AWG_ARCH=amd64
+    export MOCK_HEADERS=0 AWG_APT_SUITE=jammy AWG_ARCH=amd64
     _simulate_missing_gpg
     _awg_apt_wait() { echo 'apt-wait' >> "$MOCK_CALLS"; }
 
@@ -480,7 +544,7 @@ EOF
     for fail_at in 1 2 3; do
         rm -rf "$AWG_MODULES_ROOT/$MOCK_KERNEL/build"
         rm -f "$MOCK_STATE/gpg.available"
-        export MOCK_HEADERS=0 AWG_APT_SUITE=focal AWG_ARCH=amd64
+        export MOCK_HEADERS=0 AWG_APT_SUITE=jammy AWG_ARCH=amd64
         _seed_old_repo_state
         AWG_WAIT_CALL=0
         _awg_apt_wait() {
@@ -495,7 +559,7 @@ EOF
 }
 
 @test "AWG repository update and package install each wait for apt lock" {
-    export AWG_APT_SUITE=focal AWG_ARCH=amd64
+    export AWG_APT_SUITE=jammy AWG_ARCH=amd64
     _awg_apt_wait() { echo 'apt-wait' >> "$MOCK_CALLS"; }
 
     run _awg_ensure_packages
@@ -505,13 +569,13 @@ EOF
     assert_equal "${events[0]}" 'apt-wait'
     assert_equal "${events[1]}" 'apt-get update'
     assert_equal "${events[2]}" 'apt-wait'
-    assert_equal "${events[3]}" 'apt-get install -y amneziawg'
+    assert_equal "${events[3]}" 'apt-get install -y amneziawg amneziawg-tools amneziawg-dkms'
     assert_equal "${#events[@]}" 4
 }
 
 @test "missing headers candidate explains kernel and repository causes and rolls back APT files" {
     rm -rf "$AWG_MODULES_ROOT/$MOCK_KERNEL/build"
-    export MOCK_HEADERS=0 MOCK_HEADERS_CANDIDATE="" AWG_APT_SUITE=focal AWG_ARCH=amd64
+    export MOCK_HEADERS=0 MOCK_HEADERS_CANDIDATE="" AWG_APT_SUITE=jammy AWG_ARCH=amd64
     _seed_old_repo_state
 
     run _awg_install_repository
@@ -528,7 +592,7 @@ EOF
         rm -rf "$AWG_MODULES_ROOT/$MOCK_KERNEL/build"
         : > "$MOCK_CALLS"
         export MOCK_HEADERS="$installed" MOCK_APT_INSTALL_FAIL_PACKAGE="linux-headers-$MOCK_KERNEL"
-        export AWG_APT_SUITE=focal AWG_ARCH=amd64
+        export AWG_APT_SUITE=jammy AWG_ARCH=amd64
         _seed_old_repo_state
 
         run _awg_install_repository
@@ -545,7 +609,7 @@ EOF
 @test "successful headers APT without build-path fails factual postcondition and rolls back" {
     rm -rf "$AWG_MODULES_ROOT/$MOCK_KERNEL/build"
     export MOCK_HEADERS=0 MOCK_HEADERS_POST_INSTALL_BUILD_MISSING=1
-    export AWG_APT_SUITE=focal AWG_ARCH=amd64
+    export AWG_APT_SUITE=jammy AWG_ARCH=amd64
     _seed_old_repo_state
 
     run _awg_install_repository
@@ -574,7 +638,7 @@ EOF
         rm -f "$MOCK_STATE/gpg.available"
         : > "$MOCK_CALLS"
         export MOCK_HEADERS=0 MOCK_FINGERPRINT=75C9DD72C799870E310542E24166F2C257290828
-        export MOCK_MODINFO_FAIL=0 AWG_APT_SUITE=focal AWG_ARCH=amd64
+        export MOCK_MODINFO_FAIL=0 AWG_APT_SUITE=jammy AWG_ARCH=amd64
         _seed_old_repo_state
         if [[ "$mode" == fingerprint ]]; then
             export MOCK_FINGERPRINT=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
@@ -593,7 +657,7 @@ EOF
 }
 
 @test "PPA key fingerprint is verified and keyring/source are installed atomically without duplicates" {
-    AWG_APT_SUITE=focal
+    AWG_APT_SUITE=jammy
     cat > "$AWG_APT_SOURCES_LIST" <<EOF
 deb $AWG_PPA_URI focal main
 deb https://deb.debian.org/debian bookworm main
@@ -612,7 +676,7 @@ EOF
     assert_success
     grep -qxF 'mock public key' "$AWG_APT_KEYRING"
     grep -qxF 'Types: deb deb-src' "$AWG_APT_SOURCE"
-    grep -qxF "Suites: focal" "$AWG_APT_SOURCE"
+    grep -qxF "Suites: jammy" "$AWG_APT_SOURCE"
     grep -qxF "Signed-By: $AWG_APT_KEYRING" "$AWG_APT_SOURCE"
     grep -q 'deb.debian.org' "$AWG_APT_SOURCES_LIST"
     ! grep -Fq "$AWG_PPA_URI" "$AWG_APT_SOURCES_LIST"
@@ -635,28 +699,26 @@ EOF
 
 @test "missing APT candidate rolls back source and keyring created by this run" {
     echo 'deb https://deb.debian.org/debian bookworm main' > "$AWG_APT_SOURCES_LIST"
-    export AWG_APT_SUITE=focal AWG_ARCH=amd64 AWG_KERNEL="$MOCK_KERNEL" MOCK_CANDIDATE=""
-
+    export AWG_APT_SUITE=jammy AWG_ARCH=amd64 AWG_KERNEL="$MOCK_KERNEL" \
+        MOCK_CANDIDATE="" MOCK_AMNEZIAWG_CANDIDATE="" MOCK_TOOLS_CANDIDATE="" MOCK_DKMS_CANDIDATE=""
     run _awg_ensure_packages
-    assert_failure
     assert_output --partial "APT candidate"
     [[ ! -e "$AWG_APT_KEYRING" ]]
     [[ ! -e "$AWG_APT_SOURCE" ]]
     grep -q 'deb.debian.org' "$AWG_APT_SOURCES_LIST"
 }
 
-@test "apt update/install, DKMS and modprobe failures return nonzero and rollback repository" {
+@test "apt update/install and DKMS failures return nonzero and rollback repository" {
     local mode
-    for mode in update install modinfo modprobe; do
-        export MOCK_APT_UPDATE_FAIL=0 MOCK_APT_INSTALL_FAIL=0 MOCK_MODINFO_FAIL=0 MOCK_MODPROBE_FAIL=0
+    for mode in update install modinfo; do
+        export MOCK_APT_UPDATE_FAIL=0 MOCK_APT_INSTALL_FAIL=0 MOCK_MODINFO_FAIL=0
         rm -f "$AWG_APT_KEYRING" "$AWG_APT_SOURCE"
         case "$mode" in
             update) export MOCK_APT_UPDATE_FAIL=1 ;;
             install) export MOCK_APT_INSTALL_FAIL=1 ;;
             modinfo) export MOCK_MODINFO_FAIL=1 ;;
-            modprobe) export MOCK_MODPROBE_FAIL=1 ;;
         esac
-        AWG_APT_SUITE=focal AWG_ARCH=amd64 AWG_KERNEL="$MOCK_KERNEL"
+        AWG_APT_SUITE=jammy AWG_ARCH=amd64 AWG_KERNEL="$MOCK_KERNEL"
         run _awg_ensure_packages
         assert_failure
         [[ ! -e "$AWG_APT_KEYRING" ]]
@@ -772,8 +834,194 @@ EOF
     grep -q '^--- AmneziaWG ---$' "$AWG_CLIENT_CONFIG"
     grep -qxF '41000/udp' "$MOCK_STATE/ufw.rules"
     [[ -e "$MOCK_STATE/active.awg-quick_awg0" ]]
-    local restart_line allow_line
+    local reload_line restart_line allow_line
+    reload_line=$(grep -n '^modprobe amneziawg$' "$MOCK_CALLS" | head -1 | cut -d: -f1)
     restart_line=$(grep -n 'systemctl restart awg-quick@awg0' "$MOCK_CALLS" | head -1 | cut -d: -f1)
     allow_line=$(grep -n '^ufw allow 41000/udp' "$MOCK_CALLS" | head -1 | cut -d: -f1)
-    (( restart_line < allow_line ))
+    (( reload_line < restart_line && restart_line < allow_line ))
+}
+@test "_awg_gen_params emits AmneziaWG 3.1 ranges and defaults" {
+    local i init response cookie
+    for i in $(seq 1 100); do
+        _awg_gen_params
+        (( AWG_Jc >= 4 && AWG_Jc <= 6 ))
+        (( AWG_Jmin == 10 && AWG_Jmax == 50 ))
+        (( AWG_S1 >= 12 && AWG_S1 <= 149 ))
+        (( AWG_S2 >= 12 && AWG_S2 <= 149 ))
+        (( AWG_S3 >= 12 && AWG_S3 <= 63 ))
+        (( AWG_S4 == 12 ))
+        [[ "$AWG_S1" -ne "$AWG_S2" && "$AWG_S1" -ne "$AWG_S3" \
+            && "$AWG_S1" -ne "$AWG_S4" && "$AWG_S2" -ne "$AWG_S3" \
+            && "$AWG_S2" -ne "$AWG_S4" && "$AWG_S3" -ne "$AWG_S4" ]]
+        init=$((AWG_S1 + 148))
+        response=$((AWG_S2 + 92))
+        cookie=$((AWG_S3 + 64))
+        [[ "$init" -ne "$response" && "$init" -ne "$cookie" && "$response" -ne "$cookie" ]]
+        [[ "$AWG_H1" == 1 && "$AWG_H2" == 2 && "$AWG_H3" == 3 && "$AWG_H4" == 4 ]]
+        [[ "$AWG_ContentPaddingAddition" == 10-100 ]]
+        [[ "$AWG_RekeyAfterTime" == 100-120 && "$AWG_RekeyTimeout" == 3-7 ]]
+        [[ "$AWG_RejectAfterTime" == 150-180 && "$AWG_KeepaliveTimeout" == 5-15 ]]
+        [[ "$AWG_MaxHandshakeAttempts" == 15-20 ]]
+        [[ "$AWG_RandomTrailers" == on && "$AWG_DisableCookies" == on ]]
+    done
+}
+
+@test "server staging writes the complete AmneziaWG 3.1 interface" {
+    local stage="$BATS_TEST_TMPDIR/stage"
+    export AWG_SERVER_IP=10.10.8.1 AWG_PORT=41000 AWG_SUBNET=10.10.8 AWG_TPROXY_PORT=12000
+    _awg_gen_params
+    run _awg_stage_server_config "$stage"
+    assert_success
+    grep -qxF "HeaderProtectionKey = header-protection-key" "$stage/awg0.conf"
+    grep -qxF "ContentPaddingAddition = 10-100" "$stage/awg0.conf"
+    grep -qxF "RekeyAfterTime = 100-120" "$stage/awg0.conf"
+    grep -qxF "RekeyTimeout = 3-7" "$stage/awg0.conf"
+    grep -qxF "RejectAfterTime = 150-180" "$stage/awg0.conf"
+    grep -qxF "KeepaliveTimeout = 5-15" "$stage/awg0.conf"
+    grep -qxF "MaxHandshakeAttempts = 15-20" "$stage/awg0.conf"
+    grep -qxF "RandomTrailers = on" "$stage/awg0.conf"
+    grep -qxF "DisableCookies = on" "$stage/awg0.conf"
+    [[ "$(<"$stage/header_protection.key")" == "header-protection-key" ]]
+    [[ "$(_file_mode "$stage/awg0.conf")" == 600 ]]
+}
+
+_seed_awg31_server() {
+    mkdir -p "$AWG_DIR"
+    printf 'server-public\n' > "$AWG_DIR/server_public.key"
+    cat > "$AWG_CONF" <<'EOF'
+[Interface]
+PrivateKey = server-private
+Address = 10.10.8.1/24
+ListenPort = 41000
+Jc = 4
+Jmin = 10
+Jmax = 50
+S1 = 20
+S2 = 30
+S3 = 15
+S4 = 12
+H1 = 1
+H2 = 2
+H3 = 3
+H4 = 4
+HeaderProtectionKey = header-protection-key
+ContentPaddingAddition = 10-100
+RekeyAfterTime = 100-120
+RekeyTimeout = 3-7
+RejectAfterTime = 150-180
+KeepaliveTimeout = 5-15
+MaxHandshakeAttempts = 15-20
+RandomTrailers = on
+DisableCookies = on
+EOF
+}
+
+@test "peer native and Mihomo 3.1 configs repeat the complete options" {
+    _seed_awg31_server
+    run _awg_create_peer alice
+    assert_success
+    [[ -f "$AWG_CLIENTS_DIR/alice/alice.conf" ]]
+    [[ -f "$AWG_CLIENTS_DIR/alice/mihomo-proxy.yaml" ]]
+    grep -qxF 'MTU = 1280' "$AWG_CLIENTS_DIR/alice/alice.conf"
+    grep -qxF 'HeaderProtectionKey = header-protection-key' "$AWG_CLIENTS_DIR/alice/alice.conf"
+    grep -qxF 'RandomTrailers = on' "$AWG_CLIENTS_DIR/alice/alice.conf"
+    grep -qxF 'DisableCookies = on' "$AWG_CLIENTS_DIR/alice/alice.conf"
+    grep -qxF '    mtu: 1280' "$AWG_CLIENTS_DIR/alice/mihomo-proxy.yaml"
+    grep -qxF '      version: 3' "$AWG_CLIENTS_DIR/alice/mihomo-proxy.yaml"
+    grep -qxF '      header-protection-key: header-protection-key' "$AWG_CLIENTS_DIR/alice/mihomo-proxy.yaml"
+    grep -qxF '      content-padding-addition: 10-100' "$AWG_CLIENTS_DIR/alice/mihomo-proxy.yaml"
+    grep -qxF '      rekey-after-time: 100-120' "$AWG_CLIENTS_DIR/alice/mihomo-proxy.yaml"
+    grep -qxF '      rekey-timeout: 3-7' "$AWG_CLIENTS_DIR/alice/mihomo-proxy.yaml"
+    grep -qxF '      reject-after-time: 150-180' "$AWG_CLIENTS_DIR/alice/mihomo-proxy.yaml"
+    grep -qxF '      keepalive-timeout: 5-15' "$AWG_CLIENTS_DIR/alice/mihomo-proxy.yaml"
+    grep -qxF '      max-handshake-attempts: 15-20' "$AWG_CLIENTS_DIR/alice/mihomo-proxy.yaml"
+    grep -qxF '      random-trailers: true' "$AWG_CLIENTS_DIR/alice/mihomo-proxy.yaml"
+    grep -qxF '      disable-cookies: true' "$AWG_CLIENTS_DIR/alice/mihomo-proxy.yaml"
+    if [[ -n "${AWG_REAL_MIHOMO_BIN:-}" ]]; then
+        "$AWG_REAL_MIHOMO_BIN" -t -f "$AWG_CLIENTS_DIR/alice/mihomo-proxy.yaml"
+    fi
+}
+
+@test "stale AmneziaWG 2.0 server config is rejected before peer writes" {
+    _seed_awg31_server
+    grep -v '^HeaderProtectionKey' "$AWG_CONF" > "$AWG_CONF.tmp"
+    mv "$AWG_CONF.tmp" "$AWG_CONF"
+    cp "$AWG_CONF" "$BATS_TEST_TMPDIR/server.before"
+    run _awg_create_peer stale
+    assert_failure
+    assert_output --partial "Конфигурация сервера устарела; переустановите AmneziaWG 3.1"
+    cmp -s "$AWG_CONF" "$BATS_TEST_TMPDIR/server.before"
+    [[ ! -e "$AWG_CLIENTS_DIR/stale" ]]
+}
+
+@test "module reload unloads a loaded module and reports both failure modes" {
+    _awg_module_loaded() { return 0; }
+    export MOCK_MODPROBE_REMOVE_FAIL=1
+    run _awg_reload_module
+    assert_failure
+    export MOCK_MODPROBE_REMOVE_FAIL=0 MOCK_MODPROBE_FAIL=1
+    run _awg_reload_module
+    assert_failure
+}
+@test "all three AmneziaWG packages must have candidates and exact installed versions" {
+    export MOCK_TOOLS_CANDIDATE=""
+    run _awg_ensure_packages
+    assert_failure
+    assert_output --partial "APT candidate для пакета amneziawg-tools отсутствует"
+
+    export MOCK_TOOLS_CANDIDATE="$MOCK_TOOLS_VERSION" MOCK_DKMS_CANDIDATE="$MOCK_DKMS_VERSION"
+    export MOCK_DKMS_VERSION=3.1.20260827-1
+    run _awg_ensure_packages
+    assert_failure
+    assert_output --partial "Пакет amneziawg-dkms не обновлён до актуального APT candidate"
+}
+
+@test "tools and module capability must be at least AmneziaWG 3.1" {
+    export MOCK_TOOLS_CANDIDATE=2.0.20240101 MOCK_TOOLS_VERSION=2.0.20240101
+    run _awg_ensure_packages
+    assert_failure
+    assert_output --partial "Инструменты AmneziaWG устарели"
+
+    export MOCK_TOOLS_CANDIDATE=3.1.20260812-1 MOCK_TOOLS_VERSION=3.1.20260812-1
+    export MOCK_DKMS_CANDIDATE=2.0.20240101 MOCK_DKMS_VERSION=2.0.20240101
+    run _awg_ensure_packages
+    assert_failure
+    assert_output --partial "DKMS-модуль AmneziaWG устарел"
+}
+@test "module reload failure aborts installation and rollback retries module load" {
+    _mock_install_prerequisites
+    export MOCK_MODPROBE_FAIL=1
+    run _run_install_with_sentinel
+    assert_output --partial "Не удалось перезагрузить модуль AmneziaWG 3.1"
+    assert_output --partial "INSTALL_RC=1"
+    [[ "$(grep -c '^modprobe amneziawg$' "$MOCK_CALLS")" -ge 2 ]]
+}
+@test "reinstall stops old interface before module reload and new service start" {
+    _mock_install_prerequisites
+    mkdir -p "$AWG_DIR"
+    cat > "$AWG_CONF" <<'EOF'
+[Interface]
+PrivateKey = old-private
+Address = 10.10.8.1/24
+ListenPort = 39999
+EOF
+    touch "$MOCK_STATE/active.awg-quick_awg0"
+    run _run_install_with_sentinel
+    assert_output --partial "INSTALL_RC=0"
+    local stop_line delete_line reload_line restart_line
+    stop_line=$(grep -n 'systemctl stop awg-quick@awg0' "$MOCK_CALLS" | head -1 | cut -d: -f1)
+    delete_line=$(grep -n '^ip link del awg0' "$MOCK_CALLS" | head -1 | cut -d: -f1)
+    reload_line=$(grep -n '^modprobe amneziawg$' "$MOCK_CALLS" | head -1 | cut -d: -f1)
+    restart_line=$(grep -n 'systemctl restart awg-quick@awg0' "$MOCK_CALLS" | head -1 | cut -d: -f1)
+    (( stop_line < delete_line && delete_line < reload_line && reload_line < restart_line ))
+}
+@test "_awg_packages_installed requires all three package statuses" {
+    run _awg_packages_installed
+    assert_success
+    export MOCK_TOOLS_PACKAGE=0
+    run _awg_packages_installed
+    assert_failure
+    export MOCK_TOOLS_PACKAGE=1 MOCK_DKMS_PACKAGE=0
+    run _awg_packages_installed
+    assert_failure
 }
