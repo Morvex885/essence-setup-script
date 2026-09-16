@@ -42,6 +42,9 @@ setup() {
     ACME_TEST_LOG="$BATS_TEST_TMPDIR/acme.log"
     : > "$OPS_LOG"
     : > "$ACME_TEST_LOG"
+    UFW_RULES="$BATS_TEST_TMPDIR/ufw-rules"
+    : > "$UFW_RULES"
+    FAIL_UFW_SHOW=0
     sed() {
         if [[ "${1:-}" == -i ]]; then
             shift
@@ -78,7 +81,23 @@ setup() {
     chown() { return 0; }
     ufw() {
         printf 'ufw %s\n' "$*" >> "$OPS_LOG"
-        [[ "${FAIL_UFW:-0}" -eq 0 ]]
+        case "$*" in
+            "show added")
+                [[ "$FAIL_UFW_SHOW" -eq 0 ]] || return 1
+                cat "$UFW_RULES"
+                ;;
+            allow\ *)
+                printf 'ufw %s\n' "$*" >> "$UFW_RULES"
+                ;;
+            delete\ allow\ *)
+                [[ "${FAIL_UFW:-0}" -eq 0 ]] || return 1
+                local rule="ufw ${*:2}"
+                grep -Fxq "$rule" "$UFW_RULES" || return 1
+                sed "\|^${rule}$|d" "$UFW_RULES" > "$UFW_RULES.tmp"
+                mv "$UFW_RULES.tmp" "$UFW_RULES"
+                ;;
+            *) return 1 ;;
+        esac
     }
     systemctl() {
         printf 'systemctl %s\n' "$*" >> "$OPS_LOG"
@@ -189,6 +208,10 @@ _prepare_removal_fixture() {
     FAIL_SNI_SED=0 FAIL_ZONE_SED=0 FAIL_UFW=0 FAIL_SYSTEMCTL_RELOAD=0
     FAIL_NGINX_TEST=0 FAIL_TIMER_DISABLE=0 FAIL_DAEMON_RELOAD=0
     RM_FAIL_MATCH= ACME_TEST_FAIL=0
+    FAIL_UFW_SHOW=0
+    : > "$UFW_RULES"
+    [[ "$mode" != standalone ]] || printf 'ufw allow 2096/tcp\n' > "$UFW_RULES"
+    return 0
 }
 
 @test "malformed subscription configuration is preserved" {
@@ -322,6 +345,49 @@ _prepare_removal_fixture() {
     RM_FAIL_MATCH=
     remove_subscription
     [[ ! -e "$SUB_CONF" ]]
+}
+
+@test "subscription cleanup retries after firewall deletion and nginx validation failure" {
+    _prepare_removal_fixture standalone rsa 1
+    FAIL_NGINX_TEST=1
+    run remove_subscription
+    assert_failure 1
+    [[ ! -s "$UFW_RULES" ]]
+    [[ -e "$SUB_CONF" ]]
+    [[ -e "$FIX_ROOT/var/lib/essence-sub/subscription.yaml" ]]
+
+    FAIL_NGINX_TEST=0
+    : > "$OPS_LOG"
+    run remove_subscription
+    assert_success
+    [[ ! -e "$SUB_CONF" ]]
+    [[ ! -e "$FIX_ROOT/var/lib/essence-sub" ]]
+    [[ "$(cat "$OPS_LOG")" == *"nginx -t"* ]]
+    [[ "$(cat "$OPS_LOG")" == *"systemctl reload nginx"* ]]
+    [[ "$(cat "$OPS_LOG")" != *"ufw delete"* ]]
+}
+
+@test "subscription cleanup skips absent rule and preserves unrelated firewall rules" {
+    _prepare_removal_fixture standalone none 0
+    printf 'ufw allow 12096/tcp\nufw allow 2096/udp\nufw deny 2096/tcp\n' > "$UFW_RULES"
+    cp "$UFW_RULES" "$BATS_TEST_TMPDIR/before-rules"
+    run remove_subscription
+    assert_success
+    [[ ! -e "$SUB_CONF" ]]
+    cmp -s "$UFW_RULES" "$BATS_TEST_TMPDIR/before-rules"
+    [[ "$(cat "$OPS_LOG")" == *"nginx -t"* ]]
+    [[ "$(cat "$OPS_LOG")" != *"ufw delete"* ]]
+}
+
+@test "subscription cleanup preserves state when firewall rule query fails" {
+    _prepare_removal_fixture standalone none 0
+    FAIL_UFW_SHOW=1
+    run remove_subscription
+    assert_failure 1
+    [[ -s "$UFW_RULES" ]]
+    [[ -e "$SUB_CONF" ]]
+    [[ "$(cat "$OPS_LOG")" != *"ufw delete"* ]]
+    [[ "$(cat "$OPS_LOG")" != *"nginx -t"* ]]
 }
 
 _load_fixture_uninstall_for_lifecycle() {

@@ -438,11 +438,18 @@ remove_subscription() {
     fi
 
     # ufw
-    if [[ "$SUB_MODE" == "standalone" ]] &&
-       ! ufw delete allow "${SUB_PORT}/tcp" > /dev/null 2>&1
-    then
-        warn "Не удалось удалить правило firewall подписок."
-        return 1
+    if [[ "$SUB_MODE" == "standalone" ]]; then
+        local ufw_rules
+        if ! ufw_rules=$(ufw show added 2>/dev/null); then
+            warn "Не удалось прочитать правила firewall подписок."
+            return 1
+        fi
+        if grep -Fxq "ufw allow ${SUB_PORT}/tcp" <<< "$ufw_rules" &&
+           ! ufw delete allow "${SUB_PORT}/tcp" > /dev/null 2>&1
+        then
+            warn "Не удалось удалить правило firewall подписок."
+            return 1
+        fi
     fi
 
     if ! nginx -t; then
