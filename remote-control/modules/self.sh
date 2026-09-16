@@ -48,16 +48,23 @@ check_script_password() {
     [[ -z "$stored" ]] && return 0
 
     echo ""
-    local attempts=3
-    while (( attempts > 0 )); do
-        read -rsp "  Введите пароль: " _input; echo ""
-        if _verify_pass "$stored" "$_input"; then
-            return 0
-        fi
-        attempts=$((attempts - 1))
-        (( attempts > 0 )) && warn "Неверный пароль. Осталось попыток: $attempts"
+    while true; do
+        local attempts=3 _input
+        while (( attempts > 0 )); do
+            if ! read -rsp "  Введите пароль: " _input; then
+                echo ""
+                return 1
+            fi
+            echo ""
+            if _verify_pass "$stored" "$_input"; then
+                return 0
+            fi
+            attempts=$((attempts - 1))
+            (( attempts > 0 )) && warn "Неверный пароль. Осталось попыток: $attempts"
+        done
+        warn "Доступ запрещён."
+        startup_recovery_menu "Восстановление доступа" true || return 1
     done
-    error "Доступ запрещён."
 }
 
 set_script_password() {

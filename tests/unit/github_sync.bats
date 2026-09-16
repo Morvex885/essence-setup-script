@@ -172,6 +172,19 @@ _assert_local_switch_rolled_back() {
     assert_output 'Essence Remote Control <remote-control@localhost>'
 }
 
+@test "no-diff commit records HEAD before direct push" {
+    _seed_live_revision 1
+    local existing_head
+    existing_head=$(git -C "$GITHUB_WORKTREE" rev-parse HEAD) || return 1
+    GITHUB_LAST_COMMIT_HEAD=stale
+    GITHUB_SYNC_STATUS=clean
+
+    _github_sync_commit || return 1
+    [[ "$GITHUB_LAST_COMMIT_HEAD" == "$existing_head" ]] || return 1
+    _github_sync_push "$GITHUB_LAST_COMMIT_HEAD" || return 1
+    [[ "$(git --git-dir="$REMOTE" rev-parse main)" == "$existing_head" ]]
+}
+
 @test "commit failure keeps staged state pending and same-process retry pushes it" {
     _seed_live_revision 1
     local old_remote old_local old_head rc=0
@@ -885,4 +898,59 @@ EOF
     [[ "$(git --git-dir="$old_remote" rev-parse "refs/heads/$old_branch")" == "$old_remote_head" ]] || return 1
     _assert_remote_revision "$old_remote" 1 || return 1
     ! git --git-dir="$other" show-ref --verify --quiet "refs/heads/$old_branch"
+}
+
+@test "account switch transaction rejects malformed marker reuse" {
+    export GITHUB_ACCOUNT_SWITCH_DIR="$BATS_TEST_TMPDIR/account-switch"
+    export GITHUB_ACCOUNT_SWITCH_MARKER="$GITHUB_ACCOUNT_SWITCH_DIR/transaction.json"
+    export GITHUB_ACCOUNT_SWITCH_OLD_REPO=test-owner/config
+    export GITHUB_ACCOUNT_SWITCH_NEW_REPO=other-owner/config
+    export GITHUB_ACCOUNT_SWITCH_BRANCH=main
+    export GITHUB_ACCOUNT_SWITCH_INITIAL_LOGIN=test-owner
+    github_account_switch_begin \
+        "$GITHUB_ACCOUNT_SWITCH_OLD_REPO" \
+        "$GITHUB_ACCOUNT_SWITCH_NEW_REPO" main test-owner || return 1
+    github_account_switch_marker_valid "$GITHUB_ACCOUNT_SWITCH_MARKER" || return 1
+    printf '%s\n' '{}' > "$GITHUB_ACCOUNT_SWITCH_MARKER"
+    ! github_account_switch_begin \
+        "$GITHUB_ACCOUNT_SWITCH_OLD_REPO" \
+        "$GITHUB_ACCOUNT_SWITCH_NEW_REPO" main test-owner
+}
+
+@test "account switch begin blocks another live worktree" {
+    _seed_live_revision 1
+    local other="$BATS_TEST_TMPDIR/other-worktree"
+    git --git-dir="$GITHUB_STORE" worktree add "$other" main >/dev/null || return 1
+    export GITHUB_ACCOUNT_SWITCH_DIR="$BATS_TEST_TMPDIR/account-switch"
+    export GITHUB_ACCOUNT_SWITCH_MARKER="$GITHUB_ACCOUNT_SWITCH_DIR/transaction.json"
+    if github_account_switch_begin test-owner/config other-owner/config main test-owner; then
+        return 1
+    fi
+    [[ "${GITHUB_LAST_ERROR:-}" == *"Другой экземпляр уже использует рабочую копию"* ]] || return 1
+}
+
+@test "push unknown recovery accepts a remote descendant" {
+    local seed="$BATS_TEST_TMPDIR/seed"
+    git init -b main "$seed" >/dev/null
+    git -C "$seed" config user.name seed
+    git -C "$seed" config user.email seed@example.invalid
+    git -C "$seed" commit --allow-empty -m base >/dev/null
+    git -C "$seed" remote add origin "$REMOTE"
+    git -C "$seed" push origin main >/dev/null
+    local target="$BATS_TEST_TMPDIR/account-switch/target-store.git"
+    mkdir -p "$BATS_TEST_TMPDIR/account-switch"
+    git clone --bare "$REMOTE" "$target" >/dev/null
+    local expected
+    expected=$(git --git-dir="$target" rev-parse refs/heads/main)
+    git -C "$seed" commit --allow-empty -m descendant >/dev/null
+    git -C "$seed" push origin main >/dev/null
+    export GITHUB_ACCOUNT_SWITCH_DIR="$BATS_TEST_TMPDIR/account-switch"
+    export GITHUB_ACCOUNT_SWITCH_MARKER="$GITHUB_ACCOUNT_SWITCH_DIR/transaction.json"
+    export GITHUB_ACCOUNT_SWITCH_OLD_REPO=test-owner/config
+    export GITHUB_ACCOUNT_SWITCH_NEW_REPO=other-owner/config
+    export GITHUB_ACCOUNT_SWITCH_BRANCH=main
+    export GITHUB_ACCOUNT_SWITCH_INITIAL_LOGIN=test-owner
+    _github_account_switch_write_marker push_unknown "$expected" true false false || return 1
+    github_account_switch_recover || return 1
+    [[ "$(jq -r '.phase' "$GITHUB_ACCOUNT_SWITCH_MARKER")" == target_committed ]] || return 1
 }

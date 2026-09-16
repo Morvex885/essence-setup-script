@@ -927,73 +927,130 @@ SUBSCRIPTION_SELECT_RESULT=""
 _select_client() {
     SUBSCRIPTION_SELECT_RESULT=""
     local label="$1"
-    echo ""
-    echo -e "  ${CYAN}── ${label} ──${NC}"
-
-    local clients=()
+    local clients=() client_name c idx i
     while IFS= read -r client_name; do
         clients+=("$client_name")
     done < <(jq_r '.clients[].name')
-    [[ ${#clients[@]} -eq 0 ]] && { warn "Нет клиентов."; return 1; }
-
-    local i=1
-    for c in "${clients[@]}"; do
-        echo -e "  ${GREEN}${i})${NC} $c"
-        i=$((i + 1))
+    if [[ ${#clients[@]} -eq 0 ]]; then
+        echo ""
+        box_top
+        box_center "$label"
+        box_mid
+        box_line " Нет клиентов" " ${DIM}Нет клиентов${NC}"
+        menu_item 0 "Отмена" NC
+        box_bot
+        return 1
+    fi
+    while true; do
+        echo ""
+        box_top
+        box_center "$label"
+        box_mid
+        i=1
+        for c in "${clients[@]}"; do
+            box_line " ${i}) ${c}" " ${CYAN}${i})${NC} ${c}"
+            i=$((i + 1))
+        done
+        menu_item 0 "Отмена" NC
+        box_bot
+        echo ""
+        if ! IFS= read -rp "  Выберите клиента: " idx; then
+            return 1
+        fi
+        idx="${idx%$'\r'}"
+        [[ "$idx" == 0 ]] && return 1
+        if menu_index_valid "$idx" "${#clients[@]}"; then
+            SUBSCRIPTION_SELECT_RESULT="${clients[$((idx - 1))]}"
+            return 0
+        fi
+        warn "Неверный выбор."
     done
-    echo ""
-    read -rp "  Выберите: " idx
-    SUBSCRIPTION_SELECT_RESULT="${clients[$((idx - 1))]}"
-    [[ -z "$SUBSCRIPTION_SELECT_RESULT" ]] && { warn "Неверный выбор."; return 1; }
-    return 0
 }
 
 _select_client_with_sub() {
     SUBSCRIPTION_SELECT_RESULT=""
     local label="$1"
-    echo ""
-    echo -e "  ${CYAN}── ${label} ──${NC}"
-
-    local clients=()
+    local clients=() client_name c idx i
     while IFS= read -r client_name; do
         clients+=("$client_name")
     done < <(jq_r '.clients[] | select(.subscription.token) | .name')
-    [[ ${#clients[@]} -eq 0 ]] && { warn "Нет клиентов с подписками."; return 1; }
-
-    local i=1
-    for c in "${clients[@]}"; do
-        echo -e "  ${GREEN}${i})${NC} $c"
-        i=$((i + 1))
+    if [[ ${#clients[@]} -eq 0 ]]; then
+        echo ""
+        box_top
+        box_center "$label"
+        box_mid
+        box_line " Нет клиентов с подписками" " ${DIM}Нет клиентов с подписками${NC}"
+        menu_item 0 "Отмена" NC
+        box_bot
+        return 1
+    fi
+    while true; do
+        echo ""
+        box_top
+        box_center "$label"
+        box_mid
+        i=1
+        for c in "${clients[@]}"; do
+            box_line " ${i}) ${c}" " ${CYAN}${i})${NC} ${c}"
+            i=$((i + 1))
+        done
+        menu_item 0 "Отмена" NC
+        box_bot
+        echo ""
+        if ! IFS= read -rp "  Выберите клиента: " idx; then
+            return 1
+        fi
+        idx="${idx%$'\r'}"
+        [[ "$idx" == 0 ]] && return 1
+        if menu_index_valid "$idx" "${#clients[@]}"; then
+            SUBSCRIPTION_SELECT_RESULT="${clients[$((idx - 1))]}"
+            return 0
+        fi
+        warn "Неверный выбор."
     done
-    echo ""
-    read -rp "  Выберите: " idx
-    SUBSCRIPTION_SELECT_RESULT="${clients[$((idx - 1))]}"
-    [[ -z "$SUBSCRIPTION_SELECT_RESULT" ]] && { warn "Неверный выбор."; return 1; }
-    return 0
 }
 
 _select_group() {
     SUBSCRIPTION_SELECT_RESULT=""
     local label="$1"
-    echo ""
-    echo -e "  ${CYAN}── ${label} ──${NC}"
-
-    local groups=()
+    local groups=() group_name g idx i
     while IFS= read -r group_name; do
         groups+=("$group_name")
     done < <(jq_r '.groups[].name')
-    [[ ${#groups[@]} -eq 0 ]] && { warn "Нет групп."; return 1; }
-
-    local i=1
-    for g in "${groups[@]}"; do
-        echo -e "  ${GREEN}${i})${NC} $g"
-        i=$((i + 1))
+    if [[ ${#groups[@]} -eq 0 ]]; then
+        echo ""
+        box_top
+        box_center "$label"
+        box_mid
+        box_line " Нет групп" " ${DIM}Нет групп${NC}"
+        menu_item 0 "Отмена" NC
+        box_bot
+        return 1
+    fi
+    while true; do
+        echo ""
+        box_top
+        box_center "$label"
+        box_mid
+        i=1
+        for g in "${groups[@]}"; do
+            box_line " ${i}) ${g}" " ${CYAN}${i})${NC} ${g}"
+            i=$((i + 1))
+        done
+        menu_item 0 "Отмена" NC
+        box_bot
+        echo ""
+        if ! IFS= read -rp "  Выберите группу: " idx; then
+            return 1
+        fi
+        idx="${idx%$'\r'}"
+        [[ "$idx" == 0 ]] && return 1
+        if menu_index_valid "$idx" "${#groups[@]}"; then
+            SUBSCRIPTION_SELECT_RESULT="${groups[$((idx - 1))]}"
+            return 0
+        fi
+        warn "Неверный выбор."
     done
-    echo ""
-    read -rp "  Выберите: " idx
-    SUBSCRIPTION_SELECT_RESULT="${groups[$((idx - 1))]}"
-    [[ -z "$SUBSCRIPTION_SELECT_RESULT" ]] && { warn "Неверный выбор."; return 1; }
-    return 0
 }
 
 # ─── Авторефреш после генерации (вызывается из generate.sh) ────────────────

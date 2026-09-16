@@ -24,24 +24,24 @@ clients_menu() {
         echo ""
         box_top
         box_center "Клиенты"
+        box_mid
+        _list_clients_display
+        box_mid
+        menu_item a "Добавить клиента" GREEN
+        menu_item e "Редактировать клиента" YELLOW
+        menu_item d "Удалить клиента" RED
+        menu_item 0 "Назад" NC
         box_bot
         echo ""
-
-        _list_clients_display
-
-        echo ""
-        echo -e "  ${GREEN}a)${NC} Добавить клиента"
-        echo -e "  ${YELLOW}e)${NC} Редактировать клиента"
-        echo -e "  ${RED}d)${NC} Удалить клиента"
-        echo -e "  ${NC}0)${NC} Назад"
-        echo ""
-        read -rp "Выберите: " CL_CHOICE
-
+        if ! IFS= read -rp "  Выберите действие: " CL_CHOICE; then
+            return 0
+        fi
+        CL_CHOICE="${CL_CHOICE%$'\r'}"
         case "$CL_CHOICE" in
-            a) state_action "add_client" add_client ;;
-            e) state_action "edit_client" edit_client ;;
-            d) state_action "delete_client" delete_client ;;
-            0) return ;;
+            a|A) state_action "add_client" add_client ;;
+            e|E) state_action "edit_client" edit_client ;;
+            d|D) state_action "delete_client" delete_client ;;
+            0) return 0 ;;
             *) warn "Неверный выбор." ;;
         esac
     done
@@ -51,25 +51,24 @@ _list_clients_display() {
     local count
     count=$(jq_r '.clients | length')
     if [[ "$count" -eq 0 ]]; then
-        echo -e "  ${DIM}Нет клиентов${NC}"
+        box_line " Нет клиентов" " ${DIM}Нет клиентов${NC}"
         return
     fi
 
-    local i=1
+    local name group inherit nodes_display
     while IFS='|' read -r name group inherit; do
-        local nodes_display
         if [[ "$inherit" == "true" ]]; then
             nodes_display=$(_group_nodes_csv "$group")
             nodes_display="${nodes_display//,/, }"
             [[ -z "$nodes_display" ]] && nodes_display="нет нод"
-            nodes_display="${DIM}(группа: $nodes_display)${NC}"
+            box_line " ${name} — группа: ${group}"
+            box_line "    ноды: ${nodes_display}" "    ${DIM}ноды: ${nodes_display}${NC}"
         else
             nodes_display=$(jq_r --arg n "$name" '.clients[] | select(.name==$n) | .nodes // [] | sort | join(", ")')
             [[ -z "$nodes_display" ]] && nodes_display="нет нод"
-            nodes_display="${YELLOW}[$nodes_display]${NC}"
+            box_line " ${name} — группа: ${group}"
+            box_line "    ноды: ${nodes_display}" "    ${YELLOW}ноды: ${nodes_display}${NC}"
         fi
-        printf "  ${GREEN}%d)${NC} %-18s ${CYAN}%-8s${NC} %b\n" "$i" "$name" "$group" "$nodes_display"
-        i=$((i + 1))
     done < <(jq_r '.clients[] | "\(.name)|\(.group)|\(if .inherit_nodes_from_group == false then false else true end)"')
 }
 
@@ -408,7 +407,7 @@ _set_custom_nodes() {
     local node_names=() node_labels=() node_flags=()
     while IFS=$'\t' read -r nname nip; do
         node_names+=("$nname")
-        node_labels+=("$nname ${DIM}$nip${NC}")
+        node_labels+=("$nname $nip")
         if echo ",$current_nodes," | grep -qF ",$nname,"; then
             node_flags+=(1)
         else
@@ -418,10 +417,12 @@ _set_custom_nodes() {
 
     TOGGLE_SELECT_ITEMS=("${node_labels[@]}")
     TOGGLE_SELECT_FLAGS=("${node_flags[@]}")
-    toggle_select "Ноды для ${CYAN}$client_name${NC}"
+    toggle_select "Ноды для $client_name"
+    local toggle_rc=$?
     node_flags=("${TOGGLE_SELECT_FLAGS[@]}")
     TOGGLE_SELECT_ITEMS=()
     TOGGLE_SELECT_FLAGS=()
+    (( toggle_rc == 0 )) || return 1
 
     local selected_nodes=()
     local i=0
@@ -481,9 +482,11 @@ delete_client() {
     TOGGLE_SELECT_ITEMS=("${CLIENTS[@]}")
     TOGGLE_SELECT_FLAGS=("${_flags[@]}")
     toggle_select "Выберите клиентов для удаления"
+    local toggle_rc=$?
     _flags=("${TOGGLE_SELECT_FLAGS[@]}")
     TOGGLE_SELECT_ITEMS=()
     TOGGLE_SELECT_FLAGS=()
+    (( toggle_rc == 0 )) || return 1
 
     local -a TARGETS=()
     for (( _i=0; _i<${#CLIENTS[@]}; _i++ )); do
@@ -537,7 +540,10 @@ delete_client() {
                 continue
             fi
             if ! array_contains "$_nn" "${SCRIPTS_UPLOADED[@]}"; then
-                upload_scripts
+                if ! upload_scripts; then
+                    warn "$_nn: не удалось загрузить скрипты; AWG peers не удалены."
+                    continue
+                fi
                 SCRIPTS_UPLOADED+=("$_nn")
             fi
             _peers_list="${_peer_lists[$_node_peer_idx]# }"
@@ -588,7 +594,10 @@ delete_client() {
         [[ -z "$_remaining_users" ]] && continue
 
         if ! array_contains "$_nn" "${SCRIPTS_UPLOADED[@]}"; then
-            upload_scripts
+            if ! upload_scripts; then
+                warn "$_nn: не удалось загрузить скрипты; listeners не изменены."
+                continue
+            fi
             SCRIPTS_UPLOADED+=("$_nn")
         fi
 
@@ -774,10 +783,12 @@ _configure_client_connections() {
         1)
             TOGGLE_SELECT_ITEMS=("${disc_arr[@]}")
             TOGGLE_SELECT_FLAGS=("${flags[@]}")
-            toggle_select "${CYAN}$client_name -> $selected_node${NC}"
+            toggle_select "$client_name -> $selected_node"
+            local toggle_rc=$?
             flags=("${TOGGLE_SELECT_FLAGS[@]}")
             TOGGLE_SELECT_ITEMS=()
             TOGGLE_SELECT_FLAGS=()
+            (( toggle_rc == 0 )) || return 1
 
             local selected=()
             local i=0

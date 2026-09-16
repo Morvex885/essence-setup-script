@@ -3,8 +3,32 @@
 
 uninstall() {
     echo ""
-    warn "Будет удалено: mihomo, wgcf, nginx конфиг, сертификаты, сайт-заглушка, acme.sh, подписки, firewall правила."
-    confirm_yn "Вы уверены?" || { info "Отменено."; return; }
+    warn "Будет удалено: mihomo, wgcf, nginx конфиг, сертификаты, сайт-заглушка, acme.sh, подписки, Telegram Proxy, firewall правила."
+    confirm_yn "Удалить все установленные компоненты?" || return 0
+
+    # Shared Telegram backend is removed before Nginx/certificate cleanup.
+    if [[ -f "${TPROXY_CONF:-/etc/tproxy-server/essence.conf}" ||
+          -e "${TPROXY_ENV_FILE:-/etc/mtproxy/mtproxy.env}" ||
+          -e "${TPROXY_RELAY_SOURCE_PATH:-/opt/tproxy-server-source}" ||
+          -e "${TPROXY_MTPROXY_SOURCE_DIR:-/opt/MTProxy}" ]]; then
+        local telegram_rc
+        if TPROXY_INTERNAL_CALL=true telegram_proxy_remove_all --force; then
+            telegram_rc=0
+        else
+            telegram_rc=$?
+        fi
+        case "$telegram_rc" in
+            0|3) ;;
+            *)
+                warn "Не удалось удалить Telegram Proxy. Остальные компоненты не удалялись."
+                return 1
+                ;;
+        esac
+    fi
+
+    if [[ -f "${SUB_CONF:-/etc/mihomo/subscription.conf}" ]]; then
+        remove_subscription || return 1
+    fi
 
     # VLESS транспорты — закрываем кастомные порты
     if [[ -f /etc/mihomo/config.yaml ]]; then
@@ -48,29 +72,6 @@ uninstall() {
     rm -rf /root/wgcf
     success "wgcf удалён"
 
-    # Subscription hosting
-    if [[ -f /etc/mihomo/subscription.conf ]]; then
-        info "Удаляю subscription hosting..."
-        source /etc/mihomo/subscription.conf
-        rm -f /etc/nginx/sites-enabled/essence-sub
-        rm -f /etc/nginx/sites-available/essence-sub
-        if [[ "$SUB_MODE" == "sni" ]]; then
-            sed -i "/${SUB_HOSTNAME}.*subscription;/d" /etc/nginx/nginx.conf 2>/dev/null
-            sed -i '/upstream subscription {/,/}/d' /etc/nginx/nginx.conf 2>/dev/null
-        fi
-        sed -i '/zone=sub/d' /etc/nginx/nginx.conf 2>/dev/null
-        [[ "$SUB_MODE" == "standalone" ]] && ufw delete allow "${SUB_PORT}/tcp" > /dev/null 2>&1
-        systemctl disable --now essence-sub-cleanup.timer 2>/dev/null
-        rm -f /etc/systemd/system/essence-sub-cleanup.service
-        rm -f /etc/systemd/system/essence-sub-cleanup.timer
-        rm -f /usr/local/bin/essence-sub-cleanup
-        rm -rf "$SUB_DIR"
-        rm -rf /etc/nginx/ssl/"$SUB_HOSTNAME"
-        rm -rf /var/www/"$SUB_HOSTNAME"
-        rm -f /etc/mihomo/subscription.conf
-        systemctl daemon-reload
-        success "Subscription hosting удалён"
-    fi
 
     # Nginx конфиг и сайт
     info "Удаляю Nginx конфиг и сайт-заглушку..."

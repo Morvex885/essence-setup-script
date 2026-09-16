@@ -7,13 +7,23 @@ _ASKPASS_FILE="" _PASS_FILE=""
 SSH_BASE_OPTIONS=()
 
 _setup_askpass() {
-    _ASKPASS_FILE="" _PASS_FILE=""
+    _cleanup_askpass >/dev/null 2>&1 || true
     [[ "$SERVER_AUTH" == "key" || -z "$SERVER_PASS" ]] && return 1
-    _PASS_FILE=$(umask 077; mktemp)
-    printf '%s' "$SERVER_PASS" > "$_PASS_FILE"
-    _ASKPASS_FILE=$(umask 077; mktemp)
-    printf '#!/bin/bash\ncat "%s"\n' "$_PASS_FILE" > "$_ASKPASS_FILE"
-    chmod 700 "$_ASKPASS_FILE"
+    _PASS_FILE=$(umask 077; mktemp) || return 1
+    if ! printf '%s' "$SERVER_PASS" > "$_PASS_FILE"; then
+        _cleanup_askpass
+        return 1
+    fi
+    chmod 0600 "$_PASS_FILE" || { _cleanup_askpass; return 1; }
+    _ASKPASS_FILE=$(umask 077; mktemp) || { _cleanup_askpass; return 1; }
+    if ! printf '#!/bin/bash\ncat "%s"\n' "$_PASS_FILE" > "$_ASKPASS_FILE" ||
+       ! chmod 0700 "$_ASKPASS_FILE"; then
+        _cleanup_askpass
+        return 1
+    fi
+    if declare -F register_exit_cleanup >/dev/null 2>&1; then
+        register_exit_cleanup _cleanup_askpass
+    fi
 }
 
 _cleanup_askpass() {
@@ -97,30 +107,29 @@ _ssh_base_options() {
 }
 
 ssh_run() {
-    local extra=()
-    while [[ $# -gt 0 && "$1" != "--" ]]; do extra+=("$1"); shift; done
+    local extra=() tty=false option
+    while [[ $# -gt 0 && "$1" != "--" ]]; do
+        option="$1"
+        extra+=("$option")
+        [[ "$option" == "-t" || "$option" == "-tt" ]] && tty=true
+        shift
+    done
     [[ "${1:-}" == "--" ]] && shift
     _ssh_base_options || return 1
-
-    local is_tty=false f
-    for f in "${extra[@]}"; do [[ "$f" == "-t" ]] && is_tty=true; done
-    local rc
+    local rc timeout_seconds="${SSH_RUN_TIMEOUT:-30}" runner=()
+    [[ "$timeout_seconds" =~ ^[0-9]+$ ]] || timeout_seconds=30
+    if [[ "$tty" != true ]]; then
+        runner=(run_with_timeout "$timeout_seconds")
+    fi
     if _setup_askpass; then
-        if $is_tty; then
-            DISPLAY=dummy SSH_ASKPASS="$_ASKPASS_FILE" SSH_ASKPASS_REQUIRE=force \
-                ssh "${SSH_BASE_OPTIONS[@]}" "${extra[@]}" "${SERVER_USER}@${SERVER_IP}" "$@"
-        else
-            DISPLAY=dummy SSH_ASKPASS="$_ASKPASS_FILE" SSH_ASKPASS_REQUIRE=force \
-                run_with_timeout 30 ssh "${SSH_BASE_OPTIONS[@]}" "${extra[@]}" "${SERVER_USER}@${SERVER_IP}" "$@"
-        fi
+        DISPLAY=dummy SSH_ASKPASS="$_ASKPASS_FILE" SSH_ASKPASS_REQUIRE=force \
+            "${runner[@]}" ssh "${SSH_BASE_OPTIONS[@]}" "${extra[@]}" \
+            "${SERVER_USER}@${SERVER_IP}" "$@"
         rc=$?
         _cleanup_askpass
     else
-        if $is_tty; then
-            ssh "${SSH_BASE_OPTIONS[@]}" "${extra[@]}" "${SERVER_USER}@${SERVER_IP}" "$@"
-        else
-            run_with_timeout 30 ssh "${SSH_BASE_OPTIONS[@]}" "${extra[@]}" "${SERVER_USER}@${SERVER_IP}" "$@"
-        fi
+        "${runner[@]}" ssh "${SSH_BASE_OPTIONS[@]}" "${extra[@]}" \
+            "${SERVER_USER}@${SERVER_IP}" "$@"
         rc=$?
     fi
     return "$rc"
@@ -206,21 +215,23 @@ ssh_connect() {
 upload_scripts() {
     info "Загружаем скрипты на ${SERVER_USER}@${SERVER_IP} (${REMOTE_DIR})..."
     ssh_run -- "mkdir -p ${REMOTE_DIR}/modules" \
-        || { warn "Не удалось создать директорию на сервере."; return; }
+        || { warn "Не удалось создать директорию на сервере."; return 1; }
     scp_run "$SETUP_DIR/setup-essence.sh" \
         "${SERVER_USER}@${SERVER_IP}:${REMOTE_DIR}/setup-essence.sh" \
-        || { warn "Ошибка загрузки setup-essence.sh"; return; }
+        || { warn "Ошибка загрузки setup-essence.sh"; return 1; }
     scp_run "$SETUP_DIR/modules/"*.sh \
         "${SERVER_USER}@${SERVER_IP}:${REMOTE_DIR}/modules/" \
-        || { warn "Ошибка загрузки модулей"; return; }
+        || { warn "Ошибка загрузки модулей"; return 1; }
     scp_run -r "$COMMON_DIR" \
         "${SERVER_USER}@${SERVER_IP}:${REMOTE_DIR}/" \
-        || { warn "Ошибка загрузки common/"; return; }
+        || { warn "Ошибка загрузки common/"; return 1; }
     scp_run "$VERSION_PATH" \
         "${SERVER_USER}@${SERVER_IP}:${REMOTE_DIR}/VERSION" \
-        || { warn "Ошибка загрузки VERSION"; return; }
-    ssh_run -- "chmod +x ${REMOTE_DIR}/setup-essence.sh ${REMOTE_DIR}/modules/*.sh"
+        || { warn "Ошибка загрузки VERSION"; return 1; }
+    ssh_run -- "chmod +x ${REMOTE_DIR}/setup-essence.sh ${REMOTE_DIR}/modules/*.sh" \
+        || { warn "Не удалось установить права на скрипты."; return 1; }
     success "Скрипты загружены"
+    return 0
 }
 
 # ─── Запуск меню на сервере ───────────────────────────────────────────────────

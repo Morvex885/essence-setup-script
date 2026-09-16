@@ -31,42 +31,40 @@ groups_menu() {
         echo ""
         box_top
         box_center "Группы"
-        box_bot
-        echo ""
-
+        box_mid
         groups_list
         if [[ ${#GRP_LIST[@]} -gt 0 ]]; then
-            local i=1
+            local i=1 g count tpl tpl_display node_count gn_csv
             for g in "${GRP_LIST[@]}"; do
-                local count
                 count=$(_group_client_count "$g")
-                local tpl
                 tpl=$(jq_r --arg g "$g" '.groups[] | select(.name==$g) | .template // "default.yaml"')
-                local tpl_display=""
-                [[ "$tpl" != "default.yaml" ]] && tpl_display=" ${YELLOW}[$tpl]${NC}"
-                local node_count=0
-                local _gn_csv
-                _gn_csv=$(_group_nodes_csv "$g")
-                [[ -n "$_gn_csv" ]] && node_count=$(echo "$_gn_csv" | tr ',' '\n' | wc -l | tr -d ' ')
-                echo -e "  ${GREEN}${i})${NC} $g ${DIM}— $count клиентов, $node_count нод${NC}${tpl_display}"
+                tpl_display=""
+                [[ "$tpl" != "default.yaml" ]] && tpl_display=" [$tpl]"
+                node_count=0
+                gn_csv=$(_group_nodes_csv "$g")
+                [[ -n "$gn_csv" ]] && node_count=$(echo "$gn_csv" | tr ',' '\n' | wc -l | tr -d ' ')
+                box_line " ${g} — ${count} клиентов, ${node_count} нод${tpl_display}"
                 i=$((i + 1))
             done
         else
-            echo -e "  ${DIM}Нет групп${NC}"
+            box_line " Нет групп" " ${DIM}Нет групп${NC}"
         fi
+        box_mid
+        menu_item a "Добавить группу" GREEN
+        menu_item d "Удалить группу" RED
+        menu_item t "Поменять шаблон группе" YELLOW
+        menu_item 0 "Назад" NC
+        box_bot
         echo ""
-        echo -e "  ${GREEN}a)${NC} Добавить группу"
-        echo -e "  ${RED}d)${NC} Удалить группу"
-        echo -e "  ${YELLOW}t)${NC} Поменять шаблон группе"
-        echo -e "  ${NC}0)${NC} Назад"
-        echo ""
-        read -rp "Выберите: " GRP_CHOICE
-
+        if ! IFS= read -rp "  Выберите действие: " GRP_CHOICE; then
+            return 0
+        fi
+        GRP_CHOICE="${GRP_CHOICE%$'\r'}"
         case "$GRP_CHOICE" in
-            a) state_action "add_group" add_group ;;
-            d) state_action "delete_group" delete_group ;;
-            t) state_action "assign_template" assign_template_to_group ;;
-            0) return ;;
+            a|A) state_action "add_group" add_group ;;
+            d|D) state_action "delete_group" delete_group ;;
+            t|T) state_action "assign_template" assign_template_to_group ;;
+            0) return 0 ;;
             *) warn "Неверный выбор." ;;
         esac
     done
@@ -137,83 +135,103 @@ select_group() {
         return 1
     fi
 
-    local i=1
-    for g in "${GRP_LIST[@]}"; do
-        local count
-        count=$(_group_client_count "$g")
-        echo -e "  ${GREEN}${i})${NC} $g ${DIM}— $count клиентов${NC}"
-        i=$((i + 1))
+    while true; do
+        echo ""
+        box_top
+        box_center "Выбор группы"
+        box_mid
+        local g count i=1
+        for g in "${GRP_LIST[@]}"; do
+            count=$(_group_client_count "$g")
+            box_line " ${i}) ${g} — ${count} клиентов" \
+                " ${GREEN}${i})${NC} ${g} ${DIM}— ${count} клиентов${NC}"
+            i=$((i + 1))
+        done
+        menu_item 0 "Отмена" NC
+        box_bot
+        echo ""
+        if ! IFS= read -rp "  Выберите группу: " GRP_IDX; then
+            return 1
+        fi
+        GRP_IDX="${GRP_IDX%$'\r'}"
+        [[ "$GRP_IDX" == 0 ]] && return 1
+        if ! menu_index_valid "$GRP_IDX" "${#GRP_LIST[@]}"; then
+            warn "Неверный выбор."
+            continue
+        fi
+        SELECTED_GROUP="${GRP_LIST[$((GRP_IDX - 1))]}"
+        return 0
     done
-    echo ""
-    read -rp "Выберите группу: " GRP_IDX
-
-    if ! [[ "$GRP_IDX" =~ ^[0-9]+$ ]] || (( GRP_IDX < 1 || GRP_IDX > ${#GRP_LIST[@]} )); then
-        warn "Неверный выбор."
-        return 1
-    fi
-
-    SELECTED_GROUP="${GRP_LIST[$((GRP_IDX - 1))]}"
 }
 
 assign_template_to_group() {
-    echo ""
-    echo -e "  Выберите группу:"
-    if ! select_group; then return; fi
-    local group="$SELECTED_GROUP"
-
-    # Текущий шаблон
-    local current_tpl
+    if ! select_group; then
+        return 1
+    fi
+    local group="$SELECTED_GROUP" current_tpl templates=() template_name
     current_tpl=$(_template_name_for_group "$group")
-    info "Текущий шаблон: $current_tpl"
-
-    # Пользовательские и встроенные шаблоны.
-    echo ""
-    echo -e "  Доступные шаблоны:"
-    local templates=()
     while IFS= read -r template_name; do
         [[ -n "$template_name" ]] && templates+=("$template_name")
     done < <(_list_templates)
 
-    local i=1
-    for t in "${templates[@]}"; do
-        local marker=""
-        [[ "$t" == "$current_tpl" ]] && marker=" ${GREEN}<- текущий${NC}"
-        echo -e "  ${GREEN}${i})${NC} $t${marker}"
-        i=$((i + 1))
+    while true; do
+        echo ""
+        box_top
+        box_center "Шаблон группы: $group"
+        box_mid
+        box_line " Текущий: $current_tpl" " ${DIM}Текущий: $current_tpl${NC}"
+        local t
+        for (( i=0; i<${#templates[@]}; i++ )); do
+            if [[ "${templates[$i]}" == "$current_tpl" ]]; then
+                box_line " $((i+1))) ${templates[$i]} (текущий)" \
+                    " ${GREEN}$((i+1)))${NC} ${templates[$i]} ${DIM}(текущий)${NC}"
+            else
+                box_line " $((i+1))) ${templates[$i]}" \
+                    " ${GREEN}$((i+1)))${NC} ${templates[$i]}"
+            fi
+        done
+        menu_item n "Создать новый шаблон" GREEN
+        menu_item 0 "Отмена" NC
+        box_bot
+        echo ""
+        local TPL_CHOICE
+        if ! IFS= read -rp "  Выберите шаблон: " TPL_CHOICE; then
+            return 1
+        fi
+        TPL_CHOICE="${TPL_CHOICE%$'\r'}"
+        if [[ "$TPL_CHOICE" == n || "$TPL_CHOICE" == N ]]; then
+            _create_new_template "$group"
+            return $?
+        fi
+        [[ "$TPL_CHOICE" == 0 ]] && return 1
+        if ! menu_index_valid "$TPL_CHOICE" "${#templates[@]}"; then
+            warn "Неверный выбор."
+            continue
+        fi
+        local selected="${templates[$((TPL_CHOICE - 1))]}"
+        jq_w --arg g "$group" --arg t "$selected" \
+            '.groups |= map(if .name==$g then .template=$t else . end)' || return 1
+        success "Группа $group: шаблон — $selected"
+        return 0
     done
-    echo -e "  ${GREEN}n)${NC} Создать новый шаблон"
-    echo ""
-    read -rp "Выберите шаблон: " TPL_CHOICE
-
-    if [[ "$TPL_CHOICE" == "n" || "$TPL_CHOICE" == "N" ]]; then
-        _create_new_template "$group"
-        return
-    fi
-
-    if ! [[ "$TPL_CHOICE" =~ ^[0-9]+$ ]] || (( TPL_CHOICE < 1 || TPL_CHOICE > ${#templates[@]} )); then
-        warn "Неверный выбор."
-        return
-    fi
-
-    local selected="${templates[$((TPL_CHOICE - 1))]}"
-    jq_w --arg g "$group" --arg t "$selected" \
-        '.groups |= map(if .name==$g then .template=$t else . end)'
-    success "Группа $group: шаблон — $selected"
 }
 
 _create_new_template() {
     local group="$1"
 
-    read -rp "Имя нового шаблона (без .yaml): " TPL_NAME
+    if ! IFS= read -rp "Имя нового шаблона (без .yaml): " TPL_NAME; then
+        return 1
+    fi
+    TPL_NAME="${TPL_NAME%$'\r'}"
     if [[ -z "$TPL_NAME" || ! "$TPL_NAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
         warn "Имя может содержать только буквы, цифры, точку, - и _"
-        return
+        return 1
     fi
 
     local new_file="$TEMPLATES_DIR/${TPL_NAME}.yaml"
     if [[ -f "$new_file" ]]; then
         warn "Шаблон '${TPL_NAME}.yaml' уже существует."
-        return
+        return 1
     fi
 
     # Копируем доступный default.yaml как основу.
@@ -224,7 +242,7 @@ _create_new_template() {
         cp "$default_tpl" "$new_file" || return 1
         info "Скопирован default.yaml как основа"
     else
-        : > "$new_file"
+        : > "$new_file" || return 1
         warn "default.yaml не найден — создан пустой шаблон"
     fi
 
@@ -239,6 +257,6 @@ _create_new_template() {
 
     # Назначаем группе
     jq_w --arg g "$group" --arg t "${TPL_NAME}.yaml" \
-        '.groups |= map(if .name==$g then .template=$t else . end)'
+        '.groups |= map(if .name==$g then .template=$t else . end)' || return 1
     success "Группа $group: шаблон — ${TPL_NAME}.yaml"
 }
