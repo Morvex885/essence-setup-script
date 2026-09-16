@@ -664,24 +664,23 @@ _sync_node_listeners() {
 
     # Собираем всех клиентов, привязанных к этой ноде (через группы и кастомные ноды)
     local users_data
-    users_data=$(jq_r --arg n "$nname" '
-        . as $root |
-        [.clients[] |
-            select(
-                (.inherit_nodes_from_group != false and
-                    (.group as $g | any(
-                        $root.connections[];
-                        .node == $n and any(.groups[]?; .name == $g)
-                    ))) or
-                (.inherit_nodes_from_group == false and
-                    (.nodes // [] | index($n)))
-            ) |
-            {name: .name, vless_uuid: .credentials.vless_uuid, hy2_password: .credentials.hy2_password}
-        ] | .[] | "\(.name) \(.vless_uuid) \(.hy2_password)"
-    ' 2>/dev/null) || true
-
-    [[ -z "$users_data" ]] && return 0
-
+    users_data=$(set -o pipefail
+        jq_r --arg n "$nname" '
+            . as $root |
+            [.clients[] |
+                select(
+                    (.inherit_nodes_from_group != false and
+                        (.group as $g | any(
+                            $root.connections[];
+                            .node == $n and any(.groups[]?; .name == $g)
+                        ))) or
+                    (.inherit_nodes_from_group == false and
+                        (.nodes // [] | index($n)))
+                ) |
+                {name: .name, vless_uuid: .credentials.vless_uuid, hy2_password: .credentials.hy2_password}
+            ] | .[] | "\(.name) \(.vless_uuid) \(.hy2_password)"
+        ' 2>/dev/null
+    ) || return 1
     # Определяем какие listener'ы есть на ноде (из кешированного конфига)
     local remote_config
     remote_config=$(_get_node_config "$nname") || return 1
@@ -732,23 +731,17 @@ _sync_node_listeners() {
 
     # Формируем SSH-команду: sync каждого listener'а + restart
     local sync_cmd="source ${REMOTE_DIR}/common/listener-users.sh"
-    local has_changes=false
-
-    if $has_vless_tcp && [[ -n "$vless_tcp_users" ]]; then
+    if $has_vless_tcp; then
         sync_cmd+=" && _sync_listener_users 'vless-tcp' $(printf '%q' "$vless_tcp_users")"
-        has_changes=true
     fi
-    if $has_vless_xhttp && [[ -n "$vless_xhttp_users" ]]; then
+    if $has_vless_xhttp; then
         sync_cmd+=" && _sync_listener_users 'vless-xhttp' $(printf '%q' "$vless_xhttp_users")"
-        has_changes=true
     fi
-    if $has_vless_grpc && [[ -n "$vless_grpc_users" ]]; then
+    if $has_vless_grpc; then
         sync_cmd+=" && _sync_listener_users 'vless-grpc' $(printf '%q' "$vless_grpc_users")"
-        has_changes=true
     fi
-    if $has_hy2 && [[ -n "$hy2_users" ]]; then
+    if $has_hy2; then
         sync_cmd+=" && _sync_listener_users 'hy2' $(printf '%q' "$hy2_users")"
-        has_changes=true
     fi
     # Restart mihomo после sync
     sync_cmd+=" && systemctl restart mihomo"

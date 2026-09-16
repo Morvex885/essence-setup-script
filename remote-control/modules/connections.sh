@@ -161,7 +161,11 @@ _sync_all_connections() {
     SERVER_USER="$_save_user" SERVER_PASS="$_save_pass" SERVER_AUTH="$_save_auth"
 
     success "Синхронизировано: $ok/${#nodes[@]} нод"
-    [[ $fail -gt 0 ]] && warn "Не доступно: $fail"
+    if [[ $fail -gt 0 ]]; then
+        warn "Не доступно: $fail"
+        return 1
+    fi
+    return 0
 }
 
 _show_connections_overview() {
