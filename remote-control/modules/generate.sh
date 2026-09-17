@@ -614,9 +614,9 @@ _fetch_proxies_for_client() {
                             ;;
                     esac
                 fi
-                # AWG: переименовать proxy → "node AmneziaWG 2.0"
+                # AWG: переименовать proxy → "AmneziaWG 3.1"
                 if [[ -n "$block" && "$conn_name" == "AWG" ]]; then
-                    local awg_display="AmneziaWG 2.0"
+                    local awg_display="AmneziaWG 3.1"
                     block="  - name: \"${awg_display}\""$'\n'"$(echo "$block" | tail -n +2)"
                 fi
                 [[ -n "$block" ]] && filtered="${filtered}${block}"$'\n'

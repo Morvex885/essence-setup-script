@@ -321,3 +321,72 @@ _invoke_listener_sync_without_pipefail() {
     done
     [[ "$(wc -l < "$LISTENER_RESTART_LOG")" -eq 1 ]]
 }
+
+@test "_fetch_proxies_for_client keeps tagged AmneziaWG 3.1 options" {
+    jq_w '.connections[0].groups[0].proxies += ["AWG"]'
+    _node_config_cache_set "de-vps" "$(cat <<'EOF'
+proxies:
+  - name: "awg-my-router"
+    type: wireguard
+    server: 1.2.3.4
+    port: 41000
+    private-key: client-private
+    public-key: server-public
+    pre-shared-key: peer-psk
+    ip: 10.10.8.2
+    mtu: 1280
+    persistent-keepalive: 25
+    allowed-ips: ['0.0.0.0/0', '::/0']
+    amnezia-wg-option:
+      version: 3
+      jc: 4
+      jmin: 10
+      jmax: 50
+      s1: 20
+      s2: 30
+      s3: 15
+      s4: 12
+      h1: 1
+      h2: 2
+      h3: 3
+      h4: 4
+      header-protection-key: header-protection-key
+      content-padding-addition: 10-100
+      rekey-after-time: 100-120
+      rekey-timeout: 3-7
+      reject-after-time: 150-180
+      keepalive-timeout: 5-15
+      max-handshake-attempts: 15-20
+      random-trailers: true
+      disable-cookies: true
+proxies:
+  - name: "awg-other-client"
+    type: wireguard
+    server: 9.9.9.9
+    port: 42000
+    private-key: other-private
+    public-key: other-public
+    pre-shared-key: other-psk
+    ip: 10.10.8.3
+    mtu: 1400
+    persistent-keepalive: 10
+    allowed-ips: ['10.0.0.0/8']
+    amnezia-wg-option:
+      version: 2
+      header-protection-key: other-header
+      random-trailers: false
+      disable-cookies: false
+---
+EOF
+)"
+    run _fetch_proxies_for_client my-router ROUTER de-vps
+    assert_success
+    assert_output --partial '🇩🇪 AmneziaWG 3.1'
+    assert_output --partial 'version: 3'
+    assert_output --partial 'header-protection-key: header-protection-key'
+    assert_output --partial 'random-trailers: true'
+    assert_output --partial 'disable-cookies: true'
+    assert_output --partial 'ip: 10.10.8.2'
+    refute_output --partial '9.9.9.9'
+    refute_output --partial 'other-'
+}

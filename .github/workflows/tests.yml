@@ -33,6 +33,8 @@ jobs:
         run: docker run --rm -v /tmp/nginx-xhttp.conf:/etc/nginx/nginx.conf:ro nginx:latest nginx -t
 
       - name: Run unit tests
+        env:
+          AWG_REAL_MIHOMO_BIN: /tmp/mihomo
         run: ./tests/lib/bats-core/bin/bats tests/unit/ --recursive --tap
 
       - name: Run fuzz tests

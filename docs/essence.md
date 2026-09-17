@@ -9,7 +9,7 @@
 | **1) Базовая установка** | Установка mihomo, systemd-сервис, UFW, BBR, sysctl tuning |
 | **2) VLESS Reality** | VLESS с XTLS-Reality (TCP, xHTTP, gRPC), Self-Steal / SNI режимы, Nginx + acme.sh |
 | **3) Hysteria2** | Протокол Hysteria2 (QUIC), опционально с obfs salamander |
-| **4) AmneziaWG 2.0** | AmneziaWG VPN-туннели с автоматическим созданием peers |
+| **4) AmneziaWG 3.1** | AmneziaWG VPN-туннели с автоматическим созданием peers |
 | **5) IPv6** | Включение / отключение IPv6 на сервере |
 | **6) WARP** | Cloudflare WARP (WireGuard) как исходящий прокси |
 | **7) Каскады нод** | Каскадные подключения между серверами (iptables DNAT или shared listener) |
@@ -90,12 +90,13 @@ env/profiles и runtime возвращаются. Upstream relay собирае�
 - **1) Установить** — самоподписанный сертификат, выбор порта, опциональный `obfs salamander` (маскирует QUIC-сигнатуру XOR'ом с общим паролем)
 - **2) Удалить**
 
-### AmneziaWG — подменю
+### AmneziaWG 3.1 — подменю
 
-- **1) Установить сервер** — интерфейс `awg0` в подсети 10.10.8.0/24, параметры обфускации (Jc/Jmin/Jmax, S1-S4, H1-H4)
-- **2) Добавить клиента (peer)** — генерит конфиг, QR-код и mihomo-проксий
+- **1) Установить / обновить сервер** — интерфейс `awg0` в подсети 10.10.8.0/24 с официальными параметрами AmneziaWG 3.1: J/S/H, Header Protection, content padding, randomized timings, Random Trailers и Disable Cookies
+- **2) Добавить клиента (peer)** — перевыпускает native-конфиг, QR-код и Mihomo-прокси с теми же параметрами 3.1
 - **3) Удалить клиента**
 - **4) Удалить AmneziaWG**
+- Создаваемые Mihomo-конфиги требуют Mihomo `v1.19.30+`
 
 ### Каскады — подменю
 
