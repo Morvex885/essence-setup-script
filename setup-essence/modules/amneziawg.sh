@@ -781,6 +781,7 @@ _awg_write_client_info() {
 Server:    $SERVER_ADDR
 Port:      $AWG_PORT/udp
 Subnet:    ${AWG_SUBNET}.0/24
+DNS:       $AWG_DNS
 Clients:   $AWG_CLIENTS_DIR/
 --- /AmneziaWG ---
 EOF
@@ -908,13 +909,19 @@ _awg_create_peer() {
     MaxHandshakeAttempts=$(grep '^MaxHandshakeAttempts' "$AWG_CONF" | awk '{print $3}')
     RandomTrailers=$(grep '^RandomTrailers' "$AWG_CONF" | awk '{print $3}')
     DisableCookies=$(grep '^DisableCookies' "$AWG_CONF" | awk '{print $3}')
-    if [[ -z "$HeaderProtectionKey" || -z "$ContentPaddingAddition" \
+    if [[ -z "$Jc" || -z "$Jmin" || -z "$Jmax" || -z "$S1" || -z "$S2" \
+        || -z "$S3" || -z "$S4" || -z "$H1" || -z "$H2" || -z "$H3" \
+        || -z "$H4" || -z "$HeaderProtectionKey" || -z "$ContentPaddingAddition" \
         || -z "$RekeyAfterTime" || -z "$RekeyTimeout" || -z "$RejectAfterTime" \
         || -z "$KeepaliveTimeout" || -z "$MaxHandshakeAttempts" \
         || -z "$RandomTrailers" || -z "$DisableCookies" ]]; then
         _awg_fail "Конфигурация сервера устарела; переустановите AmneziaWG 3.1 перед добавлением клиента."
         return 1
     fi
+
+    local random_trailers_yaml=false disable_cookies_yaml=false
+    [[ "$RandomTrailers" == on ]] && random_trailers_yaml=true
+    [[ "$DisableCookies" == on ]] && disable_cookies_yaml=true
 
     # Генерация ключей
     local client_priv client_pub psk
@@ -945,12 +952,52 @@ PEEREOF
 
     # Адрес сервера
     local SERVER_ADDR
-    SERVER_ADDR=$(grep '^Domain:' /etc/mihomo/client-config.txt 2>/dev/null | awk '{print $2}')
+    SERVER_ADDR=$(grep '^Domain:' "$AWG_CLIENT_CONFIG" 2>/dev/null | awk '{print $2}')
     [[ -z "$SERVER_ADDR" ]] && SERVER_ADDR=$(curl -4 -s --max-time 5 ifconfig.me)
 
-    local dns
-    dns=$(grep '^DNS' "$AWG_CLIENTS_DIR/"*.conf 2>/dev/null | head -1 | sed 's/.*= //')
-    [[ -z "$dns" ]] && dns="1.1.1.1, 1.0.0.1"
+    local dns saved_dns dns_file dns_item dns_yaml dns_yaml_item dns_parts
+    saved_dns=$(awk '
+        /^--- AmneziaWG ---\r?$/ { in_block=1; next }
+        /^--- \/AmneziaWG ---\r?$/ { in_block=0; next }
+        in_block && /^[[:space:]]*DNS:/ {
+            value = $0
+            sub(/^[[:space:]]*DNS:[[:space:]]*/, "", value)
+            sub(/[[:space:]\r]+$/, "", value)
+            if (value != "") {
+                print value
+                exit
+            }
+        }
+    ' "$AWG_CLIENT_CONFIG" 2>/dev/null)
+    dns="$saved_dns"
+    if [[ -z "$dns" ]]; then
+        for dns_file in "$AWG_CLIENTS_DIR"/*/*.conf "$AWG_CLIENTS_DIR"/*.conf; do
+            [[ -f "$dns_file" ]] || continue
+            dns=$(awk '
+                /^[[:space:]]*DNS[[:space:]]*=/ {
+                    value = $0
+                    sub(/^[[:space:]]*DNS[[:space:]]*=[[:space:]]*/, "", value)
+                    sub(/[[:space:]\r]+$/, "", value)
+                    if (value != "") {
+                        print value
+                        exit
+                    }
+                }
+            ' "$dns_file" 2>/dev/null)
+            [[ -n "$dns" ]] && break
+        done
+    fi
+    [[ -n "$dns" ]] || dns="1.1.1.1, 1.0.0.1"
+
+    IFS=',' read -r -a dns_parts <<< "$dns"
+    dns_yaml=""
+    for dns_item in "${dns_parts[@]}"; do
+        dns_item=$(printf '%s' "$dns_item" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]\r]*$//')
+        dns_item=${dns_item//\'/\'\'}
+        dns_yaml_item="'$dns_item'"
+        [[ -n "$dns_yaml" ]] && dns_yaml+=", "
+        dns_yaml+="$dns_yaml_item"
+    done
 
     # Клиентский конфиг
     local client_dir="$AWG_CLIENTS_DIR/${CLIENT_NAME}"
@@ -993,8 +1040,7 @@ PersistentKeepalive = $persistent_keepalive"
     printf '%s\n' "$PEER_CONF" > "$client_dir/${CLIENT_NAME}.conf" || return 1
     chmod 600 "$client_dir/${CLIENT_NAME}.conf"
 
-    PEER_MIHOMO_CONF="--- Client proxy config Mihomo/Clash.Meta ---
-proxies:
+    PEER_MIHOMO_CONF="proxies:
   - name: awg-${CLIENT_NAME}
     type: wireguard
     private-key: $client_priv
@@ -1002,7 +1048,7 @@ proxies:
     port: $awg_port
     ip: $PEER_IP
     mtu: 1280
-    dns: ['${dns// /}']
+    dns: [$dns_yaml]
     public-key: $server_pub
     pre-shared-key: $psk
     allowed-ips: ['0.0.0.0/0', '::/0']
@@ -1028,8 +1074,8 @@ proxies:
       reject-after-time: $RejectAfterTime
       keepalive-timeout: $KeepaliveTimeout
       max-handshake-attempts: $MaxHandshakeAttempts
-      random-trailers: true
-      disable-cookies: true"
+      random-trailers: $random_trailers_yaml
+      disable-cookies: $disable_cookies_yaml"
 
     printf '%s\n' "$PEER_MIHOMO_CONF" > "$client_dir/mihomo-proxy.yaml" || return 1
 
@@ -1039,6 +1085,7 @@ proxies:
         chmod 600 "$client_dir/qr.png"
     fi
 }
+
 
 awg_menu() {
     while true; do

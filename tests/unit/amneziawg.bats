@@ -38,6 +38,12 @@ setup() {
     export MOCK_APT_INSTALL_FAIL_PACKAGE="" MOCK_GPG_POST_INSTALL_MISSING=0
     export MOCK_HEADERS_POST_INSTALL_BUILD_MISSING=0
     export MOCK_MIHOMO_FAIL=0 MOCK_SYSTEMCTL_FAIL_UNIT="" MOCK_UFW_FAIL=0
+    export AWG_TEST_SERVER_PRIVATE=ERERERERERERERERERERERERERERERERERERERERERE=
+    export AWG_TEST_SERVER_PUBLIC=IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI=
+    export AWG_TEST_HEADER_KEY=MzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM=
+    export AWG_TEST_CLIENT_PRIVATE=REREREREREREREREREREREREREREREREREREREREREQ=
+    export AWG_TEST_CLIENT_PUBLIC=VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=
+    export AWG_TEST_PSK=ZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmY=
 
     mkdir -p "$MOCK_BIN" "$MOCK_STATE" "$AWG_TEST_ROOT/etc/mihomo" \
         "$AWG_APT_SOURCES_DIR" "$AWG_TMP_BASE" "$AWG_MODULES_ROOT/$MOCK_KERNEL/build"
@@ -202,13 +208,20 @@ case "$1" in
     count=$((count + 1))
     printf '%s\n' "$count" > "$MOCK_STATE/genkey-count"
     case "$count" in
-      1) echo 'server-private' ;;
-      2) echo 'header-protection-key' ;;
-      *) echo 'client-private' ;;
+      1) echo "$AWG_TEST_SERVER_PRIVATE" ;;
+      2) echo "$AWG_TEST_HEADER_KEY" ;;
+      *) echo "$AWG_TEST_CLIENT_PRIVATE" ;;
     esac
     ;;
-  pubkey) read -r key; echo "public-$key" ;;
-  genpsk) echo 'server-psk' ;;
+  pubkey)
+    read -r key
+    case "$key" in
+      "$AWG_TEST_SERVER_PRIVATE") echo "$AWG_TEST_SERVER_PUBLIC" ;;
+      "$AWG_TEST_CLIENT_PRIVATE") echo "$AWG_TEST_CLIENT_PUBLIC" ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  genpsk) echo "$AWG_TEST_PSK" ;;
   show)
     case "$3" in
       random-trailers|disable-cookies) echo on ;;
@@ -788,10 +801,16 @@ EOF
     [[ "$(_file_mode "$AWG_CONF")" == 600 ]]
 }
 
-@test "reinstall failure restores old config, keys, peers, clients, firewall and service state" {
+@test "reinstall failures restore old config, keys, peers, clients, firewall and service state" {
+    local mode
     _mock_install_prerequisites
-    mkdir -p "$AWG_DIR" "$AWG_CLIENTS_DIR/old-peer"
-    cat > "$AWG_CONF" <<'EOF'
+    for mode in systemd ufw; do
+        rm -rf "$BATS_TEST_TMPDIR/awg.before" "$BATS_TEST_TMPDIR/clients.before"
+        rm -f "$BATS_TEST_TMPDIR/mihomo.before" "$BATS_TEST_TMPDIR/client.before"
+        rm -rf "$AWG_DIR" "$AWG_CLIENTS_DIR"
+        rm -f "$MOCK_STATE"/active.* "$MOCK_STATE"/enabled.* "$MOCK_STATE"/failed-once.*
+        mkdir -p "$AWG_DIR" "$AWG_CLIENTS_DIR/old-peer"
+        cat > "$AWG_CONF" <<'EOF'
 [Interface]
 PrivateKey = old-private
 ListenPort = 39999
@@ -801,27 +820,38 @@ ListenPort = 39999
 PublicKey = old-peer-key
 AllowedIPs = 10.10.8.2/32
 EOF
-    echo old-private > "$AWG_DIR/server_private.key"
-    echo old-public > "$AWG_DIR/server_public.key"
-    echo old-psk > "$AWG_DIR/psk.key"
-    echo old-client > "$AWG_CLIENTS_DIR/old-peer/old-peer.conf"
-    echo 39999/udp > "$MOCK_STATE/ufw.rules"
-    touch "$MOCK_STATE/active.awg-quick_awg0" "$MOCK_STATE/enabled.awg-quick_awg0"
-    cp -a "$AWG_DIR" "$BATS_TEST_TMPDIR/awg.before"
-    cp -a "$AWG_CLIENTS_DIR" "$BATS_TEST_TMPDIR/clients.before"
-    cp "$AWG_MIHOMO_CONFIG" "$BATS_TEST_TMPDIR/mihomo.before"
-    cp "$AWG_CLIENT_CONFIG" "$BATS_TEST_TMPDIR/client.before"
-    export MOCK_SYSTEMCTL_FAIL_UNIT=awg-quick@awg0
+        echo old-private > "$AWG_DIR/server_private.key"
+        echo old-public > "$AWG_DIR/server_public.key"
+        echo old-psk > "$AWG_DIR/psk.key"
+        echo old-client > "$AWG_CLIENTS_DIR/old-peer/old-peer.conf"
+        cat >> "$AWG_CLIENT_CONFIG" <<'EOF'
+--- AmneziaWG ---
+DNS:       4.4.4.4, 8.8.8.8
+--- /AmneziaWG ---
+EOF
+        echo 39999/udp > "$MOCK_STATE/ufw.rules"
+        touch "$MOCK_STATE/active.awg-quick_awg0" "$MOCK_STATE/enabled.awg-quick_awg0"
+        cp -a "$AWG_DIR" "$BATS_TEST_TMPDIR/awg.before"
+        cp -a "$AWG_CLIENTS_DIR" "$BATS_TEST_TMPDIR/clients.before"
+        cp "$AWG_MIHOMO_CONFIG" "$BATS_TEST_TMPDIR/mihomo.before"
+        cp "$AWG_CLIENT_CONFIG" "$BATS_TEST_TMPDIR/client.before"
+        export MOCK_SYSTEMCTL_FAIL_UNIT="" MOCK_UFW_FAIL=0
+        if [[ "$mode" == systemd ]]; then
+            export MOCK_SYSTEMCTL_FAIL_UNIT=awg-quick@awg0
+        else
+            export MOCK_UFW_FAIL=1
+        fi
 
-    run _run_install_with_sentinel
-    assert_output --partial "INSTALL_RC=1"
-    diff -ru "$BATS_TEST_TMPDIR/awg.before" "$AWG_DIR"
-    diff -ru "$BATS_TEST_TMPDIR/clients.before" "$AWG_CLIENTS_DIR"
-    cmp -s "$AWG_MIHOMO_CONFIG" "$BATS_TEST_TMPDIR/mihomo.before"
-    cmp -s "$AWG_CLIENT_CONFIG" "$BATS_TEST_TMPDIR/client.before"
-    grep -qxF '39999/udp' "$MOCK_STATE/ufw.rules"
-    [[ -e "$MOCK_STATE/active.awg-quick_awg0" ]]
-    [[ -e "$MOCK_STATE/enabled.awg-quick_awg0" ]]
+        run _run_install_with_sentinel
+        assert_output --partial "INSTALL_RC=1"
+        diff -ru "$BATS_TEST_TMPDIR/awg.before" "$AWG_DIR"
+        diff -ru "$BATS_TEST_TMPDIR/clients.before" "$AWG_CLIENTS_DIR"
+        cmp -s "$AWG_MIHOMO_CONFIG" "$BATS_TEST_TMPDIR/mihomo.before"
+        cmp -s "$AWG_CLIENT_CONFIG" "$BATS_TEST_TMPDIR/client.before"
+        grep -qxF '39999/udp' "$MOCK_STATE/ufw.rules"
+        [[ -e "$MOCK_STATE/active.awg-quick_awg0" ]]
+        [[ -e "$MOCK_STATE/enabled.awg-quick_awg0" ]]
+    done
 }
 
 @test "successful install starts awg0 before writing client info and UFW" {
@@ -872,7 +902,7 @@ EOF
     _awg_gen_params
     run _awg_stage_server_config "$stage"
     assert_success
-    grep -qxF "HeaderProtectionKey = header-protection-key" "$stage/awg0.conf"
+    grep -qxF "HeaderProtectionKey = $AWG_TEST_HEADER_KEY" "$stage/awg0.conf"
     grep -qxF "ContentPaddingAddition = 10-100" "$stage/awg0.conf"
     grep -qxF "RekeyAfterTime = 100-120" "$stage/awg0.conf"
     grep -qxF "RekeyTimeout = 3-7" "$stage/awg0.conf"
@@ -881,16 +911,19 @@ EOF
     grep -qxF "MaxHandshakeAttempts = 15-20" "$stage/awg0.conf"
     grep -qxF "RandomTrailers = on" "$stage/awg0.conf"
     grep -qxF "DisableCookies = on" "$stage/awg0.conf"
-    [[ "$(<"$stage/header_protection.key")" == "header-protection-key" ]]
+    [[ "$(<"$stage/header_protection.key")" == "$AWG_TEST_HEADER_KEY" ]]
     [[ "$(_file_mode "$stage/awg0.conf")" == 600 ]]
 }
 
 _seed_awg31_server() {
     mkdir -p "$AWG_DIR"
-    printf 'server-public\n' > "$AWG_DIR/server_public.key"
-    cat > "$AWG_CONF" <<'EOF'
+    printf '%s\n' "$AWG_TEST_SERVER_PRIVATE" > "$AWG_DIR/server_private.key"
+    printf '%s\n' "$AWG_TEST_SERVER_PUBLIC" > "$AWG_DIR/server_public.key"
+    printf '%s\n' "$AWG_TEST_HEADER_KEY" > "$AWG_DIR/header_protection.key"
+    printf '2\n' > "$MOCK_STATE/genkey-count"
+    cat > "$AWG_CONF" <<EOF
 [Interface]
-PrivateKey = server-private
+PrivateKey = $AWG_TEST_SERVER_PRIVATE
 Address = 10.10.8.1/24
 ListenPort = 41000
 Jc = 4
@@ -904,7 +937,7 @@ H1 = 1
 H2 = 2
 H3 = 3
 H4 = 4
-HeaderProtectionKey = header-protection-key
+HeaderProtectionKey = $AWG_TEST_HEADER_KEY
 ContentPaddingAddition = 10-100
 RekeyAfterTime = 100-120
 RekeyTimeout = 3-7
@@ -916,6 +949,11 @@ DisableCookies = on
 EOF
 }
 
+_assert_awg_mihomo_config() {
+    [[ -n "${AWG_REAL_MIHOMO_BIN:-}" ]] || return 0
+    "$AWG_REAL_MIHOMO_BIN" -d "$BATS_TEST_TMPDIR/mihomo" -t -f "$1"
+}
+
 @test "peer native and Mihomo 3.1 configs repeat the complete options" {
     _seed_awg31_server
     run _awg_create_peer alice
@@ -923,12 +961,12 @@ EOF
     [[ -f "$AWG_CLIENTS_DIR/alice/alice.conf" ]]
     [[ -f "$AWG_CLIENTS_DIR/alice/mihomo-proxy.yaml" ]]
     grep -qxF 'MTU = 1280' "$AWG_CLIENTS_DIR/alice/alice.conf"
-    grep -qxF 'HeaderProtectionKey = header-protection-key' "$AWG_CLIENTS_DIR/alice/alice.conf"
+    grep -qxF "HeaderProtectionKey = $AWG_TEST_HEADER_KEY" "$AWG_CLIENTS_DIR/alice/alice.conf"
     grep -qxF 'RandomTrailers = on' "$AWG_CLIENTS_DIR/alice/alice.conf"
     grep -qxF 'DisableCookies = on' "$AWG_CLIENTS_DIR/alice/alice.conf"
     grep -qxF '    mtu: 1280' "$AWG_CLIENTS_DIR/alice/mihomo-proxy.yaml"
     grep -qxF '      version: 3' "$AWG_CLIENTS_DIR/alice/mihomo-proxy.yaml"
-    grep -qxF '      header-protection-key: header-protection-key' "$AWG_CLIENTS_DIR/alice/mihomo-proxy.yaml"
+    grep -qxF "      header-protection-key: $AWG_TEST_HEADER_KEY" "$AWG_CLIENTS_DIR/alice/mihomo-proxy.yaml"
     grep -qxF '      content-padding-addition: 10-100' "$AWG_CLIENTS_DIR/alice/mihomo-proxy.yaml"
     grep -qxF '      rekey-after-time: 100-120' "$AWG_CLIENTS_DIR/alice/mihomo-proxy.yaml"
     grep -qxF '      rekey-timeout: 3-7' "$AWG_CLIENTS_DIR/alice/mihomo-proxy.yaml"
@@ -937,9 +975,7 @@ EOF
     grep -qxF '      max-handshake-attempts: 15-20' "$AWG_CLIENTS_DIR/alice/mihomo-proxy.yaml"
     grep -qxF '      random-trailers: true' "$AWG_CLIENTS_DIR/alice/mihomo-proxy.yaml"
     grep -qxF '      disable-cookies: true' "$AWG_CLIENTS_DIR/alice/mihomo-proxy.yaml"
-    if [[ -n "${AWG_REAL_MIHOMO_BIN:-}" ]]; then
-        "$AWG_REAL_MIHOMO_BIN" -t -f "$AWG_CLIENTS_DIR/alice/mihomo-proxy.yaml"
-    fi
+    _assert_awg_mihomo_config "$AWG_CLIENTS_DIR/alice/mihomo-proxy.yaml"
 }
 
 @test "stale AmneziaWG 2.0 server config is rejected before peer writes" {
@@ -952,6 +988,142 @@ EOF
     assert_output --partial "Конфигурация сервера устарела; переустановите AmneziaWG 3.1"
     cmp -s "$AWG_CONF" "$BATS_TEST_TMPDIR/server.before"
     [[ ! -e "$AWG_CLIENTS_DIR/stale" ]]
+}
+
+_set_awg_flags() {
+    local random_trailers="$1" disable_cookies="$2"
+    sed -i.bak \
+        -e "s/^RandomTrailers = .*/RandomTrailers = $random_trailers/" \
+        -e "s/^DisableCookies = .*/DisableCookies = $disable_cookies/" \
+        "$AWG_CONF"
+    rm -f "$AWG_CONF.bak"
+}
+
+@test "all required AmneziaWG 3.1 parameters are checked before key generation" {
+    local field
+    for field in Jc Jmin Jmax S1 S2 S3 S4 H1 H2 H3 H4; do
+        _seed_awg31_server
+        awk -v field="$field" '$1 != field' "$AWG_CONF" > "$AWG_CONF.tmp"
+        mv "$AWG_CONF.tmp" "$AWG_CONF"
+        cp "$AWG_CONF" "$BATS_TEST_TMPDIR/server.before"
+        run _awg_create_peer "$field"
+        assert_failure
+        cmp -s "$AWG_CONF" "$BATS_TEST_TMPDIR/server.before"
+        [[ ! -e "$AWG_CLIENTS_DIR/$field" ]]
+        [[ "$(<"$MOCK_STATE/genkey-count")" == 2 ]]
+    done
+}
+
+@test "AmneziaWG off flags are rendered independently in native and Mihomo configs" {
+    local random_trailers disable_cookies expected_random expected_cookies
+    for random_trailers in off on; do
+        for disable_cookies in off on; do
+            [[ "$random_trailers/$disable_cookies" == off/off ]] || continue
+            expected_random=false
+            expected_cookies=false
+            _seed_awg31_server
+            _set_awg_flags "$random_trailers" "$disable_cookies"
+            run _awg_create_peer off-off
+            assert_success
+            grep -qxF "RandomTrailers = $random_trailers" "$AWG_CLIENTS_DIR/off-off/off-off.conf"
+            grep -qxF "DisableCookies = $disable_cookies" "$AWG_CLIENTS_DIR/off-off/off-off.conf"
+            grep -qxF "      random-trailers: $expected_random" "$AWG_CLIENTS_DIR/off-off/mihomo-proxy.yaml"
+            grep -qxF "      disable-cookies: $expected_cookies" "$AWG_CLIENTS_DIR/off-off/mihomo-proxy.yaml"
+            _assert_awg_mihomo_config "$AWG_CLIENTS_DIR/off-off/mihomo-proxy.yaml"
+        done
+    done
+}
+
+@test "AmneziaWG mixed flags stay independent between native and Mihomo configs" {
+    _seed_awg31_server
+    _set_awg_flags on off
+    run _awg_create_peer on-off
+    assert_success
+    grep -qxF 'RandomTrailers = on' "$AWG_CLIENTS_DIR/on-off/on-off.conf"
+    grep -qxF 'DisableCookies = off' "$AWG_CLIENTS_DIR/on-off/on-off.conf"
+    grep -qxF '      random-trailers: true' "$AWG_CLIENTS_DIR/on-off/mihomo-proxy.yaml"
+    grep -qxF '      disable-cookies: false' "$AWG_CLIENTS_DIR/on-off/mihomo-proxy.yaml"
+    _assert_awg_mihomo_config "$AWG_CLIENTS_DIR/on-off/mihomo-proxy.yaml"
+
+    _seed_awg31_server
+    _set_awg_flags off on
+    run _awg_create_peer off-on
+    assert_success
+    grep -qxF 'RandomTrailers = off' "$AWG_CLIENTS_DIR/off-on/off-on.conf"
+    grep -qxF 'DisableCookies = on' "$AWG_CLIENTS_DIR/off-on/off-on.conf"
+    grep -qxF '      random-trailers: false' "$AWG_CLIENTS_DIR/off-on/mihomo-proxy.yaml"
+    grep -qxF '      disable-cookies: true' "$AWG_CLIENTS_DIR/off-on/mihomo-proxy.yaml"
+    _assert_awg_mihomo_config "$AWG_CLIENTS_DIR/off-on/mihomo-proxy.yaml"
+}
+
+@test "client DNS is persisted and reused after installation shell state is lost" {
+    _mock_install_prerequisites
+    run install_awg <<< $'\n9.9.9.9, 149.112.112.112\n'
+    assert_success
+    grep -qxF 'DNS:       9.9.9.9, 149.112.112.112' "$AWG_CLIENT_CONFIG"
+    unset AWG_DNS
+
+    run _awg_create_peer first
+    assert_success
+    run _awg_create_peer second
+    assert_success
+    for client in first second; do
+        grep -qxF 'DNS = 9.9.9.9, 149.112.112.112' "$AWG_CLIENTS_DIR/$client/$client.conf"
+        grep -qxF "    dns: ['9.9.9.9', '149.112.112.112']" "$AWG_CLIENTS_DIR/$client/mihomo-proxy.yaml"
+        _assert_awg_mihomo_config "$AWG_CLIENTS_DIR/$client/mihomo-proxy.yaml"
+    done
+}
+
+@test "saved AWG-block DNS wins over foreign sections and old peers" {
+    _seed_awg31_server
+    cat >> "$AWG_CLIENT_CONFIG" <<'EOF'
+DNS: foreign-outside-block
+--- AmneziaWG ---
+DNS:       9.9.9.9, 2620:fe::fe
+--- /AmneziaWG ---
+EOF
+    mkdir -p "$AWG_CLIENTS_DIR/old"
+    printf 'DNS = 1.1.1.1, 1.0.0.1\n' > "$AWG_CLIENTS_DIR/old/old.conf"
+    run _awg_create_peer saved
+    assert_success
+    grep -qxF 'DNS = 9.9.9.9, 2620:fe::fe' "$AWG_CLIENTS_DIR/saved/saved.conf"
+    grep -qxF "    dns: ['9.9.9.9', '2620:fe::fe']" "$AWG_CLIENTS_DIR/saved/mihomo-proxy.yaml"
+}
+
+@test "client DNS fallback reads nested peers then flat peers then default" {
+    local mode expected_yaml
+    for mode in nested flat empty-saved default; do
+        _seed_awg31_server
+        rm -rf "$AWG_CLIENTS_DIR"
+        mkdir -p "$AWG_CLIENTS_DIR"
+        case "$mode" in
+            nested)
+                mkdir -p "$AWG_CLIENTS_DIR/nested"
+                printf '[Interface]\nDNS = 9.9.9.9, 2620:fe::fe\r\n' > "$AWG_CLIENTS_DIR/nested/nested.conf"
+                expected_yaml="['9.9.9.9', '2620:fe::fe']"
+                ;;
+            flat)
+                printf '[Interface]\nDNS = 149.112.112.112, 2620:fe::9\r\n' > "$AWG_CLIENTS_DIR/legacy.conf"
+                expected_yaml="['149.112.112.112', '2620:fe::9']"
+                ;;
+            empty-saved)
+                cat >> "$AWG_CLIENT_CONFIG" <<'EOF'
+--- AmneziaWG ---
+DNS:
+--- /AmneziaWG ---
+EOF
+                printf '[Interface]\nDNS = 8.8.8.8, 8.8.4.4\n' > "$AWG_CLIENTS_DIR/legacy.conf"
+                expected_yaml="['8.8.8.8', '8.8.4.4']"
+                ;;
+            default)
+                expected_yaml="['1.1.1.1', '1.0.0.1']"
+                ;;
+        esac
+        run _awg_create_peer "$mode"
+        assert_success
+        grep -qxF "    dns: $expected_yaml" "$AWG_CLIENTS_DIR/$mode/mihomo-proxy.yaml"
+        _assert_awg_mihomo_config "$AWG_CLIENTS_DIR/$mode/mihomo-proxy.yaml"
+    done
 }
 
 @test "module reload unloads a loaded module and reports both failure modes" {

@@ -359,6 +359,23 @@ proxies:
       max-handshake-attempts: 15-20
       random-trailers: true
       disable-cookies: true
+proxies:
+  - name: "awg-other-client"
+    type: wireguard
+    server: 9.9.9.9
+    port: 42000
+    private-key: other-private
+    public-key: other-public
+    pre-shared-key: other-psk
+    ip: 10.10.8.3
+    mtu: 1400
+    persistent-keepalive: 10
+    allowed-ips: ['10.0.0.0/8']
+    amnezia-wg-option:
+      version: 2
+      header-protection-key: other-header
+      random-trailers: false
+      disable-cookies: false
 ---
 EOF
 )"
@@ -369,4 +386,7 @@ EOF
     assert_output --partial 'header-protection-key: header-protection-key'
     assert_output --partial 'random-trailers: true'
     assert_output --partial 'disable-cookies: true'
+    assert_output --partial 'ip: 10.10.8.2'
+    refute_output --partial '9.9.9.9'
+    refute_output --partial 'other-'
 }
