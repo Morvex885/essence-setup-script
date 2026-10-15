@@ -416,6 +416,28 @@ EOF
     [ "$?" -eq 0 ]
     [ "$(wc -l < "$EVENTS")" -eq 3 ]
     [[ "$(cat "$EVENTS")" == *'A|-- bash '*'web restart'*'B|-- bash '*'backend restart'*'C|-t -- bash '*'telegram-proxy menu'* ]]
+    [ "${#TELEGRAM_PROXY_SELECTED[@]}" -eq 0 ]
+    [ "${#TELEGRAM_PROXY_PLAN_PASS[@]}" -eq 0 ]
+    [ "${#TELEGRAM_PROXY_PLAN_INDEX[@]}" -eq 0 ]
+    [ -z "$TELEGRAM_PROXY_BATCH_DIR" ]
+    [ -z "$TELEGRAM_PROXY_BATCH_PIDS" ]
+}
+
+@test "failed component-selected removal leaves one-node management usable and clears private state" {
+    confirm_yn() { printf 'confirm\n' >> "$EVENTS"; return 0; }
+    ssh_run() {
+        printf '%s|%s\n' "$NODE_NAME" "$*" >> "$EVENTS"
+        [[ "$1" == -t ]]
+    }
+    telegram_proxy_remote_menu <<< $'8\nw\n1\n\n1\n3\n0' >/dev/null
+    [ "$?" -eq 0 ]
+    [ "$(wc -l < "$EVENTS")" -eq 3 ]
+    [[ "$(cat "$EVENTS")" == 'confirm'*'A|-- bash '*'web remove --force'*'C|-t -- bash '*'telegram-proxy menu'* ]]
+    [ "${#TELEGRAM_PROXY_SELECTED[@]}" -eq 0 ]
+    [ "${#TELEGRAM_PROXY_PLAN_PASS[@]}" -eq 0 ]
+    [ "${#TELEGRAM_PROXY_PLAN_INDEX[@]}" -eq 0 ]
+    [ -z "$TELEGRAM_PROXY_BATCH_DIR" ]
+    [ -z "$TELEGRAM_PROXY_BATCH_PIDS" ]
 }
 
 @test "batch abort terminates tracked process removes private files and wipes passwords" {

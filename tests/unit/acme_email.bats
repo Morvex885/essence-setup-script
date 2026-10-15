@@ -35,7 +35,7 @@ openssl() {
     if [[ "$*" == 'rand -hex 4' ]]; then printf '01234567\n'; else printf 'abcdef\n'; fi
 }
 
-curl() { cp "$ACME_FIXTURE" "$3"; }
+curl() { cp "$ACME_FIXTURE" "$4"; }
 sh() {
     [[ "$2" == email=* ]] || return 1
     printf '%s\n' "$2" > "$BATS_TEST_TMPDIR/install-email"

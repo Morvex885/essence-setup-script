@@ -1058,18 +1058,18 @@ telegram_proxy_remote_menu() {
                 node_pick "Telegram Proxy — выбор ноды" || continue
                 telegram_proxy_remote_open_menu "$NODE_PICK_INDEX" || true
                 ;;
-            2) _telegram_proxy_remote_batch_component shared status ;;
-            3) _telegram_proxy_remote_batch_component mtproto install ;;
-            4) _telegram_proxy_remote_batch_component mtproto refresh-ip ;;
-            5) _telegram_proxy_remote_batch_component web update ;;
-            6) _telegram_proxy_remote_batch_component web restart ;;
-            7) _telegram_proxy_remote_batch_component backend restart ;;
+            2) _telegram_proxy_remote_batch_component shared status || continue ;;
+            3) _telegram_proxy_remote_batch_component mtproto install || continue ;;
+            4) _telegram_proxy_remote_batch_component mtproto refresh-ip || continue ;;
+            5) _telegram_proxy_remote_batch_component web update || continue ;;
+            6) _telegram_proxy_remote_batch_component web restart || continue ;;
+            7) _telegram_proxy_remote_batch_component backend restart || continue ;;
             8)
                 _telegram_proxy_remote_component_select || continue
                 component="$TELEGRAM_PROXY_COMPONENT"
-                _telegram_proxy_remote_batch_component "$component" remove
+                _telegram_proxy_remote_batch_component "$component" remove || continue
                 ;;
-            9) _telegram_proxy_remote_batch_component shared remove-all ;;
+            9) _telegram_proxy_remote_batch_component shared remove-all || continue ;;
             *) warn "Неверный выбор." ;;
         esac
     done
@@ -1080,8 +1080,11 @@ _telegram_proxy_remote_batch_component() {
     _telegram_proxy_remote_clear_plan
     _telegram_proxy_remote_pick_multi || return 0
     _telegram_proxy_remote_force_allowed "$component" "$action" && force=true
-    _telegram_proxy_remote_run "$component" "$action" "$force" "${TELEGRAM_PROXY_SELECTED[@]}"
-    rc=$?
+    if _telegram_proxy_remote_run "$component" "$action" "$force" "${TELEGRAM_PROXY_SELECTED[@]}"; then
+        rc=0
+    else
+        rc=$?
+    fi
     TELEGRAM_PROXY_SELECTED=()
     case "$rc" in
         0|3|4) ;;

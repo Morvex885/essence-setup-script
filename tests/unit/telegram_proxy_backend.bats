@@ -137,6 +137,8 @@ listener" ]
         printf 'systemctl:%s\n' "$*" >> "$events"
     }
     _telegram_proxy_ufw_port_state() { return 0; }
+    nginx() { [[ "$1" == -t ]]; }
+    nft() { return 1; }
     _telegram_proxy_snapshot_paths "$TPROXY_SYSTEMD_DIR/$TPROXY_UNIT_MTPROXY"
     printf 'changed\n' > "$TPROXY_SYSTEMD_DIR/$TPROXY_UNIT_MTPROXY"
     TPROXY_ROLLBACK_MTPROXY_CHANGED=true

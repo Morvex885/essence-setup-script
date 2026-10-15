@@ -285,7 +285,7 @@ _prepare_removal_fixture() {
                 ACME_TEST_FAIL=1
                 ;;
             files)
-                RM_FAIL_MATCH=nginx/ssl/subs.example.com
+                RM_FAIL_MATCH="$FIX_ROOT/var/lib/essence-sub"
                 ;;
             config)
                 RM_FAIL_MATCH=subscription.conf
@@ -296,7 +296,7 @@ _prepare_removal_fixture() {
             printf 'stage %s unexpectedly succeeded\n' "$stage" >&2
             return 1
         fi
-        [[ -e "$SUB_CONF" ]]
+        [[ -e "$SUB_CONF" ]] || return 1
         case "$stage" in
             nginx-test) ! [[ "$(cat "$OPS_LOG")" == *"systemctl reload nginx"* ]] ;;
             daemon) [[ -e "$HOME/.acme.sh/subs.example.com/subs.example.com.conf" ]] &&
@@ -304,7 +304,7 @@ _prepare_removal_fixture() {
             acme) [[ -e "$FIX_ROOT/etc/nginx/ssl/subs.example.com/fullchain.pem" ]] ;;
             files|config) [[ -e "$HOME/.acme.sh/subs.example.com/subs.example.com.conf.removed" ]] ;;
             *) [[ -e "$FIX_ROOT/etc/systemd/system/essence-sub-cleanup.timer" ]] ;;
-        esac
+        esac || return 1
     done
 }
 
@@ -333,13 +333,16 @@ _prepare_removal_fixture() {
 
 @test "filesystem failure after ACME removal is retryable" {
     _prepare_removal_fixture standalone rsa 1
-    RM_FAIL_MATCH=nginx/ssl/subs.example.com
+    RM_FAIL_MATCH="$FIX_ROOT/var/lib/essence-sub"
     if remove_subscription; then
         return 1
     fi
-    [[ -e "$SUB_CONF" ]]
-    [[ -e "$HOME/.acme.sh/subs.example.com/subs.example.com.conf.removed" ]]
-    [[ -e "$FIX_ROOT/var/www/subs.example.com" ]]
+    [[ -e "$SUB_CONF" ]] || return 1
+    [[ -e "$HOME/.acme.sh/subs.example.com/subs.example.com.conf.removed" ]] || return 1
+    [[ ! -e "$HOME/.acme.sh/subs.example.com/subs.example.com.conf" ]] || return 1
+    [[ ! -e "$FIX_ROOT/etc/nginx/ssl/subs.example.com" ]] || return 1
+    [[ ! -e "$FIX_ROOT/var/www/subs.example.com" ]] || return 1
+    [[ -e "$FIX_ROOT/var/lib/essence-sub/subscription.yaml" ]] || return 1
     RM_FAIL_MATCH=
     remove_subscription
     [[ ! -e "$SUB_CONF" ]]

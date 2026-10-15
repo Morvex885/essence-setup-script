@@ -14,9 +14,12 @@ setup() {
     export REAL_SED="$(command -v sed)"
     local module
     for module in base hysteria warp cascade fake-site; do
-        "$REAL_SED" -e "s|/etc|$SERVER_FIX/etc|g" -e "s|/root|$SERVER_FIX/root|g" \
-            -e "s|/usr/local/bin|$SERVER_FIX/usr/local/bin|g" \
-            -e "s|/tmp/|$SERVER_FIX/tmp/|g" -e "s|/opt/|$SERVER_FIX/opt/|g" \
+        "$REAL_SED" -e 's|/etc|__ESSENCE_SERVER_FIX__/etc|g' \
+            -e 's|/root|__ESSENCE_SERVER_FIX__/root|g' \
+            -e 's|/usr/local/bin|__ESSENCE_SERVER_FIX__/usr/local/bin|g' \
+            -e 's|/tmp/|__ESSENCE_SERVER_FIX__/tmp/|g' \
+            -e 's|/opt/|__ESSENCE_SERVER_FIX__/opt/|g' \
+            -e "s|__ESSENCE_SERVER_FIX__|$SERVER_FIX|g" \
             "$PROJECT_ROOT/setup-essence/modules/$module.sh" > "$BATS_TEST_TMPDIR/$module.sh"
         source "$BATS_TEST_TMPDIR/$module.sh"
     done
@@ -162,6 +165,7 @@ EOF
     printf '\n' > "$BATS_TEST_TMPDIR/input"
     run install_warp < "$BATS_TEST_TMPDIR/input"
     assert_failure 1
+    [[ "$(grep -c '^restart mihomo$' "$ACTION_LOG")" == 1 ]]
     ! grep -q 'success-box' "$ACTION_LOG"
 }
 
@@ -232,8 +236,11 @@ EOF
     gen_free_port() { printf '12345\n'; }
     is_port_free() { return 0; }
     warn() { printf 'warn\n' >> "$ACTION_LOG"; }
+    cp "$SERVER_FIX/etc/mihomo/config.yaml" "$BATS_TEST_TMPDIR/config-before"
     printf '1\n\n\n\n0\n0\n' > "$BATS_TEST_TMPDIR/input"
     run hy2_menu < "$BATS_TEST_TMPDIR/input"
     assert_success
+    cmp -s "$BATS_TEST_TMPDIR/config-before" "$SERVER_FIX/etc/mihomo/config.yaml"
+    [[ ! -s "$CONFIRM_LOG" ]]
     [[ ! -s "$ACTION_LOG" ]]
 }
