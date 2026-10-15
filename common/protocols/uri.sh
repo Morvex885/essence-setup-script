@@ -63,15 +63,16 @@ _parse_server_port_from_uri() {
 _parse_proxy_uri() {
     local proxy_name="$1"
     echo "" >&2
-    read -rp "Вставьте URI: " URI
+    IFS= read -rp "  Вставьте URI: " URI || return 1
+    URI="${URI%$'\r'}"
 
     if [[ "$URI" == vless://* ]]; then
         _parse_vless_uri_to_exit "$proxy_name" "$URI"
     elif [[ "$URI" == hysteria2://* || "$URI" == hy2://* ]]; then
         _parse_hy2_uri_to_exit "$proxy_name" "$URI"
     else
-        warn "Неизвестный протокол. Поддерживаются: vless://, hysteria2://, hy2://"
-        return
+        warn "Неизвестный протокол. Поддерживаются: vless://, hysteria2://, hy2://" >&2
+        return 1
     fi
 }
 

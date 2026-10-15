@@ -741,7 +741,7 @@ EOF
 
 @test "apt-lock abort inside install_awg returns to caller instead of exiting the shell" {
     _mock_install_prerequisites
-    _awg_ensure_packages() { _awg_apt_lock_menu <<< '3'; }
+    _awg_ensure_packages() { _apt_lock_menu <<< '3'; }
     run _run_install_with_sentinel
     assert_output --partial "INSTALL_RC=1"
     assert_output --partial "SENTINEL_AFTER_INSTALL"

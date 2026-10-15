@@ -2,10 +2,21 @@
 # ─── Базовая установка (mihomo, sysctl, UFW, systemd) ────────────────────────
 
 install_base() {
-    if [[ -f /usr/local/bin/mihomo ]] && [[ -f /etc/mihomo/config.yaml ]]; then
-        warn "Mihomo уже установлен."
-        confirm_yn "Переустановить базу?" || return
-    fi
+    local _ssh_port _config_action="будет создан"
+    _ssh_port=$(awk '/^Port /{print $2; exit}' /etc/ssh/sshd_config 2>/dev/null)
+    _ssh_port="${_ssh_port:-22}"
+    [[ ! -f /etc/mihomo/config.yaml ]] || _config_action="сохраняется"
+    local _operation="Установка Mihomo"
+    [[ ! -f /usr/local/bin/mihomo ]] || _operation="Переустановка Mihomo"
+    review_frame "Базовая установка" \
+        "$_operation" \
+        "/usr/local/bin/mihomo и /etc/systemd/system/mihomo.service будут заменены." \
+        "Конфиг /etc/mihomo/config.yaml: $_config_action." \
+        "Будет записан /etc/sysctl.d/99-vpn-speedup.conf." \
+        "Все существующие правила UFW будут удалены." \
+        "Входящие подключения будут запрещены; открыт только SSH TCP/$_ssh_port." \
+        "Исходящие подключения разрешены."
+    confirm_yn "Выполнить базовую установку и сбросить UFW?" N || return 0
 
     local TOTAL_STEPS=4 STEP=0
 
@@ -24,7 +35,7 @@ install_base() {
     # ─── Шаг 2: Оптимизация сети ─────────────────────────────────────────────
     STEP=$((STEP + 1))
     echo ""
-    info "Шаг $STEP/$TOTAL_STEPS: Оптимизация сети (sysctl)..."
+    info "Шаг $STEP/$TOTAL_STEPS: Оптимизация сети и настройка firewall..."
 
     cat > /etc/sysctl.d/99-vpn-speedup.conf << SYSCTLEOF
 net.core.default_qdisc = fq
@@ -47,9 +58,6 @@ SYSCTLEOF
 
     # UFW
     info "Настройка firewall..."
-    local _ssh_port
-    _ssh_port=$(grep -E '^Port ' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
-    _ssh_port="${_ssh_port:-22}"
     ufw --force reset > /dev/null
     ufw default deny incoming
     ufw default allow outgoing
@@ -64,6 +72,7 @@ SYSCTLEOF
     # ─── Шаг 3: Mihomo ──────────────────────────────────────────────────────
     STEP=$((STEP + 1))
     echo ""
+    info "Шаг $STEP/$TOTAL_STEPS: Установка Mihomo..."
     if ! _install_mihomo_binary; then
         warn "Не удалось установить Mihomo."
         return 1
@@ -83,19 +92,22 @@ SYSCTLEOF
 
     systemctl daemon-reload
     systemctl enable mihomo
-    systemctl start mihomo
+    local _start_rc=0
+    systemctl start mihomo || _start_rc=$?
     sleep 4
 
-    if systemctl is-active --quiet mihomo; then
+    if [[ "$_start_rc" -eq 0 ]] && systemctl is-active --quiet mihomo; then
         success "Mihomo запущен"
     else
-        warn "Mihomo не запустился. Лог:"
-        journalctl -u mihomo -n 20 --no-pager
+        warn "Не удалось запустить Mihomo. Проверьте журнал и повторите действие из меню."
+        journalctl -u mihomo -n 20 --no-pager || true
+        return 1
     fi
 
     echo ""
     success "Базовая установка завершена."
     info "Теперь добавьте протоколы: VLESS Reality, Hysteria2, AmneziaWG и т.д."
+    return 0
 }
 
 # ─── Вспомогательные функции ──────────────────────────────────────────────────
@@ -328,7 +340,7 @@ SVCEOF
 # Проверка что база установлена
 _check_base() {
     if [[ ! -f /etc/mihomo/config.yaml ]]; then
-        warn "Mihomo не установлен. Сначала выполните базовую установку (пункт 1)."
+        warn "Mihomo не установлен. Сначала выберите «b) Базовая установка»."
         return 1
     fi
 }

@@ -28,7 +28,7 @@ scp_run() {
     return 0
 }
 
-upload_scripts() {
+ensure_remote_scripts_current() {
     UPLOAD_CALLS+=("$*")
     return 0
 }

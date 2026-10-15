@@ -68,56 +68,71 @@ check_script_password() {
 }
 
 set_script_password() {
-    local passfile
+    local passfile stored _choice _old _new _confirm installed
     passfile=$(_script_pass_file)
-
-    if [[ -f "$passfile" && -s "$passfile" ]]; then
-        local stored
-        stored=$(tr -d '\r\n' < "$passfile")
+    while true; do
+        installed=false
+        [[ -s "$passfile" ]] && installed=true
         echo ""
-        echo -e "  ${GREEN}1)${NC} Сменить пароль"
-        echo -e "  ${RED}2)${NC} Убрать пароль"
-        echo -e "  ${NC}0)${NC} Назад"
+        box_top
+        box_center "Пароль скрипта"
+        box_mid
+        if [[ "$installed" == true ]]; then
+            box_line " Пароль: установлен" " ${GREEN}Пароль: установлен${NC}"
+        else
+            box_line " Пароль: не установлен" " ${DIM}Пароль: не установлен${NC}"
+        fi
+        box_mid
+        if [[ "$installed" == true ]]; then
+            menu_item 1 "Сменить пароль" YELLOW
+            menu_item 2 "Убрать пароль" RED
+        else
+            menu_item 1 "Установить пароль" GREEN
+        fi
+        menu_item 0 "Назад" NC
+        box_bot
         echo ""
-        read -rp "  Выберите: " _choice
+        IFS= read -rp "  Выберите действие: " _choice || return 0
+        _choice="${_choice%$'\r'}"
         case "$_choice" in
-            1)
-                read -rsp "  Текущий пароль: " _old; echo ""
-                if ! _verify_pass "$stored" "$_old"; then
-                    warn "Неверный пароль."; return
+            0) return 0 ;;
+            1|2)
+                [[ "$_choice" == 2 && "$installed" != true ]] && { warn "Неверный выбор."; continue; }
+                if [[ "$installed" == true ]]; then
+                    stored=$(tr -d '\r\n' < "$passfile") || return 1
+                    if ! IFS= read -rsp "  Текущий пароль: " _old; then echo ""; return 0; fi
+                    echo ""
+                    _old="${_old%$'\r'}"
+                    _verify_pass "$stored" "$_old" || { warn "Неверный пароль."; continue; }
                 fi
-                read -rsp "  Новый пароль: " _new; echo ""
-                [[ -z "$_new" ]] && { warn "Пароль не может быть пустым."; return; }
-                read -rsp "  Повторите: " _confirm; echo ""
-                [[ "$_new" != "$_confirm" ]] && { warn "Пароли не совпадают."; return; }
-                _write_script_password "$passfile" "$_new" || {
+                if [[ "$_choice" == 2 ]]; then
+                    review_frame "Удаление пароля запуска" "Пароль запуска remote-control будет удалён." "Локальные данные и SSH-ключи сохранятся."
+                    confirm_yn "Убрать пароль запуска?" N || continue
+                    if state_action "script_password" rm -f "$passfile"; then
+                        success "Пароль убран"
+                    else
+                        warn "Не удалось удалить пароль."
+                    fi
+                    continue
+                fi
+                if ! IFS= read -rsp "  Новый пароль: " _new; then echo ""; return 0; fi
+                echo ""
+                _new="${_new%$'\r'}"
+                [[ -n "$_new" ]] || { warn "Пароль не может быть пустым."; continue; }
+                if ! IFS= read -rsp "  Повторите пароль: " _confirm; then echo ""; return 0; fi
+                echo ""
+                _confirm="${_confirm%$'\r'}"
+                [[ "$_new" == "$_confirm" ]] || { warn "Пароли не совпадают."; continue; }
+                if state_action "script_password" _write_script_password "$passfile" "$_new"; then
+                    success "Пароль сохранён"
+                else
                     warn "Не удалось атомарно сохранить пароль."
-                    return 1
-                }
-                success "Пароль изменён"
-                ;;
-            2)
-                read -rsp "  Текущий пароль: " _old; echo ""
-                if ! _verify_pass "$stored" "$_old"; then
-                    warn "Неверный пароль."; return
                 fi
-                rm -f "$passfile"
-                success "Пароль убран"
+                _old=""; _new=""; _confirm=""
                 ;;
-            *) return ;;
+            *) warn "Неверный выбор." ;;
         esac
-    else
-        echo ""
-        read -rsp "  Новый пароль: " _new; echo ""
-        [[ -z "$_new" ]] && { warn "Пароль не может быть пустым."; return; }
-        read -rsp "  Повторите: " _confirm; echo ""
-        [[ "$_new" != "$_confirm" ]] && { warn "Пароли не совпадают."; return; }
-        _write_script_password "$passfile" "$_new" || {
-            warn "Не удалось атомарно сохранить пароль."
-            return 1
-        }
-        success "Пароль установлен"
-    fi
+    done
 }
 
 # ─── Проверка зависимостей ───────────────────────────────────────────────────
@@ -138,37 +153,65 @@ self_update() {
     local installer="$SCRIPT_DIR/install-remote-control.sh"
     if [[ ! -f "$installer" ]]; then
         warn "install-remote-control.sh не найден. Переустановите скрипт командой из REMOTE.md."
-        return
+        return 1
     fi
     if [[ $EUID -ne 0 ]]; then
         warn "Для обновления нужен root."
         warn "Запустите: sudo remote-control-essence  или  sudo bash $installer"
-        return
+        return 1
     fi
-    bash "$installer"
-    CURRENT_VERSION=$(tr -d '\r' < "$VERSION_PATH" 2>/dev/null || echo "none")
+    if ! bash "$installer"; then
+        warn "Обновление не завершено. Повторите действие из меню."
+        return 1
+    fi
+    success "Скрипт обновлён."
+    warn "Для загрузки новых функций запустите remote-control-essence заново."
+    exit 0
 }
 
 # ─── Удаление remote-control-essence ──────────────────────────────────────────
 uninstall_self() {
-    echo ""
-    echo -e "  ${RED}── Удаление remote-control-essence ──────────${NC}"
-    confirm_yn "Вы уверены?" || return
-
     if [[ $EUID -ne 0 ]]; then
         warn "Для удаления нужен root."
         warn "Запустите: sudo remote-control-essence"
-        return
+        return 1
     fi
-
-    rm -f "/usr/local/bin/remote-control-essence"
-    rm -rf "/opt/remote-control-essence"
-
-    if confirm_yn "Удалить сохранённые ноды?"; then
-        rm -rf "$HOME/.config/remote-control-essence"
-        success "Ноды удалены"
+    menu_select "Удаление remote-control" "Выберите, что сохранить" \
+        "Сохранить локальные данные" "Удалить локальные данные" || return 0
+    local remove_data=false data_path="${CONFIG_DIR:-}" data_fate="сохраняются"
+    if [[ "$MENU_SELECT_INDEX" == 2 ]]; then
+        remove_data=true
+        data_fate="будут удалены"
+        # Resolve the real directory so slash/dot aliases and symlinks cannot
+        # turn the selected data removal into removal of HOME or root.
+        [[ -n "$data_path" && -d "$data_path" ]] || {
+            warn "Небезопасный путь локальных данных. Удаление отменено."
+            return 1
+        }
+        data_path=$(cd "$data_path" && pwd -P) || return 1
+        local home_path
+        home_path=$(cd "$HOME" && pwd -P) || return 1
+        if [[ "$data_path" == / || "$data_path" == "$home_path" ]]; then
+            warn "Небезопасный путь локальных данных. Удаление отменено."
+            return 1
+        fi
     fi
-
-    success "remote-control-essence удалён"
+    review_frame "Удаление remote-control" \
+        "/usr/local/bin/remote-control-essence будет удалён." \
+        "/opt/remote-control-essence будет удалён." \
+        "Локальные данные: $data_path — $data_fate." \
+        "Локальные данные: ноды, клиенты, группы, пароли, токены, шаблоны и SSH-ключи." \
+        "Компоненты на нодах и репозиторий GitHub не удаляются."
+    confirm_yn "Удалить remote-control в выбранном объёме?" N || return 0
+    if ! rm -f "/usr/local/bin/remote-control-essence" ||
+       ! rm -rf "/opt/remote-control-essence"; then
+        warn "Удаление remote-control не завершено."
+        return 1
+    fi
+    if [[ "$remove_data" == true ]] && ! rm -rf "$data_path"; then
+        warn "Удаление remote-control не завершено."
+        return 1
+    fi
+    success "remote-control удалён."
     exit 0
 }

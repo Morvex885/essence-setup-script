@@ -90,7 +90,7 @@ _apt_lock_menu() {
             box_line " Процессы не определены" " ${DIM}Процессы не определены${NC}"
         fi
         box_mid
-        menu_item 1 "Завершить процесс и продолжить" GREEN
+        menu_item 1 "Завершить процесс и продолжить" RED
         menu_item 2 "Подождать ещё 60с" CYAN
         menu_item 3 "Прервать установку" RED
         box_bot
@@ -101,17 +101,24 @@ _apt_lock_menu() {
         _choice="${_choice%$'\r'}"
         case "$_choice" in
             1)
-                local pid pname
+                if [[ -z "$pids" ]]; then
+                    warn "Блокирующие процессы не найдены."
+                    continue
+                fi
+                local pid pname targets=()
                 for pid in $pids; do
                     pname=$(ps -p "$pid" -o comm= 2>/dev/null || echo "???")
-                    if confirm_yn "Завершить процесс ${pname} (PID ${pid})?"; then
-                        kill "$pid" 2>/dev/null
-                        sleep 3
-                        if kill -0 "$pid" 2>/dev/null; then
-                            warn "Процесс не завершился, отправляю SIGKILL..."
-                            kill -9 "$pid" 2>/dev/null
-                            sleep 2
-                        fi
+                    targets+=("PID $pid: $pname")
+                done
+                review_frame "Завершение процессов apt" "${targets[@]}" "Установка пакетов этими процессами будет прервана."
+                confirm_yn "Завершить перечисленные процессы?" N || continue
+                for pid in $pids; do
+                    kill "$pid" 2>/dev/null
+                    sleep 3
+                    if kill -0 "$pid" 2>/dev/null; then
+                        warn "Процесс не завершился, отправляю SIGKILL..."
+                        kill -9 "$pid" 2>/dev/null
+                        sleep 2
                     fi
                 done
                 if ! fuser /var/lib/dpkg/lock-frontend &>/dev/null 2>&1; then
@@ -180,7 +187,7 @@ run_with_timeout() {
         gtimeout --foreground --signal=TERM --kill-after=5 "$seconds" "$@"
         return $?
     fi
-    "$@" &
+    "$@" <&0 &
     local child=$! watcher rc
     ( sleep "$seconds"; kill "$child" 2>/dev/null ) >/dev/null 2>&1 &
     watcher=$!
@@ -269,6 +276,56 @@ menu_index_valid() {
     [[ "$value" < "$count" || "$value" == "$count" ]]
 }
 
+menu_select() {
+    local title="$1" prompt="$2" choice line i
+    shift 2
+    local items=("$@") context=("${MENU_SELECT_CONTEXT[@]}")
+    local empty="${MENU_SELECT_EMPTY:-Нет вариантов для выбора}"
+    MENU_SELECT_INDEX=""
+    MENU_SELECT_CONTEXT=()
+    MENU_SELECT_EMPTY=""
+    while true; do
+        echo ""
+        box_top
+        box_center "$title"
+        box_mid
+        for line in "${context[@]}"; do box_line " $line"; done
+        if (( ${#items[@]} == 0 )); then
+            box_line " $empty" " ${DIM}${empty}${NC}"
+            box_mid
+        else
+            if (( ${#context[@]} > 0 )); then box_mid; fi
+            for ((i=0; i<${#items[@]}; i++)); do
+                menu_item "$((i+1))" "${items[$i]}" CYAN
+            done
+        fi
+        menu_item 0 "Отмена" NC
+        box_bot
+        echo ""
+        (( ${#items[@]} > 0 )) || return 1
+        if ! IFS= read -rp "  ${prompt}: " choice; then return 1; fi
+        choice="${choice%$'\r'}"
+        [[ "$choice" != 0 ]] || return 1
+        if menu_index_valid "$choice" "${#items[@]}"; then
+            MENU_SELECT_INDEX="$choice"
+            return 0
+        fi
+        warn "Неверный выбор."
+    done
+}
+
+review_frame() {
+    local title="$1" line
+    shift
+    echo ""
+    box_top
+    box_center "$title"
+    box_mid
+    for line in "$@"; do box_line " $line"; done
+    box_bot
+    echo ""
+}
+
 startup_recovery_menu() {
     local title="$1"
     local allow_retry="${2:-true}"
@@ -278,8 +335,9 @@ startup_recovery_menu() {
         box_center "Восстановление запуска"
         box_mid
         box_line " ${title}"
+        box_mid
         if [[ "$allow_retry" == true ]]; then
-            menu_item 1 "Повторить" GREEN
+            menu_item 1 "Повторить" CYAN
         fi
         menu_item 0 "Выход" NC
         box_bot
@@ -510,6 +568,7 @@ toggle_select() {
         box_center "$header"
         box_mid
         box_line " Нет вариантов для выбора" " ${DIM}Нет вариантов для выбора${NC}"
+        box_mid
         menu_item 0 "Отмена" NC
         box_bot
         return 1
@@ -523,13 +582,12 @@ toggle_select() {
         while [[ $i -lt ${#TOGGLE_SELECT_ITEMS[@]} ]]; do
             item="${TOGGLE_SELECT_ITEMS[$i]}"
             if [[ "${TOGGLE_SELECT_FLAGS[$i]}" == "1" ]]; then
-                box_line " $((i + 1))) [x] ${item}" " ${GREEN}$((i + 1)))${NC} [x] ${item}"
+                box_line " $((i + 1))) [x] ${item}" " ${CYAN}$((i + 1)))${NC} [x] ${item}"
             else
-                box_line " $((i + 1))) [ ] ${item}" " ${GREEN}$((i + 1)))${NC} [ ] ${item}"
+                box_line " $((i + 1))) [ ] ${item}" " ${CYAN}$((i + 1)))${NC} [ ] ${item}"
             fi
             i=$((i + 1))
         done
-        box_mid
         menu_item 0 "Отмена" NC
         box_bot
         echo ""
@@ -543,7 +601,7 @@ toggle_select() {
             i=$((choice - 1))
             [[ "${TOGGLE_SELECT_FLAGS[$i]}" == "1" ]] && TOGGLE_SELECT_FLAGS[$i]=0 || TOGGLE_SELECT_FLAGS[$i]=1
         else
-            warn "Неверный номер."
+            warn "Неверный выбор."
         fi
     done
 }

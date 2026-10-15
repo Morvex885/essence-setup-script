@@ -94,11 +94,16 @@ _assert_diagnostic_field_redacted() {
 }
 
 
-@test "storage mode prompt requires an explicit choice" {
-    run "${BASH:-bash}" -c "source '$PROJECT_ROOT/common/common.sh'; source '$PROJECT_ROOT/remote-control/modules/github-config.sh'; printf 'x\n2\n' | _github_prompt_storage_mode"
+@test "storage mode selection rejects noncanonical indices before choosing plaintext" {
+    run "${BASH:-bash}" -c "source '$PROJECT_ROOT/common/common.sh'; source '$PROJECT_ROOT/remote-control/modules/github-config.sh'; _github_prompt_storage_mode <<< \$'01\n1+1\n\n2\r'; rc=\$?; [[ \$rc == 0 && \$GITHUB_STORAGE_MODE == none ]]"
     assert_success
-    [[ "$output" == *$'\033[0;32m1)\033[0m Зашифровать паролем'* ]] || return 1
-    [[ "$output" == *$'\033[0;36m2)\033[0m Хранить без шифрования'* ]]
+}
+
+@test "storage mode cancellation and EOF clear the previous selection" {
+    run "${BASH:-bash}" -c "source '$PROJECT_ROOT/common/common.sh'; source '$PROJECT_ROOT/remote-control/modules/github-config.sh'; GITHUB_STORAGE_MODE=age; _github_prompt_storage_mode <<< 0; rc=\$?; [[ \$rc == 1 && -z \$GITHUB_STORAGE_MODE ]]"
+    assert_success
+    run "${BASH:-bash}" -c "source '$PROJECT_ROOT/common/common.sh'; source '$PROJECT_ROOT/remote-control/modules/github-config.sh'; GITHUB_STORAGE_MODE=age; _github_prompt_storage_mode </dev/null; rc=\$?; [[ \$rc == 1 && -z \$GITHUB_STORAGE_MODE ]]"
+    assert_success
 }
 
 

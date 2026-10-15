@@ -56,6 +56,17 @@ node_load() {
     fi
 }
 
+node_pick() {
+    local labels=() label
+    NODE_PICK_INDEX=""
+    while IFS= read -r label; do
+        [[ -n "$label" ]] && labels+=("$label")
+    done < <(jq_r '.nodes[] | "\(.name)  \(.ip):\(.port)"')
+    MENU_SELECT_EMPTY="Нет нод для выбора"
+    menu_select "$1" "Выберите ноду" "${labels[@]}" || return 1
+    NODE_PICK_INDEX="$MENU_SELECT_INDEX"
+}
+
 node_load_by_name() {
     local target="$1"
     local idx
@@ -99,16 +110,17 @@ _github_add_abort() {
 add_node() {
     echo ""
     echo -e "${CYAN}  ── Добавить ноду ──────────────────────────${NC}"
-    read -rp "  Название [vps-1]:  " _name
-    _name="${_name:-vps-1}"
+    IFS= read -rp "  Название [Enter = vps-1]: " _name || return 1
+    _name="${_name%$'\r'}"; _name="${_name:-vps-1}"
 
-    read -rp "  IP сервера:        " _ip
+    IFS= read -rp "  IP ноды: " _ip || return 1
+    _ip="${_ip%$'\r'}"
     [[ -z "$_ip" ]] && { warn "IP не может быть пустым."; return; }
 
     local _port
     while true; do
-        read -rp "  Порт SSH [22]:     " _port
-        _port="${_port:-22}"
+        IFS= read -rp "  SSH-порт [Enter = 22]: " _port || return 1
+        _port="${_port%$'\r'}"; _port="${_port:-22}"
         if [[ "$_port" =~ ^[0-9]+$ ]] &&
            (( _port >= 1 && _port <= 65535 )); then
             break
@@ -116,20 +128,27 @@ add_node() {
         warn "Порт SSH должен быть числом от 1 до 65535."
     done
 
-    read -rp "  Логин [root]:      " _user
-    _user="${_user:-root}"
+    IFS= read -rp "  Логин [Enter = root]: " _user || return 1
+    _user="${_user%$'\r'}"; _user="${_user:-root}"
 
     # Выбор типа авторизации
     local _auth_choice
     while true; do
         echo ""
-        echo -e "  Авторизация:"
-        echo -e "  ${GREEN}1)${NC} SSH-ключ (рекомендуется)"
-        echo -e "  ${GREEN}2)${NC} Пароль"
-        read -rp "  Выберите [1]: " _auth_choice
+        box_top
+        box_center "Авторизация SSH"
+        box_mid
+        menu_item 1 "SSH-ключ" CYAN
+        menu_item 2 "Пароль" CYAN
+        menu_item 0 "Отмена" NC
+        box_bot
+        echo ""
+        IFS= read -rp "  Выберите способ авторизации [Enter = 1]: " _auth_choice || return 1
+        _auth_choice="${_auth_choice%$'\r'}"
         _auth_choice="${_auth_choice:-1}"
+        [[ "$_auth_choice" == 0 ]] && return 1
         [[ "$_auth_choice" == 1 || "$_auth_choice" == 2 ]] && break
-        warn "Выберите 1 или 2."
+        warn "Неверный выбор."
     done
 
     local _auth="key"
@@ -148,7 +167,9 @@ add_node() {
         _auth="password"
         _identity=""
         while true; do
-            read -rsp "  Пароль:            " _pass; echo ""
+            if ! IFS= read -rsp "  Пароль: " _pass; then echo ""; return 1; fi
+            echo ""
+            _pass="${_pass%$'\r'}"
             [[ -n "$_pass" ]] && break
             warn "Пароль не может быть пустым."
         done
@@ -213,12 +234,12 @@ add_node() {
             break
         fi
         if echo "$_ssh_err" | grep -q "REMOTE HOST IDENTIFICATION HAS CHANGED"; then
-            warn "SSH-ключ сервера изменился."
+            warn "SSH-ключ ноды изменился."
             if [[ "${CONFIG_SOURCE:-local}" == "github" ]]; then
                 ssh-keygen -R "$_ip" -f "$SSH_KNOWN_HOSTS" >/dev/null 2>&1 || true
                 [[ "$_port" != "22" ]] &&
                     ssh-keygen -R "[$_ip]:$_port" -f "$SSH_KNOWN_HOSTS" >/dev/null 2>&1 || true
-            elif confirm_yn "Обновить ключ сервера?" Y; then
+            elif confirm_yn "Обновить ключ ноды?" Y; then
                 ssh-keygen -R "$_ip" 2>/dev/null
                 [[ "$_port" != "22" ]] && ssh-keygen -R "[$_ip]:$_port" 2>/dev/null
                 success "Старый ключ удалён. Повторяем подключение..."
@@ -242,7 +263,9 @@ add_node() {
         fi
         confirm_yn "Повторить попытку?" Y || return 1
         if [[ "$_auth" == "password" ]]; then
-            read -rsp "  Новый пароль:      " _pass; echo ""
+            if ! IFS= read -rsp "  Новый пароль: " _pass; then echo ""; return 1; fi
+            echo ""
+            _pass="${_pass%$'\r'}"
             [[ -z "$_pass" ]] && { warn "Пароль не может быть пустым."; continue; }
             SERVER_PASS="$_pass"
         fi
@@ -255,7 +278,7 @@ add_node() {
             local _pin_rc=$?
             SSH_ALLOW_PORTABLE_ONBOARDING="$_previous_onboarding"
             [[ $_pin_rc -eq 0 ]] && break
-            warn "Не удалось закрепить ключ сервера ноды '${_name}'."
+            warn "Не удалось закрепить SSH-ключ ноды '${_name}'."
             _portable_onboarding_choice
             _choice=$?
             [[ $_choice -eq 0 ]] && continue
@@ -296,7 +319,12 @@ add_node() {
     info "Например, эмодзи флага страны: 🇩🇪 🇷🇺 🇳🇱 🇺🇸 или текст: DE, RU, NL"
     local _tag=""
     while [[ -z "$_tag" ]]; do
-        read -rp "  Тег: " _tag
+        if ! IFS= read -rp "  Тег ноды: " _tag; then
+            [[ "${CONFIG_SOURCE:-local}" == github ]] &&
+                _github_add_abort "$_node_id" "$_managed_identity" "$_known_backup" "$_manifest_backup"
+            return 1
+        fi
+        _tag="${_tag%$'\r'}"
         [[ -z "$_tag" ]] && warn "Тег обязателен — он различает прокси разных нод."
     done
 
@@ -366,29 +394,12 @@ add_node() {
 
 # ─── Переименование ноды ─────────────────────────────────────────────────────
 rename_node() {
-    local count
-    count=$(nodes_count)
-    [[ $count -eq 0 ]] && { warn "Нод нет."; return; }
-
-    echo ""
-    echo -e "  ${CYAN}── Переименовать ноду ──────────────────────${NC}"
-    local i=1
-    while IFS=$'\t' read -r name ip; do
-        printf "  ${DIM}%2d)${NC}  %-16s  %s\n" "$i" "$name" "$ip"
-        i=$((i + 1))
-    done < <(jq_r '.nodes[] | "\(.name)\t\(.ip)"')
-    echo ""
-    read -rp "  Номер для переименования (Enter = отмена): " _idx
-    [[ -z "$_idx" ]] && return
-    if ! [[ "$_idx" =~ ^[0-9]+$ ]] || (( _idx < 1 || _idx > count )); then
-        warn "Неверный номер."
-        return
-    fi
-
-    local _old_name
+    node_pick "Переименование ноды" || return 1
+    local _idx="$NODE_PICK_INDEX" _old_name _new_name
     _old_name=$(jq_r --argjson i "$((_idx-1))" '.nodes[$i].name')
-    read -rp "  Новое имя [${_old_name}]: " _new_name
-    [[ -z "$_new_name" || "$_new_name" == "$_old_name" ]] && return
+    IFS= read -rp "  Новое имя [Enter = $_old_name]: " _new_name || return 1
+    _new_name="${_new_name%$'\r'}"
+    [[ -z "$_new_name" || "$_new_name" == "$_old_name" ]] && return 0
 
     # Проверка уникальности
     if [[ "$(jq_r --arg n "$_new_name" '.nodes[] | select(.name==$n) | .name')" == "$_new_name" ]]; then
@@ -404,51 +415,21 @@ rename_node() {
             (if .nodes then .nodes |= map(if .==$old then $new else . end) else . end) |
             (if .connections then .connections |= map(if .node==$old then .node=$new else . end) else . end)
         )
-    '
+    ' || return 1
     success "Нода '${_old_name}' переименована в '${_new_name}'"
 }
 
 # ─── Тег ноды ───────────────────────────────────────────────────────────────
 set_node_tag() {
-    local count
-    count=$(nodes_count)
-    [[ $count -eq 0 ]] && { warn "Нод нет."; return; }
-
-    while true; do
-        echo ""
-        echo -e "  ${CYAN}── Тег ноды ────────────────────────────────${NC}"
-        local i=1
-        while IFS=$'\t' read -r name tag; do
-            local tag_display=""
-            [[ -n "$tag" ]] && tag_display="  ${CYAN}[${tag}]${NC}"
-            printf "  ${DIM}%2d)${NC}  %-16s%b\n" "$i" "$name" "$tag_display"
-            i=$((i + 1))
-        done < <(jq_r '.nodes[] | "\(.name)\t\(.tag // "")"')
-        echo ""
-        read -rp "  Номер ноды (Enter = назад): " _idx
-        [[ -z "$_idx" ]] && return
-        if ! [[ "$_idx" =~ ^[0-9]+$ ]] || (( _idx < 1 || _idx > count )); then
-            warn "Неверный номер."
-            continue
-        fi
-
-        local _name _old_tag
-        _name=$(jq_r --argjson i "$((_idx-1))" '.nodes[$i].name')
-        _old_tag=$(jq_r --argjson i "$((_idx-1))" '.nodes[$i].tag // ""')
-
-        local _prompt="  Новый тег"
-        [[ -n "$_old_tag" ]] && _prompt="  Новый тег [${_old_tag}]"
-        _prompt="${_prompt} (пусто = убрать): "
-        read -rp "$_prompt" _new_tag
-
-        if [[ -z "$_new_tag" && -n "$_old_tag" ]]; then
-            jq_w --argjson i "$((_idx-1))" '.nodes[$i].tag = ""'
-            success "Тег ноды '${_name}' удалён"
-        elif [[ -n "$_new_tag" ]]; then
-            jq_w --argjson i "$((_idx-1))" --arg t "$_new_tag" '.nodes[$i].tag = $t'
-            success "Тег ноды '${_name}' установлен: ${_new_tag}"
-        fi
-    done
+    node_pick "Тег ноды" || return 1
+    local _idx="$NODE_PICK_INDEX" _name _old_tag _new_tag
+    _name=$(jq_r --argjson i "$((_idx-1))" '.nodes[$i].name')
+    _old_tag=$(jq_r --argjson i "$((_idx-1))" '.nodes[$i].tag // ""')
+    info "Нода: $_name; текущий тег: ${_old_tag:-не задан}"
+    IFS= read -rp "  Новый тег [Enter = убрать]: " _new_tag || return 1
+    _new_tag="${_new_tag%$'\r'}"
+    jq_w --argjson i "$((_idx-1))" --arg t "$_new_tag" '.nodes[$i].tag = $t' || return 1
+    success "Тег ноды '$_name' сохранён"
 }
 
 # ─── Удаление ноды ───────────────────────────────────────────────────────────
@@ -461,164 +442,226 @@ _node_delete_restore() {
     fi
     if [[ "${CONFIG_SOURCE:-local}" == github ]]; then
         github_config_checkpoint || return 1
-        github_sync_flush || true
+        github_sync_flush || return 1
     fi
 }
 
-delete_node() {
-    local count
-    count=$(nodes_count)
-    [[ $count -eq 0 ]] && { warn "Нод нет."; return; }
+# Never fall back to a fresh login after revoking its only accepted key.
+# The private ControlMaster socket keeps the authenticated transport alive
+# until both the local checkpoint and GitHub commit have completed.
+_node_delete_key_run() {
+    local socket="$1"
+    shift
+    ssh_run -S "$socket" -o ControlMaster=no -o ProxyCommand=false -- "$@"
+}
 
-    echo ""
-    echo -e "  ${RED}── Удалить ноду ────────────────────────────${NC}"
-    local i=1
-    while IFS=$'\t' read -r name ip port user auth; do
-        local auth_label="ключ"
-        [[ "$auth" == "password" ]] && auth_label="пароль"
-        printf "  ${DIM}%2d)${NC}  %-16s  %s:%s  %s  ${DIM}(%s)${NC}\n" "$i" "$name" "$ip" "$port" "$user" "$auth_label"
-        i=$((i + 1))
-    done < <(jq_r '.nodes[] | "\(.name)\t\(.ip)\t\(.port)\t\(.user)\t\(.auth // "password")"')
-    echo ""
-    read -rp "  Номер для удаления: " _idx
-    [[ -z "$_idx" ]] && { warn "Введите номер ноды."; return; }
-    if [[ "$_idx" =~ ^[0-9]+$ ]] && (( _idx >= 1 && _idx <= count )); then
-        local _name _id _ip _port _identity
-        _id=$(jq_r --argjson i "$((_idx-1))" '.nodes[$i].id')
-        _name=$(jq_r --argjson i "$((_idx-1))" '.nodes[$i].name')
-        _ip=$(jq_r --argjson i "$((_idx-1))" '.nodes[$i].ip')
-        _port=$(jq_r --argjson i "$((_idx-1))" '.nodes[$i].port')
-        _identity=$(jq_r --argjson i "$((_idx-1))" '.nodes[$i].identity // ""')
+_node_delete_key_restore() {
+    local socket="$1" pubkey="$2" quoted
+    printf -v quoted %q "$pubkey"
+    _node_delete_key_run "$socket" "key=$quoted
+mkdir -p ~/.ssh && chmod 700 ~/.ssh &&
+touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys &&
+{ grep -qxF -- \"\$key\" ~/.ssh/authorized_keys ||
+  printf '%s\n' \"\$key\" >> ~/.ssh/authorized_keys; } &&
+grep -qxF -- \"\$key\" ~/.ssh/authorized_keys" || return 1
+    # Verify a new login, not just the still-authenticated master session.
+    ssh_run -S none -o ControlMaster=no -o BatchMode=yes \
+        -i "$SSH_IDENTITIES_DIR/$NODE_IDENTITY" -o IdentitiesOnly=yes -- "true"
+}
 
-        if confirm_yn "Удалить ноду '${_name}'?"; then
-            # Удаление всех компонентов на сервере
-            if confirm_yn "Удалить все компоненты essence на сервере?"; then
-                if ! node_load "$_idx"; then
-                    warn "Не удалось загрузить ноду '${_name}'. Удаление на сервере не выполнено."
-                else
-                    info "Подключаемся к серверу для удаления..."
-                    if ssh_run -- "echo ok" &>/dev/null; then
-                        if upload_scripts; then
-                            info "В меню сервера выберите u — удалить всё установленное."
-                            run_remote
-                        else
-                            warn "Не удалось загрузить скрипты для ноды '${_name}'. Удаление на сервере не выполнено."
-                        fi
-                    else
-                        warn "Не удалось подключиться — удаление на сервере не выполнено"
-                    fi
-                fi
-            fi
-
-            local _manifest_backup="" _config_backup _secrets_backup
-            local _revoke_requested=false
-            _config_backup=$(umask 077; mktemp "${CONFIG_DIR:-/tmp}/.config.XXXXXX") || return 1
-            _secrets_backup=$(umask 077; mktemp "${CONFIG_DIR:-/tmp}/.secrets.XXXXXX") || {
-                rm -f "$_config_backup"
-                return 1
-            }
-            cp -p "$CONFIG_JSON" "$_config_backup" &&
-                cp -p "$SECRETS_JSON" "$_secrets_backup" || {
-                rm -f "$_config_backup" "$_secrets_backup"
-                return 1
-            }
-            if [[ -f "${STATE_MANIFEST:-}" ]]; then
-                _manifest_backup=$(umask 077; mktemp "${CONFIG_DIR:-/tmp}/.manifest.XXXXXX") || {
-                    rm -f "$_config_backup" "$_secrets_backup"
-                    return 1
-                }
-                cp -p "$STATE_MANIFEST" "$_manifest_backup" || {
-                    rm -f "$_config_backup" "$_secrets_backup" "$_manifest_backup"
-                    return 1
-                }
-            fi
-            if [[ "${CONFIG_SOURCE:-local}" == github && "$_identity" == "$_id" ]] &&
-               confirm_yn "Отозвать переносимый SSH-ключ на сервере?" Y; then
-                node_load "$_idx" || {
-                    rm -f "$_config_backup" "$_secrets_backup" "$_manifest_backup"
-                    return 1
-                }
-                _revoke_requested=true
-            fi
-            if [[ "${CONFIG_SOURCE:-local}" == github ]]; then
-                state_portability_remove_node "$_id" || {
-                    rm -f "$_config_backup" "$_secrets_backup" "$_manifest_backup"
-                    return 1
-                }
-            fi
-
-            if ! jq_w --arg id "$_id" --arg n "$_name" '
-                .nodes |= [.[] | select(.id != $id)] |
-                .connections |= [.[] | select(.node!=$n)] |
-                .clients |= map(
-                    (if .nodes then .nodes |= [.[] | select(.!=$n)] else . end) |
-                    (if .connections then .connections |= [.[] | select(.node!=$n)] else . end)
-                )
-            ' ||
-               ! node_secret_delete "$_id" ||
-               ! state_checkpoint; then
-                _node_delete_restore "$_config_backup" "$_secrets_backup" "$_manifest_backup" || true
-                rm -f "$_config_backup" "$_secrets_backup" "$_manifest_backup"
-                warn "Удаление ноды отменено: локальное состояние не удалось сохранить."
-                return 1
-            fi
-            if [[ "${CONFIG_SOURCE:-local}" == github ]] &&
-               { ! github_config_checkpoint || ! github_sync_flush; }; then
-                _node_delete_restore "$_config_backup" "$_secrets_backup" "$_manifest_backup" || true
-                rm -f "$_config_backup" "$_secrets_backup" "$_manifest_backup"
-                warn "Удаление ноды отменено: состояние GitHub не удалось сохранить."
-                return 1
-            fi
-
-            if [[ "$_revoke_requested" == true ]]; then
-                while true; do
-                    local _previous_onboarding="${SSH_ALLOW_PORTABLE_ONBOARDING:-0}"
-                    SSH_ALLOW_PORTABLE_ONBOARDING=1
-                    _revoke_managed_remote_key "$_id"
-                    local _revoke_rc=$?
-                    SSH_ALLOW_PORTABLE_ONBOARDING="$_previous_onboarding"
-                    [[ $_revoke_rc -eq 0 ]] && break
-                    warn "Не удалось отозвать переносимый SSH-ключ."
-                    echo ""
-                    box_top
-                    box_center "Удаление ноды"
-                    box_mid
-                    box_line " 1) Повторить отзыв ключа" " ${GREEN}1)${NC} Повторить отзыв ключа"
-                    box_line " 2) Оставить ключ на сервере" " ${YELLOW}2)${NC} Оставить ключ на сервере"
-                    box_line " 3) Восстановить ноду и отменить удаление" " ${RED}3)${NC} Восстановить ноду и отменить удаление"
-                    box_bot
-                    echo ""
-                    read -rp "  Выберите действие: " _revoke_choice
-                    case "$_revoke_choice" in
-                        1) continue ;;
-                        2)
-                            warn "Ключ останется на сервере и потребует ручного отзыва."
-                            break
-                            ;;
-                        3)
-                            _node_delete_restore "$_config_backup" "$_secrets_backup" "$_manifest_backup" || true
-                            rm -f "$_config_backup" "$_secrets_backup" "$_manifest_backup"
-                            return 1
-                            ;;
-                        *) warn "Неверный выбор." ;;
-                    esac
-                done
-            fi
-            if [[ -n "$_identity" && "$_identity" != "system" ]]; then
-                rm -f "$SSH_IDENTITIES_DIR/$_identity" "$SSH_IDENTITIES_DIR/$_identity.pub" ||
-                    warn "Не удалось удалить локальную копию SSH-ключа."
-            fi
-            if [[ "${CONFIG_SOURCE:-local}" == github && -f "${SSH_KNOWN_HOSTS:-}" ]]; then
-                ssh-keygen -R "$_ip" -f "$SSH_KNOWN_HOSTS" >/dev/null 2>&1 || true
-                [[ "$_port" != "22" ]] &&
-                    ssh-keygen -R "[$_ip]:$_port" -f "$SSH_KNOWN_HOSTS" >/dev/null 2>&1 || true
-                github_config_checkpoint || GITHUB_SYNC_STATUS=pending
-                github_sync_flush || true
-            fi
-            rm -f "$_config_backup" "$_secrets_backup" "$_manifest_backup"
-            success "Нода '${_name}' удалена"
-        fi
-    else
-        warn "Неверный номер."
+_node_delete_rollback() {
+    local backup="$1" socket="$2" revoked="$3" pubkey="$4" restored=true
+    if [[ "$revoked" == true ]] && ! _node_delete_key_restore "$socket" "$pubkey"; then
+        warn "Не удалось подтвердить восстановление SSH-доступа. Резервные копии: $backup; сокет SSH-соединения: $socket"
+        restored=false
     fi
+    _node_delete_restore "$backup/config" "$backup/secrets" \
+        "$([[ -f "$backup/manifest" ]] && printf '%s' "$backup/manifest")" || {
+        warn "Не удалось полностью восстановить локальное состояние и GitHub. Резервные копии сохранены: $backup"
+        restored=false
+    }
+    [[ "$restored" == true ]] || return 1
+    if [[ -n "$socket" ]]; then
+        ssh_run -S "$socket" -O exit -- >/dev/null 2>&1 || true
+        rm -rf "${socket%/*}"
+    fi
+    rm -rf "$backup"
+}
+
+delete_node() {
+    node_pick "Удаление ноды" || return 1
+    local _idx="$NODE_PICK_INDEX" _name _id _ip _port _identity _user
+    _id=$(jq_r --argjson i "$((_idx-1))" '.nodes[$i].id')
+    _name=$(jq_r --argjson i "$((_idx-1))" '.nodes[$i].name')
+    _ip=$(jq_r --argjson i "$((_idx-1))" '.nodes[$i].ip')
+    _port=$(jq_r --argjson i "$((_idx-1))" '.nodes[$i].port')
+    _identity=$(jq_r --argjson i "$((_idx-1))" '.nodes[$i].identity // ""')
+    _user=$(jq_r --argjson i "$((_idx-1))" '.nodes[$i].user')
+    local options=("Удалить только из remote-control; сервер и SSH-ключ оставить")
+    local server_flags=(false) key_flags=(false)
+    local managed=false
+    [[ "${CONFIG_SOURCE:-local}" == github && -n "$_id" && "$_identity" == "$_id" ]] && managed=true
+    if [[ "$managed" == true ]]; then
+        options+=("Удалить из remote-control и отозвать управляемый SSH-ключ")
+        server_flags+=(false); key_flags+=(true)
+    fi
+    options+=("Удалить из remote-control и все компоненты Essence на сервере")
+    server_flags+=(true); key_flags+=(false)
+    if [[ "$managed" == true ]]; then
+        options+=("Удалить из remote-control, все компоненты Essence и отозвать SSH-ключ")
+        server_flags+=(true); key_flags+=(true)
+    fi
+    menu_select "Объём удаления ноды" "Выберите объём удаления" "${options[@]}" || return 1
+    local selected=$((MENU_SELECT_INDEX - 1))
+    local remove_server="${server_flags[$selected]}" _revoke_requested="${key_flags[$selected]}"
+    local affected=() client
+    while IFS= read -r client; do
+        [[ -n "$client" ]] && affected+=("$client")
+    done < <(jq_r --arg n "$_name" '
+        . as $config | .clients[] | . as $client |
+        select((.nodes // [] | index($n)) != null or
+               ([.connections[]?.node] | index($n)) != null or
+               (.inherit_nodes_from_group != false and
+                ([ $config.connections[] | select(.node==$n) | .groups[]?.name ] | index($client.group)) != null)) |
+        .name')
+    local lines=("Нода: $_name  $_ip:$_port" "Пользователь: $_user" "Объём: ${options[$selected]}"
+        "Затронутые клиенты: ${affected[*]:-нет}")
+    if [[ "$remove_server" == true ]]; then
+        lines+=("Mihomo: бинарь, служба, конфигурация и клиентские записи."
+            "AmneziaWG: служба, конфигурация, ключи и все клиенты."
+            "WARP: /root/wgcf и профиль."
+            "Сайты nginx Essence, webroot и /etc/nginx/ssl целиком."
+            "Хостинг подписок, Telegram Proxy и acme.sh."
+            "/etc/sysctl.d/99-vpn-speedup.conf; IPv6 будет восстановлен."
+            "Пакеты nginx и AmneziaWG не удаляются."
+            "Правила UFW будут сброшены. Настройки SSH сохранятся.")
+        if [[ "$_port" == 22 ]]; then
+            lines+=("UFW будет отключён.")
+        else
+            lines+=("UFW останется включён: открыт только SSH TCP/$_port.")
+        fi
+    fi
+    if [[ "$_revoke_requested" == true ]]; then
+        lines+=("Управляемый SSH-ключ будет отозван на ноде.")
+    else
+        lines+=("SSH-ключ на ноде сохранится.")
+    fi
+    review_frame "Удаление ноды" "${lines[@]}"
+    confirm_yn "Удалить ноду в выбранном объёме?" N || return 0
+    if [[ "$remove_server" == true ]]; then
+        local entry
+        if ! node_load "$_idx" || ! ensure_remote_scripts_current; then
+            warn "Удаление компонентов на сервере не завершено. Нода сохранена в remote-control."
+            return 1
+        fi
+        printf -v entry %q "$REMOTE_DIR/setup-essence.sh"
+        if ! SSH_RUN_TIMEOUT=900 ssh_run -- "bash $entry uninstall --force"; then
+            warn "Удаление компонентов на сервере не завершено. Нода сохранена в remote-control."
+            return 1
+        fi
+    fi
+    # Prepare every rollback artifact before revoking remote authorization.
+    local backup socket="" pubkey="" key_present="" revoked=false quoted
+    backup=$(umask 077; mktemp -d "${CONFIG_DIR:-/tmp}/.node-delete.XXXXXX") || return 1
+    if ! cp -p "$CONFIG_JSON" "$backup/config" ||
+       ! cp -p "$SECRETS_JSON" "$backup/secrets" ||
+       { [[ -f "${STATE_MANIFEST:-}" ]] && ! cp -p "$STATE_MANIFEST" "$backup/manifest"; }; then
+        rm -rf "$backup"
+        return 1
+    fi
+    if [[ "$_revoke_requested" == true ]]; then
+        if ! node_load "$_idx" ||
+           ! cp -p "$SSH_IDENTITIES_DIR/$_id.pub" "$backup/key.pub" ||
+           ! pubkey=$(cat "$backup/key.pub") || [[ -z "$pubkey" ]]; then
+            rm -rf "$backup"
+            warn "Не удалось подготовить отзыв SSH-ключа. Нода сохранена в remote-control."
+            return 1
+        fi
+        # Unix-domain paths are limited to ~104 bytes; CONFIG_DIR may be longer.
+        socket=$(umask 077; mktemp -d /tmp/essence-ssh.XXXXXX) || {
+            rm -rf "$backup"
+            warn "Не удалось подготовить временный сокет SSH. Ключ не отозван."
+            return 1
+        }
+        socket="$socket/control"
+        if ! ssh_run -M -N -f -S "$socket" -o ControlPersist=no --; then
+            ssh_run -S "$socket" -O exit -- >/dev/null 2>&1 || true
+            rm -rf "$backup" "${socket%/*}"
+            warn "Не удалось сохранить SSH-соединение для восстановления доступа. Ключ не отозван."
+            return 1
+        fi
+        printf -v quoted %q "$pubkey"
+        key_present=$(_node_delete_key_run "$socket" "key=$quoted
+if [ ! -f ~/.ssh/authorized_keys ]; then printf absent
+elif grep -qxF -- \"\$key\" ~/.ssh/authorized_keys; then printf present
+elif [ \"\$?\" -eq 1 ]; then printf absent
+else exit 1; fi") || key_present=""
+        case "$key_present" in
+            present)
+                # Mark before sending: a lost reply may follow successful revocation.
+                revoked=true
+                if ! _node_delete_key_run "$socket" "key=$quoted
+umask 077
+tmp=\$(mktemp ~/.ssh/authorized_keys.XXXXXX) || exit 1
+if awk -v key=\"\$key\" '\$0 != key' ~/.ssh/authorized_keys > \"\$tmp\" &&
+   mv \"\$tmp\" ~/.ssh/authorized_keys; then
+    grep -qxF -- \"\$key\" ~/.ssh/authorized_keys
+    [ \"\$?\" -eq 1 ]
+else rm -f \"\$tmp\"; exit 1; fi"; then
+                    _node_delete_rollback "$backup" "$socket" "$revoked" "$pubkey" || true
+                    warn "SSH-ключ не отозван. Нода сохранена в remote-control."
+                    return 1
+                fi
+                ;;
+            absent) ;;
+            *)
+                _node_delete_rollback "$backup" "$socket" false "$pubkey" || true
+                warn "Не удалось проверить SSH-ключ. Нода сохранена в remote-control."
+                return 1
+                ;;
+        esac
+    fi
+    if [[ "${CONFIG_SOURCE:-local}" == github ]] &&
+       ! state_portability_remove_node "$_id"; then
+        _node_delete_rollback "$backup" "$socket" "$revoked" "$pubkey" || true
+        return 1
+    fi
+    if ! jq_w --arg id "$_id" --arg n "$_name" '
+        .nodes |= [.[] | select(.id != $id)] |
+        .connections |= [.[] | select(.node!=$n)] |
+        .clients |= map(
+            (if .nodes then .nodes |= [.[] | select(.!=$n)] else . end) |
+            (if .connections then .connections |= [.[] | select(.node!=$n)] else . end)
+        )
+    ' ||
+       ! node_secret_delete "$_id" ||
+       ! state_checkpoint; then
+        _node_delete_rollback "$backup" "$socket" "$revoked" "$pubkey" || true
+        warn "Удаление ноды отменено: локальное состояние не удалось сохранить."
+        return 1
+    fi
+    if [[ "${CONFIG_SOURCE:-local}" == github ]] &&
+       { ! github_config_checkpoint || ! github_sync_flush; }; then
+        _node_delete_rollback "$backup" "$socket" "$revoked" "$pubkey" || true
+        warn "Удаление ноды отменено: состояние GitHub не удалось сохранить."
+        return 1
+    fi
+    if [[ -n "$socket" ]]; then
+        ssh_run -S "$socket" -O exit -- >/dev/null 2>&1 || true
+        rm -rf "${socket%/*}"
+    fi
+    if [[ -n "$_identity" && "$_identity" != "system" ]]; then
+        rm -f "$SSH_IDENTITIES_DIR/$_identity" "$SSH_IDENTITIES_DIR/$_identity.pub" ||
+            warn "Не удалось удалить локальную копию SSH-ключа."
+    fi
+    if [[ "${CONFIG_SOURCE:-local}" == github && -f "${SSH_KNOWN_HOSTS:-}" ]]; then
+        ssh-keygen -R "$_ip" -f "$SSH_KNOWN_HOSTS" >/dev/null 2>&1 || true
+        [[ "$_port" != "22" ]] &&
+            ssh-keygen -R "[$_ip]:$_port" -f "$SSH_KNOWN_HOSTS" >/dev/null 2>&1 || true
+        github_config_checkpoint || GITHUB_SYNC_STATUS=pending
+        github_sync_flush || true
+    fi
+    rm -rf "$backup"
+            success "Нода '${_name}' удалена"
+    return 0
 }

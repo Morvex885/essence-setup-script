@@ -360,7 +360,7 @@ warp_menu() {
         if grep -q '# --- warp ---' /etc/mihomo/config.yaml 2>/dev/null; then
             box_line " Статус: установлен" " Статус: ${GREEN}установлен${NC}"
         else
-            box_line " Статус: не установлен" " Статус: ${RED}не установлен${NC}"
+            box_line " Статус: не установлен" " Статус: ${DIM}не установлен${NC}"
         fi
         box_mid
         menu_item 1 "Установить WARP" GREEN
@@ -390,18 +390,21 @@ install_warp() {
     echo ""
 
     if [[ ! -f /etc/mihomo/config.yaml ]]; then
-        warn "Mihomo не установлен. Сначала выполните установку (пункт 1)."
+        warn "Mihomo не установлен. Сначала выберите «b) Базовая установка»."
         return
     fi
 
     if grep -q '# --- warp ---' /etc/mihomo/config.yaml; then
-        warn "WARP уже настроен."
-        confirm_yn "Переустановить?" || { info "Отменено."; return; }
+        review_frame "Замена WARP" \
+            "Конфигурация WARP в Mihomo и сохранённый профиль будут заменены." \
+            "Mihomo будет перезапущен."
+        confirm_yn "Переустановить WARP?" N || { info "Отменено."; return 0; }
         warp_config_mode="update"
     fi
 
     echo ""
-    read -rp "WARP+ лицензионный ключ (Enter = бесплатный WARP): " WARP_LICENSE
+    IFS= read -rp "  WARP+ лицензионный ключ [Enter = бесплатный WARP]: " WARP_LICENSE || return 1
+    WARP_LICENSE="${WARP_LICENSE%$'\r'}"
     echo ""
 
     WGCF_DIR="/root/wgcf"
@@ -480,23 +483,25 @@ install_warp() {
         return 1
     fi
     cd /root
-    success "WARP настроен: IPv4=$WARP_IP${WARP_IPV6:+, IPv6=$WARP_IPV6}"
-    success "WARP добавлен в группу outbound"
 
     sed -i '/^WARP IP:/d; /^WARP Public key:/d' /etc/mihomo/client-config.txt
     sed -i "/^Short ID:/a WARP IP:          $WARP_IP\nWARP Public key:  $WARP_PUBLIC_KEY" \
         /etc/mihomo/client-config.txt
 
     info "Перезапускаю Mihomo..."
-    systemctl restart mihomo &>/dev/null
+    local _start_rc=0
+    systemctl restart mihomo &>/dev/null || _start_rc=$?
     sleep 4
 
-    if systemctl is-active --quiet mihomo; then
+    if [[ "$_start_rc" -eq 0 ]] && systemctl is-active --quiet mihomo; then
         success "Mihomo перезапущен с WARP"
     else
-        warn "Mihomo не запустился. Лог:"
-        journalctl -u mihomo -n 20 --no-pager
+        warn "Не удалось запустить Mihomo. Проверьте журнал и повторите действие из меню."
+        journalctl -u mihomo -n 20 --no-pager || true
+        return 1
     fi
+    success "WARP настроен: IPv4=$WARP_IP${WARP_IPV6:+, IPv6=$WARP_IPV6}"
+    success "WARP добавлен в группу outbound"
 
     echo ""
     success_box "WARP настроен!"
@@ -506,6 +511,7 @@ install_warp() {
     echo -e "  WARP Public key: ${CYAN}$WARP_PUBLIC_KEY${NC}"
     echo -e "  Профиль:         ${CYAN}/etc/mihomo/wgcf-profile.conf${NC}"
     echo ""
+    return 0
 }
 
 reregister_warp() {
@@ -524,13 +530,15 @@ reregister_warp() {
         return
     fi
 
-    warn "Будет создана новая регистрация устройства WARP."
-    warn "Старая регистрация останется в Cloudflare и может занимать слот WARP+."
-    warn "При необходимости удалите старое устройство вручную в приложении 1.1.1.1."
+    review_frame "Перерегистрация WARP" \
+        "Будет создана новая регистрация устройства WARP." \
+        "Старая регистрация останется в Cloudflare и может занимать слот WARP+." \
+        "При необходимости удалите старое устройство вручную в приложении 1.1.1.1."
     confirm_yn "Перерегистрировать аккаунт WARP?" N || { info "Отменено."; return; }
 
     echo ""
-    read -rp "WARP+ лицензионный ключ для нового аккаунта (Enter = бесплатный WARP): " new_warp_license
+    IFS= read -rp "  WARP+ лицензионный ключ для нового аккаунта [Enter = бесплатный WARP]: " new_warp_license || return 1
+    new_warp_license="${new_warp_license%$'\r'}"
     echo ""
 
     cd "$wgcf_dir" || { warn "Не удалось открыть $wgcf_dir"; return; }
@@ -630,16 +638,34 @@ uninstall_warp() {
         return
     fi
 
-    warn "Будет удалён WARP из конфига Mihomo и файлы wgcf."
-    confirm_yn "Вы уверены?" || { info "Отменено."; return; }
+    review_frame "Удаление WARP" \
+        "Блок WARP и warp-wg в группе outbound: /etc/mihomo/config.yaml." \
+        "Метаданные WARP: /etc/mihomo/client-config.txt." \
+        "Профиль: /etc/mihomo/wgcf-profile.conf; файлы: /root/wgcf." \
+        "Mihomo будет перезапущен без WARP."
+    confirm_yn "Удалить WARP?" N || return 0
 
-    awk '
-        /^# --- warp ---/{print; skip=1; next}
-        skip && /^# --- \/warp ---/{skip=0}
-        {print}
-    ' /etc/mihomo/config.yaml > /tmp/mihomo_tmp.yaml
-    mv /tmp/mihomo_tmp.yaml /etc/mihomo/config.yaml
-    success "WARP proxy удалён из config.yaml"
+    local _tmpfile
+    _tmpfile=$(umask 077; mktemp "/etc/mihomo/.config.XXXXXX") || {
+        warn "Не удалось удалить WARP из конфигурации Mihomo."
+        return 1
+    }
+    if ! awk '
+        /^# --- warp ---/ { if (skip || removed) exit 1; skip=1; next }
+        /^# --- \/warp ---/ { if (!skip) exit 1; skip=0; removed=1; next }
+        !skip { print }
+        END { if (skip || !removed) exit 1 }
+    ' /etc/mihomo/config.yaml > "$_tmpfile"; then
+        rm -f "$_tmpfile"
+        warn "Не удалось удалить WARP из конфигурации Mihomo."
+        return 1
+    fi
+    if ! mv "$_tmpfile" /etc/mihomo/config.yaml; then
+        rm -f "$_tmpfile"
+        warn "Не удалось удалить WARP из конфигурации Mihomo."
+        return 1
+    fi
+    success "WARP удалён из config.yaml"
 
     sed -i '/^      - warp-wg$/d' /etc/mihomo/config.yaml
     success "warp-wg удалён из группы outbound"
@@ -651,25 +677,28 @@ uninstall_warp() {
     success "Файлы wgcf удалены"
 
     info "Перезапускаю Mihomo..."
-    systemctl restart mihomo &>/dev/null
+    local _start_rc=0
+    systemctl restart mihomo &>/dev/null || _start_rc=$?
     sleep 3
 
-    if systemctl is-active --quiet mihomo; then
+    if [[ "$_start_rc" -eq 0 ]] && systemctl is-active --quiet mihomo; then
         success "Mihomo перезапущен без WARP"
     else
-        warn "Mihomo не запустился. Лог:"
-        journalctl -u mihomo -n 20 --no-pager
+        warn "Не удалось запустить Mihomo. Проверьте журнал и повторите действие из меню."
+        journalctl -u mihomo -n 20 --no-pager || true
+        return 1
     fi
     echo ""
+    return 0
 }
 update_warp() {
     echo ""
     if [[ ! -f /etc/mihomo/config.yaml ]]; then
-        warn "Mihomo не установлен. Сначала выполните установку (пункт 1)."
+        warn "Mihomo не установлен. Сначала выберите «b) Базовая установка»."
         return 1
     fi
     if ! grep -q '# --- warp ---' /etc/mihomo/config.yaml; then
-        warn "WARP не настроен. Сначала выполните установку WARP (пункт 4 → 1)."
+        warn "WARP не настроен. Откройте «w) WARP» и выберите «1) Установить WARP»."
         return 1
     fi
 
@@ -700,7 +729,8 @@ update_warp() {
     fi
 
     local original_dir="$PWD"
-    read -rp "WARP+ лицензионный ключ (Enter = бесплатный WARP): " NEW_WARP_LICENSE
+    IFS= read -rp "  WARP+ лицензионный ключ [Enter = бесплатный WARP]: " NEW_WARP_LICENSE || return 1
+    NEW_WARP_LICENSE="${NEW_WARP_LICENSE%$'\r'}"
     cd "$WGCF_DIR" || return 1
     if ! _warp_prepare_account "$NEW_WARP_LICENSE" ||
        ! _warp_generate_profile ||

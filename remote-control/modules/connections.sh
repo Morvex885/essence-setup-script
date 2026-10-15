@@ -24,19 +24,19 @@ connections_menu() {
             _show_connections_overview
             local i=1 nname nip
             while IFS=$'\t' read -r nname nip; do
-                box_line " ${i}) ${nname} ${nip}" " ${CYAN}${i})${NC} ${nname} ${DIM}${nip}${NC}"
+                menu_item "$i" "$nname  $nip" CYAN
                 i=$((i + 1))
-            done < <(jq_r '.nodes[] | "\(.name)\t\(.ip)"')
+            done < <(jq_r '.nodes[] | "\(.name)\t\(.ip):\(.port)"')
         fi
         box_mid
         if [[ "$node_count" -gt 0 ]]; then
             menu_item r "Переименовать подключения" YELLOW
-            menu_item s "Синхронизировать с нодами" CYAN
+            menu_item s "Синхронизировать с нодами" YELLOW
         fi
         menu_item 0 "Назад" NC
         box_bot
         echo ""
-        if ! IFS= read -rp "  Выберите ноду: " CONN_CHOICE; then
+        if ! IFS= read -rp "  Выберите действие: " CONN_CHOICE; then
             return 0
         fi
         CONN_CHOICE="${CONN_CHOICE%$'\r'}"
@@ -58,7 +58,7 @@ connections_menu() {
                 ;;
             *)
                 if menu_index_valid "$CONN_CHOICE" "$node_count"; then
-                    state_action "configure_connections" _configure_node_connections "$CONN_CHOICE"
+                    _configure_node_connections "$CONN_CHOICE"
                 else
                     warn "Неверный выбор."
                 fi
@@ -194,7 +194,7 @@ _show_connections_overview() {
 }
 
 _configure_node_connections() {
-    node_load "$1"
+    node_load "$1" || return 1
     local nname="$NODE_NAME"
 
     # Один SSH — discover
@@ -215,13 +215,14 @@ _configure_node_connections() {
     success "Обнаружено ${#disc_arr[@]} подключений"
 
     _node_disc_count_set "$nname" "${#disc_arr[@]}"
-    _purge_stale_connections "$nname" "${disc_arr[@]}"
+    state_action "purge_stale_connections" _purge_stale_connections "$nname" "${disc_arr[@]}" || return 1
 
     groups_list
     while true; do
         echo ""
-        echo -e "  ${CYAN}$nname${NC} — подключения:"
-        echo ""
+        box_top
+        box_center "Подключения ноды: $nname"
+        box_mid
         for d in "${disc_arr[@]}"; do
             local grp_tags=""
             for g in "${GRP_LIST[@]}"; do
@@ -229,25 +230,23 @@ _configure_node_connections() {
                 proxies_csv=$(jq_r --arg n "$nname" --arg g "$g" \
                     '.connections[] | select(.node==$n) | .groups[] | select(.name==$g) | .proxies | join(",")')
                 if [[ -n "$proxies_csv" ]] && echo ",$proxies_csv," | grep -qF ",$d,"; then
-                    grp_tags+=" ${GREEN}${g}${NC}"
+                    grp_tags+=" $g"
                 fi
             done
-            if [[ -n "$grp_tags" ]]; then
-                echo -e "  $d —${grp_tags}"
-            else
-                echo -e "  $d  ${DIM}(не назначено)${NC}"
-            fi
+            box_line " $d — ${grp_tags:-не назначено}"
         done
+        box_mid
+        menu_item b "Назначить подключения группам" YELLOW
+        menu_item 0 "Назад" NC
+        box_bot
         echo ""
-        echo -e "  ${CYAN}b)${NC} Назначить подключения группам"
-        echo -e "  ${NC}0)${NC} Назад"
-        echo ""
-        read -rp "  Выберите действие: " _pick
+        IFS= read -rp "  Выберите действие: " _pick || return 0
+        _pick="${_pick%$'\r'}"
 
         if [[ "$_pick" == "0" ]]; then
             return
         elif [[ "$_pick" == "b" || "$_pick" == "B" ]]; then
-            _batch_assign_connections "$nname" "${disc_arr[@]}"
+            state_action "assign_connections" _batch_assign_connections "$nname" "${disc_arr[@]}"
         else
             warn "Неверный выбор."
         fi
@@ -310,13 +309,14 @@ _batch_assign_connections() {
     i=0
     for g in "${GRP_LIST[@]}"; do
         if [[ "${grp_flags[$i]}" == "1" ]]; then
-            _save_connection "$nname" "$g" "$selected_csv"
+            _save_connection "$nname" "$g" "$selected_csv" || return 1
             success "$nname -> $g сохранено"
             applied=$((applied + 1))
         fi
         i=$((i + 1))
     done
     [[ $applied -eq 0 ]] && warn "Ни одна группа не выбрана."
+    return 0
 }
 
 _save_connection() {
@@ -341,31 +341,8 @@ _save_connection() {
 }
 
 _rename_connections() {
-    local node_count
-    node_count=$(nodes_count)
-    if [[ "$node_count" -eq 0 ]]; then
-        warn "Нет нод."
-        return
-    fi
-
-    echo ""
-    echo -e "  Выберите ноду:"
-    local i=1
-    while IFS=$'\t' read -r nname nip; do
-        echo -e "  ${GREEN}${i})${NC} $nname ${DIM}$nip${NC}"
-        i=$((i + 1))
-    done < <(jq_r '.nodes[] | "\(.name)\t\(.ip)"')
-    echo -e "  ${NC}0)${NC} Назад"
-    echo ""
-    read -rp "Выберите: " NODE_IDX
-
-    [[ "$NODE_IDX" == "0" ]] && return
-    if ! [[ "$NODE_IDX" =~ ^[0-9]+$ ]] || (( NODE_IDX < 1 || NODE_IDX > node_count )); then
-        warn "Неверный выбор."
-        return
-    fi
-
-    node_load "$NODE_IDX"
+    node_pick "Переименование подключений" || return 1
+    node_load "$NODE_PICK_INDEX" || return 1
     local nname="$NODE_NAME"
 
     info "Подключаюсь к $nname..."
@@ -388,43 +365,47 @@ _rename_connections() {
 
     while true; do
         echo ""
-        echo -e "  Подключения ${CYAN}$nname${NC}:"
-        local i=1
+        box_top
+        box_center "Переименование подключений"
+        box_mid
+        box_line " Нода: $nname"
+        box_mid
+        local i=1 alias_val label
         for d in "${disc_arr[@]}"; do
-            local alias_val
             alias_val=$(echo "$aliases_json" | jq -r --arg k "$d" '.[$k] // empty')
-            if [[ -n "$alias_val" ]]; then
-                echo -e "  ${GREEN}${i})${NC} $d  ${YELLOW}→  $alias_val${NC}"
-            else
-                echo -e "  ${GREEN}${i})${NC} $d"
-            fi
+            label="$d"
+            [[ -n "$alias_val" ]] && label+=" → $alias_val"
+            menu_item "$i" "$label" CYAN
             i=$((i + 1))
         done
+        menu_item s "Сохранить изменения" YELLOW
+        menu_item 0 "Отмена" NC
+        box_bot
         echo ""
-        read -rp "Номер для переименования (Enter = сохранить): " PICK
-        [[ -z "$PICK" ]] && break
-
-        if [[ "$PICK" =~ ^[0-9]+$ ]] && (( PICK >= 1 && PICK <= ${#disc_arr[@]} )); then
-            local orig="${disc_arr[$((PICK - 1))]}"
-            local cur_alias
-            cur_alias=$(echo "$aliases_json" | jq -r --arg k "$orig" '.[$k] // empty')
-            [[ -n "$cur_alias" ]] && echo -e "  Текущее: ${YELLOW}$cur_alias${NC}"
-            read -rp "  Новое имя (Enter = убрать alias): " NEW_NAME
-
-            if [[ -n "$NEW_NAME" ]]; then
-                aliases_json=$(echo "$aliases_json" | jq --arg k "$orig" --arg v "$NEW_NAME" '. + {($k): $v}')
-            else
-                aliases_json=$(echo "$aliases_json" | jq --arg k "$orig" 'del(.[$k])')
-            fi
-        else
-            warn "Неверный номер."
-        fi
+        IFS= read -rp "  Выберите подключение: " PICK || return 1
+        PICK="${PICK%$'\r'}"
+        case "$PICK" in
+            s|S) break ;;
+            0) return 1 ;;
+            *)
+                if ! menu_index_valid "$PICK" "${#disc_arr[@]}"; then
+                    warn "Неверный выбор."
+                    continue
+                fi
+                local orig="${disc_arr[$((PICK - 1))]}" NEW_NAME
+                IFS= read -rp "  Новое имя [Enter = убрать псевдоним]: " NEW_NAME || return 1
+                NEW_NAME="${NEW_NAME%$'\r'}"
+                if [[ -n "$NEW_NAME" ]]; then
+                    aliases_json=$(echo "$aliases_json" | jq --arg k "$orig" --arg v "$NEW_NAME" '. + {($k): $v}') || return 1
+                else
+                    aliases_json=$(echo "$aliases_json" | jq --arg k "$orig" 'del(.[$k])') || return 1
+                fi
+                ;;
+        esac
     done
-
-    # Сохраняем aliases в ноду
     jq_w --arg n "$nname" --argjson a "$aliases_json" \
-        '(.nodes[] | select(.name==$n)).aliases = $a'
-    success "Aliases для $nname сохранены"
+        '(.nodes[] | select(.name==$n)).aliases = $a' || return 1
+    success "Псевдонимы для $nname сохранены"
 }
 
 # ─── Вспомогательные функции ─────────────────────────────────────────────────

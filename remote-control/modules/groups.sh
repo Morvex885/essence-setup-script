@@ -52,7 +52,7 @@ groups_menu() {
         box_mid
         menu_item a "Добавить группу" GREEN
         menu_item d "Удалить группу" RED
-        menu_item t "Поменять шаблон группе" YELLOW
+        menu_item t "Поменять шаблон группе" CYAN
         menu_item 0 "Назад" NC
         box_bot
         echo ""
@@ -72,7 +72,8 @@ groups_menu() {
 
 add_group() {
     echo ""
-    read -rp "Название группы: " GROUP_NAME
+    IFS= read -rp "  Название группы: " GROUP_NAME || return 1
+    GROUP_NAME="${GROUP_NAME%$'\r'}"
     [[ -z "$GROUP_NAME" ]] && { warn "Название не указано."; return; }
 
     GROUP_NAME=$(echo "$GROUP_NAME" | tr '[:lower:]' '[:upper:]')
@@ -87,28 +88,10 @@ add_group() {
 }
 
 delete_group() {
-    echo ""
     groups_list
-
-    if [[ ${#GRP_LIST[@]} -eq 0 ]]; then
-        warn "Нет групп для удаления."
-        return
-    fi
-
-    local i=1
-    for g in "${GRP_LIST[@]}"; do
-        echo -e "  ${GREEN}${i})${NC} $g"
-        i=$((i + 1))
-    done
-    echo ""
-    read -rp "Номер группы для удаления: " DEL_IDX
-
-    if ! [[ "$DEL_IDX" =~ ^[0-9]+$ ]] || (( DEL_IDX < 1 || DEL_IDX > ${#GRP_LIST[@]} )); then
-        warn "Неверный выбор."
-        return
-    fi
-
-    local target="${GRP_LIST[$((DEL_IDX - 1))]}"
+    MENU_SELECT_EMPTY="Нет групп"
+    menu_select "Удаление группы" "Выберите группу" "${GRP_LIST[@]}" || return 1
+    local target="${GRP_LIST[$((MENU_SELECT_INDEX - 1))]}"
 
     # Проверяем есть ли клиенты в этой группе
     local count
@@ -118,7 +101,8 @@ delete_group() {
         return
     fi
 
-    confirm_yn "Удалить группу '$target'?" || { info "Отменено."; return; }
+    review_frame "Удаление группы" "Группа: $target" "Назначения подключений этой группе будут удалены."
+    confirm_yn "Удалить группу '$target'?" N || { info "Отменено."; return 1; }
 
     jq_w --arg g "$target" '
         .groups |= map(select(.name != $g)) |
@@ -129,39 +113,11 @@ delete_group() {
 
 # Выбор группы из списка, возвращает имя в SELECTED_GROUP
 select_group() {
+    SELECTED_GROUP=""
     groups_list
-    if [[ ${#GRP_LIST[@]} -eq 0 ]]; then
-        warn "Нет групп. Добавьте группу через меню Группы."
-        return 1
-    fi
-
-    while true; do
-        echo ""
-        box_top
-        box_center "Выбор группы"
-        box_mid
-        local g count i=1
-        for g in "${GRP_LIST[@]}"; do
-            count=$(_group_client_count "$g")
-            box_line " ${i}) ${g} — ${count} клиентов" \
-                " ${GREEN}${i})${NC} ${g} ${DIM}— ${count} клиентов${NC}"
-            i=$((i + 1))
-        done
-        menu_item 0 "Отмена" NC
-        box_bot
-        echo ""
-        if ! IFS= read -rp "  Выберите группу: " GRP_IDX; then
-            return 1
-        fi
-        GRP_IDX="${GRP_IDX%$'\r'}"
-        [[ "$GRP_IDX" == 0 ]] && return 1
-        if ! menu_index_valid "$GRP_IDX" "${#GRP_LIST[@]}"; then
-            warn "Неверный выбор."
-            continue
-        fi
-        SELECTED_GROUP="${GRP_LIST[$((GRP_IDX - 1))]}"
-        return 0
-    done
+    MENU_SELECT_EMPTY="Нет групп"
+    menu_select "Выбор группы" "Выберите группу" "${GRP_LIST[@]}" || return 1
+    SELECTED_GROUP="${GRP_LIST[$((MENU_SELECT_INDEX - 1))]}"
 }
 
 assign_template_to_group() {
@@ -180,14 +136,13 @@ assign_template_to_group() {
         box_center "Шаблон группы: $group"
         box_mid
         box_line " Текущий: $current_tpl" " ${DIM}Текущий: $current_tpl${NC}"
+        box_mid
         local t
         for (( i=0; i<${#templates[@]}; i++ )); do
             if [[ "${templates[$i]}" == "$current_tpl" ]]; then
-                box_line " $((i+1))) ${templates[$i]} (текущий)" \
-                    " ${GREEN}$((i+1)))${NC} ${templates[$i]} ${DIM}(текущий)${NC}"
+                menu_item "$((i+1))" "${templates[$i]} (текущий)" CYAN
             else
-                box_line " $((i+1))) ${templates[$i]}" \
-                    " ${GREEN}$((i+1)))${NC} ${templates[$i]}"
+                menu_item "$((i+1))" "${templates[$i]}" CYAN
             fi
         done
         menu_item n "Создать новый шаблон" GREEN
@@ -219,7 +174,7 @@ assign_template_to_group() {
 _create_new_template() {
     local group="$1"
 
-    if ! IFS= read -rp "Имя нового шаблона (без .yaml): " TPL_NAME; then
+    if ! IFS= read -rp "  Имя нового шаблона (без .yaml): " TPL_NAME; then
         return 1
     fi
     TPL_NAME="${TPL_NAME%$'\r'}"
