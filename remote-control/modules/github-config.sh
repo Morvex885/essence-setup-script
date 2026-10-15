@@ -84,7 +84,7 @@ _github_report_last_error() {
     if [[ -n ${GITHUB_LAST_HINT:-} ]]; then
         warn "$GITHUB_LAST_HINT"
     elif _github_should_show_auth_hint; then
-        warn "GitHub CLI сообщает, что вход не выполнен. Выполните: gh auth login --hostname github.com"
+        warn "Авторизуйте сохранённый аккаунт в его изолированном профиле GitHub CLI."
     fi
 }
 
@@ -115,113 +115,202 @@ _github_ensure_deps() {
         [[ "$mode" != age ]] || _github_require "$AGE_BIN"
     fi
 }
-_github_load_active_login() {
-    local gh="${GH_BIN:-gh}" output
-    _github_clear_error
-    if ! _github_require "$gh"; then
-        _github_record_error "проверка зависимостей" \
-            "Не найдена команда GitHub CLI: $gh."
-        return 1
-    fi
-    if ! output=$(NO_COLOR=1 GH_PROMPT_DISABLED=1 "$gh" api user --jq .login 2>&1); then
-        local auth_relevant=false
-        _github_auth_failure_confirmed "$output" && auth_relevant=true
-        _github_record_error "определение пользователя GitHub" "$output" "$auth_relevant"
-        return 1
-    fi
-    output=$(printf '%s' "$output" | tr -d '\r\n')
-    [[ "$output" =~ ^[A-Za-z0-9-]+$ ]] || {
-        _github_record_error "определение пользователя GitHub" \
-            "GitHub CLI не вернул имя активного аккаунта."
-        return 1
-    }
-    GITHUB_ACTIVE_LOGIN="$output"
-    export GITHUB_ACTIVE_LOGIN
+_github_profile_dir() {
+    local login="${1:-}"
+    [[ "$login" =~ ^[A-Za-z0-9-]+$ ]] || return 1
+    printf '%s/gh/%s\n' "$GITHUB_CREDENTIALS_DIR" "$login"
 }
 
-_github_switch_active_account() {
-    local login="${1-}" gh="${GH_BIN:-gh}" switch_stderr switch_output
-    local -a switch_args
-    if (( $# > 0 )); then
-        [[ "$login" =~ ^[A-Za-z0-9-]+$ ]] || {
-            _github_record_error "переключение аккаунта GitHub" \
-                "Указано некорректное имя аккаунта GitHub."
-            return 1
-        }
-        switch_args=(auth switch --hostname github.com --user "$login")
-    else
-        switch_args=(auth switch --hostname github.com)
+_github_profile_prepare() {
+    local profile
+    profile=$(_github_profile_dir "$1") || return 1
+    _github_mkdir_secure "$CONFIG_DIR" "$GITHUB_CREDENTIALS_DIR" \
+        "$GITHUB_CREDENTIALS_DIR/gh" "$profile" || return 1
+    if [[ -e "$profile/hosts.yml" || -L "$profile/hosts.yml" ]]; then
+        [[ -f "$profile/hosts.yml" && ! -L "$profile/hosts.yml" ]] || return 1
+        chmod 600 "$profile/hosts.yml" || return 1
     fi
-    switch_stderr=$(umask 077; mktemp "${TMPDIR:-/tmp}/github-switch.XXXXXX") || {
-        _github_record_error "переключение аккаунта GitHub" \
-            "Не удалось подготовить безопасную диагностику переключения аккаунта."
-        return 1
-    }
-    if ! NO_COLOR=1 "$gh" "${switch_args[@]}" 2>"$switch_stderr"; then
-        switch_output=$(cat "$switch_stderr")
-        rm -f "$switch_stderr"
-        _github_record_error "переключение аккаунта GitHub" \
-            "${switch_output:-Не удалось переключить аккаунт GitHub.}"
-        return 1
-    fi
-    rm -f "$switch_stderr"
-    _github_load_active_login
 }
 
-_github_select_account() {
-    local initial_login="${1:-}" current_owner="${2:-}" login answer option_one
-    _github_clear_error
-    if ! _github_ensure_deps; then
-        _github_record_error "проверка зависимостей" \
-            "Не удалось подготовить GitHub CLI для выбора аккаунта."
+_github_gh() (
+    local login="${1:-}" profile
+    shift
+    profile=$(_github_profile_dir "$login") || return 1
+    _github_profile_prepare "$login" || return 1
+    umask 077
+    env -u GH_TOKEN -u GITHUB_TOKEN -u GH_HOST \
+        GH_CONFIG_DIR="$profile" NO_COLOR=1 GH_PROMPT_DISABLED=1 "${GH_BIN:-gh}" "$@"
+)
+
+_github_account_login() {
+    local login="${1:-}" actual
+    [[ "$login" =~ ^[A-Za-z0-9-]+$ ]] || {
+        _github_record_error "проверка аккаунта GitHub" "Некорректное имя аккаунта." true
+        return 1
+    }
+    if ! actual=$(_github_gh "$login" api user --jq .login 2>&1); then
+        _github_record_error "проверка аккаунта GitHub" "$actual" true \
+            "Выполните: GH_CONFIG_DIR=$GITHUB_CREDENTIALS_DIR/gh/$login gh auth login --hostname github.com --web"
         return 1
     fi
-    if [[ -n "$initial_login" ]]; then
-        login="$initial_login"
-    elif ! _github_load_active_login; then
+    actual="${actual//$'\r'/}"
+    actual="${actual//$'\n'/}"
+    if [[ "$actual" != "$login" ]]; then
+        _github_record_error "проверка аккаунта GitHub" \
+            "Профиль $login авторизован как ${actual:-неизвестный пользователь}." true
         return 1
-    else
-        login="$GITHUB_ACTIVE_LOGIN"
     fi
-    while :; do
-        info "Выбран аккаунт GitHub: $login"
-        if [[ -n "$current_owner" && "$current_owner" == "$login" ]]; then
-            option_one="Продолжить с $login (текущий источник)"
-        else
-            option_one="Использовать $login для конфигурации"
-        fi
-        echo -e "  ${GREEN}1)${NC} $option_one"
-        if [[ -n "$current_owner" && "$current_owner" != "$login" ]]; then
-            echo -e "  ${DIM}Сначала скрипт проверит репозиторий этого аккаунта.${NC}"
-        fi
-        echo -e "  ${CYAN}2)${NC} Выбрать другой аккаунт GitHub"
-        echo -e "  ${RED}0)${NC} Отмена — ничего не менять"
-        if ! read -rp "  Выберите действие: " answer; then
-            _github_record_error "выбор аккаунта GitHub" \
-                "Выбор аккаунта GitHub отменён."
-            return 1
-        fi
-        case "$answer" in
-            1)
-                GITHUB_OWNER="$login"
-                GITHUB_ACTIVE_LOGIN="$login"
-                export GITHUB_OWNER GITHUB_ACTIVE_LOGIN
-                return 0
-                ;;
-            2)
-                _github_switch_active_account || return 1
-                login="$GITHUB_ACTIVE_LOGIN"
-                ;;
-            0)
-                _github_record_error "выбор аккаунта GitHub" \
-                    "Выбор аккаунта GitHub отменён."
-                return 1
-                ;;
-            *) warn "Неверный выбор." ;;
-        esac
+}
+
+_github_import_account() {
+    local login="${1:-}" profile
+    profile=$(_github_profile_dir "$login") || return 1
+    _github_profile_prepare "$login" || return 1
+    # No token enters a shell variable, diagnostics file, or command argument.
+    (umask 077
+        set -o pipefail
+        env -u GH_TOKEN -u GITHUB_TOKEN -u GH_HOST -u GH_CONFIG_DIR GH_PROMPT_DISABLED=1 \
+            "${GH_BIN:-gh}" auth token --hostname github.com --user "$login" 2>/dev/null |
+            env -u GH_TOKEN -u GITHUB_TOKEN -u GH_HOST GH_CONFIG_DIR="$profile" \
+                GH_PROMPT_DISABLED=1 "${GH_BIN:-gh}" auth login --hostname github.com \
+                --git-protocol https --with-token >/dev/null 2>&1)
+}
+
+_github_safe_web_output() {
+    local line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        printf '%s\n' "$(_github_safe_error "$line")" >&2
     done
 }
 
+_github_prepare_account() {
+    local login="${1:-}" interactive="${2:-false}" profile
+    profile=$(_github_profile_dir "$login") || return 1
+    if [[ -d "$profile" && ! -L "$profile" && -f "$profile/hosts.yml" ]]; then
+        _github_account_login "$login"
+        return $?
+    fi
+    if _github_import_account "$login" && _github_account_login "$login"; then
+        return 0
+    fi
+    if [[ "$interactive" == true ]]; then
+        _github_profile_prepare "$login" || return 1
+        if (umask 077
+            env -u GH_TOKEN -u GITHUB_TOKEN -u GH_HOST -u GH_PROMPT_DISABLED \
+                GH_CONFIG_DIR="$profile" \
+                "${GH_BIN:-gh}" auth login --hostname github.com --git-protocol https --web \
+                > >(_github_safe_web_output) 2> >(_github_safe_web_output)) &&
+           _github_account_login "$login"; then
+            return 0
+        fi
+    fi
+    _github_record_error "авторизация аккаунта GitHub" \
+        "Учётные данные аккаунта $login недоступны или не совпадают." true \
+        "Выполните: GH_CONFIG_DIR=$profile gh auth login --hostname github.com --web"
+    return 1
+}
+
+_github_load_global_login() {
+    local output
+    if ! output=$(env -u GH_TOKEN -u GITHUB_TOKEN -u GH_HOST -u GH_CONFIG_DIR GH_PROMPT_DISABLED=1 \
+        "${GH_BIN:-gh}" api user --jq .login 2>/dev/null); then
+        return 1
+    fi
+    output="${output//$'\r'/}"
+    output="${output//$'\n'/}"
+    [[ "$output" =~ ^[A-Za-z0-9-]+$ ]] || return 1
+    GITHUB_GLOBAL_LOGIN="$output"
+}
+
+_github_select_account() {
+    local current_owner="${1:-}" login="" answer requested
+    _github_clear_error
+    if ! _github_ensure_deps; then
+        _github_record_error "проверка зависимостей" "Не удалось подготовить GitHub CLI."
+        return 1
+    fi
+    if [[ -n "$current_owner" ]]; then
+        login="$current_owner"
+    elif _github_load_global_login; then
+        login="$GITHUB_GLOBAL_LOGIN"
+    fi
+    while :; do
+        echo ""
+        box_top
+        box_center "Выбор аккаунта GitHub"
+        box_mid
+        box_line " Выбранный аккаунт: ${login:-не указан}"
+        box_mid
+        if [[ -n "$login" ]]; then
+            menu_item 1 "Продолжить с $login" CYAN
+        fi
+        menu_item 2 "Указать другой логин GitHub" CYAN
+        menu_item 0 "Отмена" NC
+        box_bot
+        echo ""
+        if ! IFS= read -rp "  Выберите действие: " answer; then
+            _github_record_error "выбор аккаунта GitHub" "Выбор аккаунта GitHub отменён."
+            return 1
+        fi
+        answer="${answer%$'\r'}"
+        case "$answer" in
+            1)
+                if [[ -z "$login" ]]; then
+                    warn "Неверный выбор."
+                    continue
+                fi
+                requested="$login"
+                ;;
+            2)
+                if ! IFS= read -rp "  Логин GitHub: " requested; then
+                    _github_record_error "выбор аккаунта GitHub" "Выбор аккаунта GitHub отменён."
+                    return 1
+                fi
+                requested="${requested%$'\r'}"
+                if [[ "$requested" == 0 ]]; then
+                    _github_record_error "выбор аккаунта GitHub" "Выбор аккаунта GitHub отменён."
+                    return 1
+                fi
+                if [[ ! "$requested" =~ ^[A-Za-z0-9-]+$ ]]; then
+                    warn "Неверный логин GitHub."
+                    continue
+                fi
+                ;;
+            0)
+                _github_record_error "выбор аккаунта GitHub" "Выбор аккаунта GitHub отменён."
+                return 1
+                ;;
+            *) warn "Неверный выбор."; continue ;;
+        esac
+        _github_prepare_account "$requested" true || return 1
+        GITHUB_OWNER="$requested"
+        export GITHUB_OWNER
+        return 0
+    done
+}
+
+_github_transport_git() {
+    local login="${1:-}" timeout="${2:-}" profile
+    shift 2
+    profile=$(_github_profile_dir "$login") || return 1
+    _github_profile_prepare "$login" || return 1
+    _github_run_with_timeout "$timeout" env -u GH_TOKEN -u GITHUB_TOKEN -u GH_HOST \
+        GH_CONFIG_DIR="$profile" GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/false \
+        git -c credential.helper= \
+        -c 'credential.https://github.com.helper=!gh auth git-credential' \
+        -c "credential.https://github.com.username=$login" "$@"
+}
+
+
+_github_remote_git() {
+    local seconds="$1"
+    shift
+    if [[ "$GITHUB_REMOTE" == https://github.com/* ]]; then
+        _github_transport_git "$GITHUB_OWNER" "$seconds" "$@"
+    else
+        _github_run_with_timeout "$seconds" git "$@"
+    fi
+}
 
 _github_run_with_timeout() {
     run_with_timeout "$@"
@@ -298,47 +387,33 @@ _github_validate_tree() {
 }
 
 _github_prompt_storage_mode() {
-    local answer
-    while :; do
-        echo -e "  ${GREEN}1)${NC} Зашифровать паролем"
-        echo -e "  ${CYAN}2)${NC} Хранить без шифрования"
-        read -rp "  Выберите 1 или 2: " answer
-        case "$answer" in 1) GITHUB_STORAGE_MODE=age; return 0;; 2) GITHUB_STORAGE_MODE=none; return 0;; esac
-    done
+    GITHUB_STORAGE_MODE=""
+    menu_select "Хранение конфигурации GitHub" "Выберите способ хранения" \
+        "Зашифровать паролем" "Хранить без шифрования" || return 1
+    case "$MENU_SELECT_INDEX" in
+        1) GITHUB_STORAGE_MODE=age ;;
+        2) GITHUB_STORAGE_MODE=none ;;
+    esac
 }
 _github_prompt_existing_config_action() {
-    local allow_local="${1:-true}" answer mode_label
+    local allow_local="${1:-true}" mode_label
+    GITHUB_EXISTING_ACTION=""
     case "${GITHUB_STORAGE_MODE:-}" in
         age) mode_label="зашифровано паролем" ;;
         none) mode_label="без шифрования" ;;
         *) return 1 ;;
     esac
-    info "В GitHub уже сохранена конфигурация (режим хранения: $mode_label)."
-    while :; do
-        echo "  1) Загрузить конфигурацию из GitHub"
-        if [[ "$allow_local" == true ]]; then
-            echo "  2) Заменить конфигурацию в GitHub текущей локальной"
-        fi
-        echo "  0) Отмена"
-        if ! IFS= read -rp "  Выберите действие: " answer; then
-            return 1
-        fi
-        case "$answer" in
-            1) GITHUB_EXISTING_ACTION=remote; return 0 ;;
-            2) [[ "$allow_local" == true ]] || { warn "Неверный выбор."; continue; }
-               GITHUB_EXISTING_ACTION=local; return 0 ;;
-            0) return 1 ;;
-            *) warn "Неверный выбор." ;;
-        esac
-    done
+    local options=("Загрузить конфигурацию из GitHub")
+    [[ "$allow_local" == true ]] && options+=("Заменить конфигурацию в GitHub текущей локальной")
+    MENU_SELECT_CONTEXT=("Режим хранения: $mode_label")
+    menu_select "Конфигурация GitHub" "Выберите конфигурацию" "${options[@]}" || return 1
+    case "$MENU_SELECT_INDEX" in
+        1) GITHUB_EXISTING_ACTION=remote ;;
+        2) GITHUB_EXISTING_ACTION=local ;;
+    esac
 }
 _github_prompt_remember_unlock() {
-    local answer
-    while :; do
-        printf 'Сохранить ключ расшифровки на этом устройстве? (y/n): '
-        IFS= read -r answer || return 1
-        case "$answer" in y|Y) return 0;; n|N) return 1;; esac
-    done
+    confirm_yn "Сохранить ключ расшифровки на этом устройстве?" N
 }
 
 _github_storage_init() {
@@ -1788,7 +1863,6 @@ github_config_open() {
     fi
     GITHUB_WORKTREE="$root"
     _github_validate_tree "$root" auto || return 1
-    _github_validate_tracked_tree auto || return 1
     _github_storage_read || return 1
     _github_validate_tree "$root" "$GITHUB_STORAGE_MODE" || return 1
     _github_validate_tracked_tree "$GITHUB_STORAGE_MODE" || return 1
@@ -1804,12 +1878,6 @@ github_config_open() {
            ! _github_exact_regular_file "$root/state.json.age" ||
            [[ ! -s "$root/recipient.txt" || ! -s "$root/unlock.age" ||
               ! -s "$root/state.json.age" ]]; then
-            _github_record_error "чтение конфигурации GitHub" \
-                "Зашифрованная конфигурация GitHub неполна."
-            return 1
-        fi
-        GITHUB_RECIPIENT=$(tr -d '\r\n' < "$root/recipient.txt")
-        if [[ -z "$GITHUB_RECIPIENT" ]]; then
             _github_record_error "чтение конфигурации GitHub" \
                 "Зашифрованная конфигурация GitHub не содержит recipient."
             return 1
@@ -1847,12 +1915,14 @@ github_config_open() {
 _github_repo() { printf '%s/%s' "${GITHUB_OWNER:?}" "$GITHUB_REPO_NAME"; }
 github_repository_delete() {
     _github_clear_error
-    local repo="${1:-}" gh="${GH_BIN:-gh}" output
+    local repo="${1:-}" output owner
     if [[ ! "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
         _github_record_error "удаление репозитория GitHub" \
             "Указан некорректный репозиторий GitHub."
         return 1
     fi
+    owner="${repo%%/*}"
+    _github_prepare_account "$owner" false || return 1
     if ! github_config_switch_local; then
         _github_ensure_error "сохранение локальной конфигурации перед удалением" \
             "Не удалось сохранить конфигурацию локально."
@@ -1863,30 +1933,22 @@ github_repository_delete() {
             "Не удалось подготовить GitHub CLI."
         return 1
     fi
-    if ! _github_require "$gh"; then
-        _github_record_error "проверка зависимостей" \
-            "Не найдена команда GitHub CLI: $gh."
-        return 1
-    fi
-    if ! output=$(NO_COLOR=1 GH_PROMPT_DISABLED=1 "$gh" repo delete "$repo" --yes 2>&1); then
+    if ! output=$(_github_gh "$owner" repo delete "$repo" --yes 2>&1); then
         _github_record_error "удаление репозитория GitHub" "$output"
         return 1
     fi
 }
 github_repository_open_settings() {
     _github_clear_error
-    local repo="${1:-}" gh="${GH_BIN:-gh}"
+    local repo="${1:-}" owner
     if [[ ! "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
         _github_record_error "открытие настроек репозитория GitHub" \
             "Указан некорректный репозиторий GitHub."
         return 1
     fi
-    if ! _github_require "$gh"; then
-        _github_record_error "проверка зависимостей" \
-            "Не найдена команда GitHub CLI: $gh."
-        return 1
-    fi
-    if ! NO_COLOR=1 GH_PROMPT_DISABLED=1 "$gh" browse --settings --repo "$repo" \
+    owner="${repo%%/*}"
+    _github_account_login "$owner" || return 1
+    if ! _github_gh "$owner" browse --settings --repo "$repo" \
         >/dev/null 2>&1; then
         _github_record_error "открытие настроек репозитория GitHub" \
             "Не удалось открыть настройки репозитория GitHub."
@@ -2024,7 +2086,7 @@ _github_account_switch_remove_file() {
 
 github_account_switch_begin() {
     local old_repo="${1:-}" new_repo="${2:-}" branch="${3:-}" initial_login="${4:-}"
-    local entry worktree=""
+    local entry worktree="" current_worktree=""
     [[ "$old_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ &&
        "$new_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ &&
        "$branch" =~ ^[A-Za-z0-9._/-]+$ &&
@@ -2049,12 +2111,17 @@ github_account_switch_begin() {
                 "Не удалось очистить устаревшие регистрации рабочих копий."
             return 1
         }
+        if [[ -n "${GITHUB_WORKTREE:-}" && -d "$GITHUB_WORKTREE" ]]; then
+            current_worktree=$(realpath "$GITHUB_WORKTREE") || return 1
+        fi
         while IFS= read -r entry; do
             case "$entry" in
                 worktree\ *) worktree="${entry#worktree }" ;;
                 bare) worktree="" ;;
                 "")
-                    if [[ -n "$worktree" && "$worktree" != "${GITHUB_WORKTREE:-}" ]]; then
+                    if [[ -n "$worktree" ]] &&
+                       { [[ -z "$current_worktree" || ! -d "$worktree" ]] ||
+                         [[ "$(realpath "$worktree")" != "$current_worktree" ]]; }; then
                         _github_record_error "проверка активных сессий GitHub" \
                             "Другой экземпляр уже использует рабочую копию GitHub. Закройте его и повторите смену аккаунта."
                         return 1
@@ -2063,7 +2130,9 @@ github_account_switch_begin() {
                     ;;
             esac
         done < <(git --git-dir="$GITHUB_STORE" worktree list --porcelain 2>/dev/null)
-        if [[ -n "$worktree" && "$worktree" != "${GITHUB_WORKTREE:-}" ]]; then
+        if [[ -n "$worktree" ]] &&
+           { [[ -z "$current_worktree" || ! -d "$worktree" ]] ||
+             [[ "$(realpath "$worktree")" != "$current_worktree" ]]; }; then
             _github_record_error "проверка активных сессий GitHub" \
                 "Другой экземпляр уже использует рабочую копию GitHub. Закройте его и повторите смену аккаунта."
             return 1
@@ -2168,7 +2237,7 @@ github_account_switch_commit_local() {
 }
 
 github_account_switch_rollback() {
-    local phase marker old_repo initial_login cleanup_ok=true switch_error=""
+    local phase marker old_repo initial_login cleanup_ok=true
     marker="$GITHUB_ACCOUNT_SWITCH_MARKER"
     github_account_switch_marker_valid "$marker" || return 1
     phase=$(jq -er '.phase' "$marker") || return 1
@@ -2181,21 +2250,13 @@ github_account_switch_rollback() {
     _github_account_switch_remove_file "$GITHUB_ACCOUNT_SWITCH_DIR/old-source.json" || cleanup_ok=false
     _github_account_switch_remove_file "$GITHUB_ACCOUNT_SWITCH_DIR/old-state.json" || cleanup_ok=false
     _github_account_switch_remove_file "$GITHUB_ACCOUNT_SWITCH_DIR/target-state.json" || cleanup_ok=false
-    if ! _github_switch_active_account "$initial_login"; then
-        switch_error="${GITHUB_LAST_ERROR:-Не удалось восстановить активный аккаунт GitHub.}"
-        cleanup_ok=false
-    fi
     GITHUB_OWNER="${old_repo%%/*}"
-    GITHUB_ACTIVE_LOGIN="$initial_login"
-    export GITHUB_OWNER GITHUB_ACTIVE_LOGIN
+    export GITHUB_OWNER
     if ! _github_account_switch_remove_file "$marker"; then
         cleanup_ok=false
     fi
     rmdir "$GITHUB_ACCOUNT_SWITCH_DIR" 2>/dev/null || true
-    if [[ "$cleanup_ok" != true ]]; then
-        [[ -z "$switch_error" ]] || _github_record_error "восстановление аккаунта GitHub" "$switch_error"
-        return 1
-    fi
+    [[ "$cleanup_ok" == true ]]
 }
 
 
@@ -2249,7 +2310,9 @@ github_account_switch_recover() {
             expected=$(jq -er '.expected_head // empty' "$marker") || return 1
             target_store="$GITHUB_ACCOUNT_SWITCH_DIR/target-store.git"
             [[ -n "$expected" && -d "$target_store" && ! -L "$target_store" ]] || return 1
-            git --git-dir="$target_store" fetch --no-tags origin \
+            _github_account_login "${GITHUB_ACCOUNT_SWITCH_NEW_REPO%%/*}" || return 1
+            _github_transport_git "${GITHUB_ACCOUNT_SWITCH_NEW_REPO%%/*}" 30 \
+                --git-dir="$target_store" fetch --no-tags origin \
                 "$GITHUB_ACCOUNT_SWITCH_BRANCH:refs/remotes/origin/$GITHUB_ACCOUNT_SWITCH_BRANCH" \
                 >/dev/null 2>&1 || return 1
             head=$(git --git-dir="$target_store" rev-parse \
@@ -2363,6 +2426,18 @@ github_sync_init() {
         resume|onboarding) ;;
         *) _github_record_error "подготовка локального репозитория" "Неизвестный режим инициализации GitHub."; return 1 ;;
     esac
+    if [[ "$GITHUB_REMOTE" != /* && "$GITHUB_REMOTE" != file://* ]]; then
+        local target_repo="${GITHUB_REMOTE#https://github.com/}"
+        target_repo="${target_repo%.git}"
+        if [[ "$target_repo" =~ ^[A-Za-z0-9-]+/[A-Za-z0-9_.-]+$ ]]; then
+            GITHUB_OWNER="${target_repo%%/*}"
+            GITHUB_REPO_NAME="${target_repo#*/}"
+            _github_prepare_account "$GITHUB_OWNER" false || return 1
+        fi
+    fi
+    if [[ "$GITHUB_REMOTE" == https://github.com/* ]]; then
+        _github_account_login "$GITHUB_OWNER" || return 1
+    fi
     if [[ -n "${GITHUB_WORKTREE:-}" && -d "$GITHUB_WORKTREE" ]] &&
        git -C "$GITHUB_WORKTREE" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
         _github_session_target_guard || return 1
@@ -2377,45 +2452,24 @@ github_sync_init() {
         return 1
     fi
 
-    local repo remote_view remote_view_lc login setup_output create_output
+    local repo remote_view remote_view_lc create_output
     local git_output fetch_output fetch_ok=true local_oid="" remote_oid=""
     local current_origin="" remote_changed=false auth_failure=false
-    local gh="${GH_BIN:-gh}"
-    if [[ "$GITHUB_REMOTE" != /* && "$GITHUB_REMOTE" != *.git && "$GITHUB_REMOTE" != file://* ]]; then
+    if [[ "$GITHUB_REMOTE" == https://github.com/* ||
+          ( "$GITHUB_REMOTE" != /* && "$GITHUB_REMOTE" != *.git && "$GITHUB_REMOTE" != file://* ) ]]; then
         if ! _github_ensure_deps; then
             _github_record_error "проверка зависимостей" "Не удалось подготовить GitHub CLI."
             return 1
         fi
-        if ! _github_require "$gh"; then
-            _github_record_error "проверка зависимостей" "Не найдена команда GitHub CLI: $gh."
+        [[ -n "${GITHUB_OWNER:-}" ]] || {
+            _github_record_error "проверка пользователя GitHub" "Не задан владелец репозитория."
             return 1
-        fi
-        if ! setup_output=$(NO_COLOR=1 GH_PROMPT_DISABLED=1 "$gh" auth setup-git 2>&1); then
-            _github_auth_failure_confirmed "$setup_output" && auth_failure=true
-            _github_record_error "настройка Git для GitHub CLI" "$setup_output" "$auth_failure"
-            return 1
-        fi
-        auth_failure=false
-        if ! login=$(NO_COLOR=1 GH_PROMPT_DISABLED=1 "$gh" api user --jq .login 2>&1); then
-            _github_auth_failure_confirmed "$login" && auth_failure=true
-            _github_record_error "определение пользователя GitHub" "$login" "$auth_failure"
-            return 1
-        fi
-        login=$(printf '%s' "$login" | tr -d '\r\n')
-        if [[ -z "$login" ]]; then
-            _github_record_error "определение пользователя GitHub" \
-                "GitHub API вернул пустое имя пользователя."
-            return 1
-        fi
-        [[ -n "$GITHUB_OWNER" ]] || GITHUB_OWNER="$login"
-        if [[ "$login" != "$GITHUB_OWNER" ]]; then
-            _github_record_error "проверка пользователя GitHub" \
-                "GitHub CLI подключён как $login, ожидался пользователь $GITHUB_OWNER." true \
-                "Переключите активный аккаунт GitHub: gh auth switch --hostname github.com --user $GITHUB_OWNER"
-            return 1
+        }
+        if [[ "$GITHUB_REMOTE" != https://github.com/* ]]; then
+            _github_account_login "$GITHUB_OWNER" || return 1
         fi
         repo="$GITHUB_OWNER/$GITHUB_REPO_NAME"
-        if ! remote_view=$(NO_COLOR=1 GH_PROMPT_DISABLED=1 "$gh" repo view "$repo" --json visibility 2>&1); then
+        if ! remote_view=$(_github_gh "$GITHUB_OWNER" repo view "$repo" --json visibility 2>&1); then
             remote_view_lc=$(printf '%s' "$remote_view" | tr '[:upper:]' '[:lower:]')
             if [[ "$remote_view_lc" != *"not found"* &&
                   "$remote_view_lc" != *"could not resolve to a repository"* ]]; then
@@ -2436,7 +2490,7 @@ github_sync_init() {
                     "Создание репозитория $repo отменено."
                 return 1
             fi
-            if ! create_output=$(NO_COLOR=1 GH_PROMPT_DISABLED=1 "$gh" repo create "$repo" \
+            if ! create_output=$(_github_gh "$GITHUB_OWNER" repo create "$repo" \
                 --private --description "Essence Remote Control configuration" 2>&1); then
                 auth_failure=false
                 _github_auth_failure_confirmed "$create_output" && auth_failure=true
@@ -2455,13 +2509,13 @@ github_sync_init() {
                     "Репозиторий $repo должен быть приватным."
                 return 1
             fi
-            if ! git_output=$(NO_COLOR=1 GH_PROMPT_DISABLED=1 "$gh" repo edit "$repo" \
+            if ! git_output=$(_github_gh "$GITHUB_OWNER" repo edit "$repo" \
                 --visibility private --accept-visibility-change-consequences 2>&1); then
                 _github_record_error "изменение видимости репозитория" "$git_output"
                 return 1
             fi
             GITHUB_ACCOUNT_SWITCH_REPO_PRIVATIZED=true
-            if ! remote_view=$(NO_COLOR=1 GH_PROMPT_DISABLED=1 "$gh" repo view "$repo" \
+            if ! remote_view=$(_github_gh "$GITHUB_OWNER" repo view "$repo" \
                 --json visibility 2>&1) ||
                ! printf '%s' "$remote_view" | jq -e '.visibility == "PRIVATE"' >/dev/null 2>&1; then
                 _github_record_error "проверка приватного репозитория" \
@@ -2505,8 +2559,8 @@ github_sync_init() {
     fi
     local local_ref="refs/heads/$GITHUB_BRANCH"
     remote_ref="refs/remotes/origin/$GITHUB_BRANCH"
-    fetch_output=$(GIT_TERMINAL_PROMPT=0 _github_run_with_timeout 30 \
-        git --git-dir="$GITHUB_STORE" fetch --no-tags origin "$GITHUB_BRANCH" 2>&1) || fetch_ok=false
+    fetch_output=$(_github_remote_git 30 \
+        --git-dir="$GITHUB_STORE" fetch --no-tags origin "$GITHUB_BRANCH" 2>&1) || fetch_ok=false
 
     if [[ "$init_mode" == onboarding ]]; then
         if [[ "$fetch_ok" == true ]] &&
@@ -2537,7 +2591,7 @@ github_sync_init() {
             fi
             GITHUB_SYNC_STATUS=clean
         else
-            if ! remote_refs=$(_github_run_with_timeout 15 git ls-remote \
+            if ! remote_refs=$(_github_remote_git 15 ls-remote \
                 "$GITHUB_REMOTE" "refs/heads/$GITHUB_BRANCH" 2>/dev/null); then
                 if [[ "$GITHUB_REMOTE" == https://github.com/* ]]; then
                     _github_record_error "загрузка репозитория GitHub" "$fetch_output"
@@ -2616,7 +2670,7 @@ github_sync_init() {
         fi
     elif [[ "$fetch_ok" != true ]]; then
         if [[ "$remote_changed" == true ]]; then
-            if remote_refs=$(_github_run_with_timeout 15 git ls-remote \
+            if remote_refs=$(_github_remote_git 15 ls-remote \
                 "$GITHUB_REMOTE" "refs/heads/$GITHUB_BRANCH" 2>/dev/null) &&
                [[ -z "$remote_refs" ]]; then
                 local previous_oid=""
@@ -2673,9 +2727,9 @@ github_sync_init() {
             fi
         elif [[ "$GITHUB_REMOTE" == /* || "$GITHUB_REMOTE" == file://* ]] &&
              { [[ -d "$GITHUB_REMOTE" ]] ||
-               [[ -z "$(_github_run_with_timeout 15 git ls-remote "$GITHUB_REMOTE" "refs/heads/$GITHUB_BRANCH" 2>/dev/null)" ]]; }; then
+               [[ -z "$(_github_remote_git 15 ls-remote "$GITHUB_REMOTE" "refs/heads/$GITHUB_BRANCH" 2>/dev/null)" ]]; }; then
             :
-        elif remote_refs=$(_github_run_with_timeout 15 git ls-remote "$GITHUB_REMOTE" 2>/dev/null) &&
+        elif remote_refs=$(_github_remote_git 15 ls-remote "$GITHUB_REMOTE" 2>/dev/null) &&
              [[ -z "$remote_refs" ]]; then
             :
         else
@@ -2826,8 +2880,11 @@ _github_sync_commit() {
 _github_sync_push() {
     local expected_head="${1:-${GITHUB_LAST_COMMIT_HEAD:-}}" push_output
     [[ "$expected_head" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]] || return 1
-    push_output=$(GIT_TERMINAL_PROMPT=0 _github_run_with_timeout 30 \
-        git --git-dir="$GITHUB_STORE" push origin \
+    if [[ "$GITHUB_REMOTE" == https://github.com/* ]]; then
+        _github_account_login "$GITHUB_OWNER" || return 1
+    fi
+    push_output=$(_github_remote_git 30 \
+        --git-dir="$GITHUB_STORE" push origin \
         "refs/heads/session/$GITHUB_SESSION_ID:refs/heads/$GITHUB_BRANCH" 2>&1) || {
         _github_record_error "отправка конфигурации в GitHub" "$push_output"
         return 1
@@ -2844,6 +2901,11 @@ github_sync_flush() {
         return 1
     fi
     if ! _github_session_target_guard; then
+        GITHUB_SYNC_STATUS=pending
+        return 1
+    fi
+    if [[ "$GITHUB_REMOTE" == https://github.com/* ]] &&
+       ! _github_account_login "$GITHUB_OWNER"; then
         GITHUB_SYNC_STATUS=pending
         return 1
     fi
@@ -2883,8 +2945,8 @@ github_sync_flush() {
         GITHUB_SYNC_STATUS=pending
         return 1
     fi
-    if ! push_output=$(GIT_TERMINAL_PROMPT=0 _github_run_with_timeout 30 \
-        git --git-dir="$GITHUB_STORE" push origin \
+    if ! push_output=$(_github_remote_git 30 \
+        --git-dir="$GITHUB_STORE" push origin \
         "refs/heads/session/$GITHUB_SESSION_ID:refs/heads/$GITHUB_BRANCH" 2>&1); then
         if [[ "$GITHUB_REMOTE" == https://github.com/* ]]; then
             _github_record_error "отправка конфигурации в GitHub" "$push_output"

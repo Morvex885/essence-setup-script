@@ -93,9 +93,7 @@ EOF
     }
 
     run _generate_group PC
-    assert_success
-    assert_output --partial "my-pc — config.yaml не сгенерирован"
-    refute_output --partial "my-pc — сгенерирован"
+    assert_failure
     run cmp -s "$config_file" <(printf 'existing config\n')
     assert_success
 }
@@ -207,7 +205,7 @@ EOF
         NODE_NAME="$1"
         return 0
     }
-    upload_scripts() {
+    ensure_remote_scripts_current() {
         printf 'upload\n' >> "$LISTENER_UPLOAD_LOG"
         return 0
     }

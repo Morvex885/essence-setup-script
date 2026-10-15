@@ -27,12 +27,15 @@ _sub_load_host() {
     _sub_save_ssh_ctx
     node_load_by_name "$host_node" || { _sub_restore_ssh_ctx; warn "Нода '$host_node' не найдена."; return 1; }
 
-    if ! ssh_run -- "test -f /etc/mihomo/subscription.conf" 2>/dev/null; then
+    local rc=0
+    ssh_run -- "test -f /etc/mihomo/subscription.conf" 2>/dev/null || rc=$?
+    if [[ $rc -ne 0 ]]; then
         _sub_restore_ssh_ctx
-        warn "На ноде '$host_node' не установлен модуль подписок — выбор хост-ноды сброшен."
-        jq_w 'del(.subscription_host)'
-        info "Подключитесь к ноде и запустите: essence-setup → s) Хостинг подписок"
-        info "Или выберите другую ноду: Подписки → 1) Выбрать хост-ноду"
+        if [[ $rc -eq 1 ]]; then
+            warn "На ноде '$host_node' не установлен хостинг подписок."
+        else
+            warn "Хост-нода подписок недоступна."
+        fi
         return 1
     fi
 }
@@ -61,11 +64,13 @@ SUB_SNIPPETS_DIR="/etc/nginx/snippets/essence-sub"
 # Возвращает 0 при успехе, 1 при любой ошибке (шумит через warn).
 
 _sub_get_dir() {
-    local d
+    local d conf
     d=$(jq_r '.subscription_host.sub_dir // empty')
-    if [[ -n "$d" ]]; then echo "$d"; return; fi
-    d=$(ssh_run -- "grep '^SUB_DIR=' /etc/mihomo/subscription.conf 2>/dev/null" | cut -d= -f2-)
-    echo "${d:-/var/lib/essence-sub}"
+    if [[ -n "$d" ]]; then echo "$d"; return 0; fi
+    conf=$(ssh_run -- "grep '^SUB_DIR=' /etc/mihomo/subscription.conf 2>/dev/null") || return 1
+    d=$(printf '%s\n' "$conf" | cut -d= -f2-)
+    [[ -n "$d" ]] || return 1
+    echo "$d"
 }
 
 _sub_get_nginx_group() {
@@ -93,26 +98,26 @@ _sub_upload_config() {
     local yaml_dst="${sub_dir}/${token}.yaml"
     local snip_tmp="${snippets_dir}/.sub-${token}.conf.tmp"
     local snip_dst="${snippets_dir}/sub-${token}.conf"
-    local short="${token:0:8}…"
+    local label="${client:-подписки}"
 
     # Локально рендерим snippet (если client указан)
     local snip_local=""
     if [[ -n "$client" ]]; then
-        snip_local=$(mktemp)
-        _render_subscription_snippet "$client" "$token" "$sub_dir" > "$snip_local"
+        snip_local=$(umask 077; mktemp) || return 1
+        _render_subscription_snippet "$client" "$token" "$sub_dir" > "$snip_local" || { rm -f "$snip_local"; return 1; }
     fi
 
-    if ! scp_run "$src" "${SERVER_USER}@${SERVER_IP}:${yaml_tmp}"; then
+    if ! scp_run "$src" "${SERVER_USER}@${SERVER_IP}:${yaml_tmp}" >/dev/null 2>&1; then
         [[ -n "$snip_local" ]] && rm -f "$snip_local"
-        warn "Не удалось загрузить YAML-конфигурацию для ${short}."
+        warn "Не удалось загрузить YAML-конфигурацию для ${label}."
         return 1
     fi
 
     if [[ -n "$snip_local" ]]; then
-        if ! scp_run "$snip_local" "${SERVER_USER}@${SERVER_IP}:${snip_tmp}"; then
+        if ! scp_run "$snip_local" "${SERVER_USER}@${SERVER_IP}:${snip_tmp}" >/dev/null 2>&1; then
             rm -f "$snip_local"
-            ssh_run -- "rm -f '${yaml_tmp}'" 2>/dev/null
-            warn "Не удалось загрузить фрагмент конфигурации для ${short}."
+            ssh_run -- "rm -f '${yaml_tmp}'" >/dev/null 2>&1
+            warn "Не удалось загрузить фрагмент конфигурации для ${label}."
             return 1
         fi
         rm -f "$snip_local"
@@ -142,9 +147,9 @@ systemctl reload nginx"
 mv '${yaml_tmp}' '${yaml_dst}'"
     fi
 
-    if ! ssh_run -- "$ssh_cmd"; then
-        ssh_run -- "rm -f '${yaml_tmp}' '${snip_tmp}'" 2>/dev/null
-        warn "Не удалось применить конфигурацию ${short} (проверка nginx, права или перезагрузка)."
+    if ! ssh_run -- "$ssh_cmd" >/dev/null 2>&1; then
+        ssh_run -- "rm -f '${yaml_tmp}' '${snip_tmp}'" >/dev/null 2>&1
+        warn "Не удалось применить конфигурацию для ${label} (проверка nginx, права или перезагрузка)."
         return 1
     fi
     return 0
@@ -172,27 +177,31 @@ _sub_upload_batch() {
 
     local snippets_dir="$SUB_SNIPPETS_DIR"
     local yaml_tmp_dir snip_tmp_dir
-    yaml_tmp_dir=$(mktemp -d)
-    snip_tmp_dir=$(mktemp -d)
+    yaml_tmp_dir=$(umask 077; mktemp -d) || return 1
+    snip_tmp_dir=$(umask 077; mktemp -d) || { rm -rf "$yaml_tmp_dir"; return 1; }
 
     local tokens=()
     i=0
     while [[ $i -lt ${#triplets[@]} ]]; do
         local src="${triplets[$i]}" token="${triplets[$((i+1))]}" client="${triplets[$((i+2))]}"
-        cp "$src" "$yaml_tmp_dir/.${token}.yaml.tmp"
-        _render_subscription_snippet "$client" "$token" "$sub_dir" > "$snip_tmp_dir/.sub-${token}.conf.tmp"
+        if ! cp "$src" "$yaml_tmp_dir/.${token}.yaml.tmp" 2>/dev/null ||
+            ! _render_subscription_snippet "$client" "$token" "$sub_dir" > "$snip_tmp_dir/.sub-${token}.conf.tmp"; then
+            rm -rf "$yaml_tmp_dir" "$snip_tmp_dir"
+            warn "$client: не удалось подготовить конфигурацию подписки."
+            return 1
+        fi
         tokens+=("$token")
         i=$((i + 3))
     done
 
-    if ! scp_run "$yaml_tmp_dir"/.*.yaml.tmp "${SERVER_USER}@${SERVER_IP}:${sub_dir}/"; then
+    if ! scp_run "$yaml_tmp_dir"/.*.yaml.tmp "${SERVER_USER}@${SERVER_IP}:${sub_dir}/" >/dev/null 2>&1; then
         rm -rf "$yaml_tmp_dir" "$snip_tmp_dir"
         warn "Не удалось загрузить пакет YAML-конфигураций."
         return 1
     fi
-    if ! scp_run "$snip_tmp_dir"/.sub-*.conf.tmp "${SERVER_USER}@${SERVER_IP}:${snippets_dir}/"; then
+    if ! scp_run "$snip_tmp_dir"/.sub-*.conf.tmp "${SERVER_USER}@${SERVER_IP}:${snippets_dir}/" >/dev/null 2>&1; then
         rm -rf "$yaml_tmp_dir" "$snip_tmp_dir"
-        ssh_run -- "rm -f ${sub_dir}/.*.yaml.tmp" 2>/dev/null
+        ssh_run -- "rm -f ${sub_dir}/.*.yaml.tmp" >/dev/null 2>&1
         warn "Не удалось загрузить пакет фрагментов конфигурации."
         return 1
     fi
@@ -237,8 +246,8 @@ for f in \"\$SUB_DIR\"/.*.yaml.tmp; do
 done
 systemctl reload nginx"
 
-    if ! ssh_run -- "$ssh_cmd"; then
-        ssh_run -- "rm -f ${sub_dir}/.*.yaml.tmp ${snippets_dir}/.sub-*.conf.tmp" 2>/dev/null
+    if ! ssh_run -- "$ssh_cmd" >/dev/null 2>&1; then
+        ssh_run -- "rm -f ${sub_dir}/.*.yaml.tmp ${snippets_dir}/.sub-*.conf.tmp" >/dev/null 2>&1
         warn "Не удалось применить пакет конфигураций (проверка nginx, права или перезагрузка)."
         return 1
     fi
@@ -334,59 +343,34 @@ _render_subscription_snippet() {
 # ─── Основные команды ──────────────────────────────────────────────────────
 
 subscription_set_host() {
-    echo ""
-    echo -e "  ${CYAN}── Выбрать хост-ноду для подписок ─────────${NC}"
-    echo ""
-
-    local nodes=()
-    while IFS= read -r node_name; do
-        nodes+=("$node_name")
-    done < <(jq_r '.nodes[].name')
-    if [[ ${#nodes[@]} -eq 0 ]]; then
-        warn "Нет нод. Добавьте ноду сначала."
-        return
-    fi
-
-    local i=1
-    for n in "${nodes[@]}"; do
-        echo -e "  ${GREEN}${i})${NC} $n"
-        i=$((i + 1))
-    done
-    echo ""
-    read -rp "  Выберите ноду: " idx
-    [[ -z "$idx" || ! "$idx" =~ ^[0-9]+$ ]] && { warn "Неверный выбор."; return; }
-    local sel="${nodes[$((idx - 1))]}"
-    [[ -z "$sel" ]] && { warn "Неверный выбор."; return; }
-
-    # Проверяем что на ноде стоит subscription module
+    node_pick "Хостинг подписок — выбор ноды" || return 1
     _sub_save_ssh_ctx
-    node_load_by_name "$sel" || { _sub_restore_ssh_ctx; warn "Не удалось загрузить ноду."; return; }
-
-    local remote_conf
-    remote_conf=$(ssh_run -- "cat /etc/mihomo/subscription.conf 2>/dev/null")
-    _sub_restore_ssh_ctx
-
-    if [[ -z "$remote_conf" ]]; then
-        warn "На ноде '$sel' не установлен модуль подписок."
-        info "Подключитесь к ноде и запустите: essence-setup → s) Хостинг подписок"
-        return
+    node_load "$NODE_PICK_INDEX" || { _sub_done; return 1; }
+    local sel="$NODE_NAME" remote_conf
+    if ! remote_conf=$(ssh_run -- "cat /etc/mihomo/subscription.conf 2>/dev/null"); then
+        _sub_done
+        warn "Хост-нода подписок недоступна."
+        return 1
     fi
-
+    _sub_done
+    [[ -n "$remote_conf" ]] || { warn "На ноде '$sel' не установлен хостинг подписок."; return 1; }
     local base_url sub_dir nginx_group
     base_url=$(echo "$remote_conf" | grep '^SUB_BASE_URL=' | cut -d= -f2-)
     sub_dir=$(echo "$remote_conf" | grep '^SUB_DIR=' | cut -d= -f2-)
     nginx_group=$(echo "$remote_conf" | grep '^NGINX_GROUP=' | cut -d= -f2-)
-
-    jq_w --arg n "$sel" --arg u "$base_url" \
-         --arg d "${sub_dir:-/var/lib/essence-sub}" \
-         --arg g "${nginx_group:-www-data}" \
-         '.subscription_host = {node: $n, base_url: $u, sub_dir: $d, nginx_group: $g}'
+    [[ -n "$base_url" && -n "$sub_dir" ]] || { warn "Конфигурация хостинга подписок неполна."; return 1; }
+    jq_w --arg n "$sel" --arg u "$base_url" --arg d "$sub_dir" --arg g "${nginx_group:-www-data}" \
+        '.subscription_host = {node: $n, base_url: $u, sub_dir: $d, nginx_group: $g}' || return 1
     success "Хост-нода подписок: $sel ($base_url)"
 }
 
 subscription_publish() {
-    local client="$1" ttl="${2:-}"
-    [[ -z "$client" ]] && { _select_client "Опубликовать подписку" || return; client="$SUBSCRIPTION_SELECT_RESULT"; }
+    local client="${1:-}" ttl="${2:-}" output_mode="${3:-share}"
+    case "$output_mode" in
+        share|status) ;;
+        *) warn "Неверный режим вывода подписки."; return 1 ;;
+    esac
+    [[ -z "$client" ]] && { _select_client "Опубликовать подписку" || return 1; client="$SUBSCRIPTION_SELECT_RESULT"; }
 
     # Проверяем что клиент существует
     local client_group
@@ -411,14 +395,15 @@ subscription_publish() {
     local token
     token=$(jq_r --arg n "$client" '.clients[] | select(.name==$n) | .subscription.token // empty')
     if [[ -z "$token" ]]; then
-        token=$(openssl rand -hex 32)
+        token=$(openssl rand -hex 32) || return 1
+        [[ -n "$token" ]] || return 1
     fi
 
     # Загружаем на сервер
     _sub_load_host || return
 
     local sub_dir nginx_group
-    sub_dir=$(_sub_get_dir)
+    sub_dir=$(_sub_get_dir) || { _sub_done; return 1; }
     nginx_group=$(_sub_get_nginx_group)
 
     local rc=0
@@ -429,23 +414,26 @@ subscription_publish() {
         local expires_at expires_ts
         expires_ts=$(date -d "+${ttl}" +%s 2>/dev/null) || { _sub_done; warn "Неверный формат TTL: $ttl"; return; }
         expires_at=$(date -d "+${ttl}" --iso-8601=seconds 2>/dev/null)
-        ssh_run -- "flock ${sub_dir}/.expiry.lock bash -c 'echo \"${token} ${expires_ts}\" >> ${sub_dir}/expiry.list'"
-        jq_w --arg n "$client" --arg t "$token" --arg e "$expires_at" --arg ts "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
-            '(.clients[] | select(.name==$n)).subscription |= ((. // {}) + {token: $t, expires_at: $e, created_at: $ts})'
+        ssh_run -- "flock ${sub_dir}/.expiry.lock bash -c 'echo \"${token} ${expires_ts}\" >> ${sub_dir}/expiry.list'" || rc=1
+        if [[ $rc -eq 0 ]]; then
+            jq_w --arg n "$client" --arg t "$token" --arg e "$expires_at" --arg ts "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+                '(.clients[] | select(.name==$n)).subscription |= ((. // {}) + {token: $t, expires_at: $e, created_at: $ts})' || rc=1
+        fi
     elif [[ $rc -eq 0 ]]; then
         jq_w --arg n "$client" --arg t "$token" --arg ts "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
-            '(.clients[] | select(.name==$n)).subscription |= ((. // {}) + {token: $t, expires_at: null, created_at: $ts})'
+            '(.clients[] | select(.name==$n)).subscription |= ((. // {}) + {token: $t, expires_at: null, created_at: $ts})' || rc=1
     fi
 
     _sub_done
 
     if [[ $rc -eq 0 ]]; then
         success "Подписка опубликована: $client"
-        _sub_verify_http "$token"
-        _show_share_bundle "$client"
+        _sub_verify_http "$token" || return 1
+        if [[ "$output_mode" == share ]]; then _show_share_bundle "$client"; fi
     else
         warn "Ошибка загрузки файла на сервер."
     fi
+    return "$rc"
 }
 
 subscription_revoke() {
@@ -456,68 +444,182 @@ subscription_revoke() {
     token=$(jq_r --arg n "$client" '.clients[] | select(.name==$n) | .subscription.token // empty')
     [[ -z "$token" ]] && { warn "У клиента '$client' нет подписки."; return; }
 
-    confirm_yn "Отозвать подписку '$client'?" || return
+    local host_node
+    host_node=$(jq_r '.subscription_host.node // empty')
+    review_frame "Отзыв подписки" "Клиент: $client" "Хост-нода: $host_node" \
+        "Ссылка перестанет работать; конфиг клиента сохранится."
+    confirm_yn "Отозвать подписку?" N || return 0
 
     _subscription_revoke_silent "$client"
 }
 
-# Тихая версия revoke без confirm. Используется из delete_client и интерактивного revoke.
-# Удаляет yaml + nginx snippet + expiry-entry + subscription metadata из config.json.
-# Если host-нода offline — warn + продолжаем (orphan'ы потом сметёт publish_all sweep).
+# Удаление под expiry-lock: при сбое восстанавливаются файлы, expiry и nginx.
+# SUB_REMOVE_TOKEN_STATE разрешает очистку замены только после подтверждённого отката.
+# Не выводим диагностику SSH/команд: пути в ней содержат токены.
+_sub_remove_token() {
+    local token="$1" sub_dir="$2" replacement="${3:-}" script command response rc=0
+    SUB_REMOVE_TOKEN_STATE=unknown
+    script=$(cat <<'EOF'
+token=$1 sub_dir=$2 snippets_dir=$3 replacement=$4
+yaml="$sub_dir/$token.yaml"
+snippet="$snippets_dir/sub-$token.conf"
+expiry="$sub_dir/expiry.list"
+backup=
+yaml_saved=false snippet_saved=false expiry_saved=false
+pending=false
+rollback() {
+    files=restored expiry_state=restored nginx_state=restored
+    if $yaml_saved; then cp -p "$backup/yaml" "$yaml" || files=uncertain
+    else rm -f "$yaml" || files=uncertain; fi
+    if $snippet_saved; then cp -p "$backup/snippet" "$snippet" || files=uncertain
+    else rm -f "$snippet" || files=uncertain; fi
+    if $expiry_saved; then cp -p "$backup/expiry" "$expiry" || expiry_state=uncertain
+    else rm -f "$expiry" || expiry_state=uncertain; fi
+    if ! nginx -t; then nginx_state=uncertain
+    elif ! systemctl reload nginx; then nginx_state=uncertain; fi
+    if [ "$files:$expiry_state:$nginx_state" = restored:restored:restored ]; then
+        result=unchanged
+        if $yaml_saved && $snippet_saved && [ -s "$yaml" ] && [ -s "$snippet" ]; then result=restored; fi
+        rm -rf "$backup"
+    else
+        result="uncertain:$files:$expiry_state:$nginx_state"
+        # Keep private backups for manual recovery, and never remove a replacement.
+    fi
+}
+abort() {
+    trap - EXIT HUP INT TERM
+    if $pending; then
+        rollback >/dev/null 2>&1
+        printf '%s\n' "$result"
+    else
+        [ -z "$backup" ] || rm -rf "$backup" >/dev/null 2>&1
+        printf '%s\n' unchanged
+    fi
+    exit 1
+}
+trap abort EXIT
+trap 'exit 1' HUP INT TERM
+prepare() {
+    umask 077
+    exec 9>"$sub_dir/.expiry.lock" || return 1
+    flock -x 9 || return 1
+    backup=$(mktemp -d "$sub_dir/.subscription-remove.XXXXXX") || return 1
+    if [ -e "$yaml" ]; then cp -p "$yaml" "$backup/yaml" || return 1; yaml_saved=true; fi
+    if [ -e "$snippet" ]; then cp -p "$snippet" "$backup/snippet" || return 1; snippet_saved=true; fi
+    if [ -e "$expiry" ]; then cp -p "$expiry" "$backup/expiry" || return 1; expiry_saved=true; fi
+}
+remove() {
+    rm -f "$yaml" "$snippet" || return 1
+    if $expiry_saved; then
+        if [ -n "$replacement" ]; then
+            sed -i "s/^${token} /${replacement} /" "$expiry" || return 1
+        else
+            sed -i "/^${token} /d" "$expiry" || return 1
+        fi
+    fi
+    nginx -t || return 1
+    systemctl reload nginx || return 1
+    test ! -e "$yaml" && test ! -e "$snippet"
+}
+prepare >/dev/null 2>&1 || exit 1
+pending=true
+remove >/dev/null 2>&1 || exit 1
+trap - EXIT HUP INT TERM
+rm -rf "$backup" >/dev/null 2>&1
+printf '%s\n' removed
+EOF
+)
+    printf -v command 'bash -c %q -- %q %q %q %q' "$script" "$token" "$sub_dir" "$SUB_SNIPPETS_DIR" "$replacement"
+    response=$(ssh_run -- "$command" 2>&1) || rc=$?
+    if [[ $rc -eq 0 ]]; then
+        SUB_REMOVE_TOKEN_STATE=removed
+        return 0
+    fi
+    case "$response" in
+        restored|unchanged) SUB_REMOVE_TOKEN_STATE="$response" ;;
+        uncertain:restored:restored:uncertain)
+            SUB_REMOVE_TOKEN_STATE=uncertain
+            warn "Файлы подписки и срок восстановлены; применение nginx не подтверждено. Резервная копия сохранена в каталоге подписок."
+            ;;
+        uncertain:*)
+            SUB_REMOVE_TOKEN_STATE=uncertain
+            local protocol files expiry_state nginx_state
+            IFS=: read -r protocol files expiry_state nginx_state <<< "$response"
+            [[ "$files" == restored ]] && files="восстановлены" || files="не подтверждены"
+            [[ "$expiry_state" == restored ]] && expiry_state="восстановлен" || expiry_state="не подтверждён"
+            [[ "$nginx_state" == restored ]] && nginx_state="применён" || nginx_state="не подтверждён"
+            warn "Восстановление подписки: файлы — $files; срок — $expiry_state; nginx — $nginx_state. Резервная копия сохранена в каталоге подписок."
+            ;;
+        *) warn "Удалённое состояние подписки неизвестно: результат восстановления не получен." ;;
+    esac
+    return 1
+}
+
+# Тихий отзыв для удаления клиента: при сбое локальные данные остаются целы.
 _subscription_revoke_silent() {
-    local client="$1"
-    local token
+    local client="$1" token sub_dir rc=0
     token=$(jq_r --arg n "$client" '.clients[] | select(.name==$n) | .subscription.token // empty')
     [[ -z "$token" ]] && return 0
-
-    if _sub_load_host; then
-        local sub_dir
-        sub_dir=$(_sub_get_dir)
-        ssh_run -- "rm -f '${sub_dir}/${token}.yaml' '${SUB_SNIPPETS_DIR}/sub-${token}.conf'; sed -i '/^${token} /d' '${sub_dir}/expiry.list' 2>/dev/null; nginx -t >/dev/null 2>&1 && systemctl reload nginx" 2>/dev/null \
-            || warn "Хост-нода: ошибка удаления файлов; осиротевшие файлы будут собраны позже."
-        _sub_done
-    else
-        warn "Хост-нода недоступна — файлы подписки '$client' остались на сервере."
+    if ! _sub_load_host; then
+        warn "Подписка '$client' не отозвана: ссылка может оставаться действующей."
+        return 1
     fi
-
-    # Сохраняем headers, удаляем subscription metadata
-    jq_w --arg n "$client" '(.clients[] | select(.name==$n)) |= del(.subscription.token, .subscription.expires_at, .subscription.created_at)'
-
+    sub_dir=$(_sub_get_dir) || { _sub_done; warn "Подписка '$client' не отозвана: ссылка может оставаться действующей."; return 1; }
+    _sub_remove_token "$token" "$sub_dir" || rc=1
+    _sub_done
+    if [[ $rc -ne 0 ]]; then
+        warn "Подписка '$client' не отозвана: ссылка может оставаться действующей."
+        return 1
+    fi
+    jq_w --arg n "$client" '(.clients[] | select(.name==$n)) |= del(.subscription.token, .subscription.expires_at, .subscription.created_at)' || return 1
     success "Подписка отозвана: $client"
+    return 0
 }
 
 subscription_rotate() {
-    local client="$1"
-    [[ -z "$client" ]] && { _select_client_with_sub "Сменить токен подписки" || return; client="$SUBSCRIPTION_SELECT_RESULT"; }
-
-    local old_token
+    local client="${1:-}"
+    [[ -z "$client" ]] && { _select_client_with_sub "Сменить токен подписки" || return 1; client="$SUBSCRIPTION_SELECT_RESULT"; }
+    local old_token config_file host_node
     old_token=$(jq_r --arg n "$client" '.clients[] | select(.name==$n) | .subscription.token // empty')
-    [[ -z "$old_token" ]] && { warn "У клиента '$client' нет подписки."; return; }
-
-    local config_file
+    [[ -n "$old_token" ]] || { warn "У клиента '$client' нет подписки."; return 1; }
     config_file=$(_client_config_file "$client")
-    [[ ! -f "$config_file" ]] && { warn "Конфиг для '$client' не найден."; return; }
-
-    local new_token
-    new_token=$(openssl rand -hex 32)
-
-    _sub_load_host || return
-
-    local sub_dir nginx_group
-    sub_dir=$(_sub_get_dir)
+    _subscription_config_ready "$config_file" || { warn "Конфиг для '$client' не найден или пуст."; return 1; }
+    host_node=$(jq_r '.subscription_host.node // empty')
+    _sub_load_host || return 1
+    local sub_dir nginx_group new_token
+    sub_dir=$(_sub_get_dir) || { _sub_done; return 1; }
     nginx_group=$(_sub_get_nginx_group)
-
+    _sub_done
+    review_frame "Смена токена подписки" "Клиент: $client" "Хост-нода: $host_node" \
+        "Старая ссылка перестанет работать; новая ссылка будет показана после завершения."
+    confirm_yn "Сменить токен подписки?" N || return 0
+    new_token=$(openssl rand -hex 32) || return 1
+    [[ -n "$new_token" ]] || return 1
+    _sub_save_ssh_ctx
+    node_load_by_name "$host_node" || { _sub_done; return 1; }
     if ! _sub_upload_config "$config_file" "$new_token" "$sub_dir" "$nginx_group" "$client"; then
         _sub_done
-        return
+        return 1
     fi
-    ssh_run -- "rm -f '${sub_dir}/${old_token}.yaml' '${SUB_SNIPPETS_DIR}/sub-${old_token}.conf'; sed -i 's/^${old_token} /${new_token} /' '${sub_dir}/expiry.list' 2>/dev/null; systemctl reload nginx"
+    if ! _sub_remove_token "$old_token" "$sub_dir" "$new_token"; then
+        if [[ "$SUB_REMOVE_TOKEN_STATE" == restored ]]; then
+            if ! _sub_remove_token "$new_token" "$sub_dir"; then
+                warn "Старая подписка восстановлена; удаление новой копии не подтверждено."
+            fi
+        else
+            warn "Новая подписка сохранена на хосте: доступность старой ссылки не подтверждена. Локально остался старый токен; перед повтором проверьте хост-ноду."
+        fi
+        _sub_done
+        warn "Смена токена не завершена: удаление старой ссылки не подтверждено."
+        return 1
+    fi
     _sub_done
-
-    jq_w --arg n "$client" --arg t "$new_token" '(.clients[] | select(.name==$n)).subscription.token = $t'
-
+    if ! jq_w --arg n "$client" --arg t "$new_token" '(.clients[] | select(.name==$n)).subscription.token = $t'; then
+        warn "Старый токен удалён, но новый токен не удалось сохранить локально. Смена токена не завершена."
+        return 1
+    fi
     success "Токен обновлён: $client"
-    _sub_verify_http "$new_token"
+    _sub_verify_http "$new_token" || return 1
     _show_share_bundle "$client"
 }
 
@@ -550,7 +652,7 @@ _show_share_bundle() {
     local expires_at
     expires_at=$(jq_r --arg n "$client" '.clients[] | select(.name==$n) | .subscription.expires_at // empty')
     if [[ -n "$expires_at" ]]; then
-        echo -e "  ${YELLOW}Expires:${NC} $expires_at"
+        echo -e "  ${YELLOW}Срок действия:${NC} $expires_at"
     fi
 
     # Resolved headers — информационно (сервер сам отдаёт их в response)
@@ -572,7 +674,7 @@ _show_share_bundle() {
 
     # JSON bundle (только URL — заголовки приходят в response, а не в request)
     echo ""
-    echo -e "  ${DIM}JSON bundle${NC}"
+    echo -e "  ${DIM}Данные в JSON${NC}"
     jq -n --arg url "$url" '{url: $url}'
 
     # QR
@@ -583,41 +685,32 @@ _show_share_bundle() {
 }
 
 subscription_list() {
-    echo ""
-    echo -e "  ${CYAN}── Подписки ──────────────────────────────────${NC}"
-    echo ""
-
-    local host_node base_url
+    local host_node name expires_at found=0 now_ts
     host_node=$(jq_r '.subscription_host.node // empty')
-    base_url=$(jq_r '.subscription_host.base_url // empty')
-
-    if [[ -z "$host_node" ]]; then
-        echo -e "  ${DIM}Хост-нода подписок не задана${NC}"
-        return
-    fi
-    echo -e "  Хост-нода: ${GREEN}${host_node}${NC} (${base_url})"
+    now_ts=$(date +%s)
     echo ""
-
-    local found=0
-    while IFS='|' read -r name token expires_at; do
-        [[ -z "$token" ]] && continue
+    box_top
+    box_center "Подписки"
+    box_mid
+    box_line " Хост-нода: ${host_node:-не задана}"
+    box_mid
+    while IFS='|' read -r name expires_at; do
+        [[ -n "$name" ]] || continue
         found=1
-        local status="${GREEN}active${NC}"
-        if [[ -n "$expires_at" && "$expires_at" != "null" ]]; then
-            local exp_ts now_ts
-            exp_ts=$(date -d "$expires_at" +%s 2>/dev/null || echo 0)
-            now_ts=$(date +%s)
-            if [[ "$exp_ts" -le "$now_ts" ]]; then
-                status="${RED}expired${NC}"
-            else
-                local diff=$(( (exp_ts - now_ts) / 3600 ))
-                status="${GREEN}active${NC} ${DIM}(${diff}h left)${NC}"
+        local state="действует" term="без срока" color="$GREEN" exp_ts
+        if [[ -n "$expires_at" ]]; then
+            term="$expires_at"
+            if ! exp_ts=$(date -d "$expires_at" +%s 2>/dev/null); then
+                state="срок неизвестен"; color="$YELLOW"
+            elif [[ "$exp_ts" -le "$now_ts" ]]; then
+                state="истекла"; color="$YELLOW"
             fi
         fi
-        printf "  %-18s %b  %b\n" "$name" "$status" "$(hyperlink "${base_url}/sub/${token}")"
-    done < <(jq_r '.clients[] | select(.subscription.token) | "\(.name)|\(.subscription.token)|\(.subscription.expires_at // "")"')
-
-    [[ "$found" -eq 0 ]] && echo -e "  ${DIM}Нет опубликованных подписок${NC}"
+        box_line " $name — $term; $state" " $name — $term; ${color}${state}${NC}"
+    done < <(jq_r '.clients[] | select(.subscription.token) | "\(.name)|\(.subscription.expires_at // "")"')
+    [[ $found -eq 0 ]] && box_line " Нет опубликованных подписок" " ${DIM}Нет опубликованных подписок${NC}"
+    box_bot
+    echo ""
 }
 
 subscription_publish_all() {
@@ -630,23 +723,25 @@ subscription_publish_all() {
         all_clients+=("$client_name")
     done < <(jq_r '.clients[].name')
 
-    local triplets=() ok=0 new_tokens=() skipped=0 published=()
+    local triplets=() ok=0 new_tokens=() skipped=0 published=() rc=0
     for client in "${all_clients[@]}"; do
         local config_file
         config_file=$(_client_config_file "$client")
         if ! _subscription_config_ready "$config_file"; then
             skipped=$((skipped + 1))
+            info "$client: пропущено — конфиг отсутствует или пуст"
             continue
         fi
 
         local token
         token=$(jq_r --arg n "$client" '.clients[] | select(.name==$n) | .subscription.token // empty')
         if [[ -z "$token" ]]; then
-            token=$(openssl rand -hex 32)
+            token=$(openssl rand -hex 32) || { warn "$client: публикация не подтверждена"; return 1; }
+            [[ -n "$token" ]] || { warn "$client: публикация не подтверждена"; return 1; }
             new_tokens+=("$client" "$token")
         fi
         triplets+=("$config_file" "$token" "$client")
-        published+=("$client|$token")
+        published+=("$client")
         ok=$((ok + 1))
     done
 
@@ -659,7 +754,7 @@ subscription_publish_all() {
     _sub_load_host || return
 
     local sub_dir nginx_group
-    sub_dir=$(_sub_get_dir)
+    sub_dir=$(_sub_get_dir) || { _sub_done; return 1; }
     nginx_group=$(_sub_get_nginx_group)
 
     if _sub_upload_batch "$sub_dir" "$nginx_group" "${triplets[@]}"; then
@@ -668,25 +763,20 @@ subscription_publish_all() {
         while [[ $i -lt ${#new_tokens[@]} ]]; do
             local c="${new_tokens[$i]}" t="${new_tokens[$((i+1))]}"
             jq_w --arg n "$c" --arg t "$t" --arg ts "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
-                '(.clients[] | select(.name==$n)).subscription |= ((. // {}) + {token: $t, expires_at: null, created_at: $ts})'
+                '(.clients[] | select(.name==$n)).subscription |= ((. // {}) + {token: $t, expires_at: null, created_at: $ts})' || rc=1
             i=$((i + 2))
         done
-        success "Опубликовано: $ok"
-        [[ $skipped -gt 0 ]] && info "Пропущено (конфиг отсутствует или пуст): $skipped"
-
-        local base_url
-        base_url=$(jq_r '.subscription_host.base_url // empty')
-        if [[ -n "$base_url" && ${#published[@]} -gt 0 ]]; then
-            echo ""
-            for entry in "${published[@]}"; do
-                local pc="${entry%%|*}" pt="${entry#*|}"
-                local purl="${base_url}/sub/${pt}"
-                printf "  %-20s %b\n" "$pc" "$(hyperlink "$purl")"
-            done
+        if [[ $rc -ne 0 ]]; then
+            for client in "${published[@]}"; do warn "$client: публикация не подтверждена"; done
+            _sub_done
+            return 1
         fi
+        for client in "${published[@]}"; do success "$client: опубликовано"; done
+        success "Опубликовано: $ok"
+        info "Пропущено (конфиг отсутствует или пуст): $skipped"
+        info "Ошибка: 0"
 
-        # Orphan sweep: удалить yaml + snippet файлы для токенов которых
-        # больше нет в config.json (после delete_client при offline хосте и т.п.)
+        # Удаление осиротевших yaml и snippets после успешного сохранения токенов.
         local known_tokens
         known_tokens=$(jq_r '.clients[] | .subscription.token // empty' | tr '\n' '|' | sed 's/|$//')
         local sweep_cmd
@@ -708,94 +798,88 @@ echo \$removed"
         local removed
         removed=$(ssh_run -- "$sweep_cmd" 2>/dev/null | tail -1)
         if [[ -n "$removed" && "$removed" -gt 0 ]]; then
-            info "Cleanup: удалено $removed осиротевших подписок"
+            info "Удалено осиротевших подписок: $removed"
         fi
     else
-        warn "Не удалось загрузить пакет подписок."
+        for client in "${published[@]}"; do warn "$client: публикация не подтверждена"; done
+        info "Опубликовано: 0; пропущено: $skipped; ошибка: $ok"
+        rc=1
     fi
 
     _sub_done
+    return "$rc"
 }
 
 subscription_migrate() {
-    local old_node
+    local old_node old_base_url new_node new_conf old_conf
     old_node=$(jq_r '.subscription_host.node // empty')
-    [[ -z "$old_node" ]] && { warn "Хост-нода подписок не задана."; return; }
-
-    echo ""
-    info "Текущая хост-нода: $old_node"
-    echo ""
-
-    # Выбираем новую ноду
-    local nodes=()
-    while IFS= read -r node_name; do
-        nodes+=("$node_name")
-    done < <(jq_r '.nodes[].name')
-    local i=1
-    for n in "${nodes[@]}"; do
-        [[ "$n" == "$old_node" ]] && echo -e "  ${DIM}${i}) ${n} (текущий)${NC}" || echo -e "  ${GREEN}${i})${NC} $n"
-        i=$((i + 1))
-    done
-    echo ""
-    read -rp "  Новая хост-нода: " idx
-    local new_node="${nodes[$((idx - 1))]}"
-    [[ -z "$new_node" || "$new_node" == "$old_node" ]] && { info "Отменено."; return; }
-
-    # Проверяем subscription module на новой ноде
-    _sub_save_ssh_ctx
-    node_load_by_name "$new_node" || { _sub_restore_ssh_ctx; warn "Не удалось загрузить ноду."; return; }
-    local new_conf
-    new_conf=$(ssh_run -- "cat /etc/mihomo/subscription.conf 2>/dev/null")
-    _sub_restore_ssh_ctx
-
-    if [[ -z "$new_conf" ]]; then
-        warn "На ноде '$new_node' не установлен модуль подписок."
-        return
-    fi
-
-    local new_base_url new_sub_dir new_nginx_group
-    new_base_url=$(echo "$new_conf" | grep '^SUB_BASE_URL=' | cut -d= -f2-)
-    new_sub_dir=$(echo "$new_conf" | grep '^SUB_DIR=' | cut -d= -f2-)
-    new_sub_dir="${new_sub_dir:-/var/lib/essence-sub}"
-    new_nginx_group=$(echo "$new_conf" | grep '^NGINX_GROUP=' | cut -d= -f2-)
-    new_nginx_group="${new_nginx_group:-www-data}"
-
-    confirm_yn "Мигрировать все подписки с '$old_node' на '$new_node'?" || return
-
-    # Заливаем файлы на новую ноду
-    _sub_save_ssh_ctx
-    node_load_by_name "$new_node" || { _sub_restore_ssh_ctx; return; }
-
-    local ok=0
+    old_base_url=$(jq_r '.subscription_host.base_url // empty')
+    [[ -n "$old_node" ]] || { warn "Хост-нода подписок не задана."; return 1; }
+    MENU_SELECT_CONTEXT=("Текущая хост-нода: $old_node")
+    node_pick "Перенос подписок" || return 1
+    new_node=$(jq_r --argjson i "$((NODE_PICK_INDEX - 1))" '.nodes[$i].name')
+    [[ "$new_node" != "$old_node" ]] || { info "Выбрана текущая хост-нода. Перенос не выполнен."; return 1; }
+    local clients=() tokens=() configs=() client token config_file
     while IFS='|' read -r client token; do
-        local config_file
+        [[ -n "$token" ]] || continue
         config_file=$(_client_config_file "$client")
-        if [[ -f "$config_file" ]]; then
-            _sub_upload_config "$config_file" "$token" "$new_sub_dir" "$new_nginx_group" "$client" && ok=$((ok + 1))
+        if ! _subscription_config_ready "$config_file"; then
+            warn "$client: конфиг отсутствует или пуст. Перенос отменён."
+            return 1
         fi
+        clients+=("$client"); tokens+=("$token"); configs+=("$config_file")
     done < <(jq_r '.clients[] | select(.subscription.token) | "\(.name)|\(.subscription.token)"')
-
-    _sub_restore_ssh_ctx
-
-    # Удаляем со старой ноды (yaml + snippet)
+    [[ ${#clients[@]} -gt 0 ]] || { info "Нет опубликованных подписок для переноса."; return 0; }
     _sub_save_ssh_ctx
-    node_load_by_name "$old_node" || { _sub_restore_ssh_ctx; return; }
-
-    while IFS='|' read -r _ token; do
-        ssh_run -- "rm -f '/var/lib/essence-sub/${token}.yaml' '${SUB_SNIPPETS_DIR}/sub-${token}.conf'"
-    done < <(jq_r '.clients[] | select(.subscription.token) | "\(.name)|\(.subscription.token)"')
-    ssh_run -- "nginx -t >/dev/null 2>&1 && systemctl reload nginx" 2>/dev/null
-
-    _sub_restore_ssh_ctx
-
-    # Обновляем config.json
-    jq_w --arg n "$new_node" --arg u "$new_base_url" \
-         --arg d "$new_sub_dir" --arg g "$new_nginx_group" \
-         '.subscription_host = {node: $n, base_url: $u, sub_dir: $d, nginx_group: $g}'
-
-    success "Мигрировано $ok подписок на '$new_node'"
+    node_load_by_name "$old_node" || { _sub_done; return 1; }
+    if ! old_conf=$(ssh_run -- "cat /etc/mihomo/subscription.conf 2>/dev/null"); then
+        _sub_done; warn "Хост-нода подписок недоступна."; return 1
+    fi
+    node_load_by_name "$new_node" || { _sub_done; return 1; }
+    if ! new_conf=$(ssh_run -- "cat /etc/mihomo/subscription.conf 2>/dev/null"); then
+        _sub_done; warn "Новая хост-нода подписок недоступна."; return 1
+    fi
+    _sub_done
+    local old_sub_dir new_sub_dir new_base_url new_nginx_group
+    old_sub_dir=$(echo "$old_conf" | grep '^SUB_DIR=' | cut -d= -f2-)
+    new_sub_dir=$(echo "$new_conf" | grep '^SUB_DIR=' | cut -d= -f2-)
+    new_base_url=$(echo "$new_conf" | grep '^SUB_BASE_URL=' | cut -d= -f2-)
+    new_nginx_group=$(echo "$new_conf" | grep '^NGINX_GROUP=' | cut -d= -f2-)
+    [[ -n "$old_sub_dir" && -n "$new_sub_dir" && -n "$new_base_url" ]] || {
+        warn "Конфигурация хостинга подписок неполна. Перенос отменён."; return 1;
+    }
+    review_frame "Перенос подписок" "Старая хост-нода: $old_node" "Базовый URL: $old_base_url" \
+        "Новая хост-нода: $new_node" "Базовый URL: $new_base_url" "${clients[@]}" \
+        "Все адреса подписок изменятся." "Старые ссылки будут удалены только после загрузки всех подписок."
+    confirm_yn "Перенести подписки?" N || return 0
+    _sub_save_ssh_ctx
+    node_load_by_name "$new_node" || { _sub_done; return 1; }
+    local i rc=0
+    for ((i=0; i<${#clients[@]}; i++)); do
+        _sub_upload_config "${configs[$i]}" "${tokens[$i]}" "$new_sub_dir" "${new_nginx_group:-www-data}" "${clients[$i]}" || rc=1
+    done
+    _sub_done
+    if [[ $rc -ne 0 ]]; then
+        warn "Перенос не завершён: старый хост и старые ссылки сохранены."
+        warn "На новой ноде могли остаться копии подписок."
+        return 1
+    fi
+    jq_w --arg n "$new_node" --arg u "$new_base_url" --arg d "$new_sub_dir" --arg g "${new_nginx_group:-www-data}" \
+        '.subscription_host = {node: $n, base_url: $u, sub_dir: $d, nginx_group: $g}' || return 1
+    _sub_save_ssh_ctx
+    if node_load_by_name "$old_node"; then
+        for token in "${tokens[@]}"; do _sub_remove_token "$token" "$old_sub_dir" || rc=1; done
+    else
+        rc=1
+    fi
+    _sub_done
+    if [[ $rc -ne 0 ]]; then
+        warn "Подписки перенесены, но старые ссылки не удалось полностью удалить. Требуется очистка старой ноды."
+        return 1
+    fi
+    success "Перенесено ${#clients[@]} подписок на '$new_node'"
     info "Новый базовый URL: $new_base_url"
-    warn "Адреса всех подписок изменились! Уведомите клиентов."
+    return 0
 }
 
 # ─── Управление хедерами ───────────────────────────────────────────────────
@@ -803,8 +887,8 @@ subscription_migrate() {
 subscription_set_header() {
     local client="$1" hname="$2" hvalue="$3"
     [[ -z "$client" ]] && { _select_client "Добавить заголовок" || return; client="$SUBSCRIPTION_SELECT_RESULT"; }
-    [[ -z "$hname" ]] && { read -rp "Имя заголовка: " hname; }
-    [[ -z "$hvalue" ]] && { read -rp "Значение заголовка: " hvalue; }
+    [[ -z "$hname" ]] && { IFS= read -rp "  Имя заголовка: " hname || return 1; hname="${hname%$'\r'}"; }
+    [[ -z "$hvalue" ]] && { IFS= read -rp "  Значение заголовка: " hvalue || return 1; hvalue="${hvalue%$'\r'}"; }
     [[ -z "$hname" || -z "$hvalue" ]] && { warn "Имя и значение обязательны."; return; }
 
     # Валидация: RFC 7230 token chars для имени
@@ -827,22 +911,22 @@ subscription_set_header() {
         (.clients[] | select(.name==$n)).subscription.headers =
             (((.clients[] | select(.name==$n)).subscription.headers // [])
             | [.[] | select(.name != $hn)] + [{name: $hn, value: $hv}])
-    '
+    ' || return 1
     success "Заголовок установлен: $hname: $hvalue (клиент: $client)"
     info "Запустите публикацию для $client чтобы применить."
 }
 
 subscription_del_header() {
     local client="$1" hname="$2"
-    [[ -z "$client" ]] && { _select_client_with_sub "Удалить заголовок" || return; client="$SUBSCRIPTION_SELECT_RESULT"; }
-    [[ -z "$hname" ]] && { read -rp "Имя заголовка: " hname; }
+    [[ -z "$client" ]] && { _select_client "Удалить заголовок" || return 1; client="$SUBSCRIPTION_SELECT_RESULT"; }
+    [[ -z "$hname" ]] && { IFS= read -rp "  Имя заголовка: " hname || return 1; hname="${hname%$'\r'}"; }
     [[ -z "$hname" ]] && { warn "Имя обязательно."; return; }
 
     jq_w --arg n "$client" --arg hn "$hname" '
         (.clients[] | select(.name==$n)).subscription.headers =
             (((.clients[] | select(.name==$n)).subscription.headers // [])
             | [.[] | select(.name != $hn)])
-    '
+    ' || return 1
     success "Заголовок удалён: $hname (клиент: $client)"
     info "Запустите публикацию для $client чтобы применить."
 }
@@ -850,8 +934,8 @@ subscription_del_header() {
 subscription_group_set_header() {
     local group="$1" hname="$2" hvalue="$3"
     [[ -z "$group" ]] && { _select_group "Добавить групповой заголовок" || return; group="$SUBSCRIPTION_SELECT_RESULT"; }
-    [[ -z "$hname" ]] && { read -rp "Имя заголовка: " hname; }
-    [[ -z "$hvalue" ]] && { read -rp "Значение заголовка: " hvalue; }
+    [[ -z "$hname" ]] && { IFS= read -rp "  Имя заголовка: " hname || return 1; hname="${hname%$'\r'}"; }
+    [[ -z "$hvalue" ]] && { IFS= read -rp "  Значение заголовка: " hvalue || return 1; hvalue="${hvalue%$'\r'}"; }
     [[ -z "$hname" || -z "$hvalue" ]] && { warn "Имя и значение обязательны."; return; }
 
     if [[ ! "$hname" =~ ^[a-zA-Z0-9!#\$%\&\'*+.^_\`|~-]+$ ]]; then
@@ -871,7 +955,7 @@ subscription_group_set_header() {
         (.groups[] | select(.name==$g)).subscription_headers =
             (((.groups[] | select(.name==$g)).subscription_headers // [])
             | [.[] | select(.name != $hn)] + [{name: $hn, value: $hv}])
-    '
+    ' || return 1
     success "Заголовок установлен: $hname: $hvalue (группа: $group)"
     info "Запустите 'Обновить все подписки' чтобы применить."
 }
@@ -879,14 +963,14 @@ subscription_group_set_header() {
 subscription_group_del_header() {
     local group="$1" hname="$2"
     [[ -z "$group" ]] && { _select_group "Удалить групповой заголовок" || return; group="$SUBSCRIPTION_SELECT_RESULT"; }
-    [[ -z "$hname" ]] && { read -rp "Имя заголовка: " hname; }
+    [[ -z "$hname" ]] && { IFS= read -rp "  Имя заголовка: " hname || return 1; hname="${hname%$'\r'}"; }
     [[ -z "$hname" ]] && { warn "Имя обязательно."; return; }
 
     jq_w --arg g "$group" --arg hn "$hname" '
         (.groups[] | select(.name==$g)).subscription_headers =
             (((.groups[] | select(.name==$g)).subscription_headers // [])
             | [.[] | select(.name != $hn)])
-    '
+    ' || return 1
     success "Заголовок удалён: $hname (группа: $group)"
     info "Запустите 'Обновить все подписки' чтобы применить."
 }
@@ -918,7 +1002,7 @@ subscription_show_resolved() {
         printf "  %-20s %-30s %b\n" "$name:" "$value" "$tag"
     done < <(_resolve_headers_annotated "$client")
 
-    [[ "$found" -eq 0 ]] && echo -e "  ${DIM}Нет хедеров${NC}"
+    [[ "$found" -eq 0 ]] && echo -e "  ${DIM}Нет заголовков${NC}"
 }
 
 # Результаты интерактивного выбора передаются через глобальную переменную.
@@ -926,196 +1010,113 @@ SUBSCRIPTION_SELECT_RESULT=""
 
 _select_client() {
     SUBSCRIPTION_SELECT_RESULT=""
-    local label="$1"
-    local clients=() client_name c idx i
-    while IFS= read -r client_name; do
-        clients+=("$client_name")
-    done < <(jq_r '.clients[].name')
-    if [[ ${#clients[@]} -eq 0 ]]; then
-        echo ""
-        box_top
-        box_center "$label"
-        box_mid
-        box_line " Нет клиентов" " ${DIM}Нет клиентов${NC}"
-        menu_item 0 "Отмена" NC
-        box_bot
-        return 1
-    fi
-    while true; do
-        echo ""
-        box_top
-        box_center "$label"
-        box_mid
-        i=1
-        for c in "${clients[@]}"; do
-            box_line " ${i}) ${c}" " ${CYAN}${i})${NC} ${c}"
-            i=$((i + 1))
-        done
-        menu_item 0 "Отмена" NC
-        box_bot
-        echo ""
-        if ! IFS= read -rp "  Выберите клиента: " idx; then
-            return 1
-        fi
-        idx="${idx%$'\r'}"
-        [[ "$idx" == 0 ]] && return 1
-        if menu_index_valid "$idx" "${#clients[@]}"; then
-            SUBSCRIPTION_SELECT_RESULT="${clients[$((idx - 1))]}"
-            return 0
-        fi
-        warn "Неверный выбор."
-    done
+    local clients=() client_name
+    while IFS= read -r client_name; do clients+=("$client_name"); done < <(jq_r '.clients[].name')
+    MENU_SELECT_EMPTY="Нет клиентов"
+    menu_select "$1" "Выберите клиента" "${clients[@]}" || return 1
+    SUBSCRIPTION_SELECT_RESULT="${clients[$((MENU_SELECT_INDEX - 1))]}"
 }
 
 _select_client_with_sub() {
     SUBSCRIPTION_SELECT_RESULT=""
-    local label="$1"
-    local clients=() client_name c idx i
-    while IFS= read -r client_name; do
-        clients+=("$client_name")
-    done < <(jq_r '.clients[] | select(.subscription.token) | .name')
-    if [[ ${#clients[@]} -eq 0 ]]; then
-        echo ""
-        box_top
-        box_center "$label"
-        box_mid
-        box_line " Нет клиентов с подписками" " ${DIM}Нет клиентов с подписками${NC}"
-        menu_item 0 "Отмена" NC
-        box_bot
-        return 1
-    fi
-    while true; do
-        echo ""
-        box_top
-        box_center "$label"
-        box_mid
-        i=1
-        for c in "${clients[@]}"; do
-            box_line " ${i}) ${c}" " ${CYAN}${i})${NC} ${c}"
-            i=$((i + 1))
-        done
-        menu_item 0 "Отмена" NC
-        box_bot
-        echo ""
-        if ! IFS= read -rp "  Выберите клиента: " idx; then
-            return 1
-        fi
-        idx="${idx%$'\r'}"
-        [[ "$idx" == 0 ]] && return 1
-        if menu_index_valid "$idx" "${#clients[@]}"; then
-            SUBSCRIPTION_SELECT_RESULT="${clients[$((idx - 1))]}"
-            return 0
-        fi
-        warn "Неверный выбор."
-    done
+    local clients=() client_name
+    while IFS= read -r client_name; do clients+=("$client_name"); done < <(jq_r '.clients[] | select(.subscription.token) | .name')
+    MENU_SELECT_EMPTY="Нет клиентов с подписками"
+    menu_select "$1" "Выберите клиента" "${clients[@]}" || return 1
+    SUBSCRIPTION_SELECT_RESULT="${clients[$((MENU_SELECT_INDEX - 1))]}"
 }
 
 _select_group() {
     SUBSCRIPTION_SELECT_RESULT=""
-    local label="$1"
-    local groups=() group_name g idx i
-    while IFS= read -r group_name; do
-        groups+=("$group_name")
-    done < <(jq_r '.groups[].name')
-    if [[ ${#groups[@]} -eq 0 ]]; then
-        echo ""
-        box_top
-        box_center "$label"
-        box_mid
-        box_line " Нет групп" " ${DIM}Нет групп${NC}"
-        menu_item 0 "Отмена" NC
-        box_bot
-        return 1
-    fi
-    while true; do
-        echo ""
-        box_top
-        box_center "$label"
-        box_mid
-        i=1
-        for g in "${groups[@]}"; do
-            box_line " ${i}) ${g}" " ${CYAN}${i})${NC} ${g}"
-            i=$((i + 1))
-        done
-        menu_item 0 "Отмена" NC
-        box_bot
-        echo ""
-        if ! IFS= read -rp "  Выберите группу: " idx; then
-            return 1
-        fi
-        idx="${idx%$'\r'}"
-        [[ "$idx" == 0 ]] && return 1
-        if menu_index_valid "$idx" "${#groups[@]}"; then
-            SUBSCRIPTION_SELECT_RESULT="${groups[$((idx - 1))]}"
-            return 0
-        fi
-        warn "Неверный выбор."
-    done
-}
-
-# ─── Авторефреш после генерации (вызывается из generate.sh) ────────────────
-
-_subscription_prompt_refresh() {
-    local host_node
-    host_node=$(jq_r '.subscription_host.node // empty')
-    [[ -z "$host_node" ]] && return
-
-    local gen_count=0 generated_config
-    while IFS= read -r generated_config; do
-        [[ -z "$generated_config" ]] && continue
-        if _subscription_config_ready "$generated_config"; then
-            gen_count=$((gen_count + 1))
-        fi
-    done < <(find "$GENERATED_DIR" -type f -name config.yaml 2>/dev/null)
-    [[ $gen_count -eq 0 ]] && return
-
-    echo ""
-    if confirm_yn "Опубликовать подписки для $gen_count клиентов?"; then
-        subscription_publish_all
-    fi
+    local groups=() group_name
+    while IFS= read -r group_name; do groups+=("$group_name"); done < <(jq_r '.groups[].name')
+    MENU_SELECT_EMPTY="Нет групп"
+    menu_select "$1" "Выберите группу" "${groups[@]}" || return 1
+    SUBSCRIPTION_SELECT_RESULT="${groups[$((MENU_SELECT_INDEX - 1))]}"
 }
 
 # ─── Меню ───────────────────────────────────────────────────────────────────
 
-subscription_menu() {
-    state_action "ensure_subscription_headers" _ensure_default_headers >/dev/null 2>&1 || true
+subscription_client_headers_menu() {
+    local choice
     while true; do
         echo ""
         box_top
-        box_center "Подписки"
+        box_center "Заголовки клиента"
+        box_mid
+        menu_item 1 "Установить заголовок" YELLOW
+        menu_item 2 "Удалить заголовок" RED
+        menu_item 0 "Назад" NC
         box_bot
         echo ""
+        IFS= read -rp "  Выберите действие: " choice || return 0
+        choice="${choice%$'\r'}"
+        case "$choice" in
+            1) state_action "subscription_set_header" subscription_set_header "" "" "" || true ;;
+            2) state_action "subscription_del_header" subscription_del_header "" "" || true ;;
+            0) return 0 ;;
+            *) warn "Неверный выбор." ;;
+        esac
+    done
+}
 
-        local host_node
+subscription_group_headers_menu() {
+    local choice
+    while true; do
+        echo ""
+        box_top
+        box_center "Заголовки группы"
+        box_mid
+        menu_item 1 "Установить заголовок" YELLOW
+        menu_item 2 "Удалить заголовок" RED
+        menu_item 0 "Назад" NC
+        box_bot
+        echo ""
+        IFS= read -rp "  Выберите действие: " choice || return 0
+        choice="${choice%$'\r'}"
+        case "$choice" in
+            1) state_action "subscription_group_set_header" subscription_group_set_header "" "" "" || true ;;
+            2) state_action "subscription_group_del_header" subscription_group_del_header "" "" || true ;;
+            0) return 0 ;;
+            *) warn "Неверный выбор." ;;
+        esac
+    done
+}
+
+subscription_menu() {
+    state_action "ensure_subscription_headers" _ensure_default_headers >/dev/null 2>&1 || true
+    local choice host_node base_url
+    while true; do
         host_node=$(jq_r '.subscription_host.node // empty')
+        base_url=$(jq_r '.subscription_host.base_url // empty')
+        echo ""
+        box_top
+        box_center "Подписки"
+        box_mid
         if [[ -n "$host_node" ]]; then
-            local base_url
-            base_url=$(jq_r '.subscription_host.base_url // empty')
-            echo -e "  Хост-нода: ${GREEN}${host_node}${NC} (${base_url})"
+            box_line " Хост-нода: $host_node" " Хост-нода: ${GREEN}${host_node}${NC}"
+            box_line " Базовый URL: $base_url"
         else
-            echo -e "  ${DIM}Хост-нода подписок не задана${NC}"
+            box_line " Хост-нода подписок не задана" " ${DIM}Хост-нода подписок не задана${NC}"
         fi
+        box_mid
+        menu_item 1 "Выбрать хост-ноду" YELLOW
+        menu_item 2 "Опубликовать подписку" GREEN
+        menu_item 3 "Обновить все подписки" YELLOW
+        menu_item 4 "Показать подписку" CYAN
+        menu_item 5 "Список подписок" CYAN
+        menu_item 6 "Сменить токен подписки" RED
+        menu_item 7 "Отозвать подписку" RED
+        menu_item 8 "Перенос на другую ноду" YELLOW
+        menu_item h "Заголовки клиента" CYAN
+        menu_item g "Заголовки группы" CYAN
+        menu_item r "Показать итоговые заголовки" CYAN
+        menu_item 0 "Назад" NC
+        box_bot
         echo ""
-
-        echo -e "  ${GREEN}1)${NC} Выбрать хост-ноду"
-        echo -e "  ${GREEN}2)${NC} Опубликовать подписку"
-        echo -e "  ${GREEN}3)${NC} Обновить все подписки"
-        echo -e "  ${GREEN}4)${NC} Показать подписку"
-        echo -e "  ${GREEN}5)${NC} Список подписок"
-        echo -e "  ${YELLOW}6)${NC} Сменить токен подписки"
-        echo -e "  ${RED}7)${NC} Отозвать подписку"
-        echo -e "  ${CYAN}8)${NC} Миграция на другую ноду"
-        echo ""
-        echo -e "  ${DIM}── HTTP-заголовки ──${NC}"
-        echo -e "  ${GREEN}h)${NC} Заголовки клиента"
-        echo -e "  ${GREEN}g)${NC} Заголовки группы"
-        echo -e "  ${GREEN}r)${NC} Показать итоговые заголовки"
-        echo ""
-        echo -e "  ${NC}0)${NC} Назад"
-        echo ""
-        read -rp "  Выберите: " CHOICE
-
-        case "$CHOICE" in
+        IFS= read -rp "  Выберите действие: " choice || return 0
+        choice="${choice%$'\r'}"
+        case "$choice" in
             1) state_action "subscription_set_host" subscription_set_host ;;
             2) state_action "subscription_publish" subscription_publish "" ;;
             3) state_action "subscription_publish_all" subscription_publish_all ;;
@@ -1124,28 +1125,10 @@ subscription_menu() {
             6) state_action "subscription_rotate" subscription_rotate "" ;;
             7) state_action "subscription_revoke" subscription_revoke "" ;;
             8) state_action "subscription_migrate" subscription_migrate ;;
-            h|H)
-                echo -e "  ${GREEN}1)${NC} Установить заголовок"
-                echo -e "  ${RED}2)${NC} Удалить заголовок"
-                read -rp "  Выберите: " hc
-                case "$hc" in
-                    1) state_action "subscription_set_header" subscription_set_header "" "" "" ;;
-                    2) state_action "subscription_del_header" subscription_del_header "" "" ;;
-                    *) warn "Неверный выбор." ;;
-                esac
-                ;;
-            g|G)
-                echo -e "  ${GREEN}1)${NC} Установить заголовок"
-                echo -e "  ${RED}2)${NC} Удалить заголовок"
-                read -rp "  Выберите: " hc
-                case "$hc" in
-                    1) state_action "subscription_group_set_header" subscription_group_set_header "" "" "" ;;
-                    2) state_action "subscription_group_del_header" subscription_group_del_header "" "" ;;
-                    *) warn "Неверный выбор." ;;
-                esac
-                ;;
+            h|H) subscription_client_headers_menu ;;
+            g|G) subscription_group_headers_menu ;;
             r|R) subscription_show_resolved "" ;;
-            0) return ;;
+            0) return 0 ;;
             *) warn "Неверный выбор." ;;
         esac
     done

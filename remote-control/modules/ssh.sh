@@ -212,26 +212,137 @@ ssh_connect() {
 }
 
 # ─── Проверка и загрузка скриптов ────────────────────────────────────────────
+_remote_scripts_normalize_version() {
+    local raw="${1:-}" major minor patch
+    raw="${raw%$'\r'}"
+    raw="${raw#v}"
+    [[ "$raw" =~ ^([0-9]{1,9})\.([0-9]{1,9})\.([0-9]{1,9})$ ]] || return 1
+    major="${BASH_REMATCH[1]}"
+    minor="${BASH_REMATCH[2]}"
+    patch="${BASH_REMATCH[3]}"
+    printf '%d.%d.%d\n' "$((10#$major))" "$((10#$minor))" "$((10#$patch))"
+}
+
+_remote_scripts_probe() {
+    REMOTE_SCRIPTS_STATE=unknown
+    REMOTE_SCRIPTS_VERSION=""
+    local dir response version="" command
+    printf -v dir '%q' "$REMOTE_DIR"
+    command="dir=$dir
+if [[ ! -e \"\$dir\" && ! -L \"\$dir\" ]]; then printf 'MISSING'; exit 0; fi
+if [[ ! -d \"\$dir\" ]]; then printf 'BROKEN'; exit 0; fi
+[[ -r \"\$dir\" && -x \"\$dir\" ]] || exit 1
+entries=\$(ls -A \"\$dir\" && printf '.') || exit 1
+if [[ \"\$entries\" == '.' ]]; then printf 'MISSING'; exit 0; fi
+if [[ -x \"\$dir/setup-essence.sh\" && -f \"\$dir/setup-essence.sh\" ]]; then
+    printf 'PRESENT'
+else
+    printf 'BROKEN'
+fi
+if [[ -e \"\$dir/VERSION\" || -L \"\$dir/VERSION\" ]]; then
+    [[ -f \"\$dir/VERSION\" && -r \"\$dir/VERSION\" ]] || exit 1
+    printf '\n'
+    cat \"\$dir/VERSION\" || exit 1
+fi"
+    response=$(ssh_run -n -- "$command") || return 1
+    case "$response" in
+        MISSING) REMOTE_SCRIPTS_STATE=missing; return 0 ;;
+        PRESENT|PRESENT$'\n'*) REMOTE_SCRIPTS_STATE=ready ;;
+        BROKEN|BROKEN$'\n'*) REMOTE_SCRIPTS_STATE=broken ;;
+        *) return 1 ;;
+    esac
+    if [[ "$response" == *$'\n'* ]]; then
+        version="${response#*$'\n'}"
+        REMOTE_SCRIPTS_VERSION=$(_remote_scripts_normalize_version "$version") || REMOTE_SCRIPTS_VERSION=""
+    fi
+    if [[ "$REMOTE_SCRIPTS_STATE" == ready && -z "$REMOTE_SCRIPTS_VERSION" ]]; then
+        REMOTE_SCRIPTS_STATE=unknown
+    fi
+}
+
 upload_scripts() {
+    local dir entry modules version_tmp destination
+    printf -v dir '%q' "$REMOTE_DIR"
+    printf -v entry '%q' "$REMOTE_DIR/setup-essence.sh"
+    printf -v modules '%q' "$REMOTE_DIR/modules"
+    version_tmp="$REMOTE_DIR/.VERSION.$$.$RANDOM"
+    printf -v destination '%q' "$version_tmp"
     info "Загружаем скрипты на ${SERVER_USER}@${SERVER_IP} (${REMOTE_DIR})..."
-    ssh_run -- "mkdir -p ${REMOTE_DIR}/modules" \
+    ssh_run -- "mkdir -p $modules" \
         || { warn "Не удалось создать директорию на сервере."; return 1; }
-    scp_run "$SETUP_DIR/setup-essence.sh" \
-        "${SERVER_USER}@${SERVER_IP}:${REMOTE_DIR}/setup-essence.sh" \
-        || { warn "Ошибка загрузки setup-essence.sh"; return 1; }
-    scp_run "$SETUP_DIR/modules/"*.sh \
-        "${SERVER_USER}@${SERVER_IP}:${REMOTE_DIR}/modules/" \
-        || { warn "Ошибка загрузки модулей"; return 1; }
-    scp_run -r "$COMMON_DIR" \
-        "${SERVER_USER}@${SERVER_IP}:${REMOTE_DIR}/" \
-        || { warn "Ошибка загрузки common/"; return 1; }
-    scp_run "$VERSION_PATH" \
-        "${SERVER_USER}@${SERVER_IP}:${REMOTE_DIR}/VERSION" \
-        || { warn "Ошибка загрузки VERSION"; return 1; }
-    ssh_run -- "chmod +x ${REMOTE_DIR}/setup-essence.sh ${REMOTE_DIR}/modules/*.sh" \
-        || { warn "Не удалось установить права на скрипты."; return 1; }
+    if ! scp_run "$SETUP_DIR/setup-essence.sh" \
+            "${SERVER_USER}@${SERVER_IP}:$entry" ||
+       ! scp_run "$SETUP_DIR/modules/"*.sh \
+            "${SERVER_USER}@${SERVER_IP}:$modules/" ||
+       ! scp_run -r "$COMMON_DIR" \
+            "${SERVER_USER}@${SERVER_IP}:$dir/" ||
+       ! ssh_run -- "chmod +x $entry $modules/"'*.sh' ||
+       ! scp_run "$VERSION_PATH" \
+            "${SERVER_USER}@${SERVER_IP}:$destination" ||
+       ! ssh_run -- "mv -f $destination $dir/VERSION"; then
+        ssh_run -- "rm -f $destination" >/dev/null 2>&1 || true
+        warn "Не удалось загрузить и опубликовать скрипты."
+        return 1
+    fi
     success "Скрипты загружены"
-    return 0
+}
+
+ensure_remote_scripts_current() {
+    local force=false local_version
+    case "${1:-}" in
+        "") [[ $# -eq 0 ]] || return 2 ;;
+        --force) [[ $# -eq 1 ]] || return 2; force=true ;;
+        *) return 2 ;;
+    esac
+    if [[ -z "${VERSION_PATH:-}" || ! -f "$VERSION_PATH" ]] ||
+       ! local_version=$(_remote_scripts_normalize_version "$(cat "$VERSION_PATH")"); then
+        warn "Некорректный локальный VERSION: подготовка скриптов остановлена."
+        return 1
+    fi
+    if ! _remote_scripts_probe; then
+        warn "Не удалось определить состояние скриптов на ноде '${NODE_NAME}'."
+        return 1
+    fi
+    if [[ "$force" == true ]]; then
+        local remote_label
+        case "$REMOTE_SCRIPTS_STATE" in
+            missing) remote_label="скрипты отсутствуют" ;;
+            broken) remote_label="установка повреждена${REMOTE_SCRIPTS_VERSION:+ (версия $REMOTE_SCRIPTS_VERSION)}" ;;
+            unknown) remote_label="неизвестна" ;;
+            ready) remote_label="$REMOTE_SCRIPTS_VERSION" ;;
+        esac
+        echo ""
+        box_top
+        box_center "Принудительная загрузка скриптов"
+        box_mid
+        box_line " Нода: ${NODE_NAME} (${SERVER_IP})"
+        box_line " Локальная версия: $local_version"
+        box_line " Серверная версия: $remote_label"
+        box_mid
+        box_line " Локальные скрипты заменят серверные, включая ручные изменения;"
+        box_line " версия может быть понижена."
+        box_bot
+        echo ""
+        if ! confirm_yn "Загрузить локальные скрипты принудительно?" N; then
+            info "Загрузка скриптов отменена."
+            return 0
+        fi
+    else
+        case "$REMOTE_SCRIPTS_STATE" in
+            ready)
+                _ver_gt "$local_version" "$REMOTE_SCRIPTS_VERSION" || return 0 ;;
+            missing) ;;
+            unknown|broken)
+                warn "На ноде '${NODE_NAME}' версия скриптов неизвестна или установка повреждена. Используйте пункт ручной принудительной загрузки."
+                return 1 ;;
+        esac
+    fi
+    upload_scripts || return 1
+    if ! _remote_scripts_probe ||
+       [[ "$REMOTE_SCRIPTS_STATE" != ready || "$REMOTE_SCRIPTS_VERSION" != "$local_version" ]]; then
+        warn "Версия скриптов на ноде '${NODE_NAME}' после загрузки не подтверждена."
+        return 1
+    fi
 }
 
 # ─── Запуск меню на сервере ───────────────────────────────────────────────────
@@ -240,5 +351,7 @@ run_remote() {
     info "Открываю интерактивную SSH-сессию на ${NODE_NAME} (${SERVER_IP})..."
     echo -e "  ${YELLOW}(введите 0 в меню сервера для выхода)${NC}"
     echo ""
-    ssh_run -t -- "bash ${REMOTE_DIR}/setup-essence.sh"
+    local entry
+    printf -v entry '%q' "$REMOTE_DIR/setup-essence.sh"
+    ssh_run -t -- "bash $entry"
 }

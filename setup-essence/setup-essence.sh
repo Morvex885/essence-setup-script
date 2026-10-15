@@ -29,6 +29,7 @@ fi
 for _f in "$_proto_dir"/*.sh; do
     [[ -f "$_f" ]] && source "$_f"
 done
+source "$SCRIPT_DIR/modules/acme-email.sh"
 source "$SCRIPT_DIR/modules/fake-site.sh"
 source "$SCRIPT_DIR/modules/base.sh"
 source "$SCRIPT_DIR/modules/vless.sh"
@@ -39,6 +40,7 @@ source "$SCRIPT_DIR/modules/amneziawg.sh"
 source "$SCRIPT_DIR/modules/cascade.sh"
 source "$SCRIPT_DIR/modules/subscription.sh"
 source "$SCRIPT_DIR/modules/telegram-proxy.sh"
+source "$SCRIPT_DIR/modules/menu-address.sh"
 source "$SCRIPT_DIR/modules/uninstall.sh"
 
 if [[ $EUID -ne 0 ]]; then
@@ -57,6 +59,7 @@ elif [[ -f "$SCRIPT_DIR/../VERSION" ]]; then
     CURRENT_VERSION=$(tr -d '\r' < "$SCRIPT_DIR/../VERSION")
 fi
 check_update_start
+menu_address_start || true
 
 # ─── Самообновление ───────────────────────────────────────────────────────────
 self_update() {
@@ -100,7 +103,8 @@ show_server_config() {
 
 # ─── Меню ────────────────────────────────────────────────────────────────────
 show_menu() {
-    local latest _domain _ver _upd _rmode _sni _rline _vless=() _other=() _vstr _pstr
+    local latest _domain _ver _upd _rmode _sni _rline _address _vless=() _telegram=()
+    local _state _color _component _label _joined
     latest=$(latest_version)
 
     echo ""
@@ -109,10 +113,27 @@ show_menu() {
     box_center "Essence Setup"
     _ver="версия: ${CURRENT_VERSION}"
     box_center "$_ver" "${DIM}${_ver}${NC}"
+    box_mid
     [[ -n "$_domain" ]] && box_line " Домен: ${_domain}"
-    if has_update "$CURRENT_VERSION"; then
-        _upd="↑ ${latest} — пункт 10"
-        box_line "$_upd" "${YELLOW}${_upd}${NC}"
+    menu_address_read
+    case "$_MENU_IPV4_STATE" in
+        pending) _address="определяется…" ;;
+        ready) _address="$_MENU_NODE_IPV4" ;;
+        *) _address="не определён" ;;
+    esac
+    box_line " IPv4: $_address"
+    if [[ -f /proc/sys/net/ipv6/conf/all/disable_ipv6 ]] &&
+        [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)" == 0 ]]; then
+        case "$_MENU_IPV6_STATE" in
+            pending) _address="определяется…" ;;
+            ready) _address="$_MENU_NODE_IPV6" ;;
+            *) _address="не определён" ;;
+        esac
+        box_line " IPv6: $_address"
+    fi
+    if [[ -n "$latest" ]] && has_update "$CURRENT_VERSION"; then
+        _upd="↑ ${latest} — нажмите u"
+        box_line " $_upd" " ${YELLOW}${_upd}${NC}"
     fi
     if [[ -f /etc/mihomo/reality.conf ]]; then
         _rmode=$(grep '^MODE=' /etc/mihomo/reality.conf 2>/dev/null | cut -d= -f2)
@@ -123,49 +144,82 @@ show_menu() {
             else
                 _rline="Reality SNI: ${_sni}"
             fi
-            box_line "$_rline" "${DIM}${_rline}${NC}"
+            box_line " $_rline" " ${DIM}${_rline}${NC}"
         fi
-    fi
-    if _telegram_proxy_component_enabled web; then
-        box_line " WEB: включён" " ${GREEN}WEB: включён${NC}"
-    else
-        box_line " WEB: выключен" " ${DIM}WEB: выключен${NC}"
-    fi
-    if _telegram_proxy_component_enabled mtproto; then
-        box_line " MTProto: включён" " ${GREEN}MTProto: включён${NC}"
-    else
-        box_line " MTProto: выключен" " ${DIM}MTProto: выключен${NC}"
     fi
     if [[ -f /etc/mihomo/config.yaml ]]; then
-        grep -q '# --- vless-tcp ---' /etc/mihomo/config.yaml 2>/dev/null && _vless+=("TCP")
-        grep -q '# --- vless-xhttp ---' /etc/mihomo/config.yaml 2>/dev/null && _vless+=("xHTTP")
-        grep -q '# --- vless-grpc ---' /etc/mihomo/config.yaml 2>/dev/null && _vless+=("gRPC")
-        grep -q '# --- hy2 ---' /etc/mihomo/config.yaml 2>/dev/null && _other+=("HY2")
-        [[ -f /etc/amnezia/amneziawg/awg0.conf ]] && _other+=("AWG")
-        grep -q '# --- warp ---' /etc/mihomo/config.yaml 2>/dev/null && _other+=("WARP")
-        if [[ ${#_vless[@]} -gt 0 || ${#_other[@]} -gt 0 ]]; then
-            local _parts=()
-            [[ ${#_vless[@]} -gt 0 ]] && _parts+=("VLESS: $(IFS=', '; echo "${_vless[*]}")")
-            [[ ${#_other[@]} -gt 0 ]] && _parts+=("$(IFS=', '; echo "${_other[*]}")")
-            _pstr=$(IFS=' | '; echo "${_parts[*]}")
-            box_mid
-            box_line " $_pstr" " ${GREEN}${_pstr}${NC}"
+        if grep -q '# --- vless-tcp ---' /etc/mihomo/config.yaml 2>/dev/null; then
+            _vless+=("TCP")
+        fi
+        if grep -q '# --- vless-xhttp ---' /etc/mihomo/config.yaml 2>/dev/null; then
+            _vless+=("xHTTP")
+        fi
+        if grep -q '# --- vless-grpc ---' /etc/mihomo/config.yaml 2>/dev/null; then
+            _vless+=("gRPC")
         fi
     fi
+    if [[ -x /usr/local/bin/mihomo ]]; then
+        if systemctl is-active --quiet mihomo; then
+            _state="работает"; _color="$GREEN"
+        else
+            _state="остановлен"; _color="$YELLOW"
+        fi
+    else
+        _state="не установлен"; _color="$DIM"
+    fi
+    box_line " • Mihomo: $_state" " • Mihomo: ${_color}${_state}${NC}"
+    if [[ ${#_vless[@]} -gt 0 ]]; then
+        printf -v _joined '%s, ' "${_vless[@]}"
+        _joined="${_joined%, }"
+        box_line " • VLESS Reality: $_joined" " • VLESS Reality: ${GREEN}${_joined}${NC}"
+    else
+        box_line " • VLESS Reality: не установлен" " • VLESS Reality: ${DIM}не установлен${NC}"
+    fi
+    for _component in hy2 awg warp subscription; do
+        _state="не установлен"; _color="$DIM"
+        case "$_component" in
+            hy2)
+                _label="Hysteria2"
+                if grep -q '# --- hy2 ---' /etc/mihomo/config.yaml 2>/dev/null; then _state="установлен"; _color="$GREEN"; fi ;;
+            awg)
+                _label="AmneziaWG 3.1"
+                if [[ -f /etc/amnezia/amneziawg/awg0.conf ]]; then _state="установлен"; _color="$GREEN"; fi ;;
+            warp)
+                _label="WARP"
+                if grep -q '# --- warp ---' /etc/mihomo/config.yaml 2>/dev/null; then _state="установлен"; _color="$GREEN"; fi ;;
+            subscription)
+                _label="Хостинг подписок"
+                if ( _load_sub_conf ); then _state="установлен"; _color="$GREEN"; fi ;;
+        esac
+        box_line " • $_label: $_state" " • $_label: ${_color}${_state}${NC}"
+    done
+    _telegram_proxy_component_enabled web && _telegram+=("Web Proxy")
+    _telegram_proxy_component_enabled mtproto && _telegram+=("MTProto Proxy")
+    if [[ ${#_telegram[@]} -gt 0 ]]; then
+        printf -v _joined '%s, ' "${_telegram[@]}"
+        _joined="${_joined%, }"
+        box_line " • Telegram Proxy: $_joined" " • Telegram Proxy: ${GREEN}${_joined}${NC}"
+    else
+        box_line " • Telegram Proxy: не установлен" " • Telegram Proxy: ${DIM}не установлен${NC}"
+    fi
     box_mid
-    menu_item 1 "Базовая установка" GREEN
-    menu_item 2 "VLESS Reality" GREEN
-    menu_item 3 "Hysteria2" GREEN
-    menu_item 4 "AmneziaWG 3.1" GREEN
-    menu_item 5 "IPv6" YELLOW
-    menu_item 6 "WARP" YELLOW
-    menu_item 7 "Каскады нод" YELLOW
-    menu_item 8 "Показать клиентский конфиг" CYAN
-    menu_item 9 "Показать серверный конфиг" CYAN
-    menu_item 10 "Обновить скрипты" YELLOW
-    menu_item s "Хостинг подписок" CYAN
+    menu_item b "Базовая установка" GREEN
+    box_mid
+    menu_item v "VLESS Reality" CYAN
+    menu_item h "Hysteria2" CYAN
+    menu_item a "AmneziaWG 3.1" CYAN
     menu_item t "Telegram Proxy" CYAN
-    menu_item u "Удалить всё установленное" RED
+    box_mid
+    menu_item i "IPv6" CYAN
+    menu_item w "WARP" CYAN
+    menu_item c "Каскады" CYAN
+    box_mid
+    menu_item s "Хостинг подписок" CYAN
+    menu_item k "Показать клиентский конфиг" CYAN
+    menu_item m "Показать серверный конфиг mihomo" CYAN
+    box_mid
+    menu_item u "Обновить скрипты" YELLOW
+    menu_item x "Удалить всё установленное" RED
     menu_item 0 "Выход" NC
     box_bot
     echo ""
@@ -183,6 +237,15 @@ if [[ "${1:-}" == "telegram-proxy" ]]; then
     exit $?
 fi
 
+if [[ "${1:-}" == uninstall ]]; then
+    [[ $# -eq 2 && "$2" == --force ]] || {
+        warn "Использование: setup-essence.sh uninstall --force"
+        exit 2
+    }
+    _uninstall_components false
+    exit $?
+fi
+
 # ─── Точка входа ─────────────────────────────────────────────────────────────
 INITIAL_CHOICE="${1:-}"
 while true; do
@@ -193,23 +256,23 @@ while true; do
         show_menu || exit 0
     fi
     case "$CHOICE" in
-        1) install_base ;;
-        2) vless_menu ;;
-        3) hy2_menu ;;
-        4) awg_menu ;;
-        5) toggle_ipv6 ;;
-        6) warp_menu ;;
-        7) cascade_menu ;;
-        8) show_client_config ;;
-        9) show_server_config ;;
-        10)
+        b|B) install_base || warn "Базовая установка завершилась ошибкой. Повторите действие из меню." ;;
+        v|V) vless_menu ;;
+        h|H) hy2_menu ;;
+        a|A) awg_menu ;;
+        i|I) toggle_ipv6 ;;
+        w|W) warp_menu ;;
+        c|C) cascade_menu ;;
+        k|K) show_client_config ;;
+        m|M) show_server_config ;;
+        u|U)
             self_update
-            CURRENT_VERSION=$(tr -d '\r' < "$SCRIPT_DIR/VERSION" 2>/dev/null ||
-                tr -d '\r' < "$SCRIPT_DIR/../VERSION" 2>/dev/null || echo "none")
+            CURRENT_VERSION=$(tr -d '\r' 2>/dev/null < "$SCRIPT_DIR/VERSION" ||
+                tr -d '\r' 2>/dev/null < "$SCRIPT_DIR/../VERSION" || echo "none")
             ;;
         s|S) subscription_menu ;;
         t|T) telegram_proxy_menu ;;
-        u|U) uninstall || warn "Удаление завершилось с ошибкой; меню остаётся доступно." ;;
+        x|X) uninstall || warn "Удаление завершилось с ошибкой; меню остаётся доступно." ;;
         0) exit 0 ;;
         *) warn "Неверный выбор." ;;
     esac

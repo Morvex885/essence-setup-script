@@ -32,3 +32,14 @@ setup() {
         [[ "${TOGGLE_SELECT_FLAGS[1]}" =~ ^[01]$ ]]
     done
 }
+
+@test "fuzz menu_select only returns canonical valid indexes or cancellation" {
+    for ((i = 0; i < FUZZ_ITERATIONS; i++)); do
+        stream="$(random_pick "${DICT_BOUNDARY[@]}")"$'\n'"$(random_int 0 5)"
+        if menu_select 'Choose' 'Pick' alpha beta gamma <<< "$stream" >/dev/null 2>&1; then
+            menu_index_valid "$MENU_SELECT_INDEX" 3
+        else
+            [[ $? == 1 && -z "$MENU_SELECT_INDEX" ]]
+        fi
+    done
+}

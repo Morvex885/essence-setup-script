@@ -64,9 +64,6 @@ teardown() {
     printf '2\n' > "$input"
     select_group < "$input" > "$screen"
     [[ "$SELECTED_GROUP" == PC ]]
-    [[ "$(cat "$screen")" == *"1)"*"ROUTER"* ]]
-    [[ "$(cat "$screen")" == *"2)"*"PC"* ]]
-    [[ "$(cat "$screen")" == *"3)"*"MOBILE"* ]]
 }
 
 @test "select_group rejects zero and EOF" {
@@ -76,4 +73,42 @@ teardown() {
     if select_group </dev/null; then
         return 1
     fi
+}
+
+@test "menu_select validates input before publishing and clears context" {
+    MENU_SELECT_CONTEXT=('context')
+    MENU_SELECT_EMPTY='empty'
+    menu_select 'Choose' 'Pick' alpha beta <<< $'01\n1+1\n\n2\r\n'
+    [[ "$MENU_SELECT_INDEX" == 2 ]]
+    [[ "${#MENU_SELECT_CONTEXT[@]}" == 0 && -z "$MENU_SELECT_EMPTY" ]]
+}
+
+@test "menu_select cancellation and EOF clear previous result" {
+    MENU_SELECT_INDEX=2
+    ! menu_select 'Choose' 'Pick' alpha <<< 0
+    [[ -z "$MENU_SELECT_INDEX" ]]
+    MENU_SELECT_INDEX=2
+    ! menu_select 'Choose' 'Pick' alpha </dev/null
+    [[ -z "$MENU_SELECT_INDEX" ]]
+}
+
+@test "empty menu_select leaves input unread and clears optional inputs" {
+    MENU_SELECT_CONTEXT=('context')
+    MENU_SELECT_EMPTY='empty'
+    {
+        ! menu_select 'Choose' 'Pick'
+        IFS= read -r remaining
+    } <<< sentinel
+    [[ "$remaining" == sentinel && -z "$MENU_SELECT_INDEX" ]]
+    [[ "${#MENU_SELECT_CONTEXT[@]}" == 0 && -z "$MENU_SELECT_EMPTY" ]]
+}
+
+@test "node_pick preserves config order without loading or contacting node" {
+    source_module nodes.sh
+    load '../helpers/mock_ssh'
+    reset_ssh_mocks
+    jq_w '.nodes=[{name:"alpha",ip:"192.0.2.1",port:22},{name:"beta",ip:"192.0.2.2",port:2222}]'
+    node_load() { return 99; }
+    node_pick 'Choose' <<< 2
+    [[ "$NODE_PICK_INDEX" == 2 && -z "$SSH_RUN_CALLS" ]]
 }

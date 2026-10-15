@@ -38,7 +38,7 @@ run_cache_test() {
             return \"\${SSH_MOCK_EXIT:-0}\"
         }
         scp_run() { return 0; }
-        upload_scripts() { return 0; }
+        ensure_remote_scripts_current() { return 0; }
         source '$PROJECT_ROOT/remote-control/modules/generate.sh'
 
         $script
@@ -49,13 +49,13 @@ run_cache_test() {
     run run_cache_test '
         _node_config_cache_set "test" "data"
         NODE_CONFIG_FAILED+=("bad")
-        SCRIPTS_UPLOADED+=("uploaded")
+        SCRIPTS_READY+=("ready")
         AWG_PEERS_CHECKED+=("checked")
         _reset_node_cache
         [[ ${#NODE_CONFIG_CACHE_KEYS[@]} -eq 0 ]] || { echo "FAIL: cache keys not empty"; exit 1; }
         [[ ${#NODE_CONFIG_CACHE_VALUES[@]} -eq 0 ]] || { echo "FAIL: cache values not empty"; exit 1; }
         [[ ${#NODE_CONFIG_FAILED[@]} -eq 0 ]] || { echo "FAIL: failed not empty"; exit 1; }
-        [[ ${#SCRIPTS_UPLOADED[@]} -eq 0 ]] || { echo "FAIL: uploaded not empty"; exit 1; }
+        [[ ${#SCRIPTS_READY[@]} -eq 0 ]] || { echo "FAIL: ready not empty"; exit 1; }
         [[ ${#AWG_PEERS_CHECKED[@]} -eq 0 ]] || { echo "FAIL: checked not empty"; exit 1; }
         echo "OK"
     '

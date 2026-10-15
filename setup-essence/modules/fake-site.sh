@@ -8,14 +8,14 @@ setup_fake_site() {
         box_top
         box_center "Сайт-заглушка"
         box_mid
-        menu_item 1 "Simple Web Templates (by eGamesAPI)" GREEN
-        menu_item 2 "SNI Templates (by distillium)" GREEN
-        menu_item 3 "Nothing Templates (by prettyleaf)" GREEN
-        menu_item 4 "Случайный" NC
+        menu_item 1 "Simple Web Templates (by eGamesAPI)" CYAN
+        menu_item 2 "SNI Templates (by distillium)" CYAN
+        menu_item 3 "Nothing Templates (by prettyleaf)" CYAN
+        menu_item 4 "Случайный" CYAN
         menu_item 0 "Отмена" NC
         box_bot
         echo ""
-        if ! IFS= read -rp "  Выберите действие [Enter = 4]: " SOURCE_CHOICE; then
+        if ! IFS= read -rp "  Выберите источник сайта [Enter = 4]: " SOURCE_CHOICE; then
             return 1
         fi
         SOURCE_CHOICE="${SOURCE_CHOICE%$'\r'}"
@@ -61,48 +61,43 @@ _randomhtml() {
     fi
 
     info "Скачиваю шаблон..."
-    local attempt=0
+    local RETRY_CHOICE
     while ! wget --timeout=15 --tries=2 --show-progress "$selected_url" -O main.zip; do
-        attempt=$((attempt + 1))
-        if [[ $attempt -ge 3 ]]; then
-            warn "Не удалось скачать шаблон после 3 попыток."
-            while true; do
-                echo ""
-                box_top
-                box_center "Ошибка загрузки сайта"
-                box_mid
-                box_line " Не удалось скачать выбранный шаблон."
-                menu_item 1 "Попробовать снова" GREEN
-                menu_item 2 "Выбрать другой шаблон" YELLOW
-                menu_item 0 "Отмена" NC
-                box_bot
-                echo ""
-                if ! IFS= read -rp "  Выберите действие: " RETRY_CHOICE; then
+        warn "Не удалось скачать выбранный шаблон."
+        while true; do
+            echo ""
+            box_top
+            box_center "Ошибка загрузки сайта"
+            box_mid
+            box_line " Не удалось скачать выбранный шаблон."
+            box_mid
+            menu_item 1 "Попробовать снова" CYAN
+            menu_item 2 "Выбрать другой шаблон" CYAN
+            menu_item 0 "Отмена" NC
+            box_bot
+            echo ""
+            if ! IFS= read -rp "  Выберите действие: " RETRY_CHOICE; then
+                rm -f main.zip
+                cd "$_saved_dir"
+                return 1
+            fi
+            RETRY_CHOICE="${RETRY_CHOICE%$'\r'}"
+            case "$RETRY_CHOICE" in
+                1) break ;;
+                2)
+                    rm -f main.zip
+                    cd "$_saved_dir"
+                    setup_fake_site "$target_dir"
+                    return $?
+                    ;;
+                0)
                     rm -f main.zip
                     cd "$_saved_dir"
                     return 1
-                fi
-                RETRY_CHOICE="${RETRY_CHOICE%$'\r'}"
-                case "$RETRY_CHOICE" in
-                    1) attempt=0; break ;;
-                    2)
-                        rm -f main.zip
-                        cd "$_saved_dir"
-                        setup_fake_site "$target_dir"
-                        return $?
-                        ;;
-                    0)
-                        rm -f main.zip
-                        cd "$_saved_dir"
-                        return 1
-                        ;;
-                    *) warn "Неверный выбор." ;;
-                esac
-            done
-            continue
-        fi
-        warn "Ошибка загрузки, повтор через 3 сек... $attempt/3"
-        sleep 3
+                    ;;
+                *) warn "Неверный выбор." ;;
+            esac
+        done
     done
 
     if ! unzip -o main.zip &>/dev/null; then

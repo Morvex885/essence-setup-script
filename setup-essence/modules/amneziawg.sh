@@ -26,49 +26,6 @@ _awg_fail() {
     return 1
 }
 
-_awg_apt_lock_menu() {
-    while true; do
-        echo ""
-        warn "apt lock не освободился за 60с"
-        echo -e "  ${CYAN}Процессы, блокирующие apt:${NC}"
-        local pids pid pname
-        pids=$(fuser /var/lib/dpkg/lock-frontend 2>/dev/null || true)
-        for pid in $pids; do
-            pname=$(ps -p "$pid" -o comm= 2>/dev/null || echo "???")
-            echo -e "    PID ${YELLOW}${pid}${NC}  ${pname}"
-        done
-        echo ""
-        echo -e "  ${GREEN}1)${NC} Завершить процесс и продолжить"
-        echo -e "  ${CYAN}2)${NC} Подождать ещё 60с"
-        echo -e "  ${RED}3)${NC} Прервать установку AWG"
-        echo ""
-        read -rp "  Выберите: " _choice
-        case "$_choice" in
-            1)
-                for pid in $pids; do
-                    pname=$(ps -p "$pid" -o comm= 2>/dev/null || echo "???")
-                    if confirm_yn "Завершить процесс ${pname} (PID ${pid})?"; then
-                        kill "$pid" 2>/dev/null || true
-                        sleep 3
-                        if kill -0 "$pid" 2>/dev/null; then
-                            warn "Процесс не завершился, отправляю SIGKILL..."
-                            kill -9 "$pid" 2>/dev/null || true
-                            sleep 2
-                        fi
-                    fi
-                done
-                if ! fuser /var/lib/dpkg/lock-frontend &>/dev/null; then
-                    success "apt lock освобождён"
-                    return 0
-                fi
-                warn "Lock всё ещё занят"
-                ;;
-            2) return 0 ;;
-            3) return 1 ;;
-            *) warn "Неверный выбор." ;;
-        esac
-    done
-}
 
 _awg_apt_wait() {
     local max_wait="${AWG_APT_MAX_WAIT:-60}" waited=0
@@ -77,7 +34,7 @@ _awg_apt_wait() {
         sleep 2
         waited=$((waited + 2))
         if [[ "$waited" -ge "$max_wait" ]]; then
-            _awg_apt_lock_menu || return 1
+            _apt_lock_menu || return 1
             waited=0
         fi
     done
@@ -139,7 +96,7 @@ _awg_validate_managed_paths() {
     case "$AWG_MIHOMO_CONFIG" in /*/mihomo/config.yaml) ;; *) _awg_fail "Небезопасный путь config.yaml: $AWG_MIHOMO_CONFIG"; return 1 ;; esac
     case "$AWG_CLIENT_CONFIG" in /*/mihomo/client-config.txt) ;; *) _awg_fail "Небезопасный путь client-config.txt: $AWG_CLIENT_CONFIG"; return 1 ;; esac
     case "$AWG_SYSCTL_FILE" in /*/sysctl.d/99-vpn-speedup.conf) ;; *) _awg_fail "Небезопасный путь sysctl: $AWG_SYSCTL_FILE"; return 1 ;; esac
-    case "$AWG_TMP_BASE" in /*) ;; *) _awg_fail "Временный путь AWG должен быть абсолютным: $AWG_TMP_BASE"; return 1 ;; esac
+    case "$AWG_TMP_BASE" in /*) ;; *) _awg_fail "Временный путь AmneziaWG должен быть абсолютным: $AWG_TMP_BASE"; return 1 ;; esac
 }
 
 _awg_preflight() {
@@ -169,7 +126,7 @@ _awg_preflight() {
 
     kernel=$(uname -r)
     modprobe xt_TPROXY || {
-        _awg_fail "Ядро не поддерживает TPROXY (xt_TPROXY). AWG через Mihomo невозможен."
+        _awg_fail "Ядро не поддерживает TPROXY (xt_TPROXY). AmneziaWG через Mihomo невозможен."
         return 1
     }
     AWG_MIHOMO_BIN="$mihomo_bin"
@@ -357,7 +314,7 @@ _awg_bootstrap_dependencies() {
             headers_installed=1
         fi
         _awg_apt_wait || {
-            _awg_fail "Установка headers прервана во время ожидания apt lock."
+            _awg_fail "Установка заголовочных файлов ядра прервана во время ожидания блокировки apt."
             return 1
         }
         if (( headers_installed )); then
@@ -367,7 +324,7 @@ _awg_bootstrap_dependencies() {
                 return 1
             }
         else
-            info "Устанавливаю headers текущего ядра: $AWG_HEADERS_PKG..."
+            info "Устанавливаю заголовочные файлы текущего ядра: $AWG_HEADERS_PKG..."
             DEBIAN_FRONTEND=noninteractive apt-get install -y "$AWG_HEADERS_PKG" || {
                 _awg_fail "Не удалось установить пакет $AWG_HEADERS_PKG."
                 return 1
@@ -384,7 +341,7 @@ _awg_bootstrap_dependencies() {
         return 1
     }
     (( need_gpg )) && success "gnupg установлен"
-    (( need_headers )) && success "Headers для ядра $AWG_KERNEL готовы"
+    (( need_headers )) && success "Заголовочные файлы для ядра $AWG_KERNEL готовы"
     return 0
 }
 
@@ -499,7 +456,7 @@ _awg_ensure_packages() {
 
     _awg_install_repository || { _awg_repo_abort; return 1; }
     _awg_apt_wait || {
-        _awg_fail "Установка AWG прервана во время ожидания apt lock."
+        _awg_fail "Установка AmneziaWG прервана во время ожидания apt lock."
         _awg_repo_abort
         return 1
     }
@@ -521,7 +478,7 @@ _awg_ensure_packages() {
     done
 
     _awg_apt_wait || {
-        _awg_fail "Установка AWG прервана во время ожидания apt lock."
+        _awg_fail "Установка AmneziaWG прервана во время ожидания apt lock."
         _awg_repo_abort
         return 1
     }
@@ -1096,22 +1053,22 @@ awg_menu() {
         if _awg_packages_installed; then
             box_line " Пакеты: установлены" " Пакеты: ${GREEN}установлены${NC}"
         else
-            box_line " Пакеты: не установлены" " Пакеты: ${RED}не установлены${NC}"
+            box_line " Пакеты: не установлены" " Пакеты: ${DIM}не установлены${NC}"
         fi
         if [[ -f "$AWG_CONF" ]]; then
             box_line " Конфигурация: создана" " Конфигурация: ${GREEN}создана${NC}"
         else
-            box_line " Конфигурация: не создана" " Конфигурация: ${RED}не создана${NC}"
+            box_line " Конфигурация: не создана" " Конфигурация: ${DIM}не создана${NC}"
         fi
         if systemctl is-active --quiet awg-quick@awg0 2>/dev/null && ip link show awg0 >/dev/null 2>&1; then
-            box_line " Сервис: активен (awg0)" " Сервис: ${GREEN}активен (awg0)${NC}"
+            box_line " Служба: работает (awg0)" " Служба: ${GREEN}работает (awg0)${NC}"
         else
-            box_line " Сервис: не активен" " Сервис: ${YELLOW}не активен${NC}"
+            box_line " Служба: остановлена" " Служба: ${DIM}остановлена${NC}"
         fi
         box_mid
         menu_item 1 "Установить / обновить AmneziaWG 3.1" GREEN
-        menu_item 2 "Добавить клиента" CYAN
-        menu_item 3 "Удалить клиента" YELLOW
+        menu_item 2 "Добавить клиента" GREEN
+        menu_item 3 "Удалить клиента" RED
         menu_item 4 "Удалить AmneziaWG" RED
         menu_item 0 "Назад" NC
         box_bot
@@ -1123,7 +1080,7 @@ awg_menu() {
         case "$AWG_CHOICE" in
             1) install_awg || warn "Установка AmneziaWG завершилась ошибкой. Повторите действие из меню." ;;
             2) add_awg_peer || warn "Не удалось добавить клиента AmneziaWG." ;;
-            3) remove_awg_peer || warn "Не удалось удалить клиента AmneziaWG." ;;
+            3) remove_awg_peer ;;
             4) uninstall_awg || warn "Не удалось удалить AmneziaWG." ;;
             0) return 0 ;;
             *) warn "Неверный выбор." ;;
@@ -1173,8 +1130,8 @@ _awg_gen_params() {
 install_awg() {
     echo ""
     info "AmneziaWG — это WireGuard с обфускацией трафика против DPI."
-    info "Сейчас будет установлен AWG-сервер."
-    info "Peers (клиенты) создаются отдельно — через меню или remote-control."
+    info "Сейчас будет установлен сервер AmneziaWG."
+    info "Клиенты AmneziaWG создаются отдельно — через меню или remote-control."
     echo ""
 
     local reinstall=0 old_port="" tx_dir stage_dir old_umask
@@ -1190,13 +1147,14 @@ install_awg() {
 
     info "Предварительная проверка системы..."
     _awg_preflight || return 1
-    success "Preflight пройден: ${AWG_ARCH}, ядро ${AWG_KERNEL}, PPA suite ${AWG_APT_SUITE}"
+    success "Проверка пройдена: ${AWG_ARCH}, ядро ${AWG_KERNEL}, репозиторий PPA ${AWG_APT_SUITE}"
 
     DEFAULT_PORT=$(_awg_gen_free_port 30000 50000) || {
         _awg_fail "Не удалось найти свободный UDP-порт."
         return 1
     }
-    read -rp "UDP порт для AmneziaWG [Enter = $DEFAULT_PORT]: " AWG_PORT
+    IFS= read -rp "  UDP-порт для AmneziaWG [Enter = $DEFAULT_PORT]: " AWG_PORT || return 1
+    AWG_PORT="${AWG_PORT%$'\r'}"
     [[ -z "$AWG_PORT" ]] && AWG_PORT="$DEFAULT_PORT"
     while true; do
         if ! [[ "$AWG_PORT" =~ ^[0-9]+$ ]] || (( AWG_PORT < 1 || AWG_PORT > 65535 )); then
@@ -1206,14 +1164,16 @@ install_awg() {
         else
             break
         fi
-        read -rp "Новый порт: " AWG_PORT
+        IFS= read -rp "  Новый порт: " AWG_PORT || return 1
+        AWG_PORT="${AWG_PORT%$'\r'}"
         [[ -z "$AWG_PORT" ]] && { warn "Порт не указан"; return 1; }
     done
 
     AWG_SUBNET="10.10.8"
     AWG_SERVER_IP="${AWG_SUBNET}.1"
     DEFAULT_DNS="1.1.1.1, 1.0.0.1"
-    read -rp "DNS для клиентов [Enter = $DEFAULT_DNS]: " AWG_DNS
+    IFS= read -rp "  DNS для клиентов [Enter = $DEFAULT_DNS]: " AWG_DNS || return 1
+    AWG_DNS="${AWG_DNS%$'\r'}"
     [[ -z "$AWG_DNS" ]] && AWG_DNS="$DEFAULT_DNS"
     _awg_gen_params
 
@@ -1345,10 +1305,10 @@ install_awg() {
     echo -e "  Подсеть:     ${CYAN}${AWG_SUBNET}.0/24${NC}"
     echo ""
 
-    if confirm_yn "Создать peer сейчас?" Y; then
+    if confirm_yn "Создать клиента AmneziaWG сейчас?" Y; then
         add_awg_peer
     else
-        info "Peers можно создать позже через меню или remote-control."
+        info "Клиентов AmneziaWG можно создать позже через меню или remote-control."
     fi
 }
 
@@ -1366,7 +1326,8 @@ add_awg_peer() {
     client_num=$(ls "$AWG_DIR/clients/" 2>/dev/null | wc -l)
     client_num=$(( client_num + 1 ))
 
-    read -rp "Имя клиента [Enter = client${client_num}]: " CLIENT_NAME
+    IFS= read -rp "  Имя клиента [Enter = client${client_num}]: " CLIENT_NAME || return 1
+    CLIENT_NAME="${CLIENT_NAME%$'\r'}"
     [[ -z "$CLIENT_NAME" ]] && CLIENT_NAME="client${client_num}"
 
     if ! [[ "$CLIENT_NAME" =~ ^[a-zA-Z0-9_-]+$ ]]; then
@@ -1381,7 +1342,7 @@ add_awg_peer() {
         rm -rf "/etc/mihomo/amnezia/${CLIENT_NAME}"
     fi
 
-    _awg_create_peer "$CLIENT_NAME" || { warn "Не удалось создать peer."; return; }
+    _awg_create_peer "$CLIENT_NAME" || { warn "Не удалось создать клиента AmneziaWG."; return 1; }
 
     local client_dir="/etc/mihomo/amnezia/${CLIENT_NAME}"
     echo ""
@@ -1389,7 +1350,7 @@ add_awg_peer() {
     echo ""
     echo -e "  Имя:     ${CYAN}$CLIENT_NAME${NC}"
     echo -e "  IP:      ${CYAN}$PEER_IP${NC}"
-    echo -e "  Конфиг AWG:    ${CYAN}$client_dir/${CLIENT_NAME}.conf${NC}"
+    echo -e "  Конфиг AmneziaWG: ${CYAN}$client_dir/${CLIENT_NAME}.conf${NC}"
     echo -e "  Конфиг Mihomo: ${CYAN}$client_dir/mihomo-proxy.yaml${NC}"
     echo -e "  QR-код:        ${CYAN}$client_dir/qr.png${NC}"
     echo ""
@@ -1401,7 +1362,7 @@ add_awg_peer() {
         echo ""
     fi
 
-    echo -e "  ${CYAN}Конфиг клиента AWG:${NC}"
+    echo -e "  ${CYAN}Конфиг клиента AmneziaWG:${NC}"
     echo -e "${DIM}"
     echo "$PEER_CONF"
     echo -e "${NC}"
@@ -1435,7 +1396,7 @@ add_awg_peer_auto() {
 
     _awg_create_peer "$CLIENT_NAME" || return 1
 
-    echo "AWG peer $CLIENT_NAME создан (IP: $PEER_IP)" >&2
+    echo "Клиент AmneziaWG $CLIENT_NAME создан (IP: $PEER_IP)" >&2
     return 0
 }
 
@@ -1450,36 +1411,22 @@ remove_awg_peer() {
     fi
 
     # Список клиентов
-    local clients_dir="/etc/mihomo/amnezia"
-    local clients=()
+    local clients_dir="$AWG_CLIENTS_DIR"
+    local clients=() labels=() c c_ip d
     if [[ -d "$clients_dir" ]]; then
         for d in "$clients_dir"/*/; do
             [[ -d "$d" ]] && clients+=("$(basename "$d")")
         done
     fi
 
-    if [[ ${#clients[@]} -eq 0 ]]; then
-        warn "Нет клиентов для удаления."
-        return
-    fi
 
-    echo -e "  ${CYAN}Клиенты:${NC}"
-    local i=1
     for c in "${clients[@]}"; do
-        local c_ip
         c_ip=$(grep -A3 "# peer: $c" "$AWG_CONF" 2>/dev/null | grep 'AllowedIPs' | awk '{print $3}' | cut -d'/' -f1)
-        echo -e "  ${GREEN}${i})${NC} $c ${DIM}${c_ip}${NC}"
-        i=$((i + 1))
+        labels+=("$c  $c_ip")
     done
-    echo ""
-
-    read -rp "Номер клиента для удаления [1-${#clients[@]}]: " CLIENT_NUM
-    if ! [[ "$CLIENT_NUM" =~ ^[0-9]+$ ]] || (( CLIENT_NUM < 1 || CLIENT_NUM > ${#clients[@]} )); then
-        warn "Неверный выбор."
-        return
-    fi
-
-    local client_name="${clients[$((CLIENT_NUM - 1))]}"
+    MENU_SELECT_EMPTY="Нет клиентов для удаления"
+    menu_select "Удаление клиента AmneziaWG" "Выберите клиента" "${labels[@]}" || return 1
+    local client_name="${clients[$((MENU_SELECT_INDEX - 1))]}"
 
     warn "Будет удалён клиент: $client_name"
     confirm_yn "Вы уверены?" || { info "Отменено."; return; }
@@ -1487,7 +1434,7 @@ remove_awg_peer() {
     # Удаляем peer из серверного конфига
     if grep -q "# peer: $client_name" "$AWG_CONF"; then
         sed -i "/# peer: $client_name/,/^$/d" "$AWG_CONF"
-        success "Peer удалён из серверного конфига"
+        success "Клиент AmneziaWG удалён из серверного конфига"
     fi
 
     # Применяем без перезапуска
@@ -1510,28 +1457,39 @@ remove_awg_peer() {
 remove_awg_peer_by_name() {
     local client_name="$1"
     [[ -z "$client_name" ]] && { echo "Имя не указано" >&2; return 1; }
-    [[ ! -f "$AWG_CONF" ]] && { echo "AWG не установлен" >&2; return 1; }
+    [[ ! -f "$AWG_CONF" ]] && { echo "AmneziaWG не установлен" >&2; return 1; }
 
-    local clients_dir="/etc/mihomo/amnezia"
-    if [[ ! -d "${clients_dir}/${client_name}" ]]; then
-        echo "Peer $client_name не найден" >&2
-        return 1
+    local clients_dir="$AWG_CLIENTS_DIR"
+    if [[ ! -d "${clients_dir}/${client_name}" ]] &&
+        ! grep -qxF "# peer: $client_name" "$AWG_CONF"; then
+        return 0
     fi
 
     # Удаляем peer из серверного конфига
-    if grep -q "# peer: $client_name" "$AWG_CONF"; then
-        sed -i "/# peer: $client_name/,/^$/d" "$AWG_CONF"
+    if grep -qxF "# peer: $client_name" "$AWG_CONF"; then
+        sed -i "/^# peer: $client_name$/,/^$/d" "$AWG_CONF" || return 1
     fi
 
-    # Применяем без перезапуска
-    awg syncconf awg0 <(awg-quick strip "$AWG_CONF") 2>/dev/null || {
-        systemctl restart awg-quick@awg0 2>/dev/null
+    # Не передавать пустую конфигурацию, если awg-quick strip завершился ошибкой.
+    local stripped
+    stripped=$(umask 077; mktemp) || return 1
+    if ! awg-quick strip "$AWG_CONF" > "$stripped"; then
+        rm -f "$stripped"
+        return 1
+    fi
+    if ! awg syncconf awg0 "$stripped" 2>/dev/null; then
+        rm -f "$stripped"
+        systemctl restart awg-quick@awg0 2>/dev/null || return 1
         sleep 2
-    }
+        systemctl is-active --quiet awg-quick@awg0 || return 1
+    else
+        rm -f "$stripped"
+    fi
 
     # Удаляем папку клиента
-    rm -rf "${clients_dir}/${client_name}"
-    echo "Peer $client_name удалён" >&2
+    rm -rf "${clients_dir}/${client_name}" || return 1
+    echo "Клиент AmneziaWG $client_name удалён" >&2
+    return 0
 }
 
 # ── Удаление ─────────────────────────────────────────────────────────────────

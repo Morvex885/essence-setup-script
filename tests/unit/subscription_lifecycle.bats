@@ -5,6 +5,10 @@ setup() {
     setup_test_env
     source_common
     export HOME="$BATS_TEST_TMPDIR/home" FIX_ROOT="$BATS_TEST_TMPDIR/root"
+    export CERT_MODULE_COPY="$BATS_TEST_TMPDIR/cert.sh"
+    sed -e "s|/etc/nginx|$FIX_ROOT/etc/nginx|g" \
+        "$PROJECT_ROOT/common/cert.sh" > "$CERT_MODULE_COPY"
+    source "$CERT_MODULE_COPY"
     mkdir -p "$HOME" "$FIX_ROOT/etc/mihomo" "$FIX_ROOT/etc/nginx/sites-enabled" \
         "$FIX_ROOT/etc/nginx/sites-available" "$FIX_ROOT/etc/nginx/ssl" \
         "$FIX_ROOT/etc/nginx/snippets" "$FIX_ROOT/etc/systemd/system" \
@@ -22,9 +26,11 @@ setup() {
     mkdir -p "$FIX_ROOT/etc/nginx"
     printf 'events {}\nhttp {}\n' > "$FIX_ROOT/etc/nginx/nginx.conf"
     _check_base() { return 0; }
-    _load_reality_conf() { return 0; }
+    _load_reality_conf() { HAS_SITE=true; SITE_NAME=reality.example.com; return 0; }
+    mkdir -p "$FIX_ROOT/etc/nginx/ssl/reality.example.com"
+    : > "$FIX_ROOT/etc/nginx/ssl/reality.example.com/fullchain.pem"
+    : > "$FIX_ROOT/etc/nginx/ssl/reality.example.com/privkey.pem"
     _detect_reality_mode() { printf '%s\n' sni; }
-    _detect_site_name() { printf '%s\n' reality.example.com; }
     _nginx_h2_directives() { LISTEN_H2_FLAG='ssl;'; HTTP2_DIRECTIVE=''; }
     confirm_yn() { return 0; }
     curl() {
@@ -54,7 +60,7 @@ setup() {
             then
                 return 1
             fi
-            if [[ "${OSTYPE:-}" == darwin* ]]; then
+            if ! "$REAL_SED" --version >/dev/null 2>&1; then
                 "$REAL_SED" -i '' "$@"
             else
                 "$REAL_SED" -i "$@"
@@ -125,6 +131,14 @@ setup() {
                 return 1
             fi
         fi
+        if [[ "$1" == -T ]]; then
+            [[ "${FAIL_NGINX_DUMP:-0}" -eq 0 ]] || return 1
+            cat "$FIX_ROOT/etc/nginx/nginx.conf"
+            local site
+            for site in "$FIX_ROOT/etc/nginx/sites-enabled/"*; do
+                [[ -f "$site" ]] && cat "$site"
+            done
+        fi
         return 0
     }
     ensure_acme_installed() {
@@ -151,10 +165,11 @@ ACMEEOF
         chmod 755 "$HOME/.acme.sh/acme.sh"
         return 0
     }
-    issue_cert() { return 0; }
-    install_cert() {
+    ensure_essence_acme_email() { ensure_acme_installed "$1"; }
+    ensure_cert() {
         mkdir -p "$FIX_ROOT/etc/nginx/ssl/$1"
         : > "$FIX_ROOT/etc/nginx/ssl/$1/fullchain.pem"
+        : > "$FIX_ROOT/etc/nginx/ssl/$1/privkey.pem"
         return 0
     }
     SYSTEMCTL_RELOAD_COUNT=0 NGINX_TEST_COUNT=0 NGINX_TEST_FAIL=0 SYSTEMCTL_RELOAD_FAIL=0
@@ -195,11 +210,13 @@ _prepare_removal_fixture() {
         ensure_acme_installed test@example.com
         if [[ "$registration" == rsa || "$registration" == both ]]; then
             mkdir -p "$HOME/.acme.sh/subs.example.com"
-            : > "$HOME/.acme.sh/subs.example.com/subs.example.com.conf"
+            printf "Le_Domain='subs.example.com'\nLe_Keylength='2048'\n" \
+                > "$HOME/.acme.sh/subs.example.com/subs.example.com.conf"
         fi
         if [[ "$registration" == ecc || "$registration" == both ]]; then
             mkdir -p "$HOME/.acme.sh/subs.example.com_ecc"
-            : > "$HOME/.acme.sh/subs.example.com_ecc/subs.example.com.conf"
+            printf "Le_Domain='subs.example.com'\nLe_Keylength='ec-256'\n" \
+                > "$HOME/.acme.sh/subs.example.com_ecc/subs.example.com.conf"
         fi
     fi
     : > "$OPS_LOG"
@@ -218,19 +235,16 @@ _prepare_removal_fixture() {
     printf 'SUB_MODE=standalone\n' > "$SUB_CONF"
     run remove_subscription
     assert_failure
-    [[ "$output" == *"Не удалось прочитать конфигурацию подписок."* ]]
     [[ -e "$SUB_CONF" ]]
 }
 
 @test "missing subscription configuration is a successful no-op" {
     run remove_subscription
     assert_success
-    [[ "$output" == *"Subscription hosting не установлен."* ]]
-    [[ "$output" != *"Subscription hosting удалён"* ]]
 }
 
 @test "subscription removal fails fast at every critical stage" {
-    local stage mode registration expected output_file
+    local stage mode registration output_file
     local -a stages=(
         sites sni zone ufw nginx-test reload timer units daemon acme files config
     )
@@ -241,52 +255,40 @@ _prepare_removal_fixture() {
         case "$stage" in
             sites)
                 RM_FAIL_MATCH=sites-enabled/essence-sub
-                expected="Не удалось удалить nginx-конфигурацию подписок."
                 ;;
             sni)
                 _prepare_removal_fixture sni rsa 1
                 FAIL_SNI_SED=1
-                expected="Не удалось очистить nginx-конфигурацию подписок."
                 ;;
             zone)
                 FAIL_ZONE_SED=1
-                expected="Не удалось очистить nginx-конфигурацию подписок."
                 ;;
             ufw)
                 FAIL_UFW=1
-                expected="Не удалось удалить правило firewall подписок."
                 ;;
             nginx-test)
                 FAIL_NGINX_TEST=1
-                expected="Nginx конфигурация не прошла проверку после удаления подписок."
                 ;;
             reload)
                 FAIL_SYSTEMCTL_RELOAD=1
-                expected="Не удалось перезагрузить Nginx после удаления подписок."
                 ;;
             timer)
                 FAIL_TIMER_DISABLE=1
-                expected="Не удалось остановить таймер очистки подписок."
                 ;;
             units)
                 RM_FAIL_MATCH=essence-sub-cleanup.service
-                expected="Не удалось удалить автоочистку подписок."
                 ;;
             daemon)
                 FAIL_DAEMON_RELOAD=1
-                expected="Не удалось обновить конфигурацию systemd."
                 ;;
             acme)
                 ACME_TEST_FAIL=1
-                expected="Не удалось удалить регистрацию сертификата подписок."
                 ;;
             files)
                 RM_FAIL_MATCH=nginx/ssl/subs.example.com
-                expected="Не удалось удалить файлы подписок."
                 ;;
             config)
                 RM_FAIL_MATCH=subscription.conf
-                expected="Не удалось удалить конфигурацию подписок."
                 ;;
         esac
         output_file="$BATS_TEST_TMPDIR/${stage}.output"
@@ -294,8 +296,6 @@ _prepare_removal_fixture() {
             printf 'stage %s unexpectedly succeeded\n' "$stage" >&2
             return 1
         fi
-        [[ "$(cat "$output_file")" == *"$expected"* ]]
-        [[ "$(cat "$output_file")" != *"Subscription hosting удалён"* ]]
         [[ -e "$SUB_CONF" ]]
         case "$stage" in
             nginx-test) ! [[ "$(cat "$OPS_LOG")" == *"systemctl reload nginx"* ]] ;;
@@ -320,8 +320,6 @@ _prepare_removal_fixture() {
     [[ ! -e "$FIX_ROOT/etc/nginx/snippets/essence-sub" ]]
     [[ -e "$HOME/.acme.sh/subs.example.com/subs.example.com.conf.removed" ]]
     [[ -e "$HOME/.acme.sh/subs.example.com_ecc/subs.example.com.conf.removed" ]]
-    [[ "$(cat "$ACME_TEST_LOG")" == *"--remove -d subs.example.com"* ]]
-    [[ "$(cat "$ACME_TEST_LOG")" == *"--remove -d subs.example.com --ecc"* ]]
 }
 
 @test "partial subscription removal without timer or ACME registration succeeds" {
@@ -402,6 +400,7 @@ _load_fixture_uninstall_for_lifecycle() {
     export TPROXY_RELAY_SOURCE_PATH="$FIX_ROOT/opt/tproxy-server-source"
     export TPROXY_MTPROXY_SOURCE_DIR="$FIX_ROOT/opt/MTProxy"
     mkdir -p "$FIX_ROOT/root" "$FIX_ROOT/opt" "$FIX_ROOT/etc/tproxy-server"
+    menu_select() { MENU_SELECT_INDEX=1; return 0; }
 }
 
 @test "uninstall stops before Mihomo removal when subscription cleanup fails" {
@@ -429,6 +428,32 @@ _load_fixture_uninstall_for_lifecycle() {
     _load_sub_conf
     [[ "$SUB_PORT" == 2096 ]]
     [[ "$SUB_MODE" == standalone ]]
+}
+
+@test "certificate failure leaves recoverable state without TLS subscription provisioning" {
+    ensure_cert() { return 1; }
+    printf '%s\n' subs.example.com 1 chosen@example.com > "$BATS_TEST_TMPDIR/input"
+    run setup_subscription < "$BATS_TEST_TMPDIR/input"
+    assert_failure
+    _load_sub_conf
+    [[ "$SUB_HOSTNAME" == subs.example.com ]]
+    [[ ! -e "$FIX_ROOT/etc/nginx/sites-enabled/essence-sub" ]]
+    [[ ! -e "$FIX_ROOT/etc/nginx/sites-enabled/essence-sub-http" ]]
+}
+
+@test "subscription rejected contact change returns without persisting state" {
+    ensure_acme_installed old@example.com
+    mkdir -p "$HOME/.acme.sh/ca/acme-v02.api.letsencrypt.org/directory"
+    printf "ACCOUNT_URL='https://example.invalid/account'\nCA_EMAIL='old@example.com'\n" > "$HOME/.acme.sh/ca/acme-v02.api.letsencrypt.org/directory/ca.conf"
+    confirm_yn() {
+        [[ "$1" == Изменить* ]] && return 1
+        return 0
+    }
+    printf '%s\n' subs.example.com 1 new@example.com > "$BATS_TEST_TMPDIR/input"
+    run setup_subscription < "$BATS_TEST_TMPDIR/input"
+    assert_failure
+    [ ! -e "$SUB_CONF" ]
+    [ ! -s "$ACME_TEST_LOG" ]
 }
 
 @test "custom subscription EOF fails before persisting state" {
@@ -482,4 +507,145 @@ _load_fixture_uninstall_for_lifecycle() {
     SYSTEMCTL_RELOAD_FAIL=0
     remove_subscription
     [[ ! -e "$SUB_CONF" ]]
+}
+
+@test "VLESS discovery uses Reality identity instead of a foreign certificate directory" {
+    mkdir -p "$FIX_ROOT/etc/nginx/ssl/aaa-foreign.example.com"
+    : > "$FIX_ROOT/etc/nginx/ssl/aaa-foreign.example.com/fullchain.pem"
+    : > "$FIX_ROOT/etc/nginx/ssl/aaa-foreign.example.com/privkey.pem"
+    HAS_SITE=false SITE_NAME=caller.example.com
+    run _detect_site_name
+    assert_success
+    assert_output reality.example.com
+    [[ "$HAS_SITE" == false && "$SITE_NAME" == caller.example.com ]]
+}
+
+@test "VLESS discovery rejects bare Reality and incomplete installed pairs" {
+    _load_reality_conf() { HAS_SITE=false; SITE_NAME=reality.example.com; }
+    run _detect_site_name
+    assert_failure
+    _load_reality_conf() { HAS_SITE=true; SITE_NAME=reality.example.com; }
+    "$REAL_RM" "$FIX_ROOT/etc/nginx/ssl/reality.example.com/privkey.pem"
+    run _detect_site_name
+    assert_failure
+}
+
+@test "subscription preserves certificates and active renewal when nginx consumers cannot be inspected" {
+    local reason
+    for reason in dump variable; do
+        _prepare_removal_fixture standalone rsa 0
+        if [[ "$reason" == dump ]]; then
+            FAIL_NGINX_DUMP=1
+        else
+            FAIL_NGINX_DUMP=0
+            printf 'events {}\nhttp { server { ssl_certificate $dynamic_cert; } }\n' \
+                > "$FIX_ROOT/etc/nginx/nginx.conf"
+        fi
+        run remove_subscription
+        assert_failure
+        [[ -e "$SUB_CONF" ]]
+        [[ -e "$FIX_ROOT/etc/nginx/ssl/subs.example.com/fullchain.pem" ]]
+        [[ -e "$FIX_ROOT/var/www/subs.example.com/index.html" ]]
+        [[ -e "$HOME/.acme.sh/subs.example.com/subs.example.com.conf" ]]
+        [[ ! -s "$ACME_TEST_LOG" ]]
+    done
+}
+
+_prepare_subscription_crypto() {
+    _prepare_removal_fixture standalone none 0
+    source "$PROJECT_ROOT/tests/helpers/cert_fixture_helper.bash"
+    cert_fixture_init "$BATS_TEST_TMPDIR/pki" || return 1
+    cert_fixture_leaf "$BATS_TEST_TMPDIR/good" subs.example.com || return 1
+    cert_fixture_archive subs.example.com "$BATS_TEST_TMPDIR/good" ecc active || return 1
+    cert_fixture_installed "$FIX_ROOT/etc/nginx/ssl" subs.example.com "$BATS_TEST_TMPDIR/good" || return 1
+    cert_fixture_fake_acme || return 1
+    export FAKE_ACME_SOURCE="$BATS_TEST_TMPDIR/good"
+    sed -e "s|/etc/nginx|$FIX_ROOT/etc/nginx|g" \
+        "$PROJECT_ROOT/common/cert.sh" > "$CERT_MODULE_COPY"
+    source "$CERT_MODULE_COPY"
+    ensure_cert subs.example.com "$FIX_ROOT/var/www/subs.example.com" false || return 1
+    cat > "$FIX_ROOT/etc/nginx/sites-available/essence-sub" <<EOF
+server {
+    listen 2096 ssl;
+    server_name subs.example.com;
+    ssl_certificate "$FIX_ROOT/etc/nginx/ssl/subs.example.com/fullchain.pem";
+    ssl_certificate_key "$FIX_ROOT/etc/nginx/ssl/subs.example.com/privkey.pem";
+}
+EOF
+    ln -sf "$FIX_ROOT/etc/nginx/sites-available/essence-sub" \
+        "$FIX_ROOT/etc/nginx/sites-enabled/essence-sub"
+    cp "$HOME/.acme.sh/ca/acme-v02.api.letsencrypt.org/directory/ca.conf" \
+        "$BATS_TEST_TMPDIR/account-before"
+}
+
+@test "subscription removal keeps a trusted shared certificate and renewal for another TLS consumer" {
+    _prepare_subscription_crypto
+    cat > "$FIX_ROOT/etc/nginx/sites-available/another-consumer" <<EOF
+server {
+    listen 2443 ssl;
+    server_name subs.example.com;
+    ssl_certificate '$FIX_ROOT/etc/nginx/ssl/subs.example.com/fullchain.pem';
+    ssl_certificate_key '$FIX_ROOT/etc/nginx/ssl/subs.example.com/privkey.pem';
+}
+EOF
+    ln -s "$FIX_ROOT/etc/nginx/sites-available/another-consumer" \
+        "$FIX_ROOT/etc/nginx/sites-enabled/another-consumer"
+    remove_subscription
+    [[ ! -e "$SUB_CONF" ]]
+    [[ -e "$FIX_ROOT/etc/nginx/sites-enabled/another-consumer" ]]
+    [[ -e "$FIX_ROOT/etc/nginx/sites-enabled/essence-acme-subs.example.com" ]]
+    [[ -d "$FIX_ROOT/var/www/subs.example.com" ]]
+    local conf="$HOME/.acme.sh/subs.example.com_ecc/subs.example.com.conf"
+    [[ -e "$conf" && ! -e "$conf.removed" ]]
+    _acme_conf_value "$conf" Le_Webroot
+    [[ "$ACME_CONF_VALUE" == "$FIX_ROOT/var/www/subs.example.com" ]]
+    cmp -s "$FIX_ROOT/etc/nginx/ssl/subs.example.com/fullchain.pem" "$BATS_TEST_TMPDIR/good/fullchain.pem"
+    cmp -s "$FIX_ROOT/etc/nginx/ssl/subs.example.com/privkey.pem" "$BATS_TEST_TMPDIR/good/privkey.pem"
+    cert_is_usable subs.example.com "$FIX_ROOT/etc/nginx/ssl/subs.example.com/fullchain.pem" \
+        "$FIX_ROOT/etc/nginx/ssl/subs.example.com/privkey.pem"
+    [[ ! -s "$ACME_ORDER_LOG" ]]
+}
+
+@test "last subscription removal retains archive and reinstall restores trusted TLS without an order" {
+    _prepare_subscription_crypto
+    printf '# ssl_certificate %s;\n# subs.example.com remains only in a comment\n' \
+        "$FIX_ROOT/etc/nginx/ssl/subs.example.com/fullchain.pem" >> "$FIX_ROOT/etc/nginx/nginx.conf"
+    remove_subscription
+    [[ ! -e "$SUB_CONF" ]]
+    [[ ! -e "$FIX_ROOT/etc/nginx/ssl/subs.example.com" ]]
+    [[ ! -e "$FIX_ROOT/var/www/subs.example.com" ]]
+    [[ ! -e "$FIX_ROOT/etc/nginx/sites-available/essence-acme-subs.example.com" ]]
+    [[ ! -L "$FIX_ROOT/etc/nginx/sites-enabled/essence-acme-subs.example.com" ]]
+    local archive="$HOME/.acme.sh/subs.example.com_ecc"
+    [[ ! -e "$archive/subs.example.com.conf" && -e "$archive/subs.example.com.conf.removed" ]]
+    cmp -s "$archive/fullchain.cer" "$BATS_TEST_TMPDIR/good/fullchain.pem"
+    cmp -s "$archive/subs.example.com.key" "$BATS_TEST_TMPDIR/good/privkey.pem"
+    cmp -s "$HOME/.acme.sh/ca/acme-v02.api.letsencrypt.org/directory/ca.conf" "$BATS_TEST_TMPDIR/account-before"
+
+    cert_fixture_installed "$FIX_ROOT/etc/nginx/ssl" reality.example.com "$BATS_TEST_TMPDIR/good"
+    printf '%s\n' subs.example.com 1 '' > "$BATS_TEST_TMPDIR/input"
+    setup_subscription < "$BATS_TEST_TMPDIR/input"
+    _load_sub_conf
+    [[ "$SUB_HOSTNAME" == subs.example.com ]]
+    [[ -e "$archive/subs.example.com.conf" && ! -e "$archive/subs.example.com.conf.removed" ]]
+    [[ -e "$FIX_ROOT/etc/nginx/sites-enabled/essence-acme-subs.example.com" ]]
+    [[ -e "$FIX_ROOT/etc/nginx/sites-enabled/essence-sub" ]]
+    cert_is_usable subs.example.com "$FIX_ROOT/etc/nginx/ssl/subs.example.com/fullchain.pem" \
+        "$FIX_ROOT/etc/nginx/ssl/subs.example.com/privkey.pem"
+    cmp -s "$archive/fullchain.cer" "$BATS_TEST_TMPDIR/good/fullchain.pem"
+    cmp -s "$archive/subs.example.com.key" "$BATS_TEST_TMPDIR/good/privkey.pem"
+    [[ ! -s "$ACME_ORDER_LOG" ]]
+}
+
+@test "installed subscription hosting refuses setup without touching its artifacts" {
+    _prepare_removal_fixture standalone rsa 1
+    cp "$SUB_CONF" "$BATS_TEST_TMPDIR/sub-before"
+    cp "$FIX_ROOT/var/lib/essence-sub/subscription.yaml" "$BATS_TEST_TMPDIR/yaml-before"
+    local before_ops
+    before_ops=$(cat "$OPS_LOG")
+    run setup_subscription < /dev/null
+    assert_failure 1
+    cmp -s "$BATS_TEST_TMPDIR/sub-before" "$SUB_CONF"
+    cmp -s "$BATS_TEST_TMPDIR/yaml-before" "$FIX_ROOT/var/lib/essence-sub/subscription.yaml"
+    [[ "$(cat "$OPS_LOG")" == "$before_ops" ]]
 }

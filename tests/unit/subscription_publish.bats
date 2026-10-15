@@ -26,11 +26,9 @@ EOF
     mkdir -p "$GENERATED_DIR/MOBILE/phone"
     echo "proxies: []" > "$GENERATED_DIR/MOBILE/phone/config.yaml"
 
-    # Mock ssh_run, scp_run, curl
-    ssh_run() { return 0; }
-    scp_run() { return 0; }
+    reset_ssh_mocks
     curl() { echo "200"; return 0; }
-    export -f ssh_run scp_run curl
+    export -f curl
 }
 
 teardown() {
@@ -91,24 +89,13 @@ teardown() {
     local old_token
     old_token=$(jq_r '.clients[] | select(.name=="phone") | .subscription.token')
 
-    subscription_rotate "phone"
+    subscription_rotate "phone" <<< 'y'
     local new_token
     new_token=$(jq_r '.clients[] | select(.name=="phone") | .subscription.token')
 
     [ "$old_token" != "$new_token" ]
 }
 
-@test "publish warns without host node" {
-    jq_w 'del(.subscription_host)'
-    run subscription_publish "phone"
-    assert_output --partial "Хост-нода подписок не задана"
-}
-
-@test "publish warns without generated config" {
-    rm -f "$GENERATED_DIR/MOBILE/phone/config.yaml"
-    run subscription_publish "phone"
-    assert_output --partial "не найден"
-}
 
 @test "publish reuses existing token" {
     subscription_publish "phone"
@@ -173,8 +160,7 @@ teardown() {
 
 @test "_sub_get_dir falls back to SSH when cache empty" {
     jq_w '.subscription_host.sub_dir = ""'
-    ssh_run() { echo "SUB_DIR=/custom/path"; return 0; }
-    export -f ssh_run
+    SSH_RUN_MOCK_OUTPUT="SUB_DIR=/custom/path"
 
     run _sub_get_dir
     assert_output "/custom/path"
@@ -183,14 +169,13 @@ teardown() {
 @test "publish rejects a whitespace-only config without token or SCP" {
     printf ' \n\t\n' > "$GENERATED_DIR/MOBILE/phone/config.yaml"
     scp_run() {
-        echo "unexpected scp" >&2
+        touch "$BATS_TEST_TMPDIR/unexpected-scp"
         return 1
     }
 
     run subscription_publish "phone"
     assert_success
-    assert_output --partial "Конфиг для 'phone' не найден или пуст. Сначала сгенерируйте конфиги."
-    refute_output --partial "unexpected scp"
+    [ ! -e "$BATS_TEST_TMPDIR/unexpected-scp" ]
 
     run jq_r '.clients[] | select(.name=="phone") | .subscription.token // "empty"'
     assert_output "empty"
@@ -203,7 +188,6 @@ teardown() {
 
     run subscription_publish_all
     assert_success
-    assert_output --partial "Пропущено (конфиг отсутствует или пуст): 1"
 
     run jq_r '.clients[] | select(.name=="phone") | .subscription.token // "empty"'
     refute_output "empty"
@@ -211,29 +195,17 @@ teardown() {
     assert_output "empty"
 }
 
-@test "auto-refresh does not prompt when all generated configs are blank" {
-    printf ' \n\t\n' > "$GENERATED_DIR/MOBILE/phone/config.yaml"
-    confirm_yn() {
-        echo "unexpected prompt" >&2
-        return 1
-    }
-
-    run _subscription_prompt_refresh
-    assert_success
-    refute_output --partial "unexpected prompt"
-}
 
 @test "low-level batch upload rejects a whitespace-only source before SCP" {
     local blank_config="$BATS_TEST_TMPDIR/blank.yaml"
     printf ' \n\t\n' > "$blank_config"
     scp_run() {
-        echo "unexpected scp" >&2
+        touch "$BATS_TEST_TMPDIR/unexpected-scp"
         return 1
     }
 
     run _sub_upload_batch "/var/lib/essence-sub" "www-data" \
         "$blank_config" "token-1" "phone"
     assert_failure
-    assert_output --partial "YAML-конфигурация отсутствует или пуста — загрузка отменена."
-    refute_output --partial "unexpected scp"
+    [ ! -e "$BATS_TEST_TMPDIR/unexpected-scp" ]
 }

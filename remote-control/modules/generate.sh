@@ -13,10 +13,10 @@ edit_template() {
         box_mid
         if [[ ${#templates[@]} -eq 0 ]]; then
             box_line " Нет шаблонов" " ${DIM}Нет шаблонов${NC}"
+            box_mid
         else
             for (( i=0; i<${#templates[@]}; i++ )); do
-                box_line " $((i+1))) ${templates[$i]}" \
-                    " ${GREEN}$((i+1)))${NC} ${templates[$i]}"
+                menu_item "$((i+1))" "${templates[$i]}" CYAN
             done
         fi
         menu_item n "Создать новый шаблон" GREEN
@@ -24,14 +24,15 @@ edit_template() {
         box_bot
         echo ""
         local TPL_CHOICE
-        if ! IFS= read -rp "  Выберите: " TPL_CHOICE; then
+        if ! IFS= read -rp "  Выберите шаблон: " TPL_CHOICE; then
             return 1
         fi
         TPL_CHOICE="${TPL_CHOICE%$'\r'}"
         local template="" source=""
         mkdir -p "$TEMPLATES_DIR" || return 1
         if [[ "$TPL_CHOICE" == n || "$TPL_CHOICE" == N ]]; then
-            read -rp "Имя нового шаблона (без .yaml): " TPL_NAME
+            IFS= read -rp "  Имя нового шаблона (без .yaml): " TPL_NAME || return 1
+            TPL_NAME="${TPL_NAME%$'\r'}"
             if [[ -z "$TPL_NAME" || ! "$TPL_NAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
                 warn "Имя может содержать только буквы, цифры, точку, - и _"
                 return 1
@@ -85,9 +86,9 @@ generate_menu() {
             box_line " Нет групп" " ${DIM}Нет групп${NC}"
         fi
         box_mid
-        menu_item g "По группе" GREEN
-        menu_item a "Всем клиентам" GREEN
-        menu_item t "Редактировать шаблон" YELLOW
+        menu_item g "По группе" CYAN
+        menu_item a "Всем клиентам" CYAN
+        menu_item t "Редактировать шаблон" CYAN
         menu_item 0 "Назад" NC
         box_bot
         echo ""
@@ -105,12 +106,41 @@ generate_menu() {
     done
 }
 
+GENERATE_CLIENT_OK=()
+GENERATE_CLIENT_SKIPPED=()
+GENERATE_CLIENT_FAILED=()
+GENERATE_NODE_OK=()
+GENERATE_NODE_FAILED=()
+
+_generate_reset_results() {
+    GENERATE_CLIENT_OK=()
+    GENERATE_CLIENT_SKIPPED=()
+    GENERATE_CLIENT_FAILED=()
+    GENERATE_NODE_OK=()
+    GENERATE_NODE_FAILED=()
+}
+
+_generate_summary() {
+    review_frame "Итог генерации" \
+        "Клиенты: готово — ${#GENERATE_CLIENT_OK[@]}; пропущено — ${#GENERATE_CLIENT_SKIPPED[@]}; ошибка — ${#GENERATE_CLIENT_FAILED[@]}" \
+        "Готово: ${GENERATE_CLIENT_OK[*]:-нет}" \
+        "Пропущено: ${GENERATE_CLIENT_SKIPPED[*]:-нет}" \
+        "Ошибка: ${GENERATE_CLIENT_FAILED[*]:-нет}" \
+        "Ноды: синхронизировано — ${#GENERATE_NODE_OK[@]}; ошибка — ${#GENERATE_NODE_FAILED[@]}" \
+        "Синхронизировано: ${GENERATE_NODE_OK[*]:-нет}" \
+        "Ошибка нод: ${GENERATE_NODE_FAILED[*]:-нет}" \
+        "Конфиги: $GENERATED_DIR/"
+    [[ -n "$(jq_r '.subscription_host.node // empty')" ]] && info "Для публикации откройте «Подписки»."
+    if [[ ${#GENERATE_CLIENT_FAILED[@]} -gt 0 || ${#GENERATE_NODE_FAILED[@]} -gt 0 ]]; then return 1; fi
+    [[ ${#GENERATE_CLIENT_SKIPPED[@]} -eq 0 ]] || warn "Часть клиентов пропущена."
+    return 0
+}
+
 generate_by_group() {
+    _generate_reset_results
     _reset_node_cache
-    echo ""
-    echo -e "  Выберите группу для генерации:"
-    if ! select_group; then return; fi
-    _generate_group "$SELECTED_GROUP"
+    select_group || return 1
+    _generate_group "$SELECTED_GROUP" || true
 
     # Синхронизация per-client users на нодах группы
     local _group_nodes=()
@@ -125,19 +155,21 @@ generate_by_group() {
         $_already || _group_nodes+=("$_cn")
     done < <(jq_r --arg g "$SELECTED_GROUP" '.clients[] | select(.group==$g and .inherit_nodes_from_group==false) | .nodes // [] | .[]')
     if [[ ${#_group_nodes[@]} -gt 0 ]]; then
-        _sync_listeners_on_nodes "${_group_nodes[@]}" || return 1
+        _sync_listeners_on_nodes "${_group_nodes[@]}" || true
     fi
 
-    _subscription_prompt_refresh
+    _generate_summary
 }
 
 generate_all() {
+    _generate_reset_results
     _reset_node_cache
     echo ""
     groups_list
     if [[ ${#GRP_LIST[@]} -eq 0 ]]; then
         warn "Нет групп."
-        return
+        _generate_summary
+        return $?
     fi
 
     # Собрать все уникальные ноды и клиентов по всем группам заранее,
@@ -186,31 +218,25 @@ generate_all() {
 
     # Генерация (0 SSH — всё в кеше)
     for g in "${GRP_LIST[@]}"; do
-        _generate_group "$g"
+        _generate_group "$g" || true
     done
 
     # Синхронизация per-client users на нодах
-    if ! _sync_listeners_on_nodes "${all_unique_nodes[@]}"; then
-        return 1
-    fi
-
-    echo ""
-    success "Все конфиги обновлены."
-    info "Конфиги: $GENERATED_DIR/"
-    _subscription_prompt_refresh
+    _sync_listeners_on_nodes "${all_unique_nodes[@]}" || true
+    _generate_summary
 }
 # ─── Кеш конфигов нод ──────────────────────────────────────────────────────
 NODE_CONFIG_CACHE_KEYS=()
 NODE_CONFIG_CACHE_VALUES=()
 NODE_CONFIG_FAILED=()
-SCRIPTS_UPLOADED=()
+SCRIPTS_READY=()
 AWG_PEERS_CHECKED=()
 
 _reset_node_cache() {
     NODE_CONFIG_CACHE_KEYS=()
     NODE_CONFIG_CACHE_VALUES=()
     NODE_CONFIG_FAILED=()
-    SCRIPTS_UPLOADED=()
+    SCRIPTS_READY=()
     AWG_PEERS_CHECKED=()
 }
 
@@ -345,13 +371,13 @@ _ensure_all_awg_peers() {
         fi
 
         # Создаём все недостающие peers за один SSH
-        info "Создаю AWG peers на $nname: ${missing[*]}..."
-        if ! array_contains "$nname" "${SCRIPTS_UPLOADED[@]}"; then
-            if ! upload_scripts; then
-                warn "$nname: не удалось загрузить скрипты; peers не изменены."
+        info "Создаю клиентов AmneziaWG на $nname: ${missing[*]}..."
+        if ! array_contains "$nname" "${SCRIPTS_READY[@]}"; then
+            if ! ensure_remote_scripts_current; then
+                warn "$nname: не удалось подготовить скрипты; клиенты AmneziaWG не изменены."
                 continue
             fi
-            SCRIPTS_UPLOADED+=("$nname")
+            SCRIPTS_READY+=("$nname")
         fi
 
         local peers_cmd="source ${REMOTE_DIR}/modules/amneziawg.sh"
@@ -360,7 +386,7 @@ _ensure_all_awg_peers() {
         done
 
         ssh_run -- "$peers_cmd" || {
-            warn "Ошибка при создании AWG peers на $nname"
+            warn "Ошибка при создании клиентов AmneziaWG на $nname"
         }
 
         # Инвалидируем кеш — конфиг ноды изменился (новые peers)
@@ -396,7 +422,11 @@ _generate_group() {
 
     if [[ -z "$template" ]]; then
         warn "Шаблон '$tpl_name' не найден для группы $group. Поместите файл в $TEMPLATES_DIR/"
-        return
+        local skipped
+        while IFS= read -r skipped; do
+            [[ -n "$skipped" ]] && GENERATE_CLIENT_SKIPPED+=("$skipped")
+        done < <(jq_r --arg g "$group" '.clients[] | select(.group==$g) | .name')
+        return 0
     fi
 
     # Ноды группы
@@ -412,7 +442,7 @@ _generate_group() {
 
     if [[ ${#group_clients[@]} -eq 0 ]]; then
         warn "В группе $group нет клиентов — пропускаю."
-        return
+        return 0
     fi
 
     info "Группа $group ($tpl_name)..."
@@ -446,10 +476,15 @@ _generate_group() {
 
     # Фаза 2: батч AWG peers (до загрузки конфигов)
     _ensure_all_awg_peers "${#client_names[@]}" "${client_names[@]}" "${unique_nodes[@]}"
+    _prefetch_node_configs "${unique_nodes[@]}"
 
     # Обрабатываем шаблон
     local processed
-    processed=$(process_template "$template" "$group")
+    if ! processed=$(process_template "$template" "$group"); then
+        GENERATE_CLIENT_FAILED+=("${client_names[@]}")
+        return 1
+    fi
+    local rc=0
 
     # Фаза 4: генерация клиентов (0 SSH)
     for client_line in "${group_clients[@]}"; do
@@ -470,13 +505,20 @@ _generate_group() {
         local client_dir="$GENERATED_DIR/$group/$client_name"
         if ! mkdir -p "$client_dir"; then
             warn "$client_name — config.yaml не сгенерирован"
+            GENERATE_CLIENT_FAILED+=("$client_name")
+            rc=1
             continue
         fi
 
         # Получаем прокси из кеша
         local proxy_entries=""
         if [[ -n "$client_nodes" ]]; then
-            proxy_entries=$(_fetch_proxies_for_client "$client_name" "$client_group" "$client_nodes")
+            if ! proxy_entries=$(_fetch_proxies_for_client "$client_name" "$client_group" "$client_nodes"); then
+                warn "$client_name — не удалось получить все подключения; конфиг сохранён без изменений"
+                GENERATE_CLIENT_FAILED+=("$client_name")
+                rc=1
+                continue
+            fi
         fi
 
         # Проверяем уникальность имён прокси
@@ -486,9 +528,10 @@ _generate_group() {
             if [[ -n "$dup_names" ]]; then
                 warn "$client_name: повторяющиеся имена прокси:" >&2
                 while IFS= read -r dn; do
-                    warn "  '$dn' — задайте алиас через P → Переименовать" >&2
+                    warn "  '$dn' — задайте псевдоним через «Подключения» → «Переименовать»" >&2
                 done <<< "$dup_names"
                 warn "$client_name — пропущен (повторяющиеся имена прокси)" >&2
+                GENERATE_CLIENT_SKIPPED+=("$client_name")
                 continue
             fi
         fi
@@ -496,6 +539,8 @@ _generate_group() {
         local config=""
         if ! config=$(_render_client_config "$processed" "$proxy_entries"); then
             warn "$client_name — config.yaml не сгенерирован"
+            GENERATE_CLIENT_FAILED+=("$client_name")
+            rc=1
             continue
         fi
 
@@ -503,26 +548,36 @@ _generate_group() {
         local config_tmp=""
         if ! config_tmp=$(umask 077; mktemp "$client_dir/.config.yaml.XXXXXX"); then
             warn "$client_name — config.yaml не сгенерирован"
+            GENERATE_CLIENT_FAILED+=("$client_name")
+            rc=1
             continue
         fi
         if ! cat -s > "$config_tmp" <<< "$config"; then
             rm -f "$config_tmp"
             warn "$client_name — config.yaml не сгенерирован"
+            GENERATE_CLIENT_FAILED+=("$client_name")
+            rc=1
             continue
         fi
         if ! grep -q '[^[:space:]]' "$config_tmp"; then
             rm -f "$config_tmp"
             warn "$client_name — config.yaml не сгенерирован"
+            GENERATE_CLIENT_FAILED+=("$client_name")
+            rc=1
             continue
         fi
         if ! mv "$config_tmp" "$client_dir/config.yaml"; then
             rm -f "$config_tmp"
             warn "$client_name — config.yaml не сгенерирован"
+            GENERATE_CLIENT_FAILED+=("$client_name")
+            rc=1
             continue
         fi
 
+        GENERATE_CLIENT_OK+=("$client_name")
         success "$client_name — сгенерирован"
     done
+    return "$rc"
 }
 
 _fetch_proxies_for_client() {
@@ -530,7 +585,7 @@ _fetch_proxies_for_client() {
     local client_group="$2"
     local nodes_csv="$3"
 
-    local all_proxies=""
+    local all_proxies="" rc=0
     local -a node_names _cc allowed
     local nname _p conn_name
 
@@ -567,7 +622,7 @@ _fetch_proxies_for_client() {
 
         # Конфиг из кеша
         local remote_config
-        remote_config=$(_get_node_config "$nname") || continue
+        remote_config=$(_get_node_config "$nname") || { rc=1; continue; }
 
         # Парсим proxy блоки
         local proxy_block
@@ -648,7 +703,8 @@ _fetch_proxies_for_client() {
         fi
     done
 
-    [[ -n "$all_proxies" ]] && echo "$all_proxies" | awk '/^  - name:/ && NR>1 {print ""} 1'
+    [[ -z "$all_proxies" ]] || echo "$all_proxies" | awk '/^  - name:/ && NR>1 {print ""} 1'
+    return "$rc"
 }
 
 # ─── Синхронизация users в listener'ах на нодах ──────────────────────────────
@@ -720,13 +776,13 @@ _sync_node_listeners() {
     vless_grpc_users="${vless_grpc_users%$'\n'}"
     hy2_users="${hy2_users%$'\n'}"
 
-    # Загружаем скрипты если ещё не загружены
-    if ! array_contains "$nname" "${SCRIPTS_UPLOADED[@]}"; then
-        if ! upload_scripts; then
-            warn "$nname: не удалось загрузить скрипты; listeners не изменены."
+    # Подготовка скриптов один раз за операцию
+    if ! array_contains "$nname" "${SCRIPTS_READY[@]}"; then
+        if ! ensure_remote_scripts_current; then
+            warn "$nname: не удалось подготовить скрипты; входные подключения не изменены."
             return 1
         fi
-        SCRIPTS_UPLOADED+=("$nname")
+        SCRIPTS_READY+=("$nname")
     fi
 
     # Формируем SSH-команду: sync каждого listener'а + restart
@@ -747,10 +803,10 @@ _sync_node_listeners() {
     sync_cmd+=" && systemctl restart mihomo"
 
     if ssh_run -- "$sync_cmd" 2>/dev/null; then
-        success "$nname — listeners обновлены"
+        success "$nname — входные подключения обновлены"
         return 0
     fi
-    warn "$nname — не удалось обновить listeners"
+    warn "$nname — не удалось обновить входные подключения"
     return 1
 }
 
@@ -759,14 +815,16 @@ _sync_listeners_on_nodes() {
     local nodes=("$@") nname rc=0
 
     echo ""
-    info "Синхронизация users на нодах..."
+    info "Синхронизация пользователей на нодах..."
 
     for nname in "${nodes[@]}"; do
-        if array_contains "$nname" "${NODE_CONFIG_FAILED[@]}"; then
+        [[ -n "$nname" ]] || continue
+        if array_contains "$nname" "${NODE_CONFIG_FAILED[@]}" || ! _sync_node_listeners "$nname"; then
+            GENERATE_NODE_FAILED+=("$nname")
             rc=1
-            continue
+        else
+            GENERATE_NODE_OK+=("$nname")
         fi
-        _sync_node_listeners "$nname" || rc=1
     done
     return "$rc"
 }

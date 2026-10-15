@@ -78,18 +78,23 @@ _build_hy2_exit_yaml() {
 _ask_exit_hy2() {
     local proxy_name="$1"
     echo "" >&2
-    read -rp "Домен или IP exit-ноды: " C_SERVER
-    [[ -z "$C_SERVER" ]] && { warn "Сервер не указан"; return; }
-    read -rp "Порт: " C_PORT
-    [[ -z "$C_PORT" ]] && { warn "Порт не указан"; return; }
-    read -rp "Пароль: " C_PASS
-    [[ -z "$C_PASS" ]] && { warn "Пароль не указан"; return; }
-    read -rp "SNI [Enter = www.google.de]: " C_SNI
+    IFS= read -rp "  Домен или IP выходной ноды: " C_SERVER || return 1
+    C_SERVER="${C_SERVER%$'\r'}"
+    [[ -z "$C_SERVER" ]] && { warn "Сервер не указан" >&2; return 1; }
+    IFS= read -rp "  Порт: " C_PORT || return 1
+    C_PORT="${C_PORT%$'\r'}"
+    [[ -z "$C_PORT" ]] && { warn "Порт не указан" >&2; return 1; }
+    IFS= read -rp "  Пароль: " C_PASS || return 1
+    C_PASS="${C_PASS%$'\r'}"
+    [[ -z "$C_PASS" ]] && { warn "Пароль не указан" >&2; return 1; }
+    IFS= read -rp "  SNI [Enter = www.google.de]: " C_SNI || return 1
+    C_SNI="${C_SNI%$'\r'}"
     C_SNI="${C_SNI:-www.google.de}"
-    read -rp "Obfs salamander пароль [Enter = нет]: " C_OBFS
+    IFS= read -rp "  Пароль obfs salamander [Enter = нет]: " C_OBFS || return 1
+    C_OBFS="${C_OBFS%$'\r'}"
 
     echo "" >&2
-    info "Exit: $C_SERVER:$C_PORT Hysteria2" >&2
+    info "Выход: $C_SERVER:$C_PORT Hysteria2" >&2
 
     _build_hy2_exit_yaml "$proxy_name" "$C_SERVER" "$C_PORT" "$C_PASS" "$C_SNI" "true" "$C_OBFS"
 }

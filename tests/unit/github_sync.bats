@@ -7,10 +7,80 @@ setup() {
     source_module 'github-config.sh'
     export REMOTE="$BATS_TEST_TMPDIR/remote.git"
     export GITHUB_REMOTE="$REMOTE" GITHUB_STORE="$BATS_TEST_TMPDIR/store.git" GITHUB_SESSIONS_DIR="$BATS_TEST_TMPDIR/sessions"
-    export GIT_CONFIG_GLOBAL="$BATS_TEST_TMPDIR/gitconfig"
+    export GIT_CONFIG_GLOBAL="$BATS_TEST_TMPDIR/gitconfig" GIT_CONFIG_NOSYSTEM=1
+    export GITHUB_OWNER=test-owner GITHUB_REPO_NAME=config
+    export FAKE_GH_GLOBAL_LOGIN="$BATS_TEST_TMPDIR/global-gh-login"
+    export FAKE_GH_LOG="$BATS_TEST_TMPDIR/gh-calls"
+    printf 'other-owner\n' > "$FAKE_GH_GLOBAL_LOGIN"
+    mkdir -p "$BATS_TEST_TMPDIR/bin" \
+        "$CONFIG_DIR/credentials/gh/test-owner" \
+        "$CONFIG_DIR/credentials/gh/other-owner"
+    printf 'test-owner\n' > "$CONFIG_DIR/credentials/gh/test-owner/hosts.yml"
+    printf 'other-owner\n' > "$CONFIG_DIR/credentials/gh/other-owner/hosts.yml"
+    cat > "$BATS_TEST_TMPDIR/bin/gh" <<'EOF'
+#!/bin/bash
+printf '%s|%s\n' "${GH_CONFIG_DIR:-global}" "$*" >> "$FAKE_GH_LOG"
+if [[ -n "${GH_CONFIG_DIR:-}" ]]; then
+    [[ -f "$GH_CONFIG_DIR/hosts.yml" ]] || exit 1
+    login=$(cat "$GH_CONFIG_DIR/hosts.yml") || exit 1
+else
+    login=$(cat "$FAKE_GH_GLOBAL_LOGIN") || exit 1
+fi
+case "$1 $2" in
+    'api user')
+        printf '%s\n' "$login"
+        ;;
+    'repo view')
+        [[ "$3" == "$login/"* ]] || exit 1
+        printf '{"visibility":"PRIVATE"}\n'
+        ;;
+    'auth git-credential')
+        [[ "$3" == get ]] || exit 1
+        while IFS= read -r field && [[ -n "$field" ]]; do :; done
+        printf 'username=%s\npassword=fixture-%s\n' "$login" "$login"
+        ;;
+    'auth token')
+        requested=
+        while (( $# )); do
+            if [[ "$1" == --user ]]; then requested="$2"; break; fi
+            shift
+        done
+        [[ "$requested" == "$login" ]] || exit 1
+        printf 'fixture-%s\n' "$login"
+        ;;
+    'auth login')
+        [[ -n "${GH_CONFIG_DIR:-}" ]] || exit 1
+        if [[ " $* " == *' --with-token '* ]]; then
+            IFS= read -r token || [[ -n "$token" ]]
+            login="${token#fixture-}"
+            [[ "$login" =~ ^[A-Za-z0-9-]+$ ]] || exit 1
+            printf '%s\n' "$login" > "$GH_CONFIG_DIR/hosts.yml"
+        else
+            exit 1
+        fi
+        ;;
+    *)
+        exit 1
+        ;;
+esac
+EOF
+    chmod +x "$BATS_TEST_TMPDIR/bin/gh"
+    export PATH="$BATS_TEST_TMPDIR/bin:$PATH" GH_BIN="$BATS_TEST_TMPDIR/bin/gh"
+    cat > "$BATS_TEST_TMPDIR/bin/wrong-credential" <<'EOF'
+#!/bin/bash
+printf 'username=other-owner\npassword=wrong-global-secret\n'
+EOF
+    chmod +x "$BATS_TEST_TMPDIR/bin/wrong-credential"
+    git config --global credential.helper "!$BATS_TEST_TMPDIR/bin/wrong-credential"
     git init --bare -b main "$REMOTE" >/dev/null
 }
 teardown() { teardown_test_env; }
+_map_github_bare() {
+    local owner="$1" remote="$2"
+    git config --global "url.file://$remote.insteadOf" \
+        "https://github.com/$owner/config.git"
+}
+
 
 _file_mode() {
     case "${OSTYPE:-}" in
@@ -944,6 +1014,14 @@ EOF
     expected=$(git --git-dir="$target" rev-parse refs/heads/main)
     git -C "$seed" commit --allow-empty -m descendant >/dev/null
     git -C "$seed" push origin main >/dev/null
+    local remote_head
+    remote_head=$(git --git-dir="$REMOTE" rev-parse refs/heads/main) || return 1
+    _map_github_bare other-owner "$REMOTE" || return 1
+    git --git-dir="$target" remote set-url origin \
+        https://github.com/other-owner/config.git || return 1
+    export GIT_ALLOW_PROTOCOL=file
+    printf 'test-owner\n' > "$FAKE_GH_GLOBAL_LOGIN"
+    rm "$CONFIG_DIR/credentials/gh/test-owner/hosts.yml"
     export GITHUB_ACCOUNT_SWITCH_DIR="$BATS_TEST_TMPDIR/account-switch"
     export GITHUB_ACCOUNT_SWITCH_MARKER="$GITHUB_ACCOUNT_SWITCH_DIR/transaction.json"
     export GITHUB_ACCOUNT_SWITCH_OLD_REPO=test-owner/config
@@ -953,4 +1031,78 @@ EOF
     _github_account_switch_write_marker push_unknown "$expected" true false false || return 1
     github_account_switch_recover || return 1
     [[ "$(jq -r '.phase' "$GITHUB_ACCOUNT_SWITCH_MARKER")" == target_committed ]] || return 1
+    [[ "$(git --git-dir="$target" rev-parse refs/remotes/origin/main)" == "$remote_head" ]] || return 1
+    [[ "$(git --git-dir="$REMOTE" rev-parse refs/heads/main)" == "$remote_head" ]] || return 1
+    [[ "$(cat "$FAKE_GH_GLOBAL_LOGIN")" == test-owner ]] || return 1
+    [[ "$(cat "$CONFIG_DIR/credentials/gh/other-owner/hosts.yml")" == other-owner ]] || return 1
+    [[ "$(cat "$FAKE_GH_LOG")" == *"$CONFIG_DIR/credentials/gh/other-owner|api user"* ]]
+}
+
+@test "HTTPS credential fill ignores wrong global Git helper and inherited gh token" {
+    local credentials
+    export GH_TOKEN=fixture-other-owner GITHUB_TOKEN=fixture-other-owner GH_HOST=elsewhere.invalid
+    credentials=$(printf 'protocol=https\nhost=github.com\n\n' |
+        _github_transport_git test-owner 15 credential fill) || return 1
+    [[ "$credentials" == *'username=test-owner'* ]] || return 1
+    [[ "$credentials" == *'password=fixture-test-owner'* ]] || return 1
+    [[ "$credentials" != *'other-owner'* ]] || return 1
+
+    credentials=$(printf 'protocol=https\nhost=github.com\n\n' |
+        git credential fill) || return 1
+    [[ "$credentials" == *'username=other-owner'* ]] || return 1
+    [[ "$credentials" == *'password=wrong-global-secret'* ]] || return 1
+    [[ "$(cat "$FAKE_GH_GLOBAL_LOGIN")" == other-owner ]] || return 1
+    [[ "$(cat "$CONFIG_DIR/credentials/gh/test-owner/hosts.yml")" == test-owner ]]
+}
+
+@test "explicit account migration sends new commits only to the selected bare remote" {
+    local new_remote="$BATS_TEST_TMPDIR/other-account.git" old_head new_head
+    git init --bare -b main "$new_remote" >/dev/null || return 1
+    _map_github_bare test-owner "$REMOTE" || return 1
+    _map_github_bare other-owner "$new_remote" || return 1
+    export GIT_ALLOW_PROTOCOL=file
+    GITHUB_REMOTE=https://github.com/test-owner/config.git
+    _seed_live_revision 1 || return 1
+    old_head=$(git --git-dir="$REMOTE" rev-parse refs/heads/main) || return 1
+    github_config_close || return 1
+
+    GITHUB_OWNER=other-owner
+    GITHUB_REMOTE=https://github.com/other-owner/config.git
+    github_sync_init || return 1
+    [[ "$(git --git-dir="$GITHUB_STORE" config --get remote.origin.url)" == "$GITHUB_REMOTE" ]] || return 1
+    [[ "$(git --git-dir="$REMOTE" rev-parse refs/heads/main)" == "$old_head" ]] || return 1
+    ! git --git-dir="$new_remote" show-ref --verify --quiet refs/heads/main || return 1
+    printf '{"storage_version":1,"encryption":"none","revision":2}\n' \
+        > "$GITHUB_WORKTREE/storage.json"
+    github_sync_flush || return 1
+    new_head=$(git --git-dir="$new_remote" rev-parse refs/heads/main) || return 1
+    [[ "$new_head" != "$old_head" ]] || return 1
+    _assert_remote_revision "$new_remote" 2 || return 1
+    [[ "$(git --git-dir="$REMOTE" rev-parse refs/heads/main)" == "$old_head" ]] || return 1
+    _assert_remote_revision "$REMOTE" 1 || return 1
+    [[ "$(cat "$FAKE_GH_GLOBAL_LOGIN")" == other-owner ]]
+}
+
+@test "unauthorized migration cannot alter either bare remote or cached source" {
+    local new_remote="$BATS_TEST_TMPDIR/other-account.git" old_head cached_head
+    git init --bare -b main "$new_remote" >/dev/null || return 1
+    _map_github_bare test-owner "$REMOTE" || return 1
+    _map_github_bare other-owner "$new_remote" || return 1
+    export GIT_ALLOW_PROTOCOL=file
+    GITHUB_REMOTE=https://github.com/test-owner/config.git
+    _seed_live_revision 1 || return 1
+    old_head=$(git --git-dir="$REMOTE" rev-parse refs/heads/main) || return 1
+    cached_head=$(git --git-dir="$GITHUB_STORE" rev-parse refs/heads/main) || return 1
+    github_config_close || return 1
+
+    printf 'test-owner\n' > "$FAKE_GH_GLOBAL_LOGIN"
+    rm "$CONFIG_DIR/credentials/gh/other-owner/hosts.yml"
+    GITHUB_OWNER=other-owner
+    GITHUB_REMOTE=https://github.com/other-owner/config.git
+    if github_sync_init; then return 1; fi
+    [[ "$(git --git-dir="$REMOTE" rev-parse refs/heads/main)" == "$old_head" ]] || return 1
+    [[ "$(git --git-dir="$GITHUB_STORE" rev-parse refs/heads/main)" == "$cached_head" ]] || return 1
+    [[ "$(git --git-dir="$GITHUB_STORE" config --get remote.origin.url)" == https://github.com/test-owner/config.git ]] || return 1
+    ! git --git-dir="$new_remote" show-ref --verify --quiet refs/heads/main || return 1
+    [[ "$(cat "$FAKE_GH_GLOBAL_LOGIN")" == test-owner ]]
 }

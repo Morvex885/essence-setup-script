@@ -46,6 +46,11 @@ pkg_name_for() {
         base64:apt|base64:dnf|base64:yum|base64:pacman|base64:zypper|\
         base64:apk|base64:brew|base64:termux)
             echo "coreutils" ;;
+        nft:apt)                                  echo "nftables" ;;
+        systemctl:apt)                            echo "systemd" ;;
+        useradd:apt)                              echo "passwd" ;;
+        id:apt)                                   echo "coreutils" ;;
+        runuser:apt)                              echo "util-linux" ;;
         *) echo "$bin" ;;
     esac
 }

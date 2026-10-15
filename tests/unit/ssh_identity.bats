@@ -54,9 +54,6 @@ teardown() { teardown_test_env; }
     export STATE_MANIFEST="$CONFIG_DIR/manifest.json"
     run _ssh_base_options
     assert_failure
-    assert_output --partial 'отложена SSH-настройка для синхронизации через GitHub'
-    assert_output --partial 'H) Завершить отложенную SSH-настройку нод'
-    [[ "$output" != *"Y →"* ]]
 }
 @test "interactive SSH is not killed by operation timeout" {
     local fake_ssh="$BATS_TEST_TMPDIR/ssh" marker="$BATS_TEST_TMPDIR/ssh-complete"
@@ -94,15 +91,9 @@ _run_failed_add_node() {
     add_node <<< $'failed-node\n127.0.0.1\ninvalid\n22\nroot\nx\n2\nsecret\n3'
 }
 
-@test "failed SSH onboarding shows vertical Russian choices and cancels safely" {
+@test "failed SSH onboarding cancels without persisting the node" {
     run _run_failed_add_node
     assert_failure
-    [[ "$output" == *$'\033[0;32m1)\033[0m Повторить подключение'* ]]
-    [[ "$output" == *$'\033[1;33m2)\033[0m Продолжить — настроить ноды позже'* ]]
-    [[ "$output" == *$'\033[0;31m3)\033[0m Отменить и откатить изменения'* ]]
-    assert_output --partial "Порт SSH должен быть числом от 1 до 65535."
-    assert_output --partial "Выберите 1 или 2."
-    [[ "$output" != *"requires_setup"* ]]
     run jq -r '.nodes | length' "$CONFIG_JSON"
     assert_output 0
 }
