@@ -25,8 +25,10 @@ hyperlink() {
 
 # Компонуемый EXIT cleanup для процессов, которые используют несколько модулей.
 _EXIT_CLEANUP_FUNCTIONS=()
+_EXIT_CLEANUP_SUBSHELL=$BASH_SUBSHELL
 _run_exit_cleanups() {
-    local exit_status=$? i cleanup
+    local exit_status=$? cleanup_subshell="$1" i cleanup
+    [[ "$cleanup_subshell" == "$_EXIT_CLEANUP_SUBSHELL" ]] || return "$exit_status"
     trap - EXIT
     for ((i = ${#_EXIT_CLEANUP_FUNCTIONS[@]} - 1; i >= 0; i--)); do
         cleanup="${_EXIT_CLEANUP_FUNCTIONS[$i]}"
@@ -38,11 +40,17 @@ _run_exit_cleanups() {
 register_exit_cleanup() {
     local cleanup="$1" existing
     declare -F "$cleanup" >/dev/null 2>&1 || return 1
+    if [[ "$_EXIT_CLEANUP_SUBSHELL" != "$BASH_SUBSHELL" ]]; then
+        _EXIT_CLEANUP_FUNCTIONS=()
+        _EXIT_CLEANUP_SUBSHELL=$BASH_SUBSHELL
+    fi
     for existing in "${_EXIT_CLEANUP_FUNCTIONS[@]}"; do
         [[ "$existing" == "$cleanup" ]] && return 0
     done
     _EXIT_CLEANUP_FUNCTIONS+=("$cleanup")
-    trap _run_exit_cleanups EXIT
+    # Bash 3.2 может уменьшить live BASH_SUBSHELL перед EXIT из $(...).
+    # Передаём владельца литералом, зафиксированным при регистрации.
+    trap "_run_exit_cleanups $_EXIT_CLEANUP_SUBSHELL" EXIT
 }
 
 # ─── Y/N подтверждение с валидацией ─────────────────────────────────────────

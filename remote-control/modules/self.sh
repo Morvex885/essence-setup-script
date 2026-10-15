@@ -38,6 +38,10 @@ _write_script_password() {
     fi
 }
 
+_remove_script_password() {
+    rm -f "$1"
+}
+
 check_script_password() {
     local passfile
     passfile=$(_script_pass_file)
@@ -108,10 +112,10 @@ set_script_password() {
                 if [[ "$_choice" == 2 ]]; then
                     review_frame "Удаление пароля запуска" "Пароль запуска remote-control будет удалён." "Локальные данные и SSH-ключи сохранятся."
                     confirm_yn "Убрать пароль запуска?" N || continue
-                    if state_action "script_password" rm -f "$passfile"; then
+                    if state_action "script_password" _remove_script_password "$passfile"; then
                         success "Пароль убран"
                     else
-                        warn "Не удалось удалить пароль."
+                        warn "Операция с паролем не завершена. Проверьте его состояние перед повтором."
                     fi
                     continue
                 fi
@@ -126,7 +130,7 @@ set_script_password() {
                 if state_action "script_password" _write_script_password "$passfile" "$_new"; then
                     success "Пароль сохранён"
                 else
-                    warn "Не удалось атомарно сохранить пароль."
+                    warn "Операция с паролем не завершена. Проверьте его состояние перед повтором."
                 fi
                 _old=""; _new=""; _confirm=""
                 ;;

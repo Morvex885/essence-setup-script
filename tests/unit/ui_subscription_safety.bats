@@ -178,3 +178,58 @@ teardown() { teardown_test_env; }
     refute_output --partial secret-alpha
     refute_output --partial secret-beta
 }
+
+reject_default_headers_promotion() {
+    jq_w 'del(.subscription_default_headers)'
+    REAL_MV=$(type -P mv)
+    mv() {
+        if [[ "$1" == "$CONFIG_JSON".tmp.* && "$2" == "$CONFIG_JSON" ]]; then
+            printf 'attempt\n' >> "$BATS_TEST_TMPDIR/default-promotions"
+            return 77
+        fi
+        "$REAL_MV" "$@"
+    }
+    ssh_run() { touch "$BATS_TEST_TMPDIR/unexpected-ssh"; return 1; }
+    scp_run() { touch "$BATS_TEST_TMPDIR/unexpected-scp"; return 1; }
+    NODE_ID=prior NODE_NAME=prior NODE_IDENTITY=identity NODE_TAG=tag
+    SERVER_IP=192.0.2.99 SERVER_PORT=2222 SERVER_USER=user
+    SERVER_PASS=password SERVER_AUTH=password
+    _SAVE_NODE_NAME=unchanged-save-context
+}
+
+@test 'rejected default headers block single and batch publication before context or transport changes' {
+    reject_default_headers_promotion
+    local before context rc=0
+    before=$(jq_r '.')
+    context=$(declare -p NODE_ID NODE_NAME NODE_IDENTITY NODE_TAG SERVER_IP SERVER_PORT SERVER_USER SERVER_PASS SERVER_AUTH)
+    subscription_publish alpha > "$BATS_TEST_TMPDIR/output" 2>&1 || rc=$?
+    [ "$rc" -ne 0 ]
+    rc=0
+    subscription_publish_all >> "$BATS_TEST_TMPDIR/output" 2>&1 || rc=$?
+    [ "$rc" -ne 0 ]
+    [ "$(jq_r '.')" = "$before" ]
+    [ "$(declare -p NODE_ID NODE_NAME NODE_IDENTITY NODE_TAG SERVER_IP SERVER_PORT SERVER_USER SERVER_PASS SERVER_AUTH)" = "$context" ]
+    [ "$_SAVE_NODE_NAME" = unchanged-save-context ]
+    [ ! -e "$BATS_TEST_TMPDIR/unexpected-ssh" ]
+    [ ! -e "$BATS_TEST_TMPDIR/unexpected-scp" ]
+}
+
+@test 'subscription menu stays available after rejected defaults and does not retry on redraw' {
+    reject_default_headers_promotion
+    local before
+    before=$(jq_r '.')
+    subscription_menu <<< $'x\n\n5\n0' > "$BATS_TEST_TMPDIR/output" 2>&1
+    [ "$(jq_r '.')" = "$before" ]
+    [ "$(wc -l < "$BATS_TEST_TMPDIR/default-promotions" | tr -d ' ')" -eq 1 ]
+    [ "$_SAVE_NODE_NAME" = unchanged-save-context ]
+    [ ! -e "$BATS_TEST_TMPDIR/unexpected-ssh" ]
+    [ ! -e "$BATS_TEST_TMPDIR/unexpected-scp" ]
+    run cat "$BATS_TEST_TMPDIR/output"
+    assert_output --partial 'Не удалось заменить конфиг'
+    assert_output --partial 'Начальные настройки подписок не сохранены.'
+    assert_output --partial 'Опубликовать подписку'
+    assert_output --partial alpha
+    assert_output --partial beta
+    refute_output --partial secret-alpha
+    refute_output --partial secret-beta
+}

@@ -173,3 +173,171 @@ assert_recovered_access() {
     cmp "$CONFIG_JSON" "$BATS_TEST_TMPDIR/config.before"
     grep -qxF "$PUBKEY" "$REMOTE_HOME/.ssh/authorized_keys"
 }
+
+prepare_abort_backups() {
+    KNOWN_BACKUP="$BATS_TEST_TMPDIR/known.backup"
+    MANIFEST_BACKUP="$BATS_TEST_TMPDIR/manifest.backup"
+    SSH_KNOWN_HOSTS="$CONFIG_DIR/known_hosts"
+    printf 'previous-host\n' > "$KNOWN_BACKUP"
+    printf 'current-host\n' > "$SSH_KNOWN_HOSTS"
+    cp "$STATE_MANIFEST" "$MANIFEST_BACKUP"
+}
+
+assert_removed_without_recovery() {
+    [[ "$(jq_r --arg id "$ID" '[.nodes[] | select(.id==$id)] | length')" == 0 ]]
+    if grep -qxF "$PUBKEY" "$REMOTE_HOME/.ssh/authorized_keys"; then return 1; fi
+    [[ ! -e "$MASTER_STATE" ]]
+    local backups=("$CONFIG_DIR"/.node-delete.*)
+    [[ -f "${backups[0]}/config" && -f "${backups[0]}/secrets" ]]
+    grep -qF "${backups[0]}" "$BATS_TEST_TMPDIR/output"
+}
+
+@test "rejected add rollback retains referenced identity secrets and recovery copies" {
+    prepare_abort_backups
+    CONFIG_PERSIST_ALLOW_NEEDS_SETUP=original
+    jq_w() { return 77; }
+    _revoke_managed_remote_key() { touch "$BATS_TEST_TMPDIR/revoked"; }
+    node_secret_delete() { touch "$BATS_TEST_TMPDIR/secret-deleted"; }
+    if _github_add_abort "$ID" true "$KNOWN_BACKUP" "$MANIFEST_BACKUP"; then return 1; fi
+    [[ "$CONFIG_PERSIST_ALLOW_NEEDS_SETUP" == original ]]
+    cmp "$CONFIG_JSON" "$BATS_TEST_TMPDIR/config.before"
+    cmp "$SECRETS_JSON" "$BATS_TEST_TMPDIR/secrets.before"
+    [[ -f "$SSH_IDENTITIES_DIR/$ID" && -f "$SSH_IDENTITIES_DIR/$ID.pub" ]]
+    [[ -f "$KNOWN_BACKUP" && -f "$MANIFEST_BACKUP" ]]
+    [[ ! -e "$BATS_TEST_TMPDIR/revoked" && ! -e "$BATS_TEST_TMPDIR/secret-deleted" ]]
+}
+
+@test "add rollback failed known hosts restore preserves both recovery copies" {
+    prepare_abort_backups
+    cp() {
+        [[ "$1" == "$KNOWN_BACKUP" ]] && return 77
+        command cp "$@"
+    }
+    if _github_add_abort "$ID" false "$KNOWN_BACKUP" "$MANIFEST_BACKUP"; then return 1; fi
+    [[ -f "$KNOWN_BACKUP" && -f "$MANIFEST_BACKUP" ]]
+    [[ "$(cat "$SSH_KNOWN_HOSTS")" == current-host ]]
+}
+
+@test "add rollback missing known hosts backup does not delete current target" {
+    prepare_abort_backups
+    rm "$KNOWN_BACKUP"
+    if _github_add_abort "$ID" false "$KNOWN_BACKUP" "$MANIFEST_BACKUP"; then return 1; fi
+    [[ "$(cat "$SSH_KNOWN_HOSTS")" == current-host ]]
+    [[ -f "$MANIFEST_BACKUP" ]]
+}
+
+@test "add rollback failed manifest restore retains already restored known hosts backup" {
+    prepare_abort_backups
+    cp() {
+        [[ "$1" == "$MANIFEST_BACKUP" ]] && return 77
+        command cp "$@"
+    }
+    if _github_add_abort "$ID" false "$KNOWN_BACKUP" "$MANIFEST_BACKUP"; then return 1; fi
+    cmp "$KNOWN_BACKUP" "$SSH_KNOWN_HOSTS"
+    [[ -f "$KNOWN_BACKUP" && -f "$MANIFEST_BACKUP" ]]
+}
+
+@test "late identity removal failure leaves node deleted and recovery backup available" {
+    rm() {
+        [[ "$1" == -f && "${2:-}" == "$SSH_IDENTITIES_DIR/$ID" ]] && return 77
+        command rm "$@"
+    }
+    if delete_node <<< $'1\n2' > "$BATS_TEST_TMPDIR/output"; then return 1; fi
+    assert_removed_without_recovery
+    [[ -f "$SSH_IDENTITIES_DIR/$ID" ]]
+}
+
+@test "late known hosts removal failure does not restore deleted node or revoked key" {
+    SSH_KNOWN_HOSTS="$CONFIG_DIR/known_hosts"
+    printf 'fixture\n' > "$SSH_KNOWN_HOSTS"
+    ssh-keygen() { return 77; }
+    if delete_node <<< $'1\n2' > "$BATS_TEST_TMPDIR/output"; then return 1; fi
+    assert_removed_without_recovery
+    [[ ! -f "$SSH_IDENTITIES_DIR/$ID" ]]
+}
+
+@test "late GitHub checkpoint failure keeps deletion pending and skips late flush" {
+    SSH_KNOWN_HOSTS="$CONFIG_DIR/known_hosts"
+    printf 'fixture\n' > "$SSH_KNOWN_HOSTS"
+    ssh-keygen() { return 0; }
+    CHECKPOINTS=0 FLUSHES=0
+    github_config_checkpoint() {
+        CHECKPOINTS=$((CHECKPOINTS+1))
+        [[ "$CHECKPOINTS" -eq 1 ]]
+    }
+    github_sync_flush() { FLUSHES=$((FLUSHES+1)); }
+    _github_report_last_error() { touch "$BATS_TEST_TMPDIR/reported"; }
+    if delete_node <<< $'1\n2' > "$BATS_TEST_TMPDIR/output"; then return 1; fi
+    assert_removed_without_recovery
+    [[ "$CHECKPOINTS" == 2 && "$FLUSHES" == 1 && "$GITHUB_SYNC_STATUS" == pending ]]
+    [[ -f "$BATS_TEST_TMPDIR/reported" ]]
+}
+
+@test "late push failure leaves successful local deletion pending" {
+    SSH_KNOWN_HOSTS="$CONFIG_DIR/known_hosts"
+    printf 'fixture\n' > "$SSH_KNOWN_HOSTS"
+    ssh-keygen() { return 0; }
+    FLUSHES=0
+    github_sync_flush() {
+        FLUSHES=$((FLUSHES+1))
+        [[ "$FLUSHES" -eq 1 ]]
+    }
+    delete_node <<< $'1\n2'
+    [[ "$FLUSHES" == 2 && "$GITHUB_SYNC_STATUS" == pending ]]
+    [[ "$(jq_r --arg id "$ID" '[.nodes[] | select(.id==$id)] | length')" == 0 ]]
+    [[ ! -f "$SSH_IDENTITIES_DIR/$ID" ]]
+    local backups=("$CONFIG_DIR"/.node-delete.*)
+    [[ ! -e "${backups[0]}" ]]
+}
+
+@test "add rollback identity removal failure retains secrets and recovery copies" {
+    prepare_abort_backups
+    rm() {
+        [[ "$1" == -f && "${2:-}" == "$SSH_IDENTITIES_DIR/$ID" ]] && return 77
+        command rm "$@"
+    }
+    node_secret_delete() { touch "$BATS_TEST_TMPDIR/secret-deleted"; }
+    if _github_add_abort "$ID" false "$KNOWN_BACKUP" "$MANIFEST_BACKUP"; then return 1; fi
+    [[ -f "$SSH_IDENTITIES_DIR/$ID" && -f "$KNOWN_BACKUP" && -f "$MANIFEST_BACKUP" ]]
+    [[ ! -e "$BATS_TEST_TMPDIR/secret-deleted" ]]
+}
+
+@test "add rollback secret removal failure retains recovery copies" {
+    prepare_abort_backups
+    node_secret_delete() { return 77; }
+    if _github_add_abort "$ID" false "$KNOWN_BACKUP" "$MANIFEST_BACKUP"; then return 1; fi
+    cmp "$SECRETS_JSON" "$BATS_TEST_TMPDIR/secrets.before"
+    [[ -f "$KNOWN_BACKUP" && -f "$MANIFEST_BACKUP" ]]
+    [[ "$(cat "$SSH_KNOWN_HOSTS")" == current-host ]]
+}
+
+@test "add rollback missing manifest backup retains current manifest and surviving backup" {
+    prepare_abort_backups
+    rm "$MANIFEST_BACKUP"
+    if _github_add_abort "$ID" false "$KNOWN_BACKUP" "$MANIFEST_BACKUP"; then return 1; fi
+    # The rollback writer may update the manifest; it must never delete it.
+    [[ -f "$STATE_MANIFEST" && -f "$KNOWN_BACKUP" ]]
+}
+
+@test "late nonstandard port known hosts failure preserves committed deletion" {
+    jq_w '.nodes[0].port=2222'
+    SSH_KNOWN_HOSTS="$CONFIG_DIR/known_hosts"
+    printf 'fixture\n' > "$SSH_KNOWN_HOSTS"
+    ssh-keygen() {
+        [[ "$2" != *']:2222' ]]
+    }
+    if delete_node <<< $'1\n2' > "$BATS_TEST_TMPDIR/output"; then return 1; fi
+    assert_removed_without_recovery
+}
+
+@test "standard port cleanup does not attempt bracketed host removal" {
+    jq_w '.nodes[0].port=22'
+    SSH_KNOWN_HOSTS="$CONFIG_DIR/known_hosts"
+    printf 'fixture\n' > "$SSH_KNOWN_HOSTS"
+    ssh-keygen() {
+        [[ "$2" != \[* ]] || return 77
+        printf '%s\n' "$2" >> "$BATS_TEST_TMPDIR/removed-hosts"
+    }
+    delete_node <<< $'1\n2'
+    [[ "$(wc -l < "$BATS_TEST_TMPDIR/removed-hosts" | tr -d ' ')" == 1 ]]
+}

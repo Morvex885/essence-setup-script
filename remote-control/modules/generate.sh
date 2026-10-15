@@ -57,9 +57,15 @@ edit_template() {
             continue
         fi
         if command -v nano > /dev/null 2>&1; then
-            nano "$template"
+            nano "$template" || {
+                warn "Редактор завершился с ошибкой. Изменения шаблона не подтверждены."
+                return 1
+            }
         elif command -v vi > /dev/null 2>&1; then
-            vi "$template"
+            vi "$template" || {
+                warn "Редактор завершился с ошибкой. Изменения шаблона не подтверждены."
+                return 1
+            }
         else
             warn "Редактор не найден. Отредактируйте вручную:"
             info "$template"

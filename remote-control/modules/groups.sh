@@ -83,7 +83,7 @@ add_group() {
         return
     fi
 
-    jq_w --arg g "$GROUP_NAME" '.groups += [{name: $g, template: "default.yaml"}]'
+    jq_w --arg g "$GROUP_NAME" '.groups += [{name: $g, template: "default.yaml"}]' || return 1
     success "Группа $GROUP_NAME добавлена"
 }
 
@@ -107,7 +107,7 @@ delete_group() {
     jq_w --arg g "$target" '
         .groups |= map(select(.name != $g)) |
         .connections |= map(.groups |= [.[] | select(.name!=$g)]) |
-        .connections |= [.[] | select(.groups | length > 0)]'
+        .connections |= [.[] | select(.groups | length > 0)]' || return 1
     success "Группа $target удалена"
 }
 
@@ -203,9 +203,15 @@ _create_new_template() {
 
     # Открываем редактор
     if command -v nano > /dev/null 2>&1; then
-        nano "$new_file"
+        nano "$new_file" || {
+            warn "Редактор завершился с ошибкой. Изменения шаблона не подтверждены."
+            return 1
+        }
     elif command -v vi > /dev/null 2>&1; then
-        vi "$new_file"
+        vi "$new_file" || {
+            warn "Редактор завершился с ошибкой. Изменения шаблона не подтверждены."
+            return 1
+        }
     else
         info "Отредактируйте вручную: $new_file"
     fi

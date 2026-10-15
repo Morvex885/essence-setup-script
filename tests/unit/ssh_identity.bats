@@ -175,3 +175,186 @@ EOF
     [[ "$(jq -r '.nodes | length' "$CONFIG_JSON")" == 1 ]]
     [[ "$(jq -r '.nodes[0].identity' "$CONFIG_JSON")" == system ]]
 }
+
+# Execute remote provisioning commands only against a sandbox HOME. Keep the
+# real ssh_run, key generation, installation, persistence and revocation paths.
+_prepare_identity_transport() {
+    state_open_local
+    export CONFIG_SOURCE=local NODE_ID=0123456789abcdef0123456789abcdef
+    export NODE_IDENTITY=system SERVER_AUTH=key SERVER_PASS=
+    jq_w --arg id "$NODE_ID" \
+        '.nodes=[{id:$id,name:"node",ip:"127.0.0.1",port:22,user:"root",auth:"key",identity:"system",secret_id:null,aliases:{}}]'
+    mkdir -p "$BATS_TEST_TMPDIR/bin" "$BATS_TEST_TMPDIR/remote/.ssh"
+    export SSH_SANDBOX_HOME="$BATS_TEST_TMPDIR/remote"
+    printf '%s\n' unrelated-existing-key > "$SSH_SANDBOX_HOME/.ssh/authorized_keys"
+    cat > "$BATS_TEST_TMPDIR/bin/ssh" <<'EOF'
+#!/bin/bash
+export HOME="$SSH_SANDBOX_HOME"
+exec /bin/bash -c "${!#}"
+EOF
+    chmod 755 "$BATS_TEST_TMPDIR/bin/ssh"
+    export PATH="$BATS_TEST_TMPDIR/bin:$PATH"
+    cp "$CONFIG_JSON" "$BATS_TEST_TMPDIR/config.before"
+}
+
+_prepare_host_pin_transport() {
+    _prepare_pending_key_node
+    export NODE_ID=0123456789abcdef0123456789abcdef
+    mkdir -p "$BATS_TEST_TMPDIR/bin" "$BATS_TEST_TMPDIR/pin-tmp"
+    ssh-keygen -t ed25519 -N '' -q -f "$BATS_TEST_TMPDIR/host-key"
+    local key_type key_data rest
+    read -r key_type key_data rest < "$BATS_TEST_TMPDIR/host-key.pub"
+    printf '%s %s %s\n' "$SERVER_IP" "$key_type" "$key_data" > "$BATS_TEST_TMPDIR/host-scan"
+    export SSH_SCAN_FIXTURE="$BATS_TEST_TMPDIR/host-scan"
+    cat > "$BATS_TEST_TMPDIR/bin/ssh-keyscan" <<'EOF'
+#!/bin/bash
+exec cat "$SSH_SCAN_FIXTURE"
+EOF
+    chmod 755 "$BATS_TEST_TMPDIR/bin/ssh-keyscan"
+    export PATH="$BATS_TEST_TMPDIR/bin:$PATH" TMPDIR="$BATS_TEST_TMPDIR/pin-tmp"
+    cp "$STATE_MANIFEST" "$BATS_TEST_TMPDIR/manifest.before"
+}
+
+_assert_host_pin_failed_safely() {
+    cmp "$STATE_MANIFEST" "$BATS_TEST_TMPDIR/manifest.before"
+    jq -e --arg id "$NODE_ID" \
+        'any(.portability.issues[]; .node_id==$id and .reason=="missing_host_key")' \
+        "$STATE_MANIFEST"
+    ! compgen -G "$TMPDIR/*"
+}
+
+@test "failed known_hosts append removes keyscan temporary file and stops checkpoint" {
+    _prepare_host_pin_transport
+    printf '%s\n' existing-host > "$SSH_KNOWN_HOSTS"
+    cp "$SSH_KNOWN_HOSTS" "$BATS_TEST_TMPDIR/known.before"
+    mktemp() {
+        if [[ "$#" -eq 0 ]]; then
+            command mktemp "$TMPDIR/scan.XXXXXX"
+        else
+            command mktemp "$@"
+        fi
+    }
+    cat() {
+        case "${1:-}" in
+            "$TMPDIR"/*) printf '%s\n' "$1" > "$BATS_TEST_TMPDIR/failed-append"; return 77 ;;
+        esac
+        command cat "$@"
+    }
+    state_checkpoint() { touch "$BATS_TEST_TMPDIR/checkpoint-called"; }
+
+    run _ssh_pin_host_key
+    assert_failure
+    [[ -s "$BATS_TEST_TMPDIR/failed-append" ]]
+    [[ ! -e "$(command cat "$BATS_TEST_TMPDIR/failed-append")" ]]
+    [[ ! -e "$BATS_TEST_TMPDIR/checkpoint-called" ]]
+    cmp "$SSH_KNOWN_HOSTS" "$BATS_TEST_TMPDIR/known.before"
+    _assert_host_pin_failed_safely
+}
+
+@test "failed known_hosts permissions stop checkpoint and preserve pending host setup" {
+    _prepare_host_pin_transport
+    chmod() {
+        if [[ "$1" == 600 && "$2" == "$SSH_KNOWN_HOSTS" ]]; then
+            touch "$BATS_TEST_TMPDIR/failed-host-chmod"
+            return 77
+        fi
+        command chmod "$@"
+    }
+    state_checkpoint() { touch "$BATS_TEST_TMPDIR/checkpoint-called"; }
+
+    run _ssh_pin_host_key
+    assert_failure
+    [[ -e "$BATS_TEST_TMPDIR/failed-host-chmod" ]]
+    [[ ! -e "$BATS_TEST_TMPDIR/checkpoint-called" ]]
+    cmp "$SSH_KNOWN_HOSTS" "$SSH_SCAN_FIXTURE"
+    _assert_host_pin_failed_safely
+}
+
+@test "failed host checkpoint leaves written key but does not clear missing_host_key" {
+    _prepare_host_pin_transport
+    state_checkpoint() { touch "$BATS_TEST_TMPDIR/checkpoint-called"; return 77; }
+
+    run _ssh_pin_host_key
+    assert_failure
+    [[ -e "$BATS_TEST_TMPDIR/checkpoint-called" ]]
+    cmp "$SSH_KNOWN_HOSTS" "$SSH_SCAN_FIXTURE"
+    _assert_host_pin_failed_safely
+}
+
+_assert_identity_permission_failure() {
+    _prepare_identity_transport
+    local failed_mode="$1" failed_path="$SSH_IDENTITIES_DIR/$NODE_ID"
+    [[ "$failed_mode" == 644 ]] && failed_path="$failed_path.pub"
+    chmod() {
+        if [[ "$1" == "$failed_mode" && "$2" == "$failed_path" ]]; then
+            command grep -qxF "$(command cat "$SSH_IDENTITIES_DIR/$NODE_ID.pub")" \
+                "$SSH_SANDBOX_HOME/.ssh/authorized_keys" || return 78
+            touch "$BATS_TEST_TMPDIR/failed-key-chmod"
+            return 77
+        fi
+        command chmod "$@"
+    }
+    jq_w() { touch "$BATS_TEST_TMPDIR/config-write-called"; return 77; }
+    state_checkpoint() { touch "$BATS_TEST_TMPDIR/checkpoint-called"; return 77; }
+
+    run _provision_portable_identity "$NODE_ID"
+    assert_failure
+    [[ -e "$BATS_TEST_TMPDIR/failed-key-chmod" ]]
+    [[ ! -e "$BATS_TEST_TMPDIR/config-write-called" ]]
+    [[ ! -e "$BATS_TEST_TMPDIR/checkpoint-called" ]]
+    [[ ! -e "$SSH_IDENTITIES_DIR/$NODE_ID" && ! -e "$SSH_IDENTITIES_DIR/$NODE_ID.pub" ]]
+    ! compgen -G "$CONFIG_DIR/.identity.*"
+    cmp "$CONFIG_JSON" "$BATS_TEST_TMPDIR/config.before"
+    [[ "$(cat "$SSH_SANDBOX_HOME/.ssh/authorized_keys")" == unrelated-existing-key ]]
+}
+
+@test "private key chmod failure revokes only new key and removes installation before publication" {
+    _assert_identity_permission_failure 600
+}
+
+@test "public key chmod failure revokes only new key and removes installation before publication" {
+    _assert_identity_permission_failure 644
+}
+
+@test "late identity checkpoint failure keeps published identity and stops downstream hardening" {
+    _prepare_identity_transport
+    state_checkpoint() { touch "$BATS_TEST_TMPDIR/checkpoint-called"; return 77; }
+    _harden_select_port() { HARDEN_NEW_PORT=2222; }
+    confirm_yn() { return 0; }
+    _harden_disable_password() { touch "$BATS_TEST_TMPDIR/password-disabled"; }
+    _harden_change_port() { touch "$BATS_TEST_TMPDIR/port-changed"; }
+    _harden_restore_password() { touch "$BATS_TEST_TMPDIR/password-restored"; }
+
+    run ssh_hardening
+    assert_failure
+    [[ -e "$BATS_TEST_TMPDIR/checkpoint-called" ]]
+    [[ ! -e "$BATS_TEST_TMPDIR/password-disabled" ]]
+    [[ ! -e "$BATS_TEST_TMPDIR/port-changed" ]]
+    [[ ! -e "$BATS_TEST_TMPDIR/password-restored" ]]
+    [[ "$(jq -r '.nodes[0].identity' "$CONFIG_JSON")" == "$NODE_ID" ]]
+    ssh-keygen -y -f "$SSH_IDENTITIES_DIR/$NODE_ID" > "$BATS_TEST_TMPDIR/derived.pub"
+    [[ "$(cut -d ' ' -f 1-2 "$SSH_IDENTITIES_DIR/$NODE_ID.pub")" == \
+       "$(cut -d ' ' -f 1-2 "$BATS_TEST_TMPDIR/derived.pub")" ]]
+    command grep -qxF "$(cat "$SSH_IDENTITIES_DIR/$NODE_ID.pub")" \
+        "$SSH_SANDBOX_HOME/.ssh/authorized_keys"
+    ! compgen -G "$CONFIG_DIR/.identity.*"
+}
+
+@test "deferred identity provisioning installs keys without individual config or checkpoint writes" {
+    _prepare_identity_transport
+    cp "$STATE_MANIFEST" "$BATS_TEST_TMPDIR/manifest.before"
+    export PORTABLE_IDENTITY_DEFER_CONFIG=1
+    jq_w() { touch "$BATS_TEST_TMPDIR/config-write-called"; return 77; }
+    state_checkpoint() { touch "$BATS_TEST_TMPDIR/checkpoint-called"; return 77; }
+
+    _provision_portable_identity "$NODE_ID"
+    [[ "$NODE_IDENTITY" == "$NODE_ID" ]]
+    [[ -f "$SSH_IDENTITIES_DIR/$NODE_ID" && -f "$SSH_IDENTITIES_DIR/$NODE_ID.pub" ]]
+    [[ ! -e "$BATS_TEST_TMPDIR/config-write-called" ]]
+    [[ ! -e "$BATS_TEST_TMPDIR/checkpoint-called" ]]
+    cmp "$CONFIG_JSON" "$BATS_TEST_TMPDIR/config.before"
+    cmp "$STATE_MANIFEST" "$BATS_TEST_TMPDIR/manifest.before"
+    command grep -qxF "$(cat "$SSH_IDENTITIES_DIR/$NODE_ID.pub")" \
+        "$SSH_SANDBOX_HOME/.ssh/authorized_keys"
+    ! compgen -G "$CONFIG_DIR/.identity.*"
+}

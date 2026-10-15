@@ -669,6 +669,102 @@ _assert_local_switch_rolled_back() {
         "refs/heads/session/$session"
 }
 
+@test "password SSH substitutions preserve the owning GitHub session until EXIT" {
+    local meta="$BATS_TEST_TMPDIR/ssh-cleanup-meta"
+    local child_config="$BATS_TEST_TMPDIR/ssh-child-config"
+    local child_store="$BATS_TEST_TMPDIR/ssh-child-store.git"
+    local child_sessions="$BATS_TEST_TMPDIR/ssh-child-sessions"
+    run env PROJECT_ROOT="$PROJECT_ROOT" REMOTE="$REMOTE" \
+        CHILD_CONFIG="$child_config" CHILD_STORE="$child_store" \
+        CHILD_SESSIONS="$child_sessions" CLEANUP_META="$meta" \
+        TRANSPORT_META="$BATS_TEST_TMPDIR/askpass-paths" \
+        PASSWORD_FIXTURE="$BATS_TEST_TMPDIR/ssh-password" \
+        /bin/bash -c '
+            source "$PROJECT_ROOT/common/common.sh"
+            CONFIG_DIR="$CHILD_CONFIG"
+            CONFIG_JSON="$CONFIG_DIR/config.json"
+            LOCAL_CONFIG_JSON="$CONFIG_JSON"
+            CONFIG_SOURCE=local
+            GITHUB_STORE="$CHILD_STORE"
+            GITHUB_SESSIONS_DIR="$CHILD_SESSIONS"
+            GITHUB_WORKTREE= GITHUB_SESSION_ID= GITHUB_IDENTITY=
+            source "$PROJECT_ROOT/remote-control/modules/state.sh"
+            source "$PROJECT_ROOT/remote-control/modules/github-config.sh"
+            source "$PROJECT_ROOT/remote-control/modules/ssh.sh"
+            source "$PROJECT_ROOT/remote-control/modules/groups.sh"
+            state_open_local || exit 1
+            printf "mode: rule\n" > "$TEMPLATES_DIR/default.yaml" || exit 1
+            jq_w ".groups=[{name:\"PC\",template:\"default.yaml\"}]" || exit 1
+            git init --bare "$GITHUB_STORE" >/dev/null 2>&1 || exit 1
+            git --git-dir="$GITHUB_STORE" remote add origin "$REMOTE" || exit 1
+            tree=$(git --git-dir="$GITHUB_STORE" mktree </dev/null) || exit 1
+            seed=$(printf "fixture\n" | git --git-dir="$GITHUB_STORE" \
+                -c user.name=Fixture -c user.email=fixture@example.invalid \
+                commit-tree "$tree") || exit 1
+            git --git-dir="$GITHUB_STORE" update-ref refs/heads/main "$seed" || exit 1
+            _github_session_open_cached "$GITHUB_STORE" "$GITHUB_SESSIONS_DIR" main || exit 1
+            CONFIG_SOURCE=github GITHUB_STORAGE_MODE=none
+            register_exit_cleanup github_config_close || exit 1
+            GITHUB_IDENTITY="$CONFIG_DIR/.unlock-check.ssh"
+            printf "ephemeral-identity\n" > "$GITHUB_IDENTITY" || exit 1
+            chmod 600 "$GITHUB_IDENTITY" || exit 1
+            curl() { printf "%s\n" "{\"tag_name\":\"v1.2.3\"}"; }
+            check_update_start || exit 1
+            wait
+            printf "%s\n%s\n%s\n%s\n" \
+                "$GITHUB_WORKTREE" "$GITHUB_SESSION_ID" "$GITHUB_IDENTITY" "$_UPDATE_TMP" \
+                > "$CLEANUP_META" || exit 1
+
+            printf "fixture-password-never-output" > "$PASSWORD_FIXTURE" || exit 1
+            SERVER_AUTH=password SERVER_PASS=$(cat "$PASSWORD_FIXTURE")
+            SERVER_USER=fixture SERVER_IP=example.invalid SERVER_PORT=22
+            SSH_ALLOW_PORTABLE_ONBOARDING=1
+            ssh() {
+                local supplied expected
+                [[ -f "$SSH_ASKPASS" && -f "$_PASS_FILE" ]] || return 1
+                supplied=$("$SSH_ASKPASS") || return 1
+                expected=$(cat "$PASSWORD_FIXTURE") || return 1
+                [[ "$supplied" == "$expected" ]] || return 1
+                printf "%s\n%s\n" "$SSH_ASKPASS" "$_PASS_FILE" \
+                    > "$TRANSPORT_META" || return 1
+                printf "ok\n"
+            }
+            for attempt in 1 2; do
+                response=$(ssh_run -- "echo ok") || exit 1
+                [[ "$response" == ok ]] || exit 1
+                [[ -d "$GITHUB_WORKTREE" && -f "$GITHUB_IDENTITY" &&
+                   -f "$_UPDATE_TMP" ]] || exit 1
+                git --git-dir="$GITHUB_STORE" show-ref --verify --quiet \
+                    "refs/heads/session/$GITHUB_SESSION_ID" || exit 1
+                {
+                    IFS= read -r askpass
+                    IFS= read -r password
+                } < "$TRANSPORT_META"
+                [[ -n "$askpass" && -n "$password" &&
+                   ! -e "$askpass" && ! -e "$password" ]] || exit 1
+            done
+            state_action add_group add_group <<< "ROUTER" || exit 1
+            jq -e "any(.groups[]; .name==\"ROUTER\")" "$CONFIG_JSON" >/dev/null || exit 1
+            git --git-dir="$REMOTE" show main:config.json |
+                jq -e "any(.groups[]; .name==\"ROUTER\")" >/dev/null || exit 1
+        '
+    assert_success
+    refute_output --partial 'fixture-password-never-output'
+
+    local worktree session identity update_tmp
+    {
+        IFS= read -r worktree
+        IFS= read -r session
+        IFS= read -r identity
+        IFS= read -r update_tmp
+    } < "$meta"
+    [[ -n "$worktree" && ! -d "$worktree" ]] || return 1
+    [[ -n "$identity" && ! -e "$identity" ]] || return 1
+    [[ -n "$update_tmp" && ! -e "$update_tmp" ]] || return 1
+    ! git --git-dir="$child_store" show-ref --verify --quiet \
+        "refs/heads/session/$session"
+}
+
 @test "config close removes session state and permits a fresh session" {
     github_sync_init
     local old_session="$GITHUB_SESSION_ID" old_worktree="$GITHUB_WORKTREE"
