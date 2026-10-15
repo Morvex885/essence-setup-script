@@ -196,56 +196,6 @@ units с безвредным probe, затем удаляет их. Он не �
 Успех argv-smoke не доказывает готовность production backend: после него
 выполните штатное включение WEB и проверьте общий backend и WEB readiness в статусе.
 
-#### Адресное nginx-only восстановление WEB
-
-Если reload оставил старую TLS-конфигурацию из-за лишнего публичного listener
-в `self-steal`, не запускайте `web install --force`: это затрагивает backend и
-сертификаты, а занятые relay-порты могут остановить установку. Для подтверждённого
-узла `vm1410146` подготовлена отдельная операторская транзакция
-`telegram-web-nginx-repair.sh` (передаётся вместе с исправленным модулем, не входит
-в CLI). Запуск — от root в отдельном Bash, с SHA-256 модуля из проверенной поставки:
-
-```bash
-bash ./telegram-web-nginx-repair.sh "$EXPECTED_MODULE_SHA256"
-```
-
-Доставьте модуль в `~/essence-setup/modules/telegram-proxy.sh`; не получайте
-ожидаемый digest из самого файла на узле. Транзакция загружает определения из
-`common/common.sh`, `common/cert.sh`, `modules/subscription.sh` и
-`modules/telegram-proxy.sh`, но не делает `source setup-essence.sh`:
-entrypoint запускает updater/CLI/menu. На этом узле entrypoint расположен
-непосредственно в `~/essence-setup/setup-essence.sh`.
-
-До изменений обязательны согласованный state/env/profiles, WEB=true,
-hostname=`deweb.p1ng2win.ru`, topology=`self-steal`,
-TLS listen=`127.0.0.1:8443`, IPv6=true, обычный WEB site, enabled symlink на него,
-читаемые существующие certificate/key и активные nginx/relay/backend.
-Остановите параллельное редактирование сайта. В root-only backup сохраняются site
-с metadata, target symlink, время и диагностика; candidate строится штатным
-renderer. Разрешён только diff с удалением одной строки
-`listen [::]:443 ipv6only=on ...;`. Любые другие изменения, включая пользовательские
-директивы, требуют отдельного решения; такой файл не перетирается.
-
-Заменяется атомарно только WEB site (0644), symlink не меняется; далее выполняются
-`nginx -t`, reload nginx и локальная CA/hostname TLS-проба. При ошибке после замены
-выполняется один site-only rollback с прежними metadata; reload восстановленного
-файла разрешён только после успешного `nginx -t`. Исходный ненулевой код выхода
-сохраняется. Backup остаётся оператору. Возврат старого конфликтного сайта
-восстанавливает прежнее состояние, а не исправляет HTTPS. Никаких restart,
-ACME или изменений state, secret, REALITY, других vhosts, firewall/DNS нет.
-
-После локального TLS commit отдельно проверьте публичный IPv4 и IPv6 TCP/443
-с CA/hostname verification, `ss -ltnp` (публичный443 — mihomo, nginx — loopback8443),
-`telegram-proxy status --json` (WEB IPv6=true) и новый интервал nginx error.log:
-нет новых `bind() to [::]:443 failed`. Если локальный TLS проходит, а публичный нет,
-исследуйте frontend отдельно, без переустановки backend; успешный локальный commit
-не откатывается из-за последующей публичной проверки.
-Затем подтвердите реальное подключение и обмен трафиком по существующей
-`tg://webproxy?...` ссылке в поддерживающем WEB клиенте, сравнив sessions/bytes
-в `http://127.0.0.1:8081/metrics` до и после попытки. Рост counters и readyz сами
-по себе не заменяют клиентский успех; secret не выводите. Без операторского
-выполнения и клиентского подтверждения production-восстановление не доказано.
-
 ### VLESS Reality — подменю
 
 | Пункт | Описание |

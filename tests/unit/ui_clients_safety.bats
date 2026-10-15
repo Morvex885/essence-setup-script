@@ -26,7 +26,7 @@ teardown() { teardown_test_env; }
 @test "client deletion refusal reviews all targets without SSH or local mutation" {
     run delete_client <<< ''
     assert_failure
-    [ "$output" != *TOKEN_SENTINEL* ]
+    [[ "$output" != *TOKEN_SENTINEL* ]] || return 1
     for target in my-router my-pc de-vps ru-vps 1.2.3.4:22 5.6.7.8:2222; do
         [[ "$output" == *"$target"* ]] || return 1
     done

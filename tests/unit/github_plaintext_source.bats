@@ -1115,6 +1115,30 @@ EOF
     [[ "$output" != *"github_pat_SecretValue123456789"* ]] || return 1
     [[ "$output" != *"gh auth login"* ]] || return 1
 }
+
+@test "saved GitHub source reopens cached config during account API timeout" {
+    run bash -c 'printf "2\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    local config_dir="$HOME/.config/remote-control-essence"
+    local source_hash global_login
+    source_hash=$(_hash_file "$config_dir/source.json")
+    global_login=$(cat "$GH_ACTIVE_LOGIN_FILE")
+    git --git-dir="$config_dir/github-store.git" show main:config.json > "$BATS_TEST_TMPDIR/cached-config.json"
+    export GH_CALLS_FILE="$BATS_TEST_TMPDIR/gh-offline-calls"
+    : > "$GH_CALLS_FILE"
+
+    run env GH_MODE=api-timeout bash -c 'printf "0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    assert_output --partial "Essence — управление нодами"
+    cmp "$BATS_TEST_TMPDIR/cached-config.json" "$config_dir/github-runtime/config.json" || return 1
+    [[ "$(_hash_file "$config_dir/source.json")" == "$source_hash" ]] || return 1
+    [[ "$(cat "$GH_ACTIVE_LOGIN_FILE")" == "$global_login" ]] || return 1
+    grep -q '^api user ' "$GH_CALLS_FILE" || return 1
+    ! grep -q '^repo view ' "$GH_CALLS_FILE" || return 1
+    ! grep -q '^auth token ' "$GH_CALLS_FILE" || return 1
+    ! grep -q '^auth login ' "$GH_CALLS_FILE" || return 1
+    _assert_no_global_auth_mutation
+}
 @test "saved profile API failure blocks repository access without changing global login" {
     run bash -c 'printf "2\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
     assert_success

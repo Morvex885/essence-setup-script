@@ -143,14 +143,17 @@ _github_gh() (
 )
 
 _github_account_login() {
-    local login="${1:-}" actual
+    local login="${1:-}" actual auth_failure=false hint=""
     [[ "$login" =~ ^[A-Za-z0-9-]+$ ]] || {
         _github_record_error "проверка аккаунта GitHub" "Некорректное имя аккаунта." true
         return 1
     }
     if ! actual=$(_github_gh "$login" api user --jq .login 2>&1); then
-        _github_record_error "проверка аккаунта GitHub" "$actual" true \
-            "Выполните: GH_CONFIG_DIR=$GITHUB_CREDENTIALS_DIR/gh/$login gh auth login --hostname github.com --web"
+        if _github_auth_failure_confirmed "$actual"; then
+            auth_failure=true
+            hint="Выполните: GH_CONFIG_DIR=$GITHUB_CREDENTIALS_DIR/gh/$login gh auth login --hostname github.com --web"
+        fi
+        _github_record_error "проверка аккаунта GitHub" "$actual" "$auth_failure" "$hint"
         return 1
     fi
     actual="${actual//$'\r'/}"
@@ -2408,10 +2411,10 @@ _github_session_open_cached() {
     GITHUB_SESSION_ID="$session"
     GITHUB_WORKTREE="$dir/worktree"
     GITHUB_BRANCH="$branch"
-    GITHUB_REMOTE=$(git --git-dir="$store" remote get-url origin 2>/dev/null || true)
+    GITHUB_REMOTE=$(git --git-dir="$store" config --get remote.origin.url 2>/dev/null || true)
     GITHUB_SESSION_REMOTE="$GITHUB_REMOTE"
     GITHUB_SESSION_BRANCH="$branch"
-    GITHUB_SESSION_ORIGIN="$GITHUB_REMOTE"
+    GITHUB_SESSION_ORIGIN=$(git --git-dir="$store" remote get-url origin 2>/dev/null || true)
     export GITHUB_STORE GITHUB_SESSIONS_DIR GITHUB_SESSION_ID GITHUB_WORKTREE
     export GITHUB_SESSION_REMOTE GITHUB_SESSION_BRANCH GITHUB_SESSION_ORIGIN
 }
@@ -2432,11 +2435,35 @@ github_sync_init() {
         if [[ "$target_repo" =~ ^[A-Za-z0-9-]+/[A-Za-z0-9_.-]+$ ]]; then
             GITHUB_OWNER="${target_repo%%/*}"
             GITHUB_REPO_NAME="${target_repo#*/}"
-            _github_prepare_account "$GITHUB_OWNER" false || return 1
+            local profile safe_profile=false canonical_remote="https://github.com/$target_repo.git"
+            profile=$(_github_profile_dir "$GITHUB_OWNER") || return 1
+            if [[ -d "$profile" && ! -L "$profile" &&
+                  -f "$profile/hosts.yml" && ! -L "$profile/hosts.yml" ]]; then
+                safe_profile=true
+            fi
+            if ! _github_prepare_account "$GITHUB_OWNER" false; then
+                [[ "$init_mode" == resume && "$safe_profile" == true &&
+                   "${GITHUB_LAST_AUTH_RELEVANT:-true}" == false ]] || return 1
+                [[ -d "$GITHUB_STORE/objects" && ! -L "$GITHUB_STORE" ]] || return 1
+                [[ "$(git --git-dir="$GITHUB_STORE" config --get remote.origin.url 2>/dev/null)" == "$canonical_remote" ]] || return 1
+                git --git-dir="$GITHUB_STORE" show-ref --verify --quiet "refs/heads/$GITHUB_BRANCH" || return 1
+                if ! _github_mkdir_secure "$GITHUB_STORE" "$GITHUB_SESSIONS_DIR"; then
+                    return 1
+                fi
+                GITHUB_REMOTE="$canonical_remote"
+                if [[ -n "${GITHUB_WORKTREE:-}" && -d "$GITHUB_WORKTREE" ]] &&
+                   git -C "$GITHUB_WORKTREE" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+                    _github_session_target_guard || return 1
+                elif ! _github_session_open_cached "$GITHUB_STORE" "$GITHUB_SESSIONS_DIR" "$GITHUB_BRANCH"; then
+                    _github_record_error "подготовка локального репозитория" \
+                        "Не удалось открыть локальную рабочую копию GitHub без сети."
+                    return 1
+                fi
+                GITHUB_SYNC_STATUS=pending
+                _github_clear_error
+                return 0
+            fi
         fi
-    fi
-    if [[ "$GITHUB_REMOTE" == https://github.com/* ]]; then
-        _github_account_login "$GITHUB_OWNER" || return 1
     fi
     if [[ -n "${GITHUB_WORKTREE:-}" && -d "$GITHUB_WORKTREE" ]] &&
        git -C "$GITHUB_WORKTREE" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -2465,9 +2492,6 @@ github_sync_init() {
             _github_record_error "проверка пользователя GitHub" "Не задан владелец репозитория."
             return 1
         }
-        if [[ "$GITHUB_REMOTE" != https://github.com/* ]]; then
-            _github_account_login "$GITHUB_OWNER" || return 1
-        fi
         repo="$GITHUB_OWNER/$GITHUB_REPO_NAME"
         if ! remote_view=$(_github_gh "$GITHUB_OWNER" repo view "$repo" --json visibility 2>&1); then
             remote_view_lc=$(printf '%s' "$remote_view" | tr '[:upper:]' '[:lower:]')
@@ -2904,11 +2928,6 @@ github_sync_flush() {
         GITHUB_SYNC_STATUS=pending
         return 1
     fi
-    if [[ "$GITHUB_REMOTE" == https://github.com/* ]] &&
-       ! _github_account_login "$GITHUB_OWNER"; then
-        GITHUB_SYNC_STATUS=pending
-        return 1
-    fi
     local had_files=false commit_output push_output head head_output
     [[ -n "$(git -C "$GITHUB_WORKTREE" ls-files 2>/dev/null)" ]] && had_files=true
     if ! _github_stage_allowlist; then
@@ -2942,6 +2961,11 @@ github_sync_flush() {
     if ! git --git-dir="$GITHUB_STORE" update-ref "refs/heads/$GITHUB_BRANCH" "$head"; then
         _github_record_error "сохранение локальной точки восстановления" \
             "Не удалось закрепить локальный commit конфигурации."
+        GITHUB_SYNC_STATUS=pending
+        return 1
+    fi
+    if [[ "$GITHUB_REMOTE" == https://github.com/* ]] &&
+       ! _github_account_login "$GITHUB_OWNER"; then
         GITHUB_SYNC_STATUS=pending
         return 1
     fi

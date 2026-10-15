@@ -28,6 +28,12 @@ else
 fi
 case "$1 $2" in
     'api user')
+        case "${GH_MODE:-success}" in
+            api-timeout) printf '%s\n' 'connection timed out' >&2; exit 28 ;;
+            auth-fail) printf '%s\n' 'HTTP 401: Bad credentials' >&2; exit 1 ;;
+            wrong-account) login=other-owner ;;
+            empty-login) exit 0 ;;
+        esac
         printf '%s\n' "$login"
         ;;
     'repo view')
@@ -40,6 +46,7 @@ case "$1 $2" in
         printf 'username=%s\npassword=fixture-%s\n' "$login" "$login"
         ;;
     'auth token')
+        [[ "${GH_IMPORT_DISABLED:-false}" != true ]] || exit 1
         requested=
         while (( $# )); do
             if [[ "$1" == --user ]]; then requested="$2"; break; fi
@@ -96,6 +103,160 @@ _seed_live_revision() {
     printf '{"storage_version":1,"encryption":"none","revision":%s}\n' "$revision" \
         > "$GITHUB_WORKTREE/storage.json" || return 1
     github_sync_flush || return 1
+}
+
+_https_revision_fixture() {
+    _map_github_bare test-owner "$REMOTE"
+    GITHUB_REMOTE=https://github.com/test-owner/config.git
+    _seed_live_revision 1
+}
+
+_assert_https_flush_preserves_revision() {
+    local mode="$1" head
+    _https_revision_fixture || return 1
+    printf '{"storage_version":1,"encryption":"none","revision":2}\n' > "$GITHUB_WORKTREE/storage.json"
+    export GH_MODE="$mode"
+    if github_sync_flush; then return 1; fi
+    [[ "$GITHUB_SYNC_STATUS" == pending ]] || return 1
+    head=$(git -C "$GITHUB_WORKTREE" rev-parse HEAD) || return 1
+    [[ "$(git --git-dir="$GITHUB_STORE" rev-parse refs/heads/main)" == "$head" ]] || return 1
+    [[ "$(git --git-dir="$GITHUB_STORE" show main:storage.json | jq -r .revision)" == 2 ]] || return 1
+    [[ -z "$(git -C "$GITHUB_WORKTREE" status --porcelain)" ]] || return 1
+    _assert_remote_revision "$REMOTE" 1
+}
+
+_assert_cached_resume_rejected() {
+    local scenario="$1" mode=api-timeout init_mode=resume profile before_refs before_origin
+    _https_revision_fixture || return 1
+    github_config_close || return 1
+    profile="$GITHUB_CREDENTIALS_DIR/gh/test-owner"
+    case "$scenario" in
+        auth-fail|wrong-account|empty-login) mode="$scenario" ;;
+        missing-profile) rm -rf "$profile"; export GH_IMPORT_DISABLED=true ;;
+        imported-profile) rm -rf "$profile"; printf 'test-owner\n' > "$FAKE_GH_GLOBAL_LOGIN" ;;
+        missing-branch) git --git-dir="$GITHUB_STORE" update-ref -d refs/heads/main ;;
+        wrong-origin) git --git-dir="$GITHUB_STORE" remote set-url origin https://github.com/other-owner/config.git ;;
+        symlink-store) mv "$GITHUB_STORE" "$GITHUB_STORE.real"; ln -s "$GITHUB_STORE.real" "$GITHUB_STORE" ;;
+        symlink-profile) mv "$profile" "$profile.real"; ln -s "$profile.real" "$profile" ;;
+        symlink-hosts) mv "$profile/hosts.yml" "$profile/hosts.real"; ln -s "$profile/hosts.real" "$profile/hosts.yml" ;;
+        onboarding) init_mode=onboarding ;;
+    esac
+    before_refs=$(git --git-dir="$GITHUB_STORE" show-ref || true)
+    before_origin=$(git --git-dir="$GITHUB_STORE" remote get-url origin)
+    export GH_MODE="$mode"
+    : > "$FAKE_GH_LOG"
+    if github_sync_init false "$init_mode"; then return 1; fi
+    [[ -z "${GITHUB_WORKTREE:-}" && -z "${GITHUB_SESSION_ID:-}" ]] || return 1
+    [[ "$(git --git-dir="$GITHUB_STORE" show-ref || true)" == "$before_refs" ]] || return 1
+    [[ "$(git --git-dir="$GITHUB_STORE" remote get-url origin)" == "$before_origin" ]] || return 1
+    ! grep -q '|repo view ' "$FAKE_GH_LOG"
+}
+
+@test "HTTPS account timeout commits locally before refusing push" {
+    _assert_https_flush_preserves_revision api-timeout || return 1
+    [[ "$GITHUB_LAST_AUTH_RELEVANT" == false ]] || return 1
+    [[ -z "$GITHUB_LAST_HINT" ]]
+}
+
+@test "HTTPS auth failure commits locally before refusing push" {
+    _assert_https_flush_preserves_revision auth-fail || return 1
+    [[ "$GITHUB_LAST_AUTH_RELEVANT" == true ]]
+}
+
+@test "HTTPS account mismatch commits locally before refusing push" {
+    _assert_https_flush_preserves_revision wrong-account || return 1
+    [[ "$GITHUB_LAST_AUTH_RELEVANT" == true ]]
+}
+
+@test "HTTPS pending commit survives close and fresh offline init then no-diff retry" {
+    _assert_https_flush_preserves_revision api-timeout || return 1
+    local head old_worktree="$GITHUB_WORKTREE"
+    head=$(git -C "$GITHUB_WORKTREE" rev-parse HEAD)
+    github_config_close || return 1
+    [[ ! -d "$old_worktree" ]] || return 1
+    : > "$FAKE_GH_LOG"
+    run bash -c '
+        source "$1/common/common.sh"
+        source "$1/remote-control/modules/state.sh"
+        source "$1/remote-control/modules/github-config.sh"
+        GITHUB_REMOTE=test-owner/config
+        github_sync_init || exit 1
+        [[ "$GITHUB_SYNC_STATUS" == pending ]] || exit 2
+        [[ "$GITHUB_WORKTREE" != "$2" ]] || exit 3
+        [[ "$(git -C "$GITHUB_WORKTREE" rev-parse HEAD)" == "$3" ]] || exit 4
+        [[ "$(jq -r .revision "$GITHUB_WORKTREE/storage.json")" == 2 ]] || exit 5
+        ! grep -q "|repo view " "$FAKE_GH_LOG" || exit 6
+        GH_MODE=success
+        github_sync_flush || exit 7
+        [[ "$GITHUB_SYNC_STATUS" == clean ]] || exit 8
+        [[ "$(git --git-dir="$REMOTE" rev-parse main)" == "$3" ]] || exit 9
+        github_config_close
+    ' _ "$PROJECT_ROOT" "$old_worktree" "$head"
+    assert_success
+    _assert_remote_revision "$REMOTE" 2
+}
+
+@test "cached resume rejects confirmed authentication failure" { _assert_cached_resume_rejected auth-fail; }
+@test "cached resume rejects mismatched successful login" { _assert_cached_resume_rejected wrong-account; }
+@test "cached resume rejects empty successful login" { _assert_cached_resume_rejected empty-login; }
+@test "cached resume rejects missing profile without credential import" { _assert_cached_resume_rejected missing-profile; }
+@test "cached resume rejects profile imported during current timeout attempt" { _assert_cached_resume_rejected imported-profile; }
+@test "cached resume rejects missing local branch" { _assert_cached_resume_rejected missing-branch; }
+@test "cached resume rejects foreign origin without changing it" { _assert_cached_resume_rejected wrong-origin; }
+@test "cached resume rejects symlink store" { _assert_cached_resume_rejected symlink-store; }
+@test "cached resume rejects symlink profile" { _assert_cached_resume_rejected symlink-profile; }
+@test "cached resume rejects symlink profile hosts" { _assert_cached_resume_rejected symlink-hosts; }
+@test "cached resume rejects onboarding during account timeout" { _assert_cached_resume_rejected onboarding; }
+
+@test "offline init retains live session and uncommitted data for canonical slug" {
+    _https_revision_fixture || return 1
+    local worktree="$GITHUB_WORKTREE" session="$GITHUB_SESSION_ID"
+    printf 'local data\n' > "$worktree/uncommitted"
+    export GH_MODE=api-timeout
+    GITHUB_REMOTE=test-owner/config
+    : > "$FAKE_GH_LOG"
+    github_sync_init || return 1
+    [[ "$GITHUB_WORKTREE" == "$worktree" && "$GITHUB_SESSION_ID" == "$session" ]] || return 1
+    [[ "$(cat "$worktree/uncommitted")" == "local data" ]] || return 1
+    [[ "$GITHUB_SYNC_STATUS" == pending ]] || return 1
+    ! grep -q '|repo view ' "$FAKE_GH_LOG"
+}
+
+@test "offline live session rejects changed target without opening another session" {
+    _https_revision_fixture || return 1
+    local worktree="$GITHUB_WORKTREE" session="$GITHUB_SESSION_ID" refs
+    refs=$(git --git-dir="$GITHUB_STORE" show-ref)
+    export GH_MODE=api-timeout
+    GITHUB_REMOTE=test-owner/another-config
+    if github_sync_init; then return 1; fi
+    [[ "$GITHUB_WORKTREE" == "$worktree" && "$GITHUB_SESSION_ID" == "$session" ]] || return 1
+    [[ "$(git --git-dir="$GITHUB_STORE" show-ref)" == "$refs" ]] || return 1
+    [[ "$(git --git-dir="$GITHUB_STORE" config --get remote.origin.url)" == https://github.com/test-owner/config.git ]] || return 1
+}
+
+@test "offline live session rejects replaced origin without opening another session" {
+    _https_revision_fixture || return 1
+    local worktree="$GITHUB_WORKTREE" session="$GITHUB_SESSION_ID" refs
+    git --git-dir="$GITHUB_STORE" remote set-url origin https://github.com/other-owner/config.git
+    refs=$(git --git-dir="$GITHUB_STORE" show-ref)
+    export GH_MODE=api-timeout
+    if github_sync_init; then return 1; fi
+    [[ "$GITHUB_WORKTREE" == "$worktree" && "$GITHUB_SESSION_ID" == "$session" ]] || return 1
+    [[ "$(git --git-dir="$GITHUB_STORE" show-ref)" == "$refs" ]] || return 1
+    [[ "$(git --git-dir="$GITHUB_STORE" config --get remote.origin.url)" == https://github.com/other-owner/config.git ]] || return 1
+}
+
+@test "offline live session target guard rejects another cached branch" {
+    _https_revision_fixture || return 1
+    local worktree="$GITHUB_WORKTREE" session="$GITHUB_SESSION_ID" refs
+    git --git-dir="$GITHUB_STORE" update-ref refs/heads/another main
+    refs=$(git --git-dir="$GITHUB_STORE" show-ref)
+    GITHUB_BRANCH=another
+    export GH_MODE=api-timeout
+    if github_sync_init; then return 1; fi
+    [[ "$GITHUB_LAST_STAGE" == "проверка цели рабочей сессии GitHub" ]] || return 1
+    [[ "$GITHUB_WORKTREE" == "$worktree" && "$GITHUB_SESSION_ID" == "$session" ]] || return 1
+    [[ "$(git --git-dir="$GITHUB_STORE" show-ref)" == "$refs" ]] || return 1
 }
 
 _seed_age_revision() {

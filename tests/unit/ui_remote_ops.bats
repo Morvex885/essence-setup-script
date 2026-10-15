@@ -22,8 +22,10 @@ teardown() { teardown_test_env; }
     cp "$CONFIG_JSON" "$BATS_TEST_TMPDIR/config.before"
     cp "$SECRETS_JSON" "$BATS_TEST_TMPDIR/secrets.before"
     CONFIRMS=0
-    confirm_yn() { CONFIRMS=$((CONFIRMS+1)); [[ "$2" == N ]]; return 1; }
+    BAD_DEFAULT=0
+    confirm_yn() { CONFIRMS=$((CONFIRMS+1)); if [[ "${2:-}" != N ]]; then BAD_DEFAULT=1; return 2; fi; return 1; }
     delete_node <<< $'1\n2'
+    [[ "$BAD_DEFAULT" == 0 ]] || return 1
     [[ "$CONFIRMS" == 1 ]]
     cmp "$CONFIG_JSON" "$BATS_TEST_TMPDIR/config.before"
     cmp "$SECRETS_JSON" "$BATS_TEST_TMPDIR/secrets.before"
@@ -76,11 +78,13 @@ teardown() { teardown_test_env; }
     SERVER_AUTH=key SERVER_PORT=2222
     SSH_RUN_MOCK_OUTPUT=free
     CONFIRMS=0
-    confirm_yn() { CONFIRMS=$((CONFIRMS+1)); [[ "$2" == N ]]; return 1; }
+    BAD_DEFAULT=0
+    confirm_yn() { CONFIRMS=$((CONFIRMS+1)); if [[ "${2:-}" != N ]]; then BAD_DEFAULT=1; return 2; fi; return 1; }
     _harden_setup_key() { touch "$BATS_TEST_TMPDIR/mutation"; }
     _harden_disable_password() { touch "$BATS_TEST_TMPDIR/mutation"; }
     cp "$CONFIG_JSON" "$BATS_TEST_TMPDIR/config.before"
     ssh_hardening <<< $'\n'
+    [[ "$BAD_DEFAULT" == 0 ]] || return 1
     [[ "$CONFIRMS" == 1 && -n "$HARDEN_NEW_PORT" ]]
     [[ ! -e "$BATS_TEST_TMPDIR/mutation" ]]
     cmp "$CONFIG_JSON" "$BATS_TEST_TMPDIR/config.before"
