@@ -197,7 +197,7 @@ reject_default_headers_promotion() {
     _SAVE_NODE_NAME=unchanged-save-context
 }
 
-@test 'rejected default headers block single and batch publication before context or transport changes' {
+@test 'rejected default headers block publication and rotation before context or transport changes' {
     reject_default_headers_promotion
     local before context rc=0
     before=$(jq_r '.')
@@ -206,6 +206,9 @@ reject_default_headers_promotion() {
     [ "$rc" -ne 0 ]
     rc=0
     subscription_publish_all >> "$BATS_TEST_TMPDIR/output" 2>&1 || rc=$?
+    [ "$rc" -ne 0 ]
+    rc=0
+    subscription_rotate alpha <<< 'y' >> "$BATS_TEST_TMPDIR/output" 2>&1 || rc=$?
     [ "$rc" -ne 0 ]
     [ "$(jq_r '.')" = "$before" ]
     [ "$(declare -p NODE_ID NODE_NAME NODE_IDENTITY NODE_TAG SERVER_IP SERVER_PORT SERVER_USER SERVER_PASS SERVER_AUTH)" = "$context" ]

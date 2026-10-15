@@ -315,3 +315,45 @@ failed_recovery() {
     [[ -z "$(jq_r '.clients[0].subscription.token // empty')" ]]
     [[ "$(jq_r '.clients[0].subscription.headers[0].value')" == phone ]]
 }
+
+@test "legacy revoke removes the live link without attempting default headers writes" {
+    jq_w 'del(.subscription_default_headers)'
+    jq 'del(.clients[0].subscription.token, .clients[0].subscription.expires_at, .clients[0].subscription.created_at)' "$CONFIG_JSON" > "$BATS_TEST_TMPDIR/revoked.json"
+    REAL_MV=$(type -P mv)
+    mv() {
+        if [[ "$1" == "$CONFIG_JSON".tmp.* && "$2" == "$CONFIG_JSON" ]] &&
+            jq -e 'has("subscription_default_headers")' "$1" >/dev/null; then
+            touch "$BATS_TEST_TMPDIR/default-promotion"
+            return 77
+        fi
+        "$REAL_MV" "$@"
+    }
+    NODE_ID=prior NODE_NAME=prior NODE_IDENTITY=identity NODE_TAG=tag
+    SERVER_IP=192.0.2.99 SERVER_PORT=2222 SERVER_USER=user
+    SERVER_PASS=password SERVER_AUTH=password
+    local context
+    context=$(declare -p NODE_ID NODE_NAME NODE_IDENTITY NODE_TAG SERVER_IP SERVER_PORT SERVER_USER SERVER_PASS SERVER_AUTH)
+    subscription_revoke phone <<< 'y' > "$BATS_TEST_TMPDIR/revoke.output" 2>&1
+    [ "$(declare -p NODE_ID NODE_NAME NODE_IDENTITY NODE_TAG SERVER_IP SERVER_PORT SERVER_USER SERVER_PASS SERVER_AUTH)" = "$context" ]
+    [[ ! -e "$SUB_DIR/$OLD_TOKEN.yaml" ]]
+    [[ ! -e "$SUB_SNIPPETS_DIR/sub-$OLD_TOKEN.conf" ]]
+    [[ ! -e "$RUNTIME_DIR/sub-$OLD_TOKEN.conf" ]]
+    printf 'cccc 2100000000\n' > "$BATS_TEST_TMPDIR/remaining.expiry"
+    cmp "$SUB_DIR/expiry.list" "$BATS_TEST_TMPDIR/remaining.expiry"
+    diff <(jq -S . "$CONFIG_JSON") <(jq -S . "$BATS_TEST_TMPDIR/revoked.json")
+    [[ ! -e "$BATS_TEST_TMPDIR/default-promotion" ]]
+    run cat "$BATS_TEST_TMPDIR/revoke.output"
+    assert_success
+    [[ "$output" != *"$OLD_TOKEN"* && "$output" != *"$NEW_TOKEN"* ]]
+    unset -f mv
+}
+
+@test "legacy revoke restores the live link and metadata after an ambiguous reload failure" {
+    jq_w 'del(.subscription_default_headers)'
+    command cp "$CONFIG_JSON" "$BATS_TEST_TMPDIR/expected.json"
+    FAIL_STAGE=reload
+    run subscription_revoke phone <<< 'y'
+    assert_failure_has_no_tokens
+    [[ -e "$BATS_TEST_TMPDIR/deleted-before-reload" ]]
+    assert_old_usable
+}

@@ -20,7 +20,6 @@ _sub_restore_ssh_ctx() {
 }
 
 _sub_load_host() {
-    _ensure_default_headers || return 1
     local host_node
     host_node=$(jq_r '.subscription_host.node // empty')
     [[ -z "$host_node" ]] && { warn "Хост-нода подписок не задана. Используйте пункт «Выбрать хост-ноду»."; return 1; }
@@ -41,7 +40,7 @@ _sub_load_host() {
 }
 
 # Записывает дефолтные subscription headers если их ещё нет в config.json.
-# Вызывается лениво из _sub_load_host и subscription_menu.
+# Вызывается перед публикацией/ротацией и из subscription_menu, но не при отзыве.
 _ensure_default_headers() {
     local has
     has=$(jq_r 'has("subscription_default_headers")')
@@ -400,6 +399,7 @@ subscription_publish() {
     fi
 
     # Загружаем на сервер
+    _ensure_default_headers || return 1
     _sub_load_host || return
 
     local sub_dir nginx_group
@@ -587,6 +587,7 @@ subscription_rotate() {
     config_file=$(_client_config_file "$client")
     _subscription_config_ready "$config_file" || { warn "Конфиг для '$client' не найден или пуст."; return 1; }
     host_node=$(jq_r '.subscription_host.node // empty')
+    _ensure_default_headers || return 1
     _sub_load_host || return 1
     local sub_dir nginx_group new_token
     sub_dir=$(_sub_get_dir) || { _sub_done; return 1; }
@@ -753,6 +754,7 @@ subscription_publish_all() {
         return
     fi
 
+    _ensure_default_headers || return 1
     _sub_load_host || return
 
     local sub_dir nginx_group

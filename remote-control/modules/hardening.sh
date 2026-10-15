@@ -49,10 +49,28 @@ _portable_onboarding_choice() {
     done
 }
 
+_onboarding_restore_backups() {
+    local known_existed="$1" known_backup="$2" manifest_backup="$3" restore_ok=true
+    if [[ "$known_existed" == true ]]; then
+        [[ -f "$known_backup" ]] && cp "$known_backup" "$SSH_KNOWN_HOSTS" || restore_ok=false
+    else
+        rm -f "$SSH_KNOWN_HOSTS" || restore_ok=false
+    fi
+    if [[ -n "$manifest_backup" ]]; then
+        [[ -f "$manifest_backup" ]] && cp "$manifest_backup" "$STATE_MANIFEST" || restore_ok=false
+    fi
+    if [[ "$restore_ok" == true ]]; then
+        rm -f "$known_backup" "$manifest_backup"
+    else
+        warn "Не удалось восстановить SSH-настройку. Резервные копии оставлены: $known_backup $manifest_backup"
+        return 1
+    fi
+}
+
 _github_initial_portable_onboarding() {
     [[ "${CONFIG_SOURCE:-local}" == "github" ]] || return 0
     local known_backup="" known_existed=false manifest_backup="" id name choice
-    local provision_keys=false restore_ok
+    local provision_keys=false
     local -a key_ids=() installed_ids=()
     local -a node_rows=()
     if [[ -f "${SSH_KNOWN_HOSTS:-}" ]]; then
@@ -121,20 +139,7 @@ _github_initial_portable_onboarding() {
                             warn "Не удалось отозвать переносимый SSH-ключ ноды «${NODE_NAME:-$name}»."
                         rm -f "$SSH_IDENTITIES_DIR/$name" "$SSH_IDENTITIES_DIR/$name.pub"
                     done
-                    restore_ok=true
-                    if [[ "$known_existed" == true ]]; then
-                        [[ -f "$known_backup" ]] && cp "$known_backup" "$SSH_KNOWN_HOSTS" || restore_ok=false
-                    else
-                        rm -f "$SSH_KNOWN_HOSTS" || restore_ok=false
-                    fi
-                    if [[ -n "$manifest_backup" ]]; then
-                        [[ -f "$manifest_backup" ]] && cp "$manifest_backup" "$STATE_MANIFEST" || restore_ok=false
-                    fi
-                    if [[ "$restore_ok" == true ]]; then
-                        rm -f "$known_backup" "$manifest_backup"
-                    else
-                        warn "Не удалось восстановить SSH-настройку. Резервные копии оставлены: $known_backup $manifest_backup"
-                    fi
+                    _onboarding_restore_backups "$known_existed" "$known_backup" "$manifest_backup" || true
                     return 1
                 fi
             done
@@ -169,20 +174,7 @@ _github_initial_portable_onboarding() {
                 state_portability_add_issue "$id" missing_host_key || return 1
                 break
             else
-                restore_ok=true
-                if [[ "$known_existed" == true ]]; then
-                    [[ -f "$known_backup" ]] && cp "$known_backup" "$SSH_KNOWN_HOSTS" || restore_ok=false
-                else
-                    rm -f "$SSH_KNOWN_HOSTS" || restore_ok=false
-                fi
-                if [[ -n "$manifest_backup" ]]; then
-                    [[ -f "$manifest_backup" ]] && cp "$manifest_backup" "$STATE_MANIFEST" || restore_ok=false
-                fi
-                if [[ "$restore_ok" == true ]]; then
-                    rm -f "$known_backup" "$manifest_backup"
-                else
-                    warn "Не удалось восстановить SSH-настройку. Резервные копии оставлены: $known_backup $manifest_backup"
-                fi
+                _onboarding_restore_backups "$known_existed" "$known_backup" "$manifest_backup" || true
                 for name in "${installed_ids[@]}"; do
                     node_load_by_name "$(jq_r --arg id "$name" '.nodes[] | select(.id==$id) | .name')" || continue
                     _revoke_managed_remote_key "$name" ||
@@ -202,20 +194,7 @@ _github_initial_portable_onboarding() {
         local identity_write_rc=$?
         CONFIG_PERSIST_ALLOW_NEEDS_SETUP="$previous_candidate_allow"
         if [[ $identity_write_rc -ne 0 ]]; then
-            restore_ok=true
-            if [[ "$known_existed" == true ]]; then
-                [[ -f "$known_backup" ]] && cp "$known_backup" "$SSH_KNOWN_HOSTS" || restore_ok=false
-            else
-                rm -f "$SSH_KNOWN_HOSTS" || restore_ok=false
-            fi
-            if [[ -n "$manifest_backup" ]]; then
-                [[ -f "$manifest_backup" ]] && cp "$manifest_backup" "$STATE_MANIFEST" || restore_ok=false
-            fi
-            if [[ "$restore_ok" == true ]]; then
-                rm -f "$known_backup" "$manifest_backup"
-            else
-                warn "Не удалось восстановить SSH-настройку. Резервные копии оставлены: $known_backup $manifest_backup"
-            fi
+            _onboarding_restore_backups "$known_existed" "$known_backup" "$manifest_backup" || true
             for name in "${installed_ids[@]}"; do
                 node_load_by_name "$(jq_r --arg id "$name" '.nodes[] | select(.id==$id) | .name')" || continue
                 _revoke_managed_remote_key "$name" ||

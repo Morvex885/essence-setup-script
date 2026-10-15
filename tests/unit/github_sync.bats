@@ -674,6 +674,16 @@ _assert_local_switch_rolled_back() {
     local child_config="$BATS_TEST_TMPDIR/ssh-child-config"
     local child_store="$BATS_TEST_TMPDIR/ssh-child-store.git"
     local child_sessions="$BATS_TEST_TMPDIR/ssh-child-sessions"
+    cat > "$BATS_TEST_TMPDIR/bin/ssh" <<'SSH'
+#!/bin/bash
+[[ -f "$SSH_ASKPASS" && -f "$_PASS_FILE" ]] || exit 1
+supplied=$("$SSH_ASKPASS") || exit 1
+expected=$(cat "$PASSWORD_FIXTURE") || exit 1
+[[ "$supplied" == "$expected" ]] || exit 1
+printf "%s\n%s\n" "$SSH_ASKPASS" "$_PASS_FILE" > "$TRANSPORT_META" || exit 1
+printf "ok\n"
+SSH
+    chmod 700 "$BATS_TEST_TMPDIR/bin/ssh"
     run env PROJECT_ROOT="$PROJECT_ROOT" REMOTE="$REMOTE" \
         CHILD_CONFIG="$child_config" CHILD_STORE="$child_store" \
         CHILD_SESSIONS="$child_sessions" CLEANUP_META="$meta" \
@@ -719,16 +729,7 @@ _assert_local_switch_rolled_back() {
             SERVER_AUTH=password SERVER_PASS=$(cat "$PASSWORD_FIXTURE")
             SERVER_USER=fixture SERVER_IP=example.invalid SERVER_PORT=22
             SSH_ALLOW_PORTABLE_ONBOARDING=1
-            ssh() {
-                local supplied expected
-                [[ -f "$SSH_ASKPASS" && -f "$_PASS_FILE" ]] || return 1
-                supplied=$("$SSH_ASKPASS") || return 1
-                expected=$(cat "$PASSWORD_FIXTURE") || return 1
-                [[ "$supplied" == "$expected" ]] || return 1
-                printf "%s\n%s\n" "$SSH_ASKPASS" "$_PASS_FILE" \
-                    > "$TRANSPORT_META" || return 1
-                printf "ok\n"
-            }
+            export _PASS_FILE
             for attempt in 1 2; do
                 response=$(ssh_run -- "echo ok") || exit 1
                 [[ "$response" == ok ]] || exit 1
