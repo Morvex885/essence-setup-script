@@ -99,3 +99,67 @@ teardown() { teardown_test_env; }
     [ "${#GENERATE_CLIENT_FAILED[@]}" -eq 0 ]
     cmp -s "$GENERATED_DIR/ROUTER/my-router/config.yaml" <(printf 'previous\n')
 }
+
+# Keep editor discovery independent of editors installed on the test host.
+_select_test_editor() {
+    TEST_TEMPLATE_EDITOR="$1"
+    command() {
+        if [[ "$1" == -v && ( "$2" == nano || "$2" == vi ) ]]; then
+            [[ "$2" == "$TEST_TEMPLATE_EDITOR" ]]
+            return $?
+        fi
+        builtin command "$@"
+    }
+    nano() {
+        printf 'partial editor change\n' >> "$1"
+        return 73
+    }
+    vi() {
+        printf 'partial editor change\n' >> "$1"
+        return 74
+    }
+}
+
+@test "template editing rejects failed nano and vi while retaining their partial changes" {
+    local editor before
+    before=$(jq -S . "$CONFIG_JSON")
+    for editor in nano vi; do
+        _select_test_editor "$editor"
+        printf 'original template\n' > "$TEMPLATES_DIR/default.yaml"
+        run edit_template <<< '1'
+        [ "$status" -ne 0 ]
+        cmp -s "$TEMPLATES_DIR/default.yaml" <(printf 'original template\npartial editor change\n')
+        [ "$(jq -S . "$CONFIG_JSON")" = "$before" ]
+    done
+}
+
+@test "new template editor failures leave partial files without assigning either template to the group" {
+    local editor before
+    before=$(jq -S . "$CONFIG_JSON")
+    for editor in nano vi; do
+        _select_test_editor "$editor"
+        run _create_new_template PC <<< "failed-$editor"
+        [ "$status" -ne 0 ]
+        cmp -s "$TEMPLATES_DIR/failed-$editor.yaml" \
+            <(cat "$TEMPLATES_DIR/default.yaml"; printf 'partial editor change\n')
+        [ "$(jq -S . "$CONFIG_JSON")" = "$before" ]
+    done
+}
+
+@test "no editor preserves manual editing and permits assigning a newly copied template" {
+    _select_test_editor none
+    local before
+    before=$(jq -S . "$CONFIG_JSON")
+    run edit_template <<< $'n\nmanual-edit'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"$TEMPLATES_DIR/manual-edit.yaml"* ]]
+    cmp -s "$TEMPLATES_DIR/manual-edit.yaml" "$TEMPLATES_DIR/default.yaml"
+    [ "$(jq -S . "$CONFIG_JSON")" = "$before" ]
+
+    run _create_new_template PC <<< 'manual-group'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"$TEMPLATES_DIR/manual-group.yaml"* ]]
+    cmp -s "$TEMPLATES_DIR/manual-group.yaml" "$TEMPLATES_DIR/default.yaml"
+    jq -e '.groups[] | select(.name=="PC") | .template=="manual-group.yaml"' "$CONFIG_JSON"
+    jq -e '.groups[] | select(.name=="MOBILE") | .template=="missing.yaml"' "$CONFIG_JSON"
+}

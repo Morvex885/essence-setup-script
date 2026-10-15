@@ -171,3 +171,57 @@ _prepare_connection_sync_test() {
     ' "$CONFIG_JSON"
     assert_success
 }
+
+@test "_sync_all_connections: second promotion failure stops discovery and restores SSH context" {
+    _prepare_connection_sync_test
+    source_module "nodes.sh"
+    jq_w '
+        .nodes += [(.nodes[0] | .id="33333333333333333333333333333333" |
+            .name="third-vps" | .ip="9.8.7.6")] |
+        .connections += [{node:"third-vps",groups:[{name:"PC",
+            proxies:["vless-reality","stale-proxy"]}]}]
+    '
+    NODE_ID=original-id NODE_IDENTITY=original-identity NODE_TAG=original-tag
+    NODE_NAME=original-node SERVER_IP=original-ip SERVER_PORT=2200
+    SERVER_USER=original-user SERVER_PASS=original-pass SERVER_AUTH=password
+    local before_context
+    before_context=$(printf '%s\n' "$NODE_ID" "$NODE_IDENTITY" "$NODE_TAG" "$NODE_NAME" \
+        "$SERVER_IP" "$SERVER_PORT" "$SERVER_USER" "$SERVER_PASS" "$SERVER_AUTH")
+    ssh_run() {
+        printf '%s\n' "$NODE_NAME" >> "$BATS_TEST_TMPDIR/discovered"
+        printf '  - name: "vless-reality"\n'
+    }
+    success() { printf '%s\n' "$*" >> "$BATS_TEST_TMPDIR/completed"; }
+    local mv_real
+    mv_real=$(command -v mv)
+    printf '0\n' > "$BATS_TEST_TMPDIR/promotions"
+    mv() {
+        if [[ "$#" -eq 2 && "$1" == "$CONFIG_JSON.tmp."* && "$2" == "$CONFIG_JSON" ]]; then
+            local count
+            read -r count < "$BATS_TEST_TMPDIR/promotions"
+            count=$((count + 1))
+            printf '%s\n' "$count" > "$BATS_TEST_TMPDIR/promotions"
+            [[ "$count" -eq 2 ]] && return 77
+        fi
+        "$mv_real" "$@"
+    }
+    local rc=0
+    state_action "sync_connections" _sync_all_connections \
+        > "$BATS_TEST_TMPDIR/result" 2>&1 || rc=$?
+    [[ "$rc" -ne 0 ]]
+    [[ "$(cat "$BATS_TEST_TMPDIR/promotions")" == 2 ]]
+    [[ "$(cat "$BATS_TEST_TMPDIR/discovered")" == $'de-vps\nru-vps' ]]
+    [[ ! -e "$BATS_TEST_TMPDIR/completed" ]]
+    [[ ! -e "$STATE_MANIFEST" ]]
+    [[ "$(printf '%s\n' "$NODE_ID" "$NODE_IDENTITY" "$NODE_TAG" "$NODE_NAME" \
+        "$SERVER_IP" "$SERVER_PORT" "$SERVER_USER" "$SERVER_PASS" "$SERVER_AUTH")" == "$before_context" ]]
+    run jq -e '
+        (.connections[] | select(.node=="de-vps") |
+            all(.groups[]; .proxies==["vless-reality"])) and
+        (.connections[] | select(.node=="ru-vps") |
+            all(.groups[]; .proxies==["vless-reality","stale-proxy"])) and
+        (.connections[] | select(.node=="third-vps") |
+            all(.groups[]; .proxies==["vless-reality","stale-proxy"]))
+    ' "$CONFIG_JSON"
+    assert_success
+}

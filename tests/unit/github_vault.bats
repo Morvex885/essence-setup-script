@@ -349,25 +349,39 @@ EOF
     [[ "$failures" -eq 0 ]]
 }
 
-@test "jq_w reports detailed persistence errors and generic fallback" {
-    CONFIG_JSON="$BATS_TEST_TMPDIR/config.json"
-    printf '{"value":1}\n' > "$CONFIG_JSON"
+@test "rejected GitHub group candidate preserves config and skips completion effects" {
+    source "$PROJECT_ROOT/remote-control/modules/groups.sh"
+    local before manifest_before rc=0 temp_found
+    local completion="$BATS_TEST_TMPDIR/group-completed"
+    local pushed="$BATS_TEST_TMPDIR/github-pushed"
+    printf '{"schema_version":1,"node_passwords":{}}\n' > "$SECRETS_JSON" || return 1
+    printf 'mode: rule\n' > "$TEMPLATES_DIR/default.yaml" || return 1
+    state_open_local || return 1
+    state_validate true || return 1
+    before=$(jq -S . "$CONFIG_JSON") || return 1
+    manifest_before=$(cat "$STATE_MANIFEST") || return 1
+
+    # A lost session must reject the real checkpoint, not just a mocked writer.
     CONFIG_SOURCE=github
-    config_persist_candidate() {
-        if [[ "${PERSIST_ERROR_MODE:-detailed}" == detailed ]]; then
-            CONFIG_PERSIST_LAST_ERROR="Не удалось зафиксировать кандидат."
-        fi
-        return 1
-    }
+    GITHUB_STORAGE_MODE=none
+    GITHUB_WORKTREE="$BATS_TEST_TMPDIR/missing-worktree"
+    GITHUB_SYNC_STATUS=clean
+    success() { printf 'completed\n' > "$completion"; }
+    github_sync_flush() { printf 'pushed\n' > "$pushed"; }
 
-    run jq_w '.value=2'
-    assert_failure
-    assert_output --partial "Не удалось зафиксировать кандидат."
+    state_action add_group add_group <<< 'REJECTED' \
+        > "$BATS_TEST_TMPDIR/rejected-group-output" 2>&1 || rc=$?
 
-    PERSIST_ERROR_MODE=generic
-    run jq_w '.value=3'
-    assert_failure
-    assert_output --partial "Не удалось сохранить представление конфига"
+    [[ "$rc" -ne 0 ]] || return 1
+    [[ "$(jq -S . "$CONFIG_JSON")" == "$before" ]] || return 1
+    [[ "$(cat "$STATE_MANIFEST")" == "$manifest_before" ]] || return 1
+    [[ ! -e "$completion" && ! -e "$pushed" ]] || return 1
+    [[ ! -e "$GITHUB_WORKTREE" ]] || return 1
+    [[ "$GITHUB_SYNC_STATUS" == clean ]] || return 1
+    temp_found=$(find "$CONFIG_DIR" \
+        \( -name 'config.json.tmp.*' -o -name '.candidate-state.*' \
+           -o -name '.persist-config.*' \) -print -quit) || return 1
+    [[ -z "$temp_found" ]]
 }
 
 @test "open rejects a tracked symlink before reading its target" {

@@ -135,6 +135,40 @@ assert_original_connection_preserved() {
     [[ "$SERVER_PASS" == hardening-password-canary ]]
 }
 
+# Reject only the final publication of one sandbox state file. Key installation,
+# JSON updates and all other filesystem operations still use the real binary.
+reject_hardening_state_promotion() {
+    HARDENING_REAL_MV=$(command -v mv)
+    HARDENING_REJECT_TARGET="$1"
+    mv() {
+        if [[ "$#" == 2 && "$1" == "$HARDENING_REJECT_TARGET".tmp.* &&
+              "$2" == "$HARDENING_REJECT_TARGET" ]]; then
+            printf '%s\n' "$2" >> "$BATS_TEST_TMPDIR/rejected-promotions"
+            return 77
+        fi
+        "$HARDENING_REAL_MV" "$@"
+    }
+}
+
+assert_no_hardening_phase() {
+    local unwanted="$1" file actual
+    for file in "$SSH_ARGV_DIR/"*.phase; do
+        actual=$(cat "$file")
+        [[ "$actual" != "$unwanted "* ]] || return 1
+    done
+}
+
+assert_retained_portable_identity() {
+    [[ "$(jq_r '.nodes[0].identity')" == "$NODE_ID" ]]
+    [[ "$NODE_IDENTITY" == "$NODE_ID" ]]
+    [[ -s "$SSH_IDENTITIES_DIR/$NODE_ID" && -s "$SSH_IDENTITIES_DIR/$NODE_ID.pub" ]]
+    local key_type key_value comment derived derived_type derived_value
+    read -r key_type key_value comment < "$SSH_IDENTITIES_DIR/$NODE_ID.pub"
+    derived=$(ssh-keygen -y -f "$SSH_IDENTITIES_DIR/$NODE_ID") || return 1
+    read -r derived_type derived_value comment <<< "$derived"
+    [[ "$derived_type" == "$key_type" && "$derived_value" == "$key_value" ]]
+}
+
 @test "local password hardening applies and verifies the generated key without system keys" {
     ssh_hardening <<< $'55555\ny' > "$BATS_TEST_TMPDIR/output" 2>&1
     assert_key_recovery_argv
@@ -189,4 +223,52 @@ assert_original_connection_preserved() {
     assert_phase 'rollback 55555'
     assert_phase 'restore 22'
     assert_original_connection_preserved
+}
+
+@test "late secret deletion failure retains committed key access and never restores password or port" {
+    cp "$SECRETS_JSON" "$BATS_TEST_TMPDIR/secrets.before"
+    reject_hardening_state_promotion "$SECRETS_JSON"
+
+    if ssh_hardening <<< $'55555\ny' > "$BATS_TEST_TMPDIR/output" 2>&1; then return 1; fi
+
+    [[ "$(cat "$BATS_TEST_TMPDIR/rejected-promotions")" == "$SECRETS_JSON" ]]
+    assert_phase 'verify-key 22'
+    assert_phase 'disable 22'
+    assert_phase 'apply 22'
+    assert_phase 'verify-new 55555'
+    assert_no_hardening_phase restore
+    assert_no_hardening_phase rollback
+    assert_key_recovery_argv
+    assert_retained_portable_identity
+    [[ "$(jq_r '.nodes[0].port')" == 55555 ]]
+    [[ "$(jq_r '.nodes[0].auth')" == key ]]
+    [[ "$(jq_r '.nodes[0].secret_id')" == null ]]
+    [[ "$SERVER_PORT" == 55555 && "$SERVER_AUTH" == key && -z "$SERVER_PASS" ]]
+    cmp "$SECRETS_JSON" "$BATS_TEST_TMPDIR/secrets.before"
+    [[ "$(node_secret_get "$NODE_ID")" == hardening-password-canary ]]
+    [[ "$(cat "$BATS_TEST_TMPDIR/output")" != *"Усиление защиты SSH завершено"* ]]
+}
+
+@test "late identity checkpoint failure retains the published key and stops before disabling password or changing port" {
+    cp "$STATE_MANIFEST" "$BATS_TEST_TMPDIR/manifest.before"
+    cp "$SECRETS_JSON" "$BATS_TEST_TMPDIR/secrets.before"
+    reject_hardening_state_promotion "$STATE_MANIFEST"
+
+    if ssh_hardening <<< $'55555\ny' > "$BATS_TEST_TMPDIR/output" 2>&1; then return 1; fi
+
+    [[ "$(cat "$BATS_TEST_TMPDIR/rejected-promotions")" == "$STATE_MANIFEST" ]]
+    assert_phase 'install 22'
+    assert_phase 'verify-key 22'
+    assert_no_hardening_phase disable
+    assert_no_hardening_phase apply
+    assert_no_hardening_phase verify-new
+    assert_no_hardening_phase restore
+    assert_no_hardening_phase rollback
+    assert_key_recovery_argv
+    assert_retained_portable_identity
+    assert_original_connection_preserved
+    [[ "$(jq_r '.nodes[0].secret_id')" == node-id ]]
+    cmp "$STATE_MANIFEST" "$BATS_TEST_TMPDIR/manifest.before"
+    cmp "$SECRETS_JSON" "$BATS_TEST_TMPDIR/secrets.before"
+    [[ "$(cat "$BATS_TEST_TMPDIR/output")" != *"Усиление защиты SSH завершено"* ]]
 }

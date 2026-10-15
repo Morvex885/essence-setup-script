@@ -49,6 +49,24 @@ _portable_onboarding_choice() {
     done
 }
 
+_onboarding_restore_backups() {
+    local known_existed="$1" known_backup="$2" manifest_backup="$3" restore_ok=true
+    if [[ "$known_existed" == true ]]; then
+        [[ -f "$known_backup" ]] && cp "$known_backup" "$SSH_KNOWN_HOSTS" || restore_ok=false
+    else
+        rm -f "$SSH_KNOWN_HOSTS" || restore_ok=false
+    fi
+    if [[ -n "$manifest_backup" ]]; then
+        [[ -f "$manifest_backup" ]] && cp "$manifest_backup" "$STATE_MANIFEST" || restore_ok=false
+    fi
+    if [[ "$restore_ok" == true ]]; then
+        rm -f "$known_backup" "$manifest_backup"
+    else
+        warn "Не удалось восстановить SSH-настройку. Резервные копии оставлены: $known_backup $manifest_backup"
+        return 1
+    fi
+}
+
 _github_initial_portable_onboarding() {
     [[ "${CONFIG_SOURCE:-local}" == "github" ]] || return 0
     local known_backup="" known_existed=false manifest_backup="" id name choice
@@ -121,9 +139,7 @@ _github_initial_portable_onboarding() {
                             warn "Не удалось отозвать переносимый SSH-ключ ноды «${NODE_NAME:-$name}»."
                         rm -f "$SSH_IDENTITIES_DIR/$name" "$SSH_IDENTITIES_DIR/$name.pub"
                     done
-                    if [[ "$known_existed" == true ]]; then cp "$known_backup" "$SSH_KNOWN_HOSTS"; else rm -f "$SSH_KNOWN_HOSTS"; fi
-                    [[ -f "$manifest_backup" ]] && cp "$manifest_backup" "$STATE_MANIFEST"
-                    rm -f "$known_backup" "$manifest_backup"
+                    _onboarding_restore_backups "$known_existed" "$known_backup" "$manifest_backup" || true
                     return 1
                 fi
             done
@@ -158,9 +174,7 @@ _github_initial_portable_onboarding() {
                 state_portability_add_issue "$id" missing_host_key || return 1
                 break
             else
-                if [[ "$known_existed" == true ]]; then cp "$known_backup" "$SSH_KNOWN_HOSTS"; else rm -f "$SSH_KNOWN_HOSTS"; fi
-                [[ -f "$manifest_backup" ]] && cp "$manifest_backup" "$STATE_MANIFEST"
-                rm -f "$known_backup" "$manifest_backup"
+                _onboarding_restore_backups "$known_existed" "$known_backup" "$manifest_backup" || true
                 for name in "${installed_ids[@]}"; do
                     node_load_by_name "$(jq_r --arg id "$name" '.nodes[] | select(.id==$id) | .name')" || continue
                     _revoke_managed_remote_key "$name" ||
@@ -180,9 +194,7 @@ _github_initial_portable_onboarding() {
         local identity_write_rc=$?
         CONFIG_PERSIST_ALLOW_NEEDS_SETUP="$previous_candidate_allow"
         if [[ $identity_write_rc -ne 0 ]]; then
-            if [[ "$known_existed" == true ]]; then cp "$known_backup" "$SSH_KNOWN_HOSTS"; else rm -f "$SSH_KNOWN_HOSTS"; fi
-            [[ -f "$manifest_backup" ]] && cp "$manifest_backup" "$STATE_MANIFEST"
-            rm -f "$known_backup" "$manifest_backup"
+            _onboarding_restore_backups "$known_existed" "$known_backup" "$manifest_backup" || true
             for name in "${installed_ids[@]}"; do
                 node_load_by_name "$(jq_r --arg id "$name" '.nodes[] | select(.id==$id) | .name')" || continue
                 _revoke_managed_remote_key "$name" ||
@@ -280,15 +292,15 @@ _provision_portable_identity() {
         return 1;
     }
     if ! mv "$private" "$SSH_IDENTITIES_DIR/$node_id" ||
-       ! mv "$public" "$SSH_IDENTITIES_DIR/$node_id.pub"; then
+       ! mv "$public" "$SSH_IDENTITIES_DIR/$node_id.pub" ||
+       ! chmod 600 "$SSH_IDENTITIES_DIR/$node_id" ||
+       ! chmod 644 "$SSH_IDENTITIES_DIR/$node_id.pub"; then
         [[ "$remote_installed" == true ]] && _revoke_managed_remote_key_value "$pubkey" >/dev/null 2>&1 || true
         rm -f "$SSH_IDENTITIES_DIR/$node_id" "$SSH_IDENTITIES_DIR/$node_id.pub"
         rm -rf "$tmp_dir"
         warn "Не удалось установить переносимый SSH-ключ в локальное хранилище."
         return 1
     fi
-    chmod 600 "$SSH_IDENTITIES_DIR/$node_id"
-    chmod 644 "$SSH_IDENTITIES_DIR/$node_id.pub"
     rm -rf "$tmp_dir"
 
     if [[ "${PORTABLE_IDENTITY_DEFER_CONFIG:-0}" != "1" ]] &&
@@ -301,7 +313,10 @@ _provision_portable_identity() {
     fi
     NODE_IDENTITY="$node_id"
     if [[ "${PORTABLE_IDENTITY_DEFER_CONFIG:-0}" != "1" ]]; then
-        state_checkpoint >/dev/null 2>&1 || true
+        if ! state_checkpoint; then
+            warn "SSH-ключ сохранён, но точку восстановления сохранить не удалось; дальнейшая настройка остановлена."
+            return 1
+        fi
     fi
     success "Переносимый SSH-ключ установлен"
 }
@@ -454,7 +469,6 @@ _harden_change_port() {
         return 1
     fi
     SERVER_AUTH=key; SERVER_PASS=""
-    node_secret_delete "$NODE_ID" >/dev/null 2>&1 || true
     success "Подключение по порту ${new_port} работает"
     return 0
 }
@@ -474,6 +488,10 @@ ssh_hardening() {
     if ! _harden_disable_password || ! _harden_change_port "$HARDEN_NEW_PORT"; then
         warn "Восстанавливаем вход по паролю..."
         _harden_restore_password || warn "Не удалось восстановить вход по паролю. Используйте консоль провайдера."
+        return 1
+    fi
+    if ! node_secret_delete "$NODE_ID"; then
+        warn "Порт и SSH-ключ сохранены, но старый пароль не удалось удалить из локального состояния."
         return 1
     fi
     success "Усиление защиты SSH завершено!"

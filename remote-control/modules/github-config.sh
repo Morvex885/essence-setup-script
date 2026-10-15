@@ -3196,7 +3196,10 @@ state_action() {
             return 0
         fi
     else
-        state_checkpoint || true
+        if ! state_checkpoint; then
+            warn "Не удалось сохранить локальную точку восстановления. Проверьте результат операции перед повтором."
+            return 1
+        fi
     fi
     return 0
 }

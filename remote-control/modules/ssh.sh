@@ -166,10 +166,16 @@ _ssh_pin_host_key() {
         rm -f "$tmp"
         return 1
     fi
-    cat "$tmp" >> "$SSH_KNOWN_HOSTS"
+    if ! cat "$tmp" >> "$SSH_KNOWN_HOSTS"; then
+        rm -f "$tmp"
+        return 1
+    fi
     rm -f "$tmp"
-    chmod 600 "$SSH_KNOWN_HOSTS"
-    state_checkpoint >/dev/null 2>&1 || true
+    chmod 600 "$SSH_KNOWN_HOSTS" || return 1
+    if ! state_checkpoint; then
+        warn "Ключ сервера записан, но точку восстановления сохранить не удалось."
+        return 1
+    fi
 }
 
 # ─── Проверка соединения с ретраем ──────────────────────────────────────────

@@ -6,13 +6,14 @@ NODE_DISC_NAMES=()
 NODE_DISC_COUNTS=()
 
 connections_menu() {
-    local _conn_synced=0
+    local _conn_sync_attempted=0
     while true; do
         local node_count
         node_count=$(nodes_count)
-        if [[ "$node_count" -gt 0 && "$_conn_synced" -eq 0 ]]; then
-            _sync_all_connections
-            _conn_synced=1
+        if [[ "$node_count" -gt 0 && "$_conn_sync_attempted" -eq 0 ]]; then
+            _conn_sync_attempted=1
+            state_action "sync_connections" _sync_all_connections ||
+                warn "Повторите синхронизацию вручную через пункт s."
         fi
         echo ""
         box_top
@@ -152,7 +153,11 @@ _sync_all_connections() {
         done <<< "$discovered"
 
         _node_disc_count_set "$nname" "${#disc_arr[@]}"
-        _purge_stale_connections "$nname" "${disc_arr[@]}"
+        if ! _purge_stale_connections "$nname" "${disc_arr[@]}"; then
+            fail=$((fail + 1))
+            warn "$nname: сохранение подключений не удалось; дальнейшая синхронизация остановлена."
+            break
+        fi
         ok=$((ok + 1))
     done
 
@@ -160,11 +165,12 @@ _sync_all_connections() {
     NODE_NAME="$_save_node" SERVER_IP="$_save_ip" SERVER_PORT="$_save_port"
     SERVER_USER="$_save_user" SERVER_PASS="$_save_pass" SERVER_AUTH="$_save_auth"
 
-    success "Синхронизировано: $ok/${#nodes[@]} нод"
     if [[ $fail -gt 0 ]]; then
-        warn "Не доступно: $fail"
+        info "Сохранено: $ok/${#nodes[@]} нод"
+        warn "Синхронизация завершена не полностью; ошибок: $fail."
         return 1
     fi
+    success "Синхронизировано: $ok/${#nodes[@]} нод"
     return 0
 }
 
@@ -309,7 +315,10 @@ _batch_assign_connections() {
     i=0
     for g in "${GRP_LIST[@]}"; do
         if [[ "${grp_flags[$i]}" == "1" ]]; then
-            _save_connection "$nname" "$g" "$selected_csv" || return 1
+            if ! _save_connection "$nname" "$g" "$selected_csv"; then
+                warn "Назначение остановлено. Сохранено групп: $applied; ранее сохранённые изменения оставлены."
+                return 1
+            fi
             success "$nname -> $g сохранено"
             applied=$((applied + 1))
         fi

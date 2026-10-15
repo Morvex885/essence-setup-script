@@ -118,7 +118,7 @@ add_client() {
 
     jq_w --arg n "$CLIENT_NAME" --arg g "$group" \
         --arg uuid "$client_uuid" --arg hy2pass "$client_hy2_pass" \
-        '.clients += [{name:$n, group:$g, inherit_nodes_from_group:true, nodes:[], connections:[], credentials:{vless_uuid:$uuid, hy2_password:$hy2pass}}]'
+        '.clients += [{name:$n, group:$g, inherit_nodes_from_group:true, nodes:[], connections:[], credentials:{vless_uuid:$uuid, hy2_password:$hy2pass}}]' || return 1
 
     success "Клиент $CLIENT_NAME добавлен ($group, ноды от группы)"
 }
@@ -284,7 +284,7 @@ _change_client_group() {
 
     # Атомарное обновление group
     jq_w --arg n "$target" --arg g "$new_group" \
-        '.clients |= map(if .name==$n then .group=$g else . end)'
+        '.clients |= map(if .name==$n then .group=$g else . end)' || return 1
     success "$target: группа — $new_group"
 
     # Регенерация. Prefetch явно на ВСЕХ affected_nodes (в т.ч. нодах старой

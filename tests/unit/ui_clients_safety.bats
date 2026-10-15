@@ -140,3 +140,157 @@ teardown() { teardown_test_env; }
         any(.name=="PC" and .proxies==["live-tunnel"])))' "$CONFIG_JSON" >/dev/null
     [ "$(jq_r '[.connections[] | select(.node!="de-vps")]')" = "$other_before" ]
 }
+
+# Reject only config promotion; fixture setup and unrelated moves remain real.
+reject_config_promotion() {
+    CONFIG_SOURCE=local
+    MV_REAL=$(command -v mv)
+    mv() {
+        if [[ "$#" -eq 2 && "$1" == "$CONFIG_JSON.tmp."* && "$2" == "$CONFIG_JSON" ]]; then
+            printf '77\n' >> "$BATS_TEST_TMPDIR/rejected-promotions"
+            return 77
+        fi
+        "$MV_REAL" "$@"
+    }
+    success() { printf '%s\n' "$*" >> "$BATS_TEST_TMPDIR/mutation-success"; }
+    state_checkpoint() { printf 'checkpoint\n' >> "$BATS_TEST_TMPDIR/checkpoints"; }
+}
+
+assert_rejected_config_unchanged() {
+    cmp -s "$CONFIG_JSON" "$BATS_TEST_TMPDIR/before.json"
+    [ "$(cat "$BATS_TEST_TMPDIR/rejected-promotions")" = 77 ]
+    [ ! -e "$BATS_TEST_TMPDIR/mutation-success" ]
+    [ ! -e "$BATS_TEST_TMPDIR/checkpoints" ]
+}
+
+prepare_empty_assigned_group() {
+    jq_w '.groups += [{name:"EMPTY",template:"default.yaml"}] |
+        .connections[0].groups += [{name:"EMPTY",proxies:["keep-proxy"]}]'
+    cp "$CONFIG_JSON" "$BATS_TEST_TMPDIR/before.json"
+}
+
+@test "rejected group creation leaves the previous config and reports failure" {
+    reject_config_promotion
+    run state_action add_group add_group <<< 'NEW-GROUP'
+    assert_failure
+    assert_rejected_config_unchanged
+}
+
+@test "rejected group deletion preserves the group and its connection assignments" {
+    prepare_empty_assigned_group
+    reject_config_promotion
+    run state_action delete_group delete_group <<< $'4\ny'
+    assert_failure
+    assert_rejected_config_unchanged
+}
+
+@test "rejected client creation preserves config and reports no completed mutation" {
+    reject_config_promotion
+    run state_action add_client add_client <<< $'new-client\n1'
+    assert_failure
+    assert_rejected_config_unchanged
+}
+
+@test "rejected client group change preserves generated config and blocks dependent effects" {
+    cp "$GENERATED_DIR/ROUTER/my-router/config.yaml" "$BATS_TEST_TMPDIR/before.yaml"
+    _reset_node_cache() { touch "$BATS_TEST_TMPDIR/cache-reset"; }
+    _prefetch_node_configs() { touch "$BATS_TEST_TMPDIR/prefetch"; }
+    _generate_group() {
+        mkdir -p "$GENERATED_DIR/PC/my-router"
+        printf 'replacement\n' > "$GENERATED_DIR/PC/my-router/config.yaml"
+    }
+    _sync_listeners_on_nodes() { touch "$BATS_TEST_TMPDIR/listeners"; }
+    subscription_publish() { touch "$BATS_TEST_TMPDIR/published"; }
+    reject_config_promotion
+    run state_action change_client_group _change_client_group my-router ROUTER <<< 1
+    assert_failure
+    assert_rejected_config_unchanged
+    cmp -s "$GENERATED_DIR/ROUTER/my-router/config.yaml" "$BATS_TEST_TMPDIR/before.yaml"
+    [ ! -e "$GENERATED_DIR/PC/my-router" ]
+    [ ! -e "$BATS_TEST_TMPDIR/cache-reset" ]
+    [ ! -e "$BATS_TEST_TMPDIR/prefetch" ]
+    [ ! -e "$BATS_TEST_TMPDIR/listeners" ]
+    [ ! -e "$BATS_TEST_TMPDIR/published" ]
+    [ "${#SSH_RUN_CALLS[@]}" -eq 0 ]
+    [ "${#UPLOAD_CALLS[@]}" -eq 0 ]
+}
+
+@test "groups menu keeps both add bindings available after one rejected save" {
+    local binding line warnings frames
+    reject_config_promotion
+    for binding in a A; do
+        rm -f "$BATS_TEST_TMPDIR/rejected-promotions"
+        run groups_menu <<< "$(printf 'invalid\n\n%s\nNEW-GROUP\n0\n' "$binding")"
+        assert_success
+        assert_rejected_config_unchanged
+        warnings=0 frames=0
+        while IFS= read -r line; do
+            [[ "$line" != *"Группы"* ]] || frames=$((frames + 1))
+            [[ "$line" != *"Не удалось заменить конфиг"* ]] || warnings=$((warnings + 1))
+        done <<< "$output"
+        [ "$warnings" -eq 1 ]
+        [ "$frames" -eq 4 ]
+    done
+}
+
+@test "groups menu keeps both delete bindings available and preserves assignments on failure" {
+    prepare_empty_assigned_group
+    reject_config_promotion
+    local binding line warnings frames
+    for binding in d D; do
+        rm -f "$BATS_TEST_TMPDIR/rejected-promotions"
+        run groups_menu <<< "$(printf '%s\n4\ny\n0\n' "$binding")"
+        assert_success
+        assert_rejected_config_unchanged
+        warnings=0 frames=0
+        while IFS= read -r line; do
+            [[ "$line" != *"Группы"* ]] || frames=$((frames + 1))
+            [[ "$line" != *"Не удалось заменить конфиг"* ]] || warnings=$((warnings + 1))
+        done <<< "$output"
+        [ "$warnings" -eq 1 ]
+        [ "$frames" -eq 2 ]
+    done
+}
+
+@test "groups menu template bindings preserve assignment when promotion fails" {
+    source_module 'templates.sh'
+    printf 'mode: rule\n' > "$TEMPLATES_DIR/alternate.yaml"
+    reject_config_promotion
+    local binding line warnings
+    for binding in t T; do
+        rm -f "$BATS_TEST_TMPDIR/rejected-promotions"
+        run groups_menu <<< "$(printf '%s\n1\n1\n0\n' "$binding")"
+        assert_success
+        assert_rejected_config_unchanged
+        warnings=0
+        while IFS= read -r line; do
+            [[ "$line" != *"Не удалось заменить конфиг"* ]] || warnings=$((warnings + 1))
+        done <<< "$output"
+        [ "$warnings" -eq 1 ]
+    done
+}
+
+@test "groups menu exits on EOF without mutating config or starting a checkpoint" {
+    reject_config_promotion
+    run groups_menu </dev/null
+    assert_success
+    cmp -s "$CONFIG_JSON" "$BATS_TEST_TMPDIR/before.json"
+    [ ! -e "$BATS_TEST_TMPDIR/rejected-promotions" ]
+    [ ! -e "$BATS_TEST_TMPDIR/checkpoints" ]
+}
+
+@test "guarded client rename preserves config and generated directory on rejected promotion" {
+    reject_config_promotion
+    run state_action rename_client _rename_client my-router <<< renamed-router
+    assert_failure
+    assert_rejected_config_unchanged
+    [ -f "$GENERATED_DIR/ROUTER/my-router/config.yaml" ]
+    [ ! -e "$GENERATED_DIR/ROUTER/renamed-router" ]
+}
+
+@test "guarded client connection writer preserves previous selection on rejected promotion" {
+    reject_config_promotion
+    run state_action set_client_connections _save_client_connections my-pc de-vps '["new-proxy"]'
+    assert_failure
+    assert_rejected_config_unchanged
+}

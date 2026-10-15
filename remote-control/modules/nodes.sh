@@ -78,7 +78,7 @@ node_load_by_name() {
 # ─── Добавление ноды ─────────────────────────────────────────────────────────
 _github_add_abort() {
     local node_id="${1:-}" managed="${2:-false}" known_backup="${3:-}" manifest_backup="${4:-}"
-    local existing_name previous_candidate_allow
+    local existing_name previous_candidate_allow rollback_status=0
     existing_name=$(jq_r --arg id "$node_id" '.nodes[] | select(.id==$id) | .name' 2>/dev/null || true)
     if [[ -n "$existing_name" ]]; then
         previous_candidate_allow="${CONFIG_PERSIST_ALLOW_NEEDS_SETUP:-0}"
@@ -89,21 +89,29 @@ _github_add_abort() {
             .clients |= map(
                 (if .nodes then .nodes |= [.[] | select(. != $n)] else . end) |
                 (if .connections then .connections |= [.[] | select(.node != $n)] else . end)
-            )' >/dev/null 2>&1 || true
+            )' || rollback_status=$?
         CONFIG_PERSIST_ALLOW_NEEDS_SETUP="$previous_candidate_allow"
+        if [[ "$rollback_status" -ne 0 ]]; then
+            warn "Откат ноды не сохранён; SSH-ключи, секреты и резервные копии оставлены."
+            return 1
+        fi
     fi
     if [[ "$managed" == true && -n "$node_id" ]] && declare -F _revoke_managed_remote_key >/dev/null 2>&1; then
         _revoke_managed_remote_key "$node_id" >/dev/null 2>&1 ||
             warn "Не удалось отозвать переносимый SSH-ключ ноды «${node_id}»."
     fi
-    [[ -n "$node_id" ]] && rm -f "${SSH_IDENTITIES_DIR:-}/$node_id" "${SSH_IDENTITIES_DIR:-}/$node_id.pub"
-    [[ -n "$node_id" ]] && node_secret_delete "$node_id" >/dev/null 2>&1 || true
-    if [[ -n "$known_backup" && -f "$known_backup" ]]; then
-        cp "$known_backup" "$SSH_KNOWN_HOSTS"
-    elif [[ -n "${SSH_KNOWN_HOSTS:-}" ]]; then
-        rm -f "$SSH_KNOWN_HOSTS"
+    if { [[ -n "$node_id" ]] &&
+         { ! rm -f "${SSH_IDENTITIES_DIR:-}/$node_id" "${SSH_IDENTITIES_DIR:-}/$node_id.pub" ||
+           ! node_secret_delete "$node_id"; }; } ||
+       { [[ -n "$known_backup" ]] &&
+         { [[ ! -f "$known_backup" ]] || ! cp "$known_backup" "$SSH_KNOWN_HOSTS"; }; } ||
+       { [[ -z "$known_backup" && -n "${SSH_KNOWN_HOSTS:-}" ]] &&
+         ! rm -f "$SSH_KNOWN_HOSTS"; } ||
+       { [[ -n "$manifest_backup" ]] &&
+         { [[ ! -f "$manifest_backup" ]] || ! cp "$manifest_backup" "$STATE_MANIFEST"; }; }; then
+        warn "Восстановление ресурсов ноды не завершено. Резервные копии оставлены: $known_backup $manifest_backup"
+        return 1
     fi
-    [[ -n "$manifest_backup" && -f "$manifest_backup" ]] && cp "$manifest_backup" "$STATE_MANIFEST"
     rm -f "$known_backup" "$manifest_backup"
 }
 
@@ -300,7 +308,7 @@ add_node() {
     if ! confirm_yn "Сохранить ноду?" Y; then
         info "Нода не сохранена — используется только в этом сеансе."
         if [[ "${CONFIG_SOURCE:-local}" == "github" ]]; then
-            _github_add_abort "$_node_id" "$_managed_identity" "$_known_backup" "$_manifest_backup"
+            _github_add_abort "$_node_id" "$_managed_identity" "$_known_backup" "$_manifest_backup" || return 1
         fi
         menu_operations
         return
@@ -309,7 +317,7 @@ add_node() {
     if [[ "$(jq_r --arg n "$_name" '.nodes[] | select(.name==$n) | .name')" == "$_name" ]]; then
         warn "Нода с именем '${_name}' уже существует."
         if [[ "${CONFIG_SOURCE:-local}" == "github" ]]; then
-            _github_add_abort "$_node_id" "$_managed_identity" "$_known_backup" "$_manifest_backup"
+            _github_add_abort "$_node_id" "$_managed_identity" "$_known_backup" "$_manifest_backup" || return 1
         fi
         return
     fi
@@ -651,15 +659,29 @@ else rm -f \"\$tmp\"; exit 1; fi"; then
         rm -rf "${socket%/*}"
     fi
     if [[ -n "$_identity" && "$_identity" != "system" ]]; then
-        rm -f "$SSH_IDENTITIES_DIR/$_identity" "$SSH_IDENTITIES_DIR/$_identity.pub" ||
-            warn "Не удалось удалить локальную копию SSH-ключа."
+        if ! rm -f "$SSH_IDENTITIES_DIR/$_identity" "$SSH_IDENTITIES_DIR/$_identity.pub"; then
+            warn "Очистка локального SSH-ключа не завершена. Резервная копия: $backup"
+            return 1
+        fi
     fi
     if [[ "${CONFIG_SOURCE:-local}" == github && -f "${SSH_KNOWN_HOSTS:-}" ]]; then
-        ssh-keygen -R "$_ip" -f "$SSH_KNOWN_HOSTS" >/dev/null 2>&1 || true
-        [[ "$_port" != "22" ]] &&
-            ssh-keygen -R "[$_ip]:$_port" -f "$SSH_KNOWN_HOSTS" >/dev/null 2>&1 || true
-        github_config_checkpoint || GITHUB_SYNC_STATUS=pending
-        github_sync_flush || true
+        if ! ssh-keygen -R "$_ip" -f "$SSH_KNOWN_HOSTS" >/dev/null 2>&1; then
+            warn "Очистка известных SSH-ключей не завершена. Резервная копия: $backup"
+            return 1
+        fi
+        if [[ "$_port" != "22" ]]; then
+            if ! ssh-keygen -R "[$_ip]:$_port" -f "$SSH_KNOWN_HOSTS" >/dev/null 2>&1; then
+                warn "Очистка известных SSH-ключей не завершена. Резервная копия: $backup"
+                return 1
+            fi
+        fi
+        if ! github_config_checkpoint; then
+            GITHUB_SYNC_STATUS=pending
+            _github_report_last_error "Очистка SSH-данных не сохранена в GitHub"
+            warn "Резервная копия: $backup"
+            return 1
+        fi
+        github_sync_flush || GITHUB_SYNC_STATUS=pending
     fi
     rm -rf "$backup"
             success "Нода '${_name}' удалена"

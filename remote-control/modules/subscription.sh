@@ -20,7 +20,6 @@ _sub_restore_ssh_ctx() {
 }
 
 _sub_load_host() {
-    _ensure_default_headers
     local host_node
     host_node=$(jq_r '.subscription_host.node // empty')
     [[ -z "$host_node" ]] && { warn "Хост-нода подписок не задана. Используйте пункт «Выбрать хост-ноду»."; return 1; }
@@ -41,7 +40,7 @@ _sub_load_host() {
 }
 
 # Записывает дефолтные subscription headers если их ещё нет в config.json.
-# Вызывается лениво из _sub_load_host и subscription_menu.
+# Вызывается перед публикацией/ротацией и из subscription_menu, но не при отзыве.
 _ensure_default_headers() {
     local has
     has=$(jq_r 'has("subscription_default_headers")')
@@ -400,13 +399,14 @@ subscription_publish() {
     fi
 
     # Загружаем на сервер
+    _ensure_default_headers || return 1
     _sub_load_host || return
 
     local sub_dir nginx_group
     sub_dir=$(_sub_get_dir) || { _sub_done; return 1; }
     nginx_group=$(_sub_get_nginx_group)
 
-    local rc=0
+    local rc=0 metadata_failed=false
     _sub_upload_config "$config_file" "$token" "$sub_dir" "$nginx_group" "$client" || rc=1
 
     # TTL → expiry.list
@@ -417,11 +417,11 @@ subscription_publish() {
         ssh_run -- "flock ${sub_dir}/.expiry.lock bash -c 'echo \"${token} ${expires_ts}\" >> ${sub_dir}/expiry.list'" || rc=1
         if [[ $rc -eq 0 ]]; then
             jq_w --arg n "$client" --arg t "$token" --arg e "$expires_at" --arg ts "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
-                '(.clients[] | select(.name==$n)).subscription |= ((. // {}) + {token: $t, expires_at: $e, created_at: $ts})' || rc=1
+                '(.clients[] | select(.name==$n)).subscription |= ((. // {}) + {token: $t, expires_at: $e, created_at: $ts})' || { rc=1; metadata_failed=true; }
         fi
     elif [[ $rc -eq 0 ]]; then
         jq_w --arg n "$client" --arg t "$token" --arg ts "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
-            '(.clients[] | select(.name==$n)).subscription |= ((. // {}) + {token: $t, expires_at: null, created_at: $ts})' || rc=1
+            '(.clients[] | select(.name==$n)).subscription |= ((. // {}) + {token: $t, expires_at: null, created_at: $ts})' || { rc=1; metadata_failed=true; }
     fi
 
     _sub_done
@@ -430,6 +430,8 @@ subscription_publish() {
         success "Подписка опубликована: $client"
         _sub_verify_http "$token" || return 1
         if [[ "$output_mode" == share ]]; then _show_share_bundle "$client"; fi
+    elif $metadata_failed; then
+        warn "Файл загружен на сервер, но данные подписки сохранить не удалось. Публикация не завершена."
     else
         warn "Ошибка загрузки файла на сервер."
     fi
@@ -585,6 +587,7 @@ subscription_rotate() {
     config_file=$(_client_config_file "$client")
     _subscription_config_ready "$config_file" || { warn "Конфиг для '$client' не найден или пуст."; return 1; }
     host_node=$(jq_r '.subscription_host.node // empty')
+    _ensure_default_headers || return 1
     _sub_load_host || return 1
     local sub_dir nginx_group new_token
     sub_dir=$(_sub_get_dir) || { _sub_done; return 1; }
@@ -751,6 +754,7 @@ subscription_publish_all() {
         return
     fi
 
+    _ensure_default_headers || return 1
     _sub_load_host || return
 
     local sub_dir nginx_group
@@ -763,12 +767,13 @@ subscription_publish_all() {
         while [[ $i -lt ${#new_tokens[@]} ]]; do
             local c="${new_tokens[$i]}" t="${new_tokens[$((i+1))]}"
             jq_w --arg n "$c" --arg t "$t" --arg ts "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
-                '(.clients[] | select(.name==$n)).subscription |= ((. // {}) + {token: $t, expires_at: null, created_at: $ts})' || rc=1
+                '(.clients[] | select(.name==$n)).subscription |= ((. // {}) + {token: $t, expires_at: null, created_at: $ts})' || { rc=1; break; }
             i=$((i + 2))
         done
         if [[ $rc -ne 0 ]]; then
-            for client in "${published[@]}"; do warn "$client: публикация не подтверждена"; done
             _sub_done
+            for client in "${published[@]}"; do warn "$client: публикация не подтверждена"; done
+            warn "Файлы загружены пакетно; сохранение токенов завершено частично. Дальнейшие записи и очистка старых файлов остановлены."
             return 1
         fi
         for client in "${published[@]}"; do success "$client: опубликовано"; done
@@ -1084,7 +1089,9 @@ subscription_group_headers_menu() {
 }
 
 subscription_menu() {
-    state_action "ensure_subscription_headers" _ensure_default_headers >/dev/null 2>&1 || true
+    if ! state_action "ensure_subscription_headers" _ensure_default_headers; then
+        warn "Начальные настройки подписок не сохранены. Повторите нужное действие вручную."
+    fi
     local choice host_node base_url
     while true; do
         host_node=$(jq_r '.subscription_host.node // empty')

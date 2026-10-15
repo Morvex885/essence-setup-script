@@ -603,7 +603,10 @@ state_action() {
     "$function" "$@"
     local rc=$?
     if [[ "$CONFIG_SOURCE" == "local" && $rc -eq 0 ]]; then
-        state_checkpoint >/dev/null 2>&1 || true
+        if ! state_checkpoint; then
+            warn "Не удалось сохранить локальную точку восстановления. Проверьте результат операции перед повтором."
+            return 1
+        fi
     fi
     return "$rc"
 }
