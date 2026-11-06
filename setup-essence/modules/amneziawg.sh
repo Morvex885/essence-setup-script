@@ -9,6 +9,7 @@ AWG_CLIENT_CONFIG="${AWG_CLIENT_CONFIG:-/etc/mihomo/client-config.txt}"
 AWG_SYSCTL_FILE="${AWG_SYSCTL_FILE:-/etc/sysctl.d/99-vpn-speedup.conf}"
 AWG_OS_RELEASE="${AWG_OS_RELEASE:-/etc/os-release}"
 AWG_MODULES_ROOT="${AWG_MODULES_ROOT:-/lib/modules}"
+AWG_DKMS_ROOT="${AWG_DKMS_ROOT:-/var/lib/dkms/amneziawg}"
 AWG_APT_KEYRING="${AWG_APT_KEYRING:-/etc/apt/keyrings/amnezia.gpg}"
 AWG_APT_SOURCE="${AWG_APT_SOURCE:-/etc/apt/sources.list.d/amnezia.sources}"
 AWG_APT_SOURCES_LIST="${AWG_APT_SOURCES_LIST:-/etc/apt/sources.list}"
@@ -439,14 +440,19 @@ _awg_show_module_diagnostics() {
         echo "  dkms status:"
         dkms status 2>&1 || true
     fi
-    log=$(find /var/lib/dkms/amneziawg -path '*/build/make.log' -type f 2>/dev/null | sort | tail -1)
+    log=$(find "$AWG_DKMS_ROOT" -path '*/build/make.log' -type f 2>/dev/null | sort | tail -1)
     if [[ -n "$log" ]]; then
         echo "  make.log: $log"
         tail -n 80 "$log" 2>/dev/null || true
     fi
     echo "  dmesg (amneziawg/dkms/module):"
     dmesg 2>&1 | grep -Ei 'amnezia|awg|dkms|module|secure boot' | tail -n 80 || true
-    warn "Проверьте Secure Boot, ограничения OpenVZ/LXC и совместимость нестандартного ядра."
+    if [[ -n "$log" ]] && grep -q 'setup_udp_tunnel_sock' "$log" 2>/dev/null; then
+        warn "Известная несовместимость: текущий amneziawg-dkms не собирается на ядрах Ubuntu 7.0.0-38+ (в т.ч. HWE-ядро 24.04)."
+        warn "Исправление ещё не опубликовано в PPA: https://github.com/amnezia-vpn/amneziawg-linux-kernel-module/issues/259 — дождитесь обновления PPA или загрузитесь в более старое ядро."
+    else
+        warn "Проверьте Secure Boot, ограничения OpenVZ/LXC и совместимость нестандартного ядра."
+    fi
 }
 
 _awg_ensure_packages() {
@@ -477,6 +483,9 @@ _awg_ensure_packages() {
         candidates[$i]="$candidate"
     done
 
+    local fresh_install=0
+    _awg_any_package_installed || fresh_install=1
+
     _awg_apt_wait || {
         _awg_fail "Установка AmneziaWG прервана во время ожидания apt lock."
         _awg_repo_abort
@@ -485,6 +494,7 @@ _awg_ensure_packages() {
     DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}" || {
         _awg_fail "Не удалось установить пакеты AmneziaWG 3.1."
         _awg_show_module_diagnostics
+        _awg_cleanup_failed_packages "$fresh_install"
         _awg_repo_abort
         return 1
     }
@@ -818,6 +828,30 @@ _awg_packages_installed() {
     done
     command -v awg >/dev/null 2>&1 \
         && command -v awg-quick >/dev/null 2>&1
+}
+
+_awg_any_package_installed() {
+    local package
+    for package in amneziawg amneziawg-tools amneziawg-dkms; do
+        LC_ALL=C dpkg-query -W -f='${Status}' "$package" 2>/dev/null \
+            | grep -q '^install ok installed$' && return 0
+    done
+    return 1
+}
+
+_awg_cleanup_failed_packages() {
+    local fresh_install="$1"
+    if [[ "$fresh_install" != 1 ]]; then
+        warn "Пакеты AmneziaWG могли остаться недонастроенными. После исправления выполните: dpkg --configure -a"
+        return 0
+    fi
+    info "Удаляю частично установленные пакеты AmneziaWG, чтобы apt остался рабочим..."
+    if _awg_apt_wait && DEBIAN_FRONTEND=noninteractive apt-get purge -y amneziawg amneziawg-tools amneziawg-dkms; then
+        success "Частично установленные пакеты AmneziaWG удалены."
+    else
+        warn "Не удалось удалить пакеты AmneziaWG. Выполните вручную: apt-get purge -y amneziawg amneziawg-tools amneziawg-dkms"
+    fi
+    return 0
 }
 
 # ── Общая логика создания peer ──────────────────────────────────────────────

@@ -13,6 +13,7 @@ setup() {
     export AWG_SYSCTL_FILE="$AWG_TEST_ROOT/etc/sysctl.d/99-vpn-speedup.conf"
     export AWG_OS_RELEASE="$AWG_TEST_ROOT/etc/os-release"
     export AWG_MODULES_ROOT="$AWG_TEST_ROOT/lib/modules"
+    export AWG_DKMS_ROOT="$AWG_TEST_ROOT/var/lib/dkms/amneziawg"
     export AWG_APT_KEYRING="$AWG_TEST_ROOT/etc/apt/keyrings/amnezia.gpg"
     export AWG_APT_SOURCE="$AWG_TEST_ROOT/etc/apt/sources.list.d/amnezia.sources"
     export AWG_APT_SOURCES_LIST="$AWG_TEST_ROOT/etc/apt/sources.list"
@@ -35,7 +36,7 @@ setup() {
     export MOCK_FINGERPRINT=75C9DD72C799870E310542E24166F2C257290828
     export MOCK_APT_UPDATE_FAIL=0 MOCK_APT_INSTALL_FAIL=0 MOCK_MODINFO_FAIL=0 MOCK_MODPROBE_FAIL=0
     export MOCK_MODPROBE_REMOVE_FAIL=0 MOCK_GENKEY_COUNT=0
-    export MOCK_APT_INSTALL_FAIL_PACKAGE="" MOCK_GPG_POST_INSTALL_MISSING=0
+    export MOCK_APT_INSTALL_FAIL_PACKAGE="" MOCK_APT_PURGE_FAIL=0 MOCK_GPG_POST_INSTALL_MISSING=0
     export MOCK_HEADERS_POST_INSTALL_BUILD_MISSING=0
     export MOCK_MIHOMO_FAIL=0 MOCK_SYSTEMCTL_FAIL_UNIT="" MOCK_UFW_FAIL=0
     export AWG_TEST_SERVER_PRIVATE=ERERERERERERERERERERERERERERERERERERERERERE=
@@ -159,6 +160,7 @@ if [[ "$1" == "install" ]]; then
     mkdir -p "$AWG_MODULES_ROOT/$MOCK_KERNEL/build"
   fi
 fi
+[[ "$1" == "purge" && "$MOCK_APT_PURGE_FAIL" == 1 ]] && exit 1
 exit 0
 EOF
     cat > "$MOCK_BIN/apt-cache" <<'EOF'
@@ -737,6 +739,53 @@ EOF
         [[ ! -e "$AWG_APT_KEYRING" ]]
         [[ ! -e "$AWG_APT_SOURCE" ]]
     done
+}
+
+@test "known udp_tunnel DKMS failure gets targeted diagnosis" {
+    mkdir -p "$AWG_DKMS_ROOT/1.0.0/build"
+    printf '%s\n' "compat.h:1449:79: error: passing argument 2 of 'setup_udp_tunnel_sock' from incompatible pointer type" \
+        > "$AWG_DKMS_ROOT/1.0.0/build/make.log"
+    run _awg_show_module_diagnostics
+    assert_output --partial "Известная несовместимость"
+    assert_output --partial "issues/259"
+    refute_output --partial "Проверьте Secure Boot"
+}
+
+@test "other DKMS failure keeps generic diagnosis" {
+    mkdir -p "$AWG_DKMS_ROOT/1.0.0/build"
+    printf '%s\n' "error: unknown type name 'foo'" > "$AWG_DKMS_ROOT/1.0.0/build/make.log"
+    run _awg_show_module_diagnostics
+    assert_output --partial "Проверьте Secure Boot"
+    refute_output --partial "Известная несовместимость"
+}
+
+@test "failed install on fresh system purges amneziawg packages" {
+    export MOCK_PACKAGE=0 MOCK_TOOLS_PACKAGE=0 MOCK_DKMS_PACKAGE=0 MOCK_APT_INSTALL_FAIL=1
+    AWG_APT_SUITE=jammy AWG_ARCH=amd64 AWG_KERNEL="$MOCK_KERNEL"
+    run _awg_ensure_packages
+    assert_failure
+    grep -qx 'apt-get purge -y amneziawg amneziawg-tools amneziawg-dkms' "$MOCK_CALLS"
+    [[ ! -e "$AWG_APT_KEYRING" ]]
+    [[ ! -e "$AWG_APT_SOURCE" ]]
+}
+
+@test "failed install over existing packages does not purge" {
+    export MOCK_APT_INSTALL_FAIL=1
+    AWG_APT_SUITE=jammy AWG_ARCH=amd64 AWG_KERNEL="$MOCK_KERNEL"
+    run _awg_ensure_packages
+    assert_failure
+    assert_output --partial "dpkg --configure -a"
+    if grep -q '^apt-get purge' "$MOCK_CALLS"; then return 1; fi
+}
+
+@test "purge failure prints manual command and still fails" {
+    export MOCK_PACKAGE=0 MOCK_TOOLS_PACKAGE=0 MOCK_DKMS_PACKAGE=0 MOCK_APT_INSTALL_FAIL=1 MOCK_APT_PURGE_FAIL=1
+    AWG_APT_SUITE=jammy AWG_ARCH=amd64 AWG_KERNEL="$MOCK_KERNEL"
+    run _awg_ensure_packages
+    assert_failure
+    assert_output --partial "Выполните вручную: apt-get purge -y amneziawg amneziawg-tools amneziawg-dkms"
+    [[ ! -e "$AWG_APT_KEYRING" ]]
+    [[ ! -e "$AWG_APT_SOURCE" ]]
 }
 
 @test "apt-lock abort inside install_awg returns to caller instead of exiting the shell" {
