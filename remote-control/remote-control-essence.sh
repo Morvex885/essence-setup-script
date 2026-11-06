@@ -437,6 +437,137 @@ _config_source_create_empty_snapshot() {
     SSH_KNOWN_HOSTS="$old_hosts"; SCRIPT_AUTH_FILE="$old_auth"; rm -rf "$stage"
 }
 
+# _config_source_publish_logical <logical> — write the snapshot to the worktree, push, materialize.
+_config_source_publish_logical() {
+    local logical="${1:?logical state}"
+    github_config_checkpoint "$logical" || return 1
+    if ! github_sync_flush; then
+        _github_report_last_error "Не удалось отправить конфигурацию в GitHub"
+        warn "Изменения сохранены локально и ожидают отправки."
+        GITHUB_SYNC_STATUS=pending
+    fi
+    _config_source_materialize_state "$logical" || return 1
+    mv -f "$logical" "$CONFIG_DIR/runtime-vault.json" ||
+        warn "Не удалось сохранить копию опубликованной конфигурации GitHub."
+    return 0
+}
+
+# _config_source_local_snapshot <out> — vault snapshot of the device-only state in CONFIG_DIR.
+_config_source_local_snapshot() {
+    local out="${1:?snapshot}" rc=0
+    local old_source="$CONFIG_SOURCE" old_state="$STATE_DIR" old_config="$CONFIG_JSON"
+    local old_secrets="$SECRETS_JSON" old_manifest="$STATE_MANIFEST"
+    local old_templates="$TEMPLATES_DIR" old_ids="$SSH_IDENTITIES_DIR"
+    local old_hosts="$SSH_KNOWN_HOSTS" old_auth="$SCRIPT_AUTH_FILE"
+    CONFIG_SOURCE=github; STATE_DIR="$CONFIG_DIR"
+    CONFIG_JSON="${LOCAL_CONFIG_JSON:-$CONFIG_DIR/config.json}"
+    SECRETS_JSON="$CONFIG_DIR/secrets.json"; STATE_MANIFEST="$CONFIG_DIR/manifest.json"
+    TEMPLATES_DIR="$CONFIG_DIR/templates"; SSH_IDENTITIES_DIR="$CONFIG_DIR/ssh/identities"
+    SSH_KNOWN_HOSTS="$CONFIG_DIR/ssh/known_hosts"; SCRIPT_AUTH_FILE="$CONFIG_DIR/.auth"
+    if ! _state_ensure_dirs || ! state_format_migrate || ! _state_ensure_secrets ||
+       ! state_validate false >/dev/null 2>&1 || ! _github_initial_portable_onboarding ||
+       ! github_config_serialize "$out" "$CONFIG_JSON"; then
+        rc=1
+    fi
+    CONFIG_SOURCE="$old_source"; STATE_DIR="$old_state"; CONFIG_JSON="$old_config"
+    SECRETS_JSON="$old_secrets"; STATE_MANIFEST="$old_manifest"
+    TEMPLATES_DIR="$old_templates"; SSH_IDENTITIES_DIR="$old_ids"
+    SSH_KNOWN_HOSTS="$old_hosts"; SCRIPT_AUTH_FILE="$old_auth"
+    return "$rc"
+}
+
+# _github_counts_label <nodes\tclients\tgroups>
+_github_counts_label() {
+    local nodes clients groups
+    if [[ -z "${1:-}" ]]; then
+        printf '%s\n' "не читается"
+        return 0
+    fi
+    IFS=$'\t' read -r nodes clients groups <<< "$1"
+    printf 'нод %s, клиентов %s, групп %s\n' "$nodes" "$clients" "$groups"
+}
+_github_snapshot_counts() {
+    jq -r '[(.config.nodes//[]|length),(.config.clients//[]|length),(.config.groups//[]|length)]|@tsv' \
+        "$1" 2>/dev/null
+}
+
+# _github_format_migrate_prepare <candidate> <from> — 0 confirmed, 2 declined, 1 error.
+_github_format_migrate_prepare() {
+    local candidate="${1:?candidate}" from="${2:-?}" names minimum
+    github_config_open "$GITHUB_WORKTREE" "$candidate" migrate || return 1
+    minimum=$(_github_vault_format_min_version "$GITHUB_VAULT_FORMAT") || return 1
+    names=$(jq -r '[.portability.issues[] | select(.reason=="missing_secret") | .node_id] as $ids |
+        [.config.nodes[] | select(.id as $i | $ids | index($i)) | .name] | join(", ")' \
+        "$candidate" 2>/dev/null) || names=""
+    review_frame "Преобразование конфигурации GitHub" \
+        "Репозиторий: ${GITHUB_OWNER:-?}/${GITHUB_REPO_NAME} (ветка ${GITHUB_BRANCH})" \
+        "Формат: v${from} → v${GITHUB_VAULT_FORMAT}" \
+        "Устройства с Remote Control старше ${minimum} перестанут читать конфигурацию." \
+        "Предыдущая версия останется в истории Git." \
+        ${names:+"Потребуется повторный ввод пароля: ${names}"}
+    if ! confirm_yn "Преобразовать и опубликовать конфигурацию?" N; then
+        rm -f "$candidate"
+        return 2
+    fi
+}
+
+# github_format_migrate_action <from> — 0 published, 2 declined, 1 error.
+github_format_migrate_action() {
+    local from="${1:-?}" candidate rc=0
+    candidate=$(umask 077; mktemp "$CONFIG_DIR/.vault-migrate.XXXXXX") || return 1
+    _github_format_migrate_prepare "$candidate" "$from" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        rm -f "$candidate"
+        return "$rc"
+    fi
+    if ! _config_source_publish_logical "$candidate"; then
+        rm -f "$candidate"
+        return 1
+    fi
+}
+
+# github_replace_with_local_action <recovery|menu> — 0 published, 2 declined/no data, 1 error.
+github_replace_with_local_action() {
+    local mode="${1:-menu}" candidate local_counts github_counts pending_line=""
+    local local_nodes local_clients
+    if [[ ! -f "${LOCAL_CONFIG_JSON:-$CONFIG_DIR/config.json}" ]]; then
+        warn "Конфигурация только этого компьютера отсутствует."
+        return 2
+    fi
+    candidate=$(umask 077; mktemp "$CONFIG_DIR/.vault-replace.XXXXXX") || return 1
+    if ! _config_source_local_snapshot "$candidate"; then
+        rm -f "$candidate"
+        return 1
+    fi
+    local_counts=$(_github_snapshot_counts "$candidate") || local_counts=""
+    if [[ "$mode" == recovery ]]; then
+        github_counts="${GITHUB_LAST_SNAPSHOT_COUNTS:-}"
+    else
+        github_counts=$(jq -r '[(.nodes//[]|length),(.clients//[]|length),(.groups//[]|length)]|@tsv' \
+            "$CONFIG_JSON" 2>/dev/null) || github_counts=""
+        [[ "${GITHUB_SYNC_STATUS:-}" == pending ]] &&
+            pending_line="Неотправленные изменения рабочей конфигурации GitHub будут заменены."
+    fi
+    review_frame "Замена конфигурации GitHub" \
+        "Репозиторий: ${GITHUB_OWNER:-?}/${GITHUB_REPO_NAME} (ветка ${GITHUB_BRANCH})" \
+        "Будет опубликована конфигурация только этого компьютера." \
+        "Этот компьютер: $(_github_counts_label "$local_counts")" \
+        "GitHub: $(_github_counts_label "$github_counts")" \
+        "Текущая конфигурация GitHub останется только в истории Git." \
+        ${pending_line:+"$pending_line"}
+    IFS=$'\t' read -r local_nodes local_clients _ <<< "$local_counts"
+    [[ "${local_nodes:-0}" == 0 && "${local_clients:-0}" == 0 ]] &&
+        warn "Локальная конфигурация пуста."
+    if ! confirm_yn "Заменить конфигурацию GitHub?" N; then
+        rm -f "$candidate"
+        return 2
+    fi
+    if ! _config_source_publish_logical "$candidate"; then
+        rm -f "$candidate"
+        return 1
+    fi
+}
+
 github_config_snapshot_cached() {
     local out="${1:?snapshot}" expected_repo="${2:?repo}" branch="${3:?branch}"
     local origin old_store="$GITHUB_STORE" old_sessions="$GITHUB_SESSIONS_DIR"
@@ -572,6 +703,17 @@ github_source_change_account() {
     if [[ -n "$tracked" ]]; then
         if github_config_open "$GITHUB_WORKTREE" "$target_state"; then
             target_valid=true
+        elif [[ "${GITHUB_LAST_FORMAT:-}" == outdated || "${GITHUB_LAST_FORMAT:-}" == newer ]]; then
+            local switch_stage="$GITHUB_LAST_STAGE" switch_error="$GITHUB_LAST_ERROR" switch_hint=""
+            if [[ "$GITHUB_LAST_FORMAT" == outdated ]]; then
+                switch_stage="проверка формата конфигурации GitHub"
+                switch_error="Репозиторий ${new_repo} содержит конфигурацию формата v${GITHUB_LAST_FORMAT_VERSION}. Смена аккаунта прервана."
+                switch_hint="Отключите синхронизацию (e) и подключите GitHub заново под новым аккаунтом: при подключении будет предложено преобразование."
+            fi
+            github_config_close >/dev/null 2>&1 || true
+            _github_change_rollback "${original[@]}" >/dev/null 2>&1 || true
+            _github_record_error "$switch_stage" "$switch_error" false "$switch_hint"
+            return 1
         else
             target_needs_replace=true
         fi
@@ -913,19 +1055,51 @@ github_enable_local() {
             _github_enable_rollback "$source_backup" "$source_had_file"
             return 1
         }
+        local connect_outdated=false connect_from="" prepare_rc
         if ! github_config_open "$GITHUB_WORKTREE" "$tmp_state"; then
-            _github_ensure_error "чтение существующей конфигурации GitHub" \
-                "Не удалось проверить или расшифровать существующую конфигурацию. Репозиторий не изменён."
-            _github_enable_rollback "$source_backup" "$source_had_file" "$tmp_state"
-            return 1
+            if [[ "${GITHUB_LAST_FORMAT:-}" == outdated ]]; then
+                connect_outdated=true
+                connect_from="$GITHUB_LAST_FORMAT_VERSION"
+            else
+                _github_ensure_error "чтение существующей конфигурации GitHub" \
+                    "Не удалось проверить или расшифровать существующую конфигурацию. Репозиторий не изменён."
+                _github_enable_rollback "$source_backup" "$source_had_file" "$tmp_state"
+                return 1
+            fi
         fi
-        if ! _github_prompt_existing_config_action; then
+        if ! _github_prompt_existing_config_action true "$connect_outdated"; then
             _github_record_error "выбор версии конфигурации" "Подключение GitHub отменено."
             _github_enable_rollback "$source_backup" "$source_had_file" "$tmp_state"
             return 1
         fi
+        if [[ "$GITHUB_EXISTING_ACTION" == migrate ]]; then
+            prepare_rc=0
+            _github_format_migrate_prepare "$tmp_state" "$connect_from" || prepare_rc=$?
+            if [[ $prepare_rc -eq 2 ]]; then
+                _github_record_error "выбор версии конфигурации" "Подключение GitHub отменено."
+                _github_enable_rollback "$source_backup" "$source_had_file" "$tmp_state"
+                return 1
+            elif [[ $prepare_rc -ne 0 ]]; then
+                _github_ensure_error "преобразование конфигурации GitHub" \
+                    "Не удалось преобразовать конфигурацию GitHub."
+                _github_enable_rollback "$source_backup" "$source_had_file" "$tmp_state"
+                return 1
+            fi
+            CONFIG_SOURCE=github
+            if ! github_config_checkpoint "$tmp_state"; then
+                _github_ensure_error "подготовка конфигурации к отправке" \
+                    "Не удалось собрать конфигурацию для репозитория GitHub."
+                _github_enable_rollback "$source_backup" "$source_had_file" "$tmp_state"
+                return 1
+            fi
+            if ! github_sync_flush; then
+                GITHUB_SYNC_STATUS=pending
+                _github_report_last_error "Не удалось отправить преобразованную конфигурацию в GitHub"
+                warn "Изменения сохранены локально и не отправлены."
+            fi
+        fi
         CONFIG_SOURCE=github
-        if [[ "$GITHUB_EXISTING_ACTION" != remote ]]; then
+        if [[ "$GITHUB_EXISTING_ACTION" == local ]]; then
             if ! _github_initial_portable_onboarding; then
                 _github_ensure_error "подготовка переносимой конфигурации" \
                     "Не удалось подготовить локальные файлы для хранения в GitHub."
@@ -1008,6 +1182,7 @@ github_source_menu() {
         menu_item i "Импортировать ключ восстановления" YELLOW
     fi
     menu_item e "Использовать локальную конфигурацию без синхронизации с GitHub" RED
+    menu_item o "Заменить GitHub конфигурацией только этого компьютера" RED
     menu_item d "Удалить репозиторий GitHub" RED
     menu_item 0 "Назад" NC
     box_bot
@@ -1094,6 +1269,21 @@ github_source_menu() {
                 fi
                 return 1
             fi
+            ;;
+        O|o)
+            local _replace_rc=0
+            github_replace_with_local_action menu || _replace_rc=$?
+            case "$_replace_rc" in
+                0) success "Конфигурация GitHub заменена конфигурацией только этого компьютера." ;;
+                2) ;;
+                *)
+                    if [[ -n "${GITHUB_LAST_ERROR:-}" ]]; then
+                        _github_report_last_error "Не удалось заменить конфигурацию GitHub"
+                    else
+                        warn "Не удалось заменить конфигурацию GitHub."
+                    fi
+                    ;;
+            esac
             ;;
         D|d)
             local _repo_to_delete
@@ -1347,6 +1537,86 @@ first_run_source_menu() {
     done
 }
 
+# github_format_recovery_menu — startup recovery for snapshot format errors; 0 = runtime ready.
+github_format_recovery_menu() {
+    local state="${GITHUB_LAST_FORMAT:-invalid}" from="${GITHUB_LAST_FORMAT_VERSION:-}"
+    local required="${GITHUB_LAST_FORMAT_REQUIRED:-}" context choice rc
+    while true; do
+        case "$state" in
+            outdated) context="Формат конфигурации GitHub: v${from}, требуется v${GITHUB_VAULT_FORMAT}" ;;
+            newer)
+                if [[ -n "$required" ]]; then
+                    context="Требуется Remote Control ${required}; установлена ${CURRENT_VERSION}"
+                else
+                    context="Формат конфигурации GitHub v${from} новее поддерживаемого"
+                fi
+                ;;
+            *) context="Конфигурация GitHub повреждена или не прошла проверку" ;;
+        esac
+        echo ""
+        box_top
+        box_center "Восстановление запуска"
+        box_mid
+        box_line " ${context}" " ${YELLOW}${context}${NC}"
+        box_mid
+        [[ "$state" == outdated ]] && menu_item 1 "Преобразовать и опубликовать" YELLOW
+        [[ "$state" == outdated || "$state" == invalid ]] &&
+            menu_item 2 "Заменить GitHub конфигурацией только этого компьютера" RED
+        menu_item 0 "Выход" NC
+        box_bot
+        echo ""
+        if ! IFS= read -rp "  Выберите действие: " choice; then
+            return 1
+        fi
+        choice="${choice%$'\r'}"
+        case "$choice" in
+            1)
+                if [[ "$state" != outdated ]]; then
+                    warn "Неверный выбор."
+                    continue
+                fi
+                rc=0
+                github_format_migrate_action "$from" || rc=$?
+                case "$rc" in
+                    0)
+                        success "Конфигурация GitHub преобразована в формат v${GITHUB_VAULT_FORMAT}."
+                        return 0
+                        ;;
+                    2) ;;
+                    *)
+                        _github_report_last_error "Не удалось преобразовать конфигурацию GitHub"
+                        [[ "${GITHUB_LAST_FORMAT:-}" == invalid ]] && state=invalid
+                        ;;
+                esac
+                ;;
+            2)
+                if [[ "$state" != outdated && "$state" != invalid ]]; then
+                    warn "Неверный выбор."
+                    continue
+                fi
+                rc=0
+                github_replace_with_local_action recovery || rc=$?
+                case "$rc" in
+                    0)
+                        success "Конфигурация GitHub заменена конфигурацией только этого компьютера."
+                        return 0
+                        ;;
+                    2) ;;
+                    *)
+                        if [[ -n "${GITHUB_LAST_ERROR:-}" ]]; then
+                            _github_report_last_error "Не удалось заменить конфигурацию GitHub"
+                        else
+                            warn "Не удалось заменить конфигурацию GitHub."
+                        fi
+                        ;;
+                esac
+                ;;
+            0) return 1 ;;
+            *) warn "Неверный выбор." ;;
+        esac
+    done
+}
+
 # ─── Точка входа ──────────────────────────────────────────────────────────────
 if ! first_run_source_menu; then
     [[ -n "${GITHUB_LAST_ERROR:-}" ]] &&
@@ -1358,6 +1628,10 @@ while ! config_source_startup; do
         _github_report_last_error "Не удалось открыть источник GitHub"
     else
         warn "Не удалось открыть источник конфигурации."
+    fi
+    if [[ "$CONFIG_SOURCE" == github && -n "${GITHUB_LAST_FORMAT:-}" ]]; then
+        github_format_recovery_menu && break
+        exit 1
     fi
     startup_recovery_menu "Восстановление источника конфигурации" true || exit 1
 done

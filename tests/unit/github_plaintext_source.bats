@@ -13,6 +13,7 @@ setup() {
     mkdir -p "$APP/modules" "$APP/templates" "$APP/common/protocols" "$BIN" "$HOME"
     printf '%s\n' test-owner > "$GH_ACTIVE_LOGIN_FILE"
     cp "$PROJECT_ROOT/remote-control/remote-control-essence.sh" "$APP/"
+    cp "$PROJECT_ROOT/VERSION" "$APP/"
     cp "$PROJECT_ROOT/remote-control/modules/"*.sh "$APP/modules/"
     cp "$PROJECT_ROOT/remote-control/templates/"*.yaml "$APP/templates/"
     cp -R "$PROJECT_ROOT/common/." "$APP/common/"
@@ -1969,11 +1970,139 @@ EOF
     git -C "$updater" add manifest.json
     git -C "$updater" commit -m unsupported >/dev/null
     git -C "$updater" push origin main >/dev/null || return 1
+    local main_before
+    main_before=$(git --git-dir="$REMOTE" rev-parse main)
     run bash -c 'printf "0\n" | "$0"' "$APP/remote-control-essence.sh"
     assert_failure
+    [[ "$(git --git-dir="$REMOTE" rev-parse main)" == "$main_before" ]] || return 1
     [[ "$(_runtime_fingerprint "$PORTABLE_RUNTIME")" == "$before" ]] || return 1
     [[ "$(_materialization_temp_inventory "$PORTABLE_CONFIG")" == "$temps" ]] || return 1
     [[ ! -e "$PORTABLE_CONFIG/.auth" && ! -s "$PORTABLE_SSH_LOG" ]]
+}
+
+# _portable_publish_v1 — push a vault-1 snapshot whose secrets are device A ciphertext.
+_portable_publish_v1() {
+    local updater="$BATS_TEST_TMPDIR/v1-updater"
+    local device_a="$PORTABLE_HOME_A/.config/remote-control-essence"
+    rm -rf "$updater"
+    git clone "$REMOTE" "$updater" >/dev/null 2>&1 || return 1
+    git -C "$updater" config user.name fixture
+    git -C "$updater" config user.email fixture@example.invalid
+    jq '.vault_version=1 | .minimum_remote_control_version="1.0.3" |
+        .portability={status:"ready",issues:[]}' "$updater/manifest.json" > "$updater/manifest.next" &&
+        mv "$updater/manifest.next" "$updater/manifest.json" || return 1
+    jq '{schema_version:1,node_passwords}' "$device_a/secrets.json" > "$updater/secrets.json" || return 1
+    git -C "$updater" add manifest.json secrets.json
+    git -C "$updater" commit -m vault-v1 >/dev/null || return 1
+    git -C "$updater" push origin main >/dev/null 2>&1 || return 1
+    PORTABLE_V1_COMMIT=$(git --git-dir="$REMOTE" rev-parse main)
+}
+
+_portable_use_device_a() {
+    export HOME="$PORTABLE_HOME_A" TEST_MACHINE_ID=11111111111111111111111111111111
+}
+
+@test "format recovery migrates a v1 GitHub snapshot on top of history" {
+    _portable_prepare_two_devices || return 1
+    _portable_publish_v1 || return 1
+    _portable_use_device_a
+    run bash -c 'printf "1\ny\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    [[ "$output" != *Повторить* && "$output" != *synthetic-portable* ]] || return 1
+    git --git-dir="$REMOTE" show main:manifest.json > "$BATS_TEST_TMPDIR/m.json" || return 1
+    jq -e '.vault_version==2 and .minimum_remote_control_version=="1.1.0" and
+        .portability.issues==[{node_id:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",reason:"missing_secret"}]' "$BATS_TEST_TMPDIR/m.json" || return 1
+    git --git-dir="$REMOTE" show main:secrets.json > "$BATS_TEST_TMPDIR/s.json" || return 1
+    jq -e '.schema_version==2 and .node_passwords=={"node:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:ssh-password":"synthetic-portable-a"}' "$BATS_TEST_TMPDIR/s.json" || return 1
+    git --git-dir="$REMOTE" merge-base --is-ancestor "$PORTABLE_V1_COMMIT" main || return 1
+    [[ "$(git --git-dir="$REMOTE" rev-parse main)" != "$PORTABLE_V1_COMMIT" ]] || return 1
+    [[ "$(_portable_get_runtime_password "$HOME/.config/remote-control-essence/github-runtime" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)" == synthetic-portable-a ]] || return 1
+    [[ ! -s "$PORTABLE_SSH_LOG" ]]
+}
+
+@test "format recovery refusal and newer snapshots leave GitHub untouched" {
+    _portable_prepare_two_devices || return 1
+    _portable_publish_v1 || return 1
+    _portable_use_device_a
+    local input
+    for input in $'1\nn\n0\n' $'1\n\n0\n' $'2\n\n0\n' $'0\n' ''; do
+        run bash -c 'printf "%s" "$1" | "$0"' "$APP/remote-control-essence.sh" "$input"
+        assert_failure
+        [[ "$(git --git-dir="$REMOTE" rev-parse main)" == "$PORTABLE_V1_COMMIT" ]] || return 1
+    done
+    local updater="$BATS_TEST_TMPDIR/v1-updater"
+    jq '.minimum_remote_control_version="9.9.9"' "$updater/manifest.json" > "$updater/manifest.next" &&
+        mv "$updater/manifest.next" "$updater/manifest.json" || return 1
+    git -C "$updater" commit -am newer >/dev/null || return 1
+    git -C "$updater" push origin main >/dev/null 2>&1 || return 1
+    local newer
+    newer=$(git --git-dir="$REMOTE" rev-parse main)
+    run bash -c 'printf "1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_failure
+    assert_output --partial "Требуется Remote Control 9.9.9"
+    [[ "$output" != *"Преобразовать и опубликовать"* && "$output" != *"Заменить GitHub"* ]] || return 1
+    [[ "$(git --git-dir="$REMOTE" rev-parse main)" == "$newer" ]] || return 1
+    [[ ! -s "$PORTABLE_SSH_LOG" ]]
+}
+
+@test "format recovery on another device marks foreign passwords as missing" {
+    _portable_prepare_two_devices || return 1
+    _portable_publish_v1 || return 1
+    run bash -c 'printf "1\ny\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    git --git-dir="$REMOTE" show main:manifest.json > "$BATS_TEST_TMPDIR/m.json" || return 1
+    jq -e '.vault_version==2 and .portability.status=="needs_setup" and
+        (.portability.issues|map(select(.reason=="missing_secret").node_id)|sort)==
+        ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]' "$BATS_TEST_TMPDIR/m.json" || return 1
+    assert_output --partial "Потребуется повторный ввод пароля: portable-a, portable-b"
+    [[ ! -s "$PORTABLE_SSH_LOG" ]]
+}
+
+@test "format recovery replaces GitHub with the device-only configuration" {
+    _portable_prepare_two_devices || return 1
+    _portable_publish_v1 || return 1
+    _portable_use_device_a
+    local local_config="$HOME/.config/remote-control-essence/config.json"
+    run bash -c 'printf "2\ny\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    git --git-dir="$REMOTE" show main:config.json > "$BATS_TEST_TMPDIR/c.json" || return 1
+    cmp -s <(jq -S . "$BATS_TEST_TMPDIR/c.json") <(jq -S . "$local_config") || return 1
+    git --git-dir="$REMOTE" show main:manifest.json | jq -e '.vault_version==2' >/dev/null || return 1
+    git --git-dir="$REMOTE" merge-base --is-ancestor "$PORTABLE_V1_COMMIT" main || return 1
+    [[ ! -s "$PORTABLE_SSH_LOG" ]]
+}
+
+@test "GitHub menu o replaces remote config with the device-only configuration" {
+    _portable_prepare_two_devices || return 1
+    local before local_config="$HOME/.config/remote-control-essence/config.json"
+    before=$(git --git-dir="$REMOTE" rev-parse main)
+    run bash -c 'printf "i\nO\n\n0\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    [[ "$(git --git-dir="$REMOTE" rev-parse main)" == "$before" ]] || return 1
+    run bash -c 'printf "i\no\ny\n0\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    assert_output --partial "Локальная конфигурация пуста."
+    git --git-dir="$REMOTE" show main:config.json > "$BATS_TEST_TMPDIR/c.json" || return 1
+    cmp -s <(jq -S . "$BATS_TEST_TMPDIR/c.json") <(jq -S . "$local_config") || return 1
+    jq -e '.nodes==[]' "$HOME/.config/remote-control-essence/github-runtime/config.json" || return 1
+    [[ ! -s "$PORTABLE_SSH_LOG" ]]
+}
+
+@test "connecting a local device to a v1 repository offers migration" {
+    _portable_prepare_two_devices || return 1
+    _portable_publish_v1 || return 1
+    export HOME="$BATS_TEST_TMPDIR/device-c-home" TEST_MACHINE_ID=33333333333333333333333333333333
+    mkdir -p "$HOME"
+    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    run bash -c 'printf "i\n1\n1\ny\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    assert_output --partial "Преобразовать и загрузить конфигурацию из GitHub"
+    git --git-dir="$REMOTE" show main:manifest.json | jq -e '.vault_version==2' >/dev/null || return 1
+    git --git-dir="$REMOTE" merge-base --is-ancestor "$PORTABLE_V1_COMMIT" main || return 1
+    jq -e '.type=="github"' "$HOME/.config/remote-control-essence/source.json" || return 1
+    jq -e '(.nodes|length)==2' "$HOME/.config/remote-control-essence/github-runtime/config.json" || return 1
+    [[ ! -s "$PORTABLE_SSH_LOG" ]]
 }
 
 @test "portable password actual entrypoint real age publishes partial state and imports on device B" {

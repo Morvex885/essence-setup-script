@@ -938,22 +938,101 @@ _portable_password_transport_roundtrip() {
     done
 }
 
-@test "portable password plain reader preserves manifest version and rejects old unknown absent versions" {
+@test "plain reader classifies old, newer and absent versions" {
     _prepare_plain_worktree || return 1
     git -C "$GITHUB_WORKTREE" init >/dev/null || return 1
-    local version out="$CONFIG_DIR/open-version.json" before
+    local version out="$CONFIG_DIR/open-version.json" expected
     cp "$GITHUB_WORKTREE/manifest.json" "$CONFIG_DIR/original-manifest.json"
     for version in 1 99 null; do
         jq --argjson version "$version" '.vault_version=$version' "$CONFIG_DIR/original-manifest.json" > "$GITHUB_WORKTREE/manifest.json"
         printf 'previous-output\n' > "$out"
         chmod 640 "$out"
-        run github_config_open "$GITHUB_WORKTREE" "$out"
-        assert_failure
+        ! github_config_open "$GITHUB_WORKTREE" "$out" || return 1
+        case "$version" in
+            1) expected=outdated ;;
+            99) expected=newer ;;
+            null) expected=invalid ;;
+        esac
+        [[ "$GITHUB_LAST_FORMAT" == "$expected" ]] || return 1
+        if [[ "$version" == 1 ]]; then
+            [[ "$GITHUB_LAST_FORMAT_VERSION" == 1 ]] || return 1
+        fi
         [[ "$(cat "$out")" == previous-output && "$(_file_mode "$out")" == 640 ]] || return 1
     done
     cp "$CONFIG_DIR/original-manifest.json" "$GITHUB_WORKTREE/manifest.json"
     github_config_open "$GITHUB_WORKTREE" "$out" || return 1
     jq -e '.vault_version==2 and .secrets.schema_version==2' "$out"
+}
+
+# _prepare_v1_plain_worktree [all|partial] — publish a vault-1 tree with device-bound secrets.
+_prepare_v1_plain_worktree() {
+    local readable="${1:-all}"
+    _portable_password_runtime || return 1
+    if [[ "$readable" == all ]]; then
+        node_secret_set "$PORTABLE_B" 'synthetic-second' || return 1
+    fi
+    export GITHUB_WORKTREE="$CONFIG_DIR/v1-worktree" GITHUB_STORAGE_MODE=none
+    mkdir -p "$GITHUB_WORKTREE" || return 1
+    git -C "$GITHUB_WORKTREE" init >/dev/null || return 1
+    github_config_serialize "$CONFIG_DIR/v2.json" "$CONFIG_JSON" || return 1
+    github_config_checkpoint "$CONFIG_DIR/v2.json" >/dev/null || return 1
+    cp "$SECRETS_JSON" "$GITHUB_WORKTREE/secrets.json" || return 1
+    jq '.vault_version=1 | .minimum_remote_control_version="1.0.3" |
+        .portability={status:"ready",issues:[]}' \
+        "$GITHUB_WORKTREE/manifest.json" > "$CONFIG_DIR/v1-manifest.json" &&
+        mv "$CONFIG_DIR/v1-manifest.json" "$GITHUB_WORKTREE/manifest.json"
+}
+
+@test "vault v1 migrates device ciphertext into portable plaintext" {
+    _prepare_v1_plain_worktree all || return 1
+    local out="$CONFIG_DIR/migrated.json" received
+    ! github_config_open "$GITHUB_WORKTREE" "$out" || return 1
+    [[ "$GITHUB_LAST_FORMAT" == outdated && ! -e "$out" ]] || return 1
+    CURRENT_VERSION=1.1.0 github_config_open "$GITHUB_WORKTREE" "$out" migrate || return 1
+    jq -e --arg a "$PORTABLE_A" --arg pass "$PORTABLE_PASSWORD" '
+        .vault_version==2 and .secrets.schema_version==2 and
+        .minimum_remote_control_version=="1.1.0" and .portability.status=="ready" and
+        .secrets.node_passwords[("node:"+$a+":ssh-password")]==$pass' "$out" || return 1
+    jq -e --arg b "$PORTABLE_B" '.secrets.node_passwords[("node:"+$b+":ssh-password")]=="synthetic-second"' "$out"
+}
+
+@test "vault v1 migration marks undecryptable passwords as missing_secret" {
+    _prepare_v1_plain_worktree partial || return 1
+    local out="$CONFIG_DIR/migrated.json"
+    github_config_open "$GITHUB_WORKTREE" "$out" migrate || return 1
+    jq -e --arg a "$PORTABLE_A" --arg b "$PORTABLE_B" --arg pass "$PORTABLE_PASSWORD" '
+        .portability=={status:"needs_setup",issues:[{node_id:$b,reason:"missing_secret"}]} and
+        .secrets.node_passwords[("node:"+$a+":ssh-password")]==$pass and
+        (.secrets.node_passwords|has("node:"+$b+":ssh-password")|not)' "$out"
+}
+
+@test "vault v1 migration failure leaves output untouched and reports invalid" {
+    _prepare_v1_plain_worktree all || return 1
+    local out="$CONFIG_DIR/migrated.json"
+    jq '.schema_version=1' "$GITHUB_WORKTREE/config.json" > "$CONFIG_DIR/c.json" &&
+        mv "$CONFIG_DIR/c.json" "$GITHUB_WORKTREE/config.json" || return 1
+    printf 'previous-output\n' > "$out"
+    ! github_config_open "$GITHUB_WORKTREE" "$out" migrate || return 1
+    [[ "$GITHUB_LAST_FORMAT" == invalid && "$(cat "$out")" == previous-output ]] || return 1
+    [[ -z "$(find "$CONFIG_DIR" -maxdepth 1 -name '.github-private.*')" ]]
+}
+
+@test "snapshot requiring a newer Remote Control is classified before format" {
+    _prepare_plain_worktree || return 1
+    git -C "$GITHUB_WORKTREE" init >/dev/null || return 1
+    local out="$CONFIG_DIR/newer.json"
+    jq '.minimum_remote_control_version="9.9.9" | .vault_version=1' "$GITHUB_WORKTREE/manifest.json" > "$CONFIG_DIR/m.json" &&
+        mv "$CONFIG_DIR/m.json" "$GITHUB_WORKTREE/manifest.json" || return 1
+    CURRENT_VERSION=1.1.0
+    ! github_config_open "$GITHUB_WORKTREE" "$out" migrate || return 1
+    [[ "$GITHUB_LAST_FORMAT" == newer && "$GITHUB_LAST_FORMAT_REQUIRED" == 9.9.9 && ! -e "$out" ]]
+}
+
+@test "serializer pins minimum version to the vault format, not the script version" {
+    _portable_password_runtime || return 1
+    CURRENT_VERSION=1.2.3
+    github_config_serialize "$CONFIG_DIR/pinned.json" "$CONFIG_JSON" || return 1
+    jq -e '.minimum_remote_control_version=="1.1.0" and .vault_version==2' "$CONFIG_DIR/pinned.json"
 }
 
 @test "portable password invalid container does not replace serialized output or source ciphertext" {

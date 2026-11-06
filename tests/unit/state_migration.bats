@@ -27,7 +27,7 @@ EOF
     printf '{"nodes":[{"name":"pw","ip":"127.0.0.1","port":22,"user":"root","auth":"password","pass":"bad"}],"groups":[],"clients":[],"connections":[]}\n' > "$CONFIG_JSON"
     before=$(cat "$CONFIG_JSON")
     _state_secret_decode() { return 1; }
-    run state_migrate_v1_to_v2
+    run state_format_migrate
     assert_failure
     [[ $(cat "$CONFIG_JSON") == "$before" ]]
 }
@@ -38,8 +38,29 @@ EOF
     state_open_local
     local first second
     first=$(cat "$CONFIG_JSON"); second=$(cat "$SECRETS_JSON")
-    state_migrate_v1_to_v2
+    state_format_migrate
     [[ $(cat "$CONFIG_JSON") == "$first" && $(cat "$SECRETS_JSON") == "$second" ]]
+}
+
+@test "newer local config format is rejected without changes" {
+    local before
+    printf '{"schema_version":3,"nodes":[],"groups":[],"clients":[],"connections":[]}\n' > "$CONFIG_JSON"
+    before=$(cat "$CONFIG_JSON")
+    run state_format_migrate
+    assert_failure
+    [[ $(cat "$CONFIG_JSON") == "$before" ]]
+}
+
+@test "migration chain stops on a missing step and runs steps in order" {
+    run format_migrate_chain state 1 3
+    assert_failure
+    local log="$BATS_TEST_TMPDIR/steps"
+    _migrate_probe_1_to_2() { printf '1>2 %s\n' "$1" >> "$log"; }
+    _migrate_probe_2_to_3() { printf '2>3 %s\n' "$1" >> "$log"; }
+    format_migrate_chain probe 1 3 arg
+    [[ "$(cat "$log")" == $'1>2 arg\n2>3 arg' ]]
+    run format_migrate_chain probe 3 1
+    assert_failure
 }
 
 @test "portable validation distinguishes ready and needs_setup" {
