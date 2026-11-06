@@ -155,6 +155,7 @@ _config_source_materialize_state() {
     local old_identities="${SSH_IDENTITIES_DIR:-}" old_hosts="${SSH_KNOWN_HOSTS:-}"
     local old_auth_file="${SCRIPT_AUTH_FILE:-}" had_runtime=false had_auth=false
     local rollback_ok=true rollback_backup_preserved=false
+    github_config_validate "$logical" || return 1
     stage=$(umask 077; mktemp -d "$CONFIG_DIR/.github-runtime.stage.XXXXXX") || {
         _github_record_error "подготовка рабочего состояния" \
             "Не удалось создать защищённый каталог staging."
@@ -162,7 +163,10 @@ _config_source_materialize_state() {
     }
     if ! mkdir -p "$stage/templates" "$stage/ssh/identities" ||
        ! jq -e '.config' "$logical" > "$stage/config.json" ||
-       ! jq -e '.secrets' "$logical" > "$stage/secrets.json" ||
+       ! jq -e '.secrets' "$logical" > "$stage/.portable-secrets.json" ||
+       ! chmod 600 "$stage/.portable-secrets.json" ||
+       ! _state_secrets_import_portable "$stage/.portable-secrets.json" "$stage/secrets.json" ||
+       ! rm -f "$stage/.portable-secrets.json" ||
        ! jq -e '{schema_version:2,minimum_remote_control_version,portability,templates,access}' \
             "$logical" > "$stage/manifest.json" ||
        ! jq -j '.ssh.known_hosts // ""' "$logical" > "$stage/ssh/known_hosts"; then
@@ -384,6 +388,9 @@ _config_source_materialize_state() {
     SSH_KNOWN_HOSTS="$runtime/ssh/known_hosts"; SCRIPT_AUTH_FILE="$CONFIG_DIR/.auth"
     export CONFIG_SOURCE STATE_DIR CONFIG_JSON SECRETS_JSON STATE_MANIFEST
     export TEMPLATES_DIR SSH_IDENTITIES_DIR SSH_KNOWN_HOSTS SCRIPT_AUTH_FILE
+    _state_warn_missing_passwords "$CONFIG_JSON" \
+        "$(jq -c '.portability.issues' "$STATE_MANIFEST")"
+    return 0
 }
 _config_source_materialize_github() {
     local logical="${1:-$CONFIG_DIR/runtime-vault.json}"
@@ -1131,6 +1138,12 @@ menu_nodes() {
     while true; do
         local count
         count=$(nodes_count)
+        local _password_issues _password_readable=true
+        if ! _password_issues=$(_state_password_issues "$CONFIG_JSON" "$SECRETS_JSON"); then
+            _password_readable=false
+            _password_issues='[]'
+            warn "Не удалось прочитать состояние паролей SSH."
+        fi
         local _show_deferred_ssh_setup=false
         if [[ $CONFIG_SOURCE == github ]] &&
            state_actionable_ssh_setup_pending; then
@@ -1154,13 +1167,18 @@ menu_nodes() {
         if [[ $count -eq 0 ]]; then
             box_line " (нод нет — добавьте первую)" " ${DIM}(нод нет — добавьте первую)${NC}"
         else
-            local _num=1
-            while IFS=$'\t' read -r _name _addr _tag; do
-                local _tag_plain="" _tag_color=""
+            local _num=1 _node_id _name _addr _tag
+            while IFS=$'\t' read -r _node_id _name _addr _tag; do
+                local _tag_plain="" _tag_color="" _password_label=""
                 [[ -n "$_tag" ]] && { _tag_plain=" [${_tag}]"; _tag_color=" ${DIM}[${_tag}]${NC}"; }
-                box_line " ${_num}) ${_name}  ${_addr}${_tag_plain}" " ${GREEN}${_num})${NC} ${_name}  ${_addr}${_tag_color}"
+                if jq -e --arg id "$_node_id" 'any(.[]; .node_id==$id)' \
+                    <<< "$_password_issues" >/dev/null; then
+                    _password_label=" — пароль требует настройки"
+                fi
+                box_line " ${_num}) ${_name}  ${_addr}${_tag_plain}${_password_label}" \
+                    " ${GREEN}${_num})${NC} ${_name}  ${_addr}${_tag_color}${YELLOW}${_password_label}${NC}"
                 _num=$((_num + 1))
-            done < <(jq_r '.nodes[] | "\(.name)\t\(.ip):\(.port)\t\(.tag // "")"')
+            done < <(jq_r '.nodes[] | "\(.id)\t\(.name)\t\(.ip):\(.port)\t\(.tag // "")"')
         fi
         box_mid
         box_line " a) Добавить ноду" " ${GREEN}a)${NC} Добавить ноду"
@@ -1209,8 +1227,18 @@ menu_nodes() {
                 ;;
             *)
                 if menu_index_valid "$_pick" "$count"; then
-                    node_load "$_pick"
-                    menu_operations
+                    local _load_rc=0
+                    node_load "$_pick" || _load_rc=$?
+                    case "$_load_rc" in
+                        0) menu_operations ;;
+                        2)
+                            if [[ "$_password_readable" == true ]] &&
+                               node_prompt_password "$_pick" && node_load "$_pick"; then
+                                menu_operations
+                            fi
+                            ;;
+                        *) warn "Не удалось загрузить выбранную ноду." ;;
+                    esac
                 else
                     case "$_pick" in
                         a|A) state_action "add_node" add_node ;;

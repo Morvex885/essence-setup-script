@@ -299,6 +299,7 @@ _github_validate_tree() {
 
 _github_prompt_storage_mode() {
     local answer
+    warn "В режиме без шифрования пароли SSH и приватные ключи доступны читателям репозитория и сохраняются в истории Git."
     while :; do
         echo -e "  ${GREEN}1)${NC} Зашифровать паролем"
         echo -e "  ${CYAN}2)${NC} Хранить без шифрования"
@@ -602,7 +603,7 @@ github_config_unlock() {
         if [[ -n "$pass" ]] &&
            (umask 077
                printf '%s\n' "$pass" |
-                   "$AGE_BIN" -d -p -o "$check" "$GITHUB_WORKTREE/unlock.age" \
+                   "$AGE_BIN" -d -o "$check" "$GITHUB_WORKTREE/unlock.age" \
                        >/dev/null 2>&1
            ) && _github_exact_regular_file "$check"; then
             GITHUB_IDENTITY="$check"
@@ -630,13 +631,13 @@ _github_sha256() {
     else shasum -a 256 "$1" | cut -d' ' -f1
     fi
 }
-# Build logical state from the active runtime.
+# Build vault-2 logical state; only this boundary exports machine-encrypted secrets.
 github_config_serialize() {
     local out=${1:?output path} cfg=${2:-${CONFIG_JSON:?CONFIG_JSON is unset}}
     local secrets=${SECRETS_JSON:-${CONFIG_DIR:-.}/secrets.json}
     local manifest=${STATE_MANIFEST:-${CONFIG_DIR:-.}/manifest.json}
     local known=${SSH_KNOWN_HOSTS:-${CONFIG_DIR:-.}/ssh/known_hosts}
-    local tmp next template_list identity_list template name source pub
+    local tmp next template_list identity_list template name source pub portable_stage
     local snapshot_hash builtin_hash
     _github_exact_regular_file "$cfg" || return 1
     _github_exact_regular_file "$secrets" || return 1
@@ -657,19 +658,33 @@ github_config_serialize() {
         rm -f "$tmp" "$next" "$template_list"
         return 1
     }
+    portable_stage=$(umask 077; mktemp -d "${out}.portable.XXXXXX") || {
+        rm -f "$tmp" "$next" "$template_list" "$identity_list"
+        return 1
+    }
+    if ! _state_secrets_export_portable "$cfg" "$secrets" \
+            "$portable_stage/secrets.json" "$portable_stage/issues.json"; then
+        rm -rf "$portable_stage"
+        rm -f "$tmp" "$next" "$template_list" "$identity_list"
+        return 1
+    fi
     local -a known_args
     if _github_exact_regular_file "$known"; then
         known_args=(--rawfile known "$known")
     else
         known_args=(--arg known "")
     fi
-    if ! jq -n --slurpfile config "$cfg" --slurpfile sec "$secrets" \
+    if ! jq -n --slurpfile config "$cfg" --slurpfile sec "$portable_stage/secrets.json" \
+        --slurpfile password_issues "$portable_stage/issues.json" \
         --slurpfile man "$manifest" "${known_args[@]}" \
         --arg minimum "${CURRENT_VERSION:-0.0.0}" \
-        '{vault_version:1,minimum_remote_control_version:$minimum,
-          portability:($man[0].portability // {status:"ready",issues:[]}),
+        '([($man[0].portability.issues // [])[] | select(.reason != "missing_secret")] +
+          $password_issues[0] | unique_by([.node_id,.reason])) as $issues |
+         {vault_version:2,minimum_remote_control_version:$minimum,
+          portability:{status:(if ($issues|length)>0 then "needs_setup" else "ready" end),
+                       issues:$issues},
           access:($man[0].access // {script_password_hash:null}),
-          config:$config[0],secrets:($sec[0] // {node_passwords:{}}),
+          config:$config[0],secrets:$sec[0],
           templates:($man[0].templates // {}),
           ssh:{identities:{},known_hosts:$known}}' > "$tmp" ||
        ! printf '%s\n' default.yaml > "$template_list" ||
@@ -678,6 +693,11 @@ github_config_serialize() {
        ! jq -r '(.nodes // [])[]? |
             select(.auth == "key" and (.identity // "system") != "system") |
             .identity' "$cfg" > "$identity_list"; then
+        rm -rf "$portable_stage"
+        rm -f "$tmp" "$next" "$template_list" "$identity_list"
+        return 1
+    fi
+    if ! rm -rf "$portable_stage"; then
         rm -f "$tmp" "$next" "$template_list" "$identity_list"
         return 1
     fi
@@ -787,33 +807,79 @@ github_config_serialize() {
 github_config_validate() {
     local state=${1:?state json}
     _github_exact_regular_file "$state" || return 1
-    jq -e 'type=="object" and .vault_version==1 and
-        (.config|type=="object") and (.secrets|type=="object") and
+    if ! jq -se 'length==1 and (.[0]|type=="object")' "$state" >/dev/null 2>&1; then
+        _github_record_error "проверка формата конфигурации GitHub" \
+            "Снимок конфигурации имеет некорректную структуру."
+        return 1
+    fi
+    if ! jq -e '.vault_version==2 and .secrets.schema_version==2' "$state" >/dev/null 2>&1; then
+        _github_record_error "проверка формата конфигурации GitHub" \
+            "Неподдерживаемый формат конфигурации GitHub. Автоматическое преобразование не поддерживается."
+        return 1
+    fi
+    if ! jq -e '
+        . as $root |
+        (.config|type=="object") and .config.schema_version==2 and
+        (.config.nodes|type=="array") and (.config.groups|type=="array") and
+        (.config.clients|type=="array") and (.config.connections|type=="array") and
+        (.secrets|type=="object") and (.secrets.node_passwords|type=="object") and
+        all(.secrets.node_passwords | to_entries[];
+            (.key|index("\u0000")==null) and
+            (.value|type=="string" and length>0 and index("\u0000")==null)) and
         (.templates|type=="object") and (.ssh|type=="object") and
-        ((.portability.status=="ready") or (.portability.status=="needs_setup")) and
-        (.portability.issues|type=="array")' "$state" >/dev/null 2>&1 || return 1
-    jq -e '
-        ((.config.nodes // []) | map(.id) | length == (map(.) | unique | length)) and
-        ((.config.nodes // []) | map(.name) | length == (map(.) | unique | length)) and
-        all((.config.nodes // [])[];
-            (.id|type=="string") and (.name|type=="string") and
-            (if .auth == "key" and (.identity // "system") != "system"
-             then (.identity|type=="string") and
-                  (. as $node | $identities[$node.identity] != null)
-             else true end))
-    ' --argjson identities "$(jq -c '.ssh.identities // {}' "$state")" \
-        "$state" >/dev/null 2>&1 || return 1
-    jq -e '
-        all((.templates // {}) | to_entries[];
-            (.key | test("^[A-Za-z0-9._-]+[.]yaml$")) and
-            (.value | type=="object") and (.value.content | type=="string")) and
-        ((.ssh.known_hosts // "") | type=="string") and
+        (.portability|type=="object") and (.portability.issues|type=="array") and
+        (.portability.status ==
+            (if (.portability.issues|length)>0 then "needs_setup" else "ready" end)) and
+        (.portability.issues|length == (unique_by([.node_id,.reason])|length)) and
+        all(.portability.issues[];
+            (.node_id|type=="string") and
+            (.reason=="missing_secret" or .reason=="missing_identity" or .reason=="missing_host_key") and
+            (. as $issue | any($root.config.nodes[]; .id==$issue.node_id))) and
+        (.config.nodes | map(.id) | length == (unique|length)) and
+        (.config.nodes | map(.name) | length == (unique|length)) and
+        all(.config.nodes[];
+            (.id|type=="string" and test("^[0-9a-fA-F]{32}$")) and
+            (.name|type=="string" and length>0) and
+            (.ip|type=="string" and length>0) and
+            (.port|type=="number" and floor==. and .>=1 and .<=65535) and
+            (.user|type=="string" and length>0) and
+            (.auth=="key" or .auth=="password") and
+            ((.aliases // {})|type=="object") and
+            (. as $node |
+             [$root.portability.issues[] |
+                select(.node_id==$node.id and .reason=="missing_secret")] as $missing |
+             if .auth=="password" then
+                .secret_id==("node:"+.id+":ssh-password") and
+                (if ($root.secrets.node_passwords|has($node.secret_id))
+                 then ($missing|length)==0 else ($missing|length)==1 end)
+             else
+                has("secret_id") and .secret_id==null and ($missing|length)==0 and
+                (if (.identity // "system") != "system"
+                 then (.identity|type=="string") and
+                      $root.ssh.identities[$node.identity] != null
+                 else true end)
+             end)) and
+        all(.config.connections[]; .node as $name |
+            any($root.config.nodes[]; .name==$name)) and
+        all(.config.clients[];
+            all(.nodes[]?; . as $name | any($root.config.nodes[]; .name==$name)) and
+            all(.connections[]?; .node as $name |
+                any($root.config.nodes[]; .name==$name))) and
+        all(.templates | to_entries[];
+            (.key|test("^[A-Za-z0-9._-]+[.]yaml$")) and
+            (.value|type=="object") and (.value.content|type=="string")) and
+        ((.ssh.known_hosts // "")|type=="string") and
+        ((.ssh.identities // {})|type=="object") and
         all((.ssh.identities // {}) | to_entries[];
-            (.key | test("^[0-9a-fA-F]{32}$")) and
-            (.value | type=="object") and
-            (.value.private | type=="string" and length>0) and
-            (.value.public | type=="string" and length>0))
-    ' "$state" >/dev/null 2>&1
+            (.key|test("^[0-9a-fA-F]{32}$")) and
+            (.value|type=="object") and
+            (.value.private|type=="string" and length>0) and
+            (.value.public|type=="string" and length>0))
+    ' "$state" >/dev/null 2>&1; then
+        _github_record_error "проверка формата конфигурации GitHub" \
+            "Снимок конфигурации имеет некорректную структуру."
+        return 1
+    fi
 }
 
 _github_plain_write() {
@@ -941,7 +1007,7 @@ _github_plain_read() {
     if ! jq -n --slurpfile config "$w/config.json" \
         --slurpfile secrets "$w/secrets.json" --slurpfile man "$w/manifest.json" \
         "${known_args[@]}" \
-        '{vault_version:1,
+        '{vault_version:$man[0].vault_version,
           minimum_remote_control_version:($man[0].minimum_remote_control_version // "0.0.0"),
           portability:($man[0].portability // {status:"ready",issues:[]}),
           access:($man[0].access // {script_password_hash:null}),
@@ -1043,7 +1109,7 @@ github_config_checkpoint() {
         }
     fi
     if [[ "$generated_state" != true ]] && ! github_config_validate "$state"; then
-        _github_record_error "проверка снимка конфигурации GitHub" \
+        _github_ensure_error "проверка снимка конфигурации GitHub" \
             "Снимок конфигурации имеет некорректную структуру."
         return 1
     fi
@@ -1103,6 +1169,9 @@ github_config_checkpoint() {
         _github_remove_private_path "$age_tmp" ||
             warn "Защищённый staging-каталог снимка требует ручной очистки."
     fi
+    _state_warn_missing_passwords <(jq '.config' "$state") \
+        "$(jq -c '.portability.issues' "$state")" ||
+        warn "Снимок опубликован, но не удалось прочитать список нод с недоступным паролем."
     if [[ "$generated_state" == true ]] && ! rm -f "$state"; then
         warn "Снимок опубликован, но временное логическое состояние требует ручной очистки: $state"
     fi
@@ -1136,15 +1205,12 @@ config_persist_candidate() {
     }
     CONFIG_JSON="$candidate"
     if ! state_validate true >/dev/null 2>&1; then
-        if [[ "${CONFIG_PERSIST_ALLOW_NEEDS_SETUP:-0}" != 1 ]] ||
-           ! state_validate false >/dev/null 2>&1; then
-            CONFIG_JSON="$original"
-            rm -f "$serialized"
-            _github_ensure_error "проверка изменённой конфигурации" \
-                "Изменённая конфигурация не прошла проверку переносимого состояния."
-            CONFIG_PERSIST_LAST_ERROR="Не удалось сохранить изменение в GitHub (этап: $GITHUB_LAST_STAGE): $GITHUB_LAST_ERROR"
-            return 1
-        fi
+        CONFIG_JSON="$original"
+        rm -f "$serialized"
+        _github_ensure_error "проверка изменённой конфигурации" \
+            "Изменённая конфигурация не прошла проверку переносимого состояния."
+        CONFIG_PERSIST_LAST_ERROR="Не удалось сохранить изменение в GitHub (этап: $GITHUB_LAST_STAGE): $GITHUB_LAST_ERROR"
+        return 1
     fi
     if ! github_config_serialize "$serialized" "$candidate"; then
         CONFIG_JSON="$original"
@@ -1437,7 +1503,7 @@ github_config_rewrap_master() {
        ! chmod 600 "$backup" ||
        ! (umask 077
            printf '%s\n' "$old" |
-               "$AGE_BIN" -d -p -o "$identity_tmp" \
+               "$AGE_BIN" -d -o "$identity_tmp" \
                    "$GITHUB_WORKTREE/unlock.age" >/dev/null 2>&1
        ) ||
        ! _github_exact_regular_file "$identity_tmp" ||
@@ -2103,7 +2169,7 @@ github_account_switch_finalize() {
         return 1
     }
     github_config_validate "$desired_state" || {
-        _github_record_error "локальная финализация смены аккаунта GitHub" "Снимок целевой конфигурации имеет некорректную структуру."
+        _github_ensure_error "локальная финализация смены аккаунта GitHub" "Снимок целевой конфигурации имеет некорректную структуру."
         return 1
     }
     case "$phase" in
@@ -2902,6 +2968,72 @@ github_sync_flush() {
     return 0
 }
 
+# Same-device rollback must retain unreadable ciphertext and the original manifest.
+# Portable snapshots intentionally omit unavailable passwords and are not backups.
+_github_runtime_backup() {
+    local backup="$1" runtime="$2" auth="$3"
+    [[ -d "$backup" && ! -L "$backup" ]] || return 1
+    _github_validate_tree "$runtime" none || return 1
+    if [[ -e "$auth" || -L "$auth" ]]; then
+        _github_exact_regular_file "$auth" || return 1
+        cp -p "$auth" "$backup/auth" || return 1
+    else
+        (umask 077; : > "$backup/auth.absent") || return 1
+    fi
+    cp -Rp "$runtime" "$backup/runtime"
+}
+
+_github_runtime_restore() {
+    local backup="$1" runtime="$2" auth="$3" stage retired auth_mode
+    [[ -d "$backup" && ! -L "$backup" ]] || return 1
+    _github_validate_tree "$backup/runtime" none || return 1
+    if [[ -e "$backup/auth" || -L "$backup/auth" ]]; then
+        _github_exact_regular_file "$backup/auth" || return 1
+        [[ ! -e "$backup/auth.absent" && ! -L "$backup/auth.absent" ]] || return 1
+        auth_mode=$(stat -c '%a' "$backup/auth") || return 1
+    else
+        _github_exact_regular_file "$backup/auth.absent" || return 1
+    fi
+    if [[ -e "$auth" || -L "$auth" ]]; then
+        _github_exact_regular_file "$auth" || return 1
+    fi
+    if [[ -e "$runtime" || -L "$runtime" ]]; then
+        [[ -d "$runtime" && ! -L "$runtime" ]] || return 1
+    fi
+    stage=$(umask 077; mktemp -d "${runtime}.restore.XXXXXX") || return 1
+    retired=$(umask 077; mktemp -d "${runtime}.retired.XXXXXX") || {
+        rm -rf "$stage"
+        return 1
+    }
+    if ! cp -Rp "$backup/runtime" "$stage/runtime"; then
+        rm -rf "$stage" "$retired"
+        return 1
+    fi
+    if [[ -d "$runtime" ]] && ! mv "$runtime" "$retired/runtime"; then
+        rm -rf "$stage" "$retired"
+        return 1
+    fi
+    if ! mv "$stage/runtime" "$runtime"; then
+        if [[ -d "$retired/runtime" ]] && ! mv "$retired/runtime" "$runtime"; then
+            warn "Не удалось вернуть отложенное runtime-состояние: $retired"
+            rm -rf "$stage"
+            return 1
+        fi
+        rm -rf "$stage" "$retired"
+        return 1
+    fi
+    if [[ -f "$backup/auth" ]]; then
+        if ! _state_write_atomic "$backup/auth" "$auth" "$auth_mode"; then
+            rm -rf "$stage" "$retired"
+            return 1
+        fi
+    elif ! rm -f "$auth"; then
+        rm -rf "$stage" "$retired"
+        return 1
+    fi
+    rm -rf "$stage" "$retired"
+}
+
 github_sync_fetch() {
     _github_clear_error
     if [[ -z "${GITHUB_STORE:-}" || ! -d "$GITHUB_STORE" ]]; then
@@ -2927,17 +3059,28 @@ github_sync_fetch() {
     local old_session_origin="${GITHUB_SESSION_ORIGIN:-}"
     local old_status="${GITHUB_SYNC_STATUS:-clean}"
     local old_state_dir="${STATE_DIR:-}" runtime_snapshot="" has_runtime_snapshot=false
+    local old_auth="${SCRIPT_AUTH_FILE:-$CONFIG_DIR/.auth}"
+    local old_storage_mode="${GITHUB_STORAGE_MODE:-}" runtime_var
+    local -a runtime_vars=(CONFIG_SOURCE CONFIG_DIR LOCAL_CONFIG_JSON STATE_DIR CONFIG_JSON
+        SECRETS_JSON STATE_MANIFEST TEMPLATES_DIR SSH_IDENTITIES_DIR SSH_KNOWN_HOSTS SCRIPT_AUTH_FILE)
+    local -A runtime_values=() runtime_set=()
+    for runtime_var in "${runtime_vars[@]}"; do
+        if [[ -v "$runtime_var" ]]; then
+            runtime_set[$runtime_var]=true
+            runtime_values[$runtime_var]="${!runtime_var}"
+        fi
+    done
     local new_worktree new_session new_identity new_recipient
     local new_session_remote new_session_branch new_session_origin new_status
     local failure_stage failure_detail failure_hint failure_auth
-    if declare -F _config_source_materialize_state >/dev/null 2>&1; then
-        runtime_snapshot=$(umask 077; mktemp "$CONFIG_DIR/.fetch-runtime.XXXXXX") || {
+    if [[ -n "$old_state_dir" ]]; then
+        runtime_snapshot=$(umask 077; mktemp -d "$CONFIG_DIR/.fetch-runtime.XXXXXX") || {
             _github_record_error "резервное копирование рабочего состояния" \
                 "Не удалось создать защищённый снимок перед загрузкой."
             return 1
         }
-        if ! github_config_serialize "$runtime_snapshot" "${CONFIG_JSON:-}"; then
-            rm -f "$runtime_snapshot"
+        if ! _github_runtime_backup "$runtime_snapshot" "$old_state_dir" "$old_auth"; then
+            rm -rf "$runtime_snapshot"
             _github_ensure_error "резервное копирование рабочего состояния" \
                 "Не удалось сохранить рабочее состояние перед загрузкой."
             return 1
@@ -2961,12 +3104,21 @@ github_sync_fetch() {
             _github_report_last_error "Не удалось очистить неудачную новую GitHub-сессию"
         fi
         if [[ "$has_runtime_snapshot" == true ]] &&
-           ! _config_source_materialize_state "$runtime_snapshot" "$old_state_dir"; then
+           ! _github_runtime_restore "$runtime_snapshot" "$old_state_dir" "$old_auth"; then
             failure_stage="откат рабочего состояния после загрузки"
-            failure_detail="Не удалось восстановить runtime и пароль после ошибки повторного открытия."
+            failure_detail="Не удалось восстановить runtime и пароль после ошибки повторного открытия. Резервная копия: $runtime_snapshot"
+        else
+            rm -rf "$runtime_snapshot" ||
+                warn "Снимок неудачной загрузки требует ручной очистки: $runtime_snapshot"
         fi
-        rm -f "$runtime_snapshot" ||
-            warn "Снимок неудачной загрузки требует ручной очистки."
+        for runtime_var in "${runtime_vars[@]}"; do
+            if [[ ${runtime_set[$runtime_var]:-} == true ]]; then
+                printf -v "$runtime_var" '%s' "${runtime_values[$runtime_var]}"
+            else
+                unset "$runtime_var"
+            fi
+        done
+        GITHUB_STORAGE_MODE="$old_storage_mode"
         GITHUB_WORKTREE="$old_worktree"; GITHUB_SESSION_ID="$old_session"
         GITHUB_IDENTITY="$old_identity"; GITHUB_RECIPIENT="$old_recipient"
         GITHUB_SESSION_REMOTE="$old_session_remote"
@@ -2980,10 +3132,16 @@ github_sync_fetch() {
         return 1
     fi
     if [[ -z "${GITHUB_WORKTREE:-}" || -z "${GITHUB_SESSION_ID:-}" ]]; then
+        for runtime_var in "${runtime_vars[@]}"; do
+            if [[ ${runtime_set[$runtime_var]:-} == true ]]; then
+                printf -v "$runtime_var" '%s' "${runtime_values[$runtime_var]}"
+            else
+                unset "$runtime_var"
+            fi
+        done
+        GITHUB_STORAGE_MODE="$old_storage_mode"
         if [[ "$has_runtime_snapshot" == true ]] &&
-           ! _config_source_materialize_state "$runtime_snapshot" "$old_state_dir"; then
-            rm -f "$runtime_snapshot" ||
-                warn "Снимок неудачной загрузки требует ручной очистки."
+           ! _github_runtime_restore "$runtime_snapshot" "$old_state_dir" "$old_auth"; then
             GITHUB_WORKTREE="$old_worktree"; GITHUB_SESSION_ID="$old_session"
             GITHUB_IDENTITY="$old_identity"; GITHUB_RECIPIENT="$old_recipient"
             GITHUB_SESSION_REMOTE="$old_session_remote"
@@ -2991,7 +3149,7 @@ github_sync_fetch() {
             GITHUB_SESSION_ORIGIN="$old_session_origin"
             GITHUB_SYNC_STATUS="$old_status"
             _github_record_error "откат рабочего состояния после загрузки" \
-                "Повторное открытие не создало сессию, а прежнее runtime-состояние восстановить не удалось."
+                "Повторное открытие не создало сессию, а прежнее runtime-состояние восстановить не удалось. Резервная копия: $runtime_snapshot"
             return 1
         fi
         GITHUB_WORKTREE="$old_worktree"; GITHUB_SESSION_ID="$old_session"
@@ -3000,8 +3158,8 @@ github_sync_fetch() {
         GITHUB_SESSION_BRANCH="$old_session_branch"
         GITHUB_SESSION_ORIGIN="$old_session_origin"
         GITHUB_SYNC_STATUS="$old_status"
-        rm -f "$runtime_snapshot" ||
-            warn "Снимок загрузки требует ручной очистки."
+        rm -rf "$runtime_snapshot" ||
+            warn "Снимок загрузки требует ручной очистки: $runtime_snapshot"
         _github_clear_error
         return 0
     fi
@@ -3032,12 +3190,21 @@ github_sync_fetch() {
             _github_report_last_error "Не удалось очистить новую GitHub-сессию после ошибки замены"
         fi
         if [[ "$has_runtime_snapshot" == true ]] &&
-           ! _config_source_materialize_state "$runtime_snapshot" "$old_state_dir"; then
+           ! _github_runtime_restore "$runtime_snapshot" "$old_state_dir" "$old_auth"; then
             failure_stage="откат рабочего состояния после загрузки"
-            failure_detail="Не удалось восстановить runtime и пароль после ошибки закрытия прежней сессии."
+            failure_detail="Не удалось восстановить runtime и пароль после ошибки закрытия прежней сессии. Резервная копия: $runtime_snapshot"
+        else
+            rm -rf "$runtime_snapshot" ||
+                warn "Снимок неудачной загрузки требует ручной очистки: $runtime_snapshot"
         fi
-        rm -f "$runtime_snapshot" ||
-            warn "Снимок неудачной загрузки требует ручной очистки."
+        for runtime_var in "${runtime_vars[@]}"; do
+            if [[ ${runtime_set[$runtime_var]:-} == true ]]; then
+                printf -v "$runtime_var" '%s' "${runtime_values[$runtime_var]}"
+            else
+                unset "$runtime_var"
+            fi
+        done
+        GITHUB_STORAGE_MODE="$old_storage_mode"
         GITHUB_WORKTREE="$old_worktree"; GITHUB_SESSION_ID="$old_session"
         GITHUB_IDENTITY="$old_identity"; GITHUB_RECIPIENT="$old_recipient"
         GITHUB_SESSION_REMOTE="$old_session_remote"
@@ -3057,8 +3224,8 @@ github_sync_fetch() {
     export GITHUB_WORKTREE GITHUB_SESSION_ID GITHUB_IDENTITY GITHUB_RECIPIENT
     export GITHUB_SESSION_REMOTE GITHUB_SESSION_BRANCH GITHUB_SESSION_ORIGIN
     export GITHUB_SYNC_STATUS
-    rm -f "$runtime_snapshot" ||
-        warn "Снимок завершённой загрузки требует ручной очистки."
+    rm -rf "$runtime_snapshot" ||
+        warn "Снимок завершённой загрузки требует ручной очистки: $runtime_snapshot"
 }
 
 state_action() {

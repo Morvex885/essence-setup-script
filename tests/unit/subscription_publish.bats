@@ -14,7 +14,8 @@ setup() {
     # Config with node + client + subscription host (with cached sub_dir/nginx_group)
     cat > "$CONFIG_JSON" <<'EOF'
 {
-  "nodes": [{"name":"vps-1","ip":"1.2.3.4","port":"22","user":"root","auth":"key"}],
+  "schema_version": 2,
+  "nodes": [{"id":"11111111111111111111111111111111","name":"vps-1","ip":"1.2.3.4","port":22,"user":"root","auth":"key","identity":"system","secret_id":null,"aliases":{}}],
   "subscription_host": {"node":"vps-1","base_url":"https://sub.example.com:2096","sub_dir":"/var/lib/essence-sub","nginx_group":"www-data"},
   "groups": [{"name":"MOBILE","template":"default.yaml"}],
   "clients": [{"name":"phone","group":"MOBILE"}],

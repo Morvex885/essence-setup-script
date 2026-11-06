@@ -86,7 +86,7 @@ awg_peers_menu() {
 }
 
 _awg_peers_node() {
-    node_load "$1"
+    node_load "$1" || return 1
     local nname="$NODE_NAME"
 
     ssh_connect || return

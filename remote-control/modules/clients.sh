@@ -536,7 +536,7 @@ delete_client() {
         for (( _node_peer_idx=0; _node_peer_idx<${#_peer_nodes[@]}; _node_peer_idx++ )); do
             _nn="${_peer_nodes[$_node_peer_idx]}"
             if ! node_load_by_name "$_nn"; then
-                warn "$_nn: не удалось подключиться — AWG peers не удалены."
+                warn "Не удалось загрузить ноду '${_nn}'. AWG peers не удалены."
                 continue
             fi
             if ! array_contains "$_nn" "${SCRIPTS_UPLOADED[@]}"; then
@@ -724,8 +724,8 @@ _configure_client_connections() {
 
     # Загружаем ноду и обнаруживаем подключения
     if ! node_load_by_name "$selected_node"; then
-        warn "Нода $selected_node не найдена."
-        return
+        warn "Не удалось загрузить ноду '${selected_node}'."
+        return 1
     fi
 
     info "Подключаюсь к $selected_node..."

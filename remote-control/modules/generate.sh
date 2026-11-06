@@ -269,7 +269,7 @@ _prefetch_node_configs() {
         fi
 
         if ! node_load_by_name "$nname"; then
-            warn "Нода $nname не найдена."
+            warn "Не удалось загрузить ноду '${nname}'."
             NODE_CONFIG_FAILED+=("$nname")
             continue
         fi

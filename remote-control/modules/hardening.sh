@@ -131,7 +131,24 @@ _github_initial_portable_onboarding() {
     for name in "${node_rows[@]}"; do
         id="${name%%$'\t'*}"
         name="${name#*$'\t'}"
-        node_load_by_name "$name" || return 1
+        local load_rc=0
+        node_load_by_name "$name" || load_rc=$?
+        if [[ $load_rc -eq 2 ]]; then
+            state_portability_add_issue "$id" missing_secret || return 1
+            if (
+                SERVER_IP=$(jq_r --arg id "$id" '.nodes[] | select(.id==$id) | .ip') || exit 1
+                SERVER_PORT=$(jq_r --arg id "$id" '.nodes[] | select(.id==$id) | .port') || exit 1
+                _ssh_known_host_present
+            ); then
+                state_portability_remove_issue "$id" missing_host_key || return 1
+            else
+                state_portability_add_issue "$id" missing_host_key || return 1
+            fi
+            continue
+        elif [[ $load_rc -ne 0 ]]; then
+            rm -f "$known_backup" "$manifest_backup"
+            return 1
+        fi
         if [[ "$id" == "" ]]; then continue; fi
         NODE_ID="$id"
         if [[ ${#installed_ids[@]} -gt 0 ]] && [[ " ${installed_ids[*]} " == *" $id "* ]]; then NODE_IDENTITY="$id"; fi
@@ -171,16 +188,29 @@ _github_initial_portable_onboarding() {
         done
     done
     if [[ ${#installed_ids[@]} -gt 0 ]]; then
-        local ids_json previous_candidate_allow="${CONFIG_PERSIST_ALLOW_NEEDS_SETUP:-0}"
+        local ids_json
         ids_json=$(printf '%s\n' "${installed_ids[@]}" | jq -R . | jq -s .) || return 1
-        CONFIG_PERSIST_ALLOW_NEEDS_SETUP=1
-        jq_w --argjson ids "$ids_json" \
-            '.nodes |= map(.id as $id | if ($ids | index($id)) then .identity=$id else . end)'
-        local identity_write_rc=$?
-        CONFIG_PERSIST_ALLOW_NEEDS_SETUP="$previous_candidate_allow"
+        local identity_write_rc=0
+        # The candidate must see issues matching its newly installed identities.
+        # Restore the original manifest below if either step fails.
+        for id in "${installed_ids[@]}"; do
+            state_portability_remove_issue "$id" missing_identity || {
+                identity_write_rc=1
+                break
+            }
+        done
+        if [[ $identity_write_rc -eq 0 ]]; then
+            jq_w --argjson ids "$ids_json" \
+                '.nodes |= map(.id as $id | if ($ids | index($id)) then .identity=$id else . end)' ||
+                identity_write_rc=1
+        fi
         if [[ $identity_write_rc -ne 0 ]]; then
             if [[ "$known_existed" == true ]]; then cp "$known_backup" "$SSH_KNOWN_HOSTS"; else rm -f "$SSH_KNOWN_HOSTS"; fi
-            [[ -f "$manifest_backup" ]] && cp "$manifest_backup" "$STATE_MANIFEST"
+            if [[ -f "$manifest_backup" ]]; then
+                cp "$manifest_backup" "$STATE_MANIFEST"
+            else
+                rm -f "$STATE_MANIFEST"
+            fi
             rm -f "$known_backup" "$manifest_backup"
             for name in "${installed_ids[@]}"; do
                 node_load_by_name "$(jq_r --arg id "$name" '.nodes[] | select(.id==$id) | .name')" || continue
@@ -190,9 +220,6 @@ _github_initial_portable_onboarding() {
             done
             return 1
         fi
-        for id in "${installed_ids[@]}"; do
-            state_portability_remove_issue "$id" missing_identity || return 1
-        done
     fi
     rm -f "$known_backup" "$manifest_backup"
     return 0

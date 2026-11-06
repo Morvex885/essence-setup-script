@@ -50,7 +50,8 @@ _state_version_valid() {
        "$minor" =~ ^[0-9]+$ && "$patch" =~ ^[0-9]+$ ]]
 }
 
-_state_secret_decode() {
+_state_secret_decode() (
+    set -o pipefail
     if declare -F node_pass_decode >/dev/null 2>&1; then
         node_pass_decode "$1"
         return
@@ -59,22 +60,23 @@ _state_secret_decode() {
     # fallback only makes migration callable during early bootstrap/tests.
     local machine_id key
     machine_id=$(cat /etc/machine-id 2>/dev/null || hostname)
-    key=$(printf '%s' "rcm-${machine_id}" | openssl dgst -sha256 -r | cut -d' ' -f1)
+    key=$(printf '%s' "rcm-${machine_id}" | openssl dgst -sha256 -r | cut -d' ' -f1) || return 1
     printf '%s' "$1" | base64 -d 2>/dev/null |
         openssl enc -aes-256-cbc -d -pbkdf2 -k "$key" 2>/dev/null
-}
+)
 
-_state_secret_encode() {
+_state_secret_encode() (
+    set -o pipefail
     if declare -F node_pass_encode >/dev/null 2>&1; then
         node_pass_encode "$1"
         return
     fi
     local machine_id key
     machine_id=$(cat /etc/machine-id 2>/dev/null || hostname)
-    key=$(printf '%s' "rcm-${machine_id}" | openssl dgst -sha256 -r | cut -d' ' -f1)
+    key=$(printf '%s' "rcm-${machine_id}" | openssl dgst -sha256 -r | cut -d' ' -f1) || return 1
     printf '%s' "$1" | openssl enc -aes-256-cbc -pbkdf2 -k "$key" 2>/dev/null |
         base64 | tr -d '\n'
-}
+)
 
 _state_ensure_dirs() {
     mkdir -p "$STATE_DIR" "$TEMPLATES_DIR" "$SSH_IDENTITIES_DIR" "$(dirname "$SSH_KNOWN_HOSTS")"
@@ -280,8 +282,7 @@ _state_node_issue_json() {
 _state_declared_portability() {
     local source="$STATE_MANIFEST"
     [[ -f "$source" ]] || source="$CONFIG_JSON"
-    jq -c '{status:(.portability.status // "ready"),issues:(.portability.issues // [])}' "$source" 2>/dev/null ||
-        printf '%s\n' '{"status":"ready","issues":[]}'
+    jq -c '{status:(.portability.status // "ready"),issues:(.portability.issues // [])}' "$source" 2>/dev/null
 }
 
 # state_validate <portable:true|false> — validate logical state and resources.
@@ -316,12 +317,10 @@ state_validate() {
         fi
     fi
 
-    if [[ -f "$SECRETS_JSON" ]] &&
-       ! jq -e 'type=="object" and (.schema_version == 1) and (.node_passwords|type=="object")' \
-           "$SECRETS_JSON" >/dev/null 2>&1; then
+    _state_secrets_container_valid "$SECRETS_JSON" || {
         warn "Файл защищённых данных имеет некорректную структуру."
         return 1
-    fi
+    }
 
     jq -e '
         . as $root |
@@ -388,15 +387,6 @@ state_validate() {
                 warn "У ноды ${node_id} некорректная ссылка на пароль (secret_id)."
                 return 1
             }
-            jq -e --arg id "$node_secret" '.node_passwords[$id]|type=="string" and length>0' \
-                "$SECRETS_JSON" >/dev/null 2>&1 || {
-                if [[ "$portable" == "true" ]]; then
-                    detected+=("$(_state_node_issue_json "$node_id" missing_secret)")
-                else
-                    warn "Для ноды с авторизацией по паролю ${node_id} отсутствуют защищённые данные."
-                    return 1
-                fi
-            }
         else
             [[ "$(jq -r 'has("secret_id") and (.secret_id == null)' <<< "$node_json")" == "true" ]] || {
                 warn "У ноды с авторизацией по ключу ${node_id} ссылка на пароль (secret_id) должна быть пустой."
@@ -432,8 +422,9 @@ state_validate() {
     done < <(jq -c '.nodes[]' "$CONFIG_JSON")
     fi
 
-    local declared status issues_json detected_json
-    declared=$(_state_declared_portability)
+    local declared issues_json detected_json password_issues
+    password_issues=$(_state_password_issues "$CONFIG_JSON" "$SECRETS_JSON") || return 1
+    declared=$(_state_declared_portability) || return 1
     jq -e '(.status=="ready" or .status=="needs_setup") and
         (.issues|type=="array") and
         all(.issues[]; type=="object" and
@@ -443,8 +434,9 @@ state_validate() {
         warn "portability содержит некорректные issue."
         return 1
     }
-    status=$(jq -r '.status' <<< "$declared")
-    issues_json=$(jq -c '.issues' <<< "$declared")
+    issues_json=$(jq -c --argjson passwords "$password_issues" \
+        '[.issues[] | select(.reason!="missing_secret")] + $passwords |
+         unique | sort_by([.node_id,.reason])' <<< "$declared") || return 1
     detected_json='[]'
     if [[ "${#detected[@]}" -gt 0 ]]; then
         detected_json=$(printf '%s\n' "${detected[@]}" | jq -s -c 'unique | sort_by([.node_id,.reason])') || {
@@ -453,23 +445,13 @@ state_validate() {
         }
     fi
     if [[ "$portable" == "true" ]]; then
-        if [[ "${#detected[@]}" -gt 0 ]]; then
-            [[ "$status" == "needs_setup" ]] || {
-                warn "Переносимое состояние требует настройки нод."
-                return 1
-            }
-            if [[ "$(jq -S -c 'sort_by([.node_id,.reason])' <<< "$issues_json")" != "$(jq -S -c 'sort_by([.node_id,.reason])' <<< "$detected_json")" ]]; then
-                warn "portability.issues не соответствует отсутствующим ресурсам."
-                return 1
-            fi
-        else
-            [[ "$status" == "ready" && "$issues_json" == "[]" ]] || {
-                warn "portability содержит устаревшие issue."
-                return 1
-            }
+        if [[ "$(jq -S -c 'map(select(.reason!="missing_secret")) | sort_by([.node_id,.reason])' <<< "$issues_json")" != \
+              "$(jq -S -c 'sort_by([.node_id,.reason])' <<< "$detected_json")" ]]; then
+            warn "portability.issues не соответствует отсутствующим ресурсам."
+            return 1
         fi
     fi
-    [[ "$status" == "needs_setup" ]] && echo "needs_setup" || echo "ready"
+    [[ "$issues_json" != "[]" ]] && echo "needs_setup" || echo "ready"
 }
 state_actionable_ssh_setup_pending() {
     local status declared
@@ -482,22 +464,202 @@ state_actionable_ssh_setup_pending() {
 }
 
 
-node_secret_get() {
-    local node_id="${1:-}"
+# Runtime entries may be individually broken; only the container is mandatory.
+_state_secrets_container_valid() {
+    [[ -f "$1" && -r "$1" ]] || return 1
+    jq -e -s 'length==1 and (.[0] | type=="object" and
+        .schema_version==1 and (.node_passwords|type=="object"))' \
+        "$1" >/dev/null 2>&1
+}
+
+_state_secret_tools_available() {
+    local tool
+    for tool in jq openssl base64 cut tr cat mktemp; do
+        command -v "$tool" >/dev/null 2>&1 || return 1
+    done
+}
+
+# stdout is plaintext only. 2 is a single unavailable password, 1 is global.
+node_secret_get() (
+    umask 077
+    local node_id="${1:-}" secrets_file="${2:-$SECRETS_JSON}"
     [[ -n "$node_id" ]] || return 1
-    local secret_id="node:${node_id}:ssh-password"
-    [[ -f "$SECRETS_JSON" ]] || return 1
-    local cipher
-    cipher=$(jq -r --arg id "$secret_id" '.node_passwords[$id] // empty' "$SECRETS_JSON" 2>/dev/null) || return 1
-    [[ -n "$cipher" ]] || return 1
-    _state_secret_decode "$cipher"
+    _state_secret_tools_available || return 1
+    _state_secrets_container_valid "$secrets_file" || return 1
+    local secret_id="node:${node_id}:ssh-password" cipher plaintext work rc
+    rc=0
+    jq -e --arg id "$secret_id" '.node_passwords[$id] |
+        type=="string" and length>0 and (contains("\u0000")|not)' \
+        "$secrets_file" >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -ne 1 ]] || return 2
+    [[ "$rc" -eq 0 ]] || return 1
+    cipher=$(jq -r --arg id "$secret_id" '.node_passwords[$id]' "$secrets_file") || return 1
+    work=$(mktemp -d "${TMPDIR:-/tmp}/node-secret.XXXXXX") || return 1
+    trap 'rm -rf "$work"' EXIT
+    # A failed decoder can emit a prefix. Keep it private and discard it.
+    _state_secret_decode "$cipher" > "$work/password" || return 2
+    [[ -s "$work/password" ]] || return 2
+    rc=0
+    jq -ne --rawfile password "$work/password" \
+        '$password | contains("\u0000") | not' >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -ne 1 ]] || return 2
+    [[ "$rc" -eq 0 ]] || return 1
+    plaintext=$(cat "$work/password"; rc=$?; printf '.'; exit "$rc") || return 1
+    plaintext="${plaintext%.}"
+    [[ -n "$plaintext" ]] || return 2
+    printf '%s' "$plaintext"
+)
+
+_state_password_nodes() {
+    jq -e -s 'length==1 and (.[0] | type=="object" and
+        .schema_version==2 and (.nodes|type=="array") and
+        (.groups|type=="array") and (.clients|type=="array") and
+        (.connections|type=="array") and
+        all(.nodes[]; type=="object" and
+            (.id|type=="string" and test("^[0-9a-fA-F]{32}$")) and
+            (.name|type=="string" and length>0) and
+            (.ip|type=="string" and length>0) and
+            (.port|type=="number" and floor==. and .>=1 and .<=65535) and
+            (.user|type=="string" and length>0) and
+            (.auth=="password" or .auth=="key") and
+            (if .auth=="password" then .secret_id==("node:"+.id+":ssh-password")
+             else has("secret_id") and .secret_id==null end)))' \
+        "$1" >/dev/null 2>&1 || return 1
+    jq -r '[.nodes[] | select(.auth=="password") | .id] | unique[]' "$1"
+}
+
+_state_password_issues() {
+    local config_file="$1" secrets_file="$2" ids id rc issues='[]'
+    _state_secret_tools_available || return 1
+    _state_secrets_container_valid "$secrets_file" || return 1
+    ids=$(_state_password_nodes "$config_file") || return 1
+    while IFS= read -r id; do
+        [[ -n "$id" ]] || continue
+        rc=0
+        node_secret_get "$id" "$secrets_file" >/dev/null || rc=$?
+        case "$rc" in
+            0) ;;
+            2) issues=$(jq -c --arg id "$id" \
+                '. + [{node_id:$id,reason:"missing_secret"}]' <<< "$issues") || return 1 ;;
+            *) return 1 ;;
+        esac
+    done <<< "$ids"
+    jq -c 'unique | sort_by([.node_id,.reason])' <<< "$issues"
+}
+
+# Conversion outputs belong to private caller-owned staging, never live state.
+# Work in a private sibling directory, and publish only fully formed results.
+_state_secrets_export_portable() (
+    umask 077
+    local config_file="$1" runtime_secrets="$2" portable_output="$3" issues_output="$4"
+    local work ids id plaintext rc had_portable=false had_issues=false
+    [[ "$portable_output" != "$issues_output" &&
+       "$portable_output" != "$runtime_secrets" && "$issues_output" != "$runtime_secrets" &&
+       "$portable_output" != "$config_file" && "$issues_output" != "$config_file" ]] || return 1
+    [[ ! -d "$portable_output" && ! -L "$portable_output" &&
+       ! -d "$issues_output" && ! -L "$issues_output" &&
+       -d "$(dirname "$issues_output")" ]] || return 1
+    _state_secret_tools_available || return 1
+    _state_secrets_container_valid "$runtime_secrets" || return 1
+    ids=$(_state_password_nodes "$config_file") || return 1
+    work=$(mktemp -d "$(dirname "$portable_output")/.portable-secrets.XXXXXX") || return 1
+    trap 'rm -rf "$work"' EXIT
+    printf '%s\n' '{"schema_version":2,"node_passwords":{}}' > "$work/secrets" || return 1
+    printf '%s\n' '[]' > "$work/issues" || return 1
+    while IFS= read -r id; do
+        [[ -n "$id" ]] || continue
+        rc=0
+        plaintext=$(node_secret_get "$id" "$runtime_secrets"; rc=$?; printf '.'; exit "$rc") || rc=$?
+        case "$rc" in
+            0)
+                plaintext="${plaintext%.}"
+                printf '%s' "$plaintext" > "$work/password" || return 1
+                jq --arg id "node:${id}:ssh-password" --rawfile password "$work/password" \
+                    '.node_passwords[$id]=$password' "$work/secrets" > "$work/next" || return 1
+                mv "$work/next" "$work/secrets" || return 1
+                ;;
+            2)
+                jq --arg id "$id" '. + [{node_id:$id,reason:"missing_secret"}]' \
+                    "$work/issues" > "$work/next" || return 1
+                mv "$work/next" "$work/issues" || return 1
+                ;;
+            *) return 1 ;;
+        esac
+    done <<< "$ids"
+    if [[ -e "$portable_output" ]]; then
+        cp -p "$portable_output" "$work/old-secrets" || return 1
+        had_portable=true
+    fi
+    if [[ -e "$issues_output" ]]; then
+        cp -p "$issues_output" "$work/old-issues" || return 1
+        had_issues=true
+    fi
+    if ! _state_write_atomic "$work/secrets" "$portable_output" ||
+       ! _state_write_atomic "$work/issues" "$issues_output"; then
+        if $had_portable; then
+            mv -f "$work/old-secrets" "$portable_output" || return 1
+        else
+            rm -f "$portable_output"
+        fi
+        if $had_issues; then
+            mv -f "$work/old-issues" "$issues_output" || return 1
+        else
+            rm -f "$issues_output"
+        fi
+        return 1
+    fi
+)
+
+_state_secrets_import_portable() (
+    umask 077
+    local portable_input="$1" runtime_output="$2" work ids id plaintext encoded
+    [[ "$portable_input" != "$runtime_output" &&
+       ! -d "$runtime_output" && ! -L "$runtime_output" ]] || return 1
+    _state_secret_tools_available || return 1
+    # Reject NUL before JSON strings enter Bash; empty entries are not secrets.
+    jq -e -s 'length==1 and (.[0] | type=="object" and
+        .schema_version==2 and (.node_passwords|type=="object") and
+        all(.node_passwords | to_entries[];
+            (.key|test("^node:[0-9a-fA-F]{32}:ssh-password$")) and
+            (.value|type=="string" and length>0 and (contains("\u0000")|not))))' \
+        "$portable_input" >/dev/null 2>&1 || return 1
+    ids=$(jq -r '.node_passwords | keys[]' "$portable_input") || return 1
+    work=$(mktemp -d "$(dirname "$runtime_output")/.runtime-secrets.XXXXXX") || return 1
+    trap 'rm -rf "$work"' EXIT
+    printf '%s\n' '{"schema_version":1,"node_passwords":{}}' > "$work/secrets" || return 1
+    while IFS= read -r id; do
+        [[ -n "$id" ]] || continue
+        plaintext=$(jq -j --arg id "$id" '.node_passwords[$id]' "$portable_input";
+            rc=$?; printf '.'; exit "$rc") || return 1
+        plaintext="${plaintext%.}"
+        encoded=$(_state_secret_encode "$plaintext") || return 1
+        [[ -n "$encoded" ]] || return 1
+        printf '%s' "$encoded" > "$work/cipher" || return 1
+        jq --arg id "$id" --rawfile cipher "$work/cipher" \
+            '.node_passwords[$id]=$cipher' "$work/secrets" > "$work/next" || return 1
+        mv "$work/next" "$work/secrets" || return 1
+    done <<< "$ids"
+    _state_write_atomic "$work/secrets" "$runtime_output"
+)
+
+_state_warn_missing_passwords() {
+    local config_file="$1" issues_json="$2" names
+    names=$(jq -r --argjson issues "$issues_json" \
+        '[.nodes[] | . as $node |
+          select(any($issues[]; .reason=="missing_secret" and .node_id==$node.id)) |
+          .name] | unique | join(", ")' "$config_file") || return 1
+    [[ -n "$names" ]] || return 0
+    warn "Конфигурация неполна: пароль SSH недоступен для нод: ${names}."
 }
 
 node_secret_set() {
     local node_id="${1:-}" plaintext="${2:-}"
     [[ -n "$node_id" && -n "$plaintext" ]] || return 1
+    _state_secret_tools_available || return 1
+    umask 077
     _state_ensure_dirs || return 1
     _state_ensure_secrets || return 1
+    _state_secrets_container_valid "$SECRETS_JSON" || return 1
     local encoded tmp secret_id="node:${node_id}:ssh-password"
     encoded=$(_state_secret_encode "$plaintext") || return 1
     [[ -n "$encoded" ]] || return 1
@@ -527,18 +689,23 @@ node_secret_delete() {
 state_checkpoint() {
     [[ -f "$CONFIG_JSON" ]] || return 1
     _state_ensure_dirs || return 1
-    _state_ensure_secrets || return 1
-    local tmp existing minimum script_password_hash=""
+    local tmp existing minimum password_issues script_password_hash=""
+    password_issues=$(_state_password_issues "$CONFIG_JSON" "$SECRETS_JSON") || return 1
+    umask 077
     tmp="${STATE_MANIFEST}.tmp.$$"
     existing='{}'
-    [[ -f "$STATE_MANIFEST" ]] && existing=$(jq -c . "$STATE_MANIFEST" 2>/dev/null || printf '%s' '{}')
+    if [[ -f "$STATE_MANIFEST" ]]; then
+        existing=$(jq -ce 'select(type=="object")' "$STATE_MANIFEST") || return 1
+    fi
     minimum=$(jq -r '.minimum_remote_control_version // empty' <<< "$existing" 2>/dev/null || true)
     [[ -n "$minimum" ]] || minimum="${CURRENT_VERSION:-0.0.0}"
     [[ -s "${SCRIPT_AUTH_FILE:-}" ]] &&
         script_password_hash=$(tr -d '\r\n' < "$SCRIPT_AUTH_FILE")
     if ! jq -n --argjson old "$existing" --arg min "$minimum" \
-        --arg password_hash "$script_password_hash" \
-        '{schema_version:2,minimum_remote_control_version:$min,portability:($old.portability // {status:"ready",issues:[]}),access:{script_password_hash:(if $password_hash=="" then null else $password_hash end)},templates:($old.templates // {})}' > "$tmp"; then
+        --arg password_hash "$script_password_hash" --argjson passwords "$password_issues" \
+        '([$old.portability.issues[]? | select(.reason!="missing_secret")] + $passwords |
+          unique | sort_by([.node_id,.reason])) as $issues |
+         {schema_version:2,minimum_remote_control_version:$min,portability:{status:(if ($issues|length)>0 then "needs_setup" else "ready" end),issues:$issues},access:{script_password_hash:(if $password_hash=="" then null else $password_hash end)},templates:($old.templates // {})}' > "$tmp"; then
         rm -f "$tmp"
         return 1
     fi
@@ -603,7 +770,7 @@ state_action() {
     "$function" "$@"
     local rc=$?
     if [[ "$CONFIG_SOURCE" == "local" && $rc -eq 0 ]]; then
-        state_checkpoint >/dev/null 2>&1 || true
+        state_checkpoint >/dev/null || return 1
     fi
     return "$rc"
 }

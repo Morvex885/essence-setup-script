@@ -133,7 +133,7 @@ _sync_all_connections() {
 
     for nname in "${nodes[@]}"; do
         if ! node_load_by_name "$nname"; then
-            warn "$nname: не найдена, пропуск"
+            warn "Не удалось загрузить ноду '${nname}'."
             fail=$((fail + 1))
             continue
         fi
@@ -194,7 +194,7 @@ _show_connections_overview() {
 }
 
 _configure_node_connections() {
-    node_load "$1"
+    node_load "$1" || return 1
     local nname="$NODE_NAME"
 
     # Один SSH — discover
@@ -365,7 +365,7 @@ _rename_connections() {
         return
     fi
 
-    node_load "$NODE_IDX"
+    node_load "$NODE_IDX" || return 1
     local nname="$NODE_NAME"
 
     info "Подключаюсь к $nname..."

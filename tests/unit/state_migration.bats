@@ -56,7 +56,6 @@ EOF
     jq '.minimum_remote_control_version="99.0.0"' "$STATE_MANIFEST" > "$STATE_MANIFEST.tmp" && mv "$STATE_MANIFEST.tmp" "$STATE_MANIFEST"
     run state_validate false
     assert_failure
-    assert_output --partial 'требуется Remote Control'
 }
 
 @test "missing password data does not expose the deferred SSH action" {

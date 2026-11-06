@@ -171,3 +171,51 @@ _prepare_connection_sync_test() {
     ' "$CONFIG_JSON"
     assert_success
 }
+
+_prepare_unavailable_connection_node() {
+    override_pass_key
+    load_fixture_config
+    node_load 1
+    node_secret_delete "$(jq_r '.nodes[1].id')"
+    cp "$CONFIG_JSON" "$BATS_TEST_TMPDIR/config.before"
+    _discover_connections() {
+        touch "$BATS_TEST_TMPDIR/discovery"
+        printf '%s\n' vless-reality
+    }
+    ssh_run() { touch "$BATS_TEST_TMPDIR/ssh-calls.log"; return 1; }
+}
+
+@test "_configure_node_connections: unavailable password never discovers or mutates previous node" {
+    _prepare_unavailable_connection_node
+    local previous="$NODE_NAME" rc=0
+    _configure_node_connections 2 || rc=$?
+    [[ "$rc" == 1 ]]
+    [[ "$NODE_NAME" == "$previous" ]]
+    [[ ! -e "$BATS_TEST_TMPDIR/discovery" && ! -e "$BATS_TEST_TMPDIR/ssh-calls.log" ]]
+    cmp "$CONFIG_JSON" "$BATS_TEST_TMPDIR/config.before"
+}
+
+@test "_rename_connections: unavailable password never discovers or mutates previous node" {
+    _prepare_unavailable_connection_node
+    local previous="$NODE_NAME" rc=0
+    _rename_connections <<< "2" || rc=$?
+    [[ "$rc" == 1 ]]
+    [[ "$NODE_NAME" == "$previous" ]]
+    [[ ! -e "$BATS_TEST_TMPDIR/discovery" && ! -e "$BATS_TEST_TMPDIR/ssh-calls.log" ]]
+    cmp "$CONFIG_JSON" "$BATS_TEST_TMPDIR/config.before"
+}
+
+@test "_sync_all_connections: unavailable password skips discovery while valid node proceeds" {
+    _prepare_unavailable_connection_node
+    local missing_before
+    missing_before=$(jq -c '[.connections[] | select(.node=="ru-vps")]' "$CONFIG_JSON")
+    _discover_connections() {
+        printf '%s\n' "$NODE_NAME" >> "$BATS_TEST_TMPDIR/discovered-nodes"
+        printf '%s\n' vless-reality
+    }
+    run _sync_all_connections
+    assert_failure
+    [[ "$(cat "$BATS_TEST_TMPDIR/discovered-nodes")" == de-vps ]]
+    [[ "$(jq -c '[.connections[] | select(.node=="ru-vps")]' "$CONFIG_JSON")" == "$missing_before" ]]
+    [[ ! -e "$BATS_TEST_TMPDIR/ssh-calls.log" ]]
+}

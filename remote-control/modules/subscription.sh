@@ -25,7 +25,7 @@ _sub_load_host() {
     host_node=$(jq_r '.subscription_host.node // empty')
     [[ -z "$host_node" ]] && { warn "Хост-нода подписок не задана. Используйте пункт «Выбрать хост-ноду»."; return 1; }
     _sub_save_ssh_ctx
-    node_load_by_name "$host_node" || { _sub_restore_ssh_ctx; warn "Нода '$host_node' не найдена."; return 1; }
+    node_load_by_name "$host_node" || { _sub_restore_ssh_ctx; warn "Не удалось загрузить ноду '${host_node}'."; return 1; }
 
     if ! ssh_run -- "test -f /etc/mihomo/subscription.conf" 2>/dev/null; then
         _sub_restore_ssh_ctx
