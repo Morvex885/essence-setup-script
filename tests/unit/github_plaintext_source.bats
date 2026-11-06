@@ -909,6 +909,35 @@ EOF
     [[ "$output" != *"Доступ запрещён."* ]] || return 1
     [[ "$(cat "$config_dir/.auth")" == "$rounds_hash" ]] || return 1
 }
+@test "format recovery requires the script password and keeps its hash on replace" {
+    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    run bash -c 'printf "i\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    run bash -c 'printf "l\n1\nsecret-pass\nsecret-pass\n0\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    local config_dir="$HOME/.config/remote-control-essence" updater="$BATS_TEST_TMPDIR/v1-auth" head
+    git clone "$REMOTE" "$updater" >/dev/null 2>&1 || return 1
+    git -C "$updater" config user.name fixture
+    git -C "$updater" config user.email fixture@example.invalid
+    jq '.vault_version=1' "$updater/manifest.json" > "$updater/manifest.next" &&
+        mv "$updater/manifest.next" "$updater/manifest.json" || return 1
+    git -C "$updater" commit -am vault-v1 >/dev/null || return 1
+    git -C "$updater" push origin main >/dev/null 2>&1 || return 1
+    head=$(git --git-dir="$REMOTE" rev-parse main)
+
+    run bash -c 'printf "wrong\nwrong\nwrong\n2\ny\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_failure
+    [[ "$output" != *"Заменить GitHub"* ]] || return 1
+    [[ "$(git --git-dir="$REMOTE" rev-parse main)" == "$head" ]] || return 1
+
+    run bash -c 'printf "secret-pass\n2\ny\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    [[ "$(git --git-dir="$REMOTE" rev-parse main)" != "$head" ]] || return 1
+    [[ -s "$config_dir/.auth" ]] || return 1
+    [[ "$(git --git-dir="$REMOTE" show main:manifest.json | jq -r '.access.script_password_hash')" == \
+        "$(cat "$config_dir/.auth")" ]]
+}
 @test "existing plaintext vault can load remote without changing local files" {
     _prepare_existing_plaintext_vault
     _publish_plain_marker remote
@@ -1655,6 +1684,33 @@ EOF
     [[ ! -e "$config_dir/account-switch" ]] || return 1
     grep -q '^alternate-owner repo view alternate-owner/' "$GH_SCOPE_CALLS_FILE"
     _assert_no_global_auth_mutation
+}
+
+@test "C to a repository with an old snapshot format aborts without changes" {
+    _prepare_alternate_remote
+    run bash -c 'printf "2\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    local config_dir="$HOME/.config/remote-control-essence" a_head b_head seed="$BATS_TEST_TMPDIR/v1-alternate"
+    local source_hash
+    git clone "$REMOTE" "$seed" >/dev/null 2>&1 || return 1
+    git -C "$seed" config user.name seed
+    git -C "$seed" config user.email seed@example.invalid
+    jq '.vault_version=1' "$seed/manifest.json" > "$seed/manifest.next" &&
+        mv "$seed/manifest.next" "$seed/manifest.json" || return 1
+    git -C "$seed" commit -am vault-v1 >/dev/null || return 1
+    git -C "$seed" push --force "$ALTERNATE_REMOTE" HEAD:main >/dev/null 2>&1 || return 1
+    a_head=$(git --git-dir="$REMOTE" rev-parse main)
+    b_head=$(git --git-dir="$ALTERNATE_REMOTE" rev-parse main)
+    source_hash=$(_hash_file "$config_dir/source.json")
+
+    run bash -c 'printf "i\nC\n2\nalternate-owner\ny\n0\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    assert_output --partial "Смена аккаунта прервана."
+    assert_output --partial "Отключите синхронизацию (e)"
+    [[ "$(_hash_file "$config_dir/source.json")" == "$source_hash" ]] || return 1
+    [[ "$(git --git-dir="$REMOTE" rev-parse main)" == "$a_head" ]] || return 1
+    [[ "$(git --git-dir="$ALTERNATE_REMOTE" rev-parse main)" == "$b_head" ]] || return 1
+    [[ ! -e "$config_dir/account-switch/transaction.json" ]]
 }
 
 @test "c cancellation and failed B authorization preserve A source cache and remotes" {

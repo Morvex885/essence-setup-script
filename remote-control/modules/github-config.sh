@@ -2080,10 +2080,9 @@ github_config_open() {
                 "Зашифрованная конфигурация GitHub не содержит recipient."
             return 1
         fi
-        if [[ -z ${GITHUB_RECIPIENT:-} ]]; then
-            GITHUB_RECIPIENT=$(tr -d '\r\n' < "$root/recipient.txt")
-            export GITHUB_RECIPIENT
-        fi
+        # The opened repository owns the encryption recipient; never keep a stale one.
+        GITHUB_RECIPIENT=$(tr -d '\r\n' < "$root/recipient.txt")
+        export GITHUB_RECIPIENT
         if ! github_config_unlock; then
             _github_remove_private_path "$raw"
             return 1

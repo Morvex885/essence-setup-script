@@ -465,7 +465,8 @@ _config_source_local_snapshot() {
     TEMPLATES_DIR="$CONFIG_DIR/templates"; SSH_IDENTITIES_DIR="$CONFIG_DIR/ssh/identities"
     SSH_KNOWN_HOSTS="$CONFIG_DIR/ssh/known_hosts"; SCRIPT_AUTH_FILE="$CONFIG_DIR/.auth"
     if ! _state_ensure_dirs || ! state_format_migrate || ! _state_ensure_secrets ||
-       ! state_validate false >/dev/null 2>&1 || ! _github_initial_portable_onboarding ||
+       ! state_checkpoint || ! state_validate false >/dev/null 2>&1 ||
+       ! _github_initial_portable_onboarding ||
        ! github_config_serialize "$out" "$CONFIG_JSON"; then
         rc=1
     fi
@@ -1623,6 +1624,7 @@ if ! first_run_source_menu; then
         _github_report_last_error "Не удалось подключить GitHub"
     exit 1
 fi
+startup_password_checked=false
 while ! config_source_startup; do
     if [[ "$CONFIG_SOURCE" == github || -n "${GITHUB_LAST_STAGE:-}" ]]; then
         _github_report_last_error "Не удалось открыть источник GitHub"
@@ -1630,12 +1632,15 @@ while ! config_source_startup; do
         warn "Не удалось открыть источник конфигурации."
     fi
     if [[ "$CONFIG_SOURCE" == github && -n "${GITHUB_LAST_FORMAT:-}" ]]; then
+        # Recovery actions publish to GitHub: authenticate before offering them.
+        check_script_password || exit 1
+        startup_password_checked=true
         github_format_recovery_menu && break
         exit 1
     fi
     startup_recovery_menu "Восстановление источника конфигурации" true || exit 1
 done
-if ! check_script_password; then
+if [[ "$startup_password_checked" != true ]] && ! check_script_password; then
     exit 1
 fi
 menu_nodes

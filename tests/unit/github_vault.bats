@@ -584,6 +584,46 @@ EOF
     [[ -z "$temp_found" ]]
 }
 
+@test "age open takes the recipient from the opened repository, not a stale session" {
+    export GITHUB_WORKTREE="$CONFIG_DIR/worktree" GITHUB_STORAGE_MODE=age
+    mkdir -p "$GITHUB_WORKTREE" || return 1
+    git -C "$GITHUB_WORKTREE" init >/dev/null || return 1
+    printf '{"storage_version":1,"encryption":"age"}\n' > "$GITHUB_WORKTREE/storage.json"
+    printf 'age1repositoryrecipient\r\n' > "$GITHUB_WORKTREE/recipient.txt"
+    printf 'wrapped\n' > "$GITHUB_WORKTREE/unlock.age"
+    printf 'ciphertext\n' > "$GITHUB_WORKTREE/state.json.age"
+    git -C "$GITHUB_WORKTREE" add . >/dev/null || return 1
+    export AGE_STATE_FIXTURE="$CONFIG_DIR/plain-state.json"
+    _write_valid_logical_state "$AGE_STATE_FIXTURE" || return 1
+    cat > "$BATS_TEST_TMPDIR/age-keygen" <<'EOF'
+#!/bin/bash
+printf 'age1identityrecipient\n'
+EOF
+    cat > "$BATS_TEST_TMPDIR/age" <<'EOF'
+#!/bin/bash
+out="" in=""
+while (($#)); do
+    case "$1" in
+        -o) out="$2"; shift 2 ;;
+        -i) shift 2 ;;
+        -d) shift ;;
+        *) in="$1"; shift ;;
+    esac
+done
+case "$in" in
+    *state.json.age) cp "$AGE_STATE_FIXTURE" "$out" ;;
+    *) printf 'identity\n' > "$out" ;;
+esac
+EOF
+    chmod +x "$BATS_TEST_TMPDIR/age" "$BATS_TEST_TMPDIR/age-keygen"
+    export AGE_BIN="$BATS_TEST_TMPDIR/age" AGE_KEYGEN_BIN="$BATS_TEST_TMPDIR/age-keygen"
+    printf 'AGE-SECRET-KEY-FIXTURE\n' > "$CONFIG_DIR/identity"
+    GITHUB_IDENTITY="$CONFIG_DIR/identity" GITHUB_RECIPIENT=age1stalerecipient
+    github_config_open "$GITHUB_WORKTREE" "$CONFIG_DIR/opened.json" </dev/null || return 1
+    [[ "$GITHUB_RECIPIENT" == age1repositoryrecipient ]] || return 1
+    jq -e '.vault_version==2' "$CONFIG_DIR/opened.json"
+}
+
 @test "age partial rewrap preserves old unlock ciphertext and mode" {
     export GITHUB_WORKTREE="$CONFIG_DIR/worktree" GITHUB_STORAGE_MODE=age
     mkdir -p "$GITHUB_WORKTREE" || return 1
