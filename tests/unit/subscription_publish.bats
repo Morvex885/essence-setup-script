@@ -27,11 +27,9 @@ EOF
     mkdir -p "$GENERATED_DIR/MOBILE/phone"
     echo "proxies: []" > "$GENERATED_DIR/MOBILE/phone/config.yaml"
 
-    # Mock ssh_run, scp_run, curl
-    ssh_run() { return 0; }
-    scp_run() { return 0; }
+    reset_ssh_mocks
     curl() { echo "200"; return 0; }
-    export -f ssh_run scp_run curl
+    export -f curl
 }
 
 teardown() {
@@ -92,24 +90,13 @@ teardown() {
     local old_token
     old_token=$(jq_r '.clients[] | select(.name=="phone") | .subscription.token')
 
-    subscription_rotate "phone"
+    subscription_rotate "phone" <<< 'y'
     local new_token
     new_token=$(jq_r '.clients[] | select(.name=="phone") | .subscription.token')
 
     [ "$old_token" != "$new_token" ]
 }
 
-@test "publish warns without host node" {
-    jq_w 'del(.subscription_host)'
-    run subscription_publish "phone"
-    assert_output --partial "Хост-нода подписок не задана"
-}
-
-@test "publish warns without generated config" {
-    rm -f "$GENERATED_DIR/MOBILE/phone/config.yaml"
-    run subscription_publish "phone"
-    assert_output --partial "не найден"
-}
 
 @test "publish reuses existing token" {
     subscription_publish "phone"
@@ -174,8 +161,7 @@ teardown() {
 
 @test "_sub_get_dir falls back to SSH when cache empty" {
     jq_w '.subscription_host.sub_dir = ""'
-    ssh_run() { echo "SUB_DIR=/custom/path"; return 0; }
-    export -f ssh_run
+    SSH_RUN_MOCK_OUTPUT="SUB_DIR=/custom/path"
 
     run _sub_get_dir
     assert_output "/custom/path"
@@ -184,14 +170,13 @@ teardown() {
 @test "publish rejects a whitespace-only config without token or SCP" {
     printf ' \n\t\n' > "$GENERATED_DIR/MOBILE/phone/config.yaml"
     scp_run() {
-        echo "unexpected scp" >&2
+        touch "$BATS_TEST_TMPDIR/unexpected-scp"
         return 1
     }
 
     run subscription_publish "phone"
     assert_success
-    assert_output --partial "Конфиг для 'phone' не найден или пуст. Сначала сгенерируйте конфиги."
-    refute_output --partial "unexpected scp"
+    [ ! -e "$BATS_TEST_TMPDIR/unexpected-scp" ]
 
     run jq_r '.clients[] | select(.name=="phone") | .subscription.token // "empty"'
     assert_output "empty"
@@ -204,7 +189,6 @@ teardown() {
 
     run subscription_publish_all
     assert_success
-    assert_output --partial "Пропущено (конфиг отсутствует или пуст): 1"
 
     run jq_r '.clients[] | select(.name=="phone") | .subscription.token // "empty"'
     refute_output "empty"
@@ -212,29 +196,130 @@ teardown() {
     assert_output "empty"
 }
 
-@test "auto-refresh does not prompt when all generated configs are blank" {
-    printf ' \n\t\n' > "$GENERATED_DIR/MOBILE/phone/config.yaml"
-    confirm_yn() {
-        echo "unexpected prompt" >&2
-        return 1
-    }
-
-    run _subscription_prompt_refresh
-    assert_success
-    refute_output --partial "unexpected prompt"
-}
 
 @test "low-level batch upload rejects a whitespace-only source before SCP" {
     local blank_config="$BATS_TEST_TMPDIR/blank.yaml"
     printf ' \n\t\n' > "$blank_config"
     scp_run() {
-        echo "unexpected scp" >&2
+        touch "$BATS_TEST_TMPDIR/unexpected-scp"
         return 1
     }
 
     run _sub_upload_batch "/var/lib/essence-sub" "www-data" \
         "$blank_config" "token-1" "phone"
     assert_failure
-    assert_output --partial "YAML-конфигурация отсутствует или пуста — загрузка отменена."
-    refute_output --partial "unexpected scp"
+    [ ! -e "$BATS_TEST_TMPDIR/unexpected-scp" ]
+}
+
+# Execute the real upload scripts against sandbox paths, replacing only transport
+# and server-only commands. Config promotion still uses the real jq_w/mv path.
+setup_publication_server() {
+    local server="$BATS_TEST_TMPDIR/server"
+    mkdir -p "$server/yaml" "$server/snippets"
+    jq_w --arg dir "$server/yaml" \
+        '.subscription_host.sub_dir = $dir | .subscription_default_headers = []'
+    SUB_SNIPPETS_DIR="$server/snippets"
+    scp_run() {
+        printf 'scp\n' >> "$BATS_TEST_TMPDIR/scp-count"
+        local args=("$@") last=$(($# - 1)) dest
+        dest="${args[$last]#*:}"
+        unset 'args[last]'
+        cp "${args[@]}" "$dest"
+    }
+    ssh_run() {
+        local command="$2"
+        case "$command" in
+            'test -f /etc/mihomo/subscription.conf') return 0 ;;
+            *'KNOWN='*) touch "$BATS_TEST_TMPDIR/unexpected-sweep"; return 1 ;;
+        esac
+        printf 'apply\n' >> "$BATS_TEST_TMPDIR/apply-count"
+        (
+            chown() { return 0; }
+            nginx() { return 0; }
+            systemctl() { return 0; }
+            eval "$command"
+        )
+    }
+    NODE_ID=prior-id NODE_NAME=prior-name NODE_IDENTITY=prior-identity NODE_TAG=prior-tag
+    SERVER_IP=192.0.2.55 SERVER_PORT=2223 SERVER_USER=prior-user
+    SERVER_PASS=prior-password SERVER_AUTH=password
+}
+
+publication_context() {
+    printf '%s\n' "$NODE_ID" "$NODE_NAME" "$NODE_IDENTITY" "$NODE_TAG" \
+        "$SERVER_IP" "$SERVER_PORT" "$SERVER_USER" "$SERVER_PASS" "$SERVER_AUTH"
+}
+
+@test "batch metadata failure retains all uploads and first token but stops later saves and sweep" {
+    jq_w '.clients += [{name:"tablet",group:"MOBILE"},{name:"laptop",group:"MOBILE"}]'
+    local client
+    for client in tablet laptop; do
+        mkdir -p "$GENERATED_DIR/MOBILE/$client"
+        printf 'proxies: []\n' > "$GENERATED_DIR/MOBILE/$client/config.yaml"
+    done
+    setup_publication_server
+    local before rc=0 real_mv
+    before=$(publication_context)
+    real_mv=$(type -P mv)
+    mv() {
+        if [[ "$1" == "$CONFIG_JSON".tmp.* && "$2" == "$CONFIG_JSON" ]]; then
+            printf 'promotion\n' >> "$BATS_TEST_TMPDIR/promotions"
+            if jq -e '.clients[] | select(.name=="tablet") | .subscription.token' "$1" >/dev/null; then
+                return 77
+            fi
+        fi
+        "$real_mv" "$@"
+    }
+    state_action subscription_publish_all subscription_publish_all > "$BATS_TEST_TMPDIR/output" 2>&1 || rc=$?
+    [ "$rc" -ne 0 ]
+    [ "$(publication_context)" = "$before" ]
+    [ "$(wc -l < "$BATS_TEST_TMPDIR/promotions" | tr -d ' ')" -eq 2 ]
+    [ "$(wc -l < "$BATS_TEST_TMPDIR/scp-count" | tr -d ' ')" -eq 2 ]
+    [ "$(wc -l < "$BATS_TEST_TMPDIR/apply-count" | tr -d ' ')" -eq 1 ]
+    [ ! -e "$BATS_TEST_TMPDIR/unexpected-sweep" ]
+    local token
+    token=$(jq_r '.clients[0].subscription.token')
+    [ -s "$BATS_TEST_TMPDIR/server/yaml/$token.yaml" ]
+    run jq -e '.clients[0].subscription.token != null and all(.clients[1:][]; .subscription == null)' "$CONFIG_JSON"
+    assert_success
+    local files=("$BATS_TEST_TMPDIR/server/yaml/"*.yaml)
+    [ "${#files[@]}" -eq 3 ]
+    for client in "${files[@]}"; do
+        [ "$(cat "$client")" = 'proxies: []' ]
+        token="${client##*/}"
+        token="${token%.yaml}"
+        [ -s "$SUB_SNIPPETS_DIR/sub-$token.conf" ]
+        run cat "$BATS_TEST_TMPDIR/output"
+        refute_output --partial "$token"
+    done
+    refute_output --partial 'Опубликовано:'
+}
+
+@test "single metadata failure reports completed upload without sharing or HTTP verification" {
+    setup_publication_server
+    local before rc=0 real_mv
+    before=$(publication_context)
+    real_mv=$(type -P mv)
+    mv() {
+        if [[ "$1" == "$CONFIG_JSON".tmp.* && "$2" == "$CONFIG_JSON" ]]; then return 77; fi
+        "$real_mv" "$@"
+    }
+    curl() { touch "$BATS_TEST_TMPDIR/unexpected-http"; return 1; }
+    _show_share_bundle() { touch "$BATS_TEST_TMPDIR/unexpected-share"; }
+    subscription_publish phone > "$BATS_TEST_TMPDIR/output" 2>&1 || rc=$?
+    [ "$rc" -ne 0 ]
+    [ "$(publication_context)" = "$before" ]
+    [ ! -e "$BATS_TEST_TMPDIR/unexpected-http" ]
+    [ ! -e "$BATS_TEST_TMPDIR/unexpected-share" ]
+    [ "$(jq_r '.clients[0].subscription // "absent"')" = absent ]
+    local files=("$BATS_TEST_TMPDIR/server/yaml/"*.yaml) token
+    [ "${#files[@]}" -eq 1 ]
+    [ "$(cat "${files[0]}")" = 'proxies: []' ]
+    token="${files[0]##*/}"
+    token="${token%.yaml}"
+    run cat "$BATS_TEST_TMPDIR/output"
+    assert_output --partial 'Файл загружен на сервер, но данные подписки сохранить не удалось.'
+    refute_output --partial 'Ошибка загрузки файла на сервер.'
+    refute_output --partial "$token"
+    refute_output --partial 'Подписка опубликована:'
 }

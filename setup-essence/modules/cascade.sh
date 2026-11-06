@@ -7,32 +7,41 @@ cascade_menu() {
     while true; do
         echo ""
         box_top
-        box_center "Cascade / Цепочка"
+        box_center "Каскады"
         box_mid
 
-        local cascades=() line c block srv srv_port status_mark shared_lbl _sl _sl_port _info
+        local cascades=() line c block srv srv_port _sl _sl_port _sl_label _info
         while IFS= read -r line; do
             cascades+=("$line")
         done < <(grep '^# --- cascade:' /etc/mihomo/config.yaml 2>/dev/null | sed 's/# --- cascade://;s/ ---//')
         if [[ ${#cascades[@]} -gt 0 ]]; then
             for c in "${cascades[@]}"; do
                 block=$(sed -n "/^# --- cascade:${c} ---/,/^# --- \/cascade:${c} ---/p" /etc/mihomo/config.yaml)
-                srv=$(printf '%s\n' "$block" | grep '    server:' | head -1 | awk '{print $2}')
-                srv_port=$(printf '%s\n' "$block" | grep '    port:' | head -1 | awk '{print $2}')
-                _sl=$(printf '%s\n' "$block" | grep '^# shared-listener:' | awk '{print $3}')
-                shared_lbl=""
-                if [[ -n "$_sl" ]]; then
-                    _sl_port=$(awk '/# --- '"$_sl"' ---/{f=1} f && /port:/{print $2; exit}' /etc/mihomo/config.yaml)
-                    shared_lbl="$_sl :${_sl_port}"
-                fi
-                if [[ -n "$srv" ]] && timeout 3 bash -c "echo >/dev/tcp/${srv}/${srv_port}" 2>/dev/null; then
-                    status_mark="✓"
+                if [[ "$block" == *"# type: iptables-dnat"* ]]; then
+                    srv=$(printf '%s\n' "$block" | awk '/^# remote:/{print $3; exit}')
+                    srv_port=$(printf '%s\n' "$block" | awk '/^# remote-port:/{print $3; exit}')
+                    _sl_port=$(printf '%s\n' "$block" | awk '/^# local-port:/{print $3; exit}')
+                    _sl="DNAT"
+                    _info=" ${c}: DNAT :${_sl_port} → ${srv}:${srv_port}"
                 else
-                    status_mark="✗"
+                    srv=$(printf '%s\n' "$block" | awk '/    server:/{print $2; exit}')
+                    srv_port=$(printf '%s\n' "$block" | awk '/    port:/{print $2; exit}')
+                    _sl=$(printf '%s\n' "$block" | awk '/^# shared-listener:/{print $3; exit}')
+                    _sl_port=$(awk '/# --- '"$_sl"' ---/{f=1} f && /port:/{print $2; exit}' /etc/mihomo/config.yaml)
+                    case "$_sl" in
+                        hy2) _sl_label="Hysteria2" ;;
+                        vless-tcp) _sl_label="VLESS TCP" ;;
+                        vless-xhttp) _sl_label="VLESS xHTTP" ;;
+                        vless-grpc) _sl_label="VLESS gRPC" ;;
+                        *) _sl_label="$_sl" ;;
+                    esac
+                    _info=" ${c}: ${_sl_label}:${_sl_port} → ${srv}:${srv_port}"
                 fi
-                _info=" ${c} → ${srv}:${srv_port}"
-                [[ -n "$shared_lbl" ]] && _info+=" (${shared_lbl})"
-                box_line "$_info  $status_mark" " ${GREEN}${c}${NC} ${DIM}→ ${srv}:${srv_port}${NC}${shared_lbl:+  ${DIM}(${shared_lbl})${NC}}  ${status_mark}"
+                if [[ -n "$srv" && -n "$srv_port" && -n "$_sl" && -n "$_sl_port" ]]; then
+                    box_line "$_info"
+                else
+                    box_line " ${c}: неполная конфигурация" " ${YELLOW}${c}: неполная конфигурация${NC}"
+                fi
             done
         else
             box_line " Нет каскадов" " ${DIM}Нет каскадов${NC}"
@@ -49,8 +58,18 @@ cascade_menu() {
         fi
         CASCADE_CHOICE="${CASCADE_CHOICE%$'\r'}"
         case "$CASCADE_CHOICE" in
-            1) install_cascade ;;
-            2) remove_cascade_interactive ;;
+            1)
+                install_cascade || {
+                    [[ "${CASCADE_CANCELLED:-false}" == true ]] ||
+                        warn "Настройка каскада завершилась ошибкой. Повторите действие из меню."
+                }
+                ;;
+            2)
+                remove_cascade_interactive || {
+                    [[ "${CASCADE_CANCELLED:-false}" == true ]] ||
+                        warn "Удаление каскада завершилось ошибкой. Повторите действие из меню."
+                }
+                ;;
             0) return 0 ;;
             *) warn "Неверный выбор." ;;
         esac
@@ -58,24 +77,24 @@ cascade_menu() {
 }
 
 install_cascade() {
+    CASCADE_CANCELLED=false
     echo ""
 
     if [[ ! -f /etc/mihomo/config.yaml ]]; then
-        warn "Mihomo не установлен. Сначала выполните установку."
-        return
+        warn "Mihomo не установлен. Сначала выберите «b) Базовая установка»."
+        return 1
     fi
 
-    read -rp "Имя каскада: " CASCADE_NAME
-    [[ -z "$CASCADE_NAME" ]] && { warn "Имя не указано"; return; }
+    IFS= read -rp "  Имя каскада: " CASCADE_NAME || { CASCADE_CANCELLED=true; return 1; }
+    CASCADE_NAME="${CASCADE_NAME%$'\r'}"
+    [[ -z "$CASCADE_NAME" ]] && { warn "Имя не указано"; return 1; }
     if ! [[ "$CASCADE_NAME" =~ ^[a-zA-Z0-9._-]+$ ]]; then
         warn "Имя может содержать только буквы, цифры, точку, - и _"
-        return
+        return 1
     fi
 
     if grep -q "^# --- cascade:${CASCADE_NAME} ---" /etc/mihomo/config.yaml; then
-        warn "Каскад '$CASCADE_NAME' уже существует."
-        confirm_yn "Перенастроить?" || { info "Отменено."; return; }
-        _remove_cascade "$CASCADE_NAME"
+        warn "Каскад «$CASCADE_NAME» уже существует — после ввода параметров он будет заменён."
     fi
 
     _install_proxy_cascade "$CASCADE_NAME"
@@ -91,7 +110,7 @@ _show_current_listeners() {
     listeners=$(awk '/^  - name:/{name=$3; gsub(/"/, "", name)} /^    port:/{print name, $2}' /etc/mihomo/config.yaml)
     if [[ -n "$listeners" ]]; then
         echo ""
-        echo -e "  ${DIM}Текущие listener'ы:${NC}"
+        echo -e "  ${DIM}Текущие входные подключения:${NC}"
         while read -r lname lport; do
             echo -e "    ${DIM}:${lport}  ${lname}${NC}"
         done <<< "$listeners"
@@ -103,20 +122,36 @@ _install_dnat_cascade() {
 
     echo ""
     echo -e "  ${CYAN}iptables DNAT — прозрачный проброс пакетов${NC}"
-    echo -e "  ${DIM}Клиентский трафик уже зашифрован (Reality/HY2), дополнительное шифрование не нужно.${NC}"
+    echo -e "  ${DIM}Клиентский трафик уже зашифрован (Reality/Hysteria2), дополнительное шифрование не нужно.${NC}"
     echo ""
 
     local REMOTE_SERVER="" REMOTE_PORT="" EXIT_URI=""
 
-    echo -e "  ${GREEN}1)${NC} Вставить URI (vless://, hy2://)"
-    echo -e "  ${GREEN}2)${NC} Ввести вручную"
-    echo ""
-    read -rp "  Выберите [1]: " _input_mode
-    _input_mode="${_input_mode:-1}"
+    local _input_mode
+    while true; do
+        echo ""
+        box_top
+        box_center "Данные выходной ноды"
+        box_mid
+        menu_item 1 "Вставить URI (vless://, hy2://)" CYAN
+        menu_item 2 "Ввести вручную" CYAN
+        menu_item 0 "Отмена" NC
+        box_bot
+        echo ""
+        IFS= read -rp "  Выберите способ ввода [Enter = 1]: " _input_mode || return 1
+        _input_mode="${_input_mode%$'\r'}"
+        _input_mode="${_input_mode:-1}"
+        case "$_input_mode" in
+            1|2) break ;;
+            0) return 1 ;;
+            *) warn "Неверный выбор." ;;
+        esac
+    done
 
     case "$_input_mode" in
         1)
-            read -rp "URI exit-ноды: " EXIT_URI
+            IFS= read -rp "  URI выходной ноды: " EXIT_URI || return 1
+            EXIT_URI="${EXIT_URI%$'\r'}"
             if [[ -z "$EXIT_URI" ]]; then
                 warn "URI не указан"; return
             fi
@@ -130,12 +165,15 @@ _install_dnat_cascade() {
             info "Сервер: $REMOTE_SERVER, порт: $REMOTE_PORT"
             ;;
         2)
-            read -rp "IP или домен exit-ноды: " REMOTE_SERVER
+            IFS= read -rp "  IP или домен выходной ноды: " REMOTE_SERVER || return 1
+            REMOTE_SERVER="${REMOTE_SERVER%$'\r'}"
             [[ -z "$REMOTE_SERVER" ]] && { warn "Сервер не указан"; return; }
-            read -rp "Порт exit-ноды: " REMOTE_PORT
+            IFS= read -rp "  Порт выходной ноды: " REMOTE_PORT || return 1
+            REMOTE_PORT="${REMOTE_PORT%$'\r'}"
             [[ -z "$REMOTE_PORT" ]] && { warn "Порт не указан"; return; }
             echo ""
-            read -rp "URI exit-ноды (для клиентского конфига, Enter = пропустить): " EXIT_URI
+            IFS= read -rp "  URI выходной ноды [Enter = пропустить]: " EXIT_URI || return 1
+            EXIT_URI="${EXIT_URI%$'\r'}"
             ;;
         *)
             warn "Неверный выбор."; return ;;
@@ -147,11 +185,13 @@ _install_dnat_cascade() {
     echo -e "  ${DIM}Клиенты будут подключаться к этому серверу на этот порт.${NC}"
     echo -e "  ${DIM}Обычно совпадает с портом exit-ноды ($REMOTE_PORT).${NC}"
     echo -e "  ${DIM}Если $REMOTE_PORT уже занят — укажите свободный.${NC}"
-    read -rp "Порт для клиентов [Enter = $DEFAULT_PORT]: " LOCAL_PORT
+    IFS= read -rp "  Порт для клиентов [Enter = $DEFAULT_PORT]: " LOCAL_PORT || return 1
+    LOCAL_PORT="${LOCAL_PORT%$'\r'}"
     LOCAL_PORT="${LOCAL_PORT:-$DEFAULT_PORT}"
     while ! is_port_free "$LOCAL_PORT"; do
         warn "Порт $LOCAL_PORT занят."
-        read -rp "Другой порт: " LOCAL_PORT
+        IFS= read -rp "  Другой порт: " LOCAL_PORT || return 1
+        LOCAL_PORT="${LOCAL_PORT%$'\r'}"
         [[ -z "$LOCAL_PORT" ]] && { warn "Порт не указан"; return; }
     done
 
@@ -238,15 +278,11 @@ EOF
 _install_proxy_cascade() {
     local cname="$1"
 
-    # ── Exit-нода ────────────────────────────────────────────────────────────
-    echo ""
-    echo -e "  ${CYAN}Шаг 1/2: Данные exit-ноды${NC}"
-    echo ""
-    echo -e "  Способ ввода:"
-    echo -e "  ${GREEN}1)${NC} Вставить URI ссылку"
-    echo -e "  ${GREEN}2)${NC} Ввести вручную"
-    echo ""
-    read -rp "Выберите [1-2]: " INPUT_METHOD
+    menu_select "Данные выходной ноды" "Выберите способ ввода" "Вставить URI" "Ввести вручную" || {
+        CASCADE_CANCELLED=true
+        return 1
+    }
+    local INPUT_METHOD="$MENU_SELECT_INDEX"
 
     local exit_proxy_yaml=""
     case "$INPUT_METHOD" in
@@ -254,14 +290,12 @@ _install_proxy_cascade() {
             exit_proxy_yaml=$(_parse_proxy_uri "$cname")
             ;;
         2)
-            echo ""
-            echo -e "  Протокол exit-ноды:"
-            echo -e "  ${GREEN}1)${NC} VLESS TCP (Reality)"
-            echo -e "  ${GREEN}2)${NC} VLESS xHTTP"
-            echo -e "  ${GREEN}3)${NC} VLESS gRPC"
-            echo -e "  ${GREEN}4)${NC} Hysteria2"
-            echo ""
-            read -rp "Выберите [1-4]: " EXIT_PROTO
+            menu_select "Протокол выходной ноды" "Выберите протокол" \
+                "VLESS TCP (Reality)" "VLESS xHTTP" "VLESS gRPC" "Hysteria2" || {
+                CASCADE_CANCELLED=true
+                return 1
+            }
+            local EXIT_PROTO="$MENU_SELECT_INDEX"
             case "$EXIT_PROTO" in
                 1) exit_proxy_yaml=$(_ask_exit_vless_tcp "$cname") ;;
                 2) exit_proxy_yaml=$(_ask_exit_vless_xhttp "$cname") ;;
@@ -272,7 +306,7 @@ _install_proxy_cascade() {
             ;;
         *) warn "Неверный выбор."; return ;;
     esac
-    [[ -z "$exit_proxy_yaml" ]] && return
+    [[ -n "$exit_proxy_yaml" ]] || return 1
 
     # ── Входной протокол (выбор существующего листенера) ─────────────────────
     echo ""
@@ -299,24 +333,16 @@ _install_proxy_cascade() {
         _avail_markers+=("hy2"); _avail_labels+=("Hysteria2"); _avail_ports+=("$_lport")
     fi
 
-    if [[ ${#_avail_markers[@]} -eq 0 ]]; then
-        warn "Нет установленных протоколов. Сначала добавьте VLESS или Hysteria2."
-        return
-    fi
-
-    echo -e "  Каскад будет добавлен как пользователь в существующий listener."
-    echo -e "  Доступные listener'ы:"
-    local i
+    local _listener_labels=() i
     for i in "${!_avail_markers[@]}"; do
-        echo -e "  ${GREEN}$((i + 1)))${NC} ${_avail_labels[$i]} (:${_avail_ports[$i]})"
+        _listener_labels+=("${_avail_labels[$i]} (:${_avail_ports[$i]})")
     done
-    echo ""
-    read -rp "Выберите [1-${#_avail_markers[@]}]: " _listener_choice
-
-    if ! [[ "$_listener_choice" =~ ^[0-9]+$ ]] \
-       || (( _listener_choice < 1 || _listener_choice > ${#_avail_markers[@]} )); then
-        warn "Неверный выбор."; return
-    fi
+    MENU_SELECT_EMPTY="Нет установленных протоколов"
+    menu_select "Входной протокол каскада" "Выберите протокол" "${_listener_labels[@]}" || {
+        CASCADE_CANCELLED=true
+        return 1
+    }
+    local _listener_choice="$MENU_SELECT_INDEX"
 
     local _marker="${_avail_markers[$((_listener_choice - 1))]}"
     _attach_cascade_to_listener "$cname" "$_marker" "$exit_proxy_yaml"
@@ -396,10 +422,11 @@ _attach_cascade_to_listener() {
     # ── Генерация credentials ───────────────────────────────────────────────
     local CASCADE_UUID="" CASCADE_PASS=""
     if $is_vless; then
-        _load_cascade_reality || return
-        CASCADE_UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen | tr '[:upper:]' '[:lower:]')
+        _load_cascade_reality || return 1
+        CASCADE_UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen | tr '[:upper:]' '[:lower:]') || return 1
+        [[ -n "$CASCADE_UUID" ]] || return 1
     else
-        CASCADE_PASS=$(openssl rand -hex 16)
+        CASCADE_PASS=$(openssl rand -hex 16) && [[ -n "$CASCADE_PASS" ]] || return 1
     fi
 
     local SERVER_ADDR
@@ -413,11 +440,6 @@ _attach_cascade_to_listener() {
     case "$marker" in
         vless-tcp)
             proto_label="VLESS TCP"
-            echo ""
-            info "Каскад:   $cname ($proto_label :$client_port)"
-            info "UUID:     $CASCADE_UUID"
-            echo ""
-            confirm_yn "Всё верно?" || { info "Отменено."; return; }
             client_uri=$(_build_vless_tcp_uri "$CASCADE_UUID" "$SERVER_ADDR" "$client_port" \
                 "$SNI_DOMAIN" "$PUBLIC_KEY" "$SHORT_ID" "VLESS TCP ${cname}")
             client_yaml=$(_build_vless_tcp_client_yaml \
@@ -428,19 +450,13 @@ _attach_cascade_to_listener() {
             proto_label="VLESS xHTTP"
             local xhttp_path xhttp_sni xhttp_pubkey xhttp_sid
             _load_xhttp_cascade_client_settings /etc/mihomo/config.yaml "$SERVER_ADDR" || {
-                warn "Не удалось прочитать параметры xHTTP listener'а."
-                return
+                warn "Не удалось прочитать параметры входного подключения xHTTP."
+                return 1
             }
             xhttp_path="$XHTTP_CASCADE_PATH"
             xhttp_sni="$XHTTP_CASCADE_SNI"
             xhttp_pubkey="$XHTTP_CASCADE_PUBLIC_KEY"
             xhttp_sid="$XHTTP_CASCADE_SHORT_ID"
-            echo ""
-            info "Каскад:   $cname ($proto_label :$client_port)"
-            info "Path:     $xhttp_path"
-            info "UUID:     $CASCADE_UUID"
-            echo ""
-            confirm_yn "Всё верно?" || { info "Отменено."; return; }
             client_uri=$(_build_vless_xhttp_uri "$CASCADE_UUID" "$SERVER_ADDR" "$client_port" \
                 "$xhttp_sni" "$xhttp_path" "$xhttp_pubkey" "$xhttp_sid" "VLESS xHTTP ${cname}")
             client_yaml=$(_build_vless_xhttp_client_yaml \
@@ -452,12 +468,6 @@ _attach_cascade_to_listener() {
             local grpc_service
             grpc_service=$(sed -n "/^# --- vless-grpc ---/,/^# --- \/vless-grpc ---/p" /etc/mihomo/config.yaml \
                 | awk '/grpc-service-name:/{gsub(/"/, "", $2); print $2; exit}')
-            echo ""
-            info "Каскад:   $cname ($proto_label :$client_port)"
-            info "Service:  $grpc_service"
-            info "UUID:     $CASCADE_UUID"
-            echo ""
-            confirm_yn "Всё верно?" || { info "Отменено."; return; }
             client_uri=$(_build_vless_grpc_uri "$CASCADE_UUID" "$SERVER_ADDR" "$client_port" \
                 "$SNI_DOMAIN" "$grpc_service" "$PUBLIC_KEY" "$SHORT_ID" "VLESS gRPC ${cname}")
             client_yaml=$(_build_vless_grpc_client_yaml \
@@ -466,16 +476,37 @@ _attach_cascade_to_listener() {
             ;;
         hy2)
             proto_label="Hysteria2"
-            echo ""
-            info "Каскад:   $cname ($proto_label :$client_port)"
-            info "Пароль:   $CASCADE_PASS"
-            echo ""
-            confirm_yn "Всё верно?" || { info "Отменено."; return; }
             client_uri=$(_build_hy2_uri "$CASCADE_PASS" "$SERVER_ADDR" "$client_port")
             client_yaml=$(_build_hy2_client_yaml \
                 "Hysteria2 ${cname}" "$SERVER_ADDR" "$client_port" "$CASCADE_PASS")
             ;;
     esac
+    local exit_host exit_port replacing=false
+    exit_host=$(printf '%s\n' "$exit_proxy_yaml" | awk '/^[[:space:]]*server:/{print $2; exit}')
+    exit_port=$(printf '%s\n' "$exit_proxy_yaml" | awk '/^[[:space:]]*port:/{print $2; exit}')
+    local review_lines=("Каскад: $cname" "Вход: $proto_label, порт $client_port" "Выход: $exit_host:$exit_port")
+    if grep -Fqx "# --- cascade:${cname} ---" /etc/mihomo/config.yaml; then
+        replacing=true
+        review_lines+=("Существующий каскад «$cname» будет заменён." "Прежние данные подключения перестанут работать.")
+    fi
+    review_frame "Настройка каскада" "${review_lines[@]}"
+    local question="Всё верно?"
+    [[ "$replacing" == false ]] || question="Заменить каскад?"
+    confirm_yn "$question" N || {
+        CASCADE_CANCELLED=true
+        info "Отменено."
+        return 1
+    }
+    local _cascade_old_umask
+    _cascade_old_umask=$(umask)
+    umask 077
+    if [[ "$replacing" == true ]]; then
+        _remove_cascade "$cname" || {
+            umask "$_cascade_old_umask"
+            warn "Не удалось удалить прежний каскад."
+            return 1
+        }
+    fi
 
     # ── 1. Добавить user в листенер ──────────────────────────────────────────
     local user_block
@@ -613,14 +644,17 @@ EOF
 
     # ── 6. Перезапуск ────────────────────────────────────────────────────────
     info "Перезапускаю Mihomo..."
-    systemctl restart mihomo &>/dev/null
+    local _start_rc=0
+    systemctl restart mihomo &>/dev/null || _start_rc=$?
     sleep 3
 
-    if systemctl is-active --quiet mihomo; then
+    if [[ "$_start_rc" -eq 0 ]] && systemctl is-active --quiet mihomo; then
         success "Mihomo перезапущен"
     else
-        warn "Mihomo не запустился. Лог:"
-        journalctl -u mihomo -n 20 --no-pager
+        warn "Не удалось запустить Mihomo. Проверьте журнал и повторите действие из меню."
+        journalctl -u mihomo -n 20 --no-pager || true
+        umask "$_cascade_old_umask"
+        return 1
     fi
 
     echo ""
@@ -634,6 +668,8 @@ EOF
     echo -e "${DIM}"
     echo "$client_yaml"
     echo -e "${NC}"
+    umask "$_cascade_old_umask"
+    return 0
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -667,12 +703,12 @@ _remove_dnat_cascade() {
     local_port=$(echo "$block" | grep '^# local-port:' | awk '{print $3}')
 
     # Удаляем iptables правила
-    _remove_dnat_rules "$cname" "$remote" "$remote_port" "$local_port"
-    _persist_dnat_rules
+    _remove_dnat_rules "$cname" "$remote" "$remote_port" "$local_port" || return 1
+    _persist_dnat_rules || return 1
 
     # Удаляем маркер из config.yaml
-    sed "/^# --- cascade:${cname} ---/,/^# --- \/cascade:${cname} ---/d" /etc/mihomo/config.yaml > /tmp/mihomo_tmp.yaml
-    mv /tmp/mihomo_tmp.yaml /etc/mihomo/config.yaml
+    sed "/^# --- cascade:${cname} ---/,/^# --- \/cascade:${cname} ---/d" /etc/mihomo/config.yaml > /tmp/mihomo_tmp.yaml || return 1
+    mv /tmp/mihomo_tmp.yaml /etc/mihomo/config.yaml || return 1
 
     # Закрываем порт
     if [[ -n "$local_port" ]]; then
@@ -681,8 +717,11 @@ _remove_dnat_cascade() {
     fi
 
     # Удаляем из client-config.txt
-    sed "/^--- Cascade: ${cname} ---/,/^--- \/Cascade: ${cname} ---/d" /etc/mihomo/client-config.txt > /tmp/client_tmp.txt 2>/dev/null
-    mv /tmp/client_tmp.txt /etc/mihomo/client-config.txt 2>/dev/null || true
+    if [[ -f /etc/mihomo/client-config.txt ]]; then
+        sed "/^--- Cascade: ${cname} ---/,/^--- \/Cascade: ${cname} ---/d" /etc/mihomo/client-config.txt > /tmp/client_tmp.txt || return 1
+        mv /tmp/client_tmp.txt /etc/mihomo/client-config.txt || return 1
+    fi
+    return 0
 }
 
 _remove_proxy_cascade() {
@@ -696,18 +735,18 @@ _remove_proxy_cascade() {
     if [[ -n "$shared_marker" ]]; then
         # ── Новый формат: shared listener ────────────────────────────────────
         # a) Удалить cascade-user из листенера
-        sed -i "/^      # cascade-user:${cname}$/,/^      # \/cascade-user:${cname}$/d" /etc/mihomo/config.yaml
+        sed -i "/^      # cascade-user:${cname}$/,/^      # \/cascade-user:${cname}$/d" /etc/mihomo/config.yaml || return 1
 
         # b) Удалить IN-USER правило из sub-rules
         local subrule_name="${shared_marker}-shared"
-        sed -i "/- IN-USER,${cname},/d" /etc/mihomo/config.yaml
+        sed -i "/- IN-USER,${cname},/d" /etc/mihomo/config.yaml || return 1
 
         # c) Если больше нет cascade-user в этом листенере — вернуть proxy: outbound
         if ! sed -n "/^# --- ${shared_marker} ---/,/^# --- \/${shared_marker} ---/p" \
              /etc/mihomo/config.yaml | grep -q '# cascade-user:'; then
             # Заменить rule: → proxy: outbound
             sed -i "/^# --- ${shared_marker} ---/,/^# --- \/${shared_marker} ---/{s/    rule: .*/    proxy: outbound/}" \
-                /etc/mihomo/config.yaml
+                /etc/mihomo/config.yaml || return 1
 
             # Удалить sub-rule entry (имя + все правила)
             awk -v name="  ${subrule_name}:" '
@@ -715,14 +754,14 @@ _remove_proxy_cascade() {
                 skip && /^    - / { next }
                 skip { skip=0 }
                 { print }
-            ' /etc/mihomo/config.yaml > /tmp/mihomo_tmp.yaml
-            mv /tmp/mihomo_tmp.yaml /etc/mihomo/config.yaml
+            ' /etc/mihomo/config.yaml > /tmp/mihomo_tmp.yaml || return 1
+            mv /tmp/mihomo_tmp.yaml /etc/mihomo/config.yaml || return 1
 
             # Если sub-rules: пуста — удалить заголовок и пустые строки
             if ! grep -qE '^  [a-z]' /etc/mihomo/config.yaml 2>/dev/null \
                || ! awk '/^sub-rules:/{f=1;next} f && /^  [a-z]/{found=1} f && /^[a-z]/{exit} END{exit !found}' \
                     /etc/mihomo/config.yaml 2>/dev/null; then
-                sed -i '/^sub-rules:$/d' /etc/mihomo/config.yaml
+                sed -i '/^sub-rules:$/d' /etc/mihomo/config.yaml || return 1
             fi
         fi
     else
@@ -732,8 +771,8 @@ _remove_proxy_cascade() {
             /etc/mihomo/config.yaml | grep 'port:' | head -1 | awk '{print $2}')
 
         sed "/^# --- cascade-listener:${cname} ---/,/^# --- \/cascade-listener:${cname} ---/d" \
-            /etc/mihomo/config.yaml > /tmp/mihomo_tmp.yaml
-        mv /tmp/mihomo_tmp.yaml /etc/mihomo/config.yaml
+            /etc/mihomo/config.yaml > /tmp/mihomo_tmp.yaml || return 1
+        mv /tmp/mihomo_tmp.yaml /etc/mihomo/config.yaml || return 1
 
         if [[ -n "$cascade_port" ]]; then
             ufw delete allow "${cascade_port}/tcp" > /dev/null 2>&1 || true
@@ -743,19 +782,23 @@ _remove_proxy_cascade() {
 
     # Общее: exit-proxy, outbound группа, client-config
     sed "/^# --- cascade:${cname} ---/,/^# --- \/cascade:${cname} ---/d" \
-        /etc/mihomo/config.yaml > /tmp/mihomo_tmp.yaml
-    mv /tmp/mihomo_tmp.yaml /etc/mihomo/config.yaml
+        /etc/mihomo/config.yaml > /tmp/mihomo_tmp.yaml || return 1
+    mv /tmp/mihomo_tmp.yaml /etc/mihomo/config.yaml || return 1
 
     sed "/^# --- cascade-group:${cname} ---/,/^# --- \/cascade-group:${cname} ---/d" \
-        /etc/mihomo/config.yaml > /tmp/mihomo_tmp.yaml
-    mv /tmp/mihomo_tmp.yaml /etc/mihomo/config.yaml
+        /etc/mihomo/config.yaml > /tmp/mihomo_tmp.yaml || return 1
+    mv /tmp/mihomo_tmp.yaml /etc/mihomo/config.yaml || return 1
 
-    sed "/^--- Cascade: ${cname} ---/,/^--- \/Cascade: ${cname} ---/d" \
-        /etc/mihomo/client-config.txt > /tmp/client_tmp.txt 2>/dev/null
-    mv /tmp/client_tmp.txt /etc/mihomo/client-config.txt 2>/dev/null || true
+    if [[ -f /etc/mihomo/client-config.txt ]]; then
+        sed "/^--- Cascade: ${cname} ---/,/^--- \/Cascade: ${cname} ---/d" \
+            /etc/mihomo/client-config.txt > /tmp/client_tmp.txt || return 1
+        mv /tmp/client_tmp.txt /etc/mihomo/client-config.txt || return 1
+    fi
+    return 0
 }
 
 remove_cascade_interactive() {
+    CASCADE_CANCELLED=false
     echo ""
 
     local cascades=()
@@ -763,59 +806,33 @@ remove_cascade_interactive() {
         cascades+=("$line")
     done < <(grep '^# --- cascade:' /etc/mihomo/config.yaml 2>/dev/null | sed 's/# --- cascade://;s/ ---//')
 
-    if [[ ${#cascades[@]} -eq 0 ]]; then
-        warn "Нет каскадов для удаления."
-        return
-    fi
+    MENU_SELECT_EMPTY="Нет каскадов для удаления"
+    menu_select "Удаление каскада" "Выберите каскад" "${cascades[@]}" || {
+        CASCADE_CANCELLED=true
+        return 1
+    }
+    local target="${cascades[$((MENU_SELECT_INDEX - 1))]}"
+    review_frame "Удаление каскада" \
+        "Каскад: $target" \
+        "Доступ каскада и его клиентская конфигурация будут удалены." \
+        "Mihomo будет перезапущен."
+    confirm_yn "Удалить каскад?" N || { info "Отменено."; return 0; }
 
-    echo -e "  ${CYAN}Каскады:${NC}"
-    local i=1
-    for c in "${cascades[@]}"; do
-        local block
-        block=$(sed -n "/^# --- cascade:${c} ---/,/^# --- \/cascade:${c} ---/p" /etc/mihomo/config.yaml)
-        local ctype
-        ctype=$(echo "$block" | grep '^# type:' | awk '{print $3}')
-
-        if [[ "$ctype" == "iptables-dnat" ]]; then
-            local remote remote_port local_port
-            remote=$(echo "$block" | grep '^# remote:' | awk '{print $3}')
-            remote_port=$(echo "$block" | grep '^# remote-port:' | awk '{print $3}')
-            local_port=$(echo "$block" | grep '^# local-port:' | awk '{print $3}')
-            echo -e "  ${GREEN}${i})${NC} $c ${DIM}(DNAT :${local_port} -> ${remote}:${remote_port})${NC}"
-        else
-            local srv _sl_info=""
-            srv=$(echo "$block" | grep '    server:' | head -1 | awk '{print $2}')
-            local _sl
-            _sl=$(echo "$block" | grep '^# shared-listener:' | awk '{print $3}')
-            [[ -n "$_sl" ]] && _sl_info=" (${_sl})"
-            echo -e "  ${GREEN}${i})${NC} $c ${DIM}-> $srv${_sl_info}${NC}"
-        fi
-        i=$((i + 1))
-    done
-    echo ""
-
-    read -rp "Номер каскада для удаления [1-${#cascades[@]}]: " CHOICE
-    if ! [[ "$CHOICE" =~ ^[0-9]+$ ]] || (( CHOICE < 1 || CHOICE > ${#cascades[@]} )); then
-        warn "Неверный выбор."
-        return
-    fi
-
-    local target="${cascades[$((CHOICE - 1))]}"
-    warn "Будет удалён каскад: $target"
-    confirm_yn "Вы уверены?" || { info "Отменено."; return; }
-
-    _remove_cascade "$target"
+    _remove_cascade "$target" || return 1
     success "Каскад $target удалён"
 
     info "Перезапускаю Mihomo..."
-    systemctl restart mihomo &>/dev/null
+    local _start_rc=0
+    systemctl restart mihomo &>/dev/null || _start_rc=$?
     sleep 3
 
-    if systemctl is-active --quiet mihomo; then
+    if [[ "$_start_rc" -eq 0 ]] && systemctl is-active --quiet mihomo; then
         success "Mihomo перезапущен"
     else
-        warn "Mihomo не запустился. Лог:"
-        journalctl -u mihomo -n 20 --no-pager
+        warn "Не удалось запустить Mihomo. Проверьте журнал и повторите действие из меню."
+        journalctl -u mihomo -n 20 --no-pager || true
+        return 1
     fi
     echo ""
+    return 0
 }

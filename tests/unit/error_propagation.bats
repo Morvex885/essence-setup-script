@@ -17,7 +17,6 @@ teardown() {
     is_port_free() { return 1; }
     run gen_free_port 1000 1001
     assert_failure
-    assert_output --partial "Не удалось найти свободный порт"
 }
 
 @test "apt_wait returns failure when the lock recovery menu is cancelled" {

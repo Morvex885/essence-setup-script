@@ -157,23 +157,30 @@ _normalize_vless_xhttp_proxy_yaml() {
 _ask_exit_vless_xhttp() {
     local proxy_name="$1"
     echo "" >&2
-    read -rp "Домен или IP exit-ноды: " C_SERVER
-    [[ -z "$C_SERVER" ]] && { warn "Сервер не указан"; return; }
-    read -rp "Порт [Enter = 443]: " C_PORT
+    IFS= read -rp "  Домен или IP выходной ноды: " C_SERVER || return 1
+    C_SERVER="${C_SERVER%$'\r'}"
+    [[ -z "$C_SERVER" ]] && { warn "Сервер не указан" >&2; return 1; }
+    IFS= read -rp "  Порт [Enter = 443]: " C_PORT || return 1
+    C_PORT="${C_PORT%$'\r'}"
     C_PORT="${C_PORT:-443}"
-    read -rp "UUID: " C_UUID
-    [[ -z "$C_UUID" ]] && { warn "UUID не указан"; return; }
-    read -rp "Public key: " C_PUBKEY
-    [[ -z "$C_PUBKEY" ]] && { warn "Public key не указан"; return; }
-    read -rp "Short ID: " C_SHORT_ID
-    [[ -z "$C_SHORT_ID" ]] && { warn "Short ID не указан"; return; }
-    read -rp "SNI [Enter = $C_SERVER]: " C_SNI
+    IFS= read -rp "  UUID: " C_UUID || return 1
+    C_UUID="${C_UUID%$'\r'}"
+    [[ -z "$C_UUID" ]] && { warn "UUID не указан" >&2; return 1; }
+    IFS= read -rp "  Открытый ключ: " C_PUBKEY || return 1
+    C_PUBKEY="${C_PUBKEY%$'\r'}"
+    [[ -z "$C_PUBKEY" ]] && { warn "Открытый ключ не указан" >&2; return 1; }
+    IFS= read -rp "  Short ID: " C_SHORT_ID || return 1
+    C_SHORT_ID="${C_SHORT_ID%$'\r'}"
+    [[ -z "$C_SHORT_ID" ]] && { warn "Short ID не указан" >&2; return 1; }
+    IFS= read -rp "  SNI [Enter = $C_SERVER]: " C_SNI || return 1
+    C_SNI="${C_SNI%$'\r'}"
     C_SNI="${C_SNI:-$C_SERVER}"
-    read -rp "Path [Enter = /]: " C_PATH
+    IFS= read -rp "  Путь [Enter = /]: " C_PATH || return 1
+    C_PATH="${C_PATH%$'\r'}"
     C_PATH="${C_PATH:-/}"
 
     echo "" >&2
-    info "Exit: $C_SERVER:$C_PORT VLESS xHTTP Reality" >&2
+    info "Выход: $C_SERVER:$C_PORT VLESS xHTTP Reality" >&2
 
     _build_vless_xhttp_exit_yaml "$proxy_name" "$C_SERVER" "$C_PORT" "$C_UUID" "$C_SNI" "$C_PATH" "auto" "$C_PUBKEY" "$C_SHORT_ID"
 }

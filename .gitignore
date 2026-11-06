@@ -2,3 +2,4 @@
 .claude/cache/
 remote-control/.remote-data/
 remote-control/templates/custom.yaml
+.DS_Store

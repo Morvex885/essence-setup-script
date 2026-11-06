@@ -24,7 +24,12 @@ hy2_menu() {
         fi
         choice="${choice%$'\r'}"
         case "$choice" in
-            1) install_hy2 || warn "Установка Hysteria2 завершилась ошибкой." ;;
+            1)
+                install_hy2 || {
+                    [[ "${HY2_CANCELLED:-false}" == true ]] ||
+                        warn "Установка Hysteria2 завершилась ошибкой."
+                }
+                ;;
             2) uninstall_hy2 || warn "Удаление Hysteria2 завершилось ошибкой." ;;
             0) return 0 ;;
             *) warn "Неверный выбор." ;;
@@ -34,15 +39,18 @@ hy2_menu() {
 
 install_hy2() {
     echo ""
+    HY2_CANCELLED=false
 
     if [[ ! -f /etc/mihomo/config.yaml ]]; then
-        warn "Mihomo не установлен. Сначала выполните установку (пункт 1)."
-        return
+        warn "Mihomo не установлен. Сначала выберите «b) Базовая установка»."
+        return 1
     fi
 
     if grep -q '# --- hy2 ---' /etc/mihomo/config.yaml; then
-        warn "Hysteria2 уже настроен в config.yaml."
-        confirm_yn "Перезаписать существующую конфигурацию?" || { info "Отменено."; return; }
+        review_frame "Замена Hysteria2" \
+            "Существующее входное подключение Hysteria2 будет заменено." \
+            "Прежние данные подключения перестанут работать."
+        confirm_yn "Перезаписать существующую конфигурацию?" N || { info "Отменено."; return 0; }
     fi
 
     # ── Ввод параметров ──────────────────────────────────────────────────────
@@ -50,7 +58,8 @@ install_hy2() {
         warn "Не удалось подобрать порт для Hysteria2."
         return 1
     }
-    read -rp "Порт для Hysteria2 [Enter = $DEFAULT_PORT]: " HY2_PORT
+    IFS= read -rp "  Порт для Hysteria2 [Enter = $DEFAULT_PORT]: " HY2_PORT || { HY2_CANCELLED=true; return 1; }
+    HY2_PORT="${HY2_PORT%$'\r'}"
     [[ -z "$HY2_PORT" ]] && HY2_PORT="$DEFAULT_PORT"
     while true; do
         if ! [[ "$HY2_PORT" =~ ^[0-9]+$ ]] || (( HY2_PORT < 1 || HY2_PORT > 65535 )); then
@@ -60,29 +69,39 @@ install_hy2() {
         else
             break
         fi
-        read -rp "Новый порт: " HY2_PORT
+        IFS= read -rp "  Новый порт: " HY2_PORT || { HY2_CANCELLED=true; return 1; }
+        HY2_PORT="${HY2_PORT%$'\r'}"
         [[ -z "$HY2_PORT" ]] && { warn "Порт не указан"; return 1; }
     done
 
     DEFAULT_USER="vpn"
-    read -rp "Имя пользователя [Enter = $DEFAULT_USER]: " HY2_USER
+    IFS= read -rp "  Имя пользователя [Enter = $DEFAULT_USER]: " HY2_USER || { HY2_CANCELLED=true; return 1; }
+    HY2_USER="${HY2_USER%$'\r'}"
     [[ -z "$HY2_USER" ]] && HY2_USER="$DEFAULT_USER"
 
-    DEFAULT_PASS=$(openssl rand -hex 16)
-    read -rp "Пароль [Enter = $DEFAULT_PASS]: " HY2_PASS
-    [[ -z "$HY2_PASS" ]] && HY2_PASS="$DEFAULT_PASS"
+    IFS= read -rp "  Пароль [Enter = сгенерировать]: " HY2_PASS || { HY2_CANCELLED=true; return 1; }
+    HY2_PASS="${HY2_PASS%$'\r'}"
+    if [[ -z "$HY2_PASS" ]]; then
+        HY2_PASS=$(openssl rand -hex 16) && [[ -n "$HY2_PASS" ]] || {
+            warn "Не удалось сгенерировать пароль."
+            return 1
+        }
+    fi
 
     while true; do
         echo ""
         box_top
-        box_center "Прокси для Hysteria2"
+        box_center "Выход трафика Hysteria2"
         box_mid
-        menu_item 1 "Через outbound" GREEN
+        menu_item 1 "Через группу outbound" CYAN
+        box_line "    WARP, если подключён и доступен; иначе DIRECT." "    ${DIM}WARP, если подключён и доступен; иначе DIRECT.${NC}"
         menu_item 2 "Напрямую (DIRECT)" CYAN
+        box_line "    Выход с IP сервера, минуя группу outbound." "    ${DIM}Выход с IP сервера, минуя группу outbound.${NC}"
         menu_item 0 "Отмена" NC
         box_bot
         echo ""
-        if ! IFS= read -rp "  Выберите действие [Enter = 1]: " PROXY_CHOICE; then
+        if ! IFS= read -rp "  Выберите выход трафика [Enter = 1]: " PROXY_CHOICE; then
+            HY2_CANCELLED=true
             return 1
         fi
         PROXY_CHOICE="${PROXY_CHOICE%$'\r'}"
@@ -90,7 +109,7 @@ install_hy2() {
         case "$PROXY_CHOICE" in
             1) HY2_PROXY="outbound"; break ;;
             2) HY2_PROXY="DIRECT"; break ;;
-            0) return 1 ;;
+            0) HY2_CANCELLED=true; return 1 ;;
             *) warn "Неверный выбор." ;;
         esac
     done
@@ -99,9 +118,14 @@ install_hy2() {
     info "Obfs salamander — маскирует QUIC-трафик Hysteria2 под случайные байты,"
     info "скрывая сам факт использования протокола. Требует совпадения пароля на клиенте."
     if confirm_yn "Включить obfs salamander?"; then
-        DEFAULT_OBFS_PASS=$(openssl rand -hex 12)
-        read -rp "Пароль obfs [Enter = $DEFAULT_OBFS_PASS]: " HY2_OBFS_PASS
-        [[ -z "$HY2_OBFS_PASS" ]] && HY2_OBFS_PASS="$DEFAULT_OBFS_PASS"
+        IFS= read -rp "  Пароль obfs [Enter = сгенерировать]: " HY2_OBFS_PASS || { HY2_CANCELLED=true; return 1; }
+        HY2_OBFS_PASS="${HY2_OBFS_PASS%$'\r'}"
+        if [[ -z "$HY2_OBFS_PASS" ]]; then
+            HY2_OBFS_PASS=$(openssl rand -hex 12) && [[ -n "$HY2_OBFS_PASS" ]] || {
+                warn "Не удалось сгенерировать пароль."
+                return 1
+            }
+        fi
         USE_OBFS=true
     else
         USE_OBFS=false
@@ -110,11 +134,13 @@ install_hy2() {
     echo ""
     info "Порт:         $HY2_PORT"
     info "Пользователь: $HY2_USER"
-    info "Пароль:       $HY2_PASS"
     info "Прокси:       $HY2_PROXY"
-    [[ "$USE_OBFS" == "true" ]] && info "Obfs:         salamander / пароль: $HY2_OBFS_PASS"
+    [[ "$USE_OBFS" == "true" ]] && info "Obfs:         salamander"
     echo ""
     confirm_yn "Всё верно?" || { info "Отменено."; return; }
+    local _hy2_old_umask
+    _hy2_old_umask=$(umask)
+    umask 077
 
     # ── Сертификат ───────────────────────────────────────────────────────────
     echo ""
@@ -125,6 +151,7 @@ install_hy2() {
         -keyout /etc/mihomo/certs/hy2/server.key \
         -out    /etc/mihomo/certs/hy2/server.crt 2>/dev/null || {
         warn "Не удалось создать сертификат"
+        umask "$_hy2_old_umask"
         return 1
     }
     chmod 600 /etc/mihomo/certs/hy2/server.key
@@ -160,14 +187,17 @@ install_hy2() {
 
     # ── Перезапуск Mihomo ─────────────────────────────────────────────────────
     info "Перезапускаю Mihomo..."
-    systemctl restart mihomo &>/dev/null
+    local _start_rc=0
+    systemctl restart mihomo &>/dev/null || _start_rc=$?
     sleep 3
 
-    if systemctl is-active --quiet mihomo; then
+    if [[ "$_start_rc" -eq 0 ]] && systemctl is-active --quiet mihomo; then
         success "Mihomo перезапущен с Hysteria2"
     else
-        warn "Mihomo не запустился. Лог:"
-        journalctl -u mihomo -n 20 --no-pager
+        warn "Не удалось запустить Mihomo. Проверьте журнал и повторите действие из меню."
+        journalctl -u mihomo -n 20 --no-pager || true
+        umask "$_hy2_old_umask"
+        return 1
     fi
 
     # ── Клиентский конфиг ────────────────────────────────────────────────────
@@ -211,6 +241,8 @@ HY2SAVEOF
     echo ""
     echo -e "  Клиентский конфиг: ${CYAN}/etc/mihomo/client-config.txt${NC}"
     echo ""
+    umask "$_hy2_old_umask"
+    return 0
 }
 
 uninstall_hy2() {
@@ -221,25 +253,22 @@ uninstall_hy2() {
         return
     fi
 
-    local _cascade_names
+    local _cascade_names _cn
+    local review_lines=("Входное подключение Hysteria2 будет удалено." "Порт будет закрыт; сертификаты и клиентская запись будут удалены." "Mihomo будет перезапущен.")
     if _cascade_names=$(_check_cascade_users "hy2" 2>/dev/null) && [[ -n "$_cascade_names" ]]; then
-        echo ""
-        warn "Этот листенер используется каскадами:"
-        echo "$_cascade_names" | while read -r _cn; do
-            echo -e "    ${YELLOW}*${NC} $_cn"
-        done
-        warn "Удаление сломает эти каскады. Сначала удалите их."
-        confirm_yn "Всё равно удалить?" || { info "Отменено."; return; }
+        review_lines+=("Доступ следующих каскадов перестанет работать:")
+        while IFS= read -r _cn; do
+            review_lines+=("Каскад: $_cn")
+        done <<< "$_cascade_names"
     fi
-
-    warn "Будет удалён listener Hysteria2, закрыт порт и удалены сертификаты."
-    confirm_yn "Вы уверены?" || { info "Отменено."; return; }
+    review_frame "Удаление Hysteria2" "${review_lines[@]}"
+    confirm_yn "Удалить Hysteria2?" N || { info "Отменено."; return 0; }
 
     HY2_PORT=$(awk '/# --- hy2 ---/{f=1} f && /port:/{print $2; exit}' /etc/mihomo/config.yaml)
 
     sed '/^# --- hy2 ---/,/^# --- \/hy2 ---/d' /etc/mihomo/config.yaml > /tmp/mihomo_tmp.yaml
     mv /tmp/mihomo_tmp.yaml /etc/mihomo/config.yaml
-    success "Listener Hysteria2 удалён из config.yaml"
+    success "Входное подключение Hysteria2 удалено из config.yaml"
 
     if [[ -f /etc/mihomo/client-config.txt ]]; then
         sed '/^--- Hysteria2 ---/,/^--- \/Hysteria2 ---/d' /etc/mihomo/client-config.txt > /tmp/client_tmp.txt

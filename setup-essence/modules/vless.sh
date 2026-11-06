@@ -36,12 +36,12 @@ setup_reality() {
         box_top
         box_center "Режим Reality"
         box_mid
-        menu_item 1 "Self-Steal (рекомендуется)" GREEN
-        menu_item 2 "SNI (указать домен-маскировку)" GREEN
+        menu_item 1 "Self-Steal (рекомендуется)" CYAN
+        menu_item 2 "SNI (указать домен-маскировку)" CYAN
         menu_item 0 "Отмена" NC
         box_bot
         echo ""
-        if ! IFS= read -rp "  Выберите действие [Enter = 1]: " REALITY_MODE; then
+        if ! IFS= read -rp "  Выберите режим [Enter = 1]: " REALITY_MODE; then
             return 1
         fi
         REALITY_MODE="${REALITY_MODE%$'\r'}"
@@ -63,7 +63,8 @@ setup_reality() {
         # ─── SNI режим ───────────────────────────────────────────────────────
         REALITY_MODE="sni"
         echo ""
-        read -rp "SNI домен (например www.google.com): " SNI_DOMAIN
+        IFS= read -rp "  SNI-домен (например www.google.com): " SNI_DOMAIN || return 1
+        SNI_DOMAIN="${SNI_DOMAIN%$'\r'}"
         [[ -z "$SNI_DOMAIN" ]] && { warn "SNI домен не может быть пустым"; return; }
 
         SERVER_IP=$(curl -4 -s --max-time 5 ifconfig.me \
@@ -75,12 +76,12 @@ setup_reality() {
         if confirm_yn "Добавить свой домен с сайтом-заглушкой?"; then
             # Сценарий: SNI + свой домен
             echo ""
-            read -rp "Введите домен (например example.com): " DOMAIN
+            IFS= read -rp "  Введите домен (например example.com): " DOMAIN || return 1
+            DOMAIN="${DOMAIN%$'\r'}"
             [[ -z "$DOMAIN" ]] && { warn "Домен не может быть пустым"; return; }
 
-            DEFAULT_EMAIL="user$(openssl rand -hex 4)@$(openssl rand -hex 3).com"
-            read -rp "Email для acme.sh [Enter = $DEFAULT_EMAIL]: " EMAIL
-            [[ -z "$EMAIL" ]] && EMAIL="$DEFAULT_EMAIL"
+            acme_select_email || return 1
+            EMAIL="$ACME_SELECTED_EMAIL"
 
             SITE_NAME="$DOMAIN"
             CLIENT_SERVER="$DOMAIN"
@@ -99,9 +100,8 @@ setup_reality() {
             SITE_NAME="$SERVER_IP"
             CLIENT_SERVER="$SERVER_IP"
 
-            DEFAULT_EMAIL="user$(openssl rand -hex 4)@$(openssl rand -hex 3).com"
-            read -rp "Email для acme.sh [Enter = $DEFAULT_EMAIL]: " EMAIL
-            [[ -z "$EMAIL" ]] && EMAIL="$DEFAULT_EMAIL"
+            acme_select_email || return 1
+            EMAIL="$ACME_SELECTED_EMAIL"
         else
             # Сценарий: SNI bare
             HAS_SITE="false"
@@ -120,12 +120,12 @@ setup_reality() {
         # ─── Self-Steal режим ────────────────────────────────────────────────
         REALITY_MODE="self-steal"
         echo ""
-        read -rp "Введите домен (например example.com): " DOMAIN
+        IFS= read -rp "  Введите домен (например example.com): " DOMAIN || return 1
+        DOMAIN="${DOMAIN%$'\r'}"
         [[ -z "$DOMAIN" ]] && { warn "Домен не может быть пустым"; return; }
 
-        DEFAULT_EMAIL="user$(openssl rand -hex 4)@$(openssl rand -hex 3).com"
-        read -rp "Email для acme.sh [Enter = $DEFAULT_EMAIL]: " EMAIL
-        [[ -z "$EMAIL" ]] && EMAIL="$DEFAULT_EMAIL"
+        acme_select_email || return 1
+        EMAIL="$ACME_SELECTED_EMAIL"
 
         SNI_DOMAIN="$DOMAIN"
         REALITY_DEST="127.0.0.1:8443"
@@ -171,7 +171,7 @@ setup_reality() {
 
     # ─── Шаги: Nginx + сертификат (только если HAS_SITE) ─────────────────────
     if [[ "$HAS_SITE" == "true" ]]; then
-        TOTAL_STEPS=7
+        TOTAL_STEPS=6
     else
         TOTAL_STEPS=1
     fi
@@ -211,48 +211,14 @@ setup_reality() {
             return 1
         fi
 
-        # ─── Шаг: Nginx HTTP (для acme.sh) ──────────────────────────────────
-        STEP=$((STEP + 1))
-        echo ""
-        info "Шаг $STEP/$TOTAL_STEPS: Настройка Nginx (HTTP для acme.sh)..."
-        rm -f /etc/nginx/sites-enabled/*
-
-        cat > /etc/nginx/sites-available/"$SITE_NAME" << NGINXEOF
-server {
-    listen 80;
-    server_name $SITE_NAME;
-
-    location /.well-known/acme-challenge/ {
-        root /var/www/$SITE_NAME;
-    }
-
-    location / {
-        return 301 https://\$host\$request_uri;
-    }
-}
-NGINXEOF
-
-        ln -sf /etc/nginx/sites-available/"$SITE_NAME" /etc/nginx/sites-enabled/"$SITE_NAME"
-        if ! nginx -t; then
-            warn "Nginx конфиг невалиден"
-            return 1
-        fi
-        if ! systemctl restart nginx; then
-            warn "Nginx не запустился"
-            return 1
-        fi
-        sleep 1
-        if ! systemctl is-active --quiet nginx; then
-            warn "Nginx не активен после запуска"
-            return 1
-        fi
-        success "Nginx запущен на порту 80"
+        # Отключаем только прежний TLS site этой ноды; чужие sites сохраняются.
+        rm -f /etc/nginx/sites-enabled/"$SITE_NAME" || return 1
 
         # ─── Шаг: acme.sh ───────────────────────────────────────────────────
         STEP=$((STEP + 1))
         echo ""
         info "Шаг $STEP/$TOTAL_STEPS: Установка acme.sh..."
-        if ! ensure_acme_installed "$EMAIL"; then
+        if ! ensure_essence_acme_email "$EMAIL"; then
             return 1
         fi
         success "acme.sh готов (CA: Let's Encrypt)"
@@ -260,19 +226,10 @@ NGINXEOF
         # ─── Шаг: Сертификат ────────────────────────────────────────────────
         STEP=$((STEP + 1))
         echo ""
-        info "Шаг $STEP/$TOTAL_STEPS: Получение SSL сертификата для $SITE_NAME..."
-        if ! issue_cert "$SITE_NAME" "/var/www/$SITE_NAME" "$IS_IP_CERT"; then
+        info "Шаг $STEP/$TOTAL_STEPS: Подготовка SSL сертификата для $SITE_NAME..."
+        if ! ensure_cert "$SITE_NAME" "/var/www/$SITE_NAME" "$IS_IP_CERT"; then
             return 1
         fi
-        info "Закрываю порт 80..."
-        ufw deny 80/tcp > /dev/null
-        success "Порт 80 закрыт"
-
-        if ! install_cert "$SITE_NAME"; then
-            warn "Не удалось установить сертификат."
-            return 1
-        fi
-        success "Сертификат получен и установлен"
 
         # ─── Шаг: Nginx SSL ─────────────────────────────────────────────────
         STEP=$((STEP + 1))
@@ -294,19 +251,6 @@ NGINXEOF
             info "Шаг $STEP/$TOTAL_STEPS: Настройка Nginx SSL (self-steal на 127.0.0.1:8443)..."
 
             cat > /etc/nginx/sites-available/"$SITE_NAME" << NGINXEOF
-server {
-    listen 80;
-    server_name $SITE_NAME;
-
-    location /.well-known/acme-challenge/ {
-        root /var/www/$SITE_NAME;
-    }
-
-    location / {
-        return 301 https://\$host\$request_uri;
-    }
-}
-
 server {
     $_listen_h2
     server_name $SITE_NAME;$_http2_directive
@@ -336,19 +280,6 @@ NGINXEOF
             info "Шаг $STEP/$TOTAL_STEPS: Настройка Nginx (stream SNI-роутинг + HTTPS)..."
 
             cat > /etc/nginx/sites-available/"$SITE_NAME" << NGINXEOF
-server {
-    listen 80;
-    server_name $SITE_NAME;
-
-    location /.well-known/acme-challenge/ {
-        root /var/www/$SITE_NAME;
-    }
-
-    location / {
-        return 301 https://\$host\$request_uri;
-    }
-}
-
 server {
     $_listen_h2
     server_name $SITE_NAME;$_http2_directive
@@ -397,6 +328,8 @@ stream {
 }
 STREAMEOF
         fi
+
+        ln -sf /etc/nginx/sites-available/"$SITE_NAME" /etc/nginx/sites-enabled/"$SITE_NAME" || return 1
 
         if ! nginx -t || ! systemctl restart nginx; then
             warn "Nginx не прошёл проверку или не запустился после настройки SSL"
@@ -448,7 +381,7 @@ STREAMEOF
             !skip
         ' /etc/mihomo/config.yaml > /tmp/mihomo_tmp.yaml
         mv /tmp/mihomo_tmp.yaml /etc/mihomo/config.yaml
-        info "Старый VLESS listener (без маркеров) удалён из config.yaml"
+        info "Старое входное подключение VLESS (без маркеров) удалено из config.yaml"
     fi
 
     # Удаляем старую секцию клиентского конфига
@@ -480,7 +413,7 @@ CONFEOF
     echo ""
     success "Reality настроен!"
     info "UUID:       $UUID"
-    info "Public key: $PUBLIC_KEY"
+    info "Открытый ключ: $PUBLIC_KEY"
     info "Short ID:   $SHORT_ID"
     echo ""
     info "Теперь добавьте транспорт: TCP, xHTTP или gRPC."
@@ -492,7 +425,7 @@ _vless_port_input() {
     local default_port="$1"
     local port
 
-    if ! IFS= read -rp "Порт [Enter = $default_port]: " port; then
+    if ! IFS= read -rp "  Порт [Enter = $default_port]: " port; then
         return 1
     fi
     port="${port%$'\r'}"
@@ -506,7 +439,7 @@ _vless_port_input() {
         else
             break
         fi
-        if ! IFS= read -rp "Новый порт: " port; then
+        if ! IFS= read -rp "  Новый порт: " port; then
             return 1
         fi
         port="${port%$'\r'}"
@@ -1098,14 +1031,14 @@ _add_vless_xhttp() {
             if [[ "$XHTTP_LISTEN" == "127.0.0.1" ]]; then client_port=443; else client_port="$XHTTP_PORT"; fi
         fi
         if [[ -z "$XHTTP_LISTEN" || -z "$XHTTP_PORT" || -z "$XHTTP_PATH" ]]; then
-            warn "Существующий xHTTP listener неполный. Конфиги не изменены."
+            warn "Существующее входное подключение xHTTP неполное. Конфиги не изменены."
             return
         fi
 
         echo ""
-        info "Сохраняю топологию, порты, path, пользователей, каскады и routing."
-        info "Порт:  $client_port (listener $XHTTP_LISTEN:$XHTTP_PORT)"
-        info "Path:  $XHTTP_PATH"
+        info "Сохраняю топологию, порты, путь, пользователей, каскады и маршрутизацию."
+        info "Порт:  $client_port (входное подключение $XHTTP_LISTEN:$XHTTP_PORT)"
+        info "Путь:  $XHTTP_PATH"
         info "Проверяю кандидаты и реальное xHTTP соединение..."
         if _install_vless_xhttp_transaction "$topology" "$XHTTP_LISTEN" "$XHTTP_PORT" \
             "$client_port" "$XHTTP_PATH" true; then
@@ -1124,14 +1057,14 @@ _add_vless_xhttp() {
         box_top
         box_center "Порт для xHTTP"
         box_mid
-        menu_item 1 "443 (Reality) — занимает порт, нельзя совместить с TCP" GREEN
+        menu_item 1 "443 (Reality) — занимает порт, нельзя совместить с TCP" CYAN
         [[ "$HAS_SITE" == "true" ]] &&
-            menu_item 2 "443 (TLS, nginx) — совместно с TCP" GREEN
-        menu_item 3 "Свой порт (Reality)" GREEN
-        menu_item 0 "Назад" NC
+            menu_item 2 "443 (TLS, nginx) — совместно с TCP" CYAN
+        menu_item 3 "Свой порт (Reality)" CYAN
+        menu_item 0 "Отмена" NC
         box_bot
         echo ""
-        if ! IFS= read -rp "  Выберите действие [Enter = 1]: " PORT_CHOICE; then
+        if ! IFS= read -rp "  Выберите порт [Enter = 1]: " PORT_CHOICE; then
             return 1
         fi
         PORT_CHOICE="${PORT_CHOICE%$'\r'}"
@@ -1176,7 +1109,7 @@ _add_vless_xhttp() {
                 client_port="$XHTTP_PORT"
                 break
                 ;;
-            0) return 0 ;;
+            0) return 1 ;;
             *) warn "Неверный выбор." ;;
         esac
     done
@@ -1184,7 +1117,7 @@ _add_vless_xhttp() {
 
     echo ""
     info "Порт:  $client_port"
-    info "Path:  $XHTTP_PATH"
+    info "Путь:  $XHTTP_PATH"
     if [[ "$xhttp_via_nginx" == "true" ]]; then
         info "Режим: через nginx reverse proxy (без Reality, обычный TLS)"
         info "Внутренний порт: 127.0.0.1:$XHTTP_PORT"
@@ -1212,7 +1145,7 @@ _add_vless_xhttp() {
     else
         echo -e "  SNI:    ${CYAN}$SNI_DOMAIN${NC} (Reality)"
     fi
-    echo -e "  Path:   ${CYAN}$XHTTP_PATH${NC}"
+    echo -e "  Путь:   ${CYAN}$XHTTP_PATH${NC}"
     echo ""
 }
 
@@ -1237,12 +1170,12 @@ _add_vless_grpc() {
         box_top
         box_center "Порт для gRPC"
         box_mid
-        menu_item 1 "443 (Reality) — занимает порт, нельзя совместить с TCP/xHTTP" GREEN
-        menu_item 2 "Свой порт (Reality)" GREEN
-        menu_item 0 "Назад" NC
+        menu_item 1 "443 (Reality) — занимает порт, нельзя совместить с TCP/xHTTP" CYAN
+        menu_item 2 "Свой порт (Reality)" CYAN
+        menu_item 0 "Отмена" NC
         box_bot
         echo ""
-        if ! IFS= read -rp "  Выберите действие [Enter = 1]: " PORT_CHOICE; then
+        if ! IFS= read -rp "  Выберите порт [Enter = 1]: " PORT_CHOICE; then
             return 1
         fi
         PORT_CHOICE="${PORT_CHOICE%$'\r'}"
@@ -1273,14 +1206,14 @@ _add_vless_grpc() {
                 client_port="$GRPC_PORT"
                 break
                 ;;
-            0) return 0 ;;
+            0) return 1 ;;
             *) warn "Неверный выбор." ;;
         esac
     done
 
     echo ""
     info "Порт:         $client_port"
-    info "Service name: $GRPC_SERVICE"
+    info "Имя службы: $GRPC_SERVICE"
     echo ""
     confirm_yn "Всё верно?" || { info "Отменено."; return; }
 
@@ -1351,14 +1284,14 @@ VLESSGRPCEOF
     echo ""
     echo -e "  Сервер:       ${CYAN}$CLIENT_SERVER:$client_port${NC}"
     echo -e "  SNI:          ${CYAN}$SNI_DOMAIN${NC}"
-    echo -e "  Service name: ${CYAN}$GRPC_SERVICE${NC}"
+    echo -e "  Имя службы: ${CYAN}$GRPC_SERVICE${NC}"
     echo ""
 }
 
 # ─── Удалить транспорт ───────────────────────────────────────────────────────
 
 _remove_vless_transport() {
-    local items=() labels=() xhttp_port grpc_port i DEL_CHOICE selected
+    local items=() labels=() xhttp_port grpc_port selected
     if grep -q '# --- vless-tcp ---' /etc/mihomo/config.yaml 2>/dev/null; then
         items+=("tcp")
         labels+=("VLESS TCP (порт 443)")
@@ -1373,37 +1306,9 @@ _remove_vless_transport() {
         items+=("grpc")
         labels+=("VLESS gRPC (порт ${grpc_port:-?})")
     fi
-    if [[ ${#items[@]} -eq 0 ]]; then
-        echo ""
-        box_top
-        box_center "Удаление VLESS"
-        box_mid
-        box_line " Нет установленных VLESS транспортов" " ${DIM}Нет установленных VLESS транспортов${NC}"
-        box_bot
-        return 1
-    fi
-    while true; do
-        echo ""
-        box_top
-        box_center "Удаление VLESS"
-        box_mid
-        for i in "${!items[@]}"; do
-            menu_item "$((i + 1))" "${labels[$i]}" RED
-        done
-        menu_item 0 "Отмена" NC
-        box_bot
-        echo ""
-        if ! IFS= read -rp "  Выберите транспорт: " DEL_CHOICE; then
-            return 1
-        fi
-        DEL_CHOICE="${DEL_CHOICE%$'\r'}"
-        [[ "$DEL_CHOICE" == 0 ]] && return 1
-        if menu_index_valid "$DEL_CHOICE" "${#items[@]}"; then
-            selected="${items[$((DEL_CHOICE-1))]}"
-            break
-        fi
-        warn "Неверный выбор."
-    done
+    MENU_SELECT_EMPTY="Нет установленных транспортов VLESS"
+    menu_select "Удаление VLESS" "Выберите транспорт" "${labels[@]}" || return 1
+    selected="${items[$((MENU_SELECT_INDEX - 1))]}"
 
     # Проверяем cascade-user перед удалением
     local _marker_name
@@ -1415,7 +1320,7 @@ _remove_vless_transport() {
     local _cascade_names
     if _cascade_names=$(_check_cascade_users "$_marker_name" 2>/dev/null) && [[ -n "$_cascade_names" ]]; then
         echo ""
-        warn "Этот листенер используется каскадами:"
+        warn "Это входное подключение используется каскадами:"
         echo "$_cascade_names" | while read -r _cn; do
             echo -e "    ${YELLOW}*${NC} $_cn"
         done

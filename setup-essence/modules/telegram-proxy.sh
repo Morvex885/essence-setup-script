@@ -1,8 +1,8 @@
 #!/bin/bash
 # ─── Telegram Proxy (official MTProxy backend + WEB relay) ──────────────────
 #
-# WEB and MTProto are independent components.  The official MTProxy process,
-# secret, optional tag, firewall and refresh timer are shared by both.
+# WEB through HTTPS and direct MTProto are access modes. The official MTProxy
+# backend, secret, optional tag, firewall and refresh timer are shared by both.
 
 TPROXY_DIR="${TPROXY_DIR:-/etc/tproxy-server}"
 TPROXY_CONF="${TPROXY_CONF:-$TPROXY_DIR/essence.conf}"
@@ -26,7 +26,6 @@ TPROXY_FIREWALL_FILE="${TPROXY_FIREWALL_FILE:-$TPROXY_DIR/firewall.nft}"
 TPROXY_TOKEN_KEY="${TPROXY_TOKEN_KEY:-$TPROXY_DIR/token.key}"
 TPROXY_REFRESH_BIN="${TPROXY_REFRESH_BIN:-/usr/local/sbin/refresh-mtproxy-config}"
 TPROXY_CERT_DIR="${TPROXY_CERT_DIR:-/etc/nginx/ssl}"
-TPROXY_ACME_DIR="${TPROXY_ACME_DIR:-$HOME/.acme.sh}"
 TPROXY_WEBROOT_BASE="${TPROXY_WEBROOT_BASE:-/var/www}"
 TPROXY_IPV6_DISABLE_FILE="${TPROXY_IPV6_DISABLE_FILE:-/proc/sys/net/ipv6/conf/all/disable_ipv6}"
 TPROXY_REPO_URL="${TPROXY_REPO_URL:-https://github.com/telegramdesktop/tproxy-server.git}"
@@ -46,6 +45,7 @@ TPROXY_UNIT_TIMER="refresh-mtproxy-config.timer"
 TPROXY_NFT_TABLE="tproxy_backend"
 
 TPROXY_ROLLBACK_RUNTIME_CAPTURED=false
+TPROXY_ROLLBACK_MTPROXY_CHANGED=false
 TPROXY_ROLLBACK_NFT_EXISTED=false
 TPROXY_ROLLBACK_NFT_FILE=""
 TPROXY_ROLLBACK_UFW_80=""
@@ -66,9 +66,6 @@ _telegram_proxy_valid_hostname() {
     IFS="$old_ifs"
 }
 
-_telegram_proxy_valid_email() {
-    [[ "${1:-}" =~ ^[A-Za-z0-9._%+\-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$ ]]
-}
 
 _telegram_proxy_valid_secret() { [[ "${1:-}" =~ ^[a-f0-9]{32}$ ]]; }
 _telegram_proxy_valid_tag() { [[ "${1:-}" =~ ^[a-fA-F0-9]{32}$ ]]; }
@@ -171,7 +168,7 @@ _telegram_proxy_load_conf() {
            "$have_web_ipv6" == true && "$have_relay_path" == true &&
            "$have_relay_sha" == true ]] || return 1
         _telegram_proxy_valid_hostname "$TELEGRAM_WEB_HOSTNAME" &&
-            _telegram_proxy_valid_email "$TELEGRAM_WEB_EMAIL" || return 1
+            acme_email_valid "$TELEGRAM_WEB_EMAIL" || return 1
         case "$TELEGRAM_WEB_TOPOLOGY" in
             direct) [[ "$TELEGRAM_WEB_TLS_LISTEN" == 0.0.0.0:443 ]] || return 1 ;;
             self-steal) [[ "$TELEGRAM_WEB_TLS_LISTEN" == 127.0.0.1:8443 ]] || return 1 ;;
@@ -241,7 +238,7 @@ _telegram_proxy_state_write() {
     [[ "$TELEGRAM_WEB_ENABLED" == true || "$TELEGRAM_MTPROTO_ENABLED" == true ]] || return 1
     _telegram_proxy_valid_bool "$TPROXY_CREATED_USER" && _telegram_proxy_valid_bool "$MTPROXY_CREATED_USER" || return 1
     if [[ "$TELEGRAM_WEB_ENABLED" == true ]]; then
-        _telegram_proxy_valid_hostname "$TELEGRAM_WEB_HOSTNAME" && _telegram_proxy_valid_email "$TELEGRAM_WEB_EMAIL" || return 1
+        _telegram_proxy_valid_hostname "$TELEGRAM_WEB_HOSTNAME" && acme_email_valid "$TELEGRAM_WEB_EMAIL" || return 1
         case "$TELEGRAM_WEB_TOPOLOGY" in
             direct) [[ "$TELEGRAM_WEB_TLS_LISTEN" == 0.0.0.0:443 ]] || return 1 ;;
             self-steal) [[ "$TELEGRAM_WEB_TLS_LISTEN" == 127.0.0.1:8443 ]] || return 1 ;;
@@ -427,7 +424,7 @@ _telegram_proxy_render_mtproxy_unit() {
             next
         }
         /^ExecStart=/ {
-            sub(/[[:space:]]+--aes-pwd/, " \$MTPROXY_TAG_ARGS --aes-pwd")
+            sub(/[[:space:]]+--aes-pwd/, " $MTPROXY_TAG_ARGS --aes-pwd")
             print
             done = 1
             next
@@ -444,7 +441,6 @@ _telegram_proxy_render_mtproxy_unit() {
     }
     [[ "$(grep -cF '$MTPROXY_TAG_ARGS' "$target" 2>/dev/null || true)" == 1 ]] &&
         [[ "$(grep -c '^EnvironmentFile=' "$target" 2>/dev/null || true)" == 1 ]]
-    return 0
 }
 
 _telegram_proxy_render_firewall() {
@@ -519,6 +515,66 @@ _telegram_proxy_install_backend() {
     chmod 0755 "$TPROXY_REFRESH_BIN" || return 1
 }
 
+_telegram_proxy_prepare_backend() {
+    local source="$1" secret="$2" backend_was="$3" unit_source candidate
+    local active=false healthy=false changed=false native=false old_umask rc=0
+    unit_source="$source/deploy/mtproxy.service"
+    [[ -f "$unit_source" ]] || unit_source="$source/deploy/mtproxy.service.in"
+    old_umask=$(umask)
+    umask 077
+    candidate=$(mktemp "${TMPDIR:-/tmp}/tproxy-mtproxy-unit.XXXXXX")
+    rc=$?
+    umask "$old_umask"
+    if [[ $rc -ne 0 ]]; then
+        warn "Не удалось подготовить службу MTProxy."
+        return 1
+    fi
+    if ! _telegram_proxy_render_mtproxy_unit "$unit_source" "$candidate"; then
+        rm -f "$candidate"
+        warn "Не удалось подготовить службу MTProxy."
+        return 1
+    fi
+    if [[ "$backend_was" == true ]]; then
+        _telegram_proxy_backend_active && active=true
+        if [[ "$active" == true ]] && _telegram_proxy_wait_mtproxy_listener; then healthy=true; fi
+        cmp -s "$candidate" "$TPROXY_SYSTEMD_DIR/$TPROXY_UNIT_MTPROXY" || changed=true
+    else
+        native=true
+        _telegram_proxy_render_mtproxy_env "$secret" || rc=1
+    fi
+    if [[ "$backend_was" == true && "$healthy" != true ]]; then native=true; fi
+    if [[ "$native" == true && $rc -eq 0 ]]; then
+        [[ "$backend_was" != true ]] || warn "Восстановление службы MTProxy может прервать действующие подключения."
+        TPROXY_ROLLBACK_MTPROXY_CHANGED=true
+        _telegram_proxy_install_backend "$source" || rc=1
+        changed=true
+    elif [[ "$changed" == true && $rc -eq 0 ]]; then
+        [[ "$active" != true ]] || warn "Обновление службы MTProxy прервёт действующие подключения."
+        TPROXY_ROLLBACK_MTPROXY_CHANGED=true
+        mkdir -p "$TPROXY_SYSTEMD_DIR" &&
+            install -m 0644 "$candidate" "$TPROXY_SYSTEMD_DIR/$TPROXY_UNIT_MTPROXY" || rc=1
+    fi
+    rm -f "$candidate"
+    if [[ $rc -ne 0 ]] || { [[ "$changed" == true ]] && ! systemctl daemon-reload; }; then
+        warn "Не удалось подготовить службу MTProxy."
+        return 1
+    fi
+    if ! systemctl enable --now "$TPROXY_UNIT_FIREWALL" "$TPROXY_UNIT_MTPROXY" ||
+       { [[ "$active" == true && "$changed" == true ]] && ! systemctl restart "$TPROXY_UNIT_MTPROXY"; }; then
+        warn "Не удалось запустить службу MTProxy."
+        return 1
+    fi
+    if ! systemctl enable --now "$TPROXY_UNIT_TIMER" >/dev/null 2>&1; then
+        warn "Не удалось включить автоматическое обновление службы MTProxy."
+        return 1
+    fi
+    if ! _telegram_proxy_wait_mtproxy_listener; then
+        warn "Служба MTProxy недоступна на 127.0.0.1:2398."
+        return 1
+    fi
+    return 0
+}
+
 _telegram_proxy_initialize_state() {
     TELEGRAM_PROXY_STATE_VERSION=1
     TELEGRAM_WEB_ENABLED=false
@@ -541,7 +597,7 @@ _telegram_proxy_initialize_state() {
 _telegram_proxy_reject_unmanaged_state() {
     if [[ -f "$TPROXY_CONF" ]]; then
         _telegram_proxy_load_conf && return 0
-        warn "Найден некорректный или устаревший state Telegram Proxy; автоматическое переиспользование запрещено."
+        warn "Найдено некорректное или устаревшее состояние Telegram Proxy; автоматическое переиспользование запрещено."
         return 1
     fi
     if [[ -e "$TPROXY_ENV_FILE" || -e "$TPROXY_MTPROXY_SOURCE_DIR" ||
@@ -557,6 +613,7 @@ _telegram_proxy_reject_unmanaged_state() {
 _telegram_proxy_snapshot_runtime() {
     local unit active enabled existed i
     TPROXY_ROLLBACK_RUNTIME_CAPTURED=true
+    TPROXY_ROLLBACK_MTPROXY_CHANGED=false
     TPROXY_ROLLBACK_UNIT_NAMES=(
         "$TPROXY_UNIT_RELAY" "$TPROXY_UNIT_MTPROXY"
         "$TPROXY_UNIT_FIREWALL" "$TPROXY_UNIT_REFRESH" "$TPROXY_UNIT_TIMER"
@@ -608,8 +665,13 @@ _telegram_proxy_restore_runtime() {
                 fi
                 continue
             fi
-            if [[ "${TPROXY_ROLLBACK_UNIT_ACTIVE[$i]:-}" == active ]] &&
-               ! systemctl start "$unit" >/dev/null 2>&1; then rc=1; fi
+            if [[ "${TPROXY_ROLLBACK_UNIT_ACTIVE[$i]:-}" == active ]]; then
+                if [[ "$unit" == "$TPROXY_UNIT_MTPROXY" && "$TPROXY_ROLLBACK_MTPROXY_CHANGED" == true ]]; then
+                    systemctl restart "$unit" >/dev/null 2>&1 || rc=1
+                else
+                    systemctl start "$unit" >/dev/null 2>&1 || rc=1
+                fi
+            fi
             if [[ "${TPROXY_ROLLBACK_UNIT_ACTIVE[$i]:-}" == inactive ]] &&
                ! systemctl stop "$unit" >/dev/null 2>&1; then rc=1; fi
             if [[ "${TPROXY_ROLLBACK_UNIT_ENABLED[$i]:-}" == enabled ]] &&
@@ -648,6 +710,8 @@ _telegram_proxy_restore_runtime() {
 
 _telegram_proxy_snapshot_paths() {
     local path index backup
+    TPROXY_ROLLBACK_CERT_IDENTITY=""
+    TPROXY_ROLLBACK_CERT_REGISTRATIONS=""
     TPROXY_ROLLBACK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/telegram-proxy-rollback.XXXXXX") || return 1
     chmod 0700 "$TPROXY_ROLLBACK_DIR" || {
         rm -rf "$TPROXY_ROLLBACK_DIR"
@@ -691,6 +755,11 @@ _telegram_proxy_restore_snapshot() {
             cp -a "$backup" "$path" || rc=1
         fi
     done
+    if [[ -n "${TPROXY_ROLLBACK_CERT_REGISTRATIONS:-}" ]]; then
+        _cert_restore_registrations "$TPROXY_ROLLBACK_CERT_IDENTITY" \
+            "$TPROXY_ROLLBACK_CERT_REGISTRATIONS" || rc=1
+        TPROXY_ROLLBACK_CERT_REGISTRATIONS=""
+    fi
     _telegram_proxy_restore_runtime || rc=1
     rm -rf "$TPROXY_ROLLBACK_DIR" || rc=1
     TPROXY_ROLLBACK_DIR=""
@@ -700,6 +769,7 @@ _telegram_proxy_restore_snapshot() {
     TPROXY_ROLLBACK_UNIT_NAMES=()
     TPROXY_ROLLBACK_UNIT_ACTIVE=()
     TPROXY_ROLLBACK_UNIT_ENABLED=()
+    TPROXY_ROLLBACK_MTPROXY_CHANGED=false
     return "$rc"
 }
 
@@ -708,12 +778,15 @@ _telegram_proxy_discard_snapshot() {
     local rc=0
     [[ -n "${TPROXY_ROLLBACK_DIR:-}" ]] && rm -rf "$TPROXY_ROLLBACK_DIR" || rc=1
     TPROXY_ROLLBACK_DIR=""
+    TPROXY_ROLLBACK_CERT_REGISTRATIONS=""
+    TPROXY_ROLLBACK_CERT_IDENTITY=""
     TPROXY_ROLLBACK_TARGETS=()
     TPROXY_ROLLBACK_BACKUPS=()
     TPROXY_ROLLBACK_UNIT_EXISTED=()
     TPROXY_ROLLBACK_UNIT_NAMES=()
     TPROXY_ROLLBACK_UNIT_ACTIVE=()
     TPROXY_ROLLBACK_UNIT_ENABLED=()
+    TPROXY_ROLLBACK_MTPROXY_CHANGED=false
     return "$rc"
 }
 
@@ -723,6 +796,10 @@ _telegram_proxy_restore_install_failure() {
     local temp_path="${5:-}" rc=0 backup
     if [[ -n "${TPROXY_ROLLBACK_DIR:-}" && -d "$TPROXY_ROLLBACK_DIR" ]]; then
         _telegram_proxy_restore_snapshot || rc=1
+        if [[ -n "${TPROXY_ROLLBACK_CERT_IDENTITY:-}" ]]; then
+            _telegram_proxy_restore_certificate_registration "$TPROXY_ROLLBACK_CERT_IDENTITY" || rc=1
+            TPROXY_ROLLBACK_CERT_IDENTITY=""
+        fi
         if [[ "$mt_user_before" == false ]] && id mtproxy >/dev/null 2>&1; then
             userdel mtproxy >/dev/null 2>&1 || rc=1
         fi
@@ -756,7 +833,7 @@ _telegram_proxy_restore_install_failure() {
     done
     [[ -n "$temp_path" ]] && rm -rf "$temp_path"
     if (( rc != 0 )); then
-        warn "Откат Telegram Proxy завершился с ошибками; проверьте services, firewall и nginx."
+        warn "Откат Telegram Proxy завершился с ошибками; проверьте службы, межсетевой экран и nginx."
     fi
     return "$rc"
 }
@@ -774,7 +851,7 @@ _telegram_proxy_public_ipv4() {
 }
 _telegram_proxy_public_ipv6() { curl -6 -fsS --max-time 5 https://ifconfig.co 2>/dev/null || curl -6 -fsS --max-time 5 https://api6.ipify.org 2>/dev/null; }
 _telegram_proxy_dns_ipv4() { getent ahostsv4 "$1" 2>/dev/null | awk 'NR == 1 { print $1; exit }'; }
-_telegram_proxy_dns_ipv6() { getent ahostsv6 "$1" 2>/dev/null | awk 'NR == 1 { print $1; exit }'; }
+_telegram_proxy_dns_ipv6() { getent ahostsv6 "$1" 2>/dev/null | awk 'tolower($1) !~ /^::ffff:/ { print $1; exit }'; }
 _telegram_proxy_ipv6_enabled() { [[ ! -f "$TPROXY_IPV6_DISABLE_FILE" || "$(cat "$TPROXY_IPV6_DISABLE_FILE" 2>/dev/null)" != 1 ]]; }
 
 _telegram_proxy_ufw_port_state() {
@@ -801,7 +878,7 @@ _telegram_proxy_check_ports() {
 }
 
 _telegram_proxy_render_nginx_site() {
-    local hostname="$1" topology="$2" ipv6="${3:-false}" listen h2="ssl http2;"
+    local hostname="$1" topology="$2" listen h2="ssl http2;"
     if type _nginx_h2_directives >/dev/null 2>&1; then _nginx_h2_directives >/dev/null 2>&1 || true; h2="${LISTEN_H2_FLAG:-ssl http2;}"; fi
     case "$topology" in direct) listen="    listen 443 $h2" ;; self-steal) listen="    listen 127.0.0.1:8443 $h2" ;; sni) listen="    listen 127.0.0.1:8446 $h2" ;; *) return 1 ;; esac
     mkdir -p "$(dirname "$TPROXY_NGINX_SITE")" || return 1
@@ -809,7 +886,7 @@ _telegram_proxy_render_nginx_site() {
 server {
 ${listen}
 EOF
-    if [[ "$topology" == direct || ( "$topology" == self-steal && "$ipv6" == true ) ]]; then printf '    listen [::]:443 ipv6only=on %s\n' "$h2" >> "$TPROXY_NGINX_SITE.tmp.$$"; fi
+    if [[ "$topology" == direct ]]; then printf '    listen [::]:443 ipv6only=on %s\n' "$h2" >> "$TPROXY_NGINX_SITE.tmp.$$"; fi
     cat >> "$TPROXY_NGINX_SITE.tmp.$$" <<EOF
     server_name ${hostname};
     ssl_certificate ${TPROXY_CERT_DIR}/${hostname}/fullchain.pem;
@@ -870,7 +947,7 @@ _telegram_proxy_ensure_dependencies() {
 
 _telegram_proxy_preflight() {
     [[ "$(id -u 2>/dev/null)" == 0 ]] || { warn "Установка требует root."; return 1; }
-    case "$(uname -m)" in x86_64|amd64) ;; *) warn "Официальный MTProxy build поддерживает только x86_64."; return 1 ;; esac
+    case "$(uname -m)" in x86_64|amd64) ;; *) warn "Официальная сборка MTProxy поддерживает только x86_64."; return 1 ;; esac
     local id_value=""
     [[ -r /etc/os-release ]] && id_value=$(sed -n 's/^ID=//p' /etc/os-release | tr -d '"' | awk 'NR == 1 { print; exit }')
     case "$id_value" in debian|ubuntu) ;; *) warn "Поддерживаются только Debian и Ubuntu."; return 1 ;; esac
@@ -886,11 +963,20 @@ _telegram_proxy_detect_topology() {
 
 _telegram_proxy_wait_dns() {
     local hostname="$1" public4="$2" public6="${3:-}" answer dns4 dns6
+    TELEGRAM_WEB_IPV6=false
     while true; do
         dns4=$(_telegram_proxy_dns_ipv4 "$hostname")
         [[ "$dns4" == "$public4" ]] && break
         warn "A-запись ${hostname}: ${dns4:-не найдена}; IPv4 ноды: ${public4}."
-        read -rp "Enter = перепроверить, 0 = отмена: " answer; [[ "$answer" == 0 ]] && return 1
+        while true; do
+            if ! IFS= read -rp "  Enter = перепроверить, 0 = отмена: " answer; then return 1; fi
+            answer="${answer%$'\r'}"
+            case "$answer" in
+                "") break ;;
+                0) return 1 ;;
+                *) warn "Неверный выбор." ;;
+            esac
+        done
     done
     dns6=$(_telegram_proxy_dns_ipv6 "$hostname")
     if [[ -n "$dns6" ]]; then
@@ -899,40 +985,46 @@ _telegram_proxy_wait_dns() {
     else TELEGRAM_WEB_IPV6=false; fi
 }
 
-_telegram_proxy_issue_certificate() {
-    local hostname="$1" tmp_site="$2" webroot="$TPROXY_WEBROOT_BASE/$1" before="absent"
-    mkdir -p "$webroot" "$(dirname "$tmp_site")" || return 1
-    printf 'telegram-proxy-acme\n' > "$webroot/index.html" || return 1
-    before=$(_telegram_proxy_ufw_port_state 80)
-    cat > "$tmp_site" <<EOF
-server {
-    listen 80;
-    server_name ${hostname};
-    location /.well-known/acme-challenge/ { root ${webroot}; }
-}
-EOF
-    ln -sf "$tmp_site" "$TPROXY_NGINX_ACME_SITE" || {
-        rm -f "$tmp_site"
-        return 1
-    }
-    if ! _telegram_proxy_ufw_apply_port 80 allow; then
-        rm -f "$TPROXY_NGINX_ACME_SITE" "$tmp_site"
-        _telegram_proxy_ufw_apply_port 80 "$before" >/dev/null 2>&1 || true
-        return 1
+_telegram_proxy_ensure_certificate() {
+    local hostname="$1" before rc=0
+    TPROXY_CERT_UFW_RESTORE_FAILED=false
+    before=$(_telegram_proxy_ufw_port_state 80) || return 1
+    if ensure_essence_acme_email "$TELEGRAM_WEB_EMAIL"; then
+        ensure_cert "$hostname" "$TPROXY_WEBROOT_BASE/$hostname" false \
+            "$TPROXY_CERT_DIR" "$TPROXY_NGINX_AVAILABLE_DIR" \
+            "$TPROXY_NGINX_ENABLED_DIR" "$TPROXY_NGINX_CONF" || rc=$?
+    else
+        rc=1
     fi
-    (
-        nginx -t &&
-        systemctl reload nginx &&
-        ensure_acme_installed "$TELEGRAM_WEB_EMAIL" &&
-        issue_cert "$hostname" "$webroot" false &&
-        install_cert "$hostname" "systemctl reload nginx"
-    ) || {
-        rm -f "$TPROXY_NGINX_ACME_SITE" "$tmp_site"
-        _telegram_proxy_ufw_apply_port 80 "$before" >/dev/null 2>&1 || true
-        return 1
-    }
-    rm -f "$TPROXY_NGINX_ACME_SITE" "$tmp_site"
-    _telegram_proxy_ufw_apply_port 80 "$before" || return 1
+    if ! _telegram_proxy_ufw_apply_port 80 "$before"; then
+        TPROXY_CERT_UFW_RESTORE_FAILED=true
+        warn "Не удалось восстановить исходное правило UFW TCP/80 после настройки сертификата."
+        rc=1
+    fi
+    return "$rc"
+}
+
+_telegram_proxy_snapshot_certificate_registration() {
+    local hostname="$1" registration_backup="$TPROXY_ROLLBACK_DIR/cert-registration"
+    [[ -n "${TPROXY_ROLLBACK_DIR:-}" && -d "$TPROXY_ROLLBACK_DIR" ]] || return 1
+    mkdir -m 0700 "$registration_backup" || return 1
+    _cert_snapshot_registrations "$hostname" "$registration_backup" || return 1
+    TPROXY_ROLLBACK_CERT_IDENTITY="$hostname"
+    TPROXY_ROLLBACK_CERT_REGISTRATIONS="$registration_backup"
+}
+
+_telegram_proxy_restore_certificate_registration() {
+    local hostname="$1" rc=0
+    _cert_has_consumers "$hostname" "$TPROXY_CERT_DIR" "$TPROXY_NGINX_CONF" || rc=$?
+    case "$rc" in
+        0)
+            _cert_find_consumer_directory "$hostname" "$TPROXY_CERT_DIR" "$TPROXY_NGINX_CONF" || return 1
+            _cert_resume_registration "$hostname" "$TPROXY_WEBROOT_BASE/$hostname" \
+                "$CERT_CONSUMER_CERT_DIR" "$TPROXY_NGINX_AVAILABLE_DIR" \
+                "$TPROXY_NGINX_ENABLED_DIR" "$TPROXY_NGINX_CONF" ;;
+        1) _cert_pause_registration "$hostname" ;;
+        *) return 1 ;;
+    esac
 }
 _telegram_proxy_install_pinned_go() {
     local version="${TPROXY_GO_VERSION:-1.26.5}"
@@ -983,6 +1075,29 @@ _telegram_proxy_find_go() {
     return 1
 }
 
+_telegram_proxy_build_relay() {
+    local source="$1" go_binary="$2" candidate="$3" build_tmp rc=0
+    build_tmp=$(mktemp -d /tmp/tproxy-build.XXXXXX) || return 1
+    if ! chown tproxy:tproxy "$build_tmp" || ! chmod 0700 "$build_tmp"; then
+        rm -rf "$build_tmp"
+        return 1
+    fi
+    if ! chown -R root:tproxy "$source" ||
+       ! chmod -R g+rX,g-w,o-rwx "$source"; then
+        rc=1
+    elif ! (cd "$source" &&
+            runuser -u tproxy -- env HOME="$build_tmp" GOCACHE="$build_tmp/cache" \
+                GOPATH="$build_tmp/gopath" TMPDIR="$build_tmp" \
+                "$go_binary" build -buildvcs=false -trimpath -ldflags='-s -w' -o "$candidate" ./cmd/tproxy-server); then
+        rc=1
+    fi
+    chown -R root:root "$source" || rc=1
+    chmod -R go-rwx "$source" || rc=1
+    chmod 0700 "$source" || rc=1
+    rm -rf "$build_tmp" || rc=1
+    return "$rc"
+}
+
 _telegram_proxy_install_web_service() {
     local source="$TPROXY_RELAY_SOURCE_PATH/deploy/tproxy-server.service"
     local target="$TPROXY_SYSTEMD_DIR/$TPROXY_UNIT_RELAY" tmp
@@ -1025,12 +1140,15 @@ telegram_proxy_mtproto_install() {
         [[ "$TELEGRAM_MTPROTO_ENABLED" == true ]] && {
             if _telegram_proxy_backend_active &&
                systemctl is-enabled --quiet "$TPROXY_UNIT_MTPROXY" 2>/dev/null &&
+               systemctl is-enabled --quiet "$TPROXY_UNIT_TIMER" 2>/dev/null &&
+               systemctl is-active --quiet "$TPROXY_UNIT_TIMER" 2>/dev/null &&
                (exec 3<>/dev/tcp/127.0.0.1/2398) 2>/dev/null; then
                 exec 3>&- 3<&-
-                info "MTProto уже установлен и работает."
-                return 0
+                info "MTProto Proxy уже включён и работает."
+                _telegram_proxy_show_completed_connection "$force"
+                return $?
             fi
-            warn "MTProto отмечен установленным, но runtime не здоров; выполняется reconcile."
+            warn "MTProto Proxy включён, но работает некорректно; выполняется восстановление."
         }
         backend_was=true
         secret="$TPROXY_RUNTIME_SECRET"
@@ -1044,16 +1162,17 @@ telegram_proxy_mtproto_install() {
     if [[ "$backend_was" != true ]]; then
         _telegram_proxy_check_ports 2398 8888 || return 1
         secret=$(_telegram_proxy_generate_secret) || return 1
-        id mtproxy >/dev/null 2>&1 && mt_user_before=true
     elif ! _telegram_proxy_backend_active; then
         _telegram_proxy_check_ports 2398 8888 || return 1
     fi
     before_ufw=$(_telegram_proxy_ufw_port_state 2398)
-    echo ""
-    info "MTProto: ${public4}:2398"
-    warn "Provider firewall: разрешите TCP/2398 и запретите TCP/8888."
-    [[ "$force" == true ]] || confirm_yn "Provider firewall настроен, продолжить?" || return 0
-    [[ "$force" == true ]] || confirm_yn "Установить MTProto?" || return 0
+    id mtproxy >/dev/null 2>&1 && mt_user_before=true
+    if [[ "$force" != true ]]; then
+        review_frame "Включение MTProto Proxy" "Адрес: ${public4}:2398" \
+            "В межсетевом экране провайдера разрешите TCP/2398 и запретите TCP/8888." \
+            "Служба MTProxy устанавливается автоматически; её восстановление может прервать подключения."
+        confirm_yn "Межсетевой экран провайдера настроен. Включить MTProto Proxy?" N || return 0
+    fi
     _telegram_proxy_snapshot_paths \
         "$TPROXY_CONF" "$TPROXY_ENV_FILE" "$TPROXY_MTPROXY_DIR" \
         "$TPROXY_MTPROXY_SOURCE_DIR" "$TPROXY_FIREWALL_FILE" \
@@ -1061,66 +1180,30 @@ telegram_proxy_mtproto_install() {
         "$TPROXY_SYSTEMD_DIR/$TPROXY_UNIT_FIREWALL" \
         "$TPROXY_SYSTEMD_DIR/$TPROXY_UNIT_REFRESH" \
         "$TPROXY_SYSTEMD_DIR/$TPROXY_UNIT_TIMER" "$TPROXY_REFRESH_BIN" || return 1
-    if [[ "$backend_was" != true ]]; then
-        source_tmp=$(mktemp -d "${TMPDIR:-/tmp}/tproxy-source.XXXXXX") || {
-            _telegram_proxy_restore_snapshot
-            return 1
-        }
-        chmod 0700 "$source_tmp" || {
-            rm -rf "$source_tmp"
-            _telegram_proxy_restore_snapshot
-            return 1
-        }
-        if ! _telegram_proxy_clone_relay "$source_tmp"; then
-            rm -rf "$source_tmp"
-            _telegram_proxy_restore_snapshot
-            return 1
-        fi
-        _telegram_proxy_render_mtproxy_env "$secret" || {
-            rm -rf "$source_tmp"
-            _telegram_proxy_restore_snapshot
-            return 1
-        }
-        _telegram_proxy_install_backend "$source_tmp" || {
-            rm -rf "$source_tmp"
-            _telegram_proxy_restore_install_failure "" "$before_ufw" "$mt_user_before" true
-            return 1
-        }
-        rm -rf "$source_tmp"
-        if ! systemctl daemon-reload; then
-            _telegram_proxy_restore_install_failure "" "$before_ufw" "$mt_user_before" true
-            return 1
-        fi
-        if ! systemctl enable --now "$TPROXY_UNIT_FIREWALL" "$TPROXY_UNIT_MTPROXY"; then
-            _telegram_proxy_restore_install_failure "" "$before_ufw" "$mt_user_before" true
-            return 1
-        fi
-        if ! systemctl enable --now "$TPROXY_UNIT_TIMER" >/dev/null 2>&1; then
-            _telegram_proxy_restore_install_failure "" "$before_ufw" "$mt_user_before" true
-            return 1
-        fi
-        if [[ "$mt_user_before" == false ]] && id mtproxy >/dev/null 2>&1; then
-            MTPROXY_CREATED_USER=true
-        fi
-    else
-        _telegram_proxy_render_firewall true || {
-            _telegram_proxy_restore_install_failure "" "$before_ufw" "$mt_user_before" true
-            return 1
-        }
-        if ! systemctl reload "$TPROXY_UNIT_FIREWALL" >/dev/null 2>&1 &&
-           ! systemctl restart "$TPROXY_UNIT_FIREWALL" >/dev/null 2>&1; then
-            _telegram_proxy_restore_install_failure "" "$before_ufw" "$mt_user_before" true
-            return 1
-        fi
-        if ! _telegram_proxy_backend_active &&
-           ! systemctl enable --now "$TPROXY_UNIT_MTPROXY"; then
-            _telegram_proxy_restore_install_failure "" "$before_ufw" "$mt_user_before" true
-            return 1
-        fi
-        if ! systemctl enable --now "$TPROXY_UNIT_TIMER" >/dev/null 2>&1; then
-            _telegram_proxy_restore_install_failure "" "$before_ufw" "$mt_user_before" true
-            return 1
-        fi
+    source_tmp=$(mktemp -d "${TMPDIR:-/tmp}/tproxy-source.XXXXXX") || {
+        warn "Не удалось подготовить службу MTProxy."
+        _telegram_proxy_restore_install_failure "" "$before_ufw" "$mt_user_before" true
+        return 1
+    }
+    if ! chmod 0700 "$source_tmp" || ! _telegram_proxy_clone_relay "$source_tmp"; then
+        warn "Не удалось подготовить службу MTProxy."
+        _telegram_proxy_restore_install_failure "" "$before_ufw" "$mt_user_before" true "$source_tmp"
+        return 1
+    fi
+    if ! _telegram_proxy_prepare_backend "$source_tmp" "$secret" "$backend_was"; then
+        _telegram_proxy_restore_install_failure "" "$before_ufw" "$mt_user_before" true "$source_tmp"
+        return 1
+    fi
+    rm -rf "$source_tmp"
+    if [[ "$mt_user_before" == false ]] && id mtproxy >/dev/null 2>&1; then MTPROXY_CREATED_USER=true; fi
+    _telegram_proxy_render_firewall true || {
+        _telegram_proxy_restore_install_failure "" "$before_ufw" "$mt_user_before" true
+        return 1
+    }
+    if ! systemctl reload "$TPROXY_UNIT_FIREWALL" >/dev/null 2>&1 &&
+       ! systemctl restart "$TPROXY_UNIT_FIREWALL" >/dev/null 2>&1; then
+        _telegram_proxy_restore_install_failure "" "$before_ufw" "$mt_user_before" true
+        return 1
     fi
     if ! _telegram_proxy_ufw_apply_port 2398 allow; then
         _telegram_proxy_restore_install_failure "" "$before_ufw" "$mt_user_before" true
@@ -1135,13 +1218,30 @@ telegram_proxy_mtproto_install() {
         return 1
     fi
     _telegram_proxy_discard_snapshot
-    success "MTProto установлен. Откройте Connection в меню Telegram Proxy для ссылки."
-    return 0
+    success "MTProto Proxy включён."
+    _telegram_proxy_show_completed_connection "$force"
+}
+
+_telegram_proxy_wait_nginx_tls() {
+    local hostname="$1" topology="$2" attempts="${3:-$TPROXY_READY_ATTEMPTS}" port attempt
+    case "$topology" in
+        direct) port=443 ;;
+        self-steal) port=8443 ;;
+        sni) port=8446 ;;
+        *) return 1 ;;
+    esac
+    for ((attempt=1; attempt<=attempts; attempt++)); do
+        curl --disable --noproxy '*' --resolve "${hostname}:${port}:127.0.0.1" \
+            --max-time 2 --silent --output /dev/null "https://${hostname}:${port}/" \
+            2>/dev/null && return 0
+        ((attempt < attempts)) && sleep 1
+    done
+    return 1
 }
 
 telegram_proxy_web_install() {
     local force=false arg hostname email public4 public6 topology secret backend_was=false
-    local relay_tmp source_tmp go_binary candidate mt_user_before=false tproxy_user_before=false before_80
+    local relay_tmp go_binary candidate mt_user_before=false tproxy_user_before=false before_80
     for arg in "$@"; do
         case "$arg" in
             --force) force=true ;;
@@ -1152,11 +1252,20 @@ telegram_proxy_web_install() {
         _telegram_proxy_load_conf || return 1
         _telegram_proxy_runtime_consistent || return 1
         [[ "$TELEGRAM_WEB_ENABLED" == true ]] && {
-            if _telegram_proxy_web_runtime_healthy; then
-                info "WEB уже установлен и работает."
-                return 0
+            if _telegram_proxy_web_runtime_healthy &&
+               _telegram_proxy_backend_active &&
+               systemctl is-enabled --quiet "$TPROXY_UNIT_TIMER" 2>/dev/null &&
+               systemctl is-active --quiet "$TPROXY_UNIT_TIMER" 2>/dev/null &&
+               _telegram_proxy_wait_mtproxy_listener; then
+                if _telegram_proxy_wait_nginx_tls "$TELEGRAM_WEB_HOSTNAME" "$TELEGRAM_WEB_TOPOLOGY" 1; then
+                    info "Web Proxy уже включён и работает."
+                    _telegram_proxy_show_completed_connection "$force"
+                    return $?
+                fi
+                warn "Web Proxy работает, но TLS nginx для ${TELEGRAM_WEB_HOSTNAME} недоступен; полная переустановка не выполнялась."
+                return 1
             fi
-            warn "WEB отмечен установленным, но runtime не здоров; выполняется reconcile."
+            warn "Web Proxy включён, но работает некорректно; выполняется восстановление."
         }
         backend_was=true
         secret="$TPROXY_RUNTIME_SECRET"
@@ -1165,12 +1274,11 @@ telegram_proxy_web_install() {
         secret=""
     fi
 
-    read -rp "Введите hostname для Telegram WEB: " hostname
-    hostname=$(printf '%s' "$hostname" | tr -d '\r')
-    _telegram_proxy_valid_hostname "$hostname" || { warn "Некорректный hostname."; return 1; }
-    read -rp "Введите обязательный ACME email: " email
-    email=$(printf '%s' "$email" | tr -d '\r')
-    _telegram_proxy_valid_email "$email" || { warn "Некорректный ACME email."; return 1; }
+    IFS= read -rp "  Доменное имя для Web Proxy: " hostname || return 1
+    hostname="${hostname%$'\r'}"
+    _telegram_proxy_valid_hostname "$hostname" || { warn "Некорректное доменное имя."; return 1; }
+    acme_select_email || return 1
+    email="$ACME_SELECTED_EMAIL"
     TELEGRAM_WEB_EMAIL="$email"
     _telegram_proxy_preflight || return 1
     public4=$(_telegram_proxy_public_ipv4 | tr -d '[:space:]')
@@ -1181,62 +1289,52 @@ telegram_proxy_web_install() {
     if [[ "$backend_was" != true ]]; then
         _telegram_proxy_check_ports 2398 8888 8080 8081 || return 1
         secret=$(_telegram_proxy_generate_secret) || return 1
-        id mtproxy >/dev/null 2>&1 && mt_user_before=true
     else
         _telegram_proxy_check_ports 8080 8081 || return 1
     fi
-    echo ""
-    info "WEB: ${hostname}; topology=${topology}; IPv6=${TELEGRAM_WEB_IPV6}"
-    warn "Provider firewall: разрешите TCP/80 и TCP/443; запретите TCP/8080 и TCP/8081."
-    [[ "$backend_was" == true ]] || warn "WEB-only режим блокирует TCP/2398 до добавления MTProto."
-    [[ "$force" == true ]] || confirm_yn "Provider firewall настроен, продолжить?" || return 0
-    [[ "$force" == true ]] || confirm_yn "Установить Telegram WEB?" || return 0
+    if [[ "$force" != true ]]; then
+        review_frame "Включение Web Proxy" "Домен: ${hostname}" \
+            "IPv6: $([[ "$TELEGRAM_WEB_IPV6" == true ]] && printf включён || printf выключен)" \
+            "Откройте TCP/80 и TCP/443 в межсетевом экране провайдера." \
+            "Web Proxy работает через HTTPS (WebSocket) и требует клиента Telegram с поддержкой Web Proxy; обычная ссылка t.me/proxy есть только у MTProto Proxy." \
+            "Служба MTProxy устанавливается автоматически; её восстановление может прервать подключения."
+        confirm_yn "Межсетевой экран провайдера настроен. Включить Web Proxy?" N || return 0
+    fi
     before_80=$(_telegram_proxy_ufw_port_state 80)
     id tproxy >/dev/null 2>&1 && tproxy_user_before=true
+    id mtproxy >/dev/null 2>&1 && mt_user_before=true
     _telegram_proxy_snapshot_paths \
         "$TPROXY_CONF" "$TPROXY_TOKEN_KEY" "$TPROXY_ENV_FILE" "$TPROXY_PROFILES_FILE" \
         "$TPROXY_CONFIG_JSON" "$TPROXY_MTPROXY_DIR" "$TPROXY_MTPROXY_SOURCE_DIR" \
         "$TPROXY_RELAY_SOURCE_PATH" "$TPROXY_SITE_DIR" "$TPROXY_BIN" \
         "$TPROXY_NGINX_SITE" "$TPROXY_NGINX_ENABLED" "$TPROXY_NGINX_ACME_SITE" \
+        "$TPROXY_NGINX_SITE.acme" \
         "$TPROXY_NGINX_CONF" "$TPROXY_CERT_DIR/$hostname" "$TPROXY_WEBROOT_BASE/$hostname" \
+        "$TPROXY_NGINX_AVAILABLE_DIR/essence-acme-$hostname" \
+        "$TPROXY_NGINX_ENABLED_DIR/essence-acme-$hostname" \
         "$TPROXY_SYSTEMD_DIR/$TPROXY_UNIT_RELAY" "$TPROXY_SYSTEMD_DIR/$TPROXY_UNIT_MTPROXY" \
         "$TPROXY_SYSTEMD_DIR/$TPROXY_UNIT_FIREWALL" "$TPROXY_SYSTEMD_DIR/$TPROXY_UNIT_REFRESH" \
         "$TPROXY_SYSTEMD_DIR/$TPROXY_UNIT_TIMER" "$TPROXY_FIREWALL_FILE" \
         "$TPROXY_REFRESH_BIN" || return 1
-
-    if [[ "$backend_was" != true ]]; then
-        source_tmp=$(mktemp -d "${TMPDIR:-/tmp}/tproxy-source.XXXXXX") || {
-            _telegram_proxy_restore_install_failure "$before_80" "" "$mt_user_before" "$tproxy_user_before"; return 1;
-        }
-        chmod 0700 "$source_tmp" || {
-            rm -rf "$source_tmp"; _telegram_proxy_restore_install_failure "$before_80" "" "$mt_user_before" "$tproxy_user_before"; return 1;
-        }
-        if ! _telegram_proxy_clone_relay "$source_tmp"; then
-            rm -rf "$source_tmp"; _telegram_proxy_restore_install_failure "$before_80" "" "$mt_user_before" "$tproxy_user_before"; return 1
-        fi
-        _telegram_proxy_render_mtproxy_env "$secret" || {
-            rm -rf "$source_tmp"; _telegram_proxy_restore_install_failure "$before_80" "" "$mt_user_before" "$tproxy_user_before"; return 1;
-        }
-        _telegram_proxy_install_backend "$source_tmp" || {
-            rm -rf "$source_tmp"; _telegram_proxy_restore_install_failure "$before_80" "" "$mt_user_before" "$tproxy_user_before"; return 1;
-        }
-        rm -rf "$source_tmp"
-        systemctl daemon-reload || {
-            _telegram_proxy_restore_install_failure "$before_80" "" "$mt_user_before" "$tproxy_user_before"; return 1;
-        }
-        systemctl enable --now "$TPROXY_UNIT_FIREWALL" "$TPROXY_UNIT_MTPROXY" || {
-            _telegram_proxy_restore_install_failure "$before_80" "" "$mt_user_before" "$tproxy_user_before"; return 1;
-        }
-        if [[ "$mt_user_before" == false ]] && id mtproxy >/dev/null 2>&1; then MTPROXY_CREATED_USER=true; fi
-    fi
-
-    relay_tmp=$(mktemp -d "${TMPDIR:-/tmp}/tproxy-relay.XXXXXX") || {
+    _telegram_proxy_snapshot_certificate_registration "$hostname" || {
         _telegram_proxy_restore_install_failure "$before_80" "" "$mt_user_before" "$tproxy_user_before"; return 1;
     }
-    chmod 0700 "$relay_tmp" || { rm -rf "$relay_tmp"; _telegram_proxy_restore_install_failure "$before_80" "" "$mt_user_before" "$tproxy_user_before"; return 1; }
-    if ! _telegram_proxy_clone_relay "$relay_tmp"; then
+    rm -f "$TPROXY_NGINX_ACME_SITE" "$TPROXY_NGINX_SITE.acme" || {
+        _telegram_proxy_restore_install_failure "$before_80" "" "$mt_user_before" "$tproxy_user_before"; return 1;
+    }
+
+    relay_tmp=$(mktemp -d "${TMPDIR:-/tmp}/tproxy-relay.XXXXXX") || {
+        warn "Не удалось подготовить службу MTProxy."
+        _telegram_proxy_restore_install_failure "$before_80" "" "$mt_user_before" "$tproxy_user_before"; return 1;
+    }
+    if ! chmod 0700 "$relay_tmp" || ! _telegram_proxy_clone_relay "$relay_tmp"; then
+        warn "Не удалось подготовить службу MTProxy."
         _telegram_proxy_restore_install_failure "$before_80" "" "$mt_user_before" "$tproxy_user_before" "$relay_tmp"; return 1
     fi
+    if ! _telegram_proxy_prepare_backend "$relay_tmp" "$secret" "$backend_was"; then
+        _telegram_proxy_restore_install_failure "$before_80" "" "$mt_user_before" "$tproxy_user_before" "$relay_tmp"; return 1
+    fi
+    if [[ "$mt_user_before" == false ]] && id mtproxy >/dev/null 2>&1; then MTPROXY_CREATED_USER=true; fi
     rm -rf "$TPROXY_RELAY_SOURCE_PATH"
     mkdir -p "$(dirname "$TPROXY_RELAY_SOURCE_PATH")" || {
         _telegram_proxy_restore_install_failure "$before_80" "" "$mt_user_before" "$tproxy_user_before" "$relay_tmp"; return 1;
@@ -1254,7 +1352,6 @@ telegram_proxy_web_install() {
         TPROXY_CREATED_USER=true
     else
         tproxy_user_before=true
-        TPROXY_CREATED_USER=false
     fi
     install -d -o root -g tproxy -m 0750 "$TPROXY_DIR" || {
         _telegram_proxy_restore_install_failure "$before_80" "" "$mt_user_before" "$tproxy_user_before"; return 1;
@@ -1263,7 +1360,7 @@ telegram_proxy_web_install() {
         _telegram_proxy_restore_install_failure "$before_80" "" "$mt_user_before" "$tproxy_user_before"; return 1;
     }
     if ! ( _randomhtml "" "$TPROXY_SITE_DIR" ); then
-        warn "Не удалось подготовить сайт-заглушку Telegram WEB."
+        warn "Не удалось подготовить сайт-заглушку Web Proxy."
         _telegram_proxy_restore_install_failure "$before_80" "" "$mt_user_before" "$tproxy_user_before"; return 1
     fi
     [[ -f "$TPROXY_SITE_DIR/index.html" && -r "$TPROXY_SITE_DIR/index.html" ]] || {
@@ -1291,10 +1388,11 @@ telegram_proxy_web_install() {
         warn "Не удалось подготовить Go 1.20+."
         _telegram_proxy_restore_install_failure "$before_80" "" "$mt_user_before" "$tproxy_user_before"; return 1;
     }
-    candidate="$(mktemp "${TMPDIR:-/tmp}/tproxy-server.XXXXXX")"
+    candidate="$(mktemp /tmp/tproxy-server.XXXXXX)" || {
+        _telegram_proxy_restore_install_failure "$before_80" "" "$mt_user_before" "$tproxy_user_before"; return 1;
+    }
     rm -f "$candidate"
-    if ! (cd "$TPROXY_RELAY_SOURCE_PATH" &&
-          runuser -u tproxy -- "$go_binary" build -trimpath -ldflags='-s -w' -o "$candidate" ./cmd/tproxy-server); then
+    if ! _telegram_proxy_build_relay "$TPROXY_RELAY_SOURCE_PATH" "$go_binary" "$candidate"; then
         rm -f "$candidate"
         _telegram_proxy_restore_install_failure "$before_80" "" "$mt_user_before" "$tproxy_user_before"; return 1
     fi
@@ -1331,36 +1429,55 @@ telegram_proxy_web_install() {
     [[ "$TELEGRAM_RELAY_UPSTREAM_SHA" == "$TPROXY_UPSTREAM_CHECKSUM" ]] || {
         _telegram_proxy_restore_install_failure "$before_80" "" "$mt_user_before" "$tproxy_user_before"; return 1;
     }
-    _telegram_proxy_issue_certificate "$hostname" "$TPROXY_NGINX_SITE.acme" || {
+    _telegram_proxy_ensure_certificate "$hostname" || {
+        [[ "$TPROXY_CERT_UFW_RESTORE_FAILED" == true ]] ||
+            warn "Не удалось выпустить/установить сертификат Web Proxy."
         _telegram_proxy_restore_install_failure "$before_80" "" "$mt_user_before" "$tproxy_user_before"; return 1;
     }
-    _telegram_proxy_render_nginx_site "$hostname" "$topology" "$TELEGRAM_WEB_IPV6" || {
+    _telegram_proxy_render_nginx_site "$hostname" "$topology" || {
+        warn "Не удалось создать конфиг nginx для Web Proxy."
         _telegram_proxy_restore_install_failure "$before_80" "" "$mt_user_before" "$tproxy_user_before"; return 1;
     }
     if [[ "$topology" == sni ]] && ! _telegram_proxy_patch_sni_nginx "$hostname"; then
+        warn "Не удалось изменить SNI-конфиг nginx."
         _telegram_proxy_restore_install_failure "$before_80" "" "$mt_user_before" "$tproxy_user_before"; return 1
     fi
     ln -sf "$TPROXY_NGINX_SITE" "$TPROXY_NGINX_ENABLED" || {
+        warn "Не удалось включить сайт nginx для Web Proxy."
         _telegram_proxy_restore_install_failure "$before_80" "" "$mt_user_before" "$tproxy_user_before"; return 1;
     }
-    nginx -t || { _telegram_proxy_restore_install_failure "$before_80" "" "$mt_user_before" "$tproxy_user_before"; return 1; }
-    systemctl reload nginx || { _telegram_proxy_restore_install_failure "$before_80" "" "$mt_user_before" "$tproxy_user_before"; return 1; }
+    nginx -t || {
+        warn "Не прошла проверка nginx -t для Web Proxy."
+        _telegram_proxy_restore_install_failure "$before_80" "" "$mt_user_before" "$tproxy_user_before"; return 1;
+    }
+    systemctl reload nginx || {
+        warn "Не удалось перезагрузить nginx для Web Proxy."
+        _telegram_proxy_restore_install_failure "$before_80" "" "$mt_user_before" "$tproxy_user_before"; return 1;
+    }
+    _telegram_proxy_wait_nginx_tls "$hostname" "$topology" || {
+        warn "TLS nginx для ${hostname} не прошёл проверку после перезагрузки."
+        _telegram_proxy_restore_install_failure "$before_80" "" "$mt_user_before" "$tproxy_user_before"
+        return 1
+    }
     _telegram_proxy_render_firewall "$TELEGRAM_MTPROTO_ENABLED" || {
+        warn "Не удалось создать файл nftables для Web Proxy."
         _telegram_proxy_restore_install_failure "$before_80" "" "$mt_user_before" "$tproxy_user_before"; return 1;
     }
     if ! systemctl reload "$TPROXY_UNIT_FIREWALL" >/dev/null 2>&1 &&
        ! systemctl restart "$TPROXY_UNIT_FIREWALL" >/dev/null 2>&1; then
+        warn "Не удалось перезагрузить или перезапустить tproxy-firewall.service."
         _telegram_proxy_restore_install_failure "$before_80" "" "$mt_user_before" "$tproxy_user_before"; return 1
     fi
     _telegram_proxy_verify_components || {
         _telegram_proxy_restore_install_failure "$before_80" "" "$mt_user_before" "$tproxy_user_before"; return 1;
     }
     _telegram_proxy_state_write || {
+        warn "Не удалось записать состояние Web Proxy."
         _telegram_proxy_restore_install_failure "$before_80" "" "$mt_user_before" "$tproxy_user_before"; return 1;
     }
     _telegram_proxy_discard_snapshot
-    success "Telegram WEB установлен. Откройте Connection в меню Telegram Proxy для ссылки."
-    return 0
+    success "Web Proxy включён."
+    _telegram_proxy_show_completed_connection "$force"
 }
 
 # ─── Lifecycle ──────────────────────────────────────────────────────────────
@@ -1380,10 +1497,29 @@ telegram_proxy_status() {
             *) return 2 ;;
         esac
     done
-    _telegram_proxy_is_installed || {
-        [[ "$json" == true ]] && printf '%s\n' '{"installed":false,"web_enabled":false,"mtproto_enabled":false,"tag_configured":false}'
+    if [[ ! -e "$TPROXY_CONF" && ! -L "$TPROXY_CONF" ]]; then
+        if ! _telegram_proxy_reject_unmanaged_state >&2 ||
+           [[ -e "$TPROXY_PROFILES_FILE" || -L "$TPROXY_PROFILES_FILE" ||
+              -e "$TPROXY_CONFIG_JSON" || -L "$TPROXY_CONFIG_JSON" ||
+              -e "$TPROXY_FIREWALL_FILE" || -L "$TPROXY_FIREWALL_FILE" ]]; then
+            warn "Некорректное состояние Telegram Proxy: найдены неуправляемые артефакты." >&2
+            return 1
+        fi
+        if [[ "$json" == true ]]; then
+            printf '%s\n' '{"installed":false,"web_enabled":false,"mtproto_enabled":false,"tag_configured":false}'
+        else
+            info "Telegram Proxy не установлен"
+        fi
         return 3
-    }
+    fi
+    if ! _telegram_proxy_load_conf; then
+        warn "Некорректное состояние Telegram Proxy." >&2
+        return 1
+    fi
+    if ! _telegram_proxy_runtime_consistent; then
+        warn "Конфигурация и состояние служб Telegram Proxy не согласованы." >&2
+        return 1
+    fi
     backend=$(_telegram_proxy_service_state "$TPROXY_UNIT_MTPROXY")
     firewall=$(_telegram_proxy_service_state "$TPROXY_UNIT_FIREWALL")
     timer=$(_telegram_proxy_service_state "$TPROXY_UNIT_TIMER")
@@ -1436,17 +1572,56 @@ telegram_proxy_status() {
     fi
     info "Telegram Proxy"
     if [[ "$TELEGRAM_WEB_ENABLED" == true ]]; then
-        info "WEB: active (${TELEGRAM_WEB_HOSTNAME}); topology=${TELEGRAM_WEB_TOPOLOGY}; health=${health}; readiness=${readiness}"
+        case "$health" in ok) health=успешно ;; failed) health=ошибка ;; *) health="не проверено" ;; esac
+        case "$readiness" in ok) readiness=успешно ;; failed) readiness=ошибка ;; *) readiness="не проверено" ;; esac
+        case "$commit_state" in current) commit_state=актуально ;; "update available") commit_state=доступно ;; *) commit_state="не проверено" ;; esac
+        info "Web Proxy: включён (${TELEGRAM_WEB_HOSTNAME}); служба: $(_telegram_proxy_human_service_state "$TPROXY_UNIT_RELAY"); проверка работы: ${health}; готовность: ${readiness}; сертификат до: ${cert:-не проверено}; обновление: ${commit_state}"
     else
-        info "WEB: inactive"
+        info "Web Proxy: выключен"
     fi
     if [[ "$TELEGRAM_MTPROTO_ENABLED" == true ]]; then
-        info "MTProto: active (${TELEGRAM_MTPROTO_IPV4}:2398); listener=${listener}; ip=${ip_state}"
+        case "$listener" in true) listener=доступен ;; *) listener=недоступен ;; esac
+        case "$ip_state" in current) ip_state=актуален ;; changed) ip_state="изменился — обновите IP" ;; *) ip_state="не проверено" ;; esac
+        info "MTProto Proxy: включён (${TELEGRAM_MTPROTO_IPV4}:2398); приём подключений: ${listener}; IPv4: ${ip_state}"
     else
-        info "MTProto: inactive"
+        info "MTProto Proxy: выключен"
     fi
-    info "Shared: backend=${backend}; firewall=${firewall}; timer=${timer}; tag_configured=${TELEGRAM_TAG_CONFIGURED}"
-    info "Ссылки и secret доступны только в Connection."
+    info "Служба MTProxy: $(_telegram_proxy_human_service_state "$TPROXY_UNIT_MTPROXY"); межсетевой экран: $(_telegram_proxy_human_service_state "$TPROXY_UNIT_FIREWALL"); автоматическое обновление: $(_telegram_proxy_human_service_state "$TPROXY_UNIT_TIMER")"
+    if [[ "$TELEGRAM_TAG_CONFIGURED" == true ]]; then
+        info "Спонсорский тег: настроен"
+    else
+        info "Спонсорский тег: не настроен"
+    fi
+}
+
+_telegram_proxy_human_service_state() {
+    if systemctl is-active --quiet "$1" 2>/dev/null; then
+        printf '%s\n' "работает"
+    elif systemctl is-failed --quiet "$1" 2>/dev/null; then
+        printf '%s\n' "ошибка"
+    elif [[ ! -e "$TPROXY_SYSTEMD_DIR/$1" ]]; then
+        printf '%s\n' "не установлена"
+    else
+        printf '%s\n' "остановлена"
+    fi
+}
+
+_telegram_proxy_access_summary() {
+    local modes=()
+    [[ "$TELEGRAM_WEB_ENABLED" != true ]] || modes+=("Web Proxy: ${TELEGRAM_WEB_HOSTNAME}")
+    [[ "$TELEGRAM_MTPROTO_ENABLED" != true ]] || modes+=("MTProto Proxy: ${TELEGRAM_MTPROTO_IPV4}:2398")
+    printf '%s\n' "${modes[@]}"
+}
+
+_telegram_proxy_show_completed_connection() {
+    if [[ "${1:-false}" == true ]]; then
+        info "Ссылки подключения: пункт «Показать ссылки подключения»."
+        return 0
+    fi
+    telegram_proxy_connection || {
+        warn "Операция выполнена, но данные подключения получить не удалось."
+        return 1
+    }
 }
 
 telegram_proxy_connection() {
@@ -1456,15 +1631,15 @@ telegram_proxy_connection() {
         return 3
     }
     local secret="$TPROXY_RUNTIME_SECRET"
-    echo "Telegram Proxy connection (credentials показываются только по явному запросу):"
-    echo "Secret: ${secret}"
+    info "Данные подключения Telegram Proxy:"
+    echo "Общий секрет: ${secret}"
     if [[ "$TELEGRAM_WEB_ENABLED" == true ]]; then
-        echo "WEB: https://t.me/webproxy?server=${TELEGRAM_WEB_HOSTNAME}&port=443&secret=${secret}"
-        echo "WEB: tg://webproxy?server=${TELEGRAM_WEB_HOSTNAME}&port=443&secret=${secret}"
+        echo "Web Proxy: tg://webproxy?server=${TELEGRAM_WEB_HOSTNAME}&port=443&secret=${secret}"
+        echo "  (нужен клиент Telegram с поддержкой Web Proxy)"
     fi
     if [[ "$TELEGRAM_MTPROTO_ENABLED" == true ]]; then
-        echo "MTProto: https://t.me/proxy?server=${TELEGRAM_MTPROTO_IPV4}&port=2398&secret=${secret}"
-        echo "MTProto: tg://proxy?server=${TELEGRAM_MTPROTO_IPV4}&port=2398&secret=${secret}"
+        echo "MTProto Proxy: https://t.me/proxy?server=${TELEGRAM_MTPROTO_IPV4}&port=2398&secret=${secret}"
+        echo "MTProto Proxy: tg://proxy?server=${TELEGRAM_MTPROTO_IPV4}&port=2398&secret=${secret}"
     fi
 }
 
@@ -1475,7 +1650,7 @@ telegram_proxy_tag_show() {
     if [[ -n "$TPROXY_RUNTIME_TAG" ]]; then
         printf '%s\n' "$TPROXY_RUNTIME_TAG"
     else
-        info "Tag не настроен."
+        info "Спонсорский тег не настроен."
     fi
 }
 _telegram_proxy_web_secret_accepted() {
@@ -1504,9 +1679,19 @@ _telegram_proxy_wait_mtproxy_listener() {
 }
 
 _telegram_proxy_verify_components() {
-    _telegram_proxy_wait_mtproxy_listener || return 1
+    _telegram_proxy_wait_mtproxy_listener || {
+        warn "Служба MTProxy недоступна на 127.0.0.1:2398."
+        return 1
+    }
     if [[ "$TELEGRAM_WEB_ENABLED" == true ]]; then
-        _telegram_proxy_wait_endpoint "$TPROXY_READY_URL" || return 1
+        _telegram_proxy_wait_endpoint "$TPROXY_READY_URL" || {
+            if [[ "$TPROXY_READY_URL" == http://127.0.0.1:8081/readyz ]]; then
+                warn "Web Proxy недоступен на 127.0.0.1:8081/readyz."
+            else
+                warn "Web Proxy: настроенная проверка готовности не прошла."
+            fi
+            return 1
+        }
     fi
 }
 
@@ -1523,11 +1708,18 @@ telegram_proxy_tag_set() {
     local tag old_env old_tag
     [[ $# -eq 0 ]] || return 2
     _telegram_proxy_is_installed || return 3
-    confirm_yn "Изменить общий tag (кратко затронет WEB и MTProto)?" || return 0
-    read -rsp "Введите tag (ровно 32 hex): " tag
+    local access=()
+    while IFS= read -r old_tag; do access+=("$old_tag"); done < <(_telegram_proxy_access_summary)
+    if [[ "$TELEGRAM_TAG_CONFIGURED" == true ]]; then
+        review_frame "Замена Спонсорского тега" "${access[@]}" \
+            "Спонсорский канал изменится; перезапуск службы MTProxy прервёт подключения."
+        confirm_yn "Заменить Спонсорский тег?" N || return 0
+    fi
+    IFS= read -rsp "  Спонсорский тег из @MTProxybot (32 шестнадцатеричных символа): " tag || { echo ""; return 1; }
     echo ""
+    tag="${tag%$'\r'}"
     _telegram_proxy_valid_tag "$tag" || {
-        warn "Tag должен содержать ровно 32 hex."
+        warn "Спонсорский тег должен содержать ровно 32 шестнадцатеричных символа."
         return 2
     }
     tag=$(printf '%s' "$tag" | tr '[:upper:]' '[:lower:]')
@@ -1555,7 +1747,7 @@ telegram_proxy_tag_set() {
         return 1
     fi
     rm -f "$old_env"
-    success "Tag установлен. Откройте Tag show или Connection отдельно."
+    success "Спонсорский тег установлен."
 }
 
 telegram_proxy_tag_clear() {
@@ -1567,8 +1759,13 @@ telegram_proxy_tag_clear() {
         esac
     done
     _telegram_proxy_is_installed || return 3
-    [[ "$force" == true ]] ||
-        confirm_yn "Очистить общий tag (кратко затронет WEB и MTProto)?" || return 0
+    if [[ "$force" != true ]]; then
+        local access=() line
+        while IFS= read -r line; do access+=("$line"); done < <(_telegram_proxy_access_summary)
+        review_frame "Удаление Спонсорского тега" "${access[@]}" \
+            "Спонсорский канал больше не будет показываться; перезапуск службы MTProxy прервёт подключения."
+        confirm_yn "Удалить Спонсорский тег?" N || return 0
+    fi
     old_env="$TPROXY_ENV_FILE.telegram-proxy-old.$$"
     cp "$TPROXY_ENV_FILE" "$old_env" || return 1
     _telegram_proxy_render_mtproxy_env "$TPROXY_RUNTIME_SECRET" "" || {
@@ -1592,7 +1789,7 @@ telegram_proxy_tag_clear() {
         return 1
     fi
     rm -f "$old_env"
-    success "Tag очищен."
+    success "Спонсорский тег удалён."
 }
 
 telegram_proxy_rotate_secret() {
@@ -1604,8 +1801,14 @@ telegram_proxy_rotate_secret() {
         esac
     done
     _telegram_proxy_is_installed || return 3
-    [[ "$force" == true ]] ||
-        confirm_yn "Ротировать общий secret (старые ссылки будут отозваны)?" || return 0
+    if [[ "$force" != true ]]; then
+        local access=() line
+        while IFS= read -r line; do access+=("$line"); done < <(_telegram_proxy_access_summary)
+        review_frame "Смена секрета" "${access[@]}" \
+            "Старые ссылки перестанут работать; новые будут показаны сразу." \
+            "Перезапуск служб прервёт подключения."
+        confirm_yn "Сменить секрет?" N || return 0
+    fi
     old_secret="$TPROXY_RUNTIME_SECRET"
     new=$(_telegram_proxy_generate_secret) || return 1
     old_env="$TPROXY_ENV_FILE.telegram-proxy-old.$$"
@@ -1618,13 +1821,13 @@ telegram_proxy_rotate_secret() {
     fi
     if ! _telegram_proxy_render_mtproxy_env "$new" "$old_tag" ||
        { [[ "$TELEGRAM_WEB_ENABLED" == true ]] && ! _telegram_proxy_render_profiles "$new"; }; then
-        cp "$old_env" "$TPROXY_ENV_FILE"
-        [[ -n "$old_profile" ]] && cp "$old_profile" "$TPROXY_PROFILES_FILE"
+        mv -f "$old_env" "$TPROXY_ENV_FILE"
+        [[ -n "$old_profile" ]] && mv -f "$old_profile" "$TPROXY_PROFILES_FILE"
         rm -f "$old_env" "$old_profile"
         return 1
     fi
-    if [[ "$TELEGRAM_MTPROTO_ENABLED" == true ]] &&
-       ! systemctl restart "$TPROXY_UNIT_MTPROXY"; then
+    if ! systemctl restart "$TPROXY_UNIT_MTPROXY" ||
+       ! _telegram_proxy_wait_mtproxy_listener; then
         rollback_rc=1
     fi
     if [[ "$rollback_rc" -eq 0 && "$TELEGRAM_WEB_ENABLED" == true ]]; then
@@ -1634,23 +1837,22 @@ telegram_proxy_rotate_secret() {
         fi
     fi
     if [[ "$rollback_rc" -ne 0 ]]; then
-        cp "$old_env" "$TPROXY_ENV_FILE" || rollback_rc=1
-        [[ -n "$old_profile" ]] && cp "$old_profile" "$TPROXY_PROFILES_FILE" || true
-        [[ "$TELEGRAM_MTPROTO_ENABLED" == true ]] &&
-            systemctl restart "$TPROXY_UNIT_MTPROXY" >/dev/null 2>&1 || true
+        mv -f "$old_env" "$TPROXY_ENV_FILE" || rollback_rc=1
+        [[ -n "$old_profile" ]] && mv -f "$old_profile" "$TPROXY_PROFILES_FILE" || true
+        systemctl restart "$TPROXY_UNIT_MTPROXY" >/dev/null 2>&1 || rollback_rc=1
         [[ "$TELEGRAM_WEB_ENABLED" == true ]] &&
             systemctl restart "$TPROXY_UNIT_RELAY" >/dev/null 2>&1 || true
         if [[ "$TELEGRAM_WEB_ENABLED" == true ]] &&
            ! _telegram_proxy_web_secret_accepted "$old_secret"; then
-            warn "Не удалось подтвердить восстановление старого WEB secret."
+            warn "Не удалось подтвердить восстановление старого секрета Web Proxy."
             rollback_rc=1
         fi
         rm -f "$old_env" "$old_profile"
         return 1
     fi
     rm -f "$old_env" "$old_profile"
-    success "Secret ротирован для всех enabled components. Откройте Connection отдельно."
-    return 0
+    success "Секрет изменён для всех включённых способов доступа."
+    _telegram_proxy_show_completed_connection "$force"
 }
 
 telegram_proxy_web_restart() {
@@ -1662,43 +1864,39 @@ telegram_proxy_web_restart() {
     _telegram_proxy_component_enabled web || return 3
     systemctl restart "$TPROXY_UNIT_RELAY" || return 1
     _telegram_proxy_wait_endpoint "$TPROXY_READY_URL" || return 1
-    success "WEB relay перезапущен."
+    success "Web Proxy перезапущен."
 }
 
-telegram_proxy_mtproto_restart() {
-    local arg was_ready=false
-    for arg in "$@"; do
-        [[ "$arg" == --force ]] && return 2
-        return 2
-    done
-    _telegram_proxy_component_enabled mtproto || return 3
-    if [[ "$TELEGRAM_WEB_ENABLED" == true ]] &&
-       _telegram_proxy_probe "$TPROXY_READY_URL"; then
-        was_ready=true
+telegram_proxy_backend_restart() {
+    [[ $# -eq 0 ]] || return 2
+    _telegram_proxy_is_installed || return 3
+    local modes=""
+    [[ "$TELEGRAM_WEB_ENABLED" == true ]] && modes="Web Proxy"
+    if [[ "$TELEGRAM_MTPROTO_ENABLED" == true ]]; then
+        [[ -z "$modes" ]] || modes+=", "
+        modes+="MTProto Proxy"
     fi
+    info "Перезапуск службы MTProxy прервёт подключения: ${modes}."
     systemctl restart "$TPROXY_UNIT_MTPROXY" || return 1
     _telegram_proxy_wait_mtproxy_listener || return 1
-    if [[ "$was_ready" == true ]]; then
+    if [[ "$TELEGRAM_WEB_ENABLED" == true ]]; then
         _telegram_proxy_wait_endpoint "$TPROXY_READY_URL" || return 1
     fi
-    warn "Общий MTProxy backend кратко затронул WEB relay." >&2
-    success "MTProto перезапущен."
+    success "Служба MTProxy перезапущена."
 }
 
 telegram_proxy_web_update() {
-    local force=false arg latest old_sha go_binary candidate stage new_sha
-    for arg in "$@"; do
-        case "$arg" in
-            --force) force=true ;;
-            *) return 2 ;;
-        esac
-    done
+    local latest old_sha go_binary candidate stage new_sha
+    [[ $# -eq 0 ]] || return 2
     _telegram_proxy_component_enabled web || return 3
     latest=$(_telegram_proxy_latest_sha 2>/dev/null || true)
-    [[ -n "$latest" && "$latest" != "$TELEGRAM_RELAY_UPSTREAM_SHA" ]] || return 0
-    [[ "$force" == true ]] || confirm_yn "Обновить WEB relay до проверенной ревизии ${latest}?" || return 0
+    [[ -n "$latest" ]] || { warn "Не удалось проверить обновления Web Proxy."; return 1; }
+    if [[ "$latest" == "$TELEGRAM_RELAY_UPSTREAM_SHA" ]]; then
+        info "Web Proxy уже обновлён до проверенной ревизии."
+        return 0
+    fi
     old_sha="$TELEGRAM_RELAY_UPSTREAM_SHA"
-    stage=$(mktemp -d "${TMPDIR:-/tmp}/tproxy-update.XXXXXX") || return 1
+    stage=$(mktemp -d /tmp/tproxy-update.XXXXXX) || return 1
     chmod 0700 "$stage" || { rm -rf "$stage"; return 1; }
     if ! _telegram_proxy_clone_relay "$stage"; then
         rm -rf "$stage"
@@ -1707,9 +1905,9 @@ telegram_proxy_web_update() {
     go_binary=$(_telegram_proxy_find_go 2>/dev/null || true)
     [[ -n "$go_binary" ]] || go_binary=$(_telegram_proxy_install_pinned_go 2>/dev/null || true)
     [[ -n "$go_binary" ]] || { rm -rf "$stage"; return 1; }
-    candidate=$(mktemp "${TMPDIR:-/tmp}/tproxy-server-update.XXXXXX") || { rm -rf "$stage"; return 1; }
+    candidate=$(mktemp /tmp/tproxy-server-update.XXXXXX) || { rm -rf "$stage"; return 1; }
     rm -f "$candidate"
-    if ! (cd "$stage" && runuser -u tproxy -- "$go_binary" build -trimpath -ldflags='-s -w' -o "$candidate" ./cmd/tproxy-server); then
+    if ! _telegram_proxy_build_relay "$stage" "$go_binary" "$candidate"; then
         rm -f "$candidate"; rm -rf "$stage"; return 1
     fi
     chmod 0755 "$candidate" || { rm -f "$candidate"; rm -rf "$stage"; return 1; }
@@ -1741,34 +1939,29 @@ telegram_proxy_web_update() {
         return 1
     fi
     _telegram_proxy_discard_snapshot
-    success "WEB relay обновлён до проверенной ревизии. Откройте Status для проверки."
+    success "Web Proxy обновлён до проверенной ревизии."
     return 0
 }
 
 telegram_proxy_refresh_ip() {
-    local force=false arg new old
-    for arg in "$@"; do
-        case "$arg" in
-            --force) force=true ;;
-            *) return 2 ;;
-        esac
-    done
+    local new old
+    [[ $# -eq 0 ]] || return 2
     _telegram_proxy_component_enabled mtproto || return 3
     old="$TELEGRAM_MTPROTO_IPV4"
     new=$(_telegram_proxy_public_ipv4 | tr -d '[:space:]')
-    _telegram_proxy_valid_public_ipv4 "$new" || return 2
+    _telegram_proxy_valid_public_ipv4 "$new" || { warn "Не удалось определить публичный IPv4."; return 1; }
     [[ "$new" == "$old" ]] && {
         info "Публичный IPv4 не изменился."
         return 0
     }
     info "IPv4 изменился: ${old} -> ${new}"
-    [[ "$force" == true ]] || confirm_yn "Сохранить новый IPv4?" || return 0
     TELEGRAM_MTPROTO_IPV4="$new"
     _telegram_proxy_state_write || {
         TELEGRAM_MTPROTO_IPV4="$old"
         return 1
     }
     success "IPv4 сохранён."
+    _telegram_proxy_show_completed_connection false
 }
 
 # ─── Diagnostics, removal, menu and command grammar ───────────────────────────
@@ -1784,16 +1977,16 @@ _telegram_proxy_sanitize() {
 telegram_proxy_diagnostics() {
     [[ $# -eq 0 ]] || return 2
     _telegram_proxy_is_installed || return 3
-    echo "Telegram Proxy diagnostics"
-    echo "-- shared journal --"
+    info "Диагностика Telegram Proxy"
+    echo "-- Журнал службы MTProxy --"
     journalctl -u "$TPROXY_UNIT_MTPROXY" -u "$TPROXY_UNIT_FIREWALL" \
         -u "$TPROXY_UNIT_TIMER" --since "30 minutes ago" --no-pager 2>/dev/null |
         _telegram_proxy_sanitize || true
     if [[ "$TELEGRAM_WEB_ENABLED" == true ]]; then
-        echo "-- WEB relay metrics --"
+        echo "-- Метрики Web Proxy --"
         curl --fail --silent --max-time 5 "$TPROXY_METRICS_URL" 2>/dev/null |
             _telegram_proxy_sanitize || true
-        echo "-- WEB relay journal --"
+        echo "-- Журнал Web Proxy --"
         journalctl -u "$TPROXY_UNIT_RELAY" --since "30 minutes ago" --no-pager 2>/dev/null |
             _telegram_proxy_sanitize || true
     fi
@@ -1819,6 +2012,7 @@ _telegram_proxy_cleanup_backend() {
 
 telegram_proxy_web_remove() {
     local force=false arg host created relay_active relay_enabled failed=false
+    local challenge_root extra_roots=()
     for arg in "$@"; do
         case "$arg" in
             --force) force=true ;;
@@ -1832,31 +2026,65 @@ telegram_proxy_web_remove() {
     relay_enabled=false
     systemctl is-active --quiet "$TPROXY_UNIT_RELAY" 2>/dev/null && relay_active=true
     systemctl is-enabled --quiet "$TPROXY_UNIT_RELAY" 2>/dev/null && relay_enabled=true
-    [[ "$force" == true ]] || confirm_yn "Удалить Telegram WEB для ${host}?" || return 0
+    if [[ "$force" != true ]]; then
+        local consequence
+        if [[ "$TELEGRAM_MTPROTO_ENABLED" == true ]]; then
+            consequence="MTProto Proxy (${TELEGRAM_MTPROTO_IPV4}:2398) и служба MTProxy сохранятся."
+        else
+            consequence="Это последний способ доступа: служба MTProxy будет удалена."
+        fi
+        review_frame "Отключение Web Proxy" "Домен: ${host}" \
+            "Ссылки Web Proxy перестанут работать; сайт и сертификат Web Proxy будут удалены." "$consequence"
+        confirm_yn "Отключить Web Proxy?" N || return 0
+    fi
+    if [[ -e "$TPROXY_NGINX_AVAILABLE_DIR/essence-acme-$host" || -L "$TPROXY_NGINX_AVAILABLE_DIR/essence-acme-$host" ]]; then
+        _cert_site_root "$TPROXY_NGINX_AVAILABLE_DIR/essence-acme-$host" || {
+            warn "Не удалось безопасно прочитать общий каталог ACME; удаление отменено."
+            return 1
+        }
+        challenge_root="$CERT_EFFECTIVE_WEBROOT"
+        [[ "$challenge_root" == "$TPROXY_WEBROOT_BASE/$host" ]] || extra_roots+=("$challenge_root")
+    fi
     _telegram_proxy_snapshot_paths \
         "$TPROXY_CONF" "$TPROXY_CONFIG_JSON" "$TPROXY_PROFILES_FILE" \
         "$TPROXY_RELAY_SOURCE_PATH" "$TPROXY_SITE_DIR" "$TPROXY_BIN" \
         "$TPROXY_NGINX_SITE" "$TPROXY_NGINX_ENABLED" "$TPROXY_NGINX_ACME_SITE" \
+        "$TPROXY_NGINX_SITE.acme" \
         "$TPROXY_NGINX_CONF" "$TPROXY_CERT_DIR/$host" "$TPROXY_WEBROOT_BASE/$host" \
+        "$TPROXY_NGINX_AVAILABLE_DIR/essence-acme-$host" \
+        "$TPROXY_NGINX_ENABLED_DIR/essence-acme-$host" \
+        ${extra_roots[@]+"${extra_roots[@]}"} \
         "$TPROXY_SYSTEMD_DIR/$TPROXY_UNIT_RELAY" "$TPROXY_FIREWALL_FILE" || return 1
+    _telegram_proxy_snapshot_certificate_registration "$host" || {
+        _telegram_proxy_restore_snapshot
+        return 1
+    }
     if ! systemctl disable --now "$TPROXY_UNIT_RELAY" >/dev/null 2>&1; then
         _telegram_proxy_discard_snapshot
         return 1
     fi
     rm -f "$TPROXY_NGINX_ENABLED" "$TPROXY_NGINX_SITE" "$TPROXY_NGINX_ACME_SITE" \
-        "$TPROXY_CONFIG_JSON" "$TPROXY_BIN" || failed=true
+        "$TPROXY_NGINX_SITE.acme" "$TPROXY_CONFIG_JSON" "$TPROXY_BIN" || failed=true
     if [[ "$TELEGRAM_WEB_TOPOLOGY" == sni ]] &&
        ! _telegram_proxy_remove_sni_markers; then
         failed=true
     fi
-    rm -rf "$TPROXY_SITE_DIR" "$TPROXY_PROFILES_FILE" \
-        "$TPROXY_CERT_DIR/$host" "$TPROXY_WEBROOT_BASE/$host" "$TPROXY_RELAY_SOURCE_PATH" || failed=true
+    rm -rf "$TPROXY_SITE_DIR" "$TPROXY_PROFILES_FILE" "$TPROXY_RELAY_SOURCE_PATH" || failed=true
     if [[ "$failed" == false ]] && ! nginx -t; then failed=true; fi
     if [[ "$failed" == false ]] && ! systemctl reload nginx; then failed=true; fi
-    if [[ "$failed" == false ]] &&
-       nginx -T 2>/dev/null | grep -F "$host" >/dev/null 2>&1; then
-        warn "Удалённый hostname остался в активной nginx-конфигурации."
+    if [[ "$failed" == false && ( -e "$TPROXY_NGINX_SITE" || -L "$TPROXY_NGINX_SITE" || -e "$TPROXY_NGINX_ENABLED" || -L "$TPROXY_NGINX_ENABLED" ) ]]; then
+        warn "Сайт nginx Telegram Proxy не удалён."
         failed=true
+    fi
+    if [[ "$failed" == false && "$TELEGRAM_WEB_TOPOLOGY" == sni ]] &&
+       grep -E '# --- /?telegram-proxy-(map|upstream) ---' "$TPROXY_NGINX_CONF" >/dev/null 2>&1; then
+        warn "Директивы SNI Telegram Proxy не удалены."
+        failed=true
+    fi
+    if [[ "$failed" == false ]]; then
+        release_cert "$host" "$TPROXY_WEBROOT_BASE/$host" "$TPROXY_CERT_DIR" \
+            "$TPROXY_NGINX_AVAILABLE_DIR" "$TPROXY_NGINX_ENABLED_DIR" \
+            "$TPROXY_NGINX_CONF" || failed=true
     fi
     if [[ "$failed" == false ]]; then
         TELEGRAM_WEB_ENABLED=false
@@ -1892,17 +2120,18 @@ telegram_proxy_web_remove() {
     if [[ "$failed" == true ]]; then
         local rollback_rc=0
         _telegram_proxy_restore_snapshot || rollback_rc=1
+        _telegram_proxy_restore_certificate_registration "$host" || rollback_rc=1
         if ! nginx -t >/dev/null 2>&1 || ! systemctl reload nginx >/dev/null 2>&1; then
             rollback_rc=1
         fi
         if (( rollback_rc != 0 )); then
-            warn "Откат удаления Telegram Proxy завершился с ошибками; проверьте services, firewall и nginx."
+            warn "Откат удаления Telegram Proxy завершился с ошибками; проверьте службы, межсетевой экран и nginx."
         fi
         return 1
     fi
     _telegram_proxy_discard_snapshot
     if [[ "$TELEGRAM_MTPROTO_ENABLED" == true ]]; then
-        success "Telegram WEB удалён; MTProto и общий tag сохранены."
+        success "Web Proxy выключен; MTProto Proxy, служба MTProxy и Спонсорский тег сохранены."
     else
         success "Telegram Proxy удалён."
     fi
@@ -1919,7 +2148,17 @@ telegram_proxy_mtproto_remove() {
     done
     _telegram_proxy_component_enabled mtproto || return 3
     previous="$TELEGRAM_UFW_MTPROTO_PREVIOUS"
-    [[ "$force" == true ]] || confirm_yn "Удалить MTProto?" || return 0
+    if [[ "$force" != true ]]; then
+        local consequence
+        if [[ "$TELEGRAM_WEB_ENABLED" == true ]]; then
+            consequence="Web Proxy (${TELEGRAM_WEB_HOSTNAME}) и служба MTProxy сохранятся."
+        else
+            consequence="Это последний способ доступа: служба MTProxy будет удалена."
+        fi
+        review_frame "Отключение MTProto Proxy" "Адрес: ${TELEGRAM_MTPROTO_IPV4}:2398" \
+            "Ссылки MTProto Proxy перестанут работать." "$consequence"
+        confirm_yn "Отключить MTProto Proxy?" N || return 0
+    fi
     if [[ "$TELEGRAM_WEB_ENABLED" == true ]]; then
         _telegram_proxy_snapshot_paths "$TPROXY_CONF" "$TPROXY_FIREWALL_FILE" || return 1
         _telegram_proxy_ufw_apply_port 2398 "$previous" || {
@@ -1950,7 +2189,7 @@ telegram_proxy_mtproto_remove() {
             return 1
         fi
         _telegram_proxy_discard_snapshot
-        success "MTProto удалён; WEB и общий tag сохранены."
+        success "MTProto Proxy выключен; Web Proxy, служба MTProxy и Спонсорский тег сохранены."
     else
         local mt_user_before=false tproxy_user_before=false
         id mtproxy >/dev/null 2>&1 && mt_user_before=true
@@ -2011,121 +2250,110 @@ _telegram_proxy_menu_warn_failure() {
     warn "Операция Telegram Proxy завершилась с ошибкой. Повторите действие из меню."
 }
 
+_telegram_proxy_menu_run() {
+    local rc=0
+    if [[ -f "$TPROXY_CONF" ]] && ! _telegram_proxy_load_conf; then
+        _telegram_proxy_menu_warn_failure
+        return 0
+    fi
+    "$@" || rc=$?
+    case "$rc" in
+        0) ;;
+        3) warn "Telegram Proxy не установлен." ;;
+        *) _telegram_proxy_menu_warn_failure ;;
+    esac
+    return 0
+}
+
 _telegram_proxy_web_menu() {
     local choice
-    while true; do
-        if ! _telegram_proxy_component_enabled web; then
-            return 0
-        fi
+    while _telegram_proxy_component_enabled web; do
         echo ""
         box_top
-        box_center "Управление WEB"
+        box_center "Управление Web Proxy"
         box_mid
-        menu_item r "Перезапустить WEB" YELLOW
-        menu_item u "Обновить WEB" YELLOW
-        menu_item d "Удалить WEB" RED
+        box_line " Домен: ${TELEGRAM_WEB_HOSTNAME}"
+        box_line " Состояние: $(_telegram_proxy_human_service_state "$TPROXY_UNIT_RELAY")"
+        box_mid
+        menu_item r "Перезапустить Web Proxy" YELLOW
+        menu_item u "Обновить Web Proxy" YELLOW
+        menu_item d "Отключить Web Proxy" RED
         menu_item 0 "Назад" NC
         box_bot
         echo ""
-        if ! IFS= read -rp "  Выберите действие: " choice; then
-            return 0
-        fi
+        IFS= read -rp "  Выберите действие: " choice || return 0
         choice="${choice%$'\r'}"
         case "$choice" in
-            r|R)
-                if ! telegram_proxy_web_cli restart; then
-                    _telegram_proxy_menu_warn_failure
-                fi
-                ;;
-            u|U)
-                if ! telegram_proxy_web_cli update; then
-                    _telegram_proxy_menu_warn_failure
-                fi
-                ;;
-            d|D)
-                if ! telegram_proxy_web_cli remove; then
-                    _telegram_proxy_menu_warn_failure
-                fi
-                ;;
+            r|R) _telegram_proxy_menu_run telegram_proxy_web_cli restart ;;
+            u|U) _telegram_proxy_menu_run telegram_proxy_web_cli update ;;
+            d|D) _telegram_proxy_menu_run telegram_proxy_web_cli remove ;;
             0) return 0 ;;
             *) warn "Неверный выбор." ;;
         esac
     done
+    return 0
 }
 
 _telegram_proxy_mtproto_menu() {
     local choice
-    while true; do
-        if ! _telegram_proxy_component_enabled mtproto; then
-            return 0
-        fi
+    while _telegram_proxy_component_enabled mtproto; do
         echo ""
         box_top
-        box_center "Управление MTProto"
+        box_center "Управление MTProto Proxy"
         box_mid
-        menu_item r "Перезапустить MTProto" YELLOW
+        box_line " Адрес: ${TELEGRAM_MTPROTO_IPV4}:2398"
+        box_mid
         menu_item i "Обновить IP-адрес" YELLOW
-        menu_item d "Удалить MTProto" RED
+        menu_item d "Отключить MTProto Proxy" RED
         menu_item 0 "Назад" NC
         box_bot
         echo ""
-        if ! IFS= read -rp "  Выберите действие: " choice; then
-            return 0
-        fi
+        IFS= read -rp "  Выберите действие: " choice || return 0
         choice="${choice%$'\r'}"
         case "$choice" in
-            r|R)
-                if ! telegram_proxy_mtproto_cli restart; then
-                    _telegram_proxy_menu_warn_failure
-                fi
-                ;;
-            i|I)
-                if ! telegram_proxy_mtproto_cli refresh-ip; then
-                    _telegram_proxy_menu_warn_failure
-                fi
-                ;;
-            d|D)
-                if ! telegram_proxy_mtproto_cli remove; then
-                    _telegram_proxy_menu_warn_failure
-                fi
-                ;;
+            i|I) _telegram_proxy_menu_run telegram_proxy_mtproto_cli refresh-ip ;;
+            d|D) _telegram_proxy_menu_run telegram_proxy_mtproto_cli remove ;;
             0) return 0 ;;
             *) warn "Неверный выбор." ;;
         esac
     done
+    return 0
 }
 
 _telegram_proxy_tag_menu() {
-    local choice
+    local choice configured
     while true; do
+        _telegram_proxy_is_installed || return 0
+        configured=false
+        [[ "$TELEGRAM_TAG_CONFIGURED" == true ]] && configured=true
         echo ""
         box_top
-        box_center "Тег Telegram Proxy"
+        box_center "Спонсорский тег"
+        box_mid
+        box_line " Тег из @MTProxybot: спонсорский канал в клиентах Telegram."
+        box_line " Общий для Web Proxy и MTProto Proxy."
+        if [[ "$configured" == true ]]; then
+            box_line " Состояние: задан" " ${GREEN}Состояние: задан${NC}"
+        else
+            box_line " Состояние: не задан" " ${DIM}Состояние: не задан${NC}"
+        fi
         box_mid
         menu_item s "Показать тег" CYAN
         menu_item e "Изменить тег" YELLOW
-        menu_item d "Удалить тег" RED
+        [[ "$configured" != true ]] || menu_item d "Удалить тег" RED
         menu_item 0 "Назад" NC
         box_bot
         echo ""
-        if ! IFS= read -rp "  Выберите действие: " choice; then
-            return 0
-        fi
+        IFS= read -rp "  Выберите действие: " choice || return 0
         choice="${choice%$'\r'}"
         case "$choice" in
-            s|S)
-                if ! telegram_proxy_tag_show; then
-                    _telegram_proxy_menu_warn_failure
-                fi
-                ;;
-            e|E)
-                if ! telegram_proxy_tag_set; then
-                    _telegram_proxy_menu_warn_failure
-                fi
-                ;;
+            s|S) _telegram_proxy_menu_run telegram_proxy_tag_show ;;
+            e|E) _telegram_proxy_menu_run telegram_proxy_tag_set ;;
             d|D)
-                if ! telegram_proxy_tag_clear; then
-                    _telegram_proxy_menu_warn_failure
+                if [[ "$configured" == true ]]; then
+                    _telegram_proxy_menu_run telegram_proxy_tag_clear
+                else
+                    warn "Неверный выбор."
                 fi
                 ;;
             0) return 0 ;;
@@ -2134,94 +2362,130 @@ _telegram_proxy_tag_menu() {
     done
 }
 
-
 telegram_proxy_menu() {
-    local choice web_enabled mtproto_enabled
+    local choice installed valid web_enabled mtproto_enabled backend backend_color
+    local consequences=()
     while true; do
+        installed=false
+        valid=false
         web_enabled=false
         mtproto_enabled=false
-        _telegram_proxy_component_enabled web && web_enabled=true
-        _telegram_proxy_component_enabled mtproto && mtproto_enabled=true
-
+        if [[ -f "$TPROXY_CONF" ]]; then
+            installed=true
+            if _telegram_proxy_load_conf; then
+                valid=true
+                web_enabled="$TELEGRAM_WEB_ENABLED"
+                mtproto_enabled="$TELEGRAM_MTPROTO_ENABLED"
+            fi
+        fi
         echo ""
         box_top
         box_center "Telegram Proxy"
-        if [[ "$web_enabled" == true ]]; then
-            box_line " WEB: включён" " ${GREEN}WEB: включён${NC}"
+        box_mid
+        if [[ "$installed" == true && "$valid" != true ]]; then
+            box_line " Состояние Telegram Proxy некорректно" " ${YELLOW}Состояние Telegram Proxy некорректно${NC}"
         else
-            box_line " WEB: выключен" " ${DIM}WEB: выключен${NC}"
-        fi
-        if [[ "$mtproto_enabled" == true ]]; then
-            box_line " MTProto: включён" " ${GREEN}MTProto: включён${NC}"
-        else
-            box_line " MTProto: выключен" " ${DIM}MTProto: выключен${NC}"
+            if [[ "$web_enabled" == true ]]; then
+                box_line " Web Proxy: включён — ${TELEGRAM_WEB_HOSTNAME}" " ${GREEN}Web Proxy: включён — ${TELEGRAM_WEB_HOSTNAME}${NC}"
+            else
+                box_line " Web Proxy: выключен" " ${DIM}Web Proxy: выключен${NC}"
+                box_line " Web Proxy требует клиента Telegram с поддержкой Web Proxy" " ${DIM}Web Proxy требует клиента Telegram с поддержкой Web Proxy${NC}"
+            fi
+            if [[ "$mtproto_enabled" == true ]]; then
+                box_line " MTProto Proxy: включён — ${TELEGRAM_MTPROTO_IPV4}:2398" " ${GREEN}MTProto Proxy: включён — ${TELEGRAM_MTPROTO_IPV4}:2398${NC}"
+            else
+                box_line " MTProto Proxy: выключен" " ${DIM}MTProto Proxy: выключен${NC}"
+            fi
+            if [[ "$installed" == true ]]; then
+                backend=$(_telegram_proxy_human_service_state "$TPROXY_UNIT_MTPROXY")
+                case "$backend" in
+                    работает) backend_color="$GREEN" ;;
+                    "не установлена") backend_color="$DIM" ;;
+                    *) backend_color="$YELLOW" ;;
+                esac
+                box_line " Служба MTProxy: ${backend}" " ${backend_color}Служба MTProxy: ${backend}${NC}"
+                if [[ "$TELEGRAM_TAG_CONFIGURED" == true ]]; then
+                    box_line " Спонсорский тег: задан" " ${GREEN}Спонсорский тег: задан${NC}"
+                else
+                    box_line " Спонсорский тег: не задан" " ${DIM}Спонсорский тег: не задан${NC}"
+                fi
+            fi
         fi
         box_mid
-        menu_item 1 "Общий статус" CYAN
-        menu_item 2 "Подключение" CYAN
+        if [[ "$installed" == true ]]; then
+            menu_item 1 "Подробный статус" CYAN
+            menu_item 2 "Показать ссылки подключения" CYAN
+        fi
         if [[ "$web_enabled" == true ]]; then
-            menu_item 3 "Управление WEB" CYAN
+            menu_item 3 "Управление Web Proxy" CYAN
         else
-            menu_item 3 "Установить WEB" GREEN
+            menu_item 3 "Включить Web Proxy" GREEN
         fi
         if [[ "$mtproto_enabled" == true ]]; then
-            menu_item 4 "Управление MTProto" CYAN
+            menu_item 4 "Управление MTProto Proxy" CYAN
         else
-            menu_item 4 "Установить MTProto" GREEN
+            menu_item 4 "Включить MTProto Proxy" GREEN
         fi
-        menu_item 5 "Сменить секрет подключения" RED
-        menu_item 6 "Тег Telegram Proxy" CYAN
-        menu_item 7 "Диагностика" CYAN
-        menu_item 8 "Удалить всё" RED
+        if [[ "$installed" == true ]]; then
+            menu_item 5 "Сменить секрет" RED
+            menu_item 6 "Спонсорский тег" CYAN
+            menu_item 7 "Диагностика" CYAN
+            menu_item 8 "Отключить Telegram Proxy полностью" RED
+            menu_item 9 "Перезапустить службу MTProxy" YELLOW
+        fi
         menu_item 0 "Назад" NC
         box_bot
         echo ""
-        if ! IFS= read -rp "  Выберите действие: " choice; then
-            return 0
-        fi
+        IFS= read -rp "  Выберите действие: " choice || return 0
         choice="${choice%$'\r'}"
         case "$choice" in
             0) return 0 ;;
-            1)
-                if ! telegram_proxy_status; then
-                    _telegram_proxy_menu_warn_failure
+            1|2|5|6|7|8|9)
+                if [[ "$installed" != true ]]; then
+                    warn "Неверный выбор."
+                    continue
                 fi
-                ;;
-            2)
-                if ! telegram_proxy_connection; then
-                    _telegram_proxy_menu_warn_failure
-                fi
+                case "$choice" in
+                    1) _telegram_proxy_menu_run telegram_proxy_status ;;
+                    2) _telegram_proxy_menu_run telegram_proxy_connection ;;
+                    5) _telegram_proxy_menu_run telegram_proxy_rotate_secret ;;
+                    6)
+                        if [[ "$valid" == true ]]; then
+                            _telegram_proxy_menu_run _telegram_proxy_tag_menu
+                        else
+                            _telegram_proxy_menu_warn_failure
+                        fi
+                        ;;
+                    7) _telegram_proxy_menu_run telegram_proxy_diagnostics ;;
+                    8)
+                        if [[ "$valid" != true ]]; then
+                            _telegram_proxy_menu_warn_failure
+                            continue
+                        fi
+                        consequences=()
+                        [[ "$web_enabled" != true ]] || consequences+=("Web Proxy: ${TELEGRAM_WEB_HOSTNAME}")
+                        [[ "$mtproto_enabled" != true ]] || consequences+=("MTProto Proxy: ${TELEGRAM_MTPROTO_IPV4}:2398")
+                        review_frame "Отключение Telegram Proxy" "${consequences[@]}" \
+                            "Служба MTProxy будет удалена." "Ссылки подключения перестанут работать."
+                        if confirm_yn "Отключить Telegram Proxy полностью?" N; then
+                            TPROXY_INTERNAL_CALL=true _telegram_proxy_menu_run telegram_proxy_remove_all --force
+                        fi
+                        ;;
+                    9) _telegram_proxy_menu_run telegram_proxy_backend_restart ;;
+                esac
                 ;;
             3)
                 if [[ "$web_enabled" == true ]]; then
-                    _telegram_proxy_web_menu
-                elif ! telegram_proxy_web_cli install; then
-                    _telegram_proxy_menu_warn_failure
+                    _telegram_proxy_menu_run _telegram_proxy_web_menu
+                else
+                    _telegram_proxy_menu_run telegram_proxy_web_cli install
                 fi
                 ;;
             4)
                 if [[ "$mtproto_enabled" == true ]]; then
-                    _telegram_proxy_mtproto_menu
-                elif ! telegram_proxy_mtproto_cli install; then
-                    _telegram_proxy_menu_warn_failure
-                fi
-                ;;
-            5)
-                if ! telegram_proxy_rotate_secret; then
-                    _telegram_proxy_menu_warn_failure
-                fi
-                ;;
-            6) _telegram_proxy_tag_menu ;;
-            7)
-                if ! telegram_proxy_diagnostics; then
-                    _telegram_proxy_menu_warn_failure
-                fi
-                ;;
-            8)
-                if confirm_yn "Удалить все компоненты Telegram Proxy?" N; then
-                    if ! TPROXY_INTERNAL_CALL=true telegram_proxy_remove_all --force; then
-                        warn "Не удалось удалить все компоненты Telegram Proxy."
-                    fi
+                    _telegram_proxy_menu_run _telegram_proxy_mtproto_menu
+                else
+                    _telegram_proxy_menu_run telegram_proxy_mtproto_cli install
                 fi
                 ;;
             *) warn "Неверный выбор." ;;
@@ -2229,134 +2493,97 @@ telegram_proxy_menu() {
     done
 }
 
+_telegram_proxy_cli_usage() {
+    warn "Использование:"
+    warn "telegram-proxy menu"
+    warn "telegram-proxy web install [--force] | web remove [--force] | web restart | web update"
+    warn "telegram-proxy mtproto install [--force] | mtproto remove [--force] | mtproto refresh-ip"
+    warn "telegram-proxy backend restart"
+    warn "telegram-proxy status [--json]"
+    warn "telegram-proxy connection | diagnostics"
+    warn "telegram-proxy rotate-secret [--force]"
+    warn "telegram-proxy tag show | tag set | tag clear [--force]"
+    warn "telegram-proxy remove-all --force"
+    return 2
+}
+
 telegram_proxy_web_cli() {
     local action="${1:-}"
-    shift || true
+    [[ $# -eq 0 ]] || shift
     case "$action" in
         install) telegram_proxy_web_install "$@" ;;
         remove) telegram_proxy_web_remove "$@" ;;
         restart) telegram_proxy_web_restart "$@" ;;
         update) telegram_proxy_web_update "$@" ;;
-        *) warn "Использование: telegram-proxy web <install|remove|restart|update>"; return 2 ;;
+        *) _telegram_proxy_cli_usage ;;
     esac
 }
 
 telegram_proxy_mtproto_cli() {
     local action="${1:-}"
-    shift || true
+    [[ $# -eq 0 ]] || shift
     case "$action" in
         install) telegram_proxy_mtproto_install "$@" ;;
         remove) telegram_proxy_mtproto_remove "$@" ;;
-        restart) telegram_proxy_mtproto_restart "$@" ;;
         refresh-ip) telegram_proxy_refresh_ip "$@" ;;
-        *) warn "Использование: telegram-proxy mtproto <install|remove|restart|refresh-ip>"; return 2 ;;
+        *) _telegram_proxy_cli_usage ;;
     esac
 }
 
 telegram_proxy_cli() {
-    local group="${1:-}" action arg json=false force=false
-    local args=() seen_json=false seen_force=false
-    [[ $# -gt 0 ]] && shift
-    action="${1:-}"
-    [[ $# -gt 0 ]] && shift
-    if [[ "$group" == remove-all && "$action" == --force ]]; then
-        force=true
-        seen_force=true
-        action=""
-    fi
-    if [[ "$action" == --json ]]; then
-        json=true
-        seen_json=true
-        action=""
-    fi
+    local group="${1:-}" action arg
     for arg in "$@"; do
-        case "$arg" in
-            --json)
-                [[ "$seen_json" == false ]] || return 2
-                json=true
-                seen_json=true
-                ;;
-            --force)
-                [[ "$seen_force" == false ]] || return 2
-                force=true
-                seen_force=true
-                ;;
-            *) return 2 ;;
-        esac
+        [[ -n "$arg" ]] || { _telegram_proxy_cli_usage; return 2; }
     done
+    [[ $# -gt 0 ]] || { _telegram_proxy_cli_usage; return 2; }
+    shift
     case "$group" in
-        web)
-            [[ -n "$action" && "$json" == false ]] || return 2
-            if [[ "$force" == true ]]; then
-                case "$action" in
-                    install|remove|update) args+=(--force) ;;
-                    *) return 2 ;;
-                esac
+        menu|connection|diagnostics)
+            [[ $# -eq 0 ]] || { _telegram_proxy_cli_usage; return 2; }
+            if [[ "$group" == menu ]]; then
+                telegram_proxy_menu
+                return 0
             fi
-            telegram_proxy_web_cli "$action" "${args[@]}"
-            ;;
-        mtproto)
-            [[ -n "$action" && "$json" == false ]] || return 2
-            if [[ "$force" == true ]]; then
-                case "$action" in
-                    install|remove|refresh-ip) args+=(--force) ;;
-                    *) return 2 ;;
-                esac
-            fi
-            telegram_proxy_mtproto_cli "$action" "${args[@]}"
+            "telegram_proxy_${group}"
             ;;
         status)
-            [[ -z "$action" && "$force" == false ]] || return 2
-            if [[ "$json" == true ]]; then
-                telegram_proxy_status --json
-            else
-                telegram_proxy_status
-            fi
-            ;;
-        connection)
-            [[ -z "$action" && "$json" == false && "$force" == false ]] || return 2
-            telegram_proxy_connection
+            [[ $# -eq 0 || ( $# -eq 1 && "$1" == --json ) ]] ||
+                { _telegram_proxy_cli_usage; return 2; }
+            telegram_proxy_status "$@"
             ;;
         rotate-secret)
-            [[ -z "$action" && "$json" == false ]] || return 2
-            if [[ "$force" == true ]]; then
-                telegram_proxy_rotate_secret --force
-            else
-                telegram_proxy_rotate_secret
-            fi
-            ;;
-        tag)
-            [[ -n "$action" && "$json" == false ]] || return 2
-            case "$action" in
-                show)
-                    [[ "$force" == false ]] || return 2
-                    telegram_proxy_tag_show
-                    ;;
-                set)
-                    [[ "$force" == false ]] || return 2
-                    telegram_proxy_tag_set
-                    ;;
-                clear)
-                    if [[ "$force" == true ]]; then
-                        telegram_proxy_tag_clear --force
-                    else
-                        telegram_proxy_tag_clear
-                    fi
-                    ;;
-                *) return 2 ;;
-            esac
-            ;;
-        diagnostics)
-            [[ -z "$action" && "$json" == false && "$force" == false ]] || return 2
-            telegram_proxy_diagnostics
+            [[ $# -eq 0 || ( $# -eq 1 && "$1" == --force ) ]] ||
+                { _telegram_proxy_cli_usage; return 2; }
+            telegram_proxy_rotate_secret "$@"
             ;;
         remove-all)
-            [[ -z "$action" && "$json" == false && "$force" == true ]] || return 2
+            [[ $# -eq 1 && "$1" == --force ]] || { _telegram_proxy_cli_usage; return 2; }
             TPROXY_INTERNAL_CALL=true telegram_proxy_remove_all --force
             ;;
-        *)
-            warn "Использование: telegram-proxy <web|mtproto|status|connection|rotate-secret|tag|diagnostics|remove-all>"
-            return 2
+        backend)
+            [[ $# -eq 1 && "$1" == restart ]] || { _telegram_proxy_cli_usage; return 2; }
+            telegram_proxy_backend_restart
             ;;
+        web|mtproto|tag)
+            [[ $# -gt 0 ]] || { _telegram_proxy_cli_usage; return 2; }
+            action="$1"
+            shift
+            case "$group:$action" in
+                web:install|web:remove|mtproto:install|mtproto:remove|tag:clear)
+                    [[ $# -eq 0 || ( $# -eq 1 && "$1" == --force ) ]] ||
+                        { _telegram_proxy_cli_usage; return 2; }
+                    ;;
+                web:restart|web:update|mtproto:refresh-ip|tag:show|tag:set)
+                    [[ $# -eq 0 ]] || { _telegram_proxy_cli_usage; return 2; }
+                    ;;
+                *) _telegram_proxy_cli_usage; return 2 ;;
+            esac
+            case "$group" in
+                web) telegram_proxy_web_cli "$action" "$@" ;;
+                mtproto) telegram_proxy_mtproto_cli "$action" "$@" ;;
+                tag) "telegram_proxy_tag_${action}" "$@" ;;
+            esac
+            ;;
+        *) _telegram_proxy_cli_usage ;;
     esac
 }
