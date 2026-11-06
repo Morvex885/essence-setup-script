@@ -164,15 +164,26 @@ failed_rotation() {
             printf 'SUB_DIR=%s\nSUB_BASE_URL=https://new.example\nNGINX_GROUP=www-data\n' "$dir"
             return 0
         fi
+        if [[ "$NODE_NAME" == new ]]; then
+            # Expiry must reach the new host before the host switch.
+            [[ "$(jq_r '.subscription_host.node')" == old ]] || return 1
+            ( eval "$*" )
+            return
+        fi
         [[ "$NODE_NAME" == old && "$(jq_r '.subscription_host.node')" == new ]] || return 1
         [[ -s "$MIGRATION_NEW_DIR/$OLD_TOKEN.yaml" ]] || return 1
         ( eval "$*" )
     }
+    printf 'stale 1\n%s 1\n' "$OLD_TOKEN" > "$MIGRATION_NEW_DIR/expiry.list"
     subscription_migrate <<< $'2\ny' > "$BATS_TEST_TMPDIR/migration.output"
     [[ "$(jq_r '.subscription_host.node')" == new ]]
     [[ "$(jq_r '.clients[0].subscription.token')" == "$OLD_TOKEN" ]]
     [[ -s "$MIGRATION_NEW_DIR/$OLD_TOKEN.yaml" && ! -e "$SUB_DIR/$OLD_TOKEN.yaml" ]]
     [[ ! -e "$SUB_SNIPPETS_DIR/sub-$OLD_TOKEN.conf" ]]
+    printf 'stale 1\n%s 2000000000\n' "$OLD_TOKEN" > "$BATS_TEST_TMPDIR/new-host.expiry"
+    cmp "$MIGRATION_NEW_DIR/expiry.list" "$BATS_TEST_TMPDIR/new-host.expiry"
+    printf 'cccc 2100000000\n' > "$BATS_TEST_TMPDIR/old-host.expiry"
+    cmp "$SUB_DIR/expiry.list" "$BATS_TEST_TMPDIR/old-host.expiry"
 }
 
 @test "rotation restores the old link after a reload failed after applying new routes" {

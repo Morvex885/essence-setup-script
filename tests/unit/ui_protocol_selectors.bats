@@ -117,7 +117,7 @@ _redirect_vless_config() {
     remove_awg_peer_by_name alpha
     remove_awg_peer_by_name alpha
     [[ ! -d "$AWG_CLIENTS_DIR/alpha" && -d "$AWG_CLIENTS_DIR/beta" ]]
-    ! command grep -qx '# peer: alpha' "$AWG_CONF"
+    ! command grep -qx '# peer: alpha' "$AWG_CONF" || return 1
     command grep -qx '# peer: beta' "$AWG_CONF"
 }
 
@@ -130,7 +130,7 @@ _redirect_vless_config() {
     awg() { return 0; }
     awg-quick() { cat "$AWG_CONF"; }
     remove_awg_peer_by_name alpha
-    ! command grep -qx '# peer: alpha' "$AWG_CONF"
+    ! command grep -qx '# peer: alpha' "$AWG_CONF" || return 1
     command grep -qx '# peer: beta' "$AWG_CONF"
 }
 
@@ -142,7 +142,7 @@ _redirect_vless_config() {
     awg-quick() { cat "$AWG_CONF"; }
     awg() { return 1; }
     systemctl() { return 1; }
-    ! remove_awg_peer_by_name alpha
+    ! remove_awg_peer_by_name alpha || return 1
     [[ -d "$AWG_CLIENTS_DIR/alpha" ]]
     awg() { return 0; }
     remove_awg_peer_by_name alpha
@@ -198,6 +198,15 @@ _redirect_vless_config() {
     done
     [[ ! -e "$UI_CONFIRM_CALLS" ]]
     cmp "$XHTTP_MIHOMO_CONFIG" "$BATS_TEST_TMPDIR/vless-before"
+}
+
+@test "VLESS menu item 3 adds xHTTP even without a fake site" {
+    _check_base() { return 0; }
+    _vless_status() { :; }
+    _add_vless_xhttp() { printf 'xhttp\n' >> "$BATS_TEST_TMPDIR/xhttp-calls"; }
+    HAS_SITE=false
+    vless_menu <<< $'3\n0' >/dev/null
+    [[ "$(cat "$BATS_TEST_TMPDIR/xhttp-calls")" == xhttp ]]
 }
 
 @test "manual exit input EOF never produces YAML using stale optional defaults" {

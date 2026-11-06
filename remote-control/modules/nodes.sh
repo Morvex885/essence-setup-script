@@ -418,6 +418,23 @@ add_node() {
             _github_add_abort "$_node_id" "$_managed_identity" "$_known_backup" "$_manifest_backup"
         return 1
     fi
+    # GitHub's jq_w hook requires manifest issues to match the candidate's
+    # missing resources; _github_add_abort restores the manifest backup.
+    if [[ "${CONFIG_SOURCE:-local}" == "github" ]]; then
+        if [[ "$_auth" == "key" &&
+              ( "$_identity" == "system" || ! -f "$SSH_IDENTITIES_DIR/$_node_id" ) ]]; then
+            state_portability_add_issue "$_node_id" missing_identity || {
+                _github_add_abort "$_node_id" "$_managed_identity" "$_known_backup" "$_manifest_backup"
+                return 1
+            }
+        fi
+        if ! _ssh_known_host_present; then
+            state_portability_add_issue "$_node_id" missing_host_key || {
+                _github_add_abort "$_node_id" "$_managed_identity" "$_known_backup" "$_manifest_backup"
+                return 1
+            }
+        fi
+    fi
     if ! jq_w --arg id "$_node_id" --arg n "$_name" --arg ip "$_ip" \
         --argjson port "$_port" --arg u "$_user" --arg a "$_auth" \
         --arg identity "$_identity" --arg secret_id "$_secret_id" --arg t "$_tag" '
@@ -439,23 +456,6 @@ add_node() {
         return 1
     }
     if [[ "${CONFIG_SOURCE:-local}" == "github" ]]; then
-        if [[ "$_auth" == "key" &&
-              ( "$_identity" == "system" || ! -f "$SSH_IDENTITIES_DIR/$_node_id" ) ]]; then
-            state_portability_add_issue "$_node_id" missing_identity || {
-                _github_add_abort "$_node_id" "$_managed_identity" "$_known_backup" "$_manifest_backup"
-                return 1
-            }
-        fi
-        if ! _ssh_known_host_present; then
-            state_portability_add_issue "$_node_id" missing_host_key || {
-                _github_add_abort "$_node_id" "$_managed_identity" "$_known_backup" "$_manifest_backup"
-                return 1
-            }
-        fi
-        state_checkpoint >/dev/null 2>&1 || {
-            _github_add_abort "$_node_id" "$_managed_identity" "$_known_backup" "$_manifest_backup"
-            return 1
-        }
         if declare -F github_config_checkpoint >/dev/null 2>&1 &&
            ! github_config_checkpoint; then
             _github_add_abort "$_node_id" "$_managed_identity" "$_known_backup" "$_manifest_backup"

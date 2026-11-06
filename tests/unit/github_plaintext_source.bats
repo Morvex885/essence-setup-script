@@ -869,7 +869,7 @@ EOF
         git --git-dir="$config_dir/github-store.git" cat-file -e "main:$rel"
     done
     for rel in config.json secrets.json manifest.json; do
-        ! git --git-dir="$config_dir/github-store.git" cat-file -e "main:$rel"
+        ! git --git-dir="$config_dir/github-store.git" cat-file -e "main:$rel" || return 1
     done
     [[ -f "$config_dir/github-runtime/config.json" ]] || return 1
 
@@ -1018,7 +1018,7 @@ EOF
         done
     done < <(tr ':' '\n' <<< "$PATH")
     export PATH="$BIN:$isolated_bin"
-    ! command -v age >/dev/null 2>&1
+    ! command -v age >/dev/null 2>&1 || return 1
 
 
 
@@ -1108,8 +1108,8 @@ EOF
     [[ ! -e "$HOME/.config/remote-control-essence/source.json" ]] || return 1
     grep -q '^auth token --hostname github.com --user alternate-owner$' "$GH_CALLS_FILE"
     grep -q '^alternate-owner auth login --hostname github.com --git-protocol https --web$' "$GH_SCOPE_CALLS_FILE"
-    ! grep -q '^repo ' "$GH_CALLS_FILE"
-    ! grep -q 'ghp_' "$GH_CALLS_FILE"
+    ! grep -q '^repo ' "$GH_CALLS_FILE" || return 1
+    ! grep -q 'ghp_' "$GH_CALLS_FILE" || return 1
     _assert_no_global_auth_mutation
 }
 @test "GitHub connection error redacts credentials and tokens" {
@@ -1161,8 +1161,8 @@ EOF
     assert_failure
     assert_output --partial "GH_CONFIG_DIR=$config_dir/credentials/gh/test-owner gh auth login --hostname github.com --web"
     [[ "$(_hash_file "$config_dir/source.json")" == "$source_hash" ]] || return 1
-    ! grep -q '^repo ' "$GH_CALLS_FILE"
-    ! grep -q '^auth login ' "$GH_CALLS_FILE"
+    ! grep -q '^repo ' "$GH_CALLS_FILE" || return 1
+    ! grep -q '^auth login ' "$GH_CALLS_FILE" || return 1
     _assert_no_global_auth_mutation
 }
 
@@ -1180,9 +1180,9 @@ EOF
     assert_output --partial "Профиль test-owner авторизован как alternate-owner."
     [[ "$(_hash_file "$config_dir/source.json")" == "$source_hash" ]] || return 1
     [[ "$(sed -n 's/^user: //p' "$profile/hosts.yml")" == alternate-owner ]] || return 1
-    ! grep -q '^auth token ' "$GH_CALLS_FILE"
-    ! grep -q '^auth login ' "$GH_CALLS_FILE"
-    ! grep -q '^repo ' "$GH_CALLS_FILE"
+    ! grep -q '^auth token ' "$GH_CALLS_FILE" || return 1
+    ! grep -q '^auth login ' "$GH_CALLS_FILE" || return 1
+    ! grep -q '^repo ' "$GH_CALLS_FILE" || return 1
     _assert_no_global_auth_mutation
 }
 
@@ -1256,13 +1256,13 @@ EOF
     grep -q '^auth token --hostname github.com --user alternate-owner$' "$GH_CALLS_FILE"
     grep -q '^alternate-owner auth login --hostname github.com --git-protocol https --with-token$' "$GH_SCOPE_CALLS_FILE"
     grep -q '^alternate-owner repo view alternate-owner/essence-remote-control-config ' "$GH_SCOPE_CALLS_FILE"
-    ! grep -q '^repo view test-owner/' "$GH_CALLS_FILE"
+    ! grep -q '^repo view test-owner/' "$GH_CALLS_FILE" || return 1
     [[ "$(git --git-dir="$config_dir/github-store.git" config --get remote.origin.url)" == \
         "https://github.com/alternate-owner/essence-remote-control-config.git" ]] || return 1
     [[ "$(_file_mode "$config_dir/credentials/gh/alternate-owner/hosts.yml")" == 600 ]] || return 1
     [[ "$output" != *"ghp_FixtureToken_"* ]] || return 1
-    ! grep -q 'ghp_FixtureToken_' "$GH_CALLS_FILE"
-    ! grep -q 'ghp_FixtureToken_' "$config_dir/source.json"
+    ! grep -q 'ghp_FixtureToken_' "$GH_CALLS_FILE" || return 1
+    ! grep -q 'ghp_FixtureToken_' "$config_dir/source.json" || return 1
     _assert_no_global_auth_mutation
 }
 
@@ -1625,8 +1625,8 @@ EOF
         "https://github.com/test-owner/essence-remote-control-config.git" ]] || return 1
     [[ "$output" != *"Сменить аккаунт для конфигурации"* ]] || return 1
     grep -q '^test-owner repo view test-owner/' "$GH_SCOPE_CALLS_FILE"
-    ! grep -q '^alternate-owner ' "$GH_SCOPE_CALLS_FILE"
-    ! grep -q 'ghp_FixtureToken_' "$GH_CALLS_FILE"
+    ! grep -q '^alternate-owner ' "$GH_SCOPE_CALLS_FILE" || return 1
+    ! grep -q 'ghp_FixtureToken_' "$GH_CALLS_FILE" || return 1
     [[ "$output" != *"ghp_FixtureToken_"* ]] || return 1
     _assert_no_global_auth_mutation alternate-owner
 }
@@ -1682,7 +1682,7 @@ EOF
     [[ "$(git --git-dir="$config_dir/github-store.git" config --get remote.origin.url)" == \
         "https://github.com/test-owner/essence-remote-control-config.git" ]] || return 1
     [[ ! -e "$config_dir/account-switch" ]] || return 1
-    ! grep -q '^repo view alternate-owner/' "$GH_CALLS_FILE"
+    ! grep -q '^repo view alternate-owner/' "$GH_CALLS_FILE" || return 1
     _assert_no_global_auth_mutation
 }
 
@@ -1709,6 +1709,32 @@ EOF
     [[ "$(git --git-dir="$ALTERNATE_REMOTE" rev-parse main)" == "$b_head" ]]
 }
 
+@test "rejected B push suspends the switch and same-process fetch rolls back to A" {
+    _prepare_alternate_remote
+    export GH_CALLS_FILE="$BATS_TEST_TMPDIR/gh-calls"
+    run bash -c 'printf "2\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    local config_dir="$HOME/.config/remote-control-essence" a_head b_head
+    a_head=$(git --git-dir="$REMOTE" rev-parse main)
+    b_head=$(git --git-dir="$ALTERNATE_REMOTE" rev-parse main)
+    printf '#!/bin/sh\nexit 1\n' > "$ALTERNATE_REMOTE/hooks/pre-receive"
+    chmod +x "$ALTERNATE_REMOTE/hooks/pre-receive"
+
+    run bash -c 'printf "i\nC\n2\nalternate-owner\ny\n2\nP\nF\n0\n" | "$0"' \
+        "$APP/remote-control-essence.sh"
+    assert_success
+    assert_output --partial "Результат отправки в новый репозиторий не подтверждён."
+    assert_output --partial "Не удалось отправить конфигурацию в GitHub"
+    refute_output --partial "Локальная конфигурация отправлена в GitHub."
+    assert_output --partial "Конфигурация загружена из GitHub."
+    jq -e '.repo == "test-owner/essence-remote-control-config"' "$config_dir/source.json" || return 1
+    [[ "$(git --git-dir="$config_dir/github-store.git" config --get remote.origin.url)" == \
+        "https://github.com/test-owner/essence-remote-control-config.git" ]] || return 1
+    [[ "$(git --git-dir="$REMOTE" rev-parse main)" == "$a_head" ]] || return 1
+    [[ "$(git --git-dir="$ALTERNATE_REMOTE" rev-parse main)" == "$b_head" ]] || return 1
+    [[ ! -e "$config_dir/account-switch" ]] || return 1
+}
+
 @test "missing A profile and token never selects global B or writes either repository" {
     _prepare_alternate_remote
     export GH_CALLS_FILE="$BATS_TEST_TMPDIR/gh-calls"
@@ -1732,8 +1758,8 @@ EOF
     [[ "$(git --git-dir="$REMOTE" rev-parse main)" == "$a_head" ]] || return 1
     [[ "$(git --git-dir="$ALTERNATE_REMOTE" rev-parse main)" == "$b_head" ]] || return 1
     [[ ! -e "$config_dir/credentials/gh/test-owner/hosts.yml" ]] || return 1
-    ! grep -q '^repo ' "$GH_CALLS_FILE"
-    ! grep -q '^auth login .*--web' "$GH_CALLS_FILE"
+    ! grep -q '^repo ' "$GH_CALLS_FILE" || return 1
+    ! grep -q '^auth login .*--web' "$GH_CALLS_FILE" || return 1
     _assert_no_global_auth_mutation alternate-owner
 }
 
@@ -1755,9 +1781,9 @@ EOF
     [[ "$(sed -n 's/^user: //p' "$config_dir/credentials/gh/test-owner/hosts.yml")" == test-owner ]] || return 1
     grep -q '^auth token --hostname github.com --user test-owner$' "$GH_CALLS_FILE"
     grep -q '^test-owner auth login --hostname github.com --git-protocol https --with-token$' "$GH_SCOPE_CALLS_FILE"
-    ! grep -q '^auth login .*--web' "$GH_CALLS_FILE"
-    ! grep -q '^auth token .*--user alternate-owner' "$GH_CALLS_FILE"
-    ! grep -q 'ghp_FixtureToken_' "$GH_CALLS_FILE"
+    ! grep -q '^auth login .*--web' "$GH_CALLS_FILE" || return 1
+    ! grep -q '^auth token .*--user alternate-owner' "$GH_CALLS_FILE" || return 1
+    ! grep -q 'ghp_FixtureToken_' "$GH_CALLS_FILE" || return 1
     _assert_no_global_auth_mutation alternate-owner
 }
 
@@ -1771,8 +1797,8 @@ EOF
     jq -e '.repo == "test-owner/essence-remote-control-config"' "$config_dir/source.json"
     grep -q '^test-owner auth login --hostname github.com --git-protocol https --web$' "$GH_SCOPE_CALLS_FILE"
     [[ "$output" != *"ghp_FixtureToken_"* ]] || return 1
-    ! grep -q 'ghp_FixtureToken_' "$GH_CALLS_FILE"
-    ! grep -q 'ghp_FixtureToken_' "$config_dir/source.json"
+    ! grep -q 'ghp_FixtureToken_' "$GH_CALLS_FILE" || return 1
+    ! grep -q 'ghp_FixtureToken_' "$config_dir/source.json" || return 1
     _assert_no_global_auth_mutation
 }
 
@@ -1793,7 +1819,7 @@ EOF
     run bash -c 'printf "i\n2\n0\n0\n" | "$0"' "$APP/remote-control-essence.sh"
     assert_success
     assert_output --partial "Выбор аккаунта GitHub отменён."
-    ! grep -q '^repo ' "$GH_CALLS_FILE"
+    ! grep -q '^repo ' "$GH_CALLS_FILE" || return 1
     _assert_no_global_auth_mutation
 }
 

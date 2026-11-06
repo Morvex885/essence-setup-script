@@ -559,3 +559,26 @@ mtproto_install_fixture() {
     cmp "$BATS_TEST_TMPDIR/events-before" "$events"
     [[ "$output" != *"$secret"* ]]
 }
+
+@test "relay build output stays in the private build dir and is copied into the root-owned candidate" {
+    local relay_source="$BATS_TEST_TMPDIR/relay-src" go="$BATS_TEST_TMPDIR/fake-go" candidate inode output
+    mkdir -p "$relay_source/cmd/tproxy-server"
+    cat > "$go" <<'FAKE'
+#!/bin/bash
+while [[ $# -gt 0 ]]; do
+    if [[ "$1" == -o ]]; then printf '%s\n' "$2" > "$BUILD_OUTPUT_LOG"; printf 'built\n' > "$2"; fi
+    shift
+done
+FAKE
+    chmod 0755 "$go"
+    export BUILD_OUTPUT_LOG="$BATS_TEST_TMPDIR/build-output"
+    runuser() { shift 3; "$@"; }
+    candidate=$(mktemp "$BATS_TEST_TMPDIR/candidate.XXXXXX")
+    inode=$(stat -c %i "$candidate")
+    _telegram_proxy_build_relay "$relay_source" "$go" "$candidate"
+    output=$(cat "$BUILD_OUTPUT_LOG")
+    [[ "$output" == /tmp/tproxy-build.*/tproxy-server ]]
+    [[ ! -e "$output" ]]
+    [[ "$(cat "$candidate")" == built ]]
+    [[ "$(stat -c %i "$candidate")" == "$inode" ]]
+}

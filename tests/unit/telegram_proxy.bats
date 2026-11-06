@@ -193,7 +193,7 @@ _menu_journal() {
     grep -q '2398 drop' "$TPROXY_FIREWALL_FILE"
     grep -q '8888' "$TPROXY_FIREWALL_FILE"
     _telegram_proxy_render_firewall true
-    ! grep -q '2398 drop' "$TPROXY_FIREWALL_FILE"
+    ! grep -q '2398 drop' "$TPROXY_FIREWALL_FILE" || return 1
     grep -q '8888' "$TPROXY_FIREWALL_FILE"
     grep -q 'iifname != "lo"' "$TPROXY_FIREWALL_FILE"
 }

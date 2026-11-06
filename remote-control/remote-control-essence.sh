@@ -488,6 +488,36 @@ _github_change_rollback() {
     return "$rc"
 }
 
+# Push outcome is unknown: keep the push_unknown marker for
+# github_account_switch_recover and close both sessions. Without a worktree,
+# flush and config writes fail, so nothing reaches either repository until
+# F or the next start verifies the push and finishes or rolls back the switch.
+_github_account_switch_suspend() {
+    local stage="${GITHUB_LAST_STAGE:-}" detail="${GITHUB_LAST_ERROR:-}"
+    local hint="${GITHUB_LAST_HINT:-}" auth="${GITHUB_LAST_AUTH_RELEVANT:-false}"
+    github_config_close >/dev/null 2>&1 || true
+    GITHUB_STORE="$1"; GITHUB_SESSIONS_DIR="$2"
+    GITHUB_WORKTREE="$3"; GITHUB_SESSION_ID="$4"
+    GITHUB_REMOTE="$5"; GITHUB_BRANCH="$6"; GITHUB_OWNER="$7"
+    GITHUB_IDENTITY="$8"; GITHUB_RECIPIENT="$9"
+    GITHUB_SESSION_REMOTE="${10}"; GITHUB_SESSION_BRANCH="${11}"
+    GITHUB_SESSION_ORIGIN="${12}"; GITHUB_STORAGE_MODE="${13}"
+    if [[ -n "$GITHUB_WORKTREE" || -n "$GITHUB_SESSION_ID" ]]; then
+        github_config_close >/dev/null 2>&1 || true
+    fi
+    GITHUB_WORKTREE=""; GITHUB_SESSION_ID=""
+    GITHUB_SESSION_REMOTE=""; GITHUB_SESSION_BRANCH=""; GITHUB_SESSION_ORIGIN=""
+    GITHUB_SYNC_STATUS=pending
+    export GITHUB_STORE GITHUB_SESSIONS_DIR GITHUB_WORKTREE GITHUB_SESSION_ID
+    export GITHUB_REMOTE GITHUB_BRANCH GITHUB_OWNER GITHUB_IDENTITY GITHUB_RECIPIENT
+    export GITHUB_SESSION_REMOTE GITHUB_SESSION_BRANCH GITHUB_SESSION_ORIGIN
+    export GITHUB_STORAGE_MODE GITHUB_SYNC_STATUS
+    warn "Результат отправки в новый репозиторий не подтверждён. Синхронизация и изменения приостановлены."
+    info "Выберите F (загрузить из GitHub) или перезапустите remote-control: смена аккаунта будет проверена и завершена или отменена."
+    GITHUB_LAST_STAGE="$stage"; GITHUB_LAST_ERROR="$detail"
+    GITHUB_LAST_HINT="$hint"; GITHUB_LAST_AUTH_RELEVANT="$auth"
+}
+
 github_source_change_account() {
     local initial_login
     local old_repo old_name branch old_store old_sessions new_repo old_storage
@@ -653,6 +683,7 @@ github_source_change_account() {
             return 1
         fi
         if ! _github_sync_push "$expected_head"; then
+            _github_account_switch_suspend "${original[@]}"
             return 1
         fi
         _github_account_switch_write_marker target_committed "$expected_head" \
@@ -660,6 +691,7 @@ github_source_change_account() {
             "${GITHUB_ACCOUNT_SWITCH_REPO_PRIVATIZED:-false}" || {
             _github_record_error "фиксация отправленной конфигурации" \
                 "Не удалось записать состояние завершённой отправки."
+            _github_account_switch_suspend "${original[@]}"
             return 1
         }
     else

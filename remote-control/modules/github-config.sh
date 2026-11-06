@@ -1610,7 +1610,9 @@ github_config_rewrap_master() {
     _github_remove_private_path "$unlock_tmp" ||
         warn "Защищённый staging-каталог нового ключа требует ручной очистки."
     if ! github_sync_flush; then
-        if [[ "${GITHUB_LAST_STAGE:-}" == "отправка конфигурации в GitHub" ]]; then
+        # Both stages run after github_sync_flush pinned the commit locally.
+        if [[ "${GITHUB_LAST_STAGE:-}" == "отправка конфигурации в GitHub" ||
+              "${GITHUB_LAST_STAGE:-}" == "проверка аккаунта GitHub" ]]; then
             GITHUB_SYNC_STATUS=pending
             _github_report_last_error "Новый пароль сохранён локально, но не отправлен в GitHub"
             _github_remove_private_path "$identity_tmp" ||
@@ -1681,7 +1683,8 @@ github_config_rotate_vault_key() {
             fi
             return 0
         fi
-        if [[ "${GITHUB_LAST_STAGE:-}" == "отправка конфигурации в GitHub" ]]; then
+        if [[ "${GITHUB_LAST_STAGE:-}" == "отправка конфигурации в GitHub" ||
+              "${GITHUB_LAST_STAGE:-}" == "проверка аккаунта GitHub" ]]; then
             GITHUB_SYNC_STATUS=pending
             _github_report_last_error "Новый ключ сохранён локально, но не отправлен в GitHub"
             rm -rf "$backup" ||
@@ -2181,7 +2184,11 @@ github_account_switch_begin() {
             return 1
         }
         if [[ -n "${GITHUB_WORKTREE:-}" && -d "$GITHUB_WORKTREE" ]]; then
-            current_worktree=$(realpath "$GITHUB_WORKTREE") || return 1
+            current_worktree=$(_github_canonical_path "$GITHUB_WORKTREE") || {
+                _github_record_error "проверка активных сессий GitHub" \
+                    "Не удалось определить путь текущей рабочей копии GitHub."
+                return 1
+            }
         fi
         while IFS= read -r entry; do
             case "$entry" in
@@ -2190,7 +2197,7 @@ github_account_switch_begin() {
                 "")
                     if [[ -n "$worktree" ]] &&
                        { [[ -z "$current_worktree" || ! -d "$worktree" ]] ||
-                         [[ "$(realpath "$worktree")" != "$current_worktree" ]]; }; then
+                         [[ "$(_github_canonical_path "$worktree")" != "$current_worktree" ]]; }; then
                         _github_record_error "проверка активных сессий GitHub" \
                             "Другой экземпляр уже использует рабочую копию GitHub. Закройте его и повторите смену аккаунта."
                         return 1
@@ -2201,7 +2208,7 @@ github_account_switch_begin() {
         done < <(git --git-dir="$GITHUB_STORE" worktree list --porcelain 2>/dev/null)
         if [[ -n "$worktree" ]] &&
            { [[ -z "$current_worktree" || ! -d "$worktree" ]] ||
-             [[ "$(realpath "$worktree")" != "$current_worktree" ]]; }; then
+             [[ "$(_github_canonical_path "$worktree")" != "$current_worktree" ]]; }; then
             _github_record_error "проверка активных сессий GitHub" \
                 "Другой экземпляр уже использует рабочую копию GitHub. Закройте его и повторите смену аккаунта."
             return 1
@@ -3076,7 +3083,10 @@ _github_runtime_restore() {
     if [[ -e "$backup/auth" || -L "$backup/auth" ]]; then
         _github_exact_regular_file "$backup/auth" || return 1
         [[ ! -e "$backup/auth.absent" && ! -L "$backup/auth.absent" ]] || return 1
-        auth_mode=$(stat -c '%a' "$backup/auth") || return 1
+        # GNU stat uses -c; BSD/macOS stat uses -f.
+        auth_mode=$(stat -c '%a' "$backup/auth" 2>/dev/null ||
+            stat -f '%Lp' "$backup/auth") || return 1
+        [[ "$auth_mode" =~ ^[0-7]{3,4}$ ]] || return 1
     else
         _github_exact_regular_file "$backup/auth.absent" || return 1
     fi
@@ -3146,14 +3156,16 @@ github_sync_fetch() {
     local old_status="${GITHUB_SYNC_STATUS:-clean}"
     local old_state_dir="${STATE_DIR:-}" runtime_snapshot="" has_runtime_snapshot=false
     local old_auth="${SCRIPT_AUTH_FILE:-$CONFIG_DIR/.auth}"
-    local old_storage_mode="${GITHUB_STORAGE_MODE:-}" runtime_var
+    local old_storage_mode="${GITHUB_STORAGE_MODE:-}" runtime_var runtime_index
     local -a runtime_vars=(CONFIG_SOURCE CONFIG_DIR LOCAL_CONFIG_JSON STATE_DIR CONFIG_JSON
         SECRETS_JSON STATE_MANIFEST TEMPLATES_DIR SSH_IDENTITIES_DIR SSH_KNOWN_HOSTS SCRIPT_AUTH_FILE)
-    local -A runtime_values=() runtime_set=()
-    for runtime_var in "${runtime_vars[@]}"; do
-        if [[ -v "$runtime_var" ]]; then
-            runtime_set[$runtime_var]=true
-            runtime_values[$runtime_var]="${!runtime_var}"
+    # Bash 3.2: indexed arrays and ${!name+x} instead of local -A and [[ -v ]].
+    local -a runtime_values=() runtime_set=()
+    for ((runtime_index = 0; runtime_index < ${#runtime_vars[@]}; runtime_index++)); do
+        runtime_var="${runtime_vars[$runtime_index]}"
+        if [[ -n "${!runtime_var+x}" ]]; then
+            runtime_set[$runtime_index]=true
+            runtime_values[$runtime_index]="${!runtime_var}"
         fi
     done
     local new_worktree new_session new_identity new_recipient
@@ -3197,9 +3209,10 @@ github_sync_fetch() {
             rm -rf "$runtime_snapshot" ||
                 warn "Снимок неудачной загрузки требует ручной очистки: $runtime_snapshot"
         fi
-        for runtime_var in "${runtime_vars[@]}"; do
-            if [[ ${runtime_set[$runtime_var]:-} == true ]]; then
-                printf -v "$runtime_var" '%s' "${runtime_values[$runtime_var]}"
+        for ((runtime_index = 0; runtime_index < ${#runtime_vars[@]}; runtime_index++)); do
+            runtime_var="${runtime_vars[$runtime_index]}"
+            if [[ ${runtime_set[$runtime_index]:-} == true ]]; then
+                printf -v "$runtime_var" '%s' "${runtime_values[$runtime_index]}"
             else
                 unset "$runtime_var"
             fi
@@ -3218,9 +3231,10 @@ github_sync_fetch() {
         return 1
     fi
     if [[ -z "${GITHUB_WORKTREE:-}" || -z "${GITHUB_SESSION_ID:-}" ]]; then
-        for runtime_var in "${runtime_vars[@]}"; do
-            if [[ ${runtime_set[$runtime_var]:-} == true ]]; then
-                printf -v "$runtime_var" '%s' "${runtime_values[$runtime_var]}"
+        for ((runtime_index = 0; runtime_index < ${#runtime_vars[@]}; runtime_index++)); do
+            runtime_var="${runtime_vars[$runtime_index]}"
+            if [[ ${runtime_set[$runtime_index]:-} == true ]]; then
+                printf -v "$runtime_var" '%s' "${runtime_values[$runtime_index]}"
             else
                 unset "$runtime_var"
             fi
@@ -3283,9 +3297,10 @@ github_sync_fetch() {
             rm -rf "$runtime_snapshot" ||
                 warn "Снимок неудачной загрузки требует ручной очистки: $runtime_snapshot"
         fi
-        for runtime_var in "${runtime_vars[@]}"; do
-            if [[ ${runtime_set[$runtime_var]:-} == true ]]; then
-                printf -v "$runtime_var" '%s' "${runtime_values[$runtime_var]}"
+        for ((runtime_index = 0; runtime_index < ${#runtime_vars[@]}; runtime_index++)); do
+            runtime_var="${runtime_vars[$runtime_index]}"
+            if [[ ${runtime_set[$runtime_index]:-} == true ]]; then
+                printf -v "$runtime_var" '%s' "${runtime_values[$runtime_index]}"
             else
                 unset "$runtime_var"
             fi

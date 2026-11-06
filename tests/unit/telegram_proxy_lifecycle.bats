@@ -541,6 +541,38 @@ EOF
     [ -z "$TELEGRAM_WEB_HOSTNAME" ]
 }
 
+@test "last WEB removal rollback restores backend env, units and sources after userdel failure" {
+    mkdir -p "$TPROXY_DIR" "$TPROXY_RELAY_SOURCE_PATH" "$TPROXY_MTPROXY_DIR" "$TPROXY_MTPROXY_SOURCE_DIR" \
+        "$(dirname "$TPROXY_ENV_FILE")" "$TPROXY_SYSTEMD_DIR" "$(dirname "$TPROXY_REFRESH_BIN")" \
+        "$(dirname "$TPROXY_NGINX_SITE")" "$(dirname "$TPROXY_NGINX_ENABLED")"
+    touch "$TPROXY_CONF" "$TPROXY_CONFIG_JSON" "$TPROXY_PROFILES_FILE" "$TPROXY_NGINX_SITE" "$TPROXY_NGINX_ENABLED" \
+        "$TPROXY_ENV_FILE" "$TPROXY_MTPROXY_DIR/data" "$TPROXY_MTPROXY_SOURCE_DIR/source" "$TPROXY_REFRESH_BIN" \
+        "$TPROXY_SYSTEMD_DIR/$TPROXY_UNIT_MTPROXY" "$TPROXY_SYSTEMD_DIR/$TPROXY_UNIT_FIREWALL" \
+        "$TPROXY_SYSTEMD_DIR/$TPROXY_UNIT_REFRESH" "$TPROXY_SYSTEMD_DIR/$TPROXY_UNIT_TIMER"
+    _telegram_proxy_initialize_state
+    TELEGRAM_WEB_ENABLED=true TELEGRAM_MTPROTO_ENABLED=false TELEGRAM_WEB_HOSTNAME=web.example.com
+    TPROXY_CREATED_USER=false MTPROXY_CREATED_USER=true
+    _telegram_proxy_component_enabled() { [[ "$1" == web ]]; }
+    _telegram_proxy_snapshot_certificate_registration() { return 0; }
+    _telegram_proxy_restore_certificate_registration() { return 0; }
+    systemctl() { true; }
+    nft() { return 1; }
+    userdel() { printf '%s\n' "$1" >> "$BATS_TEST_TMPDIR/userdel"; return 1; }
+    nginx() { [[ " $* " != *' -T '* ]] || printf 'http { server { listen 80; server_name _; } }\n'; }
+    run telegram_proxy_web_remove --force
+    assert_failure 1
+    [ "$(cat "$BATS_TEST_TMPDIR/userdel")" = mtproxy ]
+    [ -e "$TPROXY_ENV_FILE" ]
+    [ -e "$TPROXY_MTPROXY_DIR/data" ]
+    [ -e "$TPROXY_MTPROXY_SOURCE_DIR/source" ]
+    [ -e "$TPROXY_REFRESH_BIN" ]
+    [ -e "$TPROXY_SYSTEMD_DIR/$TPROXY_UNIT_MTPROXY" ]
+    [ -e "$TPROXY_SYSTEMD_DIR/$TPROXY_UNIT_FIREWALL" ]
+    [ -e "$TPROXY_SYSTEMD_DIR/$TPROXY_UNIT_REFRESH" ]
+    [ -e "$TPROXY_SYSTEMD_DIR/$TPROXY_UNIT_TIMER" ]
+    [ -e "$TPROXY_CONF" ]
+}
+
 @test "MTProto removal from a combined install preserves WEB and rewrites shared state" {
     mkdir -p "$TPROXY_DIR" "$TPROXY_RELAY_SOURCE_PATH" "$(dirname "$TPROXY_FIREWALL_FILE")"
     touch "$TPROXY_CONF" "$TPROXY_FIREWALL_FILE"

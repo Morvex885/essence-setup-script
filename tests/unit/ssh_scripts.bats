@@ -75,7 +75,7 @@ teardown() { teardown_test_env; }
     _ver_gt "$(_remote_scripts_normalize_version 1.10.0)" "$(_remote_scripts_normalize_version 1.9.9)"
     local invalid
     for invalid in '' '1.2.3;touch /tmp/injected' '1.2.3  ' $'1.2.3\njunk' '9999999999.0.0'; do
-        ! _remote_scripts_normalize_version "$invalid"
+        ! _remote_scripts_normalize_version "$invalid" || return 1
     done
     printf '$(touch "%s")\n' "$BATS_TEST_TMPDIR/escaped" > "$VERSION_PATH"
     run ensure_remote_scripts_current

@@ -379,6 +379,15 @@ EOF
         [ "${#TOGGLE_SELECT_ITEMS[@]}" -eq 0 ]
         [ "${#TOGGLE_SELECT_FLAGS[@]}" -eq 0 ]
     done
+    TELEGRAM_PROXY_SELECTED=(2)
+    TOGGLE_SELECT_ITEMS=('stale')
+    TOGGLE_SELECT_FLAGS=(1)
+    telegram_proxy_remote_menu <<< $'6\n1\n0\n0' >/dev/null
+    [ "$?" -eq 0 ]
+    [ ! -s "$EVENTS" ]
+    [ "${#TELEGRAM_PROXY_SELECTED[@]}" -eq 0 ]
+    [ "${#TOGGLE_SELECT_ITEMS[@]}" -eq 0 ]
+    [ "${#TOGGLE_SELECT_FLAGS[@]}" -eq 0 ]
     telegram_proxy_remote_menu < /dev/null >/dev/null
     [ "$?" -eq 0 ]
 }
@@ -450,7 +459,7 @@ EOF
         sleep 30 &
         local pid=$!
         TELEGRAM_PROXY_BATCH_PIDS="$pid"
-        trap 'printf "%s %s %s\n" "${#TELEGRAM_PROXY_PLAN_PASS[@]}" "${TELEGRAM_PROXY_BATCH_DIR:-empty}" "${TELEGRAM_PROXY_BATCH_PIDS:-empty}" > "$receipt"; ! kill -0 "$pid" 2>/dev/null' EXIT
+        trap 'printf "%s %s %s\n" "${#TELEGRAM_PROXY_PLAN_PASS[@]}" "${TELEGRAM_PROXY_BATCH_DIR:-empty}" "${TELEGRAM_PROXY_BATCH_PIDS:-empty}" > "$receipt"; ! kill -0 "$pid" 2>/dev/null || exit 1' EXIT
         _telegram_proxy_remote_batch_abort
     )
     run abort_fixture

@@ -53,9 +53,86 @@ assert_final_registration() {
     _acme_conf_value "$file" Le_Webroot
     [ "$ACME_CONF_VALUE" = "$CERT_TEST_WEBROOT" ]
     _acme_conf_value "$file" Le_PreHook
-    [ "$ACME_CONF_VALUE" = 'ufw allow 80/tcp' ]
+    [ "$ACME_CONF_VALUE" = "$CERT_HTTP01_PRE_HOOK" ]
     _acme_conf_value "$file" Le_PostHook
-    [ "$ACME_CONF_VALUE" = 'ufw deny 80/tcp && systemctl reload nginx' ]
+    [ "$ACME_CONF_VALUE" = "$CERT_HTTP01_POST_HOOK" ]
+}
+
+use_open_http01_ufw() {
+    mkdir -p "$BATS_TEST_TMPDIR/ufw-open"
+    cat > "$BATS_TEST_TMPDIR/ufw-open/ufw" <<'FAKE'
+#!/bin/bash
+printf 'ufw %s\n' "$*" >> "$CERT_TEST_SERVICE_LOG"
+[[ "$1" != status ]] || printf '80/tcp                     ALLOW       Anywhere\n'
+exit 0
+FAKE
+    chmod 700 "$BATS_TEST_TMPDIR/ufw-open/ufw"
+    export PATH="$BATS_TEST_TMPDIR/ufw-open:$PATH"
+}
+
+run_http01_hooks() {
+    local dir="$BATS_TEST_TMPDIR/domain-path"
+    mkdir -p "$dir"
+    (cd "$dir" && sh -c "$CERT_HTTP01_PRE_HOOK" && sh -c "$CERT_HTTP01_POST_HOOK")
+    [ ! -e "$dir/$CERT_HTTP01_STATE_FILE" ]
+}
+
+@test "renewal hooks close TCP/80 only when it was closed before" {
+    run_http01_hooks
+    grep -qx 'ufw allow 80/tcp' "$CERT_TEST_SERVICE_LOG"
+    grep -qx 'ufw deny 80/tcp' "$CERT_TEST_SERVICE_LOG"
+    grep -qx 'systemctl reload nginx' "$CERT_TEST_SERVICE_LOG"
+
+    : > "$CERT_TEST_SERVICE_LOG"
+    use_open_http01_ufw
+    run_http01_hooks
+    grep -qx 'ufw allow 80/tcp' "$CERT_TEST_SERVICE_LOG"
+    ! grep -qx 'ufw deny 80/tcp' "$CERT_TEST_SERVICE_LOG" || return 1
+    grep -qx 'systemctl reload nginx' "$CERT_TEST_SERVICE_LOG"
+}
+
+@test "interrupted renewal keeps the original closed TCP/80 state for the next run" {
+    local dir="$BATS_TEST_TMPDIR/domain-path"
+    mkdir -p "$dir"
+    (cd "$dir" && sh -c "$CERT_HTTP01_PRE_HOOK")
+    [ "$(cat "$dir/$CERT_HTTP01_STATE_FILE")" = closed ]
+    # The interrupted run left TCP/80 open; the next renewal must still close it.
+    use_open_http01_ufw
+    : > "$CERT_TEST_SERVICE_LOG"
+    run_http01_hooks
+    grep -qx 'ufw deny 80/tcp' "$CERT_TEST_SERVICE_LOG"
+}
+
+@test "new order honors and clears a stale closed TCP/80 state from an interrupted renewal" {
+    mkdir -p "$RSA"
+    printf 'closed\n' > "$RSA/$CERT_HTTP01_STATE_FILE"
+    use_open_http01_ufw
+    ensure_test_cert
+    grep -qx 'ufw deny 80/tcp' "$CERT_TEST_SERVICE_LOG"
+    [ ! -e "$RSA/$CERT_HTTP01_STATE_FILE" ]
+}
+
+@test "new order keeps an already open TCP/80 open" {
+    use_open_http01_ufw
+    ensure_test_cert
+    grep -qx 'ufw allow 80/tcp' "$CERT_TEST_SERVICE_LOG"
+    ! grep -qx 'ufw deny 80/tcp' "$CERT_TEST_SERVICE_LOG"
+}
+
+@test "new order closes TCP/80 that was closed before" {
+    ensure_test_cert
+    grep -qx 'ufw allow 80/tcp' "$CERT_TEST_SERVICE_LOG"
+    grep -qx 'ufw deny 80/tcp' "$CERT_TEST_SERVICE_LOG"
+}
+
+@test "challenge route listens on IPv6 only when the IPv6 stack exists" {
+    _cert_ipv6_available() { return 0; }
+    ensure_test_cert
+    grep -qx '    listen \[::\]:80;' "$CERT_TEST_AVAILABLE/essence-acme-$ID"
+    _cert_ipv6_available() { return 1; }
+    ensure_test_cert
+    ! grep -q '\[::\]' "$CERT_TEST_AVAILABLE/essence-acme-$ID" || return 1
+    grep -qx '    listen 80;' "$CERT_TEST_AVAILABLE/essence-acme-$ID"
 }
 
 @test "managed installed pair is byte-identical and renews even with a corrupt archive" {

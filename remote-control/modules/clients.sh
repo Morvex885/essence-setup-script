@@ -211,39 +211,12 @@ _change_client_group() {
     menu_select "Смена группы клиента: $target" "Выберите группу" "${other_groups[@]}" || return 1
     local new_group="${other_groups[$((MENU_SELECT_INDEX - 1))]}"
 
-    # Сводка изменений
     local cur_tpl new_tpl
     cur_tpl=$(jq_r --arg g "$current_group" '.groups[] | select(.name==$g) | .template // "default.yaml"')
     new_tpl=$(jq_r --arg g "$new_group" '.groups[] | select(.name==$g) | .template // "default.yaml"')
 
     local inherit
     inherit=$(jq_r --arg n "$target" '.clients[] | select(.name==$n) | if .inherit_nodes_from_group == false then false else true end')
-
-    echo ""
-    info "Изменения для '$target':"
-    echo -e "    Группа:  ${YELLOW}$current_group${NC} → ${GREEN}$new_group${NC}"
-    if [[ "$cur_tpl" != "$new_tpl" ]]; then
-        echo -e "    Шаблон:  ${YELLOW}$cur_tpl${NC} → ${GREEN}$new_tpl${NC}"
-    fi
-    if [[ "$inherit" == "true" ]]; then
-        local old_nodes new_nodes
-        old_nodes=$(_group_nodes_csv "$current_group"); old_nodes="${old_nodes//,/, }"
-        new_nodes=$(_group_nodes_csv "$new_group"); new_nodes="${new_nodes//,/, }"
-        echo -e "    Ноды:    ${YELLOW}${old_nodes:-нет}${NC} → ${GREEN}${new_nodes:-нет}${NC}"
-    fi
-
-    local client_conns_count
-    client_conns_count=$(jq_r --arg n "$target" '.clients[] | select(.name==$n) | .connections // [] | length')
-    if [[ "$client_conns_count" -gt 0 ]]; then
-        warn "У клиента есть $client_conns_count собственных подключений — они сохранятся, но проверьте актуальность через пункт '3)'."
-    fi
-
-    local gh_count
-    gh_count=$(jq_r --arg g "$current_group" '.groups[] | select(.name==$g) | .subscription_headers // [] | length')
-    if [[ "$gh_count" -gt 0 ]]; then
-        warn "Заголовки подписок старой группы (${gh_count}) больше не будут применяться."
-    fi
-
 
     # Собираем affected_nodes ДО изменения JSON
     local affected_nodes=()
@@ -276,11 +249,41 @@ _change_client_group() {
         done
     fi
 
-
     # Путь старой папки клиента (не группы!) — снимается до jq_w, т.к. после
     # изменения group этот же клиент будет смотреть в новую подпапку.
     local old_dir
     old_dir=$(_client_config_dir "$target")
+
+    local token client_conns_count gh_count _addr
+    token=$(jq_r --arg n "$target" '.clients[] | select(.name==$n) | .subscription.token // empty')
+    client_conns_count=$(jq_r --arg n "$target" '.clients[] | select(.name==$n) | .connections // [] | length')
+    gh_count=$(jq_r --arg g "$current_group" '.groups[] | select(.name==$g) | .subscription_headers // [] | length')
+
+    # Сводка изменений
+    local _review=("Клиент: $target" "Группа: $current_group → $new_group")
+    [[ "$cur_tpl" != "$new_tpl" ]] && _review+=("Шаблон: $cur_tpl → $new_tpl")
+    if [[ "$inherit" == "true" ]]; then
+        local old_nodes new_nodes
+        old_nodes=$(_group_nodes_csv "$current_group"); old_nodes="${old_nodes//,/, }"
+        new_nodes=$(_group_nodes_csv "$new_group"); new_nodes="${new_nodes//,/, }"
+        _review+=("Ноды клиента: ${old_nodes:-нет} → ${new_nodes:-нет}")
+    fi
+    _review+=("Затронутые ноды:")
+    [[ ${#affected_nodes[@]} -gt 0 ]] || _review+=(" нет")
+    for _n in "${affected_nodes[@]}"; do
+        _addr=$(jq_r --arg n "$_n" '.nodes[] | select(.name==$n) | "\(.ip):\(.port)"')
+        _review+=(" $_n  ${_addr:-не найдена}")
+    done
+    [[ "$client_conns_count" -gt 0 ]] && \
+        _review+=("Собственные подключения ($client_conns_count) сохранятся — проверьте их через пункт '3)'.")
+    [[ "$gh_count" -gt 0 ]] && \
+        _review+=("Заголовки подписок старой группы ($gh_count) больше не будут применяться.")
+    _review+=("Старый каталог конфигов (удаляется после генерации нового):" " $old_dir")
+    [[ -n "$token" ]] && _review+=("Подписка клиента будет обновлена.")
+    [[ ${#affected_nodes[@]} -gt 0 ]] && \
+        _review+=("Служба mihomo на затронутых нодах может быть перезапущена.")
+    review_frame "Смена группы клиента" "${_review[@]}"
+    confirm_yn "Перенести клиента $target в группу $new_group?" N || { info "Отменено."; return 1; }
 
     # Атомарное обновление group
     jq_w --arg n "$target" --arg g "$new_group" \
@@ -306,8 +309,6 @@ _change_client_group() {
     fi
 
     # Republish подписки, если у клиента есть токен
-    local token
-    token=$(jq_r --arg n "$target" '.clients[] | select(.name==$n) | .subscription.token // empty')
     if [[ -n "$token" ]]; then
         echo ""
         info "Обновляю подписку для $target..."

@@ -28,7 +28,9 @@ teardown() {
 }
 
 @test "ensure_acme_installed propagates installer failure" {
+    HOME="$BATS_TEST_TMPDIR/home"
     curl() { return 1; }
     run ensure_acme_installed 'test@example.com'
     assert_failure
+    assert_output --partial "Не удалось установить acme.sh."
 }

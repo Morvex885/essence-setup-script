@@ -84,7 +84,7 @@ proxy-groups:
 EOF
     run uninstall_warp
     assert_success
-    ! grep -q 'warp\|secret-key' "$SERVER_FIX/etc/mihomo/config.yaml"
+    ! grep -q 'warp\|secret-key' "$SERVER_FIX/etc/mihomo/config.yaml" || return 1
     grep -q '^  - name: before$' "$SERVER_FIX/etc/mihomo/config.yaml"
     grep -q '^  - name: after$' "$SERVER_FIX/etc/mihomo/config.yaml"
     grep -q '^      - before$' "$SERVER_FIX/etc/mihomo/config.yaml"
@@ -133,7 +133,7 @@ EOF
     run install_hy2 < "$BATS_TEST_TMPDIR/input"
     assert_failure 1
     [[ "$output" != *SUPER_SECRET_MARKER* ]]
-    ! grep -q 'Password:\|URI:' "$SERVER_FIX/etc/mihomo/client-config.txt"
+    ! grep -q 'Password:\|URI:' "$SERVER_FIX/etc/mihomo/client-config.txt" || return 1
     ! grep -q 'success-box' "$ACTION_LOG"
 }
 

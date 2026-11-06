@@ -202,7 +202,7 @@ prepare_empty_assigned_group() {
     _sync_listeners_on_nodes() { touch "$BATS_TEST_TMPDIR/listeners"; }
     subscription_publish() { touch "$BATS_TEST_TMPDIR/published"; }
     reject_config_promotion
-    run state_action change_client_group _change_client_group my-router ROUTER <<< 1
+    run state_action change_client_group _change_client_group my-router ROUTER <<< $'1\ny'
     assert_failure
     assert_rejected_config_unchanged
     cmp -s "$GENERATED_DIR/ROUTER/my-router/config.yaml" "$BATS_TEST_TMPDIR/before.yaml"
@@ -211,6 +211,22 @@ prepare_empty_assigned_group() {
     [ ! -e "$BATS_TEST_TMPDIR/prefetch" ]
     [ ! -e "$BATS_TEST_TMPDIR/listeners" ]
     [ ! -e "$BATS_TEST_TMPDIR/published" ]
+    [ "${#SSH_RUN_CALLS[@]}" -eq 0 ]
+    [ "${#UPLOAD_CALLS[@]}" -eq 0 ]
+}
+
+@test "client group change refusal reviews impact without SSH or local mutation" {
+    local confirms=0 rc=0 out="$BATS_TEST_TMPDIR/review"
+    confirm_yn() { confirms=$((confirms + 1)); [[ "$2" == N ]] || return 2; return 1; }
+    _change_client_group my-router ROUTER <<< 1 > "$out" || rc=$?
+    [ "$rc" -eq 1 ]
+    [ "$confirms" -eq 1 ]
+    for target in "ROUTER → PC" de-vps 1.2.3.4:22 "$GENERATED_DIR/ROUTER/my-router" "Подписка"; do
+        grep -qF -- "$target" "$out" || return 1
+    done
+    cmp -s "$CONFIG_JSON" "$BATS_TEST_TMPDIR/before.json"
+    [ -f "$GENERATED_DIR/ROUTER/my-router/config.yaml" ]
+    [ ! -e "$GENERATED_DIR/PC/my-router" ]
     [ "${#SSH_RUN_CALLS[@]}" -eq 0 ]
     [ "${#UPLOAD_CALLS[@]}" -eq 0 ]
 }

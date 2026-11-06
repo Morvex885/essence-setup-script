@@ -369,7 +369,16 @@ EOF
 
 # ─── Удаление ───────────────────────────────────────────────────────────────
 
+# --for-uninstall: вызов из полного удаления. Ошибки Nginx и освобождения
+# сертификата только выводятся: uninstall позже перезапускает Nginx и удаляет
+# /etc/nginx/ssl и acme.sh целиком.
 remove_subscription() {
+    local for_uninstall=false
+    case "${1:-}" in
+        "") ;;
+        --for-uninstall) for_uninstall=true ;;
+        *) return 2 ;;
+    esac
     if [[ ! -f "$SUB_CONF" ]]; then
         warn "Хостинг подписок не установлен."
         return 0
@@ -425,11 +434,10 @@ remove_subscription() {
 
     if ! nginx -t; then
         warn "Nginx конфигурация не прошла проверку после удаления подписок."
-        return 1
-    fi
-    if ! systemctl reload nginx 2>/dev/null; then
+        [[ "$for_uninstall" == true ]] || return 1
+    elif ! systemctl reload nginx 2>/dev/null; then
         warn "Не удалось перезагрузить Nginx после удаления подписок."
-        return 1
+        [[ "$for_uninstall" == true ]] || return 1
     fi
 
     # cleanup timer
@@ -455,7 +463,12 @@ remove_subscription() {
 
     if ! release_cert "$SUB_HOSTNAME" "/var/www/$SUB_HOSTNAME"; then
         warn "Не удалось освободить сертификат подписок."
-        return 1
+        [[ "$for_uninstall" == true ]] || return 1
+        info "Сертификат подписок будет удалён вместе с остальными сертификатами."
+        if ! _cert_identity_valid "$SUB_HOSTNAME" || ! rm -rf -- "/var/www/$SUB_HOSTNAME"; then
+            warn "Не удалось удалить webroot подписок."
+            return 1
+        fi
     fi
     if ! rm -rf "$SUB_DIR" /etc/nginx/snippets/essence-sub
     then

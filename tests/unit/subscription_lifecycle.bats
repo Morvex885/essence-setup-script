@@ -102,6 +102,7 @@ setup() {
                 sed "\|^${rule}$|d" "$UFW_RULES" > "$UFW_RULES.tmp"
                 mv "$UFW_RULES.tmp" "$UFW_RULES"
                 ;;
+            --force\ *) ;;
             *) return 1 ;;
         esac
     }
@@ -393,9 +394,10 @@ _prepare_removal_fixture() {
 
 _load_fixture_uninstall_for_lifecycle() {
     local copy="$BATS_TEST_TMPDIR/lifecycle-uninstall.sh"
-    sed -e "s|/etc|$FIX_ROOT/etc|g" -e "s|/root|$FIX_ROOT/root|g" \
-        -e "s|/usr/local/bin|$FIX_ROOT/usr/local/bin|g" \
-        -e "s|/var/www|$FIX_ROOT/var/www|g" \
+    sed -e 's|/etc|@FIX_ROOT@/etc|g' -e 's|/root|@FIX_ROOT@/root|g' \
+        -e 's|/usr/local/bin|@FIX_ROOT@/usr/local/bin|g' \
+        -e 's|/var/www|@FIX_ROOT@/var/www|g' \
+        -e "s|@FIX_ROOT@|$FIX_ROOT|g" \
         "$PROJECT_ROOT/setup-essence/modules/uninstall.sh" > "$copy"
     source "$copy"
     export TPROXY_CONF="$FIX_ROOT/etc/tproxy-server/essence.conf"
@@ -404,13 +406,57 @@ _load_fixture_uninstall_for_lifecycle() {
     export TPROXY_MTPROXY_SOURCE_DIR="$FIX_ROOT/opt/MTProxy"
     mkdir -p "$FIX_ROOT/root" "$FIX_ROOT/opt" "$FIX_ROOT/etc/tproxy-server"
     menu_select() { MENU_SELECT_INDEX=1; return 0; }
+    awg-quick() { return 0; }
+    sysctl() { return 0; }
+    _uninstall_sshd_effective() { return 1; }
+}
+
+@test "subscription removal for full uninstall tolerates Nginx reload failure" {
+    _prepare_removal_fixture standalone rsa 1
+    FAIL_SYSTEMCTL_RELOAD=1
+    run remove_subscription --for-uninstall
+    assert_success
+    assert_output --partial "Не удалось перезагрузить Nginx после удаления подписок."
+    [[ ! -e "$SUB_CONF" ]]
+    [[ ! -e "$FIX_ROOT/etc/systemd/system/essence-sub-cleanup.timer" ]]
+    [[ ! -e "$FIX_ROOT/var/lib/essence-sub" ]]
+    [[ ! -e "$FIX_ROOT/var/www/subs.example.com" ]]
+}
+
+@test "certificate consumer check failure blocks standalone removal but not full uninstall" {
+    _prepare_removal_fixture standalone rsa 1
+    FAIL_NGINX_DUMP=1
+    run remove_subscription
+    assert_failure 1
+    [[ -e "$SUB_CONF" ]]
+    run remove_subscription --for-uninstall
+    assert_success
+    assert_output --partial "Сертификат подписок будет удалён вместе с остальными сертификатами."
+    [[ ! -e "$SUB_CONF" ]]
+    [[ ! -e "$FIX_ROOT/var/www/subs.example.com" ]]
+    [[ ! -e "$FIX_ROOT/var/lib/essence-sub" ]]
+}
+
+@test "uninstall cleans subscription and continues when Nginx validation fails" {
+    _prepare_removal_fixture standalone none 1
+    : > "$FIX_ROOT/etc/mihomo/config.yaml"
+    _load_fixture_uninstall_for_lifecycle
+    FAIL_NGINX_TEST=1
+    run uninstall
+    assert_success
+    assert_output --partial "Nginx конфигурация не прошла проверку после удаления подписок."
+    [[ ! -e "$FIX_ROOT/etc/systemd/system/essence-sub-cleanup.timer" ]]
+    [[ ! -e "$FIX_ROOT/var/lib/essence-sub" ]]
+    [[ ! -e "$FIX_ROOT/var/www/subs.example.com" ]]
+    [[ ! -e "$FIX_ROOT/etc/mihomo/config.yaml" ]]
+    [[ "$(cat "$OPS_LOG")" == *"systemctl stop mihomo"* ]]
 }
 
 @test "uninstall stops before Mihomo removal when subscription cleanup fails" {
     _prepare_removal_fixture standalone rsa 1
     : > "$FIX_ROOT/etc/mihomo/config.yaml"
     _load_fixture_uninstall_for_lifecycle
-    FAIL_NGINX_TEST=1
+    FAIL_TIMER_DISABLE=1
     if uninstall; then
         return 1
     fi

@@ -1419,8 +1419,7 @@ vless_menu() {
         box_mid
         menu_item 1 "Настроить Reality" GREEN
         menu_item 2 "Добавить TCP" GREEN
-        [[ "$HAS_SITE" == true ]] && menu_item 3 "Добавить xHTTP" GREEN ||
-            menu_item 3 "Добавить xHTTP (недоступно без сайта)" NC
+        menu_item 3 "Добавить xHTTP" GREEN
         menu_item 4 "Добавить gRPC" GREEN
         menu_item d "Удалить транспорт" RED
         menu_item s "Статус" CYAN
@@ -1434,13 +1433,7 @@ vless_menu() {
         case "$VLESS_CHOICE" in
             1) setup_reality ;;
             2) _add_vless_tcp ;;
-            3)
-                if [[ "$HAS_SITE" == true ]]; then
-                    _add_vless_xhttp
-                else
-                    warn "Неверный выбор."
-                fi
-                ;;
+            3) _add_vless_xhttp ;;
             4) _add_vless_grpc ;;
             d|D) _remove_vless_transport ;;
             s|S)

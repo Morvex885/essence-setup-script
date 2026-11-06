@@ -532,7 +532,7 @@ printf '%s\n' removed
 EOF
 )
     printf -v command 'bash -c %q -- %q %q %q %q' "$script" "$token" "$sub_dir" "$SUB_SNIPPETS_DIR" "$replacement"
-    response=$(ssh_run -- "$command" 2>&1) || rc=$?
+    response=$(ssh_run -- "$command" 2>/dev/null) || rc=$?
     if [[ $rc -eq 0 ]]; then
         SUB_REMOVE_TOKEN_STATE=removed
         return 0
@@ -815,6 +815,28 @@ echo \$removed"
     return "$rc"
 }
 
+# Перенос сроков TTL в expiry.list новой хост-ноды под тем же expiry-lock, что и очистка.
+# Аргументы: sub_dir, затем пары «токен срок_unix». Повтор переноса не дублирует записи.
+_sub_migrate_expiry() {
+    local sub_dir="$1" script command args
+    shift
+    script=$(cat <<'EOF'
+sub_dir=$1; shift
+list="$sub_dir/expiry.list"
+exec 9>"$sub_dir/.expiry.lock" || exit 1
+flock -x 9 || exit 1
+while [ $# -ge 2 ]; do
+    if [ -e "$list" ]; then sed -i "/^$1 /d" "$list" || exit 1; fi
+    printf '%s %s\n' "$1" "$2" >> "$list" || exit 1
+    shift 2
+done
+EOF
+)
+    printf -v command 'bash -c %q --' "$script"
+    printf -v args ' %q' "$sub_dir" "$@"
+    ssh_run -- "$command$args" >/dev/null 2>&1
+}
+
 subscription_migrate() {
     local old_node old_base_url new_node new_conf old_conf
     old_node=$(jq_r '.subscription_host.node // empty')
@@ -824,16 +846,23 @@ subscription_migrate() {
     node_pick "Перенос подписок" || return 1
     new_node=$(jq_r --argjson i "$((NODE_PICK_INDEX - 1))" '.nodes[$i].name')
     [[ "$new_node" != "$old_node" ]] || { info "Выбрана текущая хост-нода. Перенос не выполнен."; return 1; }
-    local clients=() tokens=() configs=() client token config_file
-    while IFS='|' read -r client token; do
+    local clients=() tokens=() configs=() expiry_args=() client token expires_at expires_ts config_file
+    while IFS='|' read -r client token expires_at; do
         [[ -n "$token" ]] || continue
         config_file=$(_client_config_file "$client")
         if ! _subscription_config_ready "$config_file"; then
             warn "$client: конфиг отсутствует или пуст. Перенос отменён."
             return 1
         fi
+        if [[ -n "$expires_at" ]]; then
+            if ! expires_ts=$(date -d "$expires_at" +%s 2>/dev/null); then
+                warn "$client: срок подписки не распознан. Перенос отменён."
+                return 1
+            fi
+            expiry_args+=("$token" "$expires_ts")
+        fi
         clients+=("$client"); tokens+=("$token"); configs+=("$config_file")
-    done < <(jq_r '.clients[] | select(.subscription.token) | "\(.name)|\(.subscription.token)"')
+    done < <(jq_r '.clients[] | select(.subscription.token) | "\(.name)|\(.subscription.token)|\(.subscription.expires_at // "")"')
     [[ ${#clients[@]} -gt 0 ]] || { info "Нет опубликованных подписок для переноса."; return 0; }
     _sub_save_ssh_ctx
     node_load_by_name "$old_node" || { _sub_done; return 1; }
@@ -863,6 +892,9 @@ subscription_migrate() {
     for ((i=0; i<${#clients[@]}; i++)); do
         _sub_upload_config "${configs[$i]}" "${tokens[$i]}" "$new_sub_dir" "${new_nginx_group:-www-data}" "${clients[$i]}" || rc=1
     done
+    if [[ $rc -eq 0 && ${#expiry_args[@]} -gt 0 ]]; then
+        _sub_migrate_expiry "$new_sub_dir" "${expiry_args[@]}" || rc=1
+    fi
     _sub_done
     if [[ $rc -ne 0 ]]; then
         warn "Перенос не завершён: старый хост и старые ссылки сохранены."

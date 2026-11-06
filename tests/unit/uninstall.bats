@@ -44,9 +44,10 @@ _load_fixture_uninstall() {
         "$root/etc/nginx/sites-enabled" "$root/etc/systemd/system" \
         "$root/etc/sysctl.d" "$root/etc/ssh" "$root/usr/local/bin" \
         "$root/root" "$root/var/www"
-    sed -e "s|/etc|$root/etc|g" -e "s|/root|$root/root|g" \
-        -e "s|/usr/local/bin|$root/usr/local/bin|g" \
-        -e "s|/var/www|$root/var/www|g" \
+    sed -e 's|/etc|@FIX_ROOT@/etc|g' -e 's|/root|@FIX_ROOT@/root|g' \
+        -e 's|/usr/local/bin|@FIX_ROOT@/usr/local/bin|g' \
+        -e 's|/var/www|@FIX_ROOT@/var/www|g' \
+        -e "s|@FIX_ROOT@|$root|g" \
         "$PROJECT_ROOT/setup-essence/modules/uninstall.sh" > "$copy"
     source "$copy"
     export FIXTURE_UNINSTALL_ROOT="$root"
@@ -61,14 +62,19 @@ _load_fixture_uninstall() {
     awg-quick() { return 0; }
     confirm_yn() { return 0; }
     menu_select() { MENU_SELECT_INDEX=1; return 0; }
+    _uninstall_sshd_effective() { return 1; }
 }
 
-@test "Telegram rc3 allows complete fixture cleanup" {
+@test "Telegram rc3 allows complete fixture cleanup and reports leftovers" {
     _load_fixture_uninstall
     : > "$TPROXY_RELAY_SOURCE_PATH"
     : > "$FIXTURE_UNINSTALL_ROOT/etc/mihomo/config.yaml"
     telegram_proxy_remove_all() { return 3; }
-    uninstall
+    run uninstall
+    assert_success
+    assert_output --partial "Конфигурация Telegram Proxy не найдена"
+    assert_output --partial "$TPROXY_RELAY_SOURCE_PATH"
+    refute_output --partial "Всё удалено."
     [[ ! -e "$FIXTURE_UNINSTALL_ROOT/etc/mihomo/config.yaml" ]]
 }
 
@@ -144,12 +150,14 @@ _load_fixture_uninstall() {
     local available="$FIXTURE_UNINSTALL_ROOT/etc/nginx/sites-available"
     local enabled="$FIXTURE_UNINSTALL_ROOT/etc/nginx/sites-enabled"
     printf '# Essence ACME challenge\nserver_name another.example.test;\n' > "$available/essence-acme-another.example.test"
-    printf 'server_name web.example.test;\n' > "$available/web.example.test"
+    printf 'server_name another.example.test;\n' > "$available/another.example.test"
+    printf 'server_name another.example.test web.example.test;\n' > "$available/web.example.test"
     ln -s "$available/web.example.test" "$enabled/web.example.test"
     _load_reality_conf() { HAS_SITE=true; SITE_NAME=web.example.test; }
     uninstall
     [[ ! -e "$available/web.example.test" ]]
     [[ ! -L "$enabled/web.example.test" ]]
+    [[ -e "$available/another.example.test" ]]
     [[ ! -e "$available/essence-acme-another.example.test" ]]
 }
 
@@ -200,12 +208,104 @@ _load_fixture_uninstall() {
         return 0
     }
     ufw() { printf '%s\n' "$*" >> "$BATS_TEST_TMPDIR/firewall"; }
+    _uninstall_sshd_effective() { printf 'port 22\npasswordauthentication yes\n'; }
     run _uninstall_components true
     assert_failure 1
     grep -q '^restart ssh.socket$' "$BATS_TEST_TMPDIR/systemctl-calls"
     grep -q '^restart sshd$' "$BATS_TEST_TMPDIR/systemctl-calls"
     grep -q '^restart ssh$' "$BATS_TEST_TMPDIR/systemctl-calls"
     [[ ! -e "$BATS_TEST_TMPDIR/firewall" ]]
+}
+
+@test "uninstall reads SSH port and password state from the effective sshd config" {
+    _load_fixture_uninstall
+    : > "$FIXTURE_UNINSTALL_ROOT/etc/ssh/sshd_config"
+    _uninstall_sshd_effective() { printf 'port 2222\npasswordauthentication no\n'; }
+    _uninstall_prepare_targets
+    [[ "$UNINSTALL_SSH_PORT" == 2222 && "$UNINSTALL_PASSWORD_DISABLED" == true ]]
+}
+
+# Mirrors sshd -T: Include drop-ins precede the main file, Port accumulates,
+# PasswordAuthentication keeps the first value.
+_sshd_effective_from_files() {
+    local dir="$FIXTURE_UNINSTALL_ROOT/etc/ssh" file
+    for file in "$dir"/sshd_config.d/*.conf "$dir/sshd_config"; do
+        [[ -f "$file" ]] && cat "$file"
+    done | awk '
+        $1 == "Port" { print "port " $2 }
+        $1 == "PasswordAuthentication" && !seen { print "passwordauthentication " $2; seen = 1 }'
+}
+
+@test "SSH restore overrides sshd_config.d with a first drop-in and tolerates repeated port 22" {
+    _load_fixture_uninstall
+    local dropin="$FIXTURE_UNINSTALL_ROOT/etc/ssh/sshd_config.d/00-essence-uninstall.conf"
+    mkdir -p "$FIXTURE_UNINSTALL_ROOT/etc/ssh/sshd_config.d"
+    printf 'Port 2222\nPasswordAuthentication no\n' > "$FIXTURE_UNINSTALL_ROOT/etc/ssh/sshd_config"
+    printf 'Port 22\nPasswordAuthentication no\n' > "$FIXTURE_UNINSTALL_ROOT/etc/ssh/sshd_config.d/50-cloud-init.conf"
+    _uninstall_sshd_effective() { _sshd_effective_from_files; }
+    ufw() { printf '%s\n' "$*" >> "$BATS_TEST_TMPDIR/firewall"; }
+    run _uninstall_components true
+    assert_success
+    assert_output --partial "SSH вернён на порт 22, вход по паролю включён"
+    grep -qx 'PasswordAuthentication yes' "$dropin"
+    ! grep -q '^Port' "$dropin" || return 1
+    [[ "$(_sshd_effective_from_files | grep -c '^port 22$')" -eq 2 ]]
+    grep -q '^--force disable$' "$BATS_TEST_TMPDIR/firewall"
+}
+
+@test "unverified SSH restore rolls back sshd_config and created drop-in before restart and firewall reset" {
+    _load_fixture_uninstall
+    local config="$FIXTURE_UNINSTALL_ROOT/etc/ssh/sshd_config"
+    local dropin="$FIXTURE_UNINSTALL_ROOT/etc/ssh/sshd_config.d/00-essence-uninstall.conf"
+    mkdir -p "$FIXTURE_UNINSTALL_ROOT/etc/ssh/sshd_config.d"
+    printf 'Port 2222\nPasswordAuthentication no\n' > "$config"
+    printf 'Port 2222\n' > "$FIXTURE_UNINSTALL_ROOT/etc/ssh/sshd_config.d/50-cloud-init.conf"
+    cp "$config" "$BATS_TEST_TMPDIR/sshd-before"
+    _uninstall_sshd_effective() { _sshd_effective_from_files; }
+    systemctl() { printf '%s\n' "$*" >> "$BATS_TEST_TMPDIR/systemctl-calls"; return 0; }
+    ufw() { printf '%s\n' "$*" >> "$BATS_TEST_TMPDIR/firewall"; }
+    run _uninstall_components true
+    assert_failure 1
+    assert_output --partial "sshd -T не подтверждает порт 22 и вход по паролю"
+    assert_output --partial "Исходная конфигурация SSH восстановлена"
+    refute_output --partial "SSH вернён на порт 22"
+    cmp -s "$BATS_TEST_TMPDIR/sshd-before" "$config"
+    [[ ! -e "$dropin" ]]
+    [[ -f "$FIXTURE_UNINSTALL_ROOT/etc/ssh/sshd_config.d/50-cloud-init.conf" ]]
+    ! grep -q '^restart ssh' "$BATS_TEST_TMPDIR/systemctl-calls" || return 1
+    [[ ! -e "$BATS_TEST_TMPDIR/firewall" ]]
+}
+
+@test "failing sshd -T keeps an existing drop-in and restores sshd_config" {
+    _load_fixture_uninstall
+    local config="$FIXTURE_UNINSTALL_ROOT/etc/ssh/sshd_config"
+    local dropin="$FIXTURE_UNINSTALL_ROOT/etc/ssh/sshd_config.d/00-essence-uninstall.conf"
+    mkdir -p "$FIXTURE_UNINSTALL_ROOT/etc/ssh/sshd_config.d"
+    printf 'Port 2222\nPasswordAuthentication no\n' > "$config"
+    printf 'PasswordAuthentication yes\n' > "$dropin"
+    cp "$config" "$BATS_TEST_TMPDIR/sshd-before"
+    _uninstall_sshd_effective() { return 255; }
+    ufw() { printf '%s\n' "$*" >> "$BATS_TEST_TMPDIR/firewall"; }
+    run _uninstall_components true
+    assert_failure 1
+    cmp -s "$BATS_TEST_TMPDIR/sshd-before" "$config"
+    [[ "$(cat "$dropin")" == 'PasswordAuthentication yes' ]]
+    [[ ! -e "$BATS_TEST_TMPDIR/firewall" ]]
+}
+
+@test "nginx restart failure warns and still removes certificates and resets firewall" {
+    _load_fixture_uninstall
+    mkdir -p "$FIXTURE_UNINSTALL_ROOT/etc/nginx/ssl/web.example.test"
+    : > "$FIXTURE_UNINSTALL_ROOT/etc/nginx/nginx.conf"
+    systemctl() { [[ "$*" != 'restart nginx' ]]; }
+    ufw() { printf '%s\n' "$*" >> "$BATS_TEST_TMPDIR/firewall"; }
+    run _uninstall_components false
+    assert_success
+    assert_output --partial "Nginx не перезапустился"
+    assert_output --partial "Удаление завершено с предупреждениями"
+    refute_output --partial "Всё удалено."
+    [[ ! -e "$FIXTURE_UNINSTALL_ROOT/etc/nginx/ssl" ]]
+    grep -q '^--force reset$' "$BATS_TEST_TMPDIR/firewall"
 }
 
 @test "uninstall filesystem failure is returned before later removals" {

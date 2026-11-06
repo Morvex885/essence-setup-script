@@ -14,10 +14,10 @@ teardown() {
 
 @test "menu_index_valid rejects zero, leading zero, signs, and expressions" {
     menu_index_valid 1 2
-    ! menu_index_valid 0 2
-    ! menu_index_valid 01 2
-    ! menu_index_valid +1 2
-    ! menu_index_valid '1+1' 2
+    ! menu_index_valid 0 2 || return 1
+    ! menu_index_valid 01 2 || return 1
+    ! menu_index_valid +1 2 || return 1
+    ! menu_index_valid '1+1' 2 || return 1
     ! menu_index_valid 3 2
 }
 
@@ -85,10 +85,10 @@ teardown() {
 
 @test "menu_select cancellation and EOF clear previous result" {
     MENU_SELECT_INDEX=2
-    ! menu_select 'Choose' 'Pick' alpha <<< 0
+    ! menu_select 'Choose' 'Pick' alpha <<< 0 || return 1
     [[ -z "$MENU_SELECT_INDEX" ]]
     MENU_SELECT_INDEX=2
-    ! menu_select 'Choose' 'Pick' alpha </dev/null
+    ! menu_select 'Choose' 'Pick' alpha </dev/null || return 1
     [[ -z "$MENU_SELECT_INDEX" ]]
 }
 
@@ -96,7 +96,7 @@ teardown() {
     MENU_SELECT_CONTEXT=('context')
     MENU_SELECT_EMPTY='empty'
     {
-        ! menu_select 'Choose' 'Pick'
+        ! menu_select 'Choose' 'Pick' || return 1
         IFS= read -r remaining
     } <<< sentinel
     [[ "$remaining" == sentinel && -z "$MENU_SELECT_INDEX" ]]

@@ -69,8 +69,8 @@ assert_archive_unchanged() {
                 Le_RealKeyPath) expected="$dest/privkey.pem" ;;
                 Le_RealFullChainPath) expected="$dest/fullchain.pem" ;;
                 Le_RealCACertPath) expected='' ;;
-                Le_PreHook) expected='ufw allow 80/tcp' ;;
-                Le_PostHook) expected='ufw deny 80/tcp && systemctl reload nginx' ;;
+                Le_PreHook) expected="$CERT_HTTP01_PRE_HOOK" ;;
+                Le_PostHook) expected="$CERT_HTTP01_POST_HOOK" ;;
                 Le_ReloadCmd) expected='systemctl reload nginx' ;;
             esac
             _acme_conf_value "$file" "$field"

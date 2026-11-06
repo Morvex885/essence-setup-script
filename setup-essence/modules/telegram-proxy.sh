@@ -886,7 +886,8 @@ _telegram_proxy_render_nginx_site() {
 server {
 ${listen}
 EOF
-    if [[ "$topology" == direct ]]; then printf '    listen [::]:443 ipv6only=on %s\n' "$h2" >> "$TPROXY_NGINX_SITE.tmp.$$"; fi
+    # ipv6only=on is nginx's default; repeating it duplicates listen options of other vhosts.
+    if [[ "$topology" == direct ]]; then printf '    listen [::]:443 %s\n' "$h2" >> "$TPROXY_NGINX_SITE.tmp.$$"; fi
     cat >> "$TPROXY_NGINX_SITE.tmp.$$" <<EOF
     server_name ${hostname};
     ssl_certificate ${TPROXY_CERT_DIR}/${hostname}/fullchain.pem;
@@ -1075,6 +1076,8 @@ _telegram_proxy_find_go() {
     return 1
 }
 
+# candidate must be an existing root-owned file: the build user writes only
+# inside its private build_tmp, then root copies the result into candidate.
 _telegram_proxy_build_relay() {
     local source="$1" go_binary="$2" candidate="$3" build_tmp rc=0
     build_tmp=$(mktemp -d /tmp/tproxy-build.XXXXXX) || return 1
@@ -1088,7 +1091,9 @@ _telegram_proxy_build_relay() {
     elif ! (cd "$source" &&
             runuser -u tproxy -- env HOME="$build_tmp" GOCACHE="$build_tmp/cache" \
                 GOPATH="$build_tmp/gopath" TMPDIR="$build_tmp" \
-                "$go_binary" build -buildvcs=false -trimpath -ldflags='-s -w' -o "$candidate" ./cmd/tproxy-server); then
+                "$go_binary" build -buildvcs=false -trimpath -ldflags='-s -w' -o "$build_tmp/tproxy-server" ./cmd/tproxy-server); then
+        rc=1
+    elif ! cp -- "$build_tmp/tproxy-server" "$candidate"; then
         rc=1
     fi
     chown -R root:root "$source" || rc=1
@@ -1391,7 +1396,6 @@ telegram_proxy_web_install() {
     candidate="$(mktemp /tmp/tproxy-server.XXXXXX)" || {
         _telegram_proxy_restore_install_failure "$before_80" "" "$mt_user_before" "$tproxy_user_before"; return 1;
     }
-    rm -f "$candidate"
     if ! _telegram_proxy_build_relay "$TPROXY_RELAY_SOURCE_PATH" "$go_binary" "$candidate"; then
         rm -f "$candidate"
         _telegram_proxy_restore_install_failure "$before_80" "" "$mt_user_before" "$tproxy_user_before"; return 1
@@ -1906,7 +1910,6 @@ telegram_proxy_web_update() {
     [[ -n "$go_binary" ]] || go_binary=$(_telegram_proxy_install_pinned_go 2>/dev/null || true)
     [[ -n "$go_binary" ]] || { rm -rf "$stage"; return 1; }
     candidate=$(mktemp /tmp/tproxy-server-update.XXXXXX) || { rm -rf "$stage"; return 1; }
-    rm -f "$candidate"
     if ! _telegram_proxy_build_relay "$stage" "$go_binary" "$candidate"; then
         rm -f "$candidate"; rm -rf "$stage"; return 1
     fi
@@ -2034,7 +2037,9 @@ telegram_proxy_web_remove() {
             consequence="Это последний способ доступа: служба MTProxy будет удалена."
         fi
         review_frame "Отключение Web Proxy" "Домен: ${host}" \
-            "Ссылки Web Proxy перестанут работать; сайт и сертификат Web Proxy будут удалены." "$consequence"
+            "Ссылки Web Proxy перестанут работать; сайт Web Proxy будет удалён." \
+            "Сертификат удаляется, если его не использует другой TLS-потребитель nginx; архив acme.sh сохранится." \
+            "$consequence"
         confirm_yn "Отключить Web Proxy?" N || return 0
     fi
     if [[ -e "$TPROXY_NGINX_AVAILABLE_DIR/essence-acme-$host" || -L "$TPROXY_NGINX_AVAILABLE_DIR/essence-acme-$host" ]]; then
@@ -2054,7 +2059,12 @@ telegram_proxy_web_remove() {
         "$TPROXY_NGINX_AVAILABLE_DIR/essence-acme-$host" \
         "$TPROXY_NGINX_ENABLED_DIR/essence-acme-$host" \
         ${extra_roots[@]+"${extra_roots[@]}"} \
-        "$TPROXY_SYSTEMD_DIR/$TPROXY_UNIT_RELAY" "$TPROXY_FIREWALL_FILE" || return 1
+        "$TPROXY_SYSTEMD_DIR/$TPROXY_UNIT_RELAY" "$TPROXY_FIREWALL_FILE" \
+        "$TPROXY_ENV_FILE" "$TPROXY_MTPROXY_DIR" "$TPROXY_MTPROXY_SOURCE_DIR" \
+        "$TPROXY_SYSTEMD_DIR/$TPROXY_UNIT_MTPROXY" \
+        "$TPROXY_SYSTEMD_DIR/$TPROXY_UNIT_FIREWALL" \
+        "$TPROXY_SYSTEMD_DIR/$TPROXY_UNIT_REFRESH" \
+        "$TPROXY_SYSTEMD_DIR/$TPROXY_UNIT_TIMER" "$TPROXY_REFRESH_BIN" || return 1
     _telegram_proxy_snapshot_certificate_registration "$host" || {
         _telegram_proxy_restore_snapshot
         return 1

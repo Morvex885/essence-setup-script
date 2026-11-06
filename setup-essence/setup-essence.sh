@@ -59,7 +59,6 @@ elif [[ -f "$SCRIPT_DIR/../VERSION" ]]; then
     CURRENT_VERSION=$(tr -d '\r' < "$SCRIPT_DIR/../VERSION")
 fi
 check_update_start
-menu_address_start || true
 
 # ─── Самообновление ───────────────────────────────────────────────────────────
 self_update() {
@@ -246,6 +245,7 @@ if [[ "${1:-}" == uninstall ]]; then
     exit $?
 fi
 
+menu_address_start || true
 # ─── Точка входа ─────────────────────────────────────────────────────────────
 INITIAL_CHOICE="${1:-}"
 while true; do
