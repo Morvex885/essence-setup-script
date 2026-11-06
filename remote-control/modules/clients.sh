@@ -728,7 +728,7 @@ _save_client_connections() {
 
 _set_client_connections() {
     local client_name="$1" client_group="$2" selected_node="$3"
-    node_load_by_name "$selected_node" || return 1
+    node_load_by_name "$selected_node" || { warn "Не удалось загрузить ноду '${selected_node}'."; return 1; }
     local discovered current d i toggle_rc proxies_json
     discovered=$(_discover_connections) || return 1
     [[ -n "$discovered" ]] || { warn "Не удалось обнаружить подключения на $selected_node."; return 1; }

@@ -194,12 +194,10 @@ assert_removed_without_recovery() {
 
 @test "rejected add rollback retains referenced identity secrets and recovery copies" {
     prepare_abort_backups
-    CONFIG_PERSIST_ALLOW_NEEDS_SETUP=original
     jq_w() { return 77; }
     _revoke_managed_remote_key() { touch "$BATS_TEST_TMPDIR/revoked"; }
     node_secret_delete() { touch "$BATS_TEST_TMPDIR/secret-deleted"; }
     if _github_add_abort "$ID" true "$KNOWN_BACKUP" "$MANIFEST_BACKUP"; then return 1; fi
-    [[ "$CONFIG_PERSIST_ALLOW_NEEDS_SETUP" == original ]]
     cmp "$CONFIG_JSON" "$BATS_TEST_TMPDIR/config.before"
     cmp "$SECRETS_JSON" "$BATS_TEST_TMPDIR/secrets.before"
     [[ -f "$SSH_IDENTITIES_DIR/$ID" && -f "$SSH_IDENTITIES_DIR/$ID.pub" ]]

@@ -134,7 +134,7 @@ _sync_all_connections() {
 
     for nname in "${nodes[@]}"; do
         if ! node_load_by_name "$nname"; then
-            warn "$nname: не найдена, пропуск"
+            warn "Не удалось загрузить ноду '${nname}'."
             fail=$((fail + 1))
             continue
         fi

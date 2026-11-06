@@ -9,7 +9,7 @@ setup() {
     source_module 'clients.sh'
     source_module 'subscription.sh'
     reset_ssh_mocks
-    jq_w '.nodes = [{name:"old",ip:"192.0.2.1",port:"22",user:"root",auth:"key"},{name:"new",ip:"192.0.2.2",port:"2222",user:"root",auth:"key"}] | .clients = [{name:"alpha",group:"MOBILE",subscription:{token:"secret-alpha",expires_at:"2030-01-01T00:00:00Z",created_at:"2026-01-01",headers:[{name:"User-Agent",value:"test"}]}},{name:"beta",group:"MOBILE",subscription:{token:"secret-beta"}}] | .subscription_host = {node:"old",base_url:"https://old.example",sub_dir:"/stale/cache",nginx_group:"www-data"} | .subscription_default_headers = []'
+    jq_w '.nodes = [{id:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",name:"old",ip:"192.0.2.1",port:22,user:"root",auth:"key"},{id:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",name:"new",ip:"192.0.2.2",port:2222,user:"root",auth:"key"}] | .clients = [{name:"alpha",group:"MOBILE",subscription:{token:"secret-alpha",expires_at:"2030-01-01T00:00:00Z",created_at:"2026-01-01",headers:[{name:"User-Agent",value:"test"}]}},{name:"beta",group:"MOBILE",subscription:{token:"secret-beta"}}] | .subscription_host = {node:"old",base_url:"https://old.example",sub_dir:"/stale/cache",nginx_group:"www-data"} | .subscription_default_headers = []'
     mkdir -p "$GENERATED_DIR/MOBILE/alpha" "$GENERATED_DIR/MOBILE/beta"
     printf 'proxies: []\n' > "$GENERATED_DIR/MOBILE/alpha/config.yaml"
     printf 'proxies: []\n' > "$GENERATED_DIR/MOBILE/beta/config.yaml"

@@ -12,7 +12,7 @@ setup() {
     source_module ssh.sh
     source_module hardening.sh
     state_open_local
-    export CONFIG_SOURCE=local NODE_NAME=local-password NODE_ID=node-id
+    export CONFIG_SOURCE=local NODE_NAME=local-password NODE_ID=0123456789abcdef0123456789abcdef
     export NODE_IDENTITY=system SERVER_IP=192.0.2.10 SERVER_PORT=22 SERVER_USER=root
     export SERVER_AUTH=password SERVER_PASS='hardening-password-canary'
     export SSH_IDENTITIES_DIR="$CONFIG_DIR/identities with spaces"
@@ -21,7 +21,7 @@ setup() {
     unset SSH_ASKPASS SSH_ASKPASS_REQUIRE
     mkdir -p "$SSH_IDENTITIES_DIR" "$SSH_ARGV_DIR" "$HOME" "$BATS_TEST_TMPDIR/bin"
     cat > "$CONFIG_JSON" <<'EOF'
-{"schema_version":2,"nodes":[{"id":"node-id","name":"local-password","ip":"192.0.2.10","port":22,"user":"root","auth":"password","identity":"system","secret_id":"node-id"}],"groups":[],"clients":[],"connections":[]}
+{"schema_version":2,"nodes":[{"id":"0123456789abcdef0123456789abcdef","name":"local-password","ip":"192.0.2.10","port":22,"user":"root","auth":"password","identity":"system","secret_id":"node:0123456789abcdef0123456789abcdef:ssh-password"}],"groups":[],"clients":[],"connections":[]}
 EOF
     node_secret_set "$NODE_ID" "$SERVER_PASS"
     cat > "$BATS_TEST_TMPDIR/bin/ssh" <<'EOF'
@@ -107,14 +107,14 @@ assert_key_recovery_argv() {
         [[ "$phase" != select && "$phase" != install ]] || continue
         [[ "$batch" == yes && "$identities" == yes && "$password_auth" == no ]]
         if [[ "$phase" == verify-key ]]; then
-            [[ "$identity" == "$CONFIG_DIR"/.identity.*/node-id ]]
+            [[ "$identity" == "$CONFIG_DIR"/.identity.*/"$NODE_ID" ]]
         else
-            [[ "$identity" == "$SSH_IDENTITIES_DIR/node-id" ]]
+            [[ "$identity" == "$SSH_IDENTITIES_DIR/$NODE_ID" ]]
         fi
     done
     [[ "$(cat "$BATS_TEST_TMPDIR/output")" != *hardening-password-canary* ]]
     local private
-    private=$(cat "$SSH_IDENTITIES_DIR/node-id")
+    private=$(cat "$SSH_IDENTITIES_DIR/$NODE_ID")
     [[ "$(cat "$BATS_TEST_TMPDIR/output")" != *"$private"* ]]
 }
 
@@ -267,7 +267,7 @@ assert_retained_portable_identity() {
     assert_key_recovery_argv
     assert_retained_portable_identity
     assert_original_connection_preserved
-    [[ "$(jq_r '.nodes[0].secret_id')" == node-id ]]
+    [[ "$(jq_r '.nodes[0].secret_id')" == "node:$NODE_ID:ssh-password" ]]
     cmp "$STATE_MANIFEST" "$BATS_TEST_TMPDIR/manifest.before"
     cmp "$SECRETS_JSON" "$BATS_TEST_TMPDIR/secrets.before"
     [[ "$(cat "$BATS_TEST_TMPDIR/output")" != *"Усиление защиты SSH завершено"* ]]

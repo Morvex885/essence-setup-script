@@ -1061,6 +1061,7 @@ EOF
 
 @test "fetch reopen failure keeps the old usable session and a same-process retry succeeds" {
     _seed_live_revision 1
+    _prepare_fetch_runtime "$BATS_TEST_TMPDIR/live-runtime" || return 1
     local old_worktree="$GITHUB_WORKTREE" old_session="$GITHUB_SESSION_ID"
     local calls="$BATS_TEST_TMPDIR/startup.calls" fetch_rc=0
     config_source_startup() {
@@ -1094,22 +1095,12 @@ EOF
     local old_worktree="$GITHUB_WORKTREE" old_session="$GITHUB_SESSION_ID"
     local runtime="$BATS_TEST_TMPDIR/live-runtime" auth="$CONFIG_DIR/.auth"
     local rc=0
-    mkdir -p "$runtime" || return 1
-    printf 'old-runtime\n' > "$runtime/value" || return 1
+    _prepare_fetch_runtime "$runtime" || return 1
     printf 'old-auth\n' > "$auth" || return 1
-    STATE_DIR="$runtime"
-    CONFIG_JSON="$runtime/value"
-    export FETCH_RUNTIME_VALUE="$runtime/value" FETCH_AUTH_FILE="$auth"
-    github_config_serialize() {
-        jq -n --arg runtime "$(cat "$FETCH_RUNTIME_VALUE")" \
-            --arg auth "$(cat "$FETCH_AUTH_FILE")" \
-            '{runtime:$runtime,auth:$auth}' > "$1"
-    }
-    _config_source_materialize_state() {
-        local snapshot="$1"
-        jq -r '.runtime' "$snapshot" > "$FETCH_RUNTIME_VALUE" || return 1
-        jq -r '.auth' "$snapshot" > "$FETCH_AUTH_FILE" || return 1
-    }
+    chmod 600 "$auth" || return 1
+    local before
+    before=$(_fetch_runtime_fingerprint "$runtime") || return 1
+    export FETCH_RUNTIME_VALUE="$runtime/config.json" FETCH_AUTH_FILE="$auth"
     config_source_startup() {
         printf 'candidate-runtime\n' > "$FETCH_RUNTIME_VALUE" || return 1
         printf 'candidate-auth\n' > "$FETCH_AUTH_FILE" || return 1
@@ -1128,7 +1119,7 @@ EOF
     github_sync_fetch || rc=$?
     unset -f git
     [[ "$rc" -ne 0 ]] || return 1
-    [[ "$(cat "$runtime/value")" == old-runtime ]] || return 1
+    [[ "$(_fetch_runtime_fingerprint "$runtime")" == "$before" ]] || return 1
     [[ "$(cat "$auth")" == old-auth ]] || return 1
     [[ "$GITHUB_WORKTREE" == "$old_worktree" ]] || return 1
     [[ "$GITHUB_SESSION_ID" == "$old_session" ]] || return 1
@@ -1139,6 +1130,7 @@ EOF
 @test "fetch retry without a worktree reaches startup instead of mandatory preflush" {
     github_sync_init || return 1
     github_config_close || return 1
+    _prepare_fetch_runtime "$BATS_TEST_TMPDIR/live-runtime" || return 1
     local marker="$BATS_TEST_TMPDIR/startup.called"
     config_source_startup() {
         printf 'called\n' > "$marker"
@@ -1363,4 +1355,106 @@ EOF
     [[ "$(git --git-dir="$GITHUB_STORE" config --get remote.origin.url)" == https://github.com/test-owner/config.git ]] || return 1
     ! git --git-dir="$new_remote" show-ref --verify --quiet refs/heads/main || return 1
     [[ "$(cat "$FAKE_GH_GLOBAL_LOGIN")" == test-owner ]]
+}
+
+_prepare_fetch_runtime() {
+    local runtime="$1"
+    mkdir -p "$runtime/templates" "$runtime/ssh/identities" || return 1
+    jq -n '{schema_version:2,nodes:[
+      {id:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",name:"portable-a",ip:"192.0.2.10",port:22,user:"root",auth:"password",identity:null,secret_id:"node:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:ssh-password"},
+      {id:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",name:"portable-b",ip:"192.0.2.11",port:22,user:"root",auth:"password",identity:null,secret_id:"node:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:ssh-password"}],
+      groups:[],clients:[],connections:[]}' > "$runtime/config.json"
+    printf '{"schema_version":1,"node_passwords":{"node:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:ssh-password":"unreadable-ciphertext\\n"}}\n' > "$runtime/secrets.json"
+    printf '{"schema_version":2,"portability":{"status":"ready","issues":[]},"access":{"script_password_hash":null},"templates":{}}\n' > "$runtime/manifest.json"
+    printf 'mode: rule\n' > "$runtime/templates/default.yaml"
+    printf 'unchanged-known-hosts\n' > "$runtime/ssh/known_hosts"
+    chmod 700 "$runtime" "$runtime/templates" "$runtime/ssh" "$runtime/ssh/identities" || return 1
+    chmod 600 "$runtime/"*.json "$runtime/templates/default.yaml" "$runtime/ssh/known_hosts" || return 1
+    export STATE_DIR="$runtime" CONFIG_JSON="$runtime/config.json"
+    export SECRETS_JSON="$runtime/secrets.json" STATE_MANIFEST="$runtime/manifest.json"
+    export TEMPLATES_DIR="$runtime/templates" SSH_IDENTITIES_DIR="$runtime/ssh/identities"
+    export SSH_KNOWN_HOSTS="$runtime/ssh/known_hosts"
+    source_module 'nodes.sh'
+    override_pass_key
+    node_secret_set aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 'synthetic-fetch-good' || return 1
+}
+
+_fetch_runtime_fingerprint() {
+    local root="$1" path
+    while IFS= read -r path; do
+        printf '%s %s\n' "${path#"$root"}" "$(_file_mode "$path")" || return 1
+        if [[ -f "$path" ]]; then
+            openssl dgst -sha256 < "$path" || return 1
+        fi
+    done < <(find "$root" -print | LC_ALL=C sort)
+}
+
+@test "portable password fetch rollback preserves raw ciphertext modes and absent auth" {
+    _seed_live_revision 1
+    local runtime="$CONFIG_DIR/live-runtime" auth="$CONFIG_DIR/.auth"
+    _prepare_fetch_runtime "$runtime" || return 1
+    local before old_worktree="$GITHUB_WORKTREE" old_session="$GITHUB_SESSION_ID"
+    before=$(_fetch_runtime_fingerprint "$runtime") || return 1
+    local branch presence rc
+    for branch in failed-startup no-session; do
+        for presence in present absent; do
+            if [[ "$presence" == present ]]; then
+                printf 'exact-auth\n\n' > "$auth"
+                chmod 600 "$auth"
+            else
+                rm -f "$auth"
+            fi
+            config_source_startup() {
+                printf 'new-ciphertext\n' > "$runtime/secrets.json"
+                printf 'new-manifest\n' > "$runtime/manifest.json"
+                printf 'new-auth\n' > "$auth"
+                STATE_DIR="$CONFIG_DIR/wrong-runtime"
+                CONFIG_JSON="$STATE_DIR/config.json"
+                SECRETS_JSON="$STATE_DIR/secrets.json"
+                STATE_MANIFEST="$STATE_DIR/manifest.json"
+                TEMPLATES_DIR="$STATE_DIR/templates"
+                SSH_IDENTITIES_DIR="$STATE_DIR/ssh/identities"
+                SSH_KNOWN_HOSTS="$STATE_DIR/ssh/known_hosts"
+                [[ "$branch" == no-session ]]
+            }
+            rc=0
+            github_sync_fetch || rc=$?
+            if [[ "$branch" == failed-startup ]]; then [[ "$rc" -ne 0 ]] || return 1
+            else [[ "$rc" -eq 0 ]] || return 1; fi
+            [[ "$(_fetch_runtime_fingerprint "$runtime")" == "$before" ]] || return 1
+            [[ "$STATE_DIR" == "$runtime" && "$CONFIG_JSON" == "$runtime/config.json" ]] || return 1
+            [[ "$SECRETS_JSON" == "$runtime/secrets.json" && "$STATE_MANIFEST" == "$runtime/manifest.json" ]] || return 1
+            [[ "$TEMPLATES_DIR" == "$runtime/templates" && "$SSH_IDENTITIES_DIR" == "$runtime/ssh/identities" ]] || return 1
+            [[ "$SSH_KNOWN_HOSTS" == "$runtime/ssh/known_hosts" ]] || return 1
+            [[ "$GITHUB_WORKTREE" == "$old_worktree" && "$GITHUB_SESSION_ID" == "$old_session" ]] || return 1
+            if [[ "$presence" == present ]]; then
+                cmp -s "$auth" <(printf 'exact-auth\n\n') || return 1
+                [[ "$(_file_mode "$auth")" == 600 ]] || return 1
+            else [[ ! -e "$auth" ]] || return 1; fi
+            [[ -z "$(find "$CONFIG_DIR" -maxdepth 1 -name '.fetch-runtime.*' -print)" ]] || return 1
+        done
+    done
+}
+
+@test "portable password failed fetch restore retains a lossless private backup" {
+    _seed_live_revision 1
+    local runtime="$CONFIG_DIR/live-runtime" auth="$CONFIG_DIR/.auth"
+    _prepare_fetch_runtime "$runtime" || return 1
+    printf 'original-auth\n' > "$auth"
+    chmod 600 "$auth"
+    local before backup rc=0
+    before=$(_fetch_runtime_fingerprint "$runtime") || return 1
+    config_source_startup() {
+        printf 'candidate-secrets\n' > "$runtime/secrets.json"
+        return 79
+    }
+    _github_runtime_restore() { return 83; }
+    github_sync_fetch || rc=$?
+    [[ "$rc" -ne 0 ]] || return 1
+    backup=$(find "$CONFIG_DIR" -maxdepth 1 -type d -name '.fetch-runtime.*' -print)
+    [[ -n "$backup" && -d "$backup/runtime" ]] || return 1
+    [[ "$(_file_mode "$backup")" == 700 ]] || return 1
+    [[ "$(_fetch_runtime_fingerprint "$backup/runtime")" == "$before" ]] || return 1
+    cmp -s "$backup/auth" "$auth" || return 1
+    [[ "$GITHUB_LAST_ERROR $GITHUB_LAST_HINT" == *"$backup"* ]] || return 1
 }

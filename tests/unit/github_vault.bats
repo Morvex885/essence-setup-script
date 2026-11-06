@@ -5,9 +5,11 @@ setup() {
     load '../helpers/test_helper'
     setup_test_env
     source_common
+    source_module 'state.sh'
+    source_module 'nodes.sh'
     source_module 'github-config.sh'
-    printf '{"node_passwords":{}}\n' > "$CONFIG_DIR/secrets.json"
-    printf '{"vault_version":1,"portability":{"status":"ready","issues":[]},"access":{"script_password_hash":null},"templates":{}}\n' > "$CONFIG_DIR/manifest.json"
+    printf '{"schema_version":1,"node_passwords":{}}\n' > "$CONFIG_DIR/secrets.json"
+    printf '{"schema_version":2,"portability":{"status":"ready","issues":[]},"access":{"script_password_hash":null},"templates":{}}\n' > "$CONFIG_DIR/manifest.json"
     export SECRETS_JSON="$CONFIG_DIR/secrets.json" STATE_MANIFEST="$CONFIG_DIR/manifest.json"
 }
 teardown() { teardown_test_env; }
@@ -21,12 +23,12 @@ _file_mode() {
 
 _write_valid_logical_state() {
     jq -n '{
-      vault_version:1,
+      vault_version:2,
       minimum_remote_control_version:"0.0.0",
       portability:{status:"ready",issues:[]},
       access:{script_password_hash:null},
       config:{schema_version:2,nodes:[],groups:[],clients:[],connections:[]},
-      secrets:{schema_version:1,node_passwords:{}},
+      secrets:{schema_version:2,node_passwords:{}},
       templates:{"default.yaml":{content:"mode: rule\n"}},
       ssh:{known_hosts:"host-key\n",identities:{}}
     }' > "$1"
@@ -104,6 +106,7 @@ _assert_diagnostic_field_redacted() {
     assert_success
     run "${BASH:-bash}" -c "source '$PROJECT_ROOT/common/common.sh'; source '$PROJECT_ROOT/remote-control/modules/github-config.sh'; GITHUB_STORAGE_MODE=age; _github_prompt_storage_mode </dev/null; rc=\$?; [[ \$rc == 1 && -z \$GITHUB_STORAGE_MODE ]]"
     assert_success
+
 }
 
 
@@ -140,7 +143,7 @@ _assert_diagnostic_field_redacted() {
     export GITHUB_WORKTREE="$CONFIG_DIR/worktree" GITHUB_STORAGE_MODE=none
     mkdir -p "$GITHUB_WORKTREE"
     git -C "$GITHUB_WORKTREE" init >/dev/null
-    printf '{"vault_version":1,"minimum_remote_control_version":"0.0.0","portability":{"status":"ready","issues":[]},"access":{"script_password_hash":null},"config":{"nodes":[],"groups":[],"clients":[],"connections":[]},"secrets":{"node_passwords":{}},"templates":{},"ssh":{"identities":{},"known_hosts":""}}\n' > "$CONFIG_DIR/state.json"
+    _write_valid_logical_state "$CONFIG_DIR/state.json"
     run github_config_checkpoint "$CONFIG_DIR/state.json"
     assert_success
     [[ -f "$GITHUB_WORKTREE/storage.json" ]] || return 1
@@ -831,4 +834,149 @@ EOF
     GITHUB_SYNC_STATUS=clean
     config_persist_candidate "$success_candidate" || return 1
     [[ "$GITHUB_SYNC_STATUS" == pending ]]
+}
+
+_portable_password_runtime() {
+    export PORTABLE_A=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa PORTABLE_B=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    export SSH_KNOWN_HOSTS="$CONFIG_DIR/ssh/known_hosts"
+    export SSH_IDENTITIES_DIR="$CONFIG_DIR/ssh/identities"
+    mkdir -p "$SSH_IDENTITIES_DIR" "$TEMPLATES_DIR" || return 1
+    printf 'mode: rule\n' > "$TEMPLATES_DIR/default.yaml"
+    ssh-keygen -q -t ed25519 -N '' -f "$BATS_TEST_TMPDIR/portable-host" || return 1
+    local kind public ignored
+    read -r kind public ignored < "$BATS_TEST_TMPDIR/portable-host.pub"
+    printf '192.0.2.10 %s %s\n192.0.2.11 %s %s\n' "$kind" "$public" "$kind" "$public" > "$SSH_KNOWN_HOSTS"
+    jq -n --arg a "$PORTABLE_A" --arg b "$PORTABLE_B" '{
+      schema_version:2,nodes:[
+        {id:$a,name:"portable-a",ip:"192.0.2.10",port:22,user:"root",auth:"password",identity:null,secret_id:("node:"+$a+":ssh-password"),tag:"TEST",aliases:{}},
+        {id:$b,name:"portable-b",ip:"192.0.2.11",port:22,user:"root",auth:"password",identity:null,secret_id:("node:"+$b+":ssh-password"),tag:"TEST",aliases:{}}],
+      groups:[],clients:[],connections:[]}' > "$CONFIG_JSON"
+    PORTABLE_PASSWORD=$' synthetic "quote" \\ slash \u03bb\r\nlast\n'
+    _pass_key() { printf '%064d' 1; }
+    node_secret_set "$PORTABLE_A" "$PORTABLE_PASSWORD" || return 1
+    node_secret_set "$PORTABLE_B" 'synthetic-second' || return 1
+    jq --arg key "node:$PORTABLE_B:ssh-password" '.node_passwords[$key]="unreadable-ciphertext"' "$SECRETS_JSON" > "$SECRETS_JSON.next" &&
+        mv "$SECRETS_JSON.next" "$SECRETS_JSON" || return 1
+    chmod 600 "$SECRETS_JSON"
+}
+
+_portable_password_transport_roundtrip() {
+    local mode="$1" logical="$CONFIG_DIR/portable.json" opened="$CONFIG_DIR/opened.json"
+    local imported="$CONFIG_DIR/imported.json" before received
+    _portable_password_runtime || return 1
+    before=$(cat "$SECRETS_JSON")
+    github_config_serialize "$logical" "$CONFIG_JSON" || return 1
+    [[ "$(cat "$SECRETS_JSON")" == "$before" ]] || return 1
+    jq -e --arg a "$PORTABLE_A" --arg b "$PORTABLE_B" '
+      .vault_version==2 and .secrets.schema_version==2 and
+      (.config.nodes|length)==2 and
+      (.secrets.node_passwords|keys)==[("node:"+$a+":ssh-password")] and
+      .portability=={status:"needs_setup",issues:[{node_id:$b,reason:"missing_secret"}]}' "$logical" || return 1
+    export GITHUB_WORKTREE="$CONFIG_DIR/portable-worktree" GITHUB_STORAGE_MODE="$mode"
+    mkdir -p "$GITHUB_WORKTREE"
+    git -C "$GITHUB_WORKTREE" init >/dev/null || return 1
+    if [[ "$mode" == age ]]; then
+        command -v age >/dev/null || return 1
+        command -v age-keygen >/dev/null || return 1
+        AGE_BIN=$(command -v age)
+        AGE_KEYGEN_BIN=$(command -v age-keygen)
+        GITHUB_UNLOCK_FILE="$BATS_TEST_TMPDIR/portable-agekey"
+        "$AGE_KEYGEN_BIN" -o "$GITHUB_UNLOCK_FILE" >/dev/null 2>&1 || return 1
+        GITHUB_RECIPIENT=$("$AGE_KEYGEN_BIN" -y "$GITHUB_UNLOCK_FILE") || return 1
+        printf '%s\n' "$GITHUB_RECIPIENT" > "$GITHUB_WORKTREE/recipient.txt"
+        "$AGE_BIN" -r "$GITHUB_RECIPIENT" -o "$GITHUB_WORKTREE/unlock.age" "$GITHUB_UNLOCK_FILE" || return 1
+        GITHUB_IDENTITY=""
+    fi
+    run github_config_checkpoint "$logical"
+    assert_success
+    [[ "$output" != *synthetic* && "$output" != *unreadable-ciphertext* ]] || return 1
+    github_config_open "$GITHUB_WORKTREE" "$opened" </dev/null || return 1
+    cmp -s <(jq -S . "$logical") <(jq -S . "$opened") || return 1
+    jq '.secrets' "$opened" > "$CONFIG_DIR/portable-secrets.json"
+    _pass_key() { printf '%064d' 2; }
+    _state_secrets_import_portable "$CONFIG_DIR/portable-secrets.json" "$imported" || return 1
+    jq -e '.schema_version==1' "$imported" || return 1
+    received=$(node_secret_get "$PORTABLE_A" "$imported"; rc=$?; printf '.'; exit "$rc") || return 1
+    [[ "${received%.}" == "$PORTABLE_PASSWORD" ]] || return 1
+    run node_secret_get "$PORTABLE_B" "$imported"
+    [[ "$status" -eq 2 && -z "$output" ]] || return 1
+    SECRETS_JSON="$imported"
+    STATE_MANIFEST="$CONFIG_DIR/imported-manifest.json"
+    jq '{schema_version:2,portability,access,templates:{}}' "$opened" > "$STATE_MANIFEST"
+    github_config_serialize "$CONFIG_DIR/reexport.json" "$CONFIG_JSON" || return 1
+    cmp -s <(jq -S . "$logical") <(jq -S . "$CONFIG_DIR/reexport.json") || return 1
+    if [[ "$mode" == age ]]; then
+        [[ ! -e "$GITHUB_WORKTREE/secrets.json" && ! -e "$GITHUB_WORKTREE/config.json" ]] || return 1
+        [[ "$(find "$GITHUB_WORKTREE" -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)" == $'recipient.txt\nstate.json.age\nstorage.json\nunlock.age' ]] || return 1
+    fi
+}
+
+@test "portable password none transport preserves plaintext across machine keys" {
+    _portable_password_transport_roundtrip none
+}
+
+@test "portable password real age transport preserves plaintext across machine keys" {
+    _portable_password_transport_roundtrip age
+}
+
+@test "portable password partial validator rejects contradictory missing secrets and NUL" {
+    _portable_password_runtime || return 1
+    local logical="$CONFIG_DIR/portable.json" invalid="$CONFIG_DIR/invalid.json" filter
+    github_config_serialize "$logical" "$CONFIG_JSON" || return 1
+    for filter in \
+        '.portability.issues=[] | .portability.status="ready"' \
+        '.portability.issues[0].node_id="cccccccccccccccccccccccccccccccc"' \
+        '.portability.issues += [{node_id:.config.nodes[0].id,reason:"missing_secret"}]' \
+        '.config.nodes[1].auth="key" | .config.nodes[1].secret_id=null | .config.nodes[1].identity="system"' \
+        '.secrets.node_passwords[("node:"+.config.nodes[0].id+":ssh-password")]="bad\u0000password"' \
+        '.secrets.node_passwords[("node:"+.config.nodes[0].id+":ssh-password")]=""' \
+        '.secrets.node_passwords[("node:"+.config.nodes[0].id+":ssh-password")]=3'; do
+        jq "$filter" "$logical" > "$invalid" || return 1
+        run github_config_validate "$invalid"
+        assert_failure
+        [[ "$output" != *synthetic* ]] || return 1
+    done
+}
+
+@test "portable password plain reader preserves manifest version and rejects old unknown absent versions" {
+    _prepare_plain_worktree || return 1
+    git -C "$GITHUB_WORKTREE" init >/dev/null || return 1
+    local version out="$CONFIG_DIR/open-version.json" before
+    cp "$GITHUB_WORKTREE/manifest.json" "$CONFIG_DIR/original-manifest.json"
+    for version in 1 99 null; do
+        jq --argjson version "$version" '.vault_version=$version' "$CONFIG_DIR/original-manifest.json" > "$GITHUB_WORKTREE/manifest.json"
+        printf 'previous-output\n' > "$out"
+        chmod 640 "$out"
+        run github_config_open "$GITHUB_WORKTREE" "$out"
+        assert_failure
+        [[ "$(cat "$out")" == previous-output && "$(_file_mode "$out")" == 640 ]] || return 1
+    done
+    cp "$CONFIG_DIR/original-manifest.json" "$GITHUB_WORKTREE/manifest.json"
+    github_config_open "$GITHUB_WORKTREE" "$out" || return 1
+    jq -e '.vault_version==2 and .secrets.schema_version==2' "$out"
+}
+
+@test "portable password invalid container does not replace serialized output or source ciphertext" {
+    _portable_password_runtime || return 1
+    local out="$CONFIG_DIR/prior-output.json" before
+    printf 'previous-output\n' > "$out"
+    chmod 640 "$out"
+    printf '{"schema_version":1,"node_passwords":[]}\n' > "$SECRETS_JSON"
+    before=$(cat "$SECRETS_JSON")
+    run github_config_serialize "$out" "$CONFIG_JSON"
+    assert_failure
+    [[ "$(cat "$out")" == previous-output && "$(_file_mode "$out")" == 640 ]] || return 1
+    [[ "$(cat "$SECRETS_JSON")" == "$before" ]]
+}
+
+@test "portable password unsupported checkpoint preserves the published tree" {
+    _prepare_plain_worktree || return 1
+    local version before="$CONFIG_DIR/prior-tree"
+    cp -Rp "$GITHUB_WORKTREE" "$before"
+    for version in 1 55; do
+        jq --argjson version "$version" '.vault_version=$version' "$CONFIG_DIR/state.json" > "$CONFIG_DIR/unsupported.json"
+        run github_config_checkpoint "$CONFIG_DIR/unsupported.json"
+        assert_failure
+        diff -r "$before" "$GITHUB_WORKTREE" || return 1
+    done
 }

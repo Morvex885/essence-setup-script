@@ -26,7 +26,7 @@ setup() {
     cp "$SUB_DIR/expiry.list" "$BATS_TEST_TMPDIR/expected.expiry"
     cp "$SUB_SNIPPETS_DIR/sub-$OLD_TOKEN.conf" "$RUNTIME_DIR/"
     jq_w --arg token "$OLD_TOKEN" --arg dir "$SUB_DIR" '
-        .nodes = [{name:"host",ip:"192.0.2.1",port:"22",user:"root",auth:"key"}] |
+        .nodes = [{id:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",name:"host",ip:"192.0.2.1",port:22,user:"root",auth:"key"}] |
         .subscription_host = {node:"host",base_url:"https://example.test",sub_dir:$dir,nginx_group:"www-data"} |
         .subscription_default_headers = [] |
         .clients = [{name:"phone",group:"MOBILE",subscription:{token:$token,expires_at:"2033-05-18T03:33:20Z",created_at:"2026-01-01T00:00:00Z",headers:[{name:"profile-title",value:"phone"}]}}]'
@@ -153,7 +153,7 @@ failed_rotation() {
 @test "migration removes configured old-host artifacts only after new copies and host commit" {
     export MIGRATION_NEW_DIR="$BATS_TEST_TMPDIR/new-host"
     mkdir -p "$MIGRATION_NEW_DIR"
-    jq_w '.nodes=[{name:"old",ip:"192.0.2.1",port:"22",user:"root",auth:"key"},{name:"new",ip:"192.0.2.2",port:"22",user:"root",auth:"key"}] | .subscription_host.node="old" | .subscription_host.sub_dir="/stale/cache"'
+    jq_w '.nodes=[{id:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",name:"old",ip:"192.0.2.1",port:22,user:"root",auth:"key"},{id:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",name:"new",ip:"192.0.2.2",port:22,user:"root",auth:"key"}] | .subscription_host.node="old" | .subscription_host.sub_dir="/stale/cache"'
     _sub_upload_config() { command cp "$1" "$3/$2.yaml"; }
     ssh_run() {
         while [[ $# -gt 0 && "$1" != -- ]]; do shift; done

@@ -23,7 +23,7 @@ setup() {
     EVENTS="$BATS_TEST_TMPDIR/events"
     : > "$EVENTS"
     cat > "$CONFIG_JSON" <<'EOF'
-{"nodes":[{"name":"A","ip":"192.0.2.1","port":22,"user":"root","auth":"key"},{"name":"B","ip":"192.0.2.2","port":22,"user":"root","auth":"key"},{"name":"C","ip":"192.0.2.3","port":22,"user":"root","auth":"key"}],"groups":[],"clients":[],"connections":[]}
+{"nodes":[{"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","name":"A","ip":"192.0.2.1","port":22,"user":"root","auth":"key"},{"id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","name":"B","ip":"192.0.2.2","port":22,"user":"root","auth":"key"},{"id":"cccccccccccccccccccccccccccccccc","name":"C","ip":"192.0.2.3","port":22,"user":"root","auth":"key"}],"groups":[],"clients":[],"connections":[]}
 EOF
     reset_ssh_mocks
     _remote_scripts_probe() { REMOTE_SCRIPTS_STATE=ready; REMOTE_SCRIPTS_VERSION=1.2.3; }

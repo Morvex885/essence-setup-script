@@ -504,21 +504,22 @@ fi
 EOF
     cat > "$BIN/age" <<'EOF'
 #!/bin/bash
-out="" input="" decrypting=false
+out="" input="" decrypting=false identity=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -d) decrypting=true; shift ;;
-        -p)
-            if [[ "$decrypting" == true && -n "${AGE_PASSWORD_DECRYPT_MARKER:-}" ]]; then
-                printf '%s\n' unlock >> "$AGE_PASSWORD_DECRYPT_MARKER"
-            fi
-            shift ;;
-        -r|-i) shift 2 ;;
+        -p) shift ;;
+        -i) identity=true; shift 2 ;;
+        -r) shift 2 ;;
         -o) out="$2"; shift 2 ;;
         *) input="$1"; shift ;;
     esac
 done
 [[ -n "$out" && -n "$input" ]] || exit 1
+if [[ "$decrypting" == true && "$identity" == false &&
+      -n "${AGE_PASSWORD_DECRYPT_MARKER:-}" ]]; then
+    printf '%s\n' unlock >> "$AGE_PASSWORD_DECRYPT_MARKER"
+fi
 cp "$input" "$out"
 EOF
     chmod +x "$BIN/age" "$BIN/age-keygen"
@@ -649,7 +650,7 @@ _prepare_existing_plaintext_vault() {
     [[ "$output" != *"Текущий пароль доступа"* ]] || return 1
 }
 
-@test "encrypted GitHub menu shows password key and recovery actions" {
+@test "opening encrypted GitHub menu preserves the published state" {
     _install_fake_age
     run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
     assert_success
@@ -665,7 +666,7 @@ _prepare_existing_plaintext_vault() {
         --slurpfile manifest "$updater/manifest.json" \
         --rawfile template "$updater/templates/default.yaml" '
         {
-          vault_version:1,
+          vault_version:2,
           minimum_remote_control_version:"0.0.0",
           portability:$manifest[0].portability,
           access:$manifest[0].access,
@@ -684,12 +685,17 @@ _prepare_existing_plaintext_vault() {
     git -C "$updater" commit -m encrypted-state >/dev/null
     git -C "$updater" push origin main >/dev/null
 
+    local before
+    before=$(git --git-dir="$REMOTE" rev-parse main) || return 1
     run bash -c 'printf "access-pass\nn\ni\n0\n0\n" | "$0"' \
         "$APP/remote-control-essence.sh"
     assert_success
+    [[ "$(git --git-dir="$REMOTE" rev-parse main)" == "$before" ]] || return 1
+    jq -e '.schema_version==1 and .node_passwords=={}' \
+        "$HOME/.config/remote-control-essence/github-runtime/secrets.json" || return 1
 }
 
-@test "encrypted GitHub menu reports empty diagnostics for every failed action" {
+@test "failed encrypted GitHub actions retain the selected source and invoke each operation" {
     _install_fake_age
     run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
     assert_success
@@ -705,7 +711,7 @@ _prepare_existing_plaintext_vault() {
         --slurpfile manifest "$updater/manifest.json" \
         --rawfile template "$updater/templates/default.yaml" '
         {
-          vault_version:1,
+          vault_version:2,
           minimum_remote_control_version:"0.0.0",
           portability:$manifest[0].portability,
           access:$manifest[0].access,
@@ -724,23 +730,21 @@ _prepare_existing_plaintext_vault() {
     git -C "$updater" commit -m empty-diagnostic-encrypted-state >/dev/null
     git -C "$updater" push origin main >/dev/null
 
+    export FAILED_GITHUB_ACTIONS="$BATS_TEST_TMPDIR/failed-github-actions"
     cat >> "$APP/modules/github-config.sh" <<'EOF'
-github_config_rewrap_master() { _github_clear_error; return 1; }
-github_config_rotate_vault_key() { _github_clear_error; return 1; }
-github_config_import_recovery() { _github_clear_error; return 1; }
-github_config_switch_local() { _github_clear_error; return 1; }
+github_config_rewrap_master() { printf 'rewrap\n' >> "$FAILED_GITHUB_ACTIONS"; _github_clear_error; return 1; }
+github_config_rotate_vault_key() { printf 'rotate\n' >> "$FAILED_GITHUB_ACTIONS"; _github_clear_error; return 1; }
+github_config_import_recovery() { printf 'import\n' >> "$FAILED_GITHUB_ACTIONS"; _github_clear_error; return 1; }
+github_config_switch_local() { printf 'local\n' >> "$FAILED_GITHUB_ACTIONS"; _github_clear_error; return 1; }
 EOF
 
     run bash -c 'printf "access-pass\nn\ni\nR\nV\nI\n/tmp/missing-recovery-key\nE\n0\n" | "$0"' \
         "$APP/remote-control-essence.sh"
     assert_success
-    assert_output --partial "Не удалось изменить пароль доступа."
-    assert_output --partial "Не удалось создать новый ключ шифрования."
-    assert_output --partial "Не удалось импортировать ключ восстановления."
-    assert_output --partial "Не удалось перейти на локальную конфигурацию."
-    assert_output --partial "Выход."
+    [[ "$(cat "$FAILED_GITHUB_ACTIONS")" == $'rewrap\nrotate\nimport\nlocal' ]] || return 1
+    jq -e '.type=="github"' "$HOME/.config/remote-control-essence/source.json" || return 1
 }
-@test "ready GitHub state with nodes does not show deferred SSH action" {
+@test "ready GitHub state preserves node SSH resources after startup" {
     run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
     assert_success
     run bash -c 'printf "i\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
@@ -749,11 +753,13 @@ EOF
 
     run bash -c 'printf "0\n" | "$0"' "$APP/remote-control-essence.sh"
     assert_success
-    assert_output --partial "ssh-node"
-    [[ "$output" != *"Завершить отложенную SSH-настройку"* ]] || return 1
+    local runtime="$HOME/.config/remote-control-essence/github-runtime"
+    jq -e '.portability=={status:"ready",issues:[]}' "$runtime/manifest.json" || return 1
+    [[ -s "$runtime/ssh/identities/0123456789abcdef0123456789abcdef" ]] || return 1
+    ssh-keygen -F 127.0.0.1 -f "$runtime/ssh/known_hosts" >/dev/null || return 1
 }
 
-@test "deferred SSH action is visible only until mocked setup resolves issues" {
+@test "deferred SSH action resolves resources and persists readiness across restart" {
     run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
     assert_success
     run bash -c 'printf "i\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
@@ -778,10 +784,14 @@ EOF
     run bash -c 'printf "H\ny\n0\n" | "$0"' "$APP/remote-control-essence.sh"
     assert_success
     assert_output --partial "Отложенная SSH-настройка нод завершена"
+    local runtime="$HOME/.config/remote-control-essence/github-runtime"
+    jq -e '.portability=={status:"ready",issues:[]}' "$runtime/manifest.json" || return 1
+    [[ -s "$runtime/ssh/identities/0123456789abcdef0123456789abcdef" ]] || return 1
+    ssh-keygen -F 127.0.0.1 -f "$runtime/ssh/known_hosts" >/dev/null || return 1
 
     run bash -c 'printf "0\n" | "$0"' "$APP/remote-control-essence.sh"
     assert_success
-    [[ "$output" != *"Завершить отложенную SSH-настройку"* ]] || return 1
+    jq -e '.portability=={status:"ready",issues:[]}' "$runtime/manifest.json" || return 1
     [[ "$(git --git-dir="$REMOTE" show main:manifest.json |
         jq -r '.portability.status')" == ready ]] || return 1
 }
@@ -964,12 +974,12 @@ EOF
         --slurpfile secrets "$config_dir/secrets.json" \
         --rawfile template "$APP/templates/default.yaml" '
         {
-          vault_version:1,
+          vault_version:2,
           minimum_remote_control_version:"0.0.0",
           portability:{status:"ready",issues:[]},
           access:{script_password_hash:null},
           config:($config[0] + {marker:"remote"}),
-          secrets:$secrets[0],
+          secrets:($secrets[0] + {schema_version:2}),
           templates:{"default.yaml":{content:$template}},
           ssh:{identities:{},known_hosts:""}
         }
@@ -1785,4 +1795,353 @@ EOF
     assert_output --partial "Выбор аккаунта GitHub отменён."
     ! grep -q '^repo ' "$GH_CALLS_FILE"
     _assert_no_global_auth_mutation
+}
+
+_portable_install_device_wrappers() {
+    export TEST_REAL_CAT TEST_MACHINE_ID=11111111111111111111111111111111
+    export PORTABLE_SSH_LOG="$BATS_TEST_TMPDIR/portable-ssh.log"
+    TEST_REAL_CAT=$(command -v cat) || return 1
+    : > "$PORTABLE_SSH_LOG"
+    cat > "$BIN/cat" <<'EOF'
+#!/bin/bash
+if [[ "$#" == 1 && "$1" == /etc/machine-id ]]; then
+    printf '%s\n' "$TEST_MACHINE_ID"
+else
+    exec "$TEST_REAL_CAT" "$@"
+fi
+EOF
+    local tool
+    for tool in ssh scp; do
+        cat > "$BIN/$tool" <<'EOF'
+#!/bin/bash
+printf '%s\n' "${0##*/}" >> "$PORTABLE_SSH_LOG"
+exit 91
+EOF
+    done
+    chmod +x "$BIN/cat" "$BIN/ssh" "$BIN/scp"
+    hash -r
+}
+
+_portable_seed_local_passwords() (
+    umask 077
+    local root="$HOME/.config/remote-control-essence"
+    export CONFIG_DIR="$root" STATE_DIR="$root" CONFIG_JSON="$root/config.json"
+    export SECRETS_JSON="$root/secrets.json" STATE_MANIFEST="$root/manifest.json"
+    export TEMPLATES_DIR="$root/templates" SSH_IDENTITIES_DIR="$root/ssh/identities"
+    export SSH_KNOWN_HOSTS="$root/ssh/known_hosts"
+    source "$APP/common/common.sh"
+    source "$APP/modules/state.sh"
+    source "$APP/modules/nodes.sh"
+    jq -n '{
+      schema_version:2,nodes:[
+        {id:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",name:"portable-a",ip:"192.0.2.10",port:22,user:"root",auth:"password",identity:null,secret_id:"node:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:ssh-password",tag:"TEST",aliases:{}},
+        {id:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",name:"portable-b",ip:"192.0.2.11",port:22,user:"root",auth:"password",identity:null,secret_id:"node:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:ssh-password",tag:"TEST",aliases:{}}],
+      groups:[],clients:[],connections:[]}' > "$CONFIG_JSON" || exit 1
+    node_secret_set aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 'synthetic-portable-a' || exit 1
+    node_secret_set bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 'synthetic-portable-b' || exit 1
+    jq '.node_passwords["node:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:ssh-password"]="bad-device-a-ciphertext"' "$SECRETS_JSON" > "$root/secrets.next" &&
+        mv "$root/secrets.next" "$SECRETS_JSON" || exit 1
+    mkdir -p "$SSH_IDENTITIES_DIR"
+    ssh-keygen -q -t ed25519 -N '' -f "$BATS_TEST_TMPDIR/password-host" || exit 1
+    local kind public ignored
+    read -r kind public ignored < "$BATS_TEST_TMPDIR/password-host.pub"
+    printf '192.0.2.10 %s %s\n192.0.2.11 %s %s\n' "$kind" "$public" "$kind" "$public" > "$SSH_KNOWN_HOSTS"
+    state_checkpoint || exit 1
+)
+
+_portable_get_runtime_password() (
+    local runtime="$1" node="$2"
+    source "$APP/common/common.sh"
+    source "$APP/modules/state.sh"
+    source "$APP/modules/nodes.sh"
+    node_secret_get "$node" "$runtime/secrets.json"
+)
+
+_portable_prepare_two_devices() {
+    _portable_install_device_wrappers || return 1
+    export PORTABLE_HOME_A="$HOME"
+    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    _portable_seed_local_passwords || return 1
+    local original="$HOME/.config/remote-control-essence/secrets.json" original_hash
+    original_hash=$(_hash_file "$original")
+    run bash -c 'printf "i\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    [[ "$output" != *synthetic-portable* && "$output" != *bad-device-a-ciphertext* ]] || return 1
+    [[ "$(_hash_file "$original")" == "$original_hash" ]] || return 1
+    git --git-dir="$REMOTE" show main:secrets.json > "$BATS_TEST_TMPDIR/published-secrets.json" || return 1
+    jq -e '.schema_version==2 and .node_passwords=={"node:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:ssh-password":"synthetic-portable-a"}' "$BATS_TEST_TMPDIR/published-secrets.json" || return 1
+    git --git-dir="$REMOTE" show main:manifest.json > "$BATS_TEST_TMPDIR/published-manifest.json" || return 1
+    jq -e '.vault_version==2 and .portability=={status:"needs_setup",issues:[{node_id:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",reason:"missing_secret"}]}' "$BATS_TEST_TMPDIR/published-manifest.json" || return 1
+    export HOME="$BATS_TEST_TMPDIR/device-b-home" TEST_MACHINE_ID=22222222222222222222222222222222
+    mkdir -p "$HOME"
+    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    run bash -c 'printf "i\n1\n1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    export PORTABLE_CONFIG="$HOME/.config/remote-control-essence"
+    export PORTABLE_RUNTIME="$PORTABLE_CONFIG/github-runtime"
+    [[ "$(_portable_get_runtime_password "$PORTABLE_RUNTIME" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)" == synthetic-portable-a ]] || return 1
+    run _portable_get_runtime_password "$PORTABLE_RUNTIME" bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    [[ "$status" -eq 2 && -z "$output" ]] || return 1
+    jq -e '.schema_version==1 and .node_passwords["node:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:ssh-password"]!="synthetic-portable-a"' "$PORTABLE_RUNTIME/secrets.json" || return 1
+    [[ "$(_file_mode "$PORTABLE_RUNTIME/secrets.json")" == 600 ]] || return 1
+    [[ -z "$(_materialization_temp_inventory "$PORTABLE_CONFIG")" ]] || return 1
+    [[ ! -s "$PORTABLE_SSH_LOG" ]]
+}
+
+@test "portable password actual entrypoint recovers only selected node and returns repaired passwords to device A" {
+    _portable_prepare_two_devices || return 1
+    local config_hash before_temps
+    config_hash=$(_hash_file "$PORTABLE_RUNTIME/config.json")
+    before_temps=$(_materialization_temp_inventory "$PORTABLE_CONFIG")
+    run bash -c 'printf "2\nY\nsynthetic-repaired-b\n0\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    [[ "$output" != *synthetic-repaired-b* && "$output" != *synthetic-portable-a* ]] || return 1
+    [[ "$(_hash_file "$PORTABLE_RUNTIME/config.json")" == "$config_hash" ]] || return 1
+    [[ "$(_portable_get_runtime_password "$PORTABLE_RUNTIME" bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)" == synthetic-repaired-b ]] || return 1
+    jq -e '.portability.status=="ready" and .portability.issues==[]' "$PORTABLE_RUNTIME/manifest.json" || return 1
+    [[ "$(_materialization_temp_inventory "$PORTABLE_CONFIG")" == "$before_temps" ]] || return 1
+    [[ ! -s "$PORTABLE_SSH_LOG" ]] || return 1
+    export HOME="$PORTABLE_HOME_A" TEST_MACHINE_ID=11111111111111111111111111111111
+    run bash -c 'printf "0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    local runtime="$HOME/.config/remote-control-essence/github-runtime"
+    [[ "$(_portable_get_runtime_password "$runtime" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)" == synthetic-portable-a ]] || return 1
+    [[ "$(_portable_get_runtime_password "$runtime" bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)" == synthetic-repaired-b ]] || return 1
+    jq -e '.portability.status=="ready" and .portability.issues==[]' "$runtime/manifest.json" || return 1
+    [[ ! -s "$PORTABLE_SSH_LOG" ]]
+}
+
+@test "portable password actual entrypoint cancellation EOF and empty input preserve local secrets" {
+    _portable_prepare_two_devices || return 1
+    _portable_reopen_local || return 1
+    local root="$PORTABLE_CONFIG" before input
+    before="$(_hash_file "$root/secrets.json") $(_hash_file "$root/manifest.json") $(_hash_file "$root/config.json")"
+    for input in $'2\nN\n0\n' $'2\nY\n\n0\n' $'2\n' $'2\nY\n'; do
+        run bash -c 'printf "%s" "$1" | "$0"' "$APP/remote-control-essence.sh" "$input"
+        assert_success
+        [[ "$(_hash_file "$root/secrets.json") $(_hash_file "$root/manifest.json") $(_hash_file "$root/config.json")" == "$before" ]] || return 1
+        [[ ! -s "$PORTABLE_SSH_LOG" ]] || return 1
+    done
+    run bash -c 'printf "0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    [[ "$(_portable_get_runtime_password "$root" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)" == synthetic-portable-a ]] || return 1
+    run _portable_get_runtime_password "$root" bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    [[ "$status" -eq 2 && -z "$output" ]]
+}
+
+@test "portable password actual entrypoint failed secret publication restores secrets and manifest" {
+    _portable_prepare_two_devices || return 1
+    _portable_reopen_local || return 1
+    local root="$PORTABLE_CONFIG" before
+    before="$(_hash_file "$root/secrets.json") $(_hash_file "$root/manifest.json")"
+    export PORTABLE_REAL_MV PORTABLE_WRITE_FAULT="$BATS_TEST_TMPDIR/password-write-failed"
+    PORTABLE_REAL_MV=$(command -v mv)
+    cat > "$BIN/mv" <<'EOF'
+#!/bin/bash
+if [[ "$*" == *"$PORTABLE_CONFIG/secrets.json"* && ! -e "$PORTABLE_WRITE_FAULT" ]]; then
+    : > "$PORTABLE_WRITE_FAULT"
+    exit 89
+fi
+exec "$PORTABLE_REAL_MV" "$@"
+EOF
+    chmod +x "$BIN/mv"
+    run bash -c 'printf "2\nY\nsynthetic-write-failure\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    [[ -f "$PORTABLE_WRITE_FAULT" ]] || return 1
+    [[ "$output" != *synthetic-write-failure* ]] || return 1
+    [[ "$(_hash_file "$root/secrets.json") $(_hash_file "$root/manifest.json")" == "$before" ]] || return 1
+    [[ ! -s "$PORTABLE_SSH_LOG" ]]
+}
+
+@test "portable password unsupported startup leaves prior runtime auth and staging unchanged" {
+    _portable_prepare_two_devices || return 1
+    local before auth_before temps updater="$BATS_TEST_TMPDIR/unsupported-updater"
+    before=$(_runtime_fingerprint "$PORTABLE_RUNTIME")
+    temps=$(_materialization_temp_inventory "$PORTABLE_CONFIG")
+    [[ ! -e "$PORTABLE_CONFIG/.auth" ]] || return 1
+    git clone "$REMOTE" "$updater" >/dev/null || return 1
+    git -C "$updater" config user.name fixture
+    git -C "$updater" config user.email fixture@example.invalid
+    jq '.vault_version=1' "$updater/manifest.json" > "$updater/manifest.next" &&
+        mv "$updater/manifest.next" "$updater/manifest.json" || return 1
+    git -C "$updater" add manifest.json
+    git -C "$updater" commit -m unsupported >/dev/null
+    git -C "$updater" push origin main >/dev/null || return 1
+    run bash -c 'printf "0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_failure
+    [[ "$(_runtime_fingerprint "$PORTABLE_RUNTIME")" == "$before" ]] || return 1
+    [[ "$(_materialization_temp_inventory "$PORTABLE_CONFIG")" == "$temps" ]] || return 1
+    [[ ! -e "$PORTABLE_CONFIG/.auth" && ! -s "$PORTABLE_SSH_LOG" ]]
+}
+
+@test "portable password actual entrypoint real age publishes partial state and imports on device B" {
+    command -v age >/dev/null || return 1
+    command -v age-keygen >/dev/null || return 1
+    _portable_install_device_wrappers || return 1
+    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    _portable_seed_local_passwords || return 1
+    _portable_entrypoint_tty $'i\n1\n1\nsynthetic-vault-pass\nsynthetic-vault-pass\n0\n'
+    assert_success
+    [[ "$output" != *synthetic-portable* && "$output" != *synthetic-vault-pass* ]] || return 1
+    local files
+    files=$(git --git-dir="$REMOTE" ls-tree -r --name-only main)
+    [[ "$files" == $'recipient.txt\nstate.json.age\nstorage.json\nunlock.age' ]] || return 1
+    export HOME="$BATS_TEST_TMPDIR/age-device-b" TEST_MACHINE_ID=22222222222222222222222222222222
+    mkdir -p "$HOME"
+    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    _portable_entrypoint_tty $'i\n1\nsynthetic-vault-pass\nn\n1\n0\n'
+    assert_success
+    local runtime="$HOME/.config/remote-control-essence/github-runtime"
+    [[ "$(_portable_get_runtime_password "$runtime" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)" == synthetic-portable-a ]] || return 1
+    run _portable_get_runtime_password "$runtime" bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    [[ "$status" -eq 2 && -z "$output" ]] || return 1
+    [[ ! -s "$PORTABLE_SSH_LOG" ]]
+}
+
+@test "portable password actual entrypoint failed issue removal restores both local files" {
+    _portable_prepare_two_devices || return 1
+    _portable_reopen_local || return 1
+    local before="$(_hash_file "$PORTABLE_CONFIG/secrets.json") $(_hash_file "$PORTABLE_CONFIG/manifest.json")"
+    export PORTABLE_REAL_MV PORTABLE_SECRET_WRITTEN="$BATS_TEST_TMPDIR/secret-written"
+    export PORTABLE_ISSUE_FAULT="$BATS_TEST_TMPDIR/issue-write-failed"
+    PORTABLE_REAL_MV=$(command -v mv)
+    cat > "$BIN/mv" <<'EOF'
+#!/bin/bash
+last="${!#}"
+if [[ "$last" == "$PORTABLE_CONFIG/secrets.json" ]]; then
+    "$PORTABLE_REAL_MV" "$@" || exit $?
+    : > "$PORTABLE_SECRET_WRITTEN"
+    exit 0
+fi
+if [[ "$last" == "$PORTABLE_CONFIG/manifest.json" &&
+      -e "$PORTABLE_SECRET_WRITTEN" && ! -e "$PORTABLE_ISSUE_FAULT" ]]; then
+    : > "$PORTABLE_ISSUE_FAULT"
+    exit 88
+fi
+exec "$PORTABLE_REAL_MV" "$@"
+EOF
+    chmod +x "$BIN/mv"
+    run bash -c 'printf "2\nY\nsynthetic-issue-failure\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    [[ -e "$PORTABLE_SECRET_WRITTEN" && -e "$PORTABLE_ISSUE_FAULT" ]] || return 1
+    [[ "$(_hash_file "$PORTABLE_CONFIG/secrets.json") $(_hash_file "$PORTABLE_CONFIG/manifest.json")" == "$before" ]] || return 1
+    [[ "$output" != *synthetic-issue-failure* && ! -s "$PORTABLE_SSH_LOG" ]]
+}
+
+@test "portable password actual entrypoint recovery keeps unrelated host pin issue" {
+    _portable_prepare_two_devices || return 1
+    _portable_reopen_local || return 1
+    ssh-keygen -R 192.0.2.11 -f "$PORTABLE_CONFIG/ssh/known_hosts" >/dev/null 2>&1 || return 1
+    jq '.portability.issues += [{node_id:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",reason:"missing_host_key"}]' "$PORTABLE_CONFIG/manifest.json" > "$BATS_TEST_TMPDIR/manifest.host-issue" &&
+        mv "$BATS_TEST_TMPDIR/manifest.host-issue" "$PORTABLE_CONFIG/manifest.json" || return 1
+    chmod 600 "$PORTABLE_CONFIG/manifest.json"
+    run bash -c 'printf "2\nY\nsynthetic-repaired-b\n0\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    [[ "$(_portable_get_runtime_password "$PORTABLE_CONFIG" bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)" == synthetic-repaired-b ]] || return 1
+    jq -e '.portability=={status:"needs_setup",issues:[{node_id:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",reason:"missing_host_key"}]}' "$PORTABLE_CONFIG/manifest.json" || return 1
+    [[ ! -s "$PORTABLE_SSH_LOG" ]]
+}
+
+@test "portable password actual entrypoint import encoding failure preserves prior runtime" {
+    _portable_prepare_two_devices || return 1
+    local before temps
+    before=$(_runtime_fingerprint "$PORTABLE_RUNTIME")
+    temps=$(_materialization_temp_inventory "$PORTABLE_CONFIG")
+    _publish_plain_marker encoding-failure || return 1
+    export PORTABLE_ENCODE_FAULT="$BATS_TEST_TMPDIR/encoding-failed"
+    mv "$BIN/openssl" "$BIN/openssl.normal"
+    cat > "$BIN/openssl" <<'EOF'
+#!/bin/bash
+if [[ "$1" == enc && "$*" != *" -d "* ]]; then
+    : > "$PORTABLE_ENCODE_FAULT"
+    printf 'partial-unpublishable-ciphertext'
+    exit 87
+fi
+exec "$BIN/openssl.normal" "$@"
+EOF
+    chmod +x "$BIN/openssl"
+    run bash -c 'printf "0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_failure
+    [[ -e "$PORTABLE_ENCODE_FAULT" ]] || return 1
+    [[ "$output" != *synthetic-portable* && "$output" != *partial-unpublishable* ]] || return 1
+    [[ "$(_runtime_fingerprint "$PORTABLE_RUNTIME")" == "$before" ]] || return 1
+    [[ "$(_materialization_temp_inventory "$PORTABLE_CONFIG")" == "$temps" ]] || return 1
+    [[ ! -e "$PORTABLE_CONFIG/.auth" && ! -s "$PORTABLE_SSH_LOG" ]]
+}
+
+_portable_reopen_local() {
+    run bash -c 'printf "i\nE\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    local secret_hash
+    secret_hash=$(_hash_file "$PORTABLE_CONFIG/secrets.json") || return 1
+    jq -S . "$PORTABLE_CONFIG/manifest.json" > "$BATS_TEST_TMPDIR/local-manifest-before.json"
+    jq -S . "$PORTABLE_CONFIG/config.json" > "$BATS_TEST_TMPDIR/local-config-before.json"
+    # Local startup checkpoints the imported manifest into its canonical key
+    # order. Establish the local UI baseline after opening, not before startup.
+    run bash -c 'printf "0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    [[ "$(_hash_file "$PORTABLE_CONFIG/secrets.json")" == "$secret_hash" ]] || return 1
+    diff -u "$BATS_TEST_TMPDIR/local-manifest-before.json" <(jq -S . "$PORTABLE_CONFIG/manifest.json") || return 1
+    diff -u "$BATS_TEST_TMPDIR/local-config-before.json" <(jq -S . "$PORTABLE_CONFIG/config.json") || return 1
+}
+
+_portable_entrypoint_tty() {
+    local commands="$1" driver="$BATS_TEST_TMPDIR/portable-tty.py"
+    cat > "$driver" <<'PY'
+import errno
+import os
+import pty
+import re
+import select
+import signal
+import sys
+import time
+
+read_fd, write_fd = os.pipe()
+pid, terminal = pty.fork()
+if pid == 0:
+    os.close(write_fd)
+    os.dup2(read_fd, 0)
+    os.close(read_fd)
+    os.execv(sys.argv[1], [sys.argv[1]])
+os.close(read_fd)
+os.write(write_fd, sys.argv[2].encode())
+os.close(write_fd)
+deadline = time.monotonic() + 90
+pending = b""
+try:
+    while True:
+        if time.monotonic() > deadline:
+            os.killpg(pid, signal.SIGKILL)
+            raise RuntimeError("interactive age scenario timed out")
+        readable, _, _ = select.select([terminal], [], [], 0.2)
+        if not readable:
+            continue
+        try:
+            chunk = os.read(terminal, 65536)
+        except OSError as error:
+            if error.errno == errno.EIO:
+                break
+            raise
+        if not chunk:
+            break
+        sys.stdout.buffer.write(chunk)
+        sys.stdout.buffer.flush()
+        pending = (pending + chunk)[-4096:]
+        # The app's stdin remains the scripted menu input. Only age's genuine
+        # controlling-terminal passphrase prompts are answered on this PTY.
+        if re.search(rb"(?:Enter|Confirm|Type) passphrase[^\r\n]*: *$", pending):
+            os.write(terminal, b"synthetic-vault-pass\n")
+            pending = b""
+finally:
+    os.close(terminal)
+_, status = os.waitpid(pid, 0)
+sys.exit(os.waitstatus_to_exitcode(status))
+PY
+    chmod 600 "$driver"
+    run python3 "$driver" "$APP/remote-control-essence.sh" "$commands"
 }

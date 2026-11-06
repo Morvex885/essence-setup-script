@@ -9,51 +9,134 @@ _pass_key() {
     printf '%s' "rcm-${mid}" | openssl dgst -sha256 -r | cut -d' ' -f1
 }
 
-node_pass_decode() {
+node_pass_decode() (
+    set -o pipefail
     local key
-    key=$(_pass_key)
+    key=$(_pass_key) || return 1
     printf '%s' "$1" | base64 -d 2>/dev/null \
         | openssl enc -aes-256-cbc -d -pbkdf2 -k "$key" 2>/dev/null
-}
+)
 
-node_pass_encode() {
+node_pass_encode() (
+    set -o pipefail
     local key
-    key=$(_pass_key)
+    key=$(_pass_key) || return 1
     printf '%s' "$1" \
         | openssl enc -aes-256-cbc -pbkdf2 -k "$key" 2>/dev/null \
         | base64 | tr -d '\n'
-}
+)
 
 node_load() {
-    CURRENT_NODE_INDEX="$1"
-    local idx=$(($1 - 1))
-    if (( idx < 0 )); then
-        warn "Неверный индекс ноды: $1"
+    local index="${1:-}" count idx
+    count=$(nodes_count) || return 1
+    menu_index_valid "$index" "$count" || return 1
+    idx=$((index - 1))
+    jq -e --argjson i "$idx" '
+        .nodes[$i] | type=="object" and
+        (.id | type=="string" and test("^[a-f0-9]{32}$")) and
+        (.name | type=="string" and length>0) and
+        (.ip | type=="string" and length>0) and
+        (.user | type=="string" and length>0) and
+        (.port | type=="number" and .>=1 and .<=65535 and floor==.) and
+        (.auth=="key" or (.auth=="password" and .secret_id==("node:"+.id+":ssh-password")))
+    ' "$CONFIG_JSON" >/dev/null 2>&1 || return 1
+    local id name ip port user auth identity tag password="" rc
+    id=$(jq_r --argjson i "$idx" '.nodes[$i].id') || return 1
+    name=$(jq_r --argjson i "$idx" '.nodes[$i].name') || return 1
+    ip=$(jq_r --argjson i "$idx" '.nodes[$i].ip') || return 1
+    port=$(jq_r --argjson i "$idx" '.nodes[$i].port') || return 1
+    user=$(jq_r --argjson i "$idx" '.nodes[$i].user') || return 1
+    auth=$(jq_r --argjson i "$idx" '.nodes[$i].auth // "password"') || return 1
+    identity=$(jq_r --argjson i "$idx" '.nodes[$i].identity // ""') || return 1
+    tag=$(jq_r --argjson i "$idx" '.nodes[$i].tag // ""') || return 1
+    [[ -n "$id" && "$id" != null && -n "$name" && "$name" != null ]] || return 1
+    case "$auth" in
+        key) ;;
+        password)
+            if password=$(node_secret_get "$id"; rc=$?; printf '.'; exit "$rc"); then
+                password="${password%.}"
+            else
+                rc=$?
+                if [[ $rc -eq 2 ]]; then
+                    warn "Пароль SSH для ноды '${name}' отсутствует или не расшифровывается."
+                    return 2
+                fi
+                warn "Не удалось получить пароль SSH для ноды '${name}'."
+                return 1
+            fi
+            ;;
+        *) return 1 ;;
+    esac
+    NODE_ID="$id" NODE_NAME="$name" NODE_IDENTITY="$identity" NODE_TAG="$tag"
+    SERVER_IP="$ip" SERVER_PORT="$port" SERVER_USER="$user" SERVER_AUTH="$auth"
+    SERVER_PASS="$password" CURRENT_NODE_INDEX="$index"
+    return 0
+}
+
+node_load_by_name() {
+    local target="$1" idx
+    idx=$(jq_r --arg n "$target" '.nodes | to_entries[] | select(.value.name==$n) | .key') || return 1
+    [[ "$idx" =~ ^[0-9]+$ ]] || return 1
+    node_load "$((idx + 1))"
+}
+
+node_prompt_password() {
+    local index="${1:-}" count idx id name auth password
+    count=$(nodes_count) || return 1
+    menu_index_valid "$index" "$count" || return 1
+    idx=$((index - 1))
+    id=$(jq_r --argjson i "$idx" '.nodes[$i].id') || return 1
+    name=$(jq_r --argjson i "$idx" '.nodes[$i].name') || return 1
+    auth=$(jq_r --argjson i "$idx" '.nodes[$i].auth') || return 1
+    [[ "$auth" == password ]] || return 1
+    confirm_yn "Сохранить пароль SSH для ноды '${name}' заново?" N || return 1
+    if ! IFS= read -rs -p "Пароль SSH (Enter — отмена): " password; then
+        echo ""
         return 1
     fi
-    local count
-    count=$(nodes_count)
-    if (( idx >= count )); then
-        warn "Нода #$1 не существует (всего: $count)"
+    echo ""
+    password="${password%$'\r'}"
+    [[ -n "$password" ]] || return 1
+    state_action "save_node_password" node_save_password "$id" "$password"
+}
+
+node_save_password() {
+    local id="${1:-}" password="${2:-}" backup manifest_existed=false
+    [[ -n "$id" && -n "$password" ]] || return 1
+    jq -e --arg id "$id" 'any(.nodes[]; .id==$id and .auth=="password")' \
+        "$CONFIG_JSON" >/dev/null 2>&1 || return 1
+    backup=$(umask 077; mktemp -d "${CONFIG_DIR:-/tmp}/.password-backup.XXXXXX") || return 1
+    if ! cp "$SECRETS_JSON" "$backup/secrets" || ! chmod 600 "$backup/secrets"; then
+        rm -rf "$backup"
         return 1
     fi
-    NODE_ID=$(jq_r --argjson i "$idx" '.nodes[$i].id')
-    NODE_NAME=$(jq_r --argjson i "$idx" '.nodes[$i].name')
-    SERVER_IP=$(jq_r --argjson i "$idx" '.nodes[$i].ip')
-    SERVER_PORT=$(jq_r --argjson i "$idx" '.nodes[$i].port')
-    SERVER_USER=$(jq_r --argjson i "$idx" '.nodes[$i].user')
-    SERVER_AUTH=$(jq_r --argjson i "$idx" '.nodes[$i].auth // "password"')
-    NODE_IDENTITY=$(jq_r --argjson i "$idx" '.nodes[$i].identity // ""')
-    NODE_TAG=$(jq_r --argjson i "$idx" '.nodes[$i].tag // ""')
-    if [[ "$SERVER_AUTH" == "key" ]]; then
-        SERVER_PASS=""
-    else
-        if ! SERVER_PASS=$(node_secret_get "$NODE_ID"); then
-            SERVER_PASS=""
-            warn "Не удалось получить пароль SSH для ноды '${NODE_NAME}'."
+    if [[ -f "$STATE_MANIFEST" ]]; then
+        manifest_existed=true
+        if ! cp "$STATE_MANIFEST" "$backup/manifest" || ! chmod 600 "$backup/manifest"; then
+            rm -rf "$backup"
             return 1
         fi
     fi
+    if ! node_secret_set "$id" "$password" ||
+       ! state_portability_remove_issue "$id" missing_secret ||
+       ! state_checkpoint; then
+        local restored=true
+        _state_write_atomic "$backup/secrets" "$SECRETS_JSON" || restored=false
+        if [[ "$manifest_existed" == true ]]; then
+            _state_write_atomic "$backup/manifest" "$STATE_MANIFEST" || restored=false
+        else
+            rm -f "$STATE_MANIFEST" || restored=false
+        fi
+        if [[ "$restored" == true ]]; then
+            rm -rf "$backup"
+        else
+            warn "Не удалось восстановить локальное состояние. Резервная копия: $backup"
+        fi
+        warn "Не удалось сохранить пароль SSH."
+        return 1
+    fi
+    rm -rf "$backup"
+    return 0
 }
 
 node_pick() {
@@ -67,22 +150,12 @@ node_pick() {
     NODE_PICK_INDEX="$MENU_SELECT_INDEX"
 }
 
-node_load_by_name() {
-    local target="$1"
-    local idx
-    idx=$(jq_r --arg n "$target" '.nodes | to_entries[] | select(.value.name==$n) | .key')
-    [[ -z "$idx" ]] && return 1
-    node_load $((idx + 1))
-}
-
 # ─── Добавление ноды ─────────────────────────────────────────────────────────
 _github_add_abort() {
     local node_id="${1:-}" managed="${2:-false}" known_backup="${3:-}" manifest_backup="${4:-}"
-    local existing_name previous_candidate_allow rollback_status=0
+    local existing_name rollback_status=0
     existing_name=$(jq_r --arg id "$node_id" '.nodes[] | select(.id==$id) | .name' 2>/dev/null || true)
     if [[ -n "$existing_name" ]]; then
-        previous_candidate_allow="${CONFIG_PERSIST_ALLOW_NEEDS_SETUP:-0}"
-        CONFIG_PERSIST_ALLOW_NEEDS_SETUP=1
         jq_w --arg id "$node_id" --arg n "$existing_name" '
             .nodes |= [.[] | select(.id != $id)] |
             .connections |= [.[] | select(.node != $n)] |
@@ -90,7 +163,6 @@ _github_add_abort() {
                 (if .nodes then .nodes |= [.[] | select(. != $n)] else . end) |
                 (if .connections then .connections |= [.[] | select(.node != $n)] else . end)
             )' || rollback_status=$?
-        CONFIG_PERSIST_ALLOW_NEEDS_SETUP="$previous_candidate_allow"
         if [[ "$rollback_status" -ne 0 ]]; then
             warn "Откат ноды не сохранён; SSH-ключи, секреты и резервные копии оставлены."
             return 1
@@ -336,7 +408,7 @@ add_node() {
         [[ -z "$_tag" ]] && warn "Тег обязателен — он различает прокси разных нод."
     done
 
-    local _secret_id="" _previous_candidate_allow="${CONFIG_PERSIST_ALLOW_NEEDS_SETUP:-0}"
+    local _secret_id=""
     [[ "$_auth" == "password" ]] && _secret_id="node:${_node_id}:ssh-password"
     # Persist the secret first: GitHub's jq_w hook validates the candidate
     # against the complete state and must see the password it references.
@@ -346,8 +418,6 @@ add_node() {
             _github_add_abort "$_node_id" "$_managed_identity" "$_known_backup" "$_manifest_backup"
         return 1
     fi
-    [[ "${CONFIG_SOURCE:-local}" == "github" ]] &&
-        CONFIG_PERSIST_ALLOW_NEEDS_SETUP=1
     if ! jq_w --arg id "$_node_id" --arg n "$_name" --arg ip "$_ip" \
         --argjson port "$_port" --arg u "$_user" --arg a "$_auth" \
         --arg identity "$_identity" --arg secret_id "$_secret_id" --arg t "$_tag" '
@@ -357,14 +427,12 @@ add_node() {
             secret_id:(if $a=="password" then $secret_id else null end),
             tag:$t, aliases:{}
         }]'; then
-        CONFIG_PERSIST_ALLOW_NEEDS_SETUP="$_previous_candidate_allow"
         [[ "${CONFIG_SOURCE:-local}" == "github" ]] &&
             _github_add_abort "$_node_id" "$_managed_identity" "$_known_backup" "$_manifest_backup"
         [[ "${CONFIG_SOURCE:-local}" != "github" && "$_auth" == "password" ]] &&
             node_secret_delete "$_node_id" >/dev/null 2>&1 || true
         return 1
     fi
-    CONFIG_PERSIST_ALLOW_NEEDS_SETUP="$_previous_candidate_allow"
     state_checkpoint >/dev/null 2>&1 || {
         [[ "${CONFIG_SOURCE:-local}" == "github" ]] &&
             _github_add_abort "$_node_id" "$_managed_identity" "$_known_backup" "$_manifest_backup"

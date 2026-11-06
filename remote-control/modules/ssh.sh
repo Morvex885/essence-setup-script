@@ -59,7 +59,7 @@ _ssh_node_portability_issue() {
     fi
     if [[ -n "$issue" ]]; then
         if [[ "$issue" == missing_secret ]]; then
-            warn "Для ноды '${NODE_NAME}' отсутствует пароль SSH в состоянии GitHub. Сохраните ноду с паролем заново."
+            warn "Пароль SSH для ноды '${NODE_NAME}' недоступен. Выберите ноду в главном меню, чтобы сохранить пароль заново."
         else
             _ssh_deferred_setup_hint
         fi
@@ -72,7 +72,7 @@ _ssh_node_portability_issue() {
             return 0
         fi
     elif [[ -z "$SERVER_PASS" ]]; then
-        warn "Для ноды '${NODE_NAME}' отсутствует пароль SSH в состоянии GitHub. Сохраните ноду с паролем заново."
+        warn "Пароль SSH для ноды '${NODE_NAME}' недоступен. Выберите ноду в главном меню, чтобы сохранить пароль заново."
         return 0
     fi
     if ! _ssh_known_host_present; then
