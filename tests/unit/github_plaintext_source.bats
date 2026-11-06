@@ -938,6 +938,33 @@ EOF
     [[ "$(git --git-dir="$REMOTE" show main:manifest.json | jq -r '.access.script_password_hash')" == \
         "$(cat "$config_dir/.auth")" ]]
 }
+@test "format recovery asks again when the migrated snapshot carries another script password" {
+    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    run bash -c 'printf "i\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    run bash -c 'printf "l\n1\nsecret-pass\nsecret-pass\n0\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+    local updater="$BATS_TEST_TMPDIR/v1-rotated" rotated
+    rotated=$(openssl passwd -6 -salt fixture rotated-pass) || return 1
+    git clone "$REMOTE" "$updater" >/dev/null 2>&1 || return 1
+    git -C "$updater" config user.name fixture
+    git -C "$updater" config user.email fixture@example.invalid
+    jq --arg hash "$rotated" '.vault_version=1 | .access.script_password_hash=$hash' \
+        "$updater/manifest.json" > "$updater/manifest.next" &&
+        mv "$updater/manifest.next" "$updater/manifest.json" || return 1
+    printf '{"schema_version":1,"node_passwords":{}}\n' > "$updater/secrets.json"
+    git -C "$updater" commit -am vault-v1 >/dev/null || return 1
+    git -C "$updater" push origin main >/dev/null 2>&1 || return 1
+
+    run bash -c 'printf "secret-pass\n1\ny\nwrong\nwrong\nwrong\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_failure
+    assert_output --partial "Доступ запрещён."
+    [[ "$output" != *"Источник конфигурации: GitHub"* ]] || return 1
+    run bash -c 'printf "rotated-pass\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_success
+}
+
 @test "existing plaintext vault can load remote without changing local files" {
     _prepare_existing_plaintext_vault
     _publish_plain_marker remote
@@ -2065,6 +2092,7 @@ _portable_use_device_a() {
     run bash -c 'printf "1\ny\n0\n" | "$0"' "$APP/remote-control-essence.sh"
     assert_success
     [[ "$output" != *Повторить* && "$output" != *synthetic-portable* ]] || return 1
+    assert_output --partial "будут храниться в GitHub без шифрования."
     git --git-dir="$REMOTE" show main:manifest.json > "$BATS_TEST_TMPDIR/m.json" || return 1
     jq -e '.vault_version==2 and .minimum_remote_control_version=="1.1.0" and
         .portability.issues==[{node_id:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",reason:"missing_secret"}]' "$BATS_TEST_TMPDIR/m.json" || return 1
@@ -2121,6 +2149,7 @@ _portable_use_device_a() {
     local local_config="$HOME/.config/remote-control-essence/config.json"
     run bash -c 'printf "2\ny\n0\n" | "$0"' "$APP/remote-control-essence.sh"
     assert_success
+    assert_output --partial "будут храниться в GitHub без шифрования."
     git --git-dir="$REMOTE" show main:config.json > "$BATS_TEST_TMPDIR/c.json" || return 1
     cmp -s <(jq -S . "$BATS_TEST_TMPDIR/c.json") <(jq -S . "$local_config") || return 1
     git --git-dir="$REMOTE" show main:manifest.json | jq -e '.vault_version==2' >/dev/null || return 1

@@ -438,6 +438,7 @@ _config_source_create_empty_snapshot() {
 }
 
 # _config_source_publish_logical <logical> — write the snapshot to the worktree, push, materialize.
+# Returns 1 when nothing was published, 3 when GitHub was updated but the runtime was not.
 _config_source_publish_logical() {
     local logical="${1:?logical state}"
     github_config_checkpoint "$logical" || return 1
@@ -446,10 +447,20 @@ _config_source_publish_logical() {
         warn "Изменения сохранены локально и ожидают отправки."
         GITHUB_SYNC_STATUS=pending
     fi
-    _config_source_materialize_state "$logical" || return 1
+    if ! _config_source_materialize_state "$logical"; then
+        _github_ensure_error "подготовка рабочего состояния" \
+            "Конфигурация GitHub обновлена, но рабочее состояние не подготовлено."
+        return 3
+    fi
     mv -f "$logical" "$CONFIG_DIR/runtime-vault.json" ||
         warn "Не удалось сохранить копию опубликованной конфигурации GitHub."
     return 0
+}
+
+# _github_plaintext_review_line — review notice for repositories stored without encryption.
+_github_plaintext_review_line() {
+    [[ "${GITHUB_STORAGE_MODE:-}" == none ]] || return 0
+    printf '%s\n' "Пароли SSH и ключи будут храниться в GitHub без шифрования."
 }
 
 # _config_source_local_snapshot <out> — vault snapshot of the device-only state in CONFIG_DIR.
@@ -494,17 +505,19 @@ _github_snapshot_counts() {
 
 # _github_format_migrate_prepare <candidate> <from> — 0 confirmed, 2 declined, 1 error.
 _github_format_migrate_prepare() {
-    local candidate="${1:?candidate}" from="${2:-?}" names minimum
+    local candidate="${1:?candidate}" from="${2:-?}" names minimum plaintext_line
     github_config_open "$GITHUB_WORKTREE" "$candidate" migrate || return 1
     minimum=$(_github_vault_format_min_version "$GITHUB_VAULT_FORMAT") || return 1
     names=$(jq -r '[.portability.issues[] | select(.reason=="missing_secret") | .node_id] as $ids |
         [.config.nodes[] | select(.id as $i | $ids | index($i)) | .name] | join(", ")' \
         "$candidate" 2>/dev/null) || names=""
+    plaintext_line=$(_github_plaintext_review_line)
     review_frame "Преобразование конфигурации GitHub" \
         "Репозиторий: ${GITHUB_OWNER:-?}/${GITHUB_REPO_NAME} (ветка ${GITHUB_BRANCH})" \
         "Формат: v${from} → v${GITHUB_VAULT_FORMAT}" \
         "Устройства с Remote Control старше ${minimum} перестанут читать конфигурацию." \
         "Предыдущая версия останется в истории Git." \
+        ${plaintext_line:+"$plaintext_line"} \
         ${names:+"Потребуется повторный ввод пароля: ${names}"}
     if ! confirm_yn "Преобразовать и опубликовать конфигурацию?" N; then
         rm -f "$candidate"
@@ -512,25 +525,21 @@ _github_format_migrate_prepare() {
     fi
 }
 
-# github_format_migrate_action <from> — 0 published, 2 declined, 1 error.
+# github_format_migrate_action <from> — 0 published, 2 declined, 1 error, 3 published without runtime.
 github_format_migrate_action() {
     local from="${1:-?}" candidate rc=0
     candidate=$(umask 077; mktemp "$CONFIG_DIR/.vault-migrate.XXXXXX") || return 1
     _github_format_migrate_prepare "$candidate" "$from" || rc=$?
-    if [[ $rc -ne 0 ]]; then
-        rm -f "$candidate"
-        return "$rc"
-    fi
-    if ! _config_source_publish_logical "$candidate"; then
-        rm -f "$candidate"
-        return 1
-    fi
+    [[ $rc -eq 0 ]] && { _config_source_publish_logical "$candidate" || rc=$?; }
+    [[ $rc -eq 0 ]] || rm -f "$candidate"
+    return "$rc"
 }
 
-# github_replace_with_local_action <recovery|menu> — 0 published, 2 declined/no data, 1 error.
+# github_replace_with_local_action <recovery|menu> — 0 published, 2 declined/no data, 1 error,
+# 3 published without runtime.
 github_replace_with_local_action() {
-    local mode="${1:-menu}" candidate local_counts github_counts pending_line=""
-    local local_nodes local_clients
+    local mode="${1:-menu}" candidate local_counts github_counts pending_line="" plaintext_line
+    local local_nodes local_clients rc=0
     if [[ ! -f "${LOCAL_CONFIG_JSON:-$CONFIG_DIR/config.json}" ]]; then
         warn "Конфигурация только этого компьютера отсутствует."
         return 2
@@ -549,12 +558,14 @@ github_replace_with_local_action() {
         [[ "${GITHUB_SYNC_STATUS:-}" == pending ]] &&
             pending_line="Неотправленные изменения рабочей конфигурации GitHub будут заменены."
     fi
+    plaintext_line=$(_github_plaintext_review_line)
     review_frame "Замена конфигурации GitHub" \
         "Репозиторий: ${GITHUB_OWNER:-?}/${GITHUB_REPO_NAME} (ветка ${GITHUB_BRANCH})" \
         "Будет опубликована конфигурация только этого компьютера." \
         "Этот компьютер: $(_github_counts_label "$local_counts")" \
         "GitHub: $(_github_counts_label "$github_counts")" \
         "Текущая конфигурация GitHub останется только в истории Git." \
+        ${plaintext_line:+"$plaintext_line"} \
         ${pending_line:+"$pending_line"}
     IFS=$'\t' read -r local_nodes local_clients _ <<< "$local_counts"
     [[ "${local_nodes:-0}" == 0 && "${local_clients:-0}" == 0 ]] &&
@@ -563,10 +574,9 @@ github_replace_with_local_action() {
         rm -f "$candidate"
         return 2
     fi
-    if ! _config_source_publish_logical "$candidate"; then
-        rm -f "$candidate"
-        return 1
-    fi
+    _config_source_publish_logical "$candidate" || rc=$?
+    [[ $rc -eq 0 ]] || rm -f "$candidate"
+    return "$rc"
 }
 
 github_config_snapshot_cached() {
@@ -1061,6 +1071,7 @@ github_enable_local() {
             if [[ "${GITHUB_LAST_FORMAT:-}" == outdated ]]; then
                 connect_outdated=true
                 connect_from="$GITHUB_LAST_FORMAT_VERSION"
+                _github_clear_error
             else
                 _github_ensure_error "чтение существующей конфигурации GitHub" \
                     "Не удалось проверить или расшифровать существующую конфигурацию. Репозиторий не изменён."
@@ -1277,6 +1288,10 @@ github_source_menu() {
             case "$_replace_rc" in
                 0) success "Конфигурация GitHub заменена конфигурацией только этого компьютера." ;;
                 2) ;;
+                3)
+                    _github_report_last_error "Не удалось обновить рабочее состояние"
+                    error "Конфигурация GitHub заменена, но рабочее состояние не обновилось. Перезапустите скрипт."
+                    ;;
                 *)
                     if [[ -n "${GITHUB_LAST_ERROR:-}" ]]; then
                         _github_report_last_error "Не удалось заменить конфигурацию GitHub"
@@ -1584,6 +1599,11 @@ github_format_recovery_menu() {
                         return 0
                         ;;
                     2) ;;
+                    3)
+                        _github_report_last_error "Не удалось обновить рабочее состояние"
+                        warn "Конфигурация GitHub преобразована. Перезапустите скрипт."
+                        return 1
+                        ;;
                     *)
                         _github_report_last_error "Не удалось преобразовать конфигурацию GitHub"
                         [[ "${GITHUB_LAST_FORMAT:-}" == invalid ]] && state=invalid
@@ -1603,6 +1623,11 @@ github_format_recovery_menu() {
                         return 0
                         ;;
                     2) ;;
+                    3)
+                        _github_report_last_error "Не удалось обновить рабочее состояние"
+                        warn "Конфигурация GitHub заменена. Перезапустите скрипт."
+                        return 1
+                        ;;
                     *)
                         if [[ -n "${GITHUB_LAST_ERROR:-}" ]]; then
                             _github_report_last_error "Не удалось заменить конфигурацию GitHub"
@@ -1634,9 +1659,12 @@ while ! config_source_startup; do
     if [[ "$CONFIG_SOURCE" == github && -n "${GITHUB_LAST_FORMAT:-}" ]]; then
         # Recovery actions publish to GitHub: authenticate before offering them.
         check_script_password || exit 1
-        startup_password_checked=true
-        github_format_recovery_menu && break
-        exit 1
+        startup_auth_before=$(cat "$SCRIPT_AUTH_FILE" 2>/dev/null || true)
+        github_format_recovery_menu || exit 1
+        # The published snapshot may carry another script password: ask again if it changed.
+        [[ "$(cat "$SCRIPT_AUTH_FILE" 2>/dev/null || true)" == "$startup_auth_before" ]] &&
+            startup_password_checked=true
+        break
     fi
     startup_recovery_menu "Восстановление источника конфигурации" true || exit 1
 done
