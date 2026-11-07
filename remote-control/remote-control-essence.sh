@@ -498,10 +498,6 @@ _github_counts_label() {
     IFS=$'\t' read -r nodes clients groups <<< "$1"
     printf 'нод %s, клиентов %s, групп %s\n' "$nodes" "$clients" "$groups"
 }
-_github_snapshot_counts() {
-    jq -r '[(.config.nodes//[]|length),(.config.clients//[]|length),(.config.groups//[]|length)]|@tsv' \
-        "$1" 2>/dev/null
-}
 
 # _github_format_migrate_prepare <candidate> <from> — 0 confirmed, 2 declined, 1 error.
 _github_format_migrate_prepare() {
@@ -539,17 +535,14 @@ github_format_migrate_action() {
 # 3 published without runtime.
 github_replace_with_local_action() {
     local mode="${1:-menu}" candidate local_counts github_counts pending_line="" plaintext_line
-    local local_nodes local_clients rc=0
-    if [[ ! -f "${LOCAL_CONFIG_JSON:-$CONFIG_DIR/config.json}" ]]; then
+    local local_config="${LOCAL_CONFIG_JSON:-$CONFIG_DIR/config.json}" local_nodes local_clients rc=0
+    if [[ ! -f "$local_config" ]]; then
         warn "Конфигурация только этого компьютера отсутствует."
         return 2
     fi
-    candidate=$(umask 077; mktemp "$CONFIG_DIR/.vault-replace.XXXXXX") || return 1
-    if ! _config_source_local_snapshot "$candidate"; then
-        rm -f "$candidate"
-        return 1
-    fi
-    local_counts=$(_github_snapshot_counts "$candidate") || local_counts=""
+    # Review reads the device-only config as is: nothing local or remote changes before consent.
+    local_counts=$(jq -r '[(.nodes//[]|length),(.clients//[]|length),(.groups//[]|length)]|@tsv' \
+        "$local_config" 2>/dev/null) || local_counts=""
     if [[ "$mode" == recovery ]]; then
         github_counts="${GITHUB_LAST_SNAPSHOT_COUNTS:-}"
     else
@@ -570,9 +563,11 @@ github_replace_with_local_action() {
     IFS=$'\t' read -r local_nodes local_clients _ <<< "$local_counts"
     [[ "${local_nodes:-0}" == 0 && "${local_clients:-0}" == 0 ]] &&
         warn "Локальная конфигурация пуста."
-    if ! confirm_yn "Заменить конфигурацию GitHub?" N; then
+    confirm_yn "Заменить конфигурацию GitHub?" N || return 2
+    candidate=$(umask 077; mktemp "$CONFIG_DIR/.vault-replace.XXXXXX") || return 1
+    if ! _config_source_local_snapshot "$candidate"; then
         rm -f "$candidate"
-        return 2
+        return 1
     fi
     _config_source_publish_logical "$candidate" || rc=$?
     [[ $rc -eq 0 ]] || rm -f "$candidate"

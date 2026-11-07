@@ -42,19 +42,29 @@ EOF
     [[ $(cat "$CONFIG_JSON") == "$first" && $(cat "$SECRETS_JSON") == "$second" ]]
 }
 
-@test "newer local config format is rejected without changes" {
-    local before
-    printf '{"schema_version":3,"nodes":[],"groups":[],"clients":[],"connections":[]}\n' > "$CONFIG_JSON"
-    before=$(cat "$CONFIG_JSON")
-    run state_format_migrate
-    assert_failure
-    [[ $(cat "$CONFIG_JSON") == "$before" ]]
+@test "state_format_migrate rejects unsupported configs without changes" {
+    local before content
+    for content in \
+        '{"schema_version":3,"nodes":[],"groups":[],"clients":[],"connections":[]}' \
+        '{"schema_version":0,"nodes":[],"groups":[],"clients":[],"connections":[]}' \
+        '{"schema_version":"2.0","nodes":[],"groups":[],"clients":[],"connections":[]}' \
+        '{"schema_version":2,"nodes":[{"name":"pw","pass":"inline"}],"groups":[],"clients":[],"connections":[]}' \
+        '{"schema_version":2,'; do
+        printf '%s\n' "$content" > "$CONFIG_JSON"
+        before=$(cat "$CONFIG_JSON")
+        run state_format_migrate
+        assert_failure
+        [[ $(cat "$CONFIG_JSON") == "$before" ]] || return 1
+    done
 }
 
 @test "migration chain stops on a missing step and runs steps in order" {
-    run format_migrate_chain state 1 3
-    assert_failure
     local log="$BATS_TEST_TMPDIR/steps"
+    _migrate_gap_1_to_2() { printf '1>2\n' >> "$log"; }
+    run format_migrate_chain gap 1 3
+    assert_failure
+    [[ "$(cat "$log")" == '1>2' ]] || return 1
+    rm -f "$log"
     _migrate_probe_1_to_2() { printf '1>2 %s\n' "$1" >> "$log"; }
     _migrate_probe_2_to_3() { printf '2>3 %s\n' "$1" >> "$log"; }
     format_migrate_chain probe 1 3 arg

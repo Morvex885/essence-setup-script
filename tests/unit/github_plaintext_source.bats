@@ -2108,11 +2108,13 @@ _portable_use_device_a() {
     _portable_prepare_two_devices || return 1
     _portable_publish_v1 || return 1
     _portable_use_device_a
-    local input
-    for input in $'1\nn\n0\n' $'1\n\n0\n' $'2\n\n0\n' $'0\n' ''; do
+    local input root="$HOME/.config/remote-control-essence" local_before
+    local_before="$(_hash_file "$root/config.json") $(_hash_file "$root/manifest.json") $(_hash_file "$root/secrets.json") $(_hash_file "$root/ssh/known_hosts")"
+    for input in $'1\nn\n0\n' $'1\n\n0\n' $'2\n\n0\n' $'2\nn\n0\n' $'0\n' ''; do
         run bash -c 'printf "%s" "$1" | "$0"' "$APP/remote-control-essence.sh" "$input"
         assert_failure
         [[ "$(git --git-dir="$REMOTE" rev-parse main)" == "$PORTABLE_V1_COMMIT" ]] || return 1
+        [[ "$(_hash_file "$root/config.json") $(_hash_file "$root/manifest.json") $(_hash_file "$root/secrets.json") $(_hash_file "$root/ssh/known_hosts")" == "$local_before" ]] || return 1
     done
     local updater="$BATS_TEST_TMPDIR/v1-updater"
     jq '.minimum_remote_control_version="9.9.9"' "$updater/manifest.json" > "$updater/manifest.next" &&
