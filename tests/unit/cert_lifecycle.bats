@@ -82,17 +82,22 @@ case "$1" in
         ;;
     delete)
         shift
-        grep -qxF "ufw $*" "$rules" || exit 1
+        found=false
         while IFS= read -r line; do
-            [[ "$line" == "ufw $*" ]] && continue
+            # A ufw comment is not part of the rule identity.
+            if [[ "${line% comment *}" == "ufw $*" ]]; then found=true; continue; fi
             [[ "$*" == 'allow 80/tcp' && "$line" == "$V6_80_RULE" ]] && continue
             printf '%s\n' "$line" >> "$tmp"
         done < "$rules"
+        [[ "$found" == true ]] || exit 1
         ;;
     allow|deny|reject|limit)
+        # Same rule without a new comment: real ufw skips it and keeps the comment.
+        if grep -q "^ufw $* comment " "$rules"; then rm -f "$tmp"; exit 0; fi
         spec="${*:2}"
         while IFS= read -r line; do
-            [[ "$line" =~ ^ufw\ (allow|deny|reject|limit)\ (.*)$ && "${BASH_REMATCH[2]}" == "$spec" ]] && continue
+            line_rule="${line% comment *}"
+            [[ "$line_rule" =~ ^ufw\ (allow|deny|reject|limit)\ (.*)$ && "${BASH_REMATCH[2]}" == "$spec" ]] && continue
             printf '%s\n' "$line" >> "$tmp"
         done < "$rules"
         printf 'ufw %s\n' "$*" >> "$tmp"
@@ -114,7 +119,7 @@ run_http01_hooks() {
 
 @test "renewal hooks remove only the temporary TCP/80 rule and keep original rules" {
     local original
-    for original in '' 'ufw allow 80/tcp' 'ufw deny 80/tcp' \
+    for original in '' 'ufw allow 80/tcp' "ufw allow 80/tcp comment 'web'" 'ufw deny 80/tcp' \
         'ufw allow from 192.168.0.0/24 to any port 80 proto tcp' "$V6_80_RULE"; do
         use_stateful_ufw "$original"
         : > "$CERT_TEST_SERVICE_LOG"

@@ -110,7 +110,7 @@ listener" ]
         if [[ "$scenario" == listenerless ]]; then
             [ "$(grep -c "^systemctl:restart $TPROXY_UNIT_MTPROXY$" "$events")" -eq 1 ]
         else
-            ! grep -q '^systemctl:restart' "$events"
+            ! grep -q '^systemctl:restart' "$events" || return 1
         fi
     done
 }
@@ -123,7 +123,7 @@ listener" ]
     _telegram_proxy_render_mtproxy_unit "$source_dir/deploy/mtproxy.service" "$BATS_TEST_TMPDIR/canonical"
     cmp -s "$BATS_TEST_TMPDIR/canonical" "$TPROXY_SYSTEMD_DIR/$TPROXY_UNIT_MTPROXY"
     cmp -s "$BATS_TEST_TMPDIR/old-env" "$TPROXY_ENV_FILE"
-    ! grep -q '^native$' "$events"
+    ! grep -q '^native$' "$events" || return 1
     [ "$(grep -c "^systemctl:restart $TPROXY_UNIT_MTPROXY$" "$events")" -eq 1 ]
     [ "$TPROXY_ROLLBACK_MTPROXY_CHANGED" = true ]
 }
@@ -185,7 +185,7 @@ web_install_harness() {
         telegram_proxy_web_install --force <<< 'web.example.com' && rc=0 || rc=$?
         [ "$rc" -eq 1 ]
         [[ "$(cat "$events")" == *$'listener\ndecoy\nrollback' ]]
-        ! grep -Eq '^(build|cert|state)$' "$events"
+        ! grep -Eq '^(build|cert|state)$' "$events" || return 1
     done
 }
 
@@ -197,7 +197,7 @@ web_install_harness() {
     [ "$rc" -eq 1 ]
     [[ "$(cat "$events")" == *$'listener\nwarn\nrollback' ]]
     [ "$(grep -c '^rollback$' "$events")" -eq 1 ]
-    ! grep -Eq '^(decoy|build|cert|state)$' "$events"
+    ! grep -Eq '^(decoy|build|cert|state)$' "$events" || return 1
     [ ! -e "$TPROXY_CONF" ]
 }
 
@@ -352,7 +352,7 @@ listener"
         _telegram_proxy_component_enabled "$second"
         [ -f "$TPROXY_ENV_FILE" ]
         [ -f "$TPROXY_SYSTEMD_DIR/$TPROXY_UNIT_MTPROXY" ]
-        ! grep -Eq '^systemctl:(stop|disable).*mtproxy' "$events"
+        ! grep -Eq '^systemctl:(stop|disable).*mtproxy' "$events" || return 1
         if [[ "$second" == web ]]; then
             telegram_proxy_web_remove --force
         else
@@ -543,7 +543,7 @@ mtproto_install_fixture() {
             [ "$(grep -c '^review$' "$events")" -eq 1 ]
         else
             [[ "$output" != *"$secret"* ]]
-            ! grep -Eq '^(confirm|review)$' "$events"
+            ! grep -Eq '^(confirm|review)$' "$events" || return 1
         fi
     done
 }

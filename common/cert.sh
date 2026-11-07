@@ -150,14 +150,15 @@ ensure_acme_installed() {
 # every renewal; ensure_cert runs the same hooks around its own orders.
 # The pre-hook saves `ufw show added` once (a snapshot left by an interrupted
 # run predates the port it opened) and adds the temporary `allow 80/tcp`.
-# The post-hook deletes that rule unless it existed before, then re-adds saved
+# The post-hook deletes that rule unless it existed before (with or without a
+# ufw comment; the comment is not part of the rule), then re-adds saved
 # TCP/80 rules the temporary rule replaced (deny, IPv6-only or subnet rules
 # stay as they were). Saved lines are never evaluated: only lines matching
 # CERT_HTTP01_RULE_RE are passed to ufw as plain words. No snapshot: no change.
 CERT_HTTP01_STATE_FILE=.essence-http01-80.state
 CERT_HTTP01_RULE_RE='ufw (allow|deny|reject|limit)( (in|out))?( [A-Za-z0-9./:_-]+)+'
 CERT_HTTP01_PRE_HOOK="{ [ -e $CERT_HTTP01_STATE_FILE ] || { ufw show added > $CERT_HTTP01_STATE_FILE.tmp && mv $CERT_HTTP01_STATE_FILE.tmp $CERT_HTTP01_STATE_FILE; }; } && ufw allow 80/tcp"
-CERT_HTTP01_POST_HOOK="if [ -e $CERT_HTTP01_STATE_FILE ]; then { grep -qx \"ufw allow 80/tcp\" $CERT_HTTP01_STATE_FILE || ufw delete allow 80/tcp; } && ufw show added > $CERT_HTTP01_STATE_FILE.now && grep \"^ufw \" $CERT_HTTP01_STATE_FILE | grep -w 80 | while read -r r; do grep -qxF -- \"\$r\" $CERT_HTTP01_STATE_FILE.now && continue; if printf \"%s\\\\n\" \"\$r\" | grep -Eqx \"$CERT_HTTP01_RULE_RE\"; then ufw \${r#ufw } || exit 1; else echo \"essence: UFW rule skipped: \$r\" >&2; fi; done && rm -f $CERT_HTTP01_STATE_FILE $CERT_HTTP01_STATE_FILE.now; fi && systemctl reload nginx"
+CERT_HTTP01_POST_HOOK="if [ -e $CERT_HTTP01_STATE_FILE ]; then { grep -Eqx \"ufw allow 80/tcp( comment .*)?\" $CERT_HTTP01_STATE_FILE || ufw delete allow 80/tcp; } && ufw show added > $CERT_HTTP01_STATE_FILE.now && grep \"^ufw \" $CERT_HTTP01_STATE_FILE | grep -w 80 | while read -r r; do grep -qxF -- \"\$r\" $CERT_HTTP01_STATE_FILE.now && continue; if printf \"%s\\\\n\" \"\$r\" | grep -Eqx \"$CERT_HTTP01_RULE_RE\"; then ufw \${r#ufw } || exit 1; else echo \"essence: UFW rule skipped: \$r\" >&2; fi; done && rm -f $CERT_HTTP01_STATE_FILE $CERT_HTTP01_STATE_FILE.now; fi && systemctl reload nginx"
 
 # Runs an HTTP-01 hook for the order family directory, as acme.sh does.
 _cert_http01_hook() {

@@ -94,9 +94,21 @@ _uninstall_prepare_targets() {
         [[ -z "$reality_site" ]] || _cert_identity_valid "$reality_site" || return 1
     fi
     if [[ -z "$reality_site" ]]; then
-        reality_site=$(grep -r --exclude='essence-acme-*' 'server_name' /etc/nginx/sites-available/ 2>/dev/null \
-            | grep -v '#' | awk '{print $2}' | tr -d ';' | head -1)
-        [[ -z "$reality_site" ]] || _cert_identity_valid "$reality_site" || return 1
+        # Без reality.conf ищем только сайт, созданный Essence: имя файла совпадает
+        # с server_name, а сертификат лежит в /etc/nginx/ssl/<имя>/.
+        local site_file site_name
+        for site_file in /etc/nginx/sites-available/*; do
+            [[ -f "$site_file" ]] || continue
+            site_name="${site_file##*/}"
+            [[ "$site_name" != essence-acme-* ]] || continue
+            _cert_identity_valid "$site_name" || continue
+            awk -v name="$site_name;" -v cert="/etc/nginx/ssl/$site_name/fullchain.pem;" '
+                $1 == "server_name" && $2 == name && NF == 2 { s = 1 }
+                $1 == "ssl_certificate" && $2 == cert { c = 1 }
+                END { exit !(s && c) }' "$site_file" 2>/dev/null || continue
+            reality_site="$site_name"
+            break
+        done
     fi
     UNINSTALL_REALITY_SITE="$reality_site"
 
