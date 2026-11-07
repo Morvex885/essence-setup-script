@@ -2117,6 +2117,10 @@ _portable_use_device_a() {
     for input in $'1\nn\n0\n' $'1\n\n0\n' $'2\n\n0\n' $'2\nn\n0\n' $'0\n' ''; do
         run bash -c 'printf "%s" "$1" | "$0"' "$APP/remote-control-essence.sh" "$input"
         assert_failure
+        case "$input" in
+            1*) assert_output --partial "Преобразование конфигурации GitHub" ;;
+            2*) assert_output --partial "Замена конфигурации GitHub" ;;
+        esac
         [[ "$(git --git-dir="$REMOTE" rev-parse main)" == "$PORTABLE_V1_COMMIT" ]] || return 1
         [[ "$(_hash_file "$root/config.json") $(_hash_file "$root/manifest.json") $(_hash_file "$root/secrets.json") $(_hash_file "$root/ssh/known_hosts")" == "$local_before" ]] || return 1
     done
