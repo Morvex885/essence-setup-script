@@ -93,8 +93,62 @@ EOF
     }
 
     run _generate_group PC
-    assert_success
+    assert_failure
     assert_output --partial "my-pc — config.yaml не сгенерирован"
+    refute_output --partial "my-pc — сгенерирован"
+    run cmp -s "$config_file" <(printf 'existing config\n')
+    assert_success
+}
+
+@test "generate_group: AWG peer creation failure preserves configs that need AWG" {
+    # Вернуть настоящий _ensure_all_awg_peers вместо заглушки из setup
+    source "$PROJECT_ROOT/remote-control/modules/generate.sh"
+    _reset_node_cache
+    jq_w '(.connections[] | select(.node=="de-vps") | .groups[] | select(.name=="PC") | .proxies) += ["AWG"]
+        | (.clients[] | select(.name=="my-pc") | .connections[0].proxies) += ["AWG"]'
+    node_load_by_name() { return 0; }
+    ensure_remote_scripts_current() { return 0; }
+    ssh_run() {
+        case "$*" in
+            *awg0.conf*) printf 'AWG_OK\n' ;;
+            *add_awg_peer_auto*) return 1 ;;
+            *) load_fixture_client_config ;;
+        esac
+    }
+    local config_file="$GENERATED_DIR/PC/my-pc/config.yaml"
+    mkdir -p "$(dirname "$config_file")"
+    printf 'existing config\n' > "$config_file"
+
+    run _generate_group PC
+    assert_failure
+    assert_output --partial "Ошибка при создании клиентов AmneziaWG на de-vps"
+    assert_output --partial "my-pc — не удалось получить все подключения; конфиг сохранён без изменений"
+    refute_output --partial "my-pc — сгенерирован"
+    run cmp -s "$config_file" <(printf 'existing config\n')
+    assert_success
+}
+
+@test "generate_group: AWG peer failure with an empty node response preserves the config" {
+    source "$PROJECT_ROOT/remote-control/modules/generate.sh"
+    _reset_node_cache
+    jq_w '(.connections[] | select(.node=="de-vps") | .groups[] | select(.name=="PC") | .proxies) += ["AWG"]
+        | (.clients[] | select(.name=="my-pc") | .connections[0].proxies) += ["AWG"]'
+    node_load_by_name() { return 0; }
+    ensure_remote_scripts_current() { return 0; }
+    ssh_run() {
+        case "$*" in
+            *awg0.conf*) printf 'AWG_OK\n' ;;
+            *add_awg_peer_auto*) return 1 ;;
+            *) : ;;
+        esac
+    }
+    local config_file="$GENERATED_DIR/PC/my-pc/config.yaml"
+    mkdir -p "$(dirname "$config_file")"
+    printf 'existing config\n' > "$config_file"
+
+    run _generate_group PC
+    assert_failure
+    assert_output --partial "my-pc: клиент AmneziaWG на de-vps не создан"
     refute_output --partial "my-pc — сгенерирован"
     run cmp -s "$config_file" <(printf 'existing config\n')
     assert_success
@@ -207,7 +261,7 @@ EOF
         NODE_NAME="$1"
         return 0
     }
-    upload_scripts() {
+    ensure_remote_scripts_current() {
         printf 'upload\n' >> "$LISTENER_UPLOAD_LOG"
         return 0
     }

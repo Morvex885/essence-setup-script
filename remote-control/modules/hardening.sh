@@ -33,12 +33,13 @@ _portable_onboarding_choice() {
         box_top
         box_center "Подключение не выполнено"
         box_mid
-        box_line " 1) Повторить подключение" " ${GREEN}1)${NC} Повторить подключение"
-        box_line " 2) Продолжить — настроить ноды позже" " ${YELLOW}2)${NC} Продолжить — настроить ноды позже"
-        box_line " 3) Отменить и откатить изменения" " ${RED}3)${NC} Отменить и откатить изменения"
+        menu_item 1 "Повторить подключение" CYAN
+        menu_item 2 "Продолжить — настроить ноды позже" YELLOW
+        menu_item 3 "Отменить и откатить изменения" RED
         box_bot
         echo ""
-        read -rp "  Выберите действие: " choice
+        IFS= read -rp "  Выберите действие: " choice || return 2
+        choice="${choice%$'\r'}"
         case "$choice" in
             1) return 0 ;;
             2) return 1 ;;
@@ -48,12 +49,48 @@ _portable_onboarding_choice() {
     done
 }
 
+_onboarding_restore_backups() {
+    local known_existed="$1" known_backup="$2" manifest_backup="$3" restore_ok=true
+    if [[ "$known_existed" == true ]]; then
+        [[ -f "$known_backup" ]] && cp "$known_backup" "$SSH_KNOWN_HOSTS" || restore_ok=false
+    else
+        rm -f "$SSH_KNOWN_HOSTS" || restore_ok=false
+    fi
+    if [[ -n "$manifest_backup" ]]; then
+        [[ -f "$manifest_backup" ]] && cp "$manifest_backup" "$STATE_MANIFEST" || restore_ok=false
+    else
+        rm -f "$STATE_MANIFEST" || restore_ok=false
+    fi
+    if [[ "$restore_ok" == true ]]; then
+        rm -f "$known_backup" "$manifest_backup"
+    else
+        warn "Не удалось восстановить SSH-настройку. Резервные копии оставлены: $known_backup $manifest_backup"
+        return 1
+    fi
+}
+
+# Revokes keys installed during onboarding, then restores known_hosts and the
+# manifest. A key whose revocation failed keeps its .pub for manual cleanup.
+_onboarding_rollback() {
+    local known_existed="$1" known_backup="$2" manifest_backup="$3" id node_name
+    shift 3
+    for id in "$@"; do
+        node_name=$(jq_r --arg id "$id" '.nodes[] | select(.id==$id) | .name')
+        if [[ -n "$node_name" ]] && node_load_by_name "$node_name" &&
+           _revoke_managed_remote_key "$id"; then
+            rm -f "$SSH_IDENTITIES_DIR/$id" "$SSH_IDENTITIES_DIR/$id.pub"
+        else
+            rm -f "$SSH_IDENTITIES_DIR/$id"
+            warn "Не удалось отозвать переносимый SSH-ключ ноды «${node_name:-$id}». Удалите его из authorized_keys вручную: $SSH_IDENTITIES_DIR/$id.pub"
+        fi
+    done
+    _onboarding_restore_backups "$known_existed" "$known_backup" "$manifest_backup" || true
+}
+
 _github_initial_portable_onboarding() {
     [[ "${CONFIG_SOURCE:-local}" == "github" ]] || return 0
-    local known_backup="" known_existed=false manifest_backup="" id name choice
-    local provision_keys=false
-    local -a key_ids=() installed_ids=()
-    local -a node_rows=()
+    local known_backup="" known_existed=false manifest_backup=""
+    local -a installed_ids=()
     if [[ -f "${SSH_KNOWN_HOSTS:-}" ]]; then
         known_existed=true
         known_backup=$(umask 077; mktemp "${CONFIG_DIR:-/tmp}/.known-hosts.XXXXXX") || return 1
@@ -69,6 +106,19 @@ _github_initial_portable_onboarding() {
             return 1
         }
     fi
+    # Every failure or cancellation after the backups exist goes through the
+    # same rollback; the steps append to installed_ids in this scope.
+    if ! _github_portable_onboarding_steps; then
+        _onboarding_rollback "$known_existed" "$known_backup" "$manifest_backup" "${installed_ids[@]}"
+        return 1
+    fi
+    rm -f "$known_backup" "$manifest_backup"
+    return 0
+}
+
+_github_portable_onboarding_steps() {
+    local id name choice provision_keys=false
+    local -a key_ids=() node_rows=()
     while IFS=$'\t' read -r id name; do
         [[ -n "$id" ]] && node_rows+=("$id"$'\t'"$name")
         if [[ -n "$id" ]] && [[ "$(jq_r --arg id "$id" '.nodes[] | select(.id==$id) | (.auth=="key" and ((.identity // "system")=="system"))')" == true ]]; then
@@ -114,15 +164,6 @@ _github_initial_portable_onboarding() {
                     state_portability_add_issue "$id" missing_identity || return 1
                     break
                 else
-                    for name in "${installed_ids[@]}"; do
-                        node_load_by_name "$(jq_r --arg id "$name" '.nodes[] | select(.id==$id) | .name')" || continue
-                        _revoke_managed_remote_key "$name" ||
-                            warn "Не удалось отозвать переносимый SSH-ключ ноды «${NODE_NAME:-$name}»."
-                        rm -f "$SSH_IDENTITIES_DIR/$name" "$SSH_IDENTITIES_DIR/$name.pub"
-                    done
-                    if [[ "$known_existed" == true ]]; then cp "$known_backup" "$SSH_KNOWN_HOSTS"; else rm -f "$SSH_KNOWN_HOSTS"; fi
-                    [[ -f "$manifest_backup" ]] && cp "$manifest_backup" "$STATE_MANIFEST"
-                    rm -f "$known_backup" "$manifest_backup"
                     return 1
                 fi
             done
@@ -131,7 +172,23 @@ _github_initial_portable_onboarding() {
     for name in "${node_rows[@]}"; do
         id="${name%%$'\t'*}"
         name="${name#*$'\t'}"
-        node_load_by_name "$name" || return 1
+        local load_rc=0
+        node_load_by_name "$name" || load_rc=$?
+        if [[ $load_rc -eq 2 ]]; then
+            state_portability_add_issue "$id" missing_secret || return 1
+            if (
+                SERVER_IP=$(jq_r --arg id "$id" '.nodes[] | select(.id==$id) | .ip') || exit 1
+                SERVER_PORT=$(jq_r --arg id "$id" '.nodes[] | select(.id==$id) | .port') || exit 1
+                _ssh_known_host_present
+            ); then
+                state_portability_remove_issue "$id" missing_host_key || return 1
+            else
+                state_portability_add_issue "$id" missing_host_key || return 1
+            fi
+            continue
+        elif [[ $load_rc -ne 0 ]]; then
+            return 1
+        fi
         if [[ "$id" == "" ]]; then continue; fi
         NODE_ID="$id"
         if [[ ${#installed_ids[@]} -gt 0 ]] && [[ " ${installed_ids[*]} " == *" $id "* ]]; then NODE_IDENTITY="$id"; fi
@@ -149,7 +206,7 @@ _github_initial_portable_onboarding() {
                 state_portability_remove_issue "$id" missing_host_key || return 1
                 break
             fi
-            warn "Не удалось закрепить ключ сервера ноды '${NODE_NAME}'."
+            warn "Не удалось закрепить SSH-ключ ноды '${NODE_NAME}'."
             _portable_onboarding_choice
             choice=$?
             if [[ $choice -eq 0 ]]; then continue
@@ -157,44 +214,22 @@ _github_initial_portable_onboarding() {
                 state_portability_add_issue "$id" missing_host_key || return 1
                 break
             else
-                if [[ "$known_existed" == true ]]; then cp "$known_backup" "$SSH_KNOWN_HOSTS"; else rm -f "$SSH_KNOWN_HOSTS"; fi
-                [[ -f "$manifest_backup" ]] && cp "$manifest_backup" "$STATE_MANIFEST"
-                rm -f "$known_backup" "$manifest_backup"
-                for name in "${installed_ids[@]}"; do
-                    node_load_by_name "$(jq_r --arg id "$name" '.nodes[] | select(.id==$id) | .name')" || continue
-                    _revoke_managed_remote_key "$name" ||
-                        warn "Не удалось отозвать переносимый SSH-ключ ноды «${NODE_NAME:-$name}»."
-                    rm -f "$SSH_IDENTITIES_DIR/$name" "$SSH_IDENTITIES_DIR/$name.pub"
-                done
                 return 1
             fi
         done
     done
     if [[ ${#installed_ids[@]} -gt 0 ]]; then
-        local ids_json previous_candidate_allow="${CONFIG_PERSIST_ALLOW_NEEDS_SETUP:-0}"
+        local ids_json
         ids_json=$(printf '%s\n' "${installed_ids[@]}" | jq -R . | jq -s .) || return 1
-        CONFIG_PERSIST_ALLOW_NEEDS_SETUP=1
-        jq_w --argjson ids "$ids_json" \
-            '.nodes |= map(.id as $id | if ($ids | index($id)) then .identity=$id else . end)'
-        local identity_write_rc=$?
-        CONFIG_PERSIST_ALLOW_NEEDS_SETUP="$previous_candidate_allow"
-        if [[ $identity_write_rc -ne 0 ]]; then
-            if [[ "$known_existed" == true ]]; then cp "$known_backup" "$SSH_KNOWN_HOSTS"; else rm -f "$SSH_KNOWN_HOSTS"; fi
-            [[ -f "$manifest_backup" ]] && cp "$manifest_backup" "$STATE_MANIFEST"
-            rm -f "$known_backup" "$manifest_backup"
-            for name in "${installed_ids[@]}"; do
-                node_load_by_name "$(jq_r --arg id "$name" '.nodes[] | select(.id==$id) | .name')" || continue
-                _revoke_managed_remote_key "$name" ||
-                    warn "Не удалось отозвать переносимый SSH-ключ ноды «${NODE_NAME:-$name}»."
-                rm -f "$SSH_IDENTITIES_DIR/$name" "$SSH_IDENTITIES_DIR/$name.pub"
-            done
-            return 1
-        fi
+        # The candidate must see issues matching its newly installed identities.
+        # The caller restores the original manifest if either step fails.
         for id in "${installed_ids[@]}"; do
             state_portability_remove_issue "$id" missing_identity || return 1
         done
+        jq_w --argjson ids "$ids_json" \
+            '.nodes |= map(.id as $id | if ($ids | index($id)) then .identity=$id else . end)' ||
+            return 1
     fi
-    rm -f "$known_backup" "$manifest_backup"
     return 0
 }
 
@@ -252,18 +287,18 @@ _provision_portable_identity() {
     SSH_ALLOW_PORTABLE_ONBOARDING="$_previous_onboarding"
 
     local verify_options=(-o ConnectTimeout=10 -o PasswordAuthentication=no
-        -o IdentitiesOnly=yes -i "$private" -p "$SERVER_PORT")
+        -o BatchMode=yes -o IdentitiesOnly=yes -i "$private" -p "$SERVER_PORT")
     if [[ "${CONFIG_SOURCE:-local}" == "github" ]]; then
         # During onboarding accept-new is scoped to this managed known_hosts;
         # normal GitHub sessions remain strict in ssh.sh.
         verify_options=(-o StrictHostKeyChecking=accept-new
             -o "UserKnownHostsFile=${SSH_KNOWN_HOSTS}"
             -o ConnectTimeout=10 -o PasswordAuthentication=no
-            -o IdentitiesOnly=yes -i "$private" -p "$SERVER_PORT")
+            -o BatchMode=yes -o IdentitiesOnly=yes -i "$private" -p "$SERVER_PORT")
     else
         verify_options=(-o StrictHostKeyChecking=accept-new
             -o ConnectTimeout=10 -o PasswordAuthentication=no
-            -o IdentitiesOnly=yes -i "$private" -p "$SERVER_PORT")
+            -o BatchMode=yes -o IdentitiesOnly=yes -i "$private" -p "$SERVER_PORT")
     fi
     info "Проверяем авторизацию по переносимому SSH-ключу..."
     if ! run_with_timeout 10 ssh "${verify_options[@]}" \
@@ -279,15 +314,15 @@ _provision_portable_identity() {
         return 1;
     }
     if ! mv "$private" "$SSH_IDENTITIES_DIR/$node_id" ||
-       ! mv "$public" "$SSH_IDENTITIES_DIR/$node_id.pub"; then
+       ! mv "$public" "$SSH_IDENTITIES_DIR/$node_id.pub" ||
+       ! chmod 600 "$SSH_IDENTITIES_DIR/$node_id" ||
+       ! chmod 644 "$SSH_IDENTITIES_DIR/$node_id.pub"; then
         [[ "$remote_installed" == true ]] && _revoke_managed_remote_key_value "$pubkey" >/dev/null 2>&1 || true
         rm -f "$SSH_IDENTITIES_DIR/$node_id" "$SSH_IDENTITIES_DIR/$node_id.pub"
         rm -rf "$tmp_dir"
         warn "Не удалось установить переносимый SSH-ключ в локальное хранилище."
         return 1
     fi
-    chmod 600 "$SSH_IDENTITIES_DIR/$node_id"
-    chmod 644 "$SSH_IDENTITIES_DIR/$node_id.pub"
     rm -rf "$tmp_dir"
 
     if [[ "${PORTABLE_IDENTITY_DEFER_CONFIG:-0}" != "1" ]] &&
@@ -300,7 +335,10 @@ _provision_portable_identity() {
     fi
     NODE_IDENTITY="$node_id"
     if [[ "${PORTABLE_IDENTITY_DEFER_CONFIG:-0}" != "1" ]]; then
-        state_checkpoint >/dev/null 2>&1 || true
+        if ! state_checkpoint; then
+            warn "SSH-ключ сохранён, но точку восстановления сохранить не удалось; дальнейшая настройка остановлена."
+            return 1
+        fi
     fi
     success "Переносимый SSH-ключ установлен"
 }
@@ -309,197 +347,219 @@ _harden_setup_key() {
     _provision_portable_identity "${NODE_ID:-}" || return 1
 }
 
+# Hardening pins the just-verified identity with IdentitiesOnly/BatchMode even
+# for local nodes, whose normal SSH sessions also allow agent/system keys.
+_harden_ssh_run() {
+    local SERVER_AUTH=key SERVER_PASS=""
+    ssh_run -i "$SSH_IDENTITIES_DIR/$NODE_IDENTITY" \
+        -o IdentitiesOnly=yes -o BatchMode=yes -o PasswordAuthentication=no -- "$@"
+}
+
 _harden_disable_password() {
     info "Отключаем вход по паролю на сервере..."
-    ssh_run -- "
-        sed -i '/^#\\?PubkeyAuthentication/d' /etc/ssh/sshd_config
-        sed -i '/^#\\?PasswordAuthentication/d' /etc/ssh/sshd_config
-        sed -i '/^#\\?ChallengeResponseAuthentication/d' /etc/ssh/sshd_config
-        echo 'PubkeyAuthentication yes' >> /etc/ssh/sshd_config
-        echo 'PasswordAuthentication no' >> /etc/ssh/sshd_config
+    _harden_ssh_run "
+        sed -i '/^#\\?PubkeyAuthentication/d' /etc/ssh/sshd_config &&
+        sed -i '/^#\\?PasswordAuthentication/d' /etc/ssh/sshd_config &&
+        sed -i '/^#\\?ChallengeResponseAuthentication/d' /etc/ssh/sshd_config &&
+        echo 'PubkeyAuthentication yes' >> /etc/ssh/sshd_config &&
+        echo 'PasswordAuthentication no' >> /etc/ssh/sshd_config &&
         echo 'ChallengeResponseAuthentication no' >> /etc/ssh/sshd_config
     " || { warn "Не удалось изменить sshd_config."; return 1; }
     success "Вход по паролю отключён (ожидает перезапуска SSH-сервиса)"
 }
 
 _harden_restore_password() {
-    ssh_run -- "
-        sed -i '/^PasswordAuthentication/d' /etc/ssh/sshd_config
-        sed -i '/^ChallengeResponseAuthentication/d' /etc/ssh/sshd_config
-        echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config
+    _harden_ssh_run "
+        sed -i '/^PasswordAuthentication/d' /etc/ssh/sshd_config &&
+        sed -i '/^ChallengeResponseAuthentication/d' /etc/ssh/sshd_config &&
+        echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config &&
+        sshd -t &&
+        (systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || service sshd restart 2>/dev/null)
     " 2>/dev/null
+}
+
+_harden_select_port() {
+    HARDEN_NEW_PORT=""
+    local new_port="" attempts=0 occupied custom_port
+    while (( attempts < 5 )); do
+        new_port=$(( RANDOM % 16384 + 49152 ))
+        occupied=$(ssh_run -- "ss -tlnp > /dev/null || exit 1; if ss -tlnp | grep -q ':${new_port}\b'; then echo occupied; else echo free; fi" 2>/dev/null) || {
+            warn "Не удалось проверить занятость SSH-порта на ноде."
+            return 1
+        }
+        occupied="${occupied%$'\r'}"
+        [[ "$occupied" == free ]] && break
+        [[ "$occupied" == occupied ]] || return 1
+        new_port=""
+        attempts=$((attempts + 1))
+    done
+    [[ -n "$new_port" ]] || { warn "Не удалось найти свободный порт."; return 1; }
+    IFS= read -rp "  SSH-порт [Enter = $new_port]: " custom_port || return 1
+    custom_port="${custom_port%$'\r'}"
+    if [[ -n "$custom_port" ]]; then
+        [[ "$custom_port" =~ ^[1-9][0-9]{0,4}$ ]] && (( custom_port <= 65535 )) || {
+            warn "Порт должен быть числом от 1 до 65535."
+            return 1
+        }
+        new_port="$custom_port"
+        occupied=$(ssh_run -- "ss -tlnp > /dev/null || exit 1; if ss -tlnp | grep -q ':${new_port}\b'; then echo occupied; else echo free; fi" 2>/dev/null) || {
+            warn "Не удалось проверить занятость SSH-порта на ноде."
+            return 1
+        }
+        [[ "${occupied%$'\r'}" == free ]] || { warn "Порт ${new_port} занят или его состояние неизвестно."; return 1; }
+    fi
+    HARDEN_NEW_PORT="$new_port"
+}
+
+_harden_rollback_port() {
+    local old_port="$1" new_port="$2" rollback_ok=false
+    local rollback_cmd="
+        sed -i '/^Port /d' /etc/ssh/sshd_config &&
+        echo 'Port ${old_port}' >> /etc/ssh/sshd_config || exit 1
+        if command -v ufw >/dev/null 2>&1; then
+            ufw allow ${old_port}/tcp >/dev/null 2>&1 &&
+            ufw delete allow ${new_port}/tcp >/dev/null 2>&1 || exit 1
+        fi
+        if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+            firewall-cmd --permanent --add-port=${old_port}/tcp >/dev/null 2>&1 &&
+            firewall-cmd --permanent --remove-port=${new_port}/tcp >/dev/null 2>&1 &&
+            firewall-cmd --reload >/dev/null 2>&1 || exit 1
+        fi
+        sshd -t &&
+        systemctl daemon-reload &&
+        (systemctl restart ssh.socket 2>/dev/null || systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null)
+    "
+    SERVER_PORT="$old_port"
+    if _harden_ssh_run "$rollback_cmd" 2>/dev/null; then
+        rollback_ok=true
+    else
+        SERVER_PORT="$new_port"
+        _harden_ssh_run "$rollback_cmd" 2>/dev/null && rollback_ok=true
+    fi
+    SERVER_PORT="$old_port"
+    local verify
+    if [[ "$rollback_ok" == true ]] &&
+       verify=$(_harden_ssh_run "echo ok" 2>/dev/null) &&
+       [[ "${verify%$'\r'}" == ok ]]; then
+        warn "SSH-порт возвращён на $old_port. Усиление защиты SSH прервано."
+        return 0
+    fi
+    warn "Не удалось подтвердить возврат SSH-порта. Проверьте порты $old_port и $new_port через консоль провайдера."
+    return 1
+}
+
+# GitHub sessions check host keys strictly against the managed known_hosts and
+# portable state requires an entry for the node's own port. Re-use only entries
+# already present for the current port, keeping @cert-authority/@revoked markers,
+# so verification stays strict.
+_harden_trust_new_port() {
+    local old_port="$1" new_port="$2" old_host="$SERVER_IP" new_host="$SERVER_IP" entries
+    [[ "$old_port" != 22 ]] && old_host="[$SERVER_IP]:$old_port"
+    [[ "$new_port" != 22 ]] && new_host="[$SERVER_IP]:$new_port"
+    [[ -n "${SSH_KNOWN_HOSTS:-}" && -f "$SSH_KNOWN_HOSTS" ]] || return 1
+    ssh-keygen -F "$new_host" -f "$SSH_KNOWN_HOSTS" >/dev/null 2>&1 && return 0
+    entries=$(ssh-keygen -F "$old_host" -f "$SSH_KNOWN_HOSTS" 2>/dev/null |
+        awk -v host="$new_host" '/^#/ { next }
+            $1 ~ /^@/ { if (NF >= 4) print $1, host, $3, $4; next }
+            NF >= 3 { print host, $2, $3 }')
+    [[ -n "$entries" ]] || return 1
+    printf '%s\n' "$entries" >> "$SSH_KNOWN_HOSTS"
+}
+
+_harden_restore_known_hosts() {
+    local backup="$1"
+    [[ -n "$backup" ]] || return 0
+    cat "$backup" > "$SSH_KNOWN_HOSTS" ||
+        warn "Не удалось вернуть прежний список ключей серверов: $SSH_KNOWN_HOSTS"
+    rm -f "$backup"
 }
 
 _harden_change_port() {
-    local old_port="$SERVER_PORT"
-    local new_port=""
-
-    # Генерируем случайный порт
-    local attempts=0
-    while (( attempts < 5 )); do
-        new_port=$(( RANDOM % 16384 + 49152 ))
-        # Проверяем что порт свободен
-        if ! ssh_run -- "ss -tlnp | grep -q ':${new_port}\b'" 2>/dev/null; then
-            break
-        fi
-        attempts=$((attempts + 1))
-        new_port=""
-    done
-    [[ -z "$new_port" ]] && { warn "Не удалось найти свободный порт."; return 1; }
-
-    echo ""
-    echo -e "  Предлагаемый порт: ${GREEN}${new_port}${NC}"
-    read -rp "  Принять (Enter) или ввести свой [${new_port}]: " _custom_port
-    if [[ -n "$_custom_port" ]]; then
-        if ! [[ "$_custom_port" =~ ^[0-9]+$ ]] || (( _custom_port < 1 || _custom_port > 65535 )); then
-            warn "Порт должен быть числом от 1 до 65535."
+    local old_port="$SERVER_PORT" new_port="$1" known_backup=""
+    if [[ "${CONFIG_SOURCE:-local}" == github ]]; then
+        if ! known_backup=$(mktemp) || ! cp "$SSH_KNOWN_HOSTS" "$known_backup"; then
+            rm -f "$known_backup"
+            warn "Не удалось сохранить копию списка ключей серверов."
             return 1
         fi
-        new_port="$_custom_port"
-        # Проверяем что кастомный порт свободен
-        if ssh_run -- "ss -tlnp | grep -q ':${new_port}\b'" 2>/dev/null; then
-            warn "Порт ${new_port} уже занят на сервере."
+        if ! _harden_trust_new_port "$old_port" "$new_port"; then
+            _harden_restore_known_hosts "$known_backup"
+            warn "Не удалось подготовить ключ сервера для нового SSH-порта."
             return 1
         fi
     fi
-
     info "Меняем SSH-порт на ${new_port}..."
-    ssh_run -- "
-        sed -i '/^#\\?Port /d' /etc/ssh/sshd_config
-        echo 'Port ${new_port}' >> /etc/ssh/sshd_config
-    " || { warn "Не удалось изменить порт в sshd_config."; return 1; }
-
-    # Открываем новый порт и удаляем старый из firewall
-    ssh_run -- "
-        if command -v ufw &>/dev/null; then
-            ufw allow ${new_port}/tcp > /dev/null 2>&1
-            ufw delete allow OpenSSH > /dev/null 2>&1
-            ufw delete allow 22/tcp > /dev/null 2>&1
-            ufw delete allow ${old_port}/tcp > /dev/null 2>&1
+    if ! _harden_ssh_run "
+        sed -i '/^#\\?Port /d' /etc/ssh/sshd_config &&
+        echo 'Port ${new_port}' >> /etc/ssh/sshd_config || exit 1
+        if command -v ufw >/dev/null 2>&1; then
+            ufw allow ${new_port}/tcp >/dev/null 2>&1 &&
+            ufw delete allow OpenSSH >/dev/null 2>&1 &&
+            ufw delete allow 22/tcp >/dev/null 2>&1 &&
+            ufw delete allow ${old_port}/tcp >/dev/null 2>&1 || exit 1
         fi
-        if command -v firewall-cmd &>/dev/null; then
-            firewall-cmd --permanent --add-port=${new_port}/tcp > /dev/null 2>&1
-            firewall-cmd --permanent --remove-service=ssh > /dev/null 2>&1
-            firewall-cmd --permanent --remove-port=${old_port}/tcp > /dev/null 2>&1
-            firewall-cmd --reload > /dev/null 2>&1
+        if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+            firewall-cmd --permanent --add-port=${new_port}/tcp >/dev/null 2>&1 &&
+            firewall-cmd --permanent --remove-service=ssh >/dev/null 2>&1 &&
+            firewall-cmd --permanent --remove-port=${old_port}/tcp >/dev/null 2>&1 &&
+            firewall-cmd --reload >/dev/null 2>&1 || exit 1
         fi
-    " 2>/dev/null
-
-    # Проверяем конфиг перед рестартом
-    local _sshd_check
-    if ! _sshd_check=$(ssh_run -- "sshd -t 2>&1"); then
-        warn "Ошибка в sshd_config:"
-        echo "$_sshd_check" | head -5
-        warn "Откатываем порт..."
-        ssh_run -- "
-            sed -i '/^Port /d' /etc/ssh/sshd_config
-            echo 'Port ${old_port}' >> /etc/ssh/sshd_config
-            if command -v ufw &>/dev/null; then
-                ufw allow ${old_port}/tcp > /dev/null 2>&1
-                ufw delete allow ${new_port}/tcp > /dev/null 2>&1
-            fi
-        "
+        sshd -t &&
+        systemctl daemon-reload &&
+        (systemctl restart ssh.socket 2>/dev/null || systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || service sshd restart 2>/dev/null)
+    "; then
+        warn "Не удалось применить новый SSH-порт."
+        _harden_rollback_port "$old_port" "$new_port" || true
+        _harden_restore_known_hosts "$known_backup"
         return 1
     fi
-
-    # Перезапускаем sshd (daemon-reload запускает generator, обновляет ssh.socket из sshd_config)
-    info "Перезапускаем SSH-сервис..."
-    ssh_run -- "
-        systemctl daemon-reload 2>/dev/null
-        systemctl restart ssh.socket 2>/dev/null || systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || service sshd restart 2>/dev/null
-    " || { warn "Не удалось перезапустить SSH-сервис."; return 1; }
-
-    # Ждём пока sshd перезапустится
     sleep 3
-
-    # Проверяем подключение по новому порту явным managed ключом.
-    info "Проверяем подключение на порту ${new_port}..."
-    local _verify_opts=(-o StrictHostKeyChecking=accept-new
-        -o ConnectTimeout=10 -o PasswordAuthentication=no
-        -o IdentitiesOnly=yes -i "$SSH_IDENTITIES_DIR/$NODE_ID" -p "$new_port")
-    [[ "${CONFIG_SOURCE:-local}" == "github" ]] && _verify_opts=(-o StrictHostKeyChecking=yes
-        -o "UserKnownHostsFile=${SSH_KNOWN_HOSTS}" -o ConnectTimeout=10
-        -o PasswordAuthentication=no -o IdentitiesOnly=yes
-        -i "$SSH_IDENTITIES_DIR/$NODE_ID" -p "$new_port")
-    local _verify_ok
-    _verify_ok=$(run_with_timeout 10 ssh "${_verify_opts[@]}" \
-        "${SERVER_USER}@${SERVER_IP}" "echo ok" 2>/dev/null)
-    if [[ "$_verify_ok" == *"ok"* ]]; then
-        success "Подключение по порту ${new_port} работает"
-    else
-        # Диагностика — повторяем с -v.
-        local _diag
-        _diag=$(run_with_timeout 10 ssh -v "${_verify_opts[@]}" \
-            "${SERVER_USER}@${SERVER_IP}" "echo ok" 2>&1)
-        echo "$_diag" | grep -iE "error|closed|refused|denied" | tail -5
+    local verify
+    SERVER_PORT="$new_port"
+    if ! verify=$(_harden_ssh_run "echo ok" 2>/dev/null) || [[ "${verify%$'\r'}" != ok ]]; then
+        SERVER_PORT="$old_port"
         warn "Не удалось подключиться по новому порту."
-        warn "Откатываем..."
-        local _rollback_cmd="sed -i '/^Port /d' /etc/ssh/sshd_config && echo 'Port ${old_port}' >> /etc/ssh/sshd_config && (command -v ufw &>/dev/null && ufw allow ${old_port}/tcp > /dev/null 2>&1 && ufw delete allow ${new_port}/tcp > /dev/null 2>&1; true) && (systemctl daemon-reload 2>/dev/null; systemctl restart ssh.socket 2>/dev/null || systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null)"
-        if ! ssh_run -- "$_rollback_cmd" 2>/dev/null; then
-            local _saved_port="$SERVER_PORT"
-            SERVER_PORT="$new_port"
-            ssh_run -- "$_rollback_cmd" 2>/dev/null
-            SERVER_PORT="$_saved_port"
-        fi
-        warn "Порт возвращён на ${old_port}. Усиление защиты SSH прервано."
+        _harden_rollback_port "$old_port" "$new_port" || true
+        _harden_restore_known_hosts "$known_backup"
         return 1
     fi
-
-    # Обновляем config.json только после успешного подключения по новому порту.
     if ! jq_w --arg id "$NODE_ID" --argjson p "$new_port" --arg identity "$NODE_ID" \
         '.nodes |= map(if .id==$id then .port=$p | .auth="key" | .identity=$identity | .secret_id=null else . end)'; then
+        SERVER_PORT="$old_port"
         warn "Не удалось сохранить параметры усиления защиты SSH."
+        _harden_rollback_port "$old_port" "$new_port" || true
+        _harden_restore_known_hosts "$known_backup"
         return 1
     fi
-    node_secret_delete "$NODE_ID" >/dev/null 2>&1 || true
-
-    # Обновляем глобальные переменные.
-    SERVER_PORT="$new_port"
-    SERVER_AUTH="key"
-    SERVER_PASS=""
-    NODE_IDENTITY="$NODE_ID"
-
+    rm -f "$known_backup"
+    SERVER_AUTH=key; SERVER_PASS=""
+    success "Подключение по порту ${new_port} работает"
+    return 0
 }
 ssh_hardening() {
-    echo ""
-    echo -e "${CYAN}  ── Усиление защиты SSH ────────────────────${NC}"
-    echo -e "  Нода:         ${GREEN}${NODE_NAME}${NC} (${SERVER_IP}:${SERVER_PORT})"
-    echo -e "  Авторизация:  ${SERVER_AUTH}"
-    echo ""
-
-    # Проверка — уже захардено?
-    if [[ "$SERVER_AUTH" == "key" && "$SERVER_PORT" != "22" ]]; then
-        warn "Усиление защиты SSH уже выполнено (ключ + порт ${SERVER_PORT})."
-        confirm_yn "Выполнить повторно?" || return
+    _harden_select_port || return 1
+    local lines=("Нода: $NODE_NAME  $SERVER_IP:$SERVER_PORT" "Пользователь: $SERVER_USER"
+        "Ключ: $SSH_IDENTITIES_DIR/$NODE_ID" "Порт: $SERVER_PORT → $HARDEN_NEW_PORT"
+        "Вход по паролю будет отключён."
+        "Будет установлен SSH-ключ и изменены правила firewall для SSH."
+        "При сбое может потребоваться консоль провайдера.")
+    if [[ "$SERVER_AUTH" == key && "$SERVER_PORT" != 22 ]]; then
+        lines+=("Усиление защиты SSH уже выполнено; настройки будут изменены повторно.")
     fi
-
-    echo -e "  Что будет сделано:"
-    echo -e "  ${GREEN}1.${NC} Сгенерируется SSH-ключ (если ещё нет) и скопируется на сервер"
-    echo -e "  ${GREEN}2.${NC} Вход по паролю будет запрещён (только по ключу)"
-    echo -e "  ${GREEN}3.${NC} SSH-порт сменится с ${SERVER_PORT} на случайный (49152-65535)"
-    echo ""
-    confirm_yn "Продолжить?" Y || return
-
-    echo ""
-
-    # Шаг 1: SSH-ключ
-    _harden_setup_key || return
-
-    # Шаг 2: Отключение пароля
-    _harden_disable_password || return
-
-    # Шаг 3: Смена порта (включает restart sshd и обновление config.json)
-    if ! _harden_change_port; then
-        # Шаг 3 провалился — откатываем шаг 2 (восстанавливаем вход по паролю)
+    review_frame "Усиление защиты SSH" "${lines[@]}"
+    confirm_yn "Усилить защиту SSH?" N || return 0
+    _harden_setup_key || return 1
+    if ! _harden_disable_password || ! _harden_change_port "$HARDEN_NEW_PORT"; then
         warn "Восстанавливаем вход по паролю..."
-        _harden_restore_password
+        _harden_restore_password || warn "Не удалось восстановить вход по паролю. Используйте консоль провайдера."
         return 1
     fi
-
-    echo ""
+    if ! node_secret_delete "$NODE_ID"; then
+        warn "Порт и SSH-ключ сохранены, но старый пароль не удалось удалить из локального состояния."
+        return 1
+    fi
     success "Усиление защиты SSH завершено!"
-    echo -e "  Ключ:  ${GREEN}$SSH_IDENTITIES_DIR/$NODE_ID${NC}"
-    echo -e "  Порт:  ${GREEN}${SERVER_PORT}${NC}"
-    echo -e "  Пароль: ${RED}отключён${NC}"
-    echo ""
+    info "Ключ: $SSH_IDENTITIES_DIR/$NODE_ID"
+    info "Порт: $SERVER_PORT; вход по паролю отключён."
+    return 0
 }

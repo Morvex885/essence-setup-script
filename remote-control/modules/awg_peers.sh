@@ -42,10 +42,11 @@ awg_peers_menu() {
         node_count=$(nodes_count)
         echo ""
         box_top
-        box_center "AWG-подключения"
+        box_center "Клиенты AmneziaWG"
         box_mid
         if [[ "$node_count" -eq 0 ]]; then
             box_line " Нет нод" " ${DIM}Нет нод${NC}"
+            box_mid
             menu_item 0 "Назад" NC
             box_bot
             return 0
@@ -62,10 +63,9 @@ awg_peers_menu() {
             nip="${_node_ips[$idx]}"
             has_awg_conn=$(jq_r --arg n "$nname" '[.connections[] | select(.node==$n) | .groups[].proxies[] | select(. == "AWG" or startswith("awg-"))] | length')
             if [[ "$has_awg_conn" -gt 0 ]]; then
-                box_line " $((idx+1))) $nname $nip" " ${CYAN}$((idx+1)))${NC} $nname ${DIM}$nip${NC}"
+                menu_item "$((idx+1))" "$nname  $nip" CYAN
             else
-                box_line " $((idx+1))) $nname $nip — нет AWG подключений" \
-                    " ${CYAN}$((idx+1)))${NC} $nname ${DIM}$nip — нет AWG подключений${NC}"
+                menu_item "$((idx+1))" "$nname  $nip — нет подключений AmneziaWG" CYAN
             fi
             i=$((i + 1))
         done
@@ -78,170 +78,142 @@ awg_peers_menu() {
         _pick="${_pick%$'\r'}"
         [[ "$_pick" == 0 ]] && return 0
         if menu_index_valid "$_pick" "${#_node_names[@]}"; then
-            state_action "awg_peers" _awg_peers_node "$_pick"
+            _awg_peers_node "$_pick"
         else
             warn "Неверный выбор."
         fi
     done
 }
 
+_awg_peers_refresh() {
+    AWG_PEERS_REFRESH_RESULT=""
+    local result peer
+    result=$(ssh_run -- "ls /etc/mihomo/amnezia/ 2>/dev/null") || return 1
+    while IFS= read -r peer; do
+        peer="${peer%$'\r'}"
+        [[ -n "$peer" ]] || continue
+        AWG_PEERS_REFRESH_RESULT="${AWG_PEERS_REFRESH_RESULT}${peer}"$'\n'
+    done <<< "$result"
+    AWG_PEERS_REFRESH_RESULT="${AWG_PEERS_REFRESH_RESULT%$'\n'}"
+    return 0
+}
+
+_awg_peers_mutate() {
+    ensure_remote_scripts_current || {
+        warn "Не удалось подготовить скрипты для ноды '$NODE_NAME'."
+        return 1
+    }
+    ssh_run -- "$1"
+}
+
 _awg_peers_node() {
-    node_load "$1"
-    local nname="$NODE_NAME"
-
-    ssh_connect || return
-
-    # SSH: проверяем AWG + получаем список peers
-    local check_result
-    check_result=$(ssh_run -- "if [ ! -f /etc/amnezia/amneziawg/awg0.conf ]; then echo NO_AWG; else echo AWG_OK; ls /etc/mihomo/amnezia/; fi") \
-        || { warn "Не удалось получить статус AWG на $nname."; return; }
-
-    if [[ "$check_result" == "NO_AWG" ]]; then
-        warn "AmneziaWG не установлен на $nname."
-        return
-    fi
-
-    local existing_peers
-    existing_peers=$(echo "$check_result" | tail -n +2 | tr -d '\r' | grep -v '^$')
-
-    # Ожидаемые peers
-    local expected_peers
+    node_load "$1" || return 1
+    local nname="$NODE_NAME" check_result existing_peers="" expected_peers stale=false
+    ssh_connect || return 1
+    check_result=$(ssh_run -- "if [ ! -f /etc/amnezia/amneziawg/awg0.conf ]; then echo NO_AWG; else echo AWG_OK; ls /etc/mihomo/amnezia/; fi") || {
+        warn "Не удалось получить статус AmneziaWG на $nname."
+        return 1
+    }
+    check_result="${check_result//$'\r'/}"
+    [[ "$check_result" == NO_AWG ]] && { warn "AmneziaWG не установлен на $nname."; return 0; }
+    [[ "$check_result" == AWG_OK || "$check_result" == AWG_OK$'\n'* ]] || return 1
+    [[ "$check_result" == *$'\n'* ]] && existing_peers="${check_result#*$'\n'}"
     expected_peers=$(_awg_expected_peers "$nname")
-
     while true; do
-        local all_peers=() peer_status=() missing_peers=() orphan_count=0
-        local idx p s
+        local all_peers=() peer_status=() missing_peers=() orphans=()
+        local idx p s choice cmd target target_status labels=()
         while IFS= read -r p; do
-            [[ -z "$p" ]] && continue
+            [[ -n "$p" ]] || continue
             all_peers+=("$p")
             if printf '%s\n' "$expected_peers" | grep -qxF "$p"; then
                 peer_status+=("used")
             else
                 peer_status+=("orphan")
+                orphans+=("$p")
             fi
         done <<< "$existing_peers"
-
         while IFS= read -r p; do
-            [[ -z "$p" ]] && continue
+            [[ -n "$p" ]] || continue
             if ! printf '%s\n' "$existing_peers" | grep -qxF "$p"; then
-                missing_peers+=("$p")
-                all_peers+=("$p")
-                peer_status+=("missing")
+                missing_peers+=("$p"); all_peers+=("$p"); peer_status+=("missing")
             fi
         done <<< "$expected_peers"
-        for s in "${peer_status[@]}"; do
-            [[ "$s" == orphan ]] && orphan_count=$((orphan_count + 1))
-        done
-
         echo ""
         box_top
-        box_center "Peers: $nname"
+        box_center "Клиенты AmneziaWG: $nname"
         box_mid
+        if [[ "$stale" == true ]]; then
+            box_line " Список не обновлён; изменения временно недоступны." \
+                " ${YELLOW}Список не обновлён; изменения временно недоступны.${NC}"
+        fi
         if [[ ${#all_peers[@]} -eq 0 ]]; then
-            box_line " Нет peers" " ${DIM}Нет peers${NC}"
+            box_line " Нет клиентов AmneziaWG" " ${DIM}Нет клиентов AmneziaWG${NC}"
         else
-            for (( idx=0; idx<${#all_peers[@]}; idx++ )); do
-                p="${all_peers[$idx]}"
-                s="${peer_status[$idx]}"
+            for ((idx=0; idx<${#all_peers[@]}; idx++)); do
+                p="${all_peers[$idx]}"; s="${peer_status[$idx]}"
                 case "$s" in
-                    used) box_line " $((idx+1))) [✓] $p" " ${GREEN}$((idx+1)))${NC} [${GREEN}✓${NC}] $p" ;;
-                    orphan) box_line " $((idx+1))) [!] $p — не привязан" " ${GREEN}$((idx+1)))${NC} [${YELLOW}!${NC}] $p ${YELLOW}— не привязан${NC}" ;;
-                    missing) box_line " $((idx+1))) [-] $p — не создан" " ${GREEN}$((idx+1)))${NC} [${RED}-${NC}] $p ${RED}— не создан${NC}" ;;
+                    used) box_line " [✓] $p" " [${GREEN}✓${NC}] $p" ;;
+                    orphan) box_line " [!] $p — не привязан" " [${YELLOW}!${NC}] $p ${YELLOW}— не привязан${NC}" ;;
+                    missing) box_line " [-] $p — не создан" " [${DIM}-${NC}] $p ${DIM}— не создан${NC}" ;;
                 esac
             done
         fi
         box_mid
-        [[ ${#missing_peers[@]} -gt 0 ]] && menu_item c "Создать недостающие peers (${#missing_peers[@]})" GREEN
-        menu_item d "Удалить peer" RED
-        [[ $orphan_count -gt 0 ]] && menu_item x "Удалить неиспользуемые ($orphan_count)" YELLOW
+        menu_item r "Обновить список" CYAN
+        [[ ${#missing_peers[@]} -gt 0 ]] && menu_item c "Создать недостающих клиентов (${#missing_peers[@]})" GREEN
+        menu_item d "Удалить клиента" RED
+        [[ ${#orphans[@]} -gt 0 ]] && menu_item x "Удалить неиспользуемых (${#orphans[@]})" RED
         menu_item 0 "Назад" NC
         box_bot
         echo ""
-        if ! IFS= read -rp "  Выберите действие: " _choice; then
-            return 0
+        IFS= read -rp "  Выберите действие: " choice || return 0
+        choice="${choice%$'\r'}"
+        if [[ "$stale" == true ]]; then
+            case "$choice" in
+                c|C|d|D|x|X) warn "Сначала обновите список клиентов AmneziaWG."; continue ;;
+            esac
         fi
-        _choice="${_choice%$'\r'}"
-        case "$_choice" in
+        case "$choice" in
             c|C)
-                if [[ ${#missing_peers[@]} -eq 0 ]]; then
-                    info "Все peers созданы."
-                    continue
-                fi
-                info "Создаю peers: ${missing_peers[*]}..."
-                if ! upload_scripts; then
-                    warn "Не удалось загрузить скрипты для ноды '${NODE_NAME}'."
-                    continue
-                fi
-                local peers_cmd="source ${REMOTE_DIR}/modules/amneziawg.sh"
+                [[ ${#missing_peers[@]} -gt 0 ]] || { warn "Неверный выбор."; continue; }
+                cmd="source $(printf '%q' "$REMOTE_DIR/modules/amneziawg.sh")"
                 for p in "${missing_peers[@]}"; do
-                    peers_cmd="$peers_cmd && add_awg_peer_auto $(printf '%q' "$p")"
+                    cmd="$cmd && add_awg_peer_auto $(printf '%q' "$p")"
                 done
-                if ssh_run -- "$peers_cmd"; then
-                    success "Peers созданы"
-                else
-                    warn "Ошибка при создании peers"
-                fi
-                # Обновить список
-                existing_peers=$(ssh_run -- "ls /etc/mihomo/amnezia/ 2>/dev/null" | tr -d '\r' | grep -v '^$')
+                state_action "awg_peers" _awg_peers_mutate "$cmd" || warn "Не удалось создать клиентов AmneziaWG."
                 ;;
             d|D)
-                if [[ ${#all_peers[@]} -eq 0 ]]; then
-                    warn "Нет peers для удаления."
-                    continue
-                fi
-                read -rp "  Номер peer для удаления: " _didx
-                if [[ "$_didx" =~ ^[0-9]+$ ]] && (( _didx >= 1 && _didx <= ${#all_peers[@]} )); then
-                    local target="${all_peers[$((_didx - 1))]}"
-                    local target_status="${peer_status[$((_didx - 1))]}"
-                    if [[ "$target_status" == "missing" ]]; then
-                        warn "Peer $target ещё не создан на сервере."
-                        continue
-                    fi
-                    if confirm_yn "Удалить peer $target?"; then
-                        if ! upload_scripts; then
-                            warn "Не удалось загрузить скрипты для ноды '${NODE_NAME}'."
-                            continue
-                        fi
-                        if ssh_run -- "source ${REMOTE_DIR}/modules/amneziawg.sh && remove_awg_peer_by_name $(printf '%q' "$target")"; then
-                            success "Peer $target удалён"
-                        else
-                            warn "Не удалось удалить peer $target"
-                        fi
-                        existing_peers=$(ssh_run -- "ls /etc/mihomo/amnezia/ 2>/dev/null" | tr -d '\r' | grep -v '^$')
-                    fi
-                else
-                    warn "Неверный номер."
-                fi
+                labels=("${all_peers[@]}")
+                menu_select "Удаление клиента AmneziaWG: $nname" "Выберите клиента" "${labels[@]}" || continue
+                target="${all_peers[$((MENU_SELECT_INDEX-1))]}"
+                target_status="${peer_status[$((MENU_SELECT_INDEX-1))]}"
+                [[ "$target_status" != missing ]] || { warn "Клиент $target ещё не создан на ноде."; continue; }
+                review_frame "Удаление клиента AmneziaWG" "Нода: $nname  $SERVER_IP:$SERVER_PORT" "Клиент: $target" "Конфигурация и ключи клиента будут удалены; доступ перестанет работать."
+                confirm_yn "Удалить клиента AmneziaWG?" N || continue
+                cmd="source $(printf '%q' "$REMOTE_DIR/modules/amneziawg.sh") && remove_awg_peer_by_name $(printf '%q' "$target")"
+                state_action "awg_peers" _awg_peers_mutate "$cmd" || warn "Не удалось удалить клиента AmneziaWG."
                 ;;
             x|X)
-                if [[ $orphan_count -eq 0 ]]; then
-                    info "Нет неиспользуемых peers."
-                    continue
-                fi
-                local orphans=()
-                for (( idx=0; idx<${#all_peers[@]}; idx++ )); do
-                    [[ "${peer_status[$idx]}" == "orphan" ]] && orphans+=("${all_peers[$idx]}")
+                [[ ${#orphans[@]} -gt 0 ]] || { warn "Неверный выбор."; continue; }
+                review_frame "Удаление неиспользуемых клиентов AmneziaWG" "Нода: $nname  $SERVER_IP:$SERVER_PORT" \
+                    "Клиенты: ${orphans[*]}" "Конфигурации и ключи клиентов будут удалены; доступ перестанет работать."
+                confirm_yn "Удалить перечисленных клиентов AmneziaWG?" N || continue
+                cmd="source $(printf '%q' "$REMOTE_DIR/modules/amneziawg.sh")"
+                for p in "${orphans[@]}"; do
+                    cmd="$cmd && remove_awg_peer_by_name $(printf '%q' "$p")"
                 done
-                echo -e "  Будут удалены: ${YELLOW}${orphans[*]}${NC}"
-                if confirm_yn "Продолжить?"; then
-                    if ! upload_scripts; then
-                        warn "Не удалось загрузить скрипты для ноды '${NODE_NAME}'."
-                        continue
-                    fi
-                    local del_cmd="source ${REMOTE_DIR}/modules/amneziawg.sh"
-                    for p in "${orphans[@]}"; do
-                        del_cmd="$del_cmd && remove_awg_peer_by_name $(printf '%q' "$p")"
-                    done
-                    if ssh_run -- "$del_cmd"; then
-                        success "Неиспользуемые peers удалены"
-                    else
-                        warn "Ошибка при удалении"
-                    fi
-                    existing_peers=$(ssh_run -- "ls /etc/mihomo/amnezia/ 2>/dev/null" | tr -d '\r' | grep -v '^$')
-                fi
+                state_action "awg_peers" _awg_peers_mutate "$cmd" || warn "Не удалось удалить всех клиентов AmneziaWG."
                 ;;
-            0) return ;;
-            *) warn "Неверный выбор." ;;
+            r|R) ;;
+            0) return 0 ;;
+            *) warn "Неверный выбор."; continue ;;
         esac
+        if _awg_peers_refresh; then
+            existing_peers="$AWG_PEERS_REFRESH_RESULT"
+            stale=false
+        else
+            stale=true
+            warn "Не удалось обновить список клиентов AmneziaWG. Показаны последние полученные данные."
+        fi
     done
 }

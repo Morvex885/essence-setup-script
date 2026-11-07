@@ -29,7 +29,8 @@ teardown() {
             jq '.phase = "invalid"' "$GITHUB_ACCOUNT_SWITCH_MARKER" > "$GITHUB_ACCOUNT_SWITCH_MARKER.tmp"
             chmod 600 "$GITHUB_ACCOUNT_SWITCH_MARKER.tmp"
             mv "$GITHUB_ACCOUNT_SWITCH_MARKER.tmp" "$GITHUB_ACCOUNT_SWITCH_MARKER"
-            ! github_account_switch_marker_valid "$GITHUB_ACCOUNT_SWITCH_MARKER"
+            run github_account_switch_marker_valid "$GITHUB_ACCOUNT_SWITCH_MARKER"
+            assert_failure
             _github_account_switch_write_marker prepared '' true false false
         fi
     done
@@ -38,8 +39,10 @@ teardown() {
 @test "marker validator rejects injection-shaped values" {
     jq -n '{version:1,phase:"prepared",old_repo:"../../etc/passwd",new_repo:"target/repo",branch:"main",initial_login:"test-owner",expected_head:null,old_state_available:true,repo_created:false,repo_privatized:false}' > "$GITHUB_ACCOUNT_SWITCH_MARKER"
     chmod 600 "$GITHUB_ACCOUNT_SWITCH_MARKER"
-    ! github_account_switch_marker_valid "$GITHUB_ACCOUNT_SWITCH_MARKER"
+    run github_account_switch_marker_valid "$GITHUB_ACCOUNT_SWITCH_MARKER"
+    assert_failure
     jq -n '{version:1,phase:"prepared",old_repo:"test-owner/repo",new_repo:"target/repo",branch:"main",initial_login:"$(touch /tmp/pwned)",expected_head:null,old_state_available:true,repo_created:false,repo_privatized:false}' > "$GITHUB_ACCOUNT_SWITCH_MARKER"
     chmod 600 "$GITHUB_ACCOUNT_SWITCH_MARKER"
-    ! github_account_switch_marker_valid "$GITHUB_ACCOUNT_SWITCH_MARKER"
+    run github_account_switch_marker_valid "$GITHUB_ACCOUNT_SWITCH_MARKER"
+    assert_failure
 }

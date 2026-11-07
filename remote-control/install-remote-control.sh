@@ -135,7 +135,7 @@ main() {
     cp "$tmp_dir/pkg/remote-control/templates/"*.yaml           "$INSTALL_DIR/templates/" 2>/dev/null || true
     cp -r "$tmp_dir/pkg/common/."                               "$INSTALL_DIR/common/"
 
-    # Включаем setup-essence — нужен для загрузки на серверы через upload_scripts
+    # Включаем setup-essence для версионной подготовки серверных скриптов
     mkdir -p "$INSTALL_DIR/setup-essence/modules"
     cp "$tmp_dir/pkg/setup-essence/setup-essence.sh"              "$INSTALL_DIR/setup-essence/"
     cp "$tmp_dir/pkg/setup-essence/modules/"*.sh                 "$INSTALL_DIR/setup-essence/modules/"

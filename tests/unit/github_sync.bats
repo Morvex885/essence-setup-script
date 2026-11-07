@@ -7,10 +7,87 @@ setup() {
     source_module 'github-config.sh'
     export REMOTE="$BATS_TEST_TMPDIR/remote.git"
     export GITHUB_REMOTE="$REMOTE" GITHUB_STORE="$BATS_TEST_TMPDIR/store.git" GITHUB_SESSIONS_DIR="$BATS_TEST_TMPDIR/sessions"
-    export GIT_CONFIG_GLOBAL="$BATS_TEST_TMPDIR/gitconfig"
+    export GIT_CONFIG_GLOBAL="$BATS_TEST_TMPDIR/gitconfig" GIT_CONFIG_NOSYSTEM=1
+    export GITHUB_OWNER=test-owner GITHUB_REPO_NAME=config
+    export FAKE_GH_GLOBAL_LOGIN="$BATS_TEST_TMPDIR/global-gh-login"
+    export FAKE_GH_LOG="$BATS_TEST_TMPDIR/gh-calls"
+    printf 'other-owner\n' > "$FAKE_GH_GLOBAL_LOGIN"
+    mkdir -p "$BATS_TEST_TMPDIR/bin" \
+        "$CONFIG_DIR/credentials/gh/test-owner" \
+        "$CONFIG_DIR/credentials/gh/other-owner"
+    printf 'test-owner\n' > "$CONFIG_DIR/credentials/gh/test-owner/hosts.yml"
+    printf 'other-owner\n' > "$CONFIG_DIR/credentials/gh/other-owner/hosts.yml"
+    cat > "$BATS_TEST_TMPDIR/bin/gh" <<'EOF'
+#!/bin/bash
+printf '%s|%s\n' "${GH_CONFIG_DIR:-global}" "$*" >> "$FAKE_GH_LOG"
+if [[ -n "${GH_CONFIG_DIR:-}" ]]; then
+    [[ -f "$GH_CONFIG_DIR/hosts.yml" ]] || exit 1
+    login=$(cat "$GH_CONFIG_DIR/hosts.yml") || exit 1
+else
+    login=$(cat "$FAKE_GH_GLOBAL_LOGIN") || exit 1
+fi
+case "$1 $2" in
+    'api user')
+        case "${GH_MODE:-success}" in
+            api-timeout) printf '%s\n' 'connection timed out' >&2; exit 28 ;;
+            auth-fail) printf '%s\n' 'HTTP 401: Bad credentials' >&2; exit 1 ;;
+            wrong-account) login=other-owner ;;
+            empty-login) exit 0 ;;
+        esac
+        printf '%s\n' "$login"
+        ;;
+    'repo view')
+        [[ "$3" == "$login/"* ]] || exit 1
+        printf '{"visibility":"PRIVATE"}\n'
+        ;;
+    'auth git-credential')
+        [[ "$3" == get ]] || exit 1
+        while IFS= read -r field && [[ -n "$field" ]]; do :; done
+        printf 'username=%s\npassword=fixture-%s\n' "$login" "$login"
+        ;;
+    'auth token')
+        [[ "${GH_IMPORT_DISABLED:-false}" != true ]] || exit 1
+        requested=
+        while (( $# )); do
+            if [[ "$1" == --user ]]; then requested="$2"; break; fi
+            shift
+        done
+        [[ "$requested" == "$login" ]] || exit 1
+        printf 'fixture-%s\n' "$login"
+        ;;
+    'auth login')
+        [[ -n "${GH_CONFIG_DIR:-}" ]] || exit 1
+        if [[ " $* " == *' --with-token '* ]]; then
+            IFS= read -r token || [[ -n "$token" ]]
+            login="${token#fixture-}"
+            [[ "$login" =~ ^[A-Za-z0-9-]+$ ]] || exit 1
+            printf '%s\n' "$login" > "$GH_CONFIG_DIR/hosts.yml"
+        else
+            exit 1
+        fi
+        ;;
+    *)
+        exit 1
+        ;;
+esac
+EOF
+    chmod +x "$BATS_TEST_TMPDIR/bin/gh"
+    export PATH="$BATS_TEST_TMPDIR/bin:$PATH" GH_BIN="$BATS_TEST_TMPDIR/bin/gh"
+    cat > "$BATS_TEST_TMPDIR/bin/wrong-credential" <<'EOF'
+#!/bin/bash
+printf 'username=other-owner\npassword=wrong-global-secret\n'
+EOF
+    chmod +x "$BATS_TEST_TMPDIR/bin/wrong-credential"
+    git config --global credential.helper "!$BATS_TEST_TMPDIR/bin/wrong-credential"
     git init --bare -b main "$REMOTE" >/dev/null
 }
 teardown() { teardown_test_env; }
+_map_github_bare() {
+    local owner="$1" remote="$2"
+    git config --global "url.file://$remote.insteadOf" \
+        "https://github.com/$owner/config.git"
+}
+
 
 _file_mode() {
     case "${OSTYPE:-}" in
@@ -26,6 +103,160 @@ _seed_live_revision() {
     printf '{"storage_version":1,"encryption":"none","revision":%s}\n' "$revision" \
         > "$GITHUB_WORKTREE/storage.json" || return 1
     github_sync_flush || return 1
+}
+
+_https_revision_fixture() {
+    _map_github_bare test-owner "$REMOTE"
+    GITHUB_REMOTE=https://github.com/test-owner/config.git
+    _seed_live_revision 1
+}
+
+_assert_https_flush_preserves_revision() {
+    local mode="$1" head
+    _https_revision_fixture || return 1
+    printf '{"storage_version":1,"encryption":"none","revision":2}\n' > "$GITHUB_WORKTREE/storage.json"
+    export GH_MODE="$mode"
+    if github_sync_flush; then return 1; fi
+    [[ "$GITHUB_SYNC_STATUS" == pending ]] || return 1
+    head=$(git -C "$GITHUB_WORKTREE" rev-parse HEAD) || return 1
+    [[ "$(git --git-dir="$GITHUB_STORE" rev-parse refs/heads/main)" == "$head" ]] || return 1
+    [[ "$(git --git-dir="$GITHUB_STORE" show main:storage.json | jq -r .revision)" == 2 ]] || return 1
+    [[ -z "$(git -C "$GITHUB_WORKTREE" status --porcelain)" ]] || return 1
+    _assert_remote_revision "$REMOTE" 1
+}
+
+_assert_cached_resume_rejected() {
+    local scenario="$1" mode=api-timeout init_mode=resume profile before_refs before_origin
+    _https_revision_fixture || return 1
+    github_config_close || return 1
+    profile="$GITHUB_CREDENTIALS_DIR/gh/test-owner"
+    case "$scenario" in
+        auth-fail|wrong-account|empty-login) mode="$scenario" ;;
+        missing-profile) rm -rf "$profile"; export GH_IMPORT_DISABLED=true ;;
+        imported-profile) rm -rf "$profile"; printf 'test-owner\n' > "$FAKE_GH_GLOBAL_LOGIN" ;;
+        missing-branch) git --git-dir="$GITHUB_STORE" update-ref -d refs/heads/main ;;
+        wrong-origin) git --git-dir="$GITHUB_STORE" remote set-url origin https://github.com/other-owner/config.git ;;
+        symlink-store) mv "$GITHUB_STORE" "$GITHUB_STORE.real"; ln -s "$GITHUB_STORE.real" "$GITHUB_STORE" ;;
+        symlink-profile) mv "$profile" "$profile.real"; ln -s "$profile.real" "$profile" ;;
+        symlink-hosts) mv "$profile/hosts.yml" "$profile/hosts.real"; ln -s "$profile/hosts.real" "$profile/hosts.yml" ;;
+        onboarding) init_mode=onboarding ;;
+    esac
+    before_refs=$(git --git-dir="$GITHUB_STORE" show-ref || true)
+    before_origin=$(git --git-dir="$GITHUB_STORE" remote get-url origin)
+    export GH_MODE="$mode"
+    : > "$FAKE_GH_LOG"
+    if github_sync_init false "$init_mode"; then return 1; fi
+    [[ -z "${GITHUB_WORKTREE:-}" && -z "${GITHUB_SESSION_ID:-}" ]] || return 1
+    [[ "$(git --git-dir="$GITHUB_STORE" show-ref || true)" == "$before_refs" ]] || return 1
+    [[ "$(git --git-dir="$GITHUB_STORE" remote get-url origin)" == "$before_origin" ]] || return 1
+    ! grep -q '|repo view ' "$FAKE_GH_LOG"
+}
+
+@test "HTTPS account timeout commits locally before refusing push" {
+    _assert_https_flush_preserves_revision api-timeout || return 1
+    [[ "$GITHUB_LAST_AUTH_RELEVANT" == false ]] || return 1
+    [[ -z "$GITHUB_LAST_HINT" ]]
+}
+
+@test "HTTPS auth failure commits locally before refusing push" {
+    _assert_https_flush_preserves_revision auth-fail || return 1
+    [[ "$GITHUB_LAST_AUTH_RELEVANT" == true ]]
+}
+
+@test "HTTPS account mismatch commits locally before refusing push" {
+    _assert_https_flush_preserves_revision wrong-account || return 1
+    [[ "$GITHUB_LAST_AUTH_RELEVANT" == true ]]
+}
+
+@test "HTTPS pending commit survives close and fresh offline init then no-diff retry" {
+    _assert_https_flush_preserves_revision api-timeout || return 1
+    local head old_worktree="$GITHUB_WORKTREE"
+    head=$(git -C "$GITHUB_WORKTREE" rev-parse HEAD)
+    github_config_close || return 1
+    [[ ! -d "$old_worktree" ]] || return 1
+    : > "$FAKE_GH_LOG"
+    run bash -c '
+        source "$1/common/common.sh"
+        source "$1/remote-control/modules/state.sh"
+        source "$1/remote-control/modules/github-config.sh"
+        GITHUB_REMOTE=test-owner/config
+        github_sync_init || exit 1
+        [[ "$GITHUB_SYNC_STATUS" == pending ]] || exit 2
+        [[ "$GITHUB_WORKTREE" != "$2" ]] || exit 3
+        [[ "$(git -C "$GITHUB_WORKTREE" rev-parse HEAD)" == "$3" ]] || exit 4
+        [[ "$(jq -r .revision "$GITHUB_WORKTREE/storage.json")" == 2 ]] || exit 5
+        ! grep -q "|repo view " "$FAKE_GH_LOG" || exit 6
+        GH_MODE=success
+        github_sync_flush || exit 7
+        [[ "$GITHUB_SYNC_STATUS" == clean ]] || exit 8
+        [[ "$(git --git-dir="$REMOTE" rev-parse main)" == "$3" ]] || exit 9
+        github_config_close
+    ' _ "$PROJECT_ROOT" "$old_worktree" "$head"
+    assert_success
+    _assert_remote_revision "$REMOTE" 2
+}
+
+@test "cached resume rejects confirmed authentication failure" { _assert_cached_resume_rejected auth-fail; }
+@test "cached resume rejects mismatched successful login" { _assert_cached_resume_rejected wrong-account; }
+@test "cached resume rejects empty successful login" { _assert_cached_resume_rejected empty-login; }
+@test "cached resume rejects missing profile without credential import" { _assert_cached_resume_rejected missing-profile; }
+@test "cached resume rejects profile imported during current timeout attempt" { _assert_cached_resume_rejected imported-profile; }
+@test "cached resume rejects missing local branch" { _assert_cached_resume_rejected missing-branch; }
+@test "cached resume rejects foreign origin without changing it" { _assert_cached_resume_rejected wrong-origin; }
+@test "cached resume rejects symlink store" { _assert_cached_resume_rejected symlink-store; }
+@test "cached resume rejects symlink profile" { _assert_cached_resume_rejected symlink-profile; }
+@test "cached resume rejects symlink profile hosts" { _assert_cached_resume_rejected symlink-hosts; }
+@test "cached resume rejects onboarding during account timeout" { _assert_cached_resume_rejected onboarding; }
+
+@test "offline init retains live session and uncommitted data for canonical slug" {
+    _https_revision_fixture || return 1
+    local worktree="$GITHUB_WORKTREE" session="$GITHUB_SESSION_ID"
+    printf 'local data\n' > "$worktree/uncommitted"
+    export GH_MODE=api-timeout
+    GITHUB_REMOTE=test-owner/config
+    : > "$FAKE_GH_LOG"
+    github_sync_init || return 1
+    [[ "$GITHUB_WORKTREE" == "$worktree" && "$GITHUB_SESSION_ID" == "$session" ]] || return 1
+    [[ "$(cat "$worktree/uncommitted")" == "local data" ]] || return 1
+    [[ "$GITHUB_SYNC_STATUS" == pending ]] || return 1
+    ! grep -q '|repo view ' "$FAKE_GH_LOG"
+}
+
+@test "offline live session rejects changed target without opening another session" {
+    _https_revision_fixture || return 1
+    local worktree="$GITHUB_WORKTREE" session="$GITHUB_SESSION_ID" refs
+    refs=$(git --git-dir="$GITHUB_STORE" show-ref)
+    export GH_MODE=api-timeout
+    GITHUB_REMOTE=test-owner/another-config
+    if github_sync_init; then return 1; fi
+    [[ "$GITHUB_WORKTREE" == "$worktree" && "$GITHUB_SESSION_ID" == "$session" ]] || return 1
+    [[ "$(git --git-dir="$GITHUB_STORE" show-ref)" == "$refs" ]] || return 1
+    [[ "$(git --git-dir="$GITHUB_STORE" config --get remote.origin.url)" == https://github.com/test-owner/config.git ]] || return 1
+}
+
+@test "offline live session rejects replaced origin without opening another session" {
+    _https_revision_fixture || return 1
+    local worktree="$GITHUB_WORKTREE" session="$GITHUB_SESSION_ID" refs
+    git --git-dir="$GITHUB_STORE" remote set-url origin https://github.com/other-owner/config.git
+    refs=$(git --git-dir="$GITHUB_STORE" show-ref)
+    export GH_MODE=api-timeout
+    if github_sync_init; then return 1; fi
+    [[ "$GITHUB_WORKTREE" == "$worktree" && "$GITHUB_SESSION_ID" == "$session" ]] || return 1
+    [[ "$(git --git-dir="$GITHUB_STORE" show-ref)" == "$refs" ]] || return 1
+    [[ "$(git --git-dir="$GITHUB_STORE" config --get remote.origin.url)" == https://github.com/other-owner/config.git ]] || return 1
+}
+
+@test "offline live session target guard rejects another cached branch" {
+    _https_revision_fixture || return 1
+    local worktree="$GITHUB_WORKTREE" session="$GITHUB_SESSION_ID" refs
+    git --git-dir="$GITHUB_STORE" update-ref refs/heads/another main
+    refs=$(git --git-dir="$GITHUB_STORE" show-ref)
+    GITHUB_BRANCH=another
+    export GH_MODE=api-timeout
+    if github_sync_init; then return 1; fi
+    [[ "$GITHUB_LAST_STAGE" == "проверка цели рабочей сессии GitHub" ]] || return 1
+    [[ "$GITHUB_WORKTREE" == "$worktree" && "$GITHUB_SESSION_ID" == "$session" ]] || return 1
+    [[ "$(git --git-dir="$GITHUB_STORE" show-ref)" == "$refs" ]] || return 1
 }
 
 _seed_age_revision() {
@@ -438,6 +669,103 @@ _assert_local_switch_rolled_back() {
         "refs/heads/session/$session"
 }
 
+@test "password SSH substitutions preserve the owning GitHub session until EXIT" {
+    local meta="$BATS_TEST_TMPDIR/ssh-cleanup-meta"
+    local child_config="$BATS_TEST_TMPDIR/ssh-child-config"
+    local child_store="$BATS_TEST_TMPDIR/ssh-child-store.git"
+    local child_sessions="$BATS_TEST_TMPDIR/ssh-child-sessions"
+    cat > "$BATS_TEST_TMPDIR/bin/ssh" <<'SSH'
+#!/bin/bash
+[[ -f "$SSH_ASKPASS" && -f "$_PASS_FILE" ]] || exit 1
+supplied=$("$SSH_ASKPASS") || exit 1
+expected=$(cat "$PASSWORD_FIXTURE") || exit 1
+[[ "$supplied" == "$expected" ]] || exit 1
+printf "%s\n%s\n" "$SSH_ASKPASS" "$_PASS_FILE" > "$TRANSPORT_META" || exit 1
+printf "ok\n"
+SSH
+    chmod 700 "$BATS_TEST_TMPDIR/bin/ssh"
+    run env PROJECT_ROOT="$PROJECT_ROOT" REMOTE="$REMOTE" \
+        CHILD_CONFIG="$child_config" CHILD_STORE="$child_store" \
+        CHILD_SESSIONS="$child_sessions" CLEANUP_META="$meta" \
+        TRANSPORT_META="$BATS_TEST_TMPDIR/askpass-paths" \
+        PASSWORD_FIXTURE="$BATS_TEST_TMPDIR/ssh-password" \
+        /bin/bash -c '
+            source "$PROJECT_ROOT/common/common.sh"
+            CONFIG_DIR="$CHILD_CONFIG"
+            CONFIG_JSON="$CONFIG_DIR/config.json"
+            LOCAL_CONFIG_JSON="$CONFIG_JSON"
+            CONFIG_SOURCE=local
+            GITHUB_STORE="$CHILD_STORE"
+            GITHUB_SESSIONS_DIR="$CHILD_SESSIONS"
+            GITHUB_WORKTREE= GITHUB_SESSION_ID= GITHUB_IDENTITY=
+            source "$PROJECT_ROOT/remote-control/modules/state.sh"
+            source "$PROJECT_ROOT/remote-control/modules/github-config.sh"
+            source "$PROJECT_ROOT/remote-control/modules/ssh.sh"
+            source "$PROJECT_ROOT/remote-control/modules/groups.sh"
+            state_open_local || exit 1
+            printf "mode: rule\n" > "$TEMPLATES_DIR/default.yaml" || exit 1
+            jq_w ".groups=[{name:\"PC\",template:\"default.yaml\"}]" || exit 1
+            git init --bare "$GITHUB_STORE" >/dev/null 2>&1 || exit 1
+            git --git-dir="$GITHUB_STORE" remote add origin "$REMOTE" || exit 1
+            tree=$(git --git-dir="$GITHUB_STORE" mktree </dev/null) || exit 1
+            seed=$(printf "fixture\n" | git --git-dir="$GITHUB_STORE" \
+                -c user.name=Fixture -c user.email=fixture@example.invalid \
+                commit-tree "$tree") || exit 1
+            git --git-dir="$GITHUB_STORE" update-ref refs/heads/main "$seed" || exit 1
+            _github_session_open_cached "$GITHUB_STORE" "$GITHUB_SESSIONS_DIR" main || exit 1
+            CONFIG_SOURCE=github GITHUB_STORAGE_MODE=none
+            register_exit_cleanup github_config_close || exit 1
+            GITHUB_IDENTITY="$CONFIG_DIR/.unlock-check.ssh"
+            printf "ephemeral-identity\n" > "$GITHUB_IDENTITY" || exit 1
+            chmod 600 "$GITHUB_IDENTITY" || exit 1
+            curl() { printf "%s\n" "{\"tag_name\":\"v1.2.3\"}"; }
+            check_update_start || exit 1
+            wait
+            printf "%s\n%s\n%s\n%s\n" \
+                "$GITHUB_WORKTREE" "$GITHUB_SESSION_ID" "$GITHUB_IDENTITY" "$_UPDATE_TMP" \
+                > "$CLEANUP_META" || exit 1
+
+            printf "fixture-password-never-output" > "$PASSWORD_FIXTURE" || exit 1
+            SERVER_AUTH=password SERVER_PASS=$(cat "$PASSWORD_FIXTURE")
+            SERVER_USER=fixture SERVER_IP=example.invalid SERVER_PORT=22
+            SSH_ALLOW_PORTABLE_ONBOARDING=1
+            export _PASS_FILE
+            for attempt in 1 2; do
+                response=$(ssh_run -- "echo ok") || exit 1
+                [[ "$response" == ok ]] || exit 1
+                [[ -d "$GITHUB_WORKTREE" && -f "$GITHUB_IDENTITY" &&
+                   -f "$_UPDATE_TMP" ]] || exit 1
+                git --git-dir="$GITHUB_STORE" show-ref --verify --quiet \
+                    "refs/heads/session/$GITHUB_SESSION_ID" || exit 1
+                {
+                    IFS= read -r askpass
+                    IFS= read -r password
+                } < "$TRANSPORT_META"
+                [[ -n "$askpass" && -n "$password" &&
+                   ! -e "$askpass" && ! -e "$password" ]] || exit 1
+            done
+            state_action add_group add_group <<< "ROUTER" || exit 1
+            jq -e "any(.groups[]; .name==\"ROUTER\")" "$CONFIG_JSON" >/dev/null || exit 1
+            git --git-dir="$REMOTE" show main:config.json |
+                jq -e "any(.groups[]; .name==\"ROUTER\")" >/dev/null || exit 1
+        '
+    assert_success
+    refute_output --partial 'fixture-password-never-output'
+
+    local worktree session identity update_tmp
+    {
+        IFS= read -r worktree
+        IFS= read -r session
+        IFS= read -r identity
+        IFS= read -r update_tmp
+    } < "$meta"
+    [[ -n "$worktree" && ! -d "$worktree" ]] || return 1
+    [[ -n "$identity" && ! -e "$identity" ]] || return 1
+    [[ -n "$update_tmp" && ! -e "$update_tmp" ]] || return 1
+    ! git --git-dir="$child_store" show-ref --verify --quiet \
+        "refs/heads/session/$session"
+}
+
 @test "config close removes session state and permits a fresh session" {
     github_sync_init
     local old_session="$GITHUB_SESSION_ID" old_worktree="$GITHUB_WORKTREE"
@@ -682,6 +1010,44 @@ EOF
     github_config_close
 }
 
+@test "rewrap account check failure after local commit keeps the new password pending" {
+    _seed_age_revision || return 1
+    local age="$BATS_TEST_TMPDIR/age-rewrap-account" new_head rc=0
+    cat > "$age" <<'EOF'
+#!/bin/bash
+out=""
+decrypt=false
+while (($#)); do
+    case "$1" in
+        -d) decrypt=true; shift ;;
+        -o) out="${2:-}"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+if [[ "$decrypt" == true ]]; then
+    printf 'AGE-SECRET-KEY-REWRAP\n' > "$out"
+else
+    printf 'new-unlock\n' > "$out"
+fi
+EOF
+    chmod +x "$age" || return 1
+    AGE_BIN="$age"
+    GITHUB_SESSION_ORIGIN=$(git --git-dir="$GITHUB_STORE" remote get-url origin) || return 1
+    GITHUB_REMOTE=https://github.com/owner/essence-config.git
+    GITHUB_SESSION_REMOTE="$GITHUB_REMOTE"
+    _github_account_login() {
+        _github_record_error "проверка аккаунта GitHub" "gh offline"
+        return 1
+    }
+    github_config_rewrap_master <<< $'old-password\nnew-password\nnew-password\n' || rc=$?
+    [[ "$rc" -eq 0 ]] || return 1
+    [[ "$GITHUB_SYNC_STATUS" == pending ]] || return 1
+    [[ "$(cat "$GITHUB_WORKTREE/unlock.age")" == new-unlock ]] || return 1
+    new_head=$(git -C "$GITHUB_WORKTREE" rev-parse HEAD) || return 1
+    [[ "$(git --git-dir="$GITHUB_STORE" rev-parse main)" == "$new_head" ]] || return 1
+    [[ "$(git --git-dir="$GITHUB_STORE" show main:unlock.age)" == new-unlock ]] || return 1
+}
+
 @test "rotation push failure keeps the complete new age bundle pending" {
     _seed_age_revision || return 1
     local age="$BATS_TEST_TMPDIR/age-rotate" keygen="$BATS_TEST_TMPDIR/age-keygen"
@@ -733,6 +1099,7 @@ EOF
 
 @test "fetch reopen failure keeps the old usable session and a same-process retry succeeds" {
     _seed_live_revision 1
+    _prepare_fetch_runtime "$BATS_TEST_TMPDIR/live-runtime" || return 1
     local old_worktree="$GITHUB_WORKTREE" old_session="$GITHUB_SESSION_ID"
     local calls="$BATS_TEST_TMPDIR/startup.calls" fetch_rc=0
     config_source_startup() {
@@ -766,22 +1133,12 @@ EOF
     local old_worktree="$GITHUB_WORKTREE" old_session="$GITHUB_SESSION_ID"
     local runtime="$BATS_TEST_TMPDIR/live-runtime" auth="$CONFIG_DIR/.auth"
     local rc=0
-    mkdir -p "$runtime" || return 1
-    printf 'old-runtime\n' > "$runtime/value" || return 1
+    _prepare_fetch_runtime "$runtime" || return 1
     printf 'old-auth\n' > "$auth" || return 1
-    STATE_DIR="$runtime"
-    CONFIG_JSON="$runtime/value"
-    export FETCH_RUNTIME_VALUE="$runtime/value" FETCH_AUTH_FILE="$auth"
-    github_config_serialize() {
-        jq -n --arg runtime "$(cat "$FETCH_RUNTIME_VALUE")" \
-            --arg auth "$(cat "$FETCH_AUTH_FILE")" \
-            '{runtime:$runtime,auth:$auth}' > "$1"
-    }
-    _config_source_materialize_state() {
-        local snapshot="$1"
-        jq -r '.runtime' "$snapshot" > "$FETCH_RUNTIME_VALUE" || return 1
-        jq -r '.auth' "$snapshot" > "$FETCH_AUTH_FILE" || return 1
-    }
+    chmod 600 "$auth" || return 1
+    local before
+    before=$(_fetch_runtime_fingerprint "$runtime") || return 1
+    export FETCH_RUNTIME_VALUE="$runtime/config.json" FETCH_AUTH_FILE="$auth"
     config_source_startup() {
         printf 'candidate-runtime\n' > "$FETCH_RUNTIME_VALUE" || return 1
         printf 'candidate-auth\n' > "$FETCH_AUTH_FILE" || return 1
@@ -800,7 +1157,7 @@ EOF
     github_sync_fetch || rc=$?
     unset -f git
     [[ "$rc" -ne 0 ]] || return 1
-    [[ "$(cat "$runtime/value")" == old-runtime ]] || return 1
+    [[ "$(_fetch_runtime_fingerprint "$runtime")" == "$before" ]] || return 1
     [[ "$(cat "$auth")" == old-auth ]] || return 1
     [[ "$GITHUB_WORKTREE" == "$old_worktree" ]] || return 1
     [[ "$GITHUB_SESSION_ID" == "$old_session" ]] || return 1
@@ -811,6 +1168,7 @@ EOF
 @test "fetch retry without a worktree reaches startup instead of mandatory preflush" {
     github_sync_init || return 1
     github_config_close || return 1
+    _prepare_fetch_runtime "$BATS_TEST_TMPDIR/live-runtime" || return 1
     local marker="$BATS_TEST_TMPDIR/startup.called"
     config_source_startup() {
         printf 'called\n' > "$marker"
@@ -944,6 +1302,14 @@ EOF
     expected=$(git --git-dir="$target" rev-parse refs/heads/main)
     git -C "$seed" commit --allow-empty -m descendant >/dev/null
     git -C "$seed" push origin main >/dev/null
+    local remote_head
+    remote_head=$(git --git-dir="$REMOTE" rev-parse refs/heads/main) || return 1
+    _map_github_bare other-owner "$REMOTE" || return 1
+    git --git-dir="$target" remote set-url origin \
+        https://github.com/other-owner/config.git || return 1
+    export GIT_ALLOW_PROTOCOL=file
+    printf 'test-owner\n' > "$FAKE_GH_GLOBAL_LOGIN"
+    rm "$CONFIG_DIR/credentials/gh/test-owner/hosts.yml"
     export GITHUB_ACCOUNT_SWITCH_DIR="$BATS_TEST_TMPDIR/account-switch"
     export GITHUB_ACCOUNT_SWITCH_MARKER="$GITHUB_ACCOUNT_SWITCH_DIR/transaction.json"
     export GITHUB_ACCOUNT_SWITCH_OLD_REPO=test-owner/config
@@ -953,4 +1319,180 @@ EOF
     _github_account_switch_write_marker push_unknown "$expected" true false false || return 1
     github_account_switch_recover || return 1
     [[ "$(jq -r '.phase' "$GITHUB_ACCOUNT_SWITCH_MARKER")" == target_committed ]] || return 1
+    [[ "$(git --git-dir="$target" rev-parse refs/remotes/origin/main)" == "$remote_head" ]] || return 1
+    [[ "$(git --git-dir="$REMOTE" rev-parse refs/heads/main)" == "$remote_head" ]] || return 1
+    [[ "$(cat "$FAKE_GH_GLOBAL_LOGIN")" == test-owner ]] || return 1
+    [[ "$(cat "$CONFIG_DIR/credentials/gh/other-owner/hosts.yml")" == other-owner ]] || return 1
+    [[ "$(cat "$FAKE_GH_LOG")" == *"$CONFIG_DIR/credentials/gh/other-owner|api user"* ]]
+}
+
+@test "HTTPS credential fill ignores wrong global Git helper and inherited gh token" {
+    local credentials
+    export GH_TOKEN=fixture-other-owner GITHUB_TOKEN=fixture-other-owner GH_HOST=elsewhere.invalid
+    credentials=$(printf 'protocol=https\nhost=github.com\n\n' |
+        _github_transport_git test-owner 15 credential fill) || return 1
+    [[ "$credentials" == *'username=test-owner'* ]] || return 1
+    [[ "$credentials" == *'password=fixture-test-owner'* ]] || return 1
+    [[ "$credentials" != *'other-owner'* ]] || return 1
+
+    credentials=$(printf 'protocol=https\nhost=github.com\n\n' |
+        git credential fill) || return 1
+    [[ "$credentials" == *'username=other-owner'* ]] || return 1
+    [[ "$credentials" == *'password=wrong-global-secret'* ]] || return 1
+    [[ "$(cat "$FAKE_GH_GLOBAL_LOGIN")" == other-owner ]] || return 1
+    [[ "$(cat "$CONFIG_DIR/credentials/gh/test-owner/hosts.yml")" == test-owner ]]
+}
+
+@test "explicit account migration sends new commits only to the selected bare remote" {
+    local new_remote="$BATS_TEST_TMPDIR/other-account.git" old_head new_head
+    git init --bare -b main "$new_remote" >/dev/null || return 1
+    _map_github_bare test-owner "$REMOTE" || return 1
+    _map_github_bare other-owner "$new_remote" || return 1
+    export GIT_ALLOW_PROTOCOL=file
+    GITHUB_REMOTE=https://github.com/test-owner/config.git
+    _seed_live_revision 1 || return 1
+    old_head=$(git --git-dir="$REMOTE" rev-parse refs/heads/main) || return 1
+    github_config_close || return 1
+
+    GITHUB_OWNER=other-owner
+    GITHUB_REMOTE=https://github.com/other-owner/config.git
+    github_sync_init || return 1
+    [[ "$(git --git-dir="$GITHUB_STORE" config --get remote.origin.url)" == "$GITHUB_REMOTE" ]] || return 1
+    [[ "$(git --git-dir="$REMOTE" rev-parse refs/heads/main)" == "$old_head" ]] || return 1
+    ! git --git-dir="$new_remote" show-ref --verify --quiet refs/heads/main || return 1
+    printf '{"storage_version":1,"encryption":"none","revision":2}\n' \
+        > "$GITHUB_WORKTREE/storage.json"
+    github_sync_flush || return 1
+    new_head=$(git --git-dir="$new_remote" rev-parse refs/heads/main) || return 1
+    [[ "$new_head" != "$old_head" ]] || return 1
+    _assert_remote_revision "$new_remote" 2 || return 1
+    [[ "$(git --git-dir="$REMOTE" rev-parse refs/heads/main)" == "$old_head" ]] || return 1
+    _assert_remote_revision "$REMOTE" 1 || return 1
+    [[ "$(cat "$FAKE_GH_GLOBAL_LOGIN")" == other-owner ]]
+}
+
+@test "unauthorized migration cannot alter either bare remote or cached source" {
+    local new_remote="$BATS_TEST_TMPDIR/other-account.git" old_head cached_head
+    git init --bare -b main "$new_remote" >/dev/null || return 1
+    _map_github_bare test-owner "$REMOTE" || return 1
+    _map_github_bare other-owner "$new_remote" || return 1
+    export GIT_ALLOW_PROTOCOL=file
+    GITHUB_REMOTE=https://github.com/test-owner/config.git
+    _seed_live_revision 1 || return 1
+    old_head=$(git --git-dir="$REMOTE" rev-parse refs/heads/main) || return 1
+    cached_head=$(git --git-dir="$GITHUB_STORE" rev-parse refs/heads/main) || return 1
+    github_config_close || return 1
+
+    printf 'test-owner\n' > "$FAKE_GH_GLOBAL_LOGIN"
+    rm "$CONFIG_DIR/credentials/gh/other-owner/hosts.yml"
+    GITHUB_OWNER=other-owner
+    GITHUB_REMOTE=https://github.com/other-owner/config.git
+    if github_sync_init; then return 1; fi
+    [[ "$(git --git-dir="$REMOTE" rev-parse refs/heads/main)" == "$old_head" ]] || return 1
+    [[ "$(git --git-dir="$GITHUB_STORE" rev-parse refs/heads/main)" == "$cached_head" ]] || return 1
+    [[ "$(git --git-dir="$GITHUB_STORE" config --get remote.origin.url)" == https://github.com/test-owner/config.git ]] || return 1
+    ! git --git-dir="$new_remote" show-ref --verify --quiet refs/heads/main || return 1
+    [[ "$(cat "$FAKE_GH_GLOBAL_LOGIN")" == test-owner ]]
+}
+
+_prepare_fetch_runtime() {
+    local runtime="$1"
+    mkdir -p "$runtime/templates" "$runtime/ssh/identities" || return 1
+    jq -n '{schema_version:2,nodes:[
+      {id:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",name:"portable-a",ip:"192.0.2.10",port:22,user:"root",auth:"password",identity:null,secret_id:"node:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:ssh-password"},
+      {id:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",name:"portable-b",ip:"192.0.2.11",port:22,user:"root",auth:"password",identity:null,secret_id:"node:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:ssh-password"}],
+      groups:[],clients:[],connections:[]}' > "$runtime/config.json"
+    printf '{"schema_version":1,"node_passwords":{"node:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:ssh-password":"unreadable-ciphertext\\n"}}\n' > "$runtime/secrets.json"
+    printf '{"schema_version":2,"portability":{"status":"ready","issues":[]},"access":{"script_password_hash":null},"templates":{}}\n' > "$runtime/manifest.json"
+    printf 'mode: rule\n' > "$runtime/templates/default.yaml"
+    printf 'unchanged-known-hosts\n' > "$runtime/ssh/known_hosts"
+    chmod 700 "$runtime" "$runtime/templates" "$runtime/ssh" "$runtime/ssh/identities" || return 1
+    chmod 600 "$runtime/"*.json "$runtime/templates/default.yaml" "$runtime/ssh/known_hosts" || return 1
+    export STATE_DIR="$runtime" CONFIG_JSON="$runtime/config.json"
+    export SECRETS_JSON="$runtime/secrets.json" STATE_MANIFEST="$runtime/manifest.json"
+    export TEMPLATES_DIR="$runtime/templates" SSH_IDENTITIES_DIR="$runtime/ssh/identities"
+    export SSH_KNOWN_HOSTS="$runtime/ssh/known_hosts"
+    source_module 'nodes.sh'
+    override_pass_key
+    node_secret_set aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 'synthetic-fetch-good' || return 1
+}
+
+_fetch_runtime_fingerprint() {
+    local root="$1" path
+    while IFS= read -r path; do
+        printf '%s %s\n' "${path#"$root"}" "$(_file_mode "$path")" || return 1
+        if [[ -f "$path" ]]; then
+            openssl dgst -sha256 < "$path" || return 1
+        fi
+    done < <(find "$root" -print | LC_ALL=C sort)
+}
+
+@test "portable password fetch rollback preserves raw ciphertext modes and absent auth" {
+    _seed_live_revision 1
+    local runtime="$CONFIG_DIR/live-runtime" auth="$CONFIG_DIR/.auth"
+    _prepare_fetch_runtime "$runtime" || return 1
+    local before old_worktree="$GITHUB_WORKTREE" old_session="$GITHUB_SESSION_ID"
+    before=$(_fetch_runtime_fingerprint "$runtime") || return 1
+    local branch presence rc
+    for branch in failed-startup no-session; do
+        for presence in present absent; do
+            if [[ "$presence" == present ]]; then
+                printf 'exact-auth\n\n' > "$auth"
+                chmod 600 "$auth"
+            else
+                rm -f "$auth"
+            fi
+            config_source_startup() {
+                printf 'new-ciphertext\n' > "$runtime/secrets.json"
+                printf 'new-manifest\n' > "$runtime/manifest.json"
+                printf 'new-auth\n' > "$auth"
+                STATE_DIR="$CONFIG_DIR/wrong-runtime"
+                CONFIG_JSON="$STATE_DIR/config.json"
+                SECRETS_JSON="$STATE_DIR/secrets.json"
+                STATE_MANIFEST="$STATE_DIR/manifest.json"
+                TEMPLATES_DIR="$STATE_DIR/templates"
+                SSH_IDENTITIES_DIR="$STATE_DIR/ssh/identities"
+                SSH_KNOWN_HOSTS="$STATE_DIR/ssh/known_hosts"
+                [[ "$branch" == no-session ]]
+            }
+            rc=0
+            github_sync_fetch || rc=$?
+            if [[ "$branch" == failed-startup ]]; then [[ "$rc" -ne 0 ]] || return 1
+            else [[ "$rc" -eq 0 ]] || return 1; fi
+            [[ "$(_fetch_runtime_fingerprint "$runtime")" == "$before" ]] || return 1
+            [[ "$STATE_DIR" == "$runtime" && "$CONFIG_JSON" == "$runtime/config.json" ]] || return 1
+            [[ "$SECRETS_JSON" == "$runtime/secrets.json" && "$STATE_MANIFEST" == "$runtime/manifest.json" ]] || return 1
+            [[ "$TEMPLATES_DIR" == "$runtime/templates" && "$SSH_IDENTITIES_DIR" == "$runtime/ssh/identities" ]] || return 1
+            [[ "$SSH_KNOWN_HOSTS" == "$runtime/ssh/known_hosts" ]] || return 1
+            [[ "$GITHUB_WORKTREE" == "$old_worktree" && "$GITHUB_SESSION_ID" == "$old_session" ]] || return 1
+            if [[ "$presence" == present ]]; then
+                cmp -s "$auth" <(printf 'exact-auth\n\n') || return 1
+                [[ "$(_file_mode "$auth")" == 600 ]] || return 1
+            else [[ ! -e "$auth" ]] || return 1; fi
+            [[ -z "$(find "$CONFIG_DIR" -maxdepth 1 -name '.fetch-runtime.*' -print)" ]] || return 1
+        done
+    done
+}
+
+@test "portable password failed fetch restore retains a lossless private backup" {
+    _seed_live_revision 1
+    local runtime="$CONFIG_DIR/live-runtime" auth="$CONFIG_DIR/.auth"
+    _prepare_fetch_runtime "$runtime" || return 1
+    printf 'original-auth\n' > "$auth"
+    chmod 600 "$auth"
+    local before backup rc=0
+    before=$(_fetch_runtime_fingerprint "$runtime") || return 1
+    config_source_startup() {
+        printf 'candidate-secrets\n' > "$runtime/secrets.json"
+        return 79
+    }
+    _github_runtime_restore() { return 83; }
+    github_sync_fetch || rc=$?
+    [[ "$rc" -ne 0 ]] || return 1
+    backup=$(find "$CONFIG_DIR" -maxdepth 1 -type d -name '.fetch-runtime.*' -print)
+    [[ -n "$backup" && -d "$backup/runtime" ]] || return 1
+    [[ "$(_file_mode "$backup")" == 700 ]] || return 1
+    [[ "$(_fetch_runtime_fingerprint "$backup/runtime")" == "$before" ]] || return 1
+    cmp -s "$backup/auth" "$auth" || return 1
+    [[ "$GITHUB_LAST_ERROR $GITHUB_LAST_HINT" == *"$backup"* ]] || return 1
 }

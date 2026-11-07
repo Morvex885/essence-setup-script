@@ -155,6 +155,7 @@ _config_source_materialize_state() {
     local old_identities="${SSH_IDENTITIES_DIR:-}" old_hosts="${SSH_KNOWN_HOSTS:-}"
     local old_auth_file="${SCRIPT_AUTH_FILE:-}" had_runtime=false had_auth=false
     local rollback_ok=true rollback_backup_preserved=false
+    github_config_validate "$logical" || return 1
     stage=$(umask 077; mktemp -d "$CONFIG_DIR/.github-runtime.stage.XXXXXX") || {
         _github_record_error "подготовка рабочего состояния" \
             "Не удалось создать защищённый каталог staging."
@@ -162,7 +163,10 @@ _config_source_materialize_state() {
     }
     if ! mkdir -p "$stage/templates" "$stage/ssh/identities" ||
        ! jq -e '.config' "$logical" > "$stage/config.json" ||
-       ! jq -e '.secrets' "$logical" > "$stage/secrets.json" ||
+       ! jq -e '.secrets' "$logical" > "$stage/.portable-secrets.json" ||
+       ! chmod 600 "$stage/.portable-secrets.json" ||
+       ! _state_secrets_import_portable "$stage/.portable-secrets.json" "$stage/secrets.json" ||
+       ! rm -f "$stage/.portable-secrets.json" ||
        ! jq -e '{schema_version:2,minimum_remote_control_version,portability,templates,access}' \
             "$logical" > "$stage/manifest.json" ||
        ! jq -j '.ssh.known_hosts // ""' "$logical" > "$stage/ssh/known_hosts"; then
@@ -384,6 +388,9 @@ _config_source_materialize_state() {
     SSH_KNOWN_HOSTS="$runtime/ssh/known_hosts"; SCRIPT_AUTH_FILE="$CONFIG_DIR/.auth"
     export CONFIG_SOURCE STATE_DIR CONFIG_JSON SECRETS_JSON STATE_MANIFEST
     export TEMPLATES_DIR SSH_IDENTITIES_DIR SSH_KNOWN_HOSTS SCRIPT_AUTH_FILE
+    _state_warn_missing_passwords "$CONFIG_JSON" \
+        "$(jq -c '.portability.issues' "$STATE_MANIFEST")"
+    return 0
 }
 _config_source_materialize_github() {
     local logical="${1:-$CONFIG_DIR/runtime-vault.json}"
@@ -430,6 +437,146 @@ _config_source_create_empty_snapshot() {
     SSH_KNOWN_HOSTS="$old_hosts"; SCRIPT_AUTH_FILE="$old_auth"; rm -rf "$stage"
 }
 
+# _config_source_publish_logical <logical> — write the snapshot to the worktree, push, materialize.
+# Returns 1 when nothing was published, 3 when GitHub was updated but the runtime was not.
+_config_source_publish_logical() {
+    local logical="${1:?logical state}"
+    github_config_checkpoint "$logical" || return 1
+    if ! github_sync_flush; then
+        _github_report_last_error "Не удалось отправить конфигурацию в GitHub"
+        warn "Изменения сохранены локально и ожидают отправки."
+        GITHUB_SYNC_STATUS=pending
+    fi
+    if ! _config_source_materialize_state "$logical"; then
+        _github_ensure_error "подготовка рабочего состояния" \
+            "Конфигурация GitHub обновлена, но рабочее состояние не подготовлено."
+        return 3
+    fi
+    mv -f "$logical" "$CONFIG_DIR/runtime-vault.json" ||
+        warn "Не удалось сохранить копию опубликованной конфигурации GitHub."
+    return 0
+}
+
+# _github_plaintext_review_lines — fill GITHUB_PLAINTEXT_REVIEW_LINES with the notice for
+# repositories stored without encryption (empty otherwise). No mapfile: Bash 3.2 is supported.
+_github_plaintext_review_lines() {
+    GITHUB_PLAINTEXT_REVIEW_LINES=()
+    [[ "${GITHUB_STORAGE_MODE:-}" == none ]] || return 0
+    GITHUB_PLAINTEXT_REVIEW_LINES=("Пароли SSH и ключи будут храниться в GitHub без шифрования"
+        "и навсегда останутся в истории Git.")
+}
+
+# _config_source_local_snapshot <out> — vault snapshot of the device-only state in CONFIG_DIR.
+_config_source_local_snapshot() {
+    local out="${1:?snapshot}" rc=0
+    local old_source="$CONFIG_SOURCE" old_state="$STATE_DIR" old_config="$CONFIG_JSON"
+    local old_secrets="$SECRETS_JSON" old_manifest="$STATE_MANIFEST"
+    local old_templates="$TEMPLATES_DIR" old_ids="$SSH_IDENTITIES_DIR"
+    local old_hosts="$SSH_KNOWN_HOSTS" old_auth="$SCRIPT_AUTH_FILE"
+    CONFIG_SOURCE=github; STATE_DIR="$CONFIG_DIR"
+    CONFIG_JSON="${LOCAL_CONFIG_JSON:-$CONFIG_DIR/config.json}"
+    SECRETS_JSON="$CONFIG_DIR/secrets.json"; STATE_MANIFEST="$CONFIG_DIR/manifest.json"
+    TEMPLATES_DIR="$CONFIG_DIR/templates"; SSH_IDENTITIES_DIR="$CONFIG_DIR/ssh/identities"
+    SSH_KNOWN_HOSTS="$CONFIG_DIR/ssh/known_hosts"; SCRIPT_AUTH_FILE="$CONFIG_DIR/.auth"
+    if ! _state_ensure_dirs || ! state_format_migrate || ! _state_ensure_secrets ||
+       ! state_checkpoint || ! state_validate false >/dev/null 2>&1 ||
+       ! _github_initial_portable_onboarding ||
+       ! github_config_serialize "$out" "$CONFIG_JSON"; then
+        rc=1
+    fi
+    CONFIG_SOURCE="$old_source"; STATE_DIR="$old_state"; CONFIG_JSON="$old_config"
+    SECRETS_JSON="$old_secrets"; STATE_MANIFEST="$old_manifest"
+    TEMPLATES_DIR="$old_templates"; SSH_IDENTITIES_DIR="$old_ids"
+    SSH_KNOWN_HOSTS="$old_hosts"; SCRIPT_AUTH_FILE="$old_auth"
+    return "$rc"
+}
+
+# _github_counts_label <nodes\tclients\tgroups>
+_github_counts_label() {
+    local nodes clients groups
+    if [[ -z "${1:-}" ]]; then
+        printf '%s\n' "не читается"
+        return 0
+    fi
+    IFS=$'\t' read -r nodes clients groups <<< "$1"
+    printf 'нод %s, клиентов %s, групп %s\n' "$nodes" "$clients" "$groups"
+}
+
+# _github_format_migrate_prepare <candidate> <from> — 0 confirmed, 2 declined, 1 error.
+_github_format_migrate_prepare() {
+    local candidate="${1:?candidate}" from="${2:-?}" names minimum
+    github_config_open "$GITHUB_WORKTREE" "$candidate" migrate || return 1
+    minimum=$(_github_vault_format_min_version "$GITHUB_VAULT_FORMAT") || return 1
+    names=$(jq -r '[.portability.issues[] | select(.reason=="missing_secret") | .node_id] as $ids |
+        [.config.nodes[] | select(.id as $i | $ids | index($i)) | .name] | join(", ")' \
+        "$candidate" 2>/dev/null) || names=""
+    _github_plaintext_review_lines
+    review_frame "Преобразование конфигурации GitHub" \
+        "Репозиторий: ${GITHUB_OWNER:-?}/${GITHUB_REPO_NAME} (ветка ${GITHUB_BRANCH})" \
+        "Формат: v${from} → v${GITHUB_VAULT_FORMAT}" \
+        "Устройства с Remote Control старше ${minimum} перестанут читать конфигурацию." \
+        "Предыдущая версия останется в истории Git." \
+        "${GITHUB_PLAINTEXT_REVIEW_LINES[@]}" \
+        ${names:+"Потребуется повторный ввод пароля: ${names}"}
+    if ! confirm_yn "Преобразовать и опубликовать конфигурацию?" N; then
+        rm -f "$candidate"
+        return 2
+    fi
+}
+
+# github_format_migrate_action <from> — 0 published, 2 declined, 1 error, 3 published without runtime.
+github_format_migrate_action() {
+    local from="${1:-?}" candidate rc=0
+    candidate=$(umask 077; mktemp "$CONFIG_DIR/.vault-migrate.XXXXXX") || return 1
+    _github_format_migrate_prepare "$candidate" "$from" || rc=$?
+    [[ $rc -eq 0 ]] && { _config_source_publish_logical "$candidate" || rc=$?; }
+    [[ $rc -eq 0 ]] || rm -f "$candidate"
+    return "$rc"
+}
+
+# github_replace_with_local_action <recovery|menu> — 0 published, 2 declined/no data, 1 error,
+# 3 published without runtime.
+github_replace_with_local_action() {
+    local mode="${1:-menu}" candidate local_counts github_counts pending_line=""
+    local local_config="${LOCAL_CONFIG_JSON:-$CONFIG_DIR/config.json}" local_nodes local_clients rc=0
+    if [[ ! -f "$local_config" ]]; then
+        warn "Конфигурация только этого компьютера отсутствует."
+        return 2
+    fi
+    # Review reads the device-only config as is: nothing local or remote changes before consent.
+    local_counts=$(jq -r '[(.nodes//[]|length),(.clients//[]|length),(.groups//[]|length)]|@tsv' \
+        "$local_config" 2>/dev/null) || local_counts=""
+    if [[ "$mode" == recovery ]]; then
+        github_counts="${GITHUB_LAST_SNAPSHOT_COUNTS:-}"
+    else
+        github_counts=$(jq -r '[(.nodes//[]|length),(.clients//[]|length),(.groups//[]|length)]|@tsv' \
+            "$CONFIG_JSON" 2>/dev/null) || github_counts=""
+        [[ "${GITHUB_SYNC_STATUS:-}" == pending ]] &&
+            pending_line="Неотправленные изменения рабочей конфигурации GitHub будут заменены."
+    fi
+    _github_plaintext_review_lines
+    review_frame "Замена конфигурации GitHub" \
+        "Репозиторий: ${GITHUB_OWNER:-?}/${GITHUB_REPO_NAME} (ветка ${GITHUB_BRANCH})" \
+        "Будет опубликована конфигурация только этого компьютера." \
+        "Этот компьютер: $(_github_counts_label "$local_counts")" \
+        "GitHub: $(_github_counts_label "$github_counts")" \
+        "Текущая конфигурация GitHub останется только в истории Git." \
+        "${GITHUB_PLAINTEXT_REVIEW_LINES[@]}" \
+        ${pending_line:+"$pending_line"}
+    IFS=$'\t' read -r local_nodes local_clients _ <<< "$local_counts"
+    [[ "${local_nodes:-0}" == 0 && "${local_clients:-0}" == 0 ]] &&
+        warn "Локальная конфигурация пуста."
+    confirm_yn "Заменить конфигурацию GitHub?" N || return 2
+    candidate=$(umask 077; mktemp "$CONFIG_DIR/.vault-replace.XXXXXX") || return 1
+    if ! _config_source_local_snapshot "$candidate"; then
+        rm -f "$candidate"
+        return 1
+    fi
+    _config_source_publish_logical "$candidate" || rc=$?
+    [[ $rc -eq 0 ]] || rm -f "$candidate"
+    return "$rc"
+}
+
 github_config_snapshot_cached() {
     local out="${1:?snapshot}" expected_repo="${2:?repo}" branch="${3:?branch}"
     local origin old_store="$GITHUB_STORE" old_sessions="$GITHUB_SESSIONS_DIR"
@@ -466,8 +613,53 @@ github_config_snapshot_cached() {
 }
 
 
+_github_change_rollback() {
+    local rc=0
+    github_account_switch_rollback || rc=$?
+    GITHUB_STORE="$1"; GITHUB_SESSIONS_DIR="$2"
+    GITHUB_WORKTREE="$3"; GITHUB_SESSION_ID="$4"
+    GITHUB_REMOTE="$5"; GITHUB_BRANCH="$6"; GITHUB_OWNER="$7"
+    GITHUB_IDENTITY="$8"; GITHUB_RECIPIENT="$9"
+    GITHUB_SESSION_REMOTE="${10}"; GITHUB_SESSION_BRANCH="${11}"
+    GITHUB_SESSION_ORIGIN="${12}"; GITHUB_STORAGE_MODE="${13}"
+    export GITHUB_STORE GITHUB_SESSIONS_DIR GITHUB_WORKTREE GITHUB_SESSION_ID
+    export GITHUB_REMOTE GITHUB_BRANCH GITHUB_OWNER GITHUB_IDENTITY GITHUB_RECIPIENT
+    export GITHUB_SESSION_REMOTE GITHUB_SESSION_BRANCH GITHUB_SESSION_ORIGIN GITHUB_STORAGE_MODE
+    return "$rc"
+}
+
+# Push outcome is unknown: keep the push_unknown marker for
+# github_account_switch_recover and close both sessions. Without a worktree,
+# flush and config writes fail, so nothing reaches either repository until
+# F or the next start verifies the push and finishes or rolls back the switch.
+_github_account_switch_suspend() {
+    local stage="${GITHUB_LAST_STAGE:-}" detail="${GITHUB_LAST_ERROR:-}"
+    local hint="${GITHUB_LAST_HINT:-}" auth="${GITHUB_LAST_AUTH_RELEVANT:-false}"
+    github_config_close >/dev/null 2>&1 || true
+    GITHUB_STORE="$1"; GITHUB_SESSIONS_DIR="$2"
+    GITHUB_WORKTREE="$3"; GITHUB_SESSION_ID="$4"
+    GITHUB_REMOTE="$5"; GITHUB_BRANCH="$6"; GITHUB_OWNER="$7"
+    GITHUB_IDENTITY="$8"; GITHUB_RECIPIENT="$9"
+    GITHUB_SESSION_REMOTE="${10}"; GITHUB_SESSION_BRANCH="${11}"
+    GITHUB_SESSION_ORIGIN="${12}"; GITHUB_STORAGE_MODE="${13}"
+    if [[ -n "$GITHUB_WORKTREE" || -n "$GITHUB_SESSION_ID" ]]; then
+        github_config_close >/dev/null 2>&1 || true
+    fi
+    GITHUB_WORKTREE=""; GITHUB_SESSION_ID=""
+    GITHUB_SESSION_REMOTE=""; GITHUB_SESSION_BRANCH=""; GITHUB_SESSION_ORIGIN=""
+    GITHUB_SYNC_STATUS=pending
+    export GITHUB_STORE GITHUB_SESSIONS_DIR GITHUB_WORKTREE GITHUB_SESSION_ID
+    export GITHUB_REMOTE GITHUB_BRANCH GITHUB_OWNER GITHUB_IDENTITY GITHUB_RECIPIENT
+    export GITHUB_SESSION_REMOTE GITHUB_SESSION_BRANCH GITHUB_SESSION_ORIGIN
+    export GITHUB_STORAGE_MODE GITHUB_SYNC_STATUS
+    warn "Результат отправки в новый репозиторий не подтверждён. Синхронизация и изменения приостановлены."
+    info "Выберите F (загрузить из GitHub) или перезапустите remote-control: смена аккаунта будет проверена и завершена или отменена."
+    GITHUB_LAST_STAGE="$stage"; GITHUB_LAST_ERROR="$detail"
+    GITHUB_LAST_HINT="$hint"; GITHUB_LAST_AUTH_RELEVANT="$auth"
+}
+
 github_source_change_account() {
-    local mode="${1:-menu}" initial_login="${2:-}"
+    local initial_login
     local old_repo old_name branch old_store old_sessions new_repo old_storage
     local old_worktree old_remote old_branch old_owner old_session
     local old_identity old_recipient old_session_remote old_session_branch old_session_origin
@@ -486,27 +678,14 @@ github_source_change_account() {
     old_identity="$GITHUB_IDENTITY"; old_recipient="$GITHUB_RECIPIENT"
     old_session_remote="$GITHUB_SESSION_REMOTE"; old_session_branch="$GITHUB_SESSION_BRANCH"
     old_session_origin="$GITHUB_SESSION_ORIGIN"; old_storage="$GITHUB_STORAGE_MODE"
+    local -a original=("$old_store" "$old_sessions" "$old_worktree" "$old_session"
+        "$old_remote" "$old_branch" "$old_owner" "$old_identity" "$old_recipient"
+        "$old_session_remote" "$old_session_branch" "$old_session_origin" "$old_storage")
 
-    if [[ -n "$initial_login" ]]; then
-        [[ "$initial_login" =~ ^[A-Za-z0-9-]+$ ]] || {
-            _github_record_error "выбор аккаунта GitHub" \
-                "Указано некорректное имя активного аккаунта GitHub."
-            return 1
-        }
-    elif ! _github_load_active_login; then
-        return 1
-    else
-        initial_login="$GITHUB_ACTIVE_LOGIN"
-    fi
-    if ! _github_select_account "$initial_login" "${old_repo%%/*}"; then
-        local picker_error="${GITHUB_LAST_ERROR:-Выбор аккаунта GitHub отменён.}"
-        if ! _github_switch_active_account "$initial_login"; then
-            _github_record_error "отмена выбора аккаунта GitHub" \
-                "$picker_error Активный аккаунт не удалось восстановить."
-        else
-            _github_record_error "выбор аккаунта GitHub" \
-                "Смена аккаунта GitHub отменена."
-        fi
+    initial_login="${old_repo%%/*}"
+    if ! _github_select_account "$initial_login"; then
+        GITHUB_OWNER="$initial_login"
+        export GITHUB_OWNER
         return 1
     fi
     target_owner="$GITHUB_OWNER"
@@ -516,7 +695,10 @@ github_source_change_account() {
         return 0
     }
 
-    _github_mkdir_secure "$GITHUB_ACCOUNT_SWITCH_DIR" || return 1
+    if ! _github_mkdir_secure "$GITHUB_ACCOUNT_SWITCH_DIR"; then
+        GITHUB_OWNER="$old_owner"
+        return 1
+    fi
     if [[ -f "$CONFIG_JSON" && -f "$SECRETS_JSON" && -f "$STATE_MANIFEST" ]] &&
        github_config_serialize "$logical" "$CONFIG_JSON"; then
         old_state_available=true
@@ -530,16 +712,18 @@ github_source_change_account() {
             _github_account_switch_remove_path "$GITHUB_ACCOUNT_SWITCH_DIR" || true
             _github_record_error "выбор данных смены аккаунта" \
                 "Смена аккаунта GitHub отменена."
+            GITHUB_OWNER="$old_owner"
             return 1
         fi
     fi
     if ! github_account_switch_begin "$old_repo" "$new_repo" "$branch" "$initial_login"; then
+        GITHUB_OWNER="$old_owner"
         return 1
     fi
     if ! cp "$CONFIG_DIR/source.json" "$GITHUB_ACCOUNT_SWITCH_DIR/old-source.json" ||
        ! chmod 600 "$GITHUB_ACCOUNT_SWITCH_DIR/old-source.json" ||
        ! _github_account_switch_write_marker prepared "" "$old_state_available" false false; then
-        github_account_switch_rollback >/dev/null 2>&1 || true
+        _github_change_rollback "${original[@]}" >/dev/null 2>&1 || true
         return 1
     fi
 
@@ -548,16 +732,27 @@ github_source_change_account() {
     GITHUB_SESSIONS_DIR="$GITHUB_ACCOUNT_SWITCH_DIR/target-sessions"
     GITHUB_SESSION_ID=""; GITHUB_WORKTREE=""
     if ! github_sync_init true onboarding true; then
-        github_account_switch_rollback >/dev/null 2>&1 || true
+        _github_change_rollback "${original[@]}" >/dev/null 2>&1 || true
         return 1
     fi
     tracked=$(git -C "$GITHUB_WORKTREE" ls-files 2>/dev/null) || {
-        github_account_switch_rollback >/dev/null 2>&1 || true
+        _github_change_rollback "${original[@]}" >/dev/null 2>&1 || true
         return 1
     }
     if [[ -n "$tracked" ]]; then
         if github_config_open "$GITHUB_WORKTREE" "$target_state"; then
             target_valid=true
+        elif [[ "${GITHUB_LAST_FORMAT:-}" == outdated || "${GITHUB_LAST_FORMAT:-}" == newer ]]; then
+            local switch_stage="$GITHUB_LAST_STAGE" switch_error="$GITHUB_LAST_ERROR" switch_hint=""
+            if [[ "$GITHUB_LAST_FORMAT" == outdated ]]; then
+                switch_stage="проверка формата конфигурации GitHub"
+                switch_error="Репозиторий ${new_repo} содержит конфигурацию формата v${GITHUB_LAST_FORMAT_VERSION}. Смена аккаунта прервана."
+                switch_hint="Отключите синхронизацию (e) и подключите GitHub заново под новым аккаунтом: при подключении будет предложено преобразование."
+            fi
+            github_config_close >/dev/null 2>&1 || true
+            _github_change_rollback "${original[@]}" >/dev/null 2>&1 || true
+            _github_record_error "$switch_stage" "$switch_error" false "$switch_hint"
+            return 1
         else
             target_needs_replace=true
         fi
@@ -565,7 +760,7 @@ github_source_change_account() {
     if [[ "$target_valid" == true ]]; then
         if ! _github_prompt_existing_config_action "$old_state_available"; then
             github_config_close >/dev/null 2>&1 || true
-            github_account_switch_rollback >/dev/null 2>&1 || true
+            _github_change_rollback "${original[@]}" >/dev/null 2>&1 || true
             return 1
         fi
         action="$GITHUB_EXISTING_ACTION"
@@ -580,11 +775,11 @@ github_source_change_account() {
         if [[ "$target_needs_replace" == true ]]; then
             if ! confirm_yn "Удалить все tracked-файлы $new_repo и заменить репозиторий корректной конфигурацией Essence?" N; then
                 github_config_close >/dev/null 2>&1 || true
-                github_account_switch_rollback >/dev/null 2>&1 || true
+                _github_change_rollback "${original[@]}" >/dev/null 2>&1 || true
                 return 1
             fi
             git -C "$GITHUB_WORKTREE" rm -r -f -- . >/dev/null 2>&1 || {
-                github_account_switch_rollback >/dev/null 2>&1 || true
+                _github_change_rollback "${original[@]}" >/dev/null 2>&1 || true
                 return 1
             }
         fi
@@ -593,16 +788,16 @@ github_source_change_account() {
         else
             desired_state="$logical"
             if ! _config_source_create_empty_snapshot "$desired_state"; then
-                github_account_switch_rollback >/dev/null 2>&1 || true
+                _github_change_rollback "${original[@]}" >/dev/null 2>&1 || true
                 return 1
             fi
         fi
         if ! _github_prompt_storage_mode; then
-            github_account_switch_rollback >/dev/null 2>&1 || true
+            _github_change_rollback "${original[@]}" >/dev/null 2>&1 || true
             return 1
         fi
         if [[ "$GITHUB_STORAGE_MODE" == age ]] && ! github_config_age_init; then
-            github_account_switch_rollback >/dev/null 2>&1 || true
+            _github_change_rollback "${original[@]}" >/dev/null 2>&1 || true
             return 1
         fi
         push_required=true
@@ -611,7 +806,7 @@ github_source_change_account() {
        { ! cp "$desired_state" "$target_state" || ! chmod 600 "$target_state" ||
          ! github_config_validate "$target_state"; }; then
         local target_state_error="${GITHUB_LAST_ERROR:-Снимок целевой конфигурации не прошёл проверку.}"
-        github_account_switch_rollback >/dev/null 2>&1 || true
+        _github_change_rollback "${original[@]}" >/dev/null 2>&1 || true
         _github_record_error "подготовка целевой конфигурации" "$target_state_error"
         return 1
     fi
@@ -619,7 +814,7 @@ github_source_change_account() {
         if ! github_config_checkpoint "$desired_state" || ! _github_sync_commit; then
             local failure_stage="${GITHUB_LAST_STAGE:-сохранение новой конфигурации}"
             local failure_detail="${GITHUB_LAST_ERROR:-Не удалось подготовить новую конфигурацию.}"
-            github_account_switch_rollback >/dev/null 2>&1 || true
+            _github_change_rollback "${original[@]}" >/dev/null 2>&1 || true
             _github_record_error "$failure_stage" "$failure_detail"
             return 1
         fi
@@ -627,7 +822,7 @@ github_source_change_account() {
         [[ "$expected_head" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]] || {
             _github_record_error "подготовка отправки новой конфигурации" \
                 "Не удалось определить commit новой конфигурации."
-            github_account_switch_rollback >/dev/null 2>&1 || true
+            _github_change_rollback "${original[@]}" >/dev/null 2>&1 || true
             return 1
         }
         if ! _github_account_switch_write_marker push_unknown "$expected_head" \
@@ -635,10 +830,11 @@ github_source_change_account() {
             "${GITHUB_ACCOUNT_SWITCH_REPO_PRIVATIZED:-false}"; then
             _github_record_error "подготовка отправки новой конфигурации" \
                 "Не удалось записать защищённый маркер перед отправкой."
-            github_account_switch_rollback >/dev/null 2>&1 || true
+            _github_change_rollback "${original[@]}" >/dev/null 2>&1 || true
             return 1
         fi
         if ! _github_sync_push "$expected_head"; then
+            _github_account_switch_suspend "${original[@]}"
             return 1
         fi
         _github_account_switch_write_marker target_committed "$expected_head" \
@@ -646,6 +842,7 @@ github_source_change_account() {
             "${GITHUB_ACCOUNT_SWITCH_REPO_PRIVATIZED:-false}" || {
             _github_record_error "фиксация отправленной конфигурации" \
                 "Не удалось записать состояние завершённой отправки."
+            _github_account_switch_suspend "${original[@]}"
             return 1
         }
     else
@@ -722,27 +919,8 @@ config_source_startup() {
             return 1
         }
         source_owner="${source_repo%%/*}"
-        local active_login
-        if ! _github_load_active_login; then
-            return 1
-        fi
-        active_login="$GITHUB_ACTIVE_LOGIN"
-        if [[ "$active_login" != "$source_owner" ]]; then
-            warn "Конфигурация подключена к GitHub-аккаунту $source_owner, а сейчас выбран $active_login."
-            info "Ничего не изменено. Выберите аккаунт, с которым продолжить."
-            if ! github_source_change_account startup "$active_login"; then
-                return 1
-            fi
-            source_repo=$(jq -er '.repo' "$CONFIG_DIR/source.json") || {
-                _github_record_error "проверка настроек источника GitHub" "source.json не содержит репозиторий GitHub."
-                return 1
-            }
-            source_branch=$(jq -er '.branch' "$CONFIG_DIR/source.json") || {
-                _github_record_error "проверка настроек источника GitHub" "source.json не содержит ветку GitHub."
-                return 1
-            }
-            source_owner="${source_repo%%/*}"
-        fi
+        # The saved repository owns this session; global gh selection is only
+        # a first-connect hint and must never trigger a migration on startup.
         CONFIG_SOURCE=github
         GITHUB_OWNER="$source_owner"
         GITHUB_BRANCH="$source_branch"
@@ -918,19 +1096,52 @@ github_enable_local() {
             _github_enable_rollback "$source_backup" "$source_had_file"
             return 1
         }
+        local connect_outdated=false connect_from="" prepare_rc
         if ! github_config_open "$GITHUB_WORKTREE" "$tmp_state"; then
-            _github_ensure_error "чтение существующей конфигурации GitHub" \
-                "Не удалось проверить или расшифровать существующую конфигурацию. Репозиторий не изменён."
-            _github_enable_rollback "$source_backup" "$source_had_file" "$tmp_state"
-            return 1
+            if [[ "${GITHUB_LAST_FORMAT:-}" == outdated ]]; then
+                connect_outdated=true
+                connect_from="$GITHUB_LAST_FORMAT_VERSION"
+                _github_clear_error
+            else
+                _github_ensure_error "чтение существующей конфигурации GitHub" \
+                    "Не удалось проверить или расшифровать существующую конфигурацию. Репозиторий не изменён."
+                _github_enable_rollback "$source_backup" "$source_had_file" "$tmp_state"
+                return 1
+            fi
         fi
-        if ! _github_prompt_existing_config_action; then
+        if ! _github_prompt_existing_config_action true "$connect_outdated"; then
             _github_record_error "выбор версии конфигурации" "Подключение GitHub отменено."
             _github_enable_rollback "$source_backup" "$source_had_file" "$tmp_state"
             return 1
         fi
+        if [[ "$GITHUB_EXISTING_ACTION" == migrate ]]; then
+            prepare_rc=0
+            _github_format_migrate_prepare "$tmp_state" "$connect_from" || prepare_rc=$?
+            if [[ $prepare_rc -eq 2 ]]; then
+                _github_record_error "выбор версии конфигурации" "Подключение GitHub отменено."
+                _github_enable_rollback "$source_backup" "$source_had_file" "$tmp_state"
+                return 1
+            elif [[ $prepare_rc -ne 0 ]]; then
+                _github_ensure_error "преобразование конфигурации GitHub" \
+                    "Не удалось преобразовать конфигурацию GitHub."
+                _github_enable_rollback "$source_backup" "$source_had_file" "$tmp_state"
+                return 1
+            fi
+            CONFIG_SOURCE=github
+            if ! github_config_checkpoint "$tmp_state"; then
+                _github_ensure_error "подготовка конфигурации к отправке" \
+                    "Не удалось собрать конфигурацию для репозитория GitHub."
+                _github_enable_rollback "$source_backup" "$source_had_file" "$tmp_state"
+                return 1
+            fi
+            if ! github_sync_flush; then
+                GITHUB_SYNC_STATUS=pending
+                _github_report_last_error "Не удалось отправить преобразованную конфигурацию в GitHub"
+                warn "Изменения сохранены локально и не отправлены."
+            fi
+        fi
         CONFIG_SOURCE=github
-        if [[ "$GITHUB_EXISTING_ACTION" != remote ]]; then
+        if [[ "$GITHUB_EXISTING_ACTION" == local ]]; then
             if ! _github_initial_portable_onboarding; then
                 _github_ensure_error "подготовка переносимой конфигурации" \
                     "Не удалось подготовить локальные файлы для хранения в GitHub."
@@ -991,6 +1202,7 @@ github_source_menu() {
 
     local _sync_status _encrypted_storage
     while true; do
+        [[ $CONFIG_SOURCE == github ]] || return 0
         _sync_status=$(_github_sync_status_label)
         _encrypted_storage=false
         [[ ${GITHUB_STORAGE_MODE:-none} == age ]] && _encrypted_storage=true
@@ -1000,20 +1212,21 @@ github_source_menu() {
     box_mid
     box_line " Состояние синхронизации: ${_sync_status}"
     box_mid
-    box_line " F) Загрузить конфигурацию из GitHub" " ${CYAN}F)${NC} Загрузить конфигурацию из GitHub"
-    box_line " P) Отправить локальную конфигурацию в GitHub" " ${GREEN}P)${NC} Отправить локальную конфигурацию в GitHub"
-    box_line " C) Сменить аккаунт GitHub" " ${YELLOW}C)${NC} Сменить аккаунт GitHub"
+    menu_item f "Загрузить конфигурацию из GitHub" YELLOW
+    menu_item p "Отправить локальную конфигурацию в GitHub" YELLOW
+    menu_item c "Сменить аккаунт GitHub" YELLOW
     if [[ "$_encrypted_storage" == true ]]; then
-        box_line " R) Сменить пароль доступа (ключ останется прежним)" " ${YELLOW}R)${NC} Сменить пароль доступа ${DIM}(ключ останется прежним)${NC}"
-        box_line " V) Создать новый ключ шифрования" " ${YELLOW}V)${NC} Создать новый ключ шифрования"
+        menu_item r "Сменить пароль доступа (ключ останется прежним)" RED
+        menu_item v "Создать новый ключ шифрования" RED
         box_line "    Текущая конфигурация будет зашифрована заново" " ${DIM}   Текущая конфигурация будет зашифрована заново${NC}"
         box_line "    Старые версии в GitHub потребуют прежний ключ" " ${DIM}   Старые версии в GitHub потребуют прежний ключ${NC}"
         box_line "    Пароли нод при этом не меняются" " ${DIM}   Пароли нод при этом не меняются${NC}"
-        box_line " I) Импортировать ключ восстановления" " ${YELLOW}I)${NC} Импортировать ключ восстановления"
+        menu_item i "Импортировать ключ восстановления" YELLOW
     fi
-    box_line " E) Использовать локальную конфигурацию без синхронизации с GitHub" " ${RED}E)${NC} Использовать локальную конфигурацию без синхронизации с GitHub"
-    box_line " D) Удалить репозиторий GitHub" " ${RED}D)${NC} Удалить репозиторий GitHub"
-    box_line " 0) Назад"
+    menu_item e "Использовать локальную конфигурацию без синхронизации с GitHub" RED
+    menu_item o "Заменить GitHub конфигурацией только этого компьютера" RED
+    menu_item d "Удалить репозиторий GitHub" RED
+    menu_item 0 "Назад" NC
     box_bot
     echo ""
     if ! IFS= read -rp "  Выберите действие: " _sync_choice; then
@@ -1022,11 +1235,10 @@ github_source_menu() {
     _sync_choice="${_sync_choice%$'\r'}"
     case "$_sync_choice" in
         C|c)
-            if github_source_change_account menu; then
+            if github_source_change_account; then
                 :
             else
                 _github_report_last_error "Не удалось сменить аккаунт GitHub"
-                return 1
             fi
             ;;
         F|f)
@@ -1055,7 +1267,6 @@ github_source_menu() {
                 else
                     warn "Не удалось изменить пароль доступа."
                 fi
-                return 1
             fi
             ;;
         V|v)
@@ -1069,14 +1280,14 @@ github_source_menu() {
                 else
                     warn "Не удалось создать новый ключ шифрования."
                 fi
-                return 1
             fi
             ;;
         I|i)
             if [[ "$_encrypted_storage" != true ]]; then
                 warn "Неверный выбор."
             else
-                read -rp "  Путь к файлу с ключом восстановления: " _recovery
+                if ! IFS= read -rp "  Путь к файлу с ключом восстановления: " _recovery; then return 0; fi
+                _recovery="${_recovery%$'\r'}"
                 if github_config_import_recovery "$_recovery"; then
                     success "Ключ восстановления импортирован для текущего сеанса."
                 else
@@ -1085,7 +1296,6 @@ github_source_menu() {
                     else
                         warn "Не удалось импортировать ключ восстановления."
                     fi
-                    return 1
                 fi
             fi
             ;;
@@ -1102,6 +1312,25 @@ github_source_menu() {
                 return 1
             fi
             ;;
+        O|o)
+            local _replace_rc=0
+            github_replace_with_local_action menu || _replace_rc=$?
+            case "$_replace_rc" in
+                0) success "Конфигурация GitHub заменена конфигурацией только этого компьютера." ;;
+                2) ;;
+                3)
+                    _github_report_last_error "Не удалось обновить рабочее состояние"
+                    error "Конфигурация GitHub заменена, но рабочее состояние не обновилось. Перезапустите скрипт."
+                    ;;
+                *)
+                    if [[ -n "${GITHUB_LAST_ERROR:-}" ]]; then
+                        _github_report_last_error "Не удалось заменить конфигурацию GitHub"
+                    else
+                        warn "Не удалось заменить конфигурацию GitHub."
+                    fi
+                    ;;
+            esac
+            ;;
         D|d)
             local _repo_to_delete
             _repo_to_delete=$(_github_repo)
@@ -1110,6 +1339,7 @@ github_source_menu() {
             if confirm_yn "Удалить репозиторий $_repo_to_delete?" N; then
                 if github_repository_delete "$_repo_to_delete"; then
                     success "Репозиторий $_repo_to_delete удалён. Конфигурация сохранена локально, синхронизация отключена."
+                    return 0
                 else
                     _github_report_last_error "Не удалось удалить репозиторий GitHub"
                     if [[ "$GITHUB_LAST_STAGE" == "удаление репозитория GitHub" ]]; then
@@ -1131,6 +1361,12 @@ menu_nodes() {
     while true; do
         local count
         count=$(nodes_count)
+        local _password_issues _password_readable=true
+        if ! _password_issues=$(_state_password_issues "$CONFIG_JSON" "$SECRETS_JSON"); then
+            _password_readable=false
+            _password_issues='[]'
+            warn "Не удалось прочитать состояние паролей SSH."
+        fi
         local _show_deferred_ssh_setup=false
         if [[ $CONFIG_SOURCE == github ]] &&
            state_actionable_ssh_setup_pending; then
@@ -1143,105 +1379,118 @@ menu_nodes() {
 
         echo ""
         box_top
-        box_center "Essence Remote Management"
+        box_center "Essence — управление нодами"
         local _ver="версия: ${CURRENT_VERSION}"
         box_center "$_ver" "${DIM}${_ver}${NC}"
-        if has_update "$CURRENT_VERSION"; then
-            local _upd="↑ ${latest} — нажмите U"
-            box_center "$_upd" "${YELLOW}↑ ${latest} — нажмите U${NC}"
+        if [[ -n "$latest" ]] && has_update "$CURRENT_VERSION"; then
+            local _upd="↑ ${latest} — нажмите u"
+            box_line " $_upd" " ${YELLOW}${_upd}${NC}"
         fi
         box_mid
         if [[ $count -eq 0 ]]; then
-            box_line " (нод нет — добавьте первую)" " ${DIM}(нод нет — добавьте первую)${NC}"
+            box_line " Нет нод — добавьте первую" " ${DIM}Нет нод — добавьте первую${NC}"
         else
-            local _num=1
-            while IFS=$'\t' read -r _name _addr _tag; do
-                local _tag_plain="" _tag_color=""
-                [[ -n "$_tag" ]] && { _tag_plain=" [${_tag}]"; _tag_color=" ${DIM}[${_tag}]${NC}"; }
-                box_line " ${_num}) ${_name}  ${_addr}${_tag_plain}" " ${GREEN}${_num})${NC} ${_name}  ${_addr}${_tag_color}"
+            local _num=1 _node_id _name _addr _tag
+            while IFS=$'\t' read -r _node_id _name _addr _tag; do
+                local _tag_plain="" _password_label=""
+                [[ -n "$_tag" ]] && _tag_plain=" [${_tag}]"
+                if jq -e --arg id "$_node_id" 'any(.[]; .node_id==$id)' \
+                    <<< "$_password_issues" >/dev/null; then
+                    _password_label=" — пароль требует настройки"
+                fi
+                box_line " ${_num}) ${_name}  ${_addr}${_tag_plain}${_password_label}" \
+                    " ${CYAN}${_num})${NC} ${_name}  ${_addr}${_tag_plain}${YELLOW}${_password_label}${NC}"
                 _num=$((_num + 1))
-            done < <(jq_r '.nodes[] | "\(.name)\t\(.ip):\(.port)\t\(.tag // "")"')
+            done < <(jq_r '.nodes[] | "\(.id)\t\(.name)\t\(.ip):\(.port)\t\(.tag // "")"')
         fi
         box_mid
-        box_line " a) Добавить ноду" " ${GREEN}a)${NC} Добавить ноду"
+        menu_item n "Добавить ноду" GREEN
         if [[ $count -gt 0 ]]; then
-            box_line " n) Переименовать ноду" " ${YELLOW}n)${NC} Переименовать ноду"
-            box_line " t) Тег ноды" " ${YELLOW}t)${NC} Тег ноды"
-            box_line " d) Удалить ноду" " ${RED}d)${NC} Удалить ноду"
+            menu_item r "Переименовать ноду" YELLOW
+            menu_item e "Тег ноды" YELLOW
+            menu_item d "Удалить ноду" RED
         fi
         box_mid
-        box_line " C) Клиенты" " ${CYAN}C)${NC} Клиенты"
-        box_line " G) Группы" " ${YELLOW}G)${NC} Группы"
+        menu_item c "Клиенты" CYAN
+        menu_item g "Группы" CYAN
         box_mid
-        box_line " P) Подключения нод для групп" " ${YELLOW}P)${NC} Подключения нод для групп"
-        if [[ $CONFIG_SOURCE == github ]] &&
-           [[ "$_show_deferred_ssh_setup" == true ]]; then
-            box_line " H) Завершить отложенную SSH-настройку нод" " ${YELLOW}H)${NC} Завершить отложенную SSH-настройку нод"
+        menu_item p "Подключения нод для групп" CYAN
+        if [[ "$_show_deferred_ssh_setup" == true ]]; then
+            menu_item h "Завершить отложенную SSH-настройку" YELLOW
         fi
-        box_line " W) AWG подключения" " ${CYAN}W)${NC} AWG подключения"
-        box_line " b) Telegram Proxy" " ${CYAN}b)${NC} Telegram Proxy"
+        menu_item a "Клиенты AmneziaWG" CYAN
+        menu_item t "Telegram Proxy" CYAN
         box_mid
-        box_line " F) Сгенерировать конфиги" " ${GREEN}F)${NC} Сгенерировать конфиги"
-        box_line " S) Подписки" " ${GREEN}S)${NC} Подписки"
+        menu_item f "Сгенерировать конфиги" CYAN
+        menu_item s "Подписки" CYAN
         box_mid
         if [[ $CONFIG_SOURCE == github ]]; then
             local _github_status _github_url _github_link
             _github_status=$(_github_sync_status_label)
             _github_url="https://github.com/$(_github_repo)"
             _github_link=$(hyperlink "$_github_url" "GitHub")
-            box_line " Y) Источник конфигурации: GitHub • ${_github_status}" " ${CYAN}Y)${NC} Источник конфигурации: ${_github_link} • ${_github_status}"
+            box_line " i) Источник конфигурации: GitHub • ${_github_status}" " ${CYAN}i)${NC} Источник конфигурации: ${_github_link} • ${_github_status}"
         else
-            box_line " Y) Источник конфигурации: локальный" " ${CYAN}Y)${NC} Источник конфигурации: локальный"
+            menu_item i "Источник конфигурации: локальный" CYAN
         fi
-        box_line " U) Обновить скрипт" " ${CYAN}U)${NC} Обновить скрипт"
-        box_line " L) Пароль скрипта" " ${YELLOW}L)${NC} Пароль скрипта"
-        box_line " R) Удалить remote-control" " ${RED}R)${NC} Удалить remote-control"
-        box_line " 0) Выход"
+        menu_item u "Обновить скрипт" YELLOW
+        menu_item l "Пароль скрипта" CYAN
+        menu_item x "Удалить remote-control" RED
+        menu_item 0 "Выход" NC
         box_bot
         echo ""
         if ! IFS= read -rp "  Выберите ноду или действие: " _pick; then
-            echo ""; echo "  Выход."; exit 0
+            info "Выход."; exit 0
         fi
         _pick="${_pick%$'\r'}"
         case "$_pick" in
             0)
-                echo ""; echo "  Выход."; exit 0
+                info "Выход."; exit 0
                 ;;
             *)
                 if menu_index_valid "$_pick" "$count"; then
-                    node_load "$_pick"
-                    menu_operations
+                    local _load_rc=0
+                    node_load "$_pick" || _load_rc=$?
+                    case "$_load_rc" in
+                        0) menu_operations ;;
+                        2)
+                            if [[ "$_password_readable" == true ]] &&
+                               node_prompt_password "$_pick" && node_load "$_pick"; then
+                                menu_operations
+                            fi
+                            ;;
+                        *) warn "Не удалось загрузить выбранную ноду." ;;
+                    esac
                 else
                     case "$_pick" in
-                        a|A) state_action "add_node" add_node ;;
+                        n|N) state_action "add_node" add_node ;;
                         d|D)
-                            [[ $count -gt 0 ]] && state_action "delete_node" delete_node ||
-                                warn "Неверный выбор."
+                            if [[ $count -gt 0 ]]; then state_action "delete_node" delete_node; else warn "Неверный выбор."; fi
                             ;;
-                        n|N)
-                            [[ $count -gt 0 ]] && state_action "rename_node" rename_node ||
-                                warn "Неверный выбор."
+                        r|R)
+                            if [[ $count -gt 0 ]]; then state_action "rename_node" rename_node; else warn "Неверный выбор."; fi
                             ;;
-                        t|T)
-                            [[ $count -gt 0 ]] && state_action "set_node_tag" set_node_tag ||
-                                warn "Неверный выбор."
+                        e|E)
+                            if [[ $count -gt 0 ]]; then state_action "set_node_tag" set_node_tag; else warn "Неверный выбор."; fi
                             ;;
-                        C|c) clients_menu ;;
-                        P|p) connections_menu ;;
-                        G|g) groups_menu ;;
-                        F|f) generate_menu ;;
-                        W|w) awg_peers_menu ;;
-                        b|B) telegram_proxy_remote_menu ;;
-                        S|s) subscription_menu ;;
-                        Y|y) github_source_menu ;;
-                        H|h)
-                            [[ "$_show_deferred_ssh_setup" == true ]] &&
-                                state_action "complete_portable_node_setup" complete_portable_node_setup ||
+                        c|C) clients_menu ;;
+                        p|P) connections_menu ;;
+                        g|G) groups_menu ;;
+                        f|F) generate_menu ;;
+                        a|A) awg_peers_menu ;;
+                        t|T) telegram_proxy_remote_menu ;;
+                        s|S) subscription_menu ;;
+                        i|I) github_source_menu ;;
+                        h|H)
+                            if [[ "$_show_deferred_ssh_setup" == true ]]; then
+                                state_action "complete_portable_node_setup" complete_portable_node_setup
+                            else
                                 warn "Неверный выбор."
+                            fi
                             ;;
-                        U|u) self_update ;;
-                        L|l) state_action "set_script_password" set_script_password ;;
-                        R|r) uninstall_self ;;
+                        u|U) self_update ;;
+                        l|L) set_script_password ;;
+                        x|X) uninstall_self ;;
                         *) warn "Неверный выбор." ;;
                     esac
                 fi
@@ -1256,39 +1505,36 @@ menu_operations() {
     while true; do
         echo ""
         box_top
-        local _node="${NODE_NAME}  (${SERVER_IP})"
+        local _node="${NODE_NAME}  ${SERVER_IP}:${SERVER_PORT}"
         box_center "$_node" "${GREEN}${_node}${NC}"
         box_mid
-        box_line " 1) Открыть меню сервера" " ${GREEN}1)${NC} Открыть меню сервера"
-        box_line " b) Telegram Proxy" " ${CYAN}b)${NC} Telegram Proxy"
-        box_mid
-        box_line " h) Настройка SSH ключа на ноде" " ${YELLOW}h)${NC} Настройка SSH ключа на ноде"
-        box_line " u) Обновить скрипты на сервере" " ${CYAN}u)${NC} Обновить скрипты на сервере"
-        box_line " 0) Назад"
+        menu_item o "Открыть меню сервера" CYAN
+        menu_item t "Telegram Proxy" CYAN
+        menu_item h "Усиление защиты SSH" YELLOW
+        menu_item u "Загрузить скрипты принудительно" YELLOW
+        menu_item 0 "Назад" NC
         box_bot
         echo ""
-        if ! IFS= read -rp "  Выберите пункт: " CHOICE; then
+        if ! IFS= read -rp "  Выберите действие: " CHOICE; then
             return 0
         fi
         CHOICE="${CHOICE%$'\r'}"
 
         case "$CHOICE" in
-            1)
-                if ssh_connect && upload_scripts; then
+            o|O)
+                if ssh_connect && ensure_remote_scripts_current; then
                     run_remote
-                    echo ""
-                    echo -e "  ${DIM}── SSH-сессия завершена ──────────────────${NC}"
-                    confirm_yn "Продолжить работу с ${NODE_NAME}?" Y || return 0
+                    info "SSH-сессия завершена."
                 else
-                    warn "Не удалось открыть SSH-сессию или загрузить скрипты."
+                    warn "Не удалось открыть SSH-сессию или подготовить скрипты."
                 fi
                 ;;
-            b|B)
-                TELEGRAM_PROXY_NODE_SCOPED=true telegram_proxy_remote_menu
+            t|T)
+                telegram_proxy_remote_open_menu "$CURRENT_NODE_INDEX" || true
                 ;;
             h|H)        state_action "ssh_hardening" ssh_hardening ;;
             u|U)
-                if ! upload_scripts; then
+                if ! ensure_remote_scripts_current --force; then
                     warn "Не удалось загрузить скрипты для ноды '${NODE_NAME}'."
                 fi
                 ;;
@@ -1337,21 +1583,122 @@ first_run_source_menu() {
     done
 }
 
+# github_format_recovery_menu — startup recovery for snapshot format errors; 0 = runtime ready.
+github_format_recovery_menu() {
+    local state="${GITHUB_LAST_FORMAT:-invalid}" from="${GITHUB_LAST_FORMAT_VERSION:-}"
+    local required="${GITHUB_LAST_FORMAT_REQUIRED:-}" context choice rc
+    while true; do
+        case "$state" in
+            outdated) context="Формат конфигурации GitHub: v${from}, требуется v${GITHUB_VAULT_FORMAT}" ;;
+            newer)
+                if [[ -n "$required" ]]; then
+                    context="Требуется Remote Control ${required}; установлена ${CURRENT_VERSION}"
+                else
+                    context="Формат конфигурации GitHub v${from} новее поддерживаемого"
+                fi
+                ;;
+            *) context="Конфигурация GitHub повреждена или не прошла проверку" ;;
+        esac
+        echo ""
+        box_top
+        box_center "Восстановление запуска"
+        box_mid
+        box_line " ${context}" " ${YELLOW}${context}${NC}"
+        box_mid
+        [[ "$state" == outdated ]] && menu_item 1 "Преобразовать и опубликовать" YELLOW
+        [[ "$state" == outdated || "$state" == invalid ]] &&
+            menu_item 2 "Заменить GitHub конфигурацией только этого компьютера" RED
+        menu_item 0 "Выход" NC
+        box_bot
+        echo ""
+        if ! IFS= read -rp "  Выберите действие: " choice; then
+            return 1
+        fi
+        choice="${choice%$'\r'}"
+        case "$choice" in
+            1)
+                if [[ "$state" != outdated ]]; then
+                    warn "Неверный выбор."
+                    continue
+                fi
+                rc=0
+                github_format_migrate_action "$from" || rc=$?
+                case "$rc" in
+                    0)
+                        success "Конфигурация GitHub преобразована в формат v${GITHUB_VAULT_FORMAT}."
+                        return 0
+                        ;;
+                    2) ;;
+                    3)
+                        _github_report_last_error "Не удалось обновить рабочее состояние"
+                        warn "Конфигурация GitHub преобразована. Перезапустите скрипт."
+                        return 1
+                        ;;
+                    *)
+                        _github_report_last_error "Не удалось преобразовать конфигурацию GitHub"
+                        [[ "${GITHUB_LAST_FORMAT:-}" == invalid ]] && state=invalid
+                        ;;
+                esac
+                ;;
+            2)
+                if [[ "$state" != outdated && "$state" != invalid ]]; then
+                    warn "Неверный выбор."
+                    continue
+                fi
+                rc=0
+                github_replace_with_local_action recovery || rc=$?
+                case "$rc" in
+                    0)
+                        success "Конфигурация GitHub заменена конфигурацией только этого компьютера."
+                        return 0
+                        ;;
+                    2) ;;
+                    3)
+                        _github_report_last_error "Не удалось обновить рабочее состояние"
+                        warn "Конфигурация GitHub заменена. Перезапустите скрипт."
+                        return 1
+                        ;;
+                    *)
+                        if [[ -n "${GITHUB_LAST_ERROR:-}" ]]; then
+                            _github_report_last_error "Не удалось заменить конфигурацию GitHub"
+                        else
+                            warn "Не удалось заменить конфигурацию GitHub."
+                        fi
+                        ;;
+                esac
+                ;;
+            0) return 1 ;;
+            *) warn "Неверный выбор." ;;
+        esac
+    done
+}
+
 # ─── Точка входа ──────────────────────────────────────────────────────────────
 if ! first_run_source_menu; then
     [[ -n "${GITHUB_LAST_ERROR:-}" ]] &&
         _github_report_last_error "Не удалось подключить GitHub"
     exit 1
 fi
+startup_password_checked=false
 while ! config_source_startup; do
     if [[ "$CONFIG_SOURCE" == github || -n "${GITHUB_LAST_STAGE:-}" ]]; then
         _github_report_last_error "Не удалось открыть источник GitHub"
     else
         warn "Не удалось открыть источник конфигурации."
     fi
+    if [[ "$CONFIG_SOURCE" == github && -n "${GITHUB_LAST_FORMAT:-}" ]]; then
+        # Recovery actions publish to GitHub: authenticate before offering them.
+        check_script_password || exit 1
+        startup_auth_before=$(cat "$SCRIPT_AUTH_FILE" 2>/dev/null || true)
+        github_format_recovery_menu || exit 1
+        # The published snapshot may carry another script password: ask again if it changed.
+        [[ "$(cat "$SCRIPT_AUTH_FILE" 2>/dev/null || true)" == "$startup_auth_before" ]] &&
+            startup_password_checked=true
+        break
+    fi
     startup_recovery_menu "Восстановление источника конфигурации" true || exit 1
 done
-if ! check_script_password; then
+if [[ "$startup_password_checked" != true ]] && ! check_script_password; then
     exit 1
 fi
 menu_nodes
