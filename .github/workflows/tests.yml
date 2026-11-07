@@ -1,10 +1,20 @@
 name: Tests
 
-on: [push, pull_request]
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    concurrency:
+      group: tests-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -31,6 +41,10 @@ jobs:
 
       - name: Validate xHTTP nginx config with latest nginx
         run: docker run --rm -v /tmp/nginx-xhttp.conf:/etc/nginx/nginx.conf:ro nginx:latest nginx -t
+
+      - name: Build and verify release tarball (PR в main)
+        if: github.event_name == 'pull_request' && github.base_ref == 'main'
+        run: bash tests/ci/build_release_tarball.sh v0.0.0-ci "$RUNNER_TEMP/release"
 
       - name: Run unit tests
         env:
