@@ -1093,7 +1093,8 @@ _telegram_proxy_build_relay() {
                 GOPATH="$build_tmp/gopath" TMPDIR="$build_tmp" \
                 "$go_binary" build -buildvcs=false -trimpath -ldflags='-s -w' -o "$build_tmp/tproxy-server" ./cmd/tproxy-server); then
         rc=1
-    elif ! cp -- "$build_tmp/tproxy-server" "$candidate"; then
+    # Read as tproxy: a symlink planted in build_tmp must not expose root-only files.
+    elif ! runuser -u tproxy -- cat -- "$build_tmp/tproxy-server" > "$candidate"; then
         rc=1
     fi
     chown -R root:root "$source" || rc=1
@@ -2015,7 +2016,7 @@ _telegram_proxy_cleanup_backend() {
 
 telegram_proxy_web_remove() {
     local force=false arg host created relay_active relay_enabled failed=false
-    local challenge_root extra_roots=()
+    local challenge_root extra_roots=() backend_paths=()
     for arg in "$@"; do
         case "$arg" in
             --force) force=true ;;
@@ -2050,6 +2051,16 @@ telegram_proxy_web_remove() {
         challenge_root="$CERT_EFFECTIVE_WEBROOT"
         [[ "$challenge_root" == "$TPROXY_WEBROOT_BASE/$host" ]] || extra_roots+=("$challenge_root")
     fi
+    # The shared backend is removed only when Web Proxy is the last component.
+    if [[ "$TELEGRAM_MTPROTO_ENABLED" != true ]]; then
+        backend_paths=(
+            "$TPROXY_ENV_FILE" "$TPROXY_MTPROXY_DIR" "$TPROXY_MTPROXY_SOURCE_DIR"
+            "$TPROXY_SYSTEMD_DIR/$TPROXY_UNIT_MTPROXY"
+            "$TPROXY_SYSTEMD_DIR/$TPROXY_UNIT_FIREWALL"
+            "$TPROXY_SYSTEMD_DIR/$TPROXY_UNIT_REFRESH"
+            "$TPROXY_SYSTEMD_DIR/$TPROXY_UNIT_TIMER" "$TPROXY_REFRESH_BIN"
+        )
+    fi
     _telegram_proxy_snapshot_paths \
         "$TPROXY_CONF" "$TPROXY_CONFIG_JSON" "$TPROXY_PROFILES_FILE" \
         "$TPROXY_RELAY_SOURCE_PATH" "$TPROXY_SITE_DIR" "$TPROXY_BIN" \
@@ -2060,11 +2071,7 @@ telegram_proxy_web_remove() {
         "$TPROXY_NGINX_ENABLED_DIR/essence-acme-$host" \
         ${extra_roots[@]+"${extra_roots[@]}"} \
         "$TPROXY_SYSTEMD_DIR/$TPROXY_UNIT_RELAY" "$TPROXY_FIREWALL_FILE" \
-        "$TPROXY_ENV_FILE" "$TPROXY_MTPROXY_DIR" "$TPROXY_MTPROXY_SOURCE_DIR" \
-        "$TPROXY_SYSTEMD_DIR/$TPROXY_UNIT_MTPROXY" \
-        "$TPROXY_SYSTEMD_DIR/$TPROXY_UNIT_FIREWALL" \
-        "$TPROXY_SYSTEMD_DIR/$TPROXY_UNIT_REFRESH" \
-        "$TPROXY_SYSTEMD_DIR/$TPROXY_UNIT_TIMER" "$TPROXY_REFRESH_BIN" || return 1
+        ${backend_paths[@]+"${backend_paths[@]}"} || return 1
     _telegram_proxy_snapshot_certificate_registration "$host" || {
         _telegram_proxy_restore_snapshot
         return 1

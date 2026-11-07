@@ -147,39 +147,23 @@ ensure_acme_installed() {
 }
 
 # acme.sh runs HTTP-01 hooks in the private domain directory on issue and on
-# every renewal. The pre-hook records whether TCP/80 was already allowed; the
-# post-hook restores that state instead of closing a port opened by the owner.
-# A state left by an interrupted run is kept: it holds the state before the port
-# was opened by that run.
+# every renewal; ensure_cert runs the same hooks around its own orders.
+# The pre-hook saves `ufw show added` once (a snapshot left by an interrupted
+# run predates the port it opened) and adds the temporary `allow 80/tcp`.
+# The post-hook deletes that rule unless it existed before, then re-adds saved
+# TCP/80 rules the temporary rule replaced (deny, IPv6-only or subnet rules
+# stay as they were). Saved lines are never evaluated: only lines matching
+# CERT_HTTP01_RULE_RE are passed to ufw as plain words. No snapshot: no change.
 CERT_HTTP01_STATE_FILE=.essence-http01-80.state
-CERT_HTTP01_PRE_HOOK="{ [ -e $CERT_HTTP01_STATE_FILE ] || { if ufw status 2>/dev/null | grep -Eq \"^80/tcp +ALLOW( |\$)\"; then echo allow; else echo closed; fi > $CERT_HTTP01_STATE_FILE; }; } && ufw allow 80/tcp"
-CERT_HTTP01_POST_HOOK="{ [ \"\$(cat $CERT_HTTP01_STATE_FILE 2>/dev/null)\" = allow ] || ufw deny 80/tcp; } && rm -f $CERT_HTTP01_STATE_FILE && systemctl reload nginx"
+CERT_HTTP01_RULE_RE='ufw (allow|deny|reject|limit)( (in|out))?( [A-Za-z0-9./:_-]+)+'
+CERT_HTTP01_PRE_HOOK="{ [ -e $CERT_HTTP01_STATE_FILE ] || { ufw show added > $CERT_HTTP01_STATE_FILE.tmp && mv $CERT_HTTP01_STATE_FILE.tmp $CERT_HTTP01_STATE_FILE; }; } && ufw allow 80/tcp"
+CERT_HTTP01_POST_HOOK="if [ -e $CERT_HTTP01_STATE_FILE ]; then { grep -qx \"ufw allow 80/tcp\" $CERT_HTTP01_STATE_FILE || ufw delete allow 80/tcp; } && ufw show added > $CERT_HTTP01_STATE_FILE.now && grep \"^ufw \" $CERT_HTTP01_STATE_FILE | grep -w 80 | while read -r r; do grep -qxF -- \"\$r\" $CERT_HTTP01_STATE_FILE.now && continue; if printf \"%s\\\\n\" \"\$r\" | grep -Eqx \"$CERT_HTTP01_RULE_RE\"; then ufw \${r#ufw } || exit 1; else echo \"essence: UFW rule skipped: \$r\" >&2; fi; done && rm -f $CERT_HTTP01_STATE_FILE $CERT_HTTP01_STATE_FILE.now; fi && systemctl reload nginx"
 
-_cert_http01_allowed() { ufw status 2>/dev/null | grep -Eq '^80/tcp +ALLOW( |$)'; }
-
-_cert_http01_state_files() {
-    printf '%s\n' "$HOME/.acme.sh/${1}_ecc/$CERT_HTTP01_STATE_FILE" "$HOME/.acme.sh/$1/$CERT_HTTP01_STATE_FILE"
-}
-
-# State before HTTP-01 opened TCP/80: a hook state left by an interrupted
-# renewal wins over the current UFW rule, which that renewal opened.
-_cert_http01_initially_allowed() {
-    local file state=""
-    while IFS= read -r file; do
-        [[ -f "$file" ]] || continue
-        state=$(<"$file")
-        break
-    done < <(_cert_http01_state_files "$1")
-    case "$state" in
-        allow) return 0 ;;
-        closed) return 1 ;;
-    esac
-    _cert_http01_allowed
-}
-
-_cert_http01_clear_state() {
-    local file
-    while IFS= read -r file; do rm -f "$file"; done < <(_cert_http01_state_files "$1")
+# Runs an HTTP-01 hook for the order family directory, as acme.sh does.
+_cert_http01_hook() {
+    local dir="$1" hook="$2"
+    mkdir -p "$dir" && chmod 700 "$dir" || return 1
+    (cd "$dir" && eval "$hook") >/dev/null
 }
 
 # Identity is also used as a filename and a literal nginx server_name.
@@ -779,7 +763,7 @@ _cert_ensure_rollback() {
 ensure_cert() (
     local identity="${1:-}" webroot="${2:-}" is_ip="${3:-false}" cert_dir="${4:-/etc/nginx/ssl}"
     local available="${5:-/etc/nginx/sites-available}" enabled="${6:-/etc/nginx/sites-enabled}"
-    local conf="${7:-/etc/nginx/nginx.conf}" dest tx="" now path file ok=false firewall=false http01_allowed=false
+    local conf="${7:-/etc/nginx/nginx.conf}" dest tx="" now path file ok=false firewall=false http01_dir=""
     local index length=ec-256 rc issued=false message i unmanaged_usable=false
     _cert_identity_valid "$identity" || { warn "Некорректное имя сертификата."; return 1; }
     for path in "$webroot" "$cert_dir" "$available" "$enabled" "$conf" "$HOME/.acme.sh"; do
@@ -806,7 +790,7 @@ ensure_cert() (
         _cert_snapshot "$dest/$file" "$tx/$file" || { rm -rf "$tx"; return 1; }
     done
     [[ -d "$dest" ]] || : > "$tx/dest.absent"
-    trap 'if [[ "$firewall" == true ]]; then if [[ "$http01_allowed" == true ]] || ufw deny 80/tcp >/dev/null; then _cert_http01_clear_state "$identity"; else warn "Не удалось закрыть порт HTTP-01."; fi; fi; if [[ "$ok" != true ]]; then _cert_ensure_rollback "$identity" "$tx" "$dest" "$available" "$enabled" "$conf"; fi; rm -rf "$tx"' EXIT
+    trap 'if [[ "$firewall" == true ]] && ! _cert_http01_hook "$http01_dir" "$CERT_HTTP01_POST_HOOK"; then warn "Не удалось вернуть исходные правила UFW для TCP/80."; fi; if [[ "$ok" != true ]]; then _cert_ensure_rollback "$identity" "$tx" "$dest" "$available" "$enabled" "$conf"; fi; rm -rf "$tx"' EXIT
     if [[ "$CERT_MATERIAL" == none ]]; then
         if ((${#CERT_REG_FILES[@]} > 0)); then
             length="${CERT_REG_LENGTHS[0]}"
@@ -816,9 +800,10 @@ ensure_cert() (
         _cert_enable_site "$identity" "$webroot" "$available" "$enabled" "$conf" || {
             warn "Не удалось включить HTTP-01 маршрут."; return 1;
         }
-        if _cert_http01_initially_allowed "$identity"; then http01_allowed=true; fi
-        ufw allow 80/tcp >/dev/null || return 1
+        http01_dir="$HOME/.acme.sh/$identity"
+        [[ "$length" != ec-* ]] || http01_dir="${http01_dir}_ecc"
         firewall=true
+        _cert_http01_hook "$http01_dir" "$CERT_HTTP01_PRE_HOOK" || return 1
         if _cert_issue_once "$identity" "$webroot" "$is_ip" "$length"; then rc=0; else rc=$?; fi
         if ((rc != 0 && rc != 2)); then
             warn "Не удалось получить сертификат; повторная выдача не выполняется."
@@ -845,9 +830,8 @@ ensure_cert() (
                 return 1
             fi
         fi
-        if [[ "$http01_allowed" != true ]]; then ufw deny 80/tcp >/dev/null || return 1; fi
         firewall=false
-        _cert_http01_clear_state "$identity"
+        _cert_http01_hook "$http01_dir" "$CERT_HTTP01_POST_HOOK" || return 1
     fi
     index="$CERT_SELECTED_INDEX"
     if [[ "$CERT_MATERIAL" == archive ]]; then

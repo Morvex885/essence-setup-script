@@ -128,6 +128,32 @@ EOF
     assert_success
 }
 
+@test "generate_group: AWG peer failure with an empty node response preserves the config" {
+    source "$PROJECT_ROOT/remote-control/modules/generate.sh"
+    _reset_node_cache
+    jq_w '(.connections[] | select(.node=="de-vps") | .groups[] | select(.name=="PC") | .proxies) += ["AWG"]
+        | (.clients[] | select(.name=="my-pc") | .connections[0].proxies) += ["AWG"]'
+    node_load_by_name() { return 0; }
+    ensure_remote_scripts_current() { return 0; }
+    ssh_run() {
+        case "$*" in
+            *awg0.conf*) printf 'AWG_OK\n' ;;
+            *add_awg_peer_auto*) return 1 ;;
+            *) : ;;
+        esac
+    }
+    local config_file="$GENERATED_DIR/PC/my-pc/config.yaml"
+    mkdir -p "$(dirname "$config_file")"
+    printf 'existing config\n' > "$config_file"
+
+    run _generate_group PC
+    assert_failure
+    assert_output --partial "my-pc: клиент AmneziaWG на de-vps не создан"
+    refute_output --partial "my-pc — сгенерирован"
+    run cmp -s "$config_file" <(printf 'existing config\n')
+    assert_success
+}
+
 _setup_listener_sync_sandbox() {
     export REMOTE_DIR="$BATS_TEST_TMPDIR/remote"
     export REMOTE_CONFIG="$REMOTE_DIR/config.yaml"

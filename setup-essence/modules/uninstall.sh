@@ -19,7 +19,7 @@ _uninstall_ssh_restored() {
 # sshd откроет порт 22, закрытый в UFW.
 _uninstall_restore_ssh() {
     local config=/etc/ssh/sshd_config dropin=/etc/ssh/sshd_config.d/00-essence-uninstall.conf
-    local backup created_dropin=false failure="Не удалось применить настройки SSH."
+    local backup created_dropin=false reloaded=false failure="Не удалось применить настройки SSH."
     backup=$(mktemp "${TMPDIR:-/tmp}/essence-sshd.XXXXXX") || { warn "$failure Firewall не изменён."; return 1; }
     if ! cp -p "$config" "$backup"; then
         rm -f "$backup"
@@ -38,37 +38,51 @@ _uninstall_restore_ssh() {
         fi
         if ! _uninstall_ssh_restored; then
             failure="sshd -T не подтверждает порт 22 и вход по паролю; проверьте /etc/ssh/sshd_config.d."
-        elif systemctl daemon-reload 2>/dev/null &&
-             { systemctl restart ssh.socket 2>/dev/null || systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null; }; then
+        elif systemctl daemon-reload 2>/dev/null && reloaded=true &&
+             _uninstall_restart_ssh; then
             rm -f "$backup"
             return 0
         fi
     fi
-    [[ "$created_dropin" != true ]] || rm -f "$dropin"
-    if cp -p "$backup" "$config"; then
-        rm -f "$backup"
-        warn "$failure Исходная конфигурация SSH восстановлена, firewall не изменён."
-    else
+    if [[ "$created_dropin" == true ]] && ! rm -f "$dropin"; then
+        warn "Не удалось удалить $dropin; удалите его вручную до перезапуска SSH."
+    fi
+    if ! cp -p "$backup" "$config"; then
         warn "$failure Не удалось восстановить $config; копия: $backup. Firewall не изменён."
+        return 1
+    fi
+    rm -f "$backup"
+    if [[ "$reloaded" != true ]]; then
+        warn "$failure Исходная конфигурация SSH восстановлена, firewall не изменён."
+    # systemd уже сгенерировал ssh.socket с портом 22: вернуть прежние порты.
+    elif systemctl daemon-reload 2>/dev/null && _uninstall_restart_ssh; then
+        warn "$failure Исходная конфигурация SSH восстановлена и SSH перезапущен с ней, firewall не изменён."
+    else
+        warn "$failure Исходная конфигурация SSH восстановлена, но SSH не перезапустился; проверьте ssh.socket/sshd до перезагрузки. Firewall не изменён."
     fi
     return 1
+}
+
+_uninstall_restart_ssh() {
+    systemctl restart ssh.socket 2>/dev/null || systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null
 }
 
 _uninstall_prepare_targets() {
     local ssh_effective=""
     UNINSTALL_PASSWORD_DISABLED=false
+    # Все уникальные порты через пробел: UFW должен сохранить доступ к каждому.
     if ssh_effective=$(_uninstall_sshd_effective) && [[ -n "$ssh_effective" ]]; then
-        UNINSTALL_SSH_PORT=$(awk '$1 == "port" { print $2; exit }' <<< "$ssh_effective")
+        UNINSTALL_SSH_PORTS=$(awk '$1 == "port" && !seen[$2]++ { printf "%s%s", sep, $2; sep = " " }' <<< "$ssh_effective")
         if grep -qx 'passwordauthentication no' <<< "$ssh_effective"; then
             UNINSTALL_PASSWORD_DISABLED=true
         fi
     else
-        UNINSTALL_SSH_PORT=$(awk '/^Port /{print $2; exit}' /etc/ssh/sshd_config 2>/dev/null)
+        UNINSTALL_SSH_PORTS=$(awk '/^Port / && !seen[$2]++ { printf "%s%s", sep, $2; sep = " " }' /etc/ssh/sshd_config 2>/dev/null)
         if grep -Eq '^[[:space:]]*PasswordAuthentication[[:space:]]+no([[:space:]]|$)' /etc/ssh/sshd_config 2>/dev/null; then
             UNINSTALL_PASSWORD_DISABLED=true
         fi
     fi
-    UNINSTALL_SSH_PORT="${UNINSTALL_SSH_PORT:-22}"
+    UNINSTALL_SSH_PORTS="${UNINSTALL_SSH_PORTS:-22}"
     UNINSTALL_REALITY_SITE=""
     UNINSTALL_TELEGRAM_CERT=""
     UNINSTALL_TELEGRAM_WEBROOT=""
@@ -111,23 +125,23 @@ _uninstall_prepare_targets() {
 
 uninstall() {
     _uninstall_prepare_targets || return 1
-    local restore=false final_port="$UNINSTALL_SSH_PORT" firewall_line ssh_line
-    if [[ "$UNINSTALL_SSH_PORT" != 22 || "$UNINSTALL_PASSWORD_DISABLED" == true ]]; then
-        MENU_SELECT_CONTEXT=("Текущий SSH-порт: $UNINSTALL_SSH_PORT")
+    local restore=false final_ports="$UNINSTALL_SSH_PORTS" firewall_line ssh_line
+    if [[ "$UNINSTALL_SSH_PORTS" != 22 || "$UNINSTALL_PASSWORD_DISABLED" == true ]]; then
+        MENU_SELECT_CONTEXT=("Текущие SSH-порты: ${UNINSTALL_SSH_PORTS// /, }")
         menu_select "SSH после удаления" "Выберите действие" \
             "Сохранить текущие настройки SSH" \
             "Вернуть порт 22 и включить вход по паролю" || return 0
         if [[ "$MENU_SELECT_INDEX" == 2 ]]; then
             restore=true
-            final_port=22
+            final_ports=22
         fi
     fi
-    if [[ "$final_port" != 22 ]]; then
-        firewall_line="UFW останется включён: открыт только SSH TCP/$final_port."
+    if [[ "$final_ports" != 22 ]]; then
+        firewall_line="UFW останется включён: открыты только SSH TCP ${final_ports// /, }."
     else
         firewall_line="UFW будет отключён."
     fi
-    ssh_line="SSH: порт $final_port; текущие настройки входа сохраняются."
+    ssh_line="SSH: порты ${final_ports// /, }; текущие настройки входа сохраняются."
     [[ "$restore" == false ]] || ssh_line="SSH: порт 22; вход по паролю будет включён."
     review_frame "Удаление установленных компонентов" \
         "Mihomo: бинарь, служба, конфиг и клиентские записи." \
@@ -153,7 +167,7 @@ _uninstall_components() {
     local reality_site="$UNINSTALL_REALITY_SITE"
     local telegram_cert="$UNINSTALL_TELEGRAM_CERT" telegram_webroot="$UNINSTALL_TELEGRAM_WEBROOT"
     local telegram_available="$UNINSTALL_TELEGRAM_AVAILABLE" telegram_enabled="$UNINSTALL_TELEGRAM_ENABLED"
-    local _ssh_port="$UNINSTALL_SSH_PORT" uninstall_warnings=false
+    local _ssh_ports="$UNINSTALL_SSH_PORTS" _ssh_port uninstall_warnings=false
 
     # Shared Telegram backend is removed before Nginx/certificate cleanup.
     if [[ -f "${TPROXY_CONF:-/etc/tproxy-server/essence.conf}" ||
@@ -301,19 +315,21 @@ _uninstall_components() {
     # SSH hardening
     if [[ "$restore" == true ]]; then
         _uninstall_restore_ssh || return 1
-        _ssh_port=22
+        _ssh_ports=22
         success "SSH вернён на порт 22, вход по паролю включён"
     fi
 
     # Firewall
     info "Сбрасываю правила firewall..."
     ufw --force reset > /dev/null || return 1
-    if [[ "$_ssh_port" != "22" ]]; then
+    if [[ "$_ssh_ports" != "22" ]]; then
         ufw default deny incoming > /dev/null || return 1
         ufw default allow outgoing > /dev/null || return 1
-        ufw allow "${_ssh_port}/tcp" > /dev/null 2>&1 || return 1
+        for _ssh_port in $_ssh_ports; do
+            ufw allow "${_ssh_port}/tcp" > /dev/null 2>&1 || return 1
+        done
         ufw --force enable > /dev/null || return 1
-        success "Firewall сброшен, SSH-порт ${_ssh_port} открыт."
+        success "Firewall сброшен, SSH-порты ${_ssh_ports// /, } открыты."
     else
         ufw --force disable > /dev/null || return 1
         success "Firewall отключён — все порты открыты."

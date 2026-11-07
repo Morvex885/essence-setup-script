@@ -216,11 +216,12 @@ prepare_empty_assigned_group() {
 }
 
 @test "client group change refusal reviews impact without SSH or local mutation" {
-    local confirms=0 rc=0 out="$BATS_TEST_TMPDIR/review"
-    confirm_yn() { confirms=$((confirms + 1)); [[ "$2" == N ]] || return 2; return 1; }
+    local confirms=0 rc=0 out="$BATS_TEST_TMPDIR/review" confirm_default=
+    confirm_yn() { confirms=$((confirms + 1)); confirm_default="${2-}"; return 1; }
     _change_client_group my-router ROUTER <<< 1 > "$out" || rc=$?
     [ "$rc" -eq 1 ]
     [ "$confirms" -eq 1 ]
+    [ "$confirm_default" = N ]
     for target in "ROUTER → PC" de-vps 1.2.3.4:22 "$GENERATED_DIR/ROUTER/my-router" "Подписка"; do
         grep -qF -- "$target" "$out" || return 1
     done
@@ -229,6 +230,19 @@ prepare_empty_assigned_group() {
     [ ! -e "$GENERATED_DIR/PC/my-router" ]
     [ "${#SSH_RUN_CALLS[@]}" -eq 0 ]
     [ "${#UPLOAD_CALLS[@]}" -eq 0 ]
+}
+
+@test "client group change review lists effective subscription header changes" {
+    jq_w '.subscription_default_headers = [{name:"profile-update-interval",value:"24"}]
+        | (.groups[] | select(.name=="ROUTER") | .subscription_headers) = [{name:"X-Old",value:"o"}]
+        | (.groups[] | select(.name=="PC") | .subscription_headers) = [{name:"profile-update-interval",value:"6"}]'
+    local rc=0 out="$BATS_TEST_TMPDIR/review"
+    confirm_yn() { return 1; }
+    _change_client_group my-router ROUTER <<< 1 > "$out" || rc=$?
+    [ "$rc" -eq 1 ]
+    grep -qF -- "Заголовки подписки изменятся:" "$out" || return 1
+    grep -qF -- "profile-update-interval: 24 → 6" "$out" || return 1
+    grep -qF -- "- X-Old: o" "$out" || return 1
 }
 
 @test "groups menu keeps both add bindings available after one rejected save" {

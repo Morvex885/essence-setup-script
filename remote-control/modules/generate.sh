@@ -641,7 +641,8 @@ _fetch_proxies_for_client() {
         proxy_block=$(echo "$remote_config" | sed -n '/^proxies:/,/^---/p' | grep -v '^---' | grep -v '^proxies:' \
             | sed 's/^  - name: \([^"]\)\(.*\)/  - name: "\1\2"/')
 
-        if [[ -n "$proxy_block" && -n "$allowed_connections" ]]; then
+        # Фильтр выполняется и при пустом ответе ноды: иначе сбой AWG peer не заметен.
+        if [[ -n "$allowed_connections" ]]; then
             local filtered=""
             IFS=',' read -ra allowed <<< "$allowed_connections"
             for conn_name in "${allowed[@]}"; do

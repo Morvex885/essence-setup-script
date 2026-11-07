@@ -190,9 +190,10 @@ _load_fixture_uninstall() {
     [[ ! -e "$BATS_TEST_TMPDIR/questions" ]]
 }
 
-@test "SSH restart failure aborts component cleanup before firewall reset" {
+@test "SSH restart failure restores sshd_config, retries once and keeps firewall" {
     _load_fixture_uninstall
     printf 'Port 2222\nPasswordAuthentication no\n' > "$FIXTURE_UNINSTALL_ROOT/etc/ssh/sshd_config"
+    cp "$FIXTURE_UNINSTALL_ROOT/etc/ssh/sshd_config" "$BATS_TEST_TMPDIR/sshd-before"
     sed() {
         if [[ "${1:-}" == -i ]]; then
             shift
@@ -211,9 +212,36 @@ _load_fixture_uninstall() {
     _uninstall_sshd_effective() { printf 'port 22\npasswordauthentication yes\n'; }
     run _uninstall_components true
     assert_failure 1
-    grep -q '^restart ssh.socket$' "$BATS_TEST_TMPDIR/systemctl-calls"
+    assert_output --partial "SSH не перезапустился"
+    [[ "$(grep -c '^restart ssh.socket$' "$BATS_TEST_TMPDIR/systemctl-calls")" -eq 2 ]]
     grep -q '^restart sshd$' "$BATS_TEST_TMPDIR/systemctl-calls"
     grep -q '^restart ssh$' "$BATS_TEST_TMPDIR/systemctl-calls"
+    awk '/^restart ssh$/ { failed = 1 } failed && /^daemon-reload$/ { found = 1 } END { exit !found }' "$BATS_TEST_TMPDIR/systemctl-calls"
+    cmp -s "$BATS_TEST_TMPDIR/sshd-before" "$FIXTURE_UNINSTALL_ROOT/etc/ssh/sshd_config"
+    [[ ! -e "$BATS_TEST_TMPDIR/firewall" ]]
+}
+
+@test "SSH restart failure recovers sshd with the restored config before returning" {
+    _load_fixture_uninstall
+    printf 'Port 2222\nPasswordAuthentication no\n' > "$FIXTURE_UNINSTALL_ROOT/etc/ssh/sshd_config"
+    cp "$FIXTURE_UNINSTALL_ROOT/etc/ssh/sshd_config" "$BATS_TEST_TMPDIR/sshd-before"
+    systemctl() {
+        printf '%s\n' "$*" >> "$BATS_TEST_TMPDIR/systemctl-calls"
+        case "$*" in
+            'restart ssh.socket')
+                # The first restart chain fails; the recovery restart succeeds.
+                [[ "$(grep -c '^restart ssh.socket$' "$BATS_TEST_TMPDIR/systemctl-calls")" -gt 1 ]] ;;
+            'restart sshd'|'restart ssh') return 1 ;;
+            *) return 0 ;;
+        esac
+    }
+    ufw() { printf '%s\n' "$*" >> "$BATS_TEST_TMPDIR/firewall"; }
+    _uninstall_sshd_effective() { printf 'port 22\npasswordauthentication yes\n'; }
+    run _uninstall_components true
+    assert_failure 1
+    assert_output --partial "SSH перезапущен с ней"
+    cmp -s "$BATS_TEST_TMPDIR/sshd-before" "$FIXTURE_UNINSTALL_ROOT/etc/ssh/sshd_config"
+    awk '/^restart ssh$/ { failed = 1 } failed && /^daemon-reload$/ { found = 1 } END { exit !found }' "$BATS_TEST_TMPDIR/systemctl-calls"
     [[ ! -e "$BATS_TEST_TMPDIR/firewall" ]]
 }
 
@@ -222,7 +250,20 @@ _load_fixture_uninstall() {
     : > "$FIXTURE_UNINSTALL_ROOT/etc/ssh/sshd_config"
     _uninstall_sshd_effective() { printf 'port 2222\npasswordauthentication no\n'; }
     _uninstall_prepare_targets
-    [[ "$UNINSTALL_SSH_PORT" == 2222 && "$UNINSTALL_PASSWORD_DISABLED" == true ]]
+    [[ "$UNINSTALL_SSH_PORTS" == 2222 && "$UNINSTALL_PASSWORD_DISABLED" == true ]]
+}
+
+@test "kept SSH settings open every effective SSH port in UFW" {
+    _load_fixture_uninstall
+    : > "$FIXTURE_UNINSTALL_ROOT/etc/mihomo/config.yaml"
+    _uninstall_sshd_effective() { printf 'port 2222\nport 22\nport 2222\npasswordauthentication no\n'; }
+    _uninstall_prepare_targets
+    [[ "$UNINSTALL_SSH_PORTS" == '2222 22' ]]
+    ufw() { printf '%s\n' "$*" >> "$BATS_TEST_TMPDIR/firewall"; }
+    _uninstall_components false
+    grep -q '^allow 2222/tcp$' "$BATS_TEST_TMPDIR/firewall"
+    grep -q '^allow 22/tcp$' "$BATS_TEST_TMPDIR/firewall"
+    grep -q '^--force enable$' "$BATS_TEST_TMPDIR/firewall"
 }
 
 # Mirrors sshd -T: Include drop-ins precede the main file, Port accumulates,

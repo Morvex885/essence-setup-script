@@ -254,10 +254,22 @@ _change_client_group() {
     local old_dir
     old_dir=$(_client_config_dir "$target")
 
-    local token client_conns_count gh_count _addr
+    local token client_conns_count header_changes="" _addr
     token=$(jq_r --arg n "$target" '.clients[] | select(.name==$n) | .subscription.token // empty')
     client_conns_count=$(jq_r --arg n "$target" '.clients[] | select(.name==$n) | .connections // [] | length')
-    gh_count=$(jq_r --arg g "$current_group" '.groups[] | select(.name==$g) | .subscription_headers // [] | length')
+    # Итоговые заголовки подписки (default → группа → клиент, как _resolve_headers) до и после.
+    if [[ -n "$token" ]]; then
+        header_changes=$(jq_r --arg n "$target" --arg old "$current_group" --arg new "$new_group" '
+            def effective($g): ((.subscription_default_headers // [])
+                + ((.groups[] | select(.name==$g) | .subscription_headers) // [])
+                + ((.clients[] | select(.name==$n) | .subscription.headers) // []))
+                | group_by(.name) | map({key: .[-1].name, value: .[-1].value}) | from_entries;
+            effective($old) as $a | effective($new) as $b |
+            (($a + $b) | keys)[] as $k | select($a[$k] != $b[$k]) |
+            if ($a | has($k) | not) then " + \($k): \($b[$k])"
+            elif ($b | has($k) | not) then " - \($k): \($a[$k])"
+            else " \($k): \($a[$k]) → \($b[$k])" end')
+    fi
 
     # Сводка изменений
     local _review=("Клиент: $target" "Группа: $current_group → $new_group")
@@ -276,8 +288,10 @@ _change_client_group() {
     done
     [[ "$client_conns_count" -gt 0 ]] && \
         _review+=("Собственные подключения ($client_conns_count) сохранятся — проверьте их через пункт '3)'.")
-    [[ "$gh_count" -gt 0 ]] && \
-        _review+=("Заголовки подписок старой группы ($gh_count) больше не будут применяться.")
+    if [[ -n "$header_changes" ]]; then
+        _review+=("Заголовки подписки изменятся:")
+        while IFS= read -r _n; do _review+=("$_n"); done <<< "$header_changes"
+    fi
     _review+=("Старый каталог конфигов (удаляется после генерации нового):" " $old_dir")
     [[ -n "$token" ]] && _review+=("Подписка клиента будет обновлена.")
     [[ ${#affected_nodes[@]} -gt 0 ]] && \

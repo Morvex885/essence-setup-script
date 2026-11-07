@@ -560,7 +560,7 @@ mtproto_install_fixture() {
     [[ "$output" != *"$secret"* ]]
 }
 
-@test "relay build output stays in the private build dir and is copied into the root-owned candidate" {
+@test "relay build output stays in the private build dir and is read as tproxy into the root-owned candidate" {
     local relay_source="$BATS_TEST_TMPDIR/relay-src" go="$BATS_TEST_TMPDIR/fake-go" candidate inode output
     mkdir -p "$relay_source/cmd/tproxy-server"
     cat > "$go" <<'FAKE'
@@ -572,7 +572,7 @@ done
 FAKE
     chmod 0755 "$go"
     export BUILD_OUTPUT_LOG="$BATS_TEST_TMPDIR/build-output"
-    runuser() { shift 3; "$@"; }
+    runuser() { printf '%s\n' "$*" >> "$BATS_TEST_TMPDIR/runuser-calls"; shift 3; "$@"; }
     candidate=$(mktemp "$BATS_TEST_TMPDIR/candidate.XXXXXX")
     inode=$(stat -c %i "$candidate")
     _telegram_proxy_build_relay "$relay_source" "$go" "$candidate"
@@ -581,4 +581,5 @@ FAKE
     [[ ! -e "$output" ]]
     [[ "$(cat "$candidate")" == built ]]
     [[ "$(stat -c %i "$candidate")" == "$inode" ]]
+    grep -qxF -- "-u tproxy -- cat -- $output" "$BATS_TEST_TMPDIR/runuser-calls"
 }

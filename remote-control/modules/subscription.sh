@@ -703,7 +703,7 @@ subscription_list() {
         local state="действует" term="без срока" color="$GREEN" exp_ts
         if [[ -n "$expires_at" ]]; then
             term="$expires_at"
-            if ! exp_ts=$(date -d "$expires_at" +%s 2>/dev/null); then
+            if ! exp_ts=$(_sub_iso_to_epoch "$expires_at"); then
                 state="срок неизвестен"; color="$YELLOW"
             elif [[ "$exp_ts" -le "$now_ts" ]]; then
                 state="истекла"; color="$YELLOW"
@@ -815,21 +815,45 @@ echo \$removed"
     return "$rc"
 }
 
-# Перенос сроков TTL в expiry.list новой хост-ноды под тем же expiry-lock, что и очистка.
-# Аргументы: sub_dir, затем пары «токен срок_unix». Повтор переноса не дублирует записи.
+# ISO-8601 срок подписки (формат `date --iso-8601=seconds` или с суффиксом Z) → unix-время.
+# Разбор через jq, без GNU `date -d`: работает и в macOS.
+_sub_iso_to_epoch() {
+    local epoch
+    epoch=$(jq -enr --arg d "${1:-}" '
+        $d | capture("^(?<t>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?<z>Z|(?<s>[+-])(?<h>[0-9]{2}):?(?<m>[0-9]{2}))$")
+        | ((.t + "Z") | fromdateiso8601)
+          - (if .z == "Z" then 0
+             else (if .s == "-" then -1 else 1 end) * ((.h | tonumber) * 3600 + (.m | tonumber) * 60) end)
+    ' 2>/dev/null) && [[ "$epoch" =~ ^-?[0-9]+$ ]] || return 1
+    printf '%s\n' "$epoch"
+}
+
+# Сроки подписок в expiry.list новой хост-ноды под тем же expiry-lock, что и очистка.
+# Аргументы: sub_dir, затем пары «токен срок_unix»; пустой срок только удаляет прежнюю
+# запись токена. Список заменяется атомарно: при ошибке прежний expiry.list не меняется.
 _sub_migrate_expiry() {
     local sub_dir="$1" script command args
     shift
     script=$(cat <<'EOF'
 sub_dir=$1; shift
-list="$sub_dir/expiry.list"
+list="$sub_dir/expiry.list"; tmp="$list.migrate.$$"
+drop=" "; i=1
+for arg in "$@"; do
+    [ $((i % 2)) -eq 1 ] && drop="$drop$arg "
+    i=$((i + 1))
+done
 exec 9>"$sub_dir/.expiry.lock" || exit 1
 flock -x 9 || exit 1
-while [ $# -ge 2 ]; do
-    if [ -e "$list" ]; then sed -i "/^$1 /d" "$list" || exit 1; fi
-    printf '%s %s\n' "$1" "$2" >> "$list" || exit 1
-    shift 2
-done
+(
+    if [ -e "$list" ]; then
+        awk -v drop="$drop" 'index(drop, " " $1 " ") == 0' "$list" || exit 1
+    fi
+    while [ $# -ge 2 ]; do
+        if [ -n "$2" ]; then printf '%s %s\n' "$1" "$2" || exit 1; fi
+        shift 2
+    done
+) > "$tmp" || { rm -f "$tmp"; exit 1; }
+mv -f "$tmp" "$list" || { rm -f "$tmp"; exit 1; }
 EOF
 )
     printf -v command 'bash -c %q --' "$script"
@@ -855,12 +879,14 @@ subscription_migrate() {
             return 1
         fi
         if [[ -n "$expires_at" ]]; then
-            if ! expires_ts=$(date -d "$expires_at" +%s 2>/dev/null); then
+            if ! expires_ts=$(_sub_iso_to_epoch "$expires_at"); then
                 warn "$client: срок подписки не распознан. Перенос отменён."
                 return 1
             fi
-            expiry_args+=("$token" "$expires_ts")
+        else
+            expires_ts=""
         fi
+        expiry_args+=("$token" "$expires_ts")
         clients+=("$client"); tokens+=("$token"); configs+=("$config_file")
     done < <(jq_r '.clients[] | select(.subscription.token) | "\(.name)|\(.subscription.token)|\(.subscription.expires_at // "")"')
     [[ ${#clients[@]} -gt 0 ]] || { info "Нет опубликованных подписок для переноса."; return 0; }
@@ -889,11 +915,12 @@ subscription_migrate() {
     _sub_save_ssh_ctx
     node_load_by_name "$new_node" || { _sub_done; return 1; }
     local i rc=0
-    for ((i=0; i<${#clients[@]}; i++)); do
-        _sub_upload_config "${configs[$i]}" "${tokens[$i]}" "$new_sub_dir" "${new_nginx_group:-www-data}" "${clients[$i]}" || rc=1
-    done
-    if [[ $rc -eq 0 && ${#expiry_args[@]} -gt 0 ]]; then
-        _sub_migrate_expiry "$new_sub_dir" "${expiry_args[@]}" || rc=1
+    # Сначала сроки: устаревшая запись токена на новой ноде не должна удалить загруженный YAML.
+    _sub_migrate_expiry "$new_sub_dir" "${expiry_args[@]}" || rc=1
+    if [[ $rc -eq 0 ]]; then
+        for ((i=0; i<${#clients[@]}; i++)); do
+            _sub_upload_config "${configs[$i]}" "${tokens[$i]}" "$new_sub_dir" "${new_nginx_group:-www-data}" "${clients[$i]}" || rc=1
+        done
     fi
     _sub_done
     if [[ $rc -ne 0 ]]; then

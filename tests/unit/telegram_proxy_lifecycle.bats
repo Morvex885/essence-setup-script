@@ -573,6 +573,27 @@ EOF
     [ -e "$TPROXY_CONF" ]
 }
 
+@test "WEB removal snapshots shared backend paths only when WEB is the last component" {
+    local snapshot="$BATS_TEST_TMPDIR/snapshot-args" mtproto
+    _telegram_proxy_initialize_state
+    TELEGRAM_WEB_ENABLED=true TELEGRAM_WEB_HOSTNAME=web.example.com
+    _telegram_proxy_component_enabled() { [[ "$1" == web ]]; }
+    _telegram_proxy_snapshot_paths() { printf '%s\n' "$@" > "$snapshot"; return 1; }
+    systemctl() { true; }
+    for mtproto in true false; do
+        TELEGRAM_MTPROTO_ENABLED="$mtproto"
+        if telegram_proxy_web_remove --force; then return 1; fi
+        grep -qxF "$TPROXY_SYSTEMD_DIR/$TPROXY_UNIT_RELAY" "$snapshot" || return 1
+        if [[ "$mtproto" == true ]]; then
+            ! grep -qxF "$TPROXY_ENV_FILE" "$snapshot" || return 1
+            ! grep -qxF "$TPROXY_MTPROXY_SOURCE_DIR" "$snapshot" || return 1
+        else
+            grep -qxF "$TPROXY_ENV_FILE" "$snapshot" || return 1
+            grep -qxF "$TPROXY_SYSTEMD_DIR/$TPROXY_UNIT_TIMER" "$snapshot" || return 1
+        fi
+    done
+}
+
 @test "MTProto removal from a combined install preserves WEB and rewrites shared state" {
     mkdir -p "$TPROXY_DIR" "$TPROXY_RELAY_SOURCE_PATH" "$(dirname "$TPROXY_FIREWALL_FILE")"
     touch "$TPROXY_CONF" "$TPROXY_FIREWALL_FILE"

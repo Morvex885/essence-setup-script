@@ -293,6 +293,23 @@ _write_github_known_hosts() {
     cmp "$SSH_KNOWN_HOSTS" "$BATS_TEST_TMPDIR/known.before"
 }
 
+@test "GitHub hardening keeps @revoked and @cert-authority markers for the new port" {
+    _write_github_known_hosts
+    local key ca
+    key=$(cut -d ' ' -f 1-2 "$BATS_TEST_TMPDIR/hostkey.pub")
+    ssh-keygen -q -t ed25519 -N '' -f "$BATS_TEST_TMPDIR/ca"
+    ca=$(cut -d ' ' -f 1-2 "$BATS_TEST_TMPDIR/ca.pub")
+    printf '@revoked 192.0.2.10 %s\n@cert-authority 192.0.2.10 %s\n' "$key" "$ca" >> "$SSH_KNOWN_HOSTS"
+    _harden_trust_new_port 22 55555
+    command grep -qxF "[192.0.2.10]:55555 $key" "$SSH_KNOWN_HOSTS" || return 1
+    command grep -qxF "@revoked [192.0.2.10]:55555 $key" "$SSH_KNOWN_HOSTS" || return 1
+    command grep -qxF "@cert-authority [192.0.2.10]:55555 $ca" "$SSH_KNOWN_HOSTS" || return 1
+
+    printf '@cert-authority 192.0.2.10 %s\n' "$ca" > "$SSH_KNOWN_HOSTS"
+    _harden_trust_new_port 22 55555
+    command grep -qxF "@cert-authority [192.0.2.10]:55555 $ca" "$SSH_KNOWN_HOSTS"
+}
+
 @test "GitHub hardening save failure rolls back the port and restores known_hosts" {
     _write_github_known_hosts
     _harden_ssh_run() {
@@ -300,9 +317,10 @@ _write_github_known_hosts() {
         [[ "$1" != "echo ok" ]] || printf 'ok\n'
     }
     _harden_rollback_port() { touch "$BATS_TEST_TMPDIR/rolled-back"; }
-    jq_w() { return 1; }
+    jq_w() { touch "$BATS_TEST_TMPDIR/jq-w-called"; return 1; }
 
     if _harden_change_port 55555 > "$BATS_TEST_TMPDIR/output" 2>&1; then return 1; fi
+    [[ -e "$BATS_TEST_TMPDIR/jq-w-called" ]] || return 1
     [[ -e "$BATS_TEST_TMPDIR/rolled-back" && "$SERVER_PORT" == 22 ]]
     cmp "$SSH_KNOWN_HOSTS" "$BATS_TEST_TMPDIR/known.before"
 }

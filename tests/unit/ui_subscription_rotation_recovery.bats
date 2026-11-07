@@ -150,7 +150,7 @@ failed_rotation() {
     failed_rotation
 }
 
-@test "migration removes configured old-host artifacts only after new copies and host commit" {
+_prepare_migration_mock() {
     export MIGRATION_NEW_DIR="$BATS_TEST_TMPDIR/new-host"
     mkdir -p "$MIGRATION_NEW_DIR"
     jq_w '.nodes=[{id:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",name:"old",ip:"192.0.2.1",port:22,user:"root",auth:"key"},{id:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",name:"new",ip:"192.0.2.2",port:22,user:"root",auth:"key"}] | .subscription_host.node="old" | .subscription_host.sub_dir="/stale/cache"'
@@ -175,6 +175,10 @@ failed_rotation() {
         ( eval "$*" )
     }
     printf 'stale 1\n%s 1\n' "$OLD_TOKEN" > "$MIGRATION_NEW_DIR/expiry.list"
+}
+
+@test "migration removes configured old-host artifacts only after new copies and host commit" {
+    _prepare_migration_mock
     subscription_migrate <<< $'2\ny' > "$BATS_TEST_TMPDIR/migration.output"
     [[ "$(jq_r '.subscription_host.node')" == new ]]
     [[ "$(jq_r '.clients[0].subscription.token')" == "$OLD_TOKEN" ]]
@@ -184,6 +188,33 @@ failed_rotation() {
     cmp "$MIGRATION_NEW_DIR/expiry.list" "$BATS_TEST_TMPDIR/new-host.expiry"
     printf 'cccc 2100000000\n' > "$BATS_TEST_TMPDIR/old-host.expiry"
     cmp "$SUB_DIR/expiry.list" "$BATS_TEST_TMPDIR/old-host.expiry"
+}
+
+@test "migration of a subscription without TTL drops the stale new-host expiry entry" {
+    _prepare_migration_mock
+    jq_w '.clients[0].subscription.expires_at = null'
+    subscription_migrate <<< $'2\ny' > "$BATS_TEST_TMPDIR/migration.output"
+    [[ "$(jq_r '.subscription_host.node')" == new ]]
+    [[ -s "$MIGRATION_NEW_DIR/$OLD_TOKEN.yaml" ]]
+    printf 'stale 1\n' > "$BATS_TEST_TMPDIR/new-host.expiry"
+    cmp "$MIGRATION_NEW_DIR/expiry.list" "$BATS_TEST_TMPDIR/new-host.expiry"
+}
+
+@test "failed expiry replacement keeps the new-host list and aborts before uploads" {
+    _prepare_migration_mock
+    cp "$MIGRATION_NEW_DIR/expiry.list" "$BATS_TEST_TMPDIR/new-host.before"
+    # Fail only the final replacement of the new host's expiry.list.
+    mv() { [[ "${*: -1}" != */expiry.list ]] || return 1; command mv "$@"; }
+    export -f mv
+    local rc=0
+    subscription_migrate <<< $'2\ny' > "$BATS_TEST_TMPDIR/migration.output" || rc=$?
+    unset -f mv
+    [[ "$rc" -ne 0 ]]
+    [[ "$(jq_r '.subscription_host.node')" == old ]]
+    cmp "$MIGRATION_NEW_DIR/expiry.list" "$BATS_TEST_TMPDIR/new-host.before"
+    [[ ! -e "$MIGRATION_NEW_DIR/$OLD_TOKEN.yaml" ]]
+    ! compgen -G "$MIGRATION_NEW_DIR/expiry.list.migrate.*" || return 1
+    [[ -s "$SUB_DIR/$OLD_TOKEN.yaml" ]]
 }
 
 @test "rotation restores the old link after a reload failed after applying new routes" {

@@ -449,8 +449,9 @@ _harden_rollback_port() {
 }
 
 # GitHub sessions check host keys strictly against the managed known_hosts and
-# portable state requires an entry for the node's own port. Re-use only keys
-# already trusted for the current port, so verification stays strict.
+# portable state requires an entry for the node's own port. Re-use only entries
+# already present for the current port, keeping @cert-authority/@revoked markers,
+# so verification stays strict.
 _harden_trust_new_port() {
     local old_port="$1" new_port="$2" old_host="$SERVER_IP" new_host="$SERVER_IP" entries
     [[ "$old_port" != 22 ]] && old_host="[$SERVER_IP]:$old_port"
@@ -458,7 +459,9 @@ _harden_trust_new_port() {
     [[ -n "${SSH_KNOWN_HOSTS:-}" && -f "$SSH_KNOWN_HOSTS" ]] || return 1
     ssh-keygen -F "$new_host" -f "$SSH_KNOWN_HOSTS" >/dev/null 2>&1 && return 0
     entries=$(ssh-keygen -F "$old_host" -f "$SSH_KNOWN_HOSTS" 2>/dev/null |
-        awk -v host="$new_host" '!/^#/ && $1 !~ /^@/ && NF >= 3 { print host, $2, $3 }')
+        awk -v host="$new_host" '/^#/ { next }
+            $1 ~ /^@/ { if (NF >= 4) print $1, host, $3, $4; next }
+            NF >= 3 { print host, $2, $3 }')
     [[ -n "$entries" ]] || return 1
     printf '%s\n' "$entries" >> "$SSH_KNOWN_HOSTS"
 }
