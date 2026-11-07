@@ -457,11 +457,13 @@ _config_source_publish_logical() {
     return 0
 }
 
-# _github_plaintext_review_lines — review notice for repositories stored without encryption.
+# _github_plaintext_review_lines — fill GITHUB_PLAINTEXT_REVIEW_LINES with the notice for
+# repositories stored without encryption (empty otherwise). No mapfile: Bash 3.2 is supported.
 _github_plaintext_review_lines() {
+    GITHUB_PLAINTEXT_REVIEW_LINES=()
     [[ "${GITHUB_STORAGE_MODE:-}" == none ]] || return 0
-    printf '%s\n' "Пароли SSH и ключи будут храниться в GitHub без шифрования" \
-        "и навсегда останутся в истории Git."
+    GITHUB_PLAINTEXT_REVIEW_LINES=("Пароли SSH и ключи будут храниться в GitHub без шифрования"
+        "и навсегда останутся в истории Git.")
 }
 
 # _config_source_local_snapshot <out> — vault snapshot of the device-only state in CONFIG_DIR.
@@ -508,14 +510,13 @@ _github_format_migrate_prepare() {
     names=$(jq -r '[.portability.issues[] | select(.reason=="missing_secret") | .node_id] as $ids |
         [.config.nodes[] | select(.id as $i | $ids | index($i)) | .name] | join(", ")' \
         "$candidate" 2>/dev/null) || names=""
-    local -a plaintext_lines=()
-    mapfile -t plaintext_lines < <(_github_plaintext_review_lines)
+    _github_plaintext_review_lines
     review_frame "Преобразование конфигурации GitHub" \
         "Репозиторий: ${GITHUB_OWNER:-?}/${GITHUB_REPO_NAME} (ветка ${GITHUB_BRANCH})" \
         "Формат: v${from} → v${GITHUB_VAULT_FORMAT}" \
         "Устройства с Remote Control старше ${minimum} перестанут читать конфигурацию." \
         "Предыдущая версия останется в истории Git." \
-        "${plaintext_lines[@]}" \
+        "${GITHUB_PLAINTEXT_REVIEW_LINES[@]}" \
         ${names:+"Потребуется повторный ввод пароля: ${names}"}
     if ! confirm_yn "Преобразовать и опубликовать конфигурацию?" N; then
         rm -f "$candidate"
@@ -553,15 +554,14 @@ github_replace_with_local_action() {
         [[ "${GITHUB_SYNC_STATUS:-}" == pending ]] &&
             pending_line="Неотправленные изменения рабочей конфигурации GitHub будут заменены."
     fi
-    local -a plaintext_lines=()
-    mapfile -t plaintext_lines < <(_github_plaintext_review_lines)
+    _github_plaintext_review_lines
     review_frame "Замена конфигурации GitHub" \
         "Репозиторий: ${GITHUB_OWNER:-?}/${GITHUB_REPO_NAME} (ветка ${GITHUB_BRANCH})" \
         "Будет опубликована конфигурация только этого компьютера." \
         "Этот компьютер: $(_github_counts_label "$local_counts")" \
         "GitHub: $(_github_counts_label "$github_counts")" \
         "Текущая конфигурация GitHub останется только в истории Git." \
-        "${plaintext_lines[@]}" \
+        "${GITHUB_PLAINTEXT_REVIEW_LINES[@]}" \
         ${pending_line:+"$pending_line"}
     IFS=$'\t' read -r local_nodes local_clients _ <<< "$local_counts"
     [[ "${local_nodes:-0}" == 0 && "${local_clients:-0}" == 0 ]] &&
