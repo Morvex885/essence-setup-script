@@ -2110,6 +2110,9 @@ _portable_use_device_a() {
     _portable_publish_v1 || return 1
     _portable_use_device_a
     local input root="$HOME/.config/remote-control-essence" local_before
+    # A manifest without .access would be rewritten by state_checkpoint if the snapshot ran before consent.
+    jq 'del(.access)' "$root/manifest.json" > "$root/manifest.next" &&
+        mv "$root/manifest.next" "$root/manifest.json" || return 1
     local_before="$(_hash_file "$root/config.json") $(_hash_file "$root/manifest.json") $(_hash_file "$root/secrets.json") $(_hash_file "$root/ssh/known_hosts")"
     for input in $'1\nn\n0\n' $'1\n\n0\n' $'2\n\n0\n' $'2\nn\n0\n' $'0\n' ''; do
         run bash -c 'printf "%s" "$1" | "$0"' "$APP/remote-control-essence.sh" "$input"
