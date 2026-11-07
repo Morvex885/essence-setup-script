@@ -75,6 +75,8 @@ _github_record_error() {
     else
         GITHUB_LAST_HINT=""
     fi
+    # Only _github_record_format_error classifies a failure as a snapshot format problem.
+    GITHUB_LAST_FORMAT="" GITHUB_LAST_FORMAT_VERSION="" GITHUB_LAST_FORMAT_REQUIRED=""
 }
 _github_ensure_error() {
     if [[ -z ${GITHUB_LAST_ERROR:-} ]]; then

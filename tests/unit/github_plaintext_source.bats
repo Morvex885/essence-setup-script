@@ -2092,7 +2092,8 @@ _portable_use_device_a() {
     run bash -c 'printf "1\ny\n0\n" | "$0"' "$APP/remote-control-essence.sh"
     assert_success
     [[ "$output" != *Повторить* && "$output" != *synthetic-portable* ]] || return 1
-    assert_output --partial "будут храниться в GitHub без шифрования."
+    assert_output --partial "будут храниться в GitHub без шифрования"
+    assert_output --partial "навсегда останутся в истории Git."
     git --git-dir="$REMOTE" show main:manifest.json > "$BATS_TEST_TMPDIR/m.json" || return 1
     jq -e '.vault_version==2 and .minimum_remote_control_version=="1.1.0" and
         .portability.issues==[{node_id:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",reason:"missing_secret"}]' "$BATS_TEST_TMPDIR/m.json" || return 1
@@ -2151,7 +2152,8 @@ _portable_use_device_a() {
     local local_config="$HOME/.config/remote-control-essence/config.json"
     run bash -c 'printf "2\ny\n0\n" | "$0"' "$APP/remote-control-essence.sh"
     assert_success
-    assert_output --partial "будут храниться в GitHub без шифрования."
+    assert_output --partial "будут храниться в GitHub без шифрования"
+    assert_output --partial "навсегда останутся в истории Git."
     git --git-dir="$REMOTE" show main:config.json > "$BATS_TEST_TMPDIR/c.json" || return 1
     cmp -s <(jq -S . "$BATS_TEST_TMPDIR/c.json") <(jq -S . "$local_config") || return 1
     git --git-dir="$REMOTE" show main:manifest.json | jq -e '.vault_version==2' >/dev/null || return 1
