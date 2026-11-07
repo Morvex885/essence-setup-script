@@ -503,6 +503,11 @@ _harden_change_port() {
             firewall-cmd --permanent --remove-service=ssh >/dev/null 2>&1 &&
             firewall-cmd --permanent --remove-port=${old_port}/tcp >/dev/null 2>&1 &&
             firewall-cmd --reload >/dev/null 2>&1 || exit 1
+        elif command -v firewall-cmd >/dev/null 2>&1 &&
+             systemctl is-enabled firewalld >/dev/null 2>&1; then
+            # Остановленный, но включённый firewalld после перезагрузки поднимет
+            # старую permanent-зону и закроет новый порт: порт не меняем.
+            exit 1
         fi
         sshd -t &&
         systemctl daemon-reload &&
