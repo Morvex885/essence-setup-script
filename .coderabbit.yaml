@@ -10,15 +10,15 @@ reviews:
     base_branches:
       - "^develop$"
   path_instructions:
-    - path: ".github/workflows/**"
+    - path: "{.github/workflows/**,tests/ci/build_release_tarball.sh}"
       instructions: |
-        - release.yml: архив essence-setup-<tag>.tar.gz обязан содержать все tracked-файлы из common/, setup-essence/, remote-control/ и VERSION — их требуют проверки `_need` в setup-essence/install-essence.sh и remote-control/install-remote-control.sh.
+        - Релизный архив собирает и проверяет tests/ci/build_release_tarball.sh (release.yml и tests.yml для PR в main): архив обязан содержать все tracked-файлы из common/, setup-essence/, remote-control/ и VERSION — их требуют проверки `_need` в setup-essence/install-essence.sh и remote-control/install-remote-control.sh.
         - Job id `test` в tests.yml — обязательная проверка в rulesets protect-main и protect-develop; переименование блокирует мерж.
         - Минимальные permissions GITHUB_TOKEN; `contents: write` только у job публикации релиза.
         - Не подставлять `${{ }}`-выражения прямо в `run:`; передавать через `env:`.
     - path: "**/install-*.sh"
       instructions: |
-        - Список `_need` должен соответствовать содержимому архива из .github/workflows/release.yml; новый обязательный файл — проверить, что release.yml его упаковывает.
+        - Список `_need` должен соответствовать содержимому архива из tests/ci/build_release_tarball.sh; новый обязательный файл — проверить, что скрипт его упаковывает.
     - path: "**/*.sh"
       instructions: |
         - Все entrypoints поддерживают Bash 3.2 (системный bash macOS): без mapfile/readarray, `declare -A`, `${var,,}`/`${var^^}`, `&>>`, `|&`, отрицательных индексов массивов.

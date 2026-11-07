@@ -42,6 +42,10 @@ jobs:
       - name: Validate xHTTP nginx config with latest nginx
         run: docker run --rm -v /tmp/nginx-xhttp.conf:/etc/nginx/nginx.conf:ro nginx:latest nginx -t
 
+      - name: Build and verify release tarball (PR в main)
+        if: github.event_name == 'pull_request' && github.base_ref == 'main'
+        run: bash tests/ci/build_release_tarball.sh v0.0.0-ci "$RUNNER_TEMP/release"
+
       - name: Run unit tests
         env:
           AWG_REAL_MIHOMO_BIN: /tmp/mihomo
