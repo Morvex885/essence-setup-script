@@ -28,7 +28,11 @@ teardown() { teardown_test_env; }
     [ "$rc" -eq 1 ]
     [ "$(jq_r '.subscription_host, .clients')" = "$before" ]
     local command
-    for command in "${SSH_RUN_CALLS[@]}"; do [[ "$command" != *'rm -f'* ]]; done
+    # Link removal (_sub_remove_token) deletes the YAML and snippet; the expiry
+    # update only cleans up its own temporary file.
+    for command in "${SSH_RUN_CALLS[@]}"; do
+        [[ "$command" != *'rm -f "$yaml"'* && "$command" != *'rm -f "$snippet"'* ]] || return 1
+    done
     run cat "$BATS_TEST_TMPDIR/output"
     refute_output --partial 'secret-alpha'
     refute_output --partial 'secret-beta'
@@ -42,7 +46,9 @@ teardown() { teardown_test_env; }
     [ "$rc" -eq 1 ]
     [ "$(jq_r '.subscription_host.node')" = old ]
     local command
-    for command in "${SSH_RUN_CALLS[@]}"; do [[ "$command" != *'rm -f'* ]]; done
+    for command in "${SSH_RUN_CALLS[@]}"; do
+        [[ "$command" != *'rm -f "$yaml"'* && "$command" != *'rm -f "$snippet"'* ]] || return 1
+    done
 }
 
 

@@ -20,6 +20,15 @@ teardown() { teardown_test_env; }
     [[ " ${SSH_BASE_OPTIONS[*]} " != *"IdentitiesOnly=yes"* ]]
 }
 
+@test "local key auth with managed identity passes the key in base SSH options" {
+    export CONFIG_SOURCE=local SERVER_AUTH=key SERVER_PASS= NODE_IDENTITY=node-id
+    : > "$SSH_IDENTITIES_DIR/node-id"
+    _ssh_base_options
+    [[ " ${SSH_BASE_OPTIONS[*]} " == *" -i $SSH_IDENTITIES_DIR/node-id "* ]]
+    [[ " ${SSH_BASE_OPTIONS[*]} " == *"StrictHostKeyChecking=accept-new"* ]]
+    [[ " ${SSH_BASE_OPTIONS[*]} " != *"IdentitiesOnly=yes"* ]]
+}
+
 @test "GitHub password auth requires managed known host and strict checking" {
     export CONFIG_SOURCE=github SERVER_AUTH=password SERVER_PASS=secret
     _ssh_known_host_present() { return 0; }
@@ -59,26 +68,40 @@ teardown() { teardown_test_env; }
     local fake_ssh="$BATS_TEST_TMPDIR/ssh" marker="$BATS_TEST_TMPDIR/ssh-complete"
     cat > "$fake_ssh" <<'EOF'
 #!/bin/bash
+if [[ -n "${SSH_ASKPASS:-}" ]]; then
+    "$SSH_ASKPASS" > "$SSH_FAKE_ASKPASS_MARKER"
+fi
 sleep 2
 printf '%s\n' complete > "$SSH_FAKE_MARKER"
 EOF
     chmod 755 "$fake_ssh"
     export SSH_FAKE_MARKER="$marker" PATH="$BATS_TEST_TMPDIR:$PATH"
+    export SSH_FAKE_ASKPASS_MARKER="$BATS_TEST_TMPDIR/askpass-used"
+    # A desktop session may export SSH_ASKPASS; only ssh_run may provide one here.
+    unset SSH_ASKPASS SSH_ASKPASS_REQUIRE
 
     export CONFIG_SOURCE=local SERVER_AUTH=key SERVER_PASS= SSH_RUN_TIMEOUT=1
     run ssh_run -t -- true
     assert_success
     [[ "$(cat "$marker")" == complete ]]
-    [[ -z "${SERVER_PASS:-}" ]]
-    [[ ! -e "${_ASKPASS_FILE:-}" && ! -e "${_PASS_FILE:-}" ]]
+    [[ ! -e "$SSH_FAKE_ASKPASS_MARKER" ]]
 
     rm -f "$marker"
     export SERVER_AUTH=password SERVER_PASS='password-secret'
-    run ssh_run -- true
-    [[ "$status" -eq 124 || "$status" -eq 143 ]]
+    # Askpass files must be gone when ssh_run returns, before the EXIT cleanup.
+    _check_password_ssh_cleanup() {
+        export TMPDIR="$BATS_TEST_TMPDIR/askpass-tmp"
+        mkdir -p "$TMPDIR" || return 1
+        local rc=0
+        ssh_run -- true || rc=$?
+        [[ "$rc" -eq 124 || "$rc" -eq 143 ]] || return 1
+        [[ -z "$(find "$TMPDIR" -mindepth 1 -print -quit)" ]]
+    }
+    run _check_password_ssh_cleanup
+    assert_success
     [[ ! -e "$marker" ]]
     [[ "$output" != *password-secret* ]]
-    [[ ! -e "${_ASKPASS_FILE:-}" && ! -e "${_PASS_FILE:-}" ]]
+    [[ "$(cat "$SSH_FAKE_ASKPASS_MARKER")" == password-secret ]]
 }
 
 _run_failed_add_node() {
@@ -96,6 +119,36 @@ _run_failed_add_node() {
     assert_failure
     run jq -r '.nodes | length' "$CONFIG_JSON"
     assert_output 0
+}
+
+@test "GitHub add with deferred SSH setup records issues before the validated node write" {
+    state_open_local
+    CONFIG_SOURCE=github
+    mkdir -p "$TEMPLATES_DIR" && : > "$TEMPLATES_DIR/default.yaml"
+    # Mirrors the GitHub jq_w hook: the candidate must pass portable validation.
+    config_persist_candidate() {
+        local original="$CONFIG_JSON" rc=0
+        CONFIG_JSON="$1"
+        state_validate true >/dev/null 2>&1 || rc=1
+        CONFIG_JSON="$original"
+        [[ $rc -eq 0 ]] && mv "$1" "$CONFIG_JSON"
+    }
+    _provision_portable_identity() { return 1; }
+    ssh_run() { printf '%s\n' ok; }
+    _ssh_pin_host_key() { return 1; }
+
+    run add_node <<< $'deferred-node\n127.0.0.1\n22\nroot\n1\n2\n2\ny\nDE'
+    assert_success
+    local node_id
+    node_id=$(jq -r '.nodes[0].id' "$CONFIG_JSON")
+    [[ "$(jq -r '.nodes[0].identity' "$CONFIG_JSON")" == system ]]
+    jq -e --arg id "$node_id" '
+        any(.portability.issues[]; .node_id==$id and .reason=="missing_identity") and
+        any(.portability.issues[]; .node_id==$id and .reason=="missing_host_key")
+    ' "$STATE_MANIFEST"
+    [[ "$(state_validate true)" == needs_setup ]]
+    ! compgen -G "$CONFIG_DIR/.manifest.*" || return 1
+    ! compgen -G "$CONFIG_DIR/.known-hosts.*"
 }
 
 _run_validated_password_add_node() {
@@ -174,6 +227,56 @@ EOF
     [[ ! -e "$SSH_IDENTITIES_DIR/$node_id.pub" ]]
     [[ "$(jq -r '.nodes | length' "$CONFIG_JSON")" == 1 ]]
     [[ "$(jq -r '.nodes[0].identity' "$CONFIG_JSON")" == system ]]
+}
+
+_prepare_onboarding_rollback() {
+    _prepare_pending_key_node
+    printf '%s\n' existing-host > "$SSH_KNOWN_HOSTS"
+    cp "$SSH_KNOWN_HOSTS" "$BATS_TEST_TMPDIR/known.before"
+    cp "$STATE_MANIFEST" "$BATS_TEST_TMPDIR/manifest.before"
+    _provision_portable_identity() {
+        mkdir -p "$SSH_IDENTITIES_DIR"
+        printf private > "$SSH_IDENTITIES_DIR/$1"
+        printf public > "$SSH_IDENTITIES_DIR/$1.pub"
+        NODE_IDENTITY="$1"
+    }
+}
+
+_assert_onboarding_rolled_back() {
+    cmp "$SSH_KNOWN_HOSTS" "$BATS_TEST_TMPDIR/known.before"
+    cmp "$STATE_MANIFEST" "$BATS_TEST_TMPDIR/manifest.before"
+    [[ "$(jq -r '.nodes[0].identity' "$CONFIG_JSON")" == system ]]
+    ! compgen -G "$CONFIG_DIR/.known-hosts.*" || return 1
+    ! compgen -G "$CONFIG_DIR/.manifest.*"
+}
+
+@test "onboarding state write failure after provisioning revokes key and restores backups" {
+    _prepare_onboarding_rollback
+    local node_id=0123456789abcdef0123456789abcdef
+    REVOKED_ID=""
+    _ssh_pin_host_key() { printf '%s\n' pinned-host >> "$SSH_KNOWN_HOSTS"; }
+    state_portability_remove_issue() { return 77; }
+    _revoke_managed_remote_key() { REVOKED_ID="$1"; }
+
+    if _github_initial_portable_onboarding <<< $'y'; then
+        return 1
+    fi
+    [[ "$REVOKED_ID" == "$node_id" ]]
+    [[ ! -e "$SSH_IDENTITIES_DIR/$node_id" && ! -e "$SSH_IDENTITIES_DIR/$node_id.pub" ]]
+    _assert_onboarding_rolled_back
+}
+
+@test "onboarding rollback keeps public key for manual cleanup when revocation fails" {
+    _prepare_onboarding_rollback
+    local node_id=0123456789abcdef0123456789abcdef
+    _ssh_pin_host_key() { return 1; }
+    _revoke_managed_remote_key() { return 1; }
+
+    run _github_initial_portable_onboarding <<< $'y\n3'
+    assert_failure
+    assert_output --partial "Удалите его из authorized_keys вручную: $SSH_IDENTITIES_DIR/$node_id.pub"
+    [[ ! -e "$SSH_IDENTITIES_DIR/$node_id" && -f "$SSH_IDENTITIES_DIR/$node_id.pub" ]]
+    _assert_onboarding_rolled_back
 }
 
 # Execute remote provisioning commands only against a sandbox HOME. Keep the
@@ -303,7 +406,7 @@ _assert_identity_permission_failure() {
     [[ ! -e "$BATS_TEST_TMPDIR/config-write-called" ]]
     [[ ! -e "$BATS_TEST_TMPDIR/checkpoint-called" ]]
     [[ ! -e "$SSH_IDENTITIES_DIR/$NODE_ID" && ! -e "$SSH_IDENTITIES_DIR/$NODE_ID.pub" ]]
-    ! compgen -G "$CONFIG_DIR/.identity.*"
+    ! compgen -G "$CONFIG_DIR/.identity.*" || return 1
     cmp "$CONFIG_JSON" "$BATS_TEST_TMPDIR/config.before"
     [[ "$(cat "$SSH_SANDBOX_HOME/.ssh/authorized_keys")" == unrelated-existing-key ]]
 }

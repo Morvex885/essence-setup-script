@@ -33,10 +33,10 @@ status_batch() {
         '{"installed":"false","web_enabled":false,"mtproto_enabled":false}' \
         '{"installed":false,"web_enabled":true,"mtproto_enabled":false}'; do
         ! _telegram_proxy_status_object "$invalid" >/dev/null 2>&1 || \
-            ! _telegram_proxy_status_result "$(_telegram_proxy_status_object "$invalid")" 3
+            ! _telegram_proxy_status_result "$(_telegram_proxy_status_object "$invalid")" 3 || return 1
     done
-    ! _telegram_proxy_status_result '{"installed":true,"web_enabled":false,"mtproto_enabled":false}' 0
-    ! _telegram_proxy_status_result '{"installed":false,"web_enabled":false,"mtproto_enabled":false}' 0
+    ! _telegram_proxy_status_result '{"installed":true,"web_enabled":false,"mtproto_enabled":false}' 0 || return 1
+    ! _telegram_proxy_status_result '{"installed":false,"web_enabled":false,"mtproto_enabled":false}' 0 || return 1
     ! _telegram_proxy_status_result '{"installed":false,"web_enabled":false,"mtproto_enabled":true}' 3
 }
 
@@ -64,6 +64,16 @@ status_batch() {
     _telegram_proxy_external_probe() { TELEGRAM_PROXY_EXTERNAL_IPV6_STATUS=UNVERIFIED; return 2; }
     _telegram_proxy_status_result '{"installed":true,"web_enabled":true,"mtproto_enabled":false,"web_hostname":"web.example.com"}' 0
     [[ "$TELEGRAM_PROXY_STATUS_RESULT" == 0\|* ]]
+}
+
+@test "MTProto listener failure and changed IP independently degrade status" {
+    local base='"installed":true,"web_enabled":false,"mtproto_enabled":true,"mtproto_ipv4":"203.0.113.4"'
+    _telegram_proxy_status_result "{$base,\"mtproto_listener\":true,\"mtproto_ip_state\":\"current\"}" 0
+    [[ "$TELEGRAM_PROXY_STATUS_RESULT" == 0* ]]
+    _telegram_proxy_status_result "{$base,\"mtproto_listener\":false,\"mtproto_ip_state\":\"current\"}" 0
+    [[ "$TELEGRAM_PROXY_STATUS_RESULT" == 4\|* ]]
+    _telegram_proxy_status_result "{$base,\"mtproto_listener\":true,\"mtproto_ip_state\":\"changed\"}" 0
+    [[ "$TELEGRAM_PROXY_STATUS_RESULT" == 4\|* ]]
 }
 
 @test "untrusted health fields cannot become display text or commands" {

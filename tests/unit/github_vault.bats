@@ -947,7 +947,7 @@ _portable_password_transport_roundtrip() {
     cmp -s <(jq -S . "$logical") <(jq -S . "$CONFIG_DIR/reexport.json") || return 1
     if [[ "$mode" == age ]]; then
         [[ ! -e "$GITHUB_WORKTREE/secrets.json" && ! -e "$GITHUB_WORKTREE/config.json" ]] || return 1
-        [[ "$(find "$GITHUB_WORKTREE" -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)" == $'recipient.txt\nstate.json.age\nstorage.json\nunlock.age' ]] || return 1
+        [[ "$(cd "$GITHUB_WORKTREE" && find . -maxdepth 1 -type f | sed 's|^\./||' | LC_ALL=C sort)" == $'recipient.txt\nstate.json.age\nstorage.json\nunlock.age' ]] || return 1
     fi
 }
 

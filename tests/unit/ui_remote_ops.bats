@@ -47,9 +47,27 @@ teardown() { teardown_test_env; }
 @test "key revocation failure preserves managed node before local mutation" {
     CONFIG_SOURCE=github
     jq_w '.nodes[0].identity=.nodes[0].id'
+    local id
+    id=$(jq_r '.nodes[0].id')
+    printf '%s\n' 'ssh-ed25519 AAAATEST essence:test' > "$SSH_IDENTITIES_DIR/$id.pub"
     cp "$CONFIG_JSON" "$BATS_TEST_TMPDIR/config.before"
-    _revoke_managed_remote_key() { return 1; }
-    if delete_node <<< $'1\n2\ny'; then return 1; fi
+    # The key is present remotely, but the authorized_keys rewrite fails.
+    ssh_run() {
+        while [[ $# -gt 0 && "$1" != "--" ]]; do shift; done
+        [[ "${1:-}" == "--" ]] && shift
+        case "${1:-}" in
+            *'awk -v key='*) touch "$BATS_TEST_TMPDIR/revoke-attempted"; return 1 ;;
+            *'printf present'*) printf present ;;
+        esac
+        return 0
+    }
+    github_config_checkpoint() { return 0; }
+    github_sync_flush() { return 0; }
+    local rc=0
+    delete_node <<< $'1\n2\ny' > "$BATS_TEST_TMPDIR/out" 2>&1 || rc=$?
+    [[ $rc -ne 0 ]]
+    [[ -e "$BATS_TEST_TMPDIR/revoke-attempted" ]]
+    grep -Fq "SSH-ключ не отозван. Нода сохранена в remote-control." "$BATS_TEST_TMPDIR/out"
     cmp "$CONFIG_JSON" "$BATS_TEST_TMPDIR/config.before"
     [[ ${#UPLOAD_CALLS[@]} == 0 ]]
 }

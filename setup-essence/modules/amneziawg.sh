@@ -1173,7 +1173,7 @@ install_awg() {
         reinstall=1
         old_port=$(awk '/^ListenPort[[:space:]]*=/{print $3; exit}' "$AWG_CONF" 2>/dev/null)
         warn "AmneziaWG уже настроен."
-        confirm_yn "Переустановить AmneziaWG 3.1? (после успешного запуска клиентские конфиги будут перевыпущены)" || {
+        confirm_yn "Переустановить AmneziaWG 3.1? (клиентские конфиги будут удалены; клиентов потребуется создать заново)" || {
             info "Отменено."
             return 0
         }

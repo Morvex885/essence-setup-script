@@ -1,5 +1,7 @@
 #!/usr/bin/env bats
 
+FUZZ_ITERATIONS="${FUZZ_ITERATIONS:-100}"
+
 setup() {
     load '../helpers/test_helper'
     load '../helpers/fuzz_helper'

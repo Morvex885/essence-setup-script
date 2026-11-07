@@ -42,7 +42,7 @@ teardown() { teardown_test_env; }
         older="$major.$minor.$((patch - 1))"
         newer="$major.$minor.$((patch + 1))"
         _ver_gt "$normalized" "$older"
-        ! _ver_gt "$normalized" "$newer"
+        ! _ver_gt "$normalized" "$newer" || return 1
         printf '%s\r\n' "$version" > "$VERSION_PATH"
         mkdir -p "$REMOTE_DIR"
         printf 'old payload %s\n' "$i" > "$REMOTE_DIR/setup-essence.sh"
@@ -71,11 +71,11 @@ teardown() { teardown_test_env; }
         invalid=$(mutate_inject '1.2.3' "${DICT_SHELL_INJECTION[@]}")
         if _remote_scripts_normalize_version "$invalid" >/dev/null 2>&1; then continue; fi
         printf '%s\n' "$invalid" > "$VERSION_PATH"
-        ! ensure_remote_scripts_current >/dev/null 2>&1
+        ! ensure_remote_scripts_current >/dev/null 2>&1 || return 1
         [ "$(cat "$REMOTE_DIR/setup-essence.sh")" = "$before" ]
         [ "$(cat "$REMOTE_DIR/VERSION")" = 1.2.3 ]
     done
     printf '$(touch "%s")\n' "$marker" > "$VERSION_PATH"
-    ! ensure_remote_scripts_current >/dev/null 2>&1
+    ! ensure_remote_scripts_current >/dev/null 2>&1 || return 1
     [ ! -e "$marker" ]
 }

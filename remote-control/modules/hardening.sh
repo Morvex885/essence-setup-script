@@ -69,12 +69,28 @@ _onboarding_restore_backups() {
     fi
 }
 
+# Revokes keys installed during onboarding, then restores known_hosts and the
+# manifest. A key whose revocation failed keeps its .pub for manual cleanup.
+_onboarding_rollback() {
+    local known_existed="$1" known_backup="$2" manifest_backup="$3" id node_name
+    shift 3
+    for id in "$@"; do
+        node_name=$(jq_r --arg id "$id" '.nodes[] | select(.id==$id) | .name')
+        if [[ -n "$node_name" ]] && node_load_by_name "$node_name" &&
+           _revoke_managed_remote_key "$id"; then
+            rm -f "$SSH_IDENTITIES_DIR/$id" "$SSH_IDENTITIES_DIR/$id.pub"
+        else
+            rm -f "$SSH_IDENTITIES_DIR/$id"
+            warn "Не удалось отозвать переносимый SSH-ключ ноды «${node_name:-$id}». Удалите его из authorized_keys вручную: $SSH_IDENTITIES_DIR/$id.pub"
+        fi
+    done
+    _onboarding_restore_backups "$known_existed" "$known_backup" "$manifest_backup" || true
+}
+
 _github_initial_portable_onboarding() {
     [[ "${CONFIG_SOURCE:-local}" == "github" ]] || return 0
-    local known_backup="" known_existed=false manifest_backup="" id name choice
-    local provision_keys=false
-    local -a key_ids=() installed_ids=()
-    local -a node_rows=()
+    local known_backup="" known_existed=false manifest_backup=""
+    local -a installed_ids=()
     if [[ -f "${SSH_KNOWN_HOSTS:-}" ]]; then
         known_existed=true
         known_backup=$(umask 077; mktemp "${CONFIG_DIR:-/tmp}/.known-hosts.XXXXXX") || return 1
@@ -90,6 +106,19 @@ _github_initial_portable_onboarding() {
             return 1
         }
     fi
+    # Every failure or cancellation after the backups exist goes through the
+    # same rollback; the steps append to installed_ids in this scope.
+    if ! _github_portable_onboarding_steps; then
+        _onboarding_rollback "$known_existed" "$known_backup" "$manifest_backup" "${installed_ids[@]}"
+        return 1
+    fi
+    rm -f "$known_backup" "$manifest_backup"
+    return 0
+}
+
+_github_portable_onboarding_steps() {
+    local id name choice provision_keys=false
+    local -a key_ids=() node_rows=()
     while IFS=$'\t' read -r id name; do
         [[ -n "$id" ]] && node_rows+=("$id"$'\t'"$name")
         if [[ -n "$id" ]] && [[ "$(jq_r --arg id "$id" '.nodes[] | select(.id==$id) | (.auth=="key" and ((.identity // "system")=="system"))')" == true ]]; then
@@ -135,13 +164,6 @@ _github_initial_portable_onboarding() {
                     state_portability_add_issue "$id" missing_identity || return 1
                     break
                 else
-                    for name in "${installed_ids[@]}"; do
-                        node_load_by_name "$(jq_r --arg id "$name" '.nodes[] | select(.id==$id) | .name')" || continue
-                        _revoke_managed_remote_key "$name" ||
-                            warn "Не удалось отозвать переносимый SSH-ключ ноды «${NODE_NAME:-$name}»."
-                        rm -f "$SSH_IDENTITIES_DIR/$name" "$SSH_IDENTITIES_DIR/$name.pub"
-                    done
-                    _onboarding_restore_backups "$known_existed" "$known_backup" "$manifest_backup" || true
                     return 1
                 fi
             done
@@ -165,7 +187,6 @@ _github_initial_portable_onboarding() {
             fi
             continue
         elif [[ $load_rc -ne 0 ]]; then
-            rm -f "$known_backup" "$manifest_backup"
             return 1
         fi
         if [[ "$id" == "" ]]; then continue; fi
@@ -193,13 +214,6 @@ _github_initial_portable_onboarding() {
                 state_portability_add_issue "$id" missing_host_key || return 1
                 break
             else
-                _onboarding_restore_backups "$known_existed" "$known_backup" "$manifest_backup" || true
-                for name in "${installed_ids[@]}"; do
-                    node_load_by_name "$(jq_r --arg id "$name" '.nodes[] | select(.id==$id) | .name')" || continue
-                    _revoke_managed_remote_key "$name" ||
-                        warn "Не удалось отозвать переносимый SSH-ключ ноды «${NODE_NAME:-$name}»."
-                    rm -f "$SSH_IDENTITIES_DIR/$name" "$SSH_IDENTITIES_DIR/$name.pub"
-                done
                 return 1
             fi
         done
@@ -207,32 +221,15 @@ _github_initial_portable_onboarding() {
     if [[ ${#installed_ids[@]} -gt 0 ]]; then
         local ids_json
         ids_json=$(printf '%s\n' "${installed_ids[@]}" | jq -R . | jq -s .) || return 1
-        local identity_write_rc=0
         # The candidate must see issues matching its newly installed identities.
-        # Restore the original manifest below if either step fails.
+        # The caller restores the original manifest if either step fails.
         for id in "${installed_ids[@]}"; do
-            state_portability_remove_issue "$id" missing_identity || {
-                identity_write_rc=1
-                break
-            }
+            state_portability_remove_issue "$id" missing_identity || return 1
         done
-        if [[ $identity_write_rc -eq 0 ]]; then
-            jq_w --argjson ids "$ids_json" \
-                '.nodes |= map(.id as $id | if ($ids | index($id)) then .identity=$id else . end)' ||
-                identity_write_rc=1
-        fi
-        if [[ $identity_write_rc -ne 0 ]]; then
-            _onboarding_restore_backups "$known_existed" "$known_backup" "$manifest_backup" || true
-            for name in "${installed_ids[@]}"; do
-                node_load_by_name "$(jq_r --arg id "$name" '.nodes[] | select(.id==$id) | .name')" || continue
-                _revoke_managed_remote_key "$name" ||
-                    warn "Не удалось отозвать переносимый SSH-ключ ноды «${NODE_NAME:-$name}»."
-                rm -f "$SSH_IDENTITIES_DIR/$name" "$SSH_IDENTITIES_DIR/$name.pub"
-            done
+        jq_w --argjson ids "$ids_json" \
+            '.nodes |= map(.id as $id | if ($ids | index($id)) then .identity=$id else . end)' ||
             return 1
-        fi
     fi
-    rm -f "$known_backup" "$manifest_backup"
     return 0
 }
 
@@ -350,8 +347,8 @@ _harden_setup_key() {
     _provision_portable_identity "${NODE_ID:-}" || return 1
 }
 
-# Hardening uses the just-verified identity even for local nodes, whose normal
-# SSH sessions deliberately keep the existing system/agent-key policy.
+# Hardening pins the just-verified identity with IdentitiesOnly/BatchMode even
+# for local nodes, whose normal SSH sessions also allow agent/system keys.
 _harden_ssh_run() {
     local SERVER_AUTH=key SERVER_PASS=""
     ssh_run -i "$SSH_IDENTITIES_DIR/$NODE_IDENTITY" \
@@ -451,8 +448,46 @@ _harden_rollback_port() {
     return 1
 }
 
+# GitHub sessions check host keys strictly against the managed known_hosts and
+# portable state requires an entry for the node's own port. Re-use only entries
+# already present for the current port, keeping @cert-authority/@revoked markers,
+# so verification stays strict.
+_harden_trust_new_port() {
+    local old_port="$1" new_port="$2" old_host="$SERVER_IP" new_host="$SERVER_IP" entries
+    [[ "$old_port" != 22 ]] && old_host="[$SERVER_IP]:$old_port"
+    [[ "$new_port" != 22 ]] && new_host="[$SERVER_IP]:$new_port"
+    [[ -n "${SSH_KNOWN_HOSTS:-}" && -f "$SSH_KNOWN_HOSTS" ]] || return 1
+    ssh-keygen -F "$new_host" -f "$SSH_KNOWN_HOSTS" >/dev/null 2>&1 && return 0
+    entries=$(ssh-keygen -F "$old_host" -f "$SSH_KNOWN_HOSTS" 2>/dev/null |
+        awk -v host="$new_host" '/^#/ { next }
+            $1 ~ /^@/ { if (NF >= 4) print $1, host, $3, $4; next }
+            NF >= 3 { print host, $2, $3 }')
+    [[ -n "$entries" ]] || return 1
+    printf '%s\n' "$entries" >> "$SSH_KNOWN_HOSTS"
+}
+
+_harden_restore_known_hosts() {
+    local backup="$1"
+    [[ -n "$backup" ]] || return 0
+    cat "$backup" > "$SSH_KNOWN_HOSTS" ||
+        warn "Не удалось вернуть прежний список ключей серверов: $SSH_KNOWN_HOSTS"
+    rm -f "$backup"
+}
+
 _harden_change_port() {
-    local old_port="$SERVER_PORT" new_port="$1"
+    local old_port="$SERVER_PORT" new_port="$1" known_backup=""
+    if [[ "${CONFIG_SOURCE:-local}" == github ]]; then
+        if ! known_backup=$(mktemp) || ! cp "$SSH_KNOWN_HOSTS" "$known_backup"; then
+            rm -f "$known_backup"
+            warn "Не удалось сохранить копию списка ключей серверов."
+            return 1
+        fi
+        if ! _harden_trust_new_port "$old_port" "$new_port"; then
+            _harden_restore_known_hosts "$known_backup"
+            warn "Не удалось подготовить ключ сервера для нового SSH-порта."
+            return 1
+        fi
+    fi
     info "Меняем SSH-порт на ${new_port}..."
     if ! _harden_ssh_run "
         sed -i '/^#\\?Port /d' /etc/ssh/sshd_config &&
@@ -475,6 +510,7 @@ _harden_change_port() {
     "; then
         warn "Не удалось применить новый SSH-порт."
         _harden_rollback_port "$old_port" "$new_port" || true
+        _harden_restore_known_hosts "$known_backup"
         return 1
     fi
     sleep 3
@@ -484,6 +520,7 @@ _harden_change_port() {
         SERVER_PORT="$old_port"
         warn "Не удалось подключиться по новому порту."
         _harden_rollback_port "$old_port" "$new_port" || true
+        _harden_restore_known_hosts "$known_backup"
         return 1
     fi
     if ! jq_w --arg id "$NODE_ID" --argjson p "$new_port" --arg identity "$NODE_ID" \
@@ -491,8 +528,10 @@ _harden_change_port() {
         SERVER_PORT="$old_port"
         warn "Не удалось сохранить параметры усиления защиты SSH."
         _harden_rollback_port "$old_port" "$new_port" || true
+        _harden_restore_known_hosts "$known_backup"
         return 1
     fi
+    rm -f "$known_backup"
     SERVER_AUTH=key; SERVER_PASS=""
     success "Подключение по порту ${new_port} работает"
     return 0

@@ -237,6 +237,7 @@ NODE_CONFIG_CACHE_VALUES=()
 NODE_CONFIG_FAILED=()
 SCRIPTS_READY=()
 AWG_PEERS_CHECKED=()
+AWG_PEERS_FAILED=()
 
 _reset_node_cache() {
     NODE_CONFIG_CACHE_KEYS=()
@@ -244,6 +245,7 @@ _reset_node_cache() {
     NODE_CONFIG_FAILED=()
     SCRIPTS_READY=()
     AWG_PEERS_CHECKED=()
+    AWG_PEERS_FAILED=()
 }
 
 # Получить client-config.txt из кеша (без SSH)
@@ -349,8 +351,10 @@ _ensure_all_awg_peers() {
 
         # Проверяем AWG + какие peers уже существуют — одним SSH
         local check_result
-        check_result=$(ssh_run -- "if [ ! -f /etc/amnezia/amneziawg/awg0.conf ]; then echo NO_AWG; else echo AWG_OK; ls /etc/mihomo/amnezia/; fi") \
-            || continue
+        check_result=$(ssh_run -- "if [ ! -f /etc/amnezia/amneziawg/awg0.conf ]; then echo NO_AWG; else echo AWG_OK; ls /etc/mihomo/amnezia/; fi") || {
+            AWG_PEERS_FAILED+=("$nname")
+            continue
+        }
 
         # AWG не установлен на ноде
         if [[ "$check_result" == "NO_AWG" ]]; then
@@ -381,6 +385,7 @@ _ensure_all_awg_peers() {
         if ! array_contains "$nname" "${SCRIPTS_READY[@]}"; then
             if ! ensure_remote_scripts_current; then
                 warn "$nname: не удалось подготовить скрипты; клиенты AmneziaWG не изменены."
+                AWG_PEERS_FAILED+=("$nname")
                 continue
             fi
             SCRIPTS_READY+=("$nname")
@@ -393,6 +398,7 @@ _ensure_all_awg_peers() {
 
         ssh_run -- "$peers_cmd" || {
             warn "Ошибка при создании клиентов AmneziaWG на $nname"
+            AWG_PEERS_FAILED+=("$nname")
         }
 
         # Инвалидируем кеш — конфиг ноды изменился (новые peers)
@@ -635,7 +641,8 @@ _fetch_proxies_for_client() {
         proxy_block=$(echo "$remote_config" | sed -n '/^proxies:/,/^---/p' | grep -v '^---' | grep -v '^proxies:' \
             | sed 's/^  - name: \([^"]\)\(.*\)/  - name: "\1\2"/')
 
-        if [[ -n "$proxy_block" && -n "$allowed_connections" ]]; then
+        # Фильтр выполняется и при пустом ответе ноды: иначе сбой AWG peer не заметен.
+        if [[ -n "$allowed_connections" ]]; then
             local filtered=""
             IFS=',' read -ra allowed <<< "$allowed_connections"
             for conn_name in "${allowed[@]}"; do
@@ -679,6 +686,11 @@ _fetch_proxies_for_client() {
                 if [[ -n "$block" && "$conn_name" == "AWG" ]]; then
                     local awg_display="AmneziaWG 3.1"
                     block="  - name: \"${awg_display}\""$'\n'"$(echo "$block" | tail -n +2)"
+                fi
+                # AWG peer не создан на этой ноде — не сохраняем конфиг без AWG
+                if [[ -z "$block" && "$conn_name" == "AWG" ]] && array_contains "$nname" "${AWG_PEERS_FAILED[@]}"; then
+                    warn "$client_name: клиент AmneziaWG на $nname не создан" >&2
+                    rc=1
                 fi
                 [[ -n "$block" ]] && filtered="${filtered}${block}"$'\n'
             done

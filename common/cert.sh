@@ -146,6 +146,26 @@ ensure_acme_installed() {
     fi
 }
 
+# acme.sh runs HTTP-01 hooks in the private domain directory on issue and on
+# every renewal; ensure_cert runs the same hooks around its own orders.
+# The pre-hook saves `ufw show added` once (a snapshot left by an interrupted
+# run predates the port it opened) and adds the temporary `allow 80/tcp`.
+# The post-hook deletes that rule unless it existed before, then re-adds saved
+# TCP/80 rules the temporary rule replaced (deny, IPv6-only or subnet rules
+# stay as they were). Saved lines are never evaluated: only lines matching
+# CERT_HTTP01_RULE_RE are passed to ufw as plain words. No snapshot: no change.
+CERT_HTTP01_STATE_FILE=.essence-http01-80.state
+CERT_HTTP01_RULE_RE='ufw (allow|deny|reject|limit)( (in|out))?( [A-Za-z0-9./:_-]+)+'
+CERT_HTTP01_PRE_HOOK="{ [ -e $CERT_HTTP01_STATE_FILE ] || { ufw show added > $CERT_HTTP01_STATE_FILE.tmp && mv $CERT_HTTP01_STATE_FILE.tmp $CERT_HTTP01_STATE_FILE; }; } && ufw allow 80/tcp"
+CERT_HTTP01_POST_HOOK="if [ -e $CERT_HTTP01_STATE_FILE ]; then { grep -qx \"ufw allow 80/tcp\" $CERT_HTTP01_STATE_FILE || ufw delete allow 80/tcp; } && ufw show added > $CERT_HTTP01_STATE_FILE.now && grep \"^ufw \" $CERT_HTTP01_STATE_FILE | grep -w 80 | while read -r r; do grep -qxF -- \"\$r\" $CERT_HTTP01_STATE_FILE.now && continue; if printf \"%s\\\\n\" \"\$r\" | grep -Eqx \"$CERT_HTTP01_RULE_RE\"; then ufw \${r#ufw } || exit 1; else echo \"essence: UFW rule skipped: \$r\" >&2; fi; done && rm -f $CERT_HTTP01_STATE_FILE $CERT_HTTP01_STATE_FILE.now; fi && systemctl reload nginx"
+
+# Runs an HTTP-01 hook for the order family directory, as acme.sh does.
+_cert_http01_hook() {
+    local dir="$1" hook="$2"
+    mkdir -p "$dir" && chmod 700 "$dir" || return 1
+    (cd "$dir" && eval "$hook") >/dev/null
+}
+
 # Identity is also used as a filename and a literal nginx server_name.
 _cert_identity_valid() {
     [[ -n "${1:-}" && "$1" != *[[:space:][:cntrl:]/]* &&
@@ -314,7 +334,7 @@ _cert_registrations() {
 _cert_write_metadata() (
     local file="$1" webroot="$2" dest="$3" line name i tmp
     local keys=(Le_Webroot Le_PreHook Le_PostHook Le_RealCertPath Le_RealKeyPath Le_RealCACertPath Le_RealFullChainPath Le_ReloadCmd Le_InstallCertSuccessTime Le_InstallCertSuccessTimeStr)
-    local values=("$webroot" "ufw allow 80/tcp" "ufw deny 80/tcp && systemctl reload nginx" "$dest/cert.pem" "$dest/privkey.pem" "" "$dest/fullchain.pem" "systemctl reload nginx" "" "")
+    local values=("$webroot" "$CERT_HTTP01_PRE_HOOK" "$CERT_HTTP01_POST_HOOK" "$dest/cert.pem" "$dest/privkey.pem" "" "$dest/fullchain.pem" "systemctl reload nginx" "" "")
     local seen=()
     # renew() retries a pending install before its renewal-date check. The
     # published pair was independently validated, so no unchecked archive
@@ -454,8 +474,12 @@ _cert_effective_root() {
     fi
 }
 
+# Let's Encrypt prefers AAAA and does not retry IPv4 after an HTTP error, so the
+# challenge route must also own [::]:80 when the kernel has an IPv6 stack.
+_cert_ipv6_available() { [[ -d /proc/sys/net/ipv6 ]]; }
+
 _cert_enable_site() {
-    local identity="$1" webroot="$2" available="$3" enabled="$4" conf="$5" site link tmp
+    local identity="$1" webroot="$2" available="$3" enabled="$4" conf="$5" site link tmp listen6=()
     site="$available/essence-acme-$identity" link="$enabled/essence-acme-$identity"
     if [[ -e "$site" || -L "$site" ]]; then _cert_site_root "$site" || return 1; fi
     if [[ -e "$link" || -L "$link" ]]; then
@@ -465,7 +489,8 @@ _cert_enable_site() {
     # existing decoy root; transaction and key directories stay private.
     (umask 022; mkdir -p "$webroot" "$available" "$enabled") || return 1
     tmp=$(umask 077; mktemp "$available/.essence-acme.XXXXXX") || return 1
-    if ! printf '%s\n' "# Essence ACME challenge" "server {" "    listen 80;" \
+    if _cert_ipv6_available; then listen6=("    listen [::]:80;"); fi
+    if ! printf '%s\n' "# Essence ACME challenge" "server {" "    listen 80;" ${listen6[@]+"${listen6[@]}"} \
         "    server_name $identity;" "    location /.well-known/acme-challenge/ {" \
         "        root $webroot;" "    }" \
         '    location / { return 301 https://$host$request_uri; }' "}" > "$tmp" ||
@@ -682,7 +707,7 @@ _cert_select_issued_material() {
 _cert_issue_once() {
     local identity="$1" webroot="$2" is_ip="$3" length="$4" force="${5:-false}"
     local args=(--issue -d "$identity" --webroot "$webroot" --server letsencrypt --keylength "$length"
-        --pre-hook "ufw allow 80/tcp" --post-hook "ufw deny 80/tcp && systemctl reload nginx")
+        --pre-hook "$CERT_HTTP01_PRE_HOOK" --post-hook "$CERT_HTTP01_POST_HOOK")
     [[ "$is_ip" != true ]] || args+=(--certificate-profile shortlived --days 5)
     [[ "$force" != true ]] || args+=(--force)
     "$HOME/.acme.sh/acme.sh" "${args[@]}"
@@ -738,7 +763,7 @@ _cert_ensure_rollback() {
 ensure_cert() (
     local identity="${1:-}" webroot="${2:-}" is_ip="${3:-false}" cert_dir="${4:-/etc/nginx/ssl}"
     local available="${5:-/etc/nginx/sites-available}" enabled="${6:-/etc/nginx/sites-enabled}"
-    local conf="${7:-/etc/nginx/nginx.conf}" dest tx="" now path file ok=false firewall=false
+    local conf="${7:-/etc/nginx/nginx.conf}" dest tx="" now path file ok=false firewall=false http01_dir=""
     local index length=ec-256 rc issued=false message i unmanaged_usable=false
     _cert_identity_valid "$identity" || { warn "Некорректное имя сертификата."; return 1; }
     for path in "$webroot" "$cert_dir" "$available" "$enabled" "$conf" "$HOME/.acme.sh"; do
@@ -765,7 +790,7 @@ ensure_cert() (
         _cert_snapshot "$dest/$file" "$tx/$file" || { rm -rf "$tx"; return 1; }
     done
     [[ -d "$dest" ]] || : > "$tx/dest.absent"
-    trap 'if [[ "$firewall" == true ]]; then ufw deny 80/tcp >/dev/null || warn "Не удалось закрыть порт HTTP-01."; fi; if [[ "$ok" != true ]]; then _cert_ensure_rollback "$identity" "$tx" "$dest" "$available" "$enabled" "$conf"; fi; rm -rf "$tx"' EXIT
+    trap 'if [[ "$firewall" == true ]] && ! _cert_http01_hook "$http01_dir" "$CERT_HTTP01_POST_HOOK"; then warn "Не удалось вернуть исходные правила UFW для TCP/80."; fi; if [[ "$ok" != true ]]; then _cert_ensure_rollback "$identity" "$tx" "$dest" "$available" "$enabled" "$conf"; fi; rm -rf "$tx"' EXIT
     if [[ "$CERT_MATERIAL" == none ]]; then
         if ((${#CERT_REG_FILES[@]} > 0)); then
             length="${CERT_REG_LENGTHS[0]}"
@@ -775,8 +800,10 @@ ensure_cert() (
         _cert_enable_site "$identity" "$webroot" "$available" "$enabled" "$conf" || {
             warn "Не удалось включить HTTP-01 маршрут."; return 1;
         }
-        ufw allow 80/tcp >/dev/null || return 1
+        http01_dir="$HOME/.acme.sh/$identity"
+        [[ "$length" != ec-* ]] || http01_dir="${http01_dir}_ecc"
         firewall=true
+        _cert_http01_hook "$http01_dir" "$CERT_HTTP01_PRE_HOOK" || return 1
         if _cert_issue_once "$identity" "$webroot" "$is_ip" "$length"; then rc=0; else rc=$?; fi
         if ((rc != 0 && rc != 2)); then
             warn "Не удалось получить сертификат; повторная выдача не выполняется."
@@ -803,8 +830,8 @@ ensure_cert() (
                 return 1
             fi
         fi
-        ufw deny 80/tcp >/dev/null || return 1
         firewall=false
+        _cert_http01_hook "$http01_dir" "$CERT_HTTP01_POST_HOOK" || return 1
     fi
     index="$CERT_SELECTED_INDEX"
     if [[ "$CERT_MATERIAL" == archive ]]; then

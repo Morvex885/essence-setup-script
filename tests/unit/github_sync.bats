@@ -1010,6 +1010,44 @@ EOF
     github_config_close
 }
 
+@test "rewrap account check failure after local commit keeps the new password pending" {
+    _seed_age_revision || return 1
+    local age="$BATS_TEST_TMPDIR/age-rewrap-account" new_head rc=0
+    cat > "$age" <<'EOF'
+#!/bin/bash
+out=""
+decrypt=false
+while (($#)); do
+    case "$1" in
+        -d) decrypt=true; shift ;;
+        -o) out="${2:-}"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+if [[ "$decrypt" == true ]]; then
+    printf 'AGE-SECRET-KEY-REWRAP\n' > "$out"
+else
+    printf 'new-unlock\n' > "$out"
+fi
+EOF
+    chmod +x "$age" || return 1
+    AGE_BIN="$age"
+    GITHUB_SESSION_ORIGIN=$(git --git-dir="$GITHUB_STORE" remote get-url origin) || return 1
+    GITHUB_REMOTE=https://github.com/owner/essence-config.git
+    GITHUB_SESSION_REMOTE="$GITHUB_REMOTE"
+    _github_account_login() {
+        _github_record_error "проверка аккаунта GitHub" "gh offline"
+        return 1
+    }
+    github_config_rewrap_master <<< $'old-password\nnew-password\nnew-password\n' || rc=$?
+    [[ "$rc" -eq 0 ]] || return 1
+    [[ "$GITHUB_SYNC_STATUS" == pending ]] || return 1
+    [[ "$(cat "$GITHUB_WORKTREE/unlock.age")" == new-unlock ]] || return 1
+    new_head=$(git -C "$GITHUB_WORKTREE" rev-parse HEAD) || return 1
+    [[ "$(git --git-dir="$GITHUB_STORE" rev-parse main)" == "$new_head" ]] || return 1
+    [[ "$(git --git-dir="$GITHUB_STORE" show main:unlock.age)" == new-unlock ]] || return 1
+}
+
 @test "rotation push failure keeps the complete new age bundle pending" {
     _seed_age_revision || return 1
     local age="$BATS_TEST_TMPDIR/age-rotate" keygen="$BATS_TEST_TMPDIR/age-keygen"

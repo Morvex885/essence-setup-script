@@ -103,6 +103,13 @@ _ssh_base_options() {
         SSH_BASE_OPTIONS=(-o StrictHostKeyChecking=accept-new
             -o ConnectTimeout=10 -o ServerAliveInterval=5
             -o ServerAliveCountMax=3 -p "${SERVER_PORT:-22}")
+        # After local hardening the managed key may be the only accepted one;
+        # keep agent/system keys as a fallback (no IdentitiesOnly).
+        if [[ "$SERVER_AUTH" == "key" &&
+              "${NODE_IDENTITY:-}" != "" && "${NODE_IDENTITY:-}" != "system" &&
+              -f "${SSH_IDENTITIES_DIR:-}/$NODE_IDENTITY" ]]; then
+            SSH_BASE_OPTIONS+=(-i "$SSH_IDENTITIES_DIR/$NODE_IDENTITY")
+        fi
     fi
 }
 

@@ -53,9 +53,140 @@ assert_final_registration() {
     _acme_conf_value "$file" Le_Webroot
     [ "$ACME_CONF_VALUE" = "$CERT_TEST_WEBROOT" ]
     _acme_conf_value "$file" Le_PreHook
-    [ "$ACME_CONF_VALUE" = 'ufw allow 80/tcp' ]
+    [ "$ACME_CONF_VALUE" = "$CERT_HTTP01_PRE_HOOK" ]
     _acme_conf_value "$file" Le_PostHook
-    [ "$ACME_CONF_VALUE" = 'ufw deny 80/tcp && systemctl reload nginx' ]
+    [ "$ACME_CONF_VALUE" = "$CERT_HTTP01_POST_HOOK" ]
+}
+
+V6_80_RULE='ufw allow from ::/0 to any port 80 proto tcp'
+
+# Stateful ufw: rules are `ufw show added` lines. A new action for the same
+# rule spec replaces the old one; deleting `allow 80/tcp` also drops the
+# identical IPv6-only rule, as real ufw does when it skipped adding it.
+use_stateful_ufw() {
+    export CERT_TEST_UFW_RULES="$BATS_TEST_TMPDIR/ufw-rules" V6_80_RULE
+    printf '%s' "${1:-}" > "$CERT_TEST_UFW_RULES"
+    [[ -z "${1:-}" ]] || printf '\n' >> "$CERT_TEST_UFW_RULES"
+    mkdir -p "$BATS_TEST_TMPDIR/ufw-state"
+    cat > "$BATS_TEST_TMPDIR/ufw-state/ufw" <<'FAKE'
+#!/bin/bash
+printf 'ufw %s\n' "$*" >> "$CERT_TEST_SERVICE_LOG"
+rules="$CERT_TEST_UFW_RULES"
+tmp="$CERT_TEST_UFW_RULES.tmp"
+: > "$tmp"
+case "$1" in
+    show)
+        printf '%s\n' "Added user rules (see 'ufw status' for running firewall):"
+        cat "$rules"
+        exit 0
+        ;;
+    delete)
+        shift
+        grep -qxF "ufw $*" "$rules" || exit 1
+        while IFS= read -r line; do
+            [[ "$line" == "ufw $*" ]] && continue
+            [[ "$*" == 'allow 80/tcp' && "$line" == "$V6_80_RULE" ]] && continue
+            printf '%s\n' "$line" >> "$tmp"
+        done < "$rules"
+        ;;
+    allow|deny|reject|limit)
+        spec="${*:2}"
+        while IFS= read -r line; do
+            [[ "$line" =~ ^ufw\ (allow|deny|reject|limit)\ (.*)$ && "${BASH_REMATCH[2]}" == "$spec" ]] && continue
+            printf '%s\n' "$line" >> "$tmp"
+        done < "$rules"
+        printf 'ufw %s\n' "$*" >> "$tmp"
+        ;;
+    *) exit 0 ;;
+esac
+mv "$tmp" "$rules"
+FAKE
+    chmod 700 "$BATS_TEST_TMPDIR/ufw-state/ufw"
+    export PATH="$BATS_TEST_TMPDIR/ufw-state:$PATH"
+}
+
+run_http01_hooks() {
+    local dir="$BATS_TEST_TMPDIR/domain-path"
+    mkdir -p "$dir"
+    (cd "$dir" && sh -c "$CERT_HTTP01_PRE_HOOK" && sh -c "$CERT_HTTP01_POST_HOOK")
+    [ ! -e "$dir/$CERT_HTTP01_STATE_FILE" ]
+}
+
+@test "renewal hooks remove only the temporary TCP/80 rule and keep original rules" {
+    local original
+    for original in '' 'ufw allow 80/tcp' 'ufw deny 80/tcp' \
+        'ufw allow from 192.168.0.0/24 to any port 80 proto tcp' "$V6_80_RULE"; do
+        use_stateful_ufw "$original"
+        : > "$CERT_TEST_SERVICE_LOG"
+        run_http01_hooks
+        [ "$(cat "$CERT_TEST_UFW_RULES")" = "$original" ] || return 1
+        grep -qx 'ufw allow 80/tcp' "$CERT_TEST_SERVICE_LOG" || return 1
+        grep -qx 'systemctl reload nginx' "$CERT_TEST_SERVICE_LOG" || return 1
+    done
+}
+
+@test "interrupted renewal keeps the original TCP/80 snapshot for the next run" {
+    local dir="$BATS_TEST_TMPDIR/domain-path"
+    use_stateful_ufw ''
+    mkdir -p "$dir"
+    (cd "$dir" && sh -c "$CERT_HTTP01_PRE_HOOK")
+    [ "$(cat "$CERT_TEST_UFW_RULES")" = 'ufw allow 80/tcp' ]
+    run_http01_hooks
+    [ ! -s "$CERT_TEST_UFW_RULES" ]
+}
+
+@test "post-hook re-adds only whitelisted saved rules and never executes saved text" {
+    local dir="$BATS_TEST_TMPDIR/domain-path" marker="$BATS_TEST_TMPDIR/pwned"
+    use_stateful_ufw 'ufw allow 80/tcp'
+    mkdir -p "$dir"
+    printf '%s\n' 'ufw deny 80/tcp' "ufw deny 80/tcp;touch $marker" > "$dir/$CERT_HTTP01_STATE_FILE"
+    (cd "$dir" && sh -c "$CERT_HTTP01_POST_HOOK") 2> "$BATS_TEST_TMPDIR/stderr"
+    [ "$(cat "$CERT_TEST_UFW_RULES")" = 'ufw deny 80/tcp' ]
+    [ ! -e "$marker" ]
+    grep -q 'UFW rule skipped' "$BATS_TEST_TMPDIR/stderr"
+    [ ! -e "$dir/$CERT_HTTP01_STATE_FILE" ]
+}
+
+@test "post-hook without a snapshot leaves UFW untouched" {
+    local dir="$BATS_TEST_TMPDIR/domain-path"
+    use_stateful_ufw 'ufw allow 80/tcp'
+    mkdir -p "$dir"
+    (cd "$dir" && sh -c "$CERT_HTTP01_POST_HOOK")
+    [ "$(cat "$CERT_TEST_UFW_RULES")" = 'ufw allow 80/tcp' ]
+}
+
+@test "new order keeps a subnet-only TCP/80 rule and removes the temporary rule" {
+    use_stateful_ufw 'ufw allow from 192.168.0.0/24 to any port 80 proto tcp'
+    ensure_test_cert
+    [ "$(cat "$CERT_TEST_UFW_RULES")" = 'ufw allow from 192.168.0.0/24 to any port 80 proto tcp' ]
+    grep -qx 'ufw allow 80/tcp' "$CERT_TEST_SERVICE_LOG"
+    grep -qx 'ufw delete allow 80/tcp' "$CERT_TEST_SERVICE_LOG"
+}
+
+@test "new order keeps an already open TCP/80 rule" {
+    use_stateful_ufw 'ufw allow 80/tcp'
+    ensure_test_cert
+    [ "$(cat "$CERT_TEST_UFW_RULES")" = 'ufw allow 80/tcp' ]
+    ! grep -q '^ufw delete' "$CERT_TEST_SERVICE_LOG"
+}
+
+@test "new order uses a stale snapshot from an interrupted renewal and clears it" {
+    use_stateful_ufw 'ufw allow 80/tcp'
+    mkdir -p "$ECC"
+    printf '%s\n' "Added user rules (see 'ufw status' for running firewall):" > "$ECC/$CERT_HTTP01_STATE_FILE"
+    ensure_test_cert
+    [ ! -s "$CERT_TEST_UFW_RULES" ]
+    [ ! -e "$ECC/$CERT_HTTP01_STATE_FILE" ]
+}
+
+@test "challenge route listens on IPv6 only when the IPv6 stack exists" {
+    _cert_ipv6_available() { return 0; }
+    ensure_test_cert
+    grep -qx '    listen \[::\]:80;' "$CERT_TEST_AVAILABLE/essence-acme-$ID"
+    _cert_ipv6_available() { return 1; }
+    ensure_test_cert
+    ! grep -q '\[::\]' "$CERT_TEST_AVAILABLE/essence-acme-$ID" || return 1
+    grep -qx '    listen 80;' "$CERT_TEST_AVAILABLE/essence-acme-$ID"
 }
 
 @test "managed installed pair is byte-identical and renews even with a corrupt archive" {

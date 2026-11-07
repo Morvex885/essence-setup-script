@@ -249,6 +249,21 @@ _pin_hosts() {
     jq -e --arg a "$A" '.portability.issues==[{node_id:$a,reason:"missing_host_key"}]' "$STATE_MANIFEST"
 }
 
+@test "portability issue updates refuse a corrupt manifest without replacing it" {
+    printf '%s' '{"schema_version":2,"access":{"script_password_hash":"h"},' > "$STATE_MANIFEST"
+    cp "$STATE_MANIFEST" "$STATE_DIR/manifest-before"
+    run state_portability_add_issue "$A" missing_host_key
+    assert_failure
+    run state_portability_remove_issue "$A" missing_host_key
+    assert_failure
+    run state_portability_remove_node "$A"
+    assert_failure
+    cmp "$STATE_DIR/manifest-before" "$STATE_MANIFEST"
+    run state_portability_set_issues '[]'
+    assert_failure
+    cmp "$STATE_DIR/manifest-before" "$STATE_MANIFEST"
+}
+
 @test "password relaxation does not bypass invalid links containers or resource declarations" {
     node_secret_delete "$B"
     run state_validate true

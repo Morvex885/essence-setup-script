@@ -740,7 +740,9 @@ state_portability_set_issues() {
         (.reason=="missing_identity" or .reason=="missing_secret" or .reason=="missing_host_key"))' \
         <<< "$issues" >/dev/null 2>&1 || return 1
     _state_ensure_dirs || return 1
-    [[ -f "$STATE_MANIFEST" ]] && existing=$(jq -c . "$STATE_MANIFEST" 2>/dev/null || printf '%s' '{}')
+    if [[ -f "$STATE_MANIFEST" ]]; then
+        existing=$(jq -ce 'select(type=="object")' "$STATE_MANIFEST" 2>/dev/null) || return 1
+    fi
     tmp="${STATE_MANIFEST}.tmp.$$"
     jq --argjson issues "$issues" \
         '.schema_version=2 | .portability={status:(if ($issues|length)>0 then "needs_setup" else "ready" end),issues:$issues}' \
@@ -751,10 +753,18 @@ state_portability_set_issues() {
     chmod 600 "$tmp" && mv "$tmp" "$STATE_MANIFEST"
 }
 
+# Prints the declared issues array; fails on an unreadable manifest instead of
+# letting an empty read replace the issue list.
+_state_declared_issues() {
+    local declared
+    declared=$(_state_declared_portability) && [[ -n "$declared" ]] || return 1
+    jq -ce '.issues | arrays' <<< "$declared"
+}
+
 state_portability_add_issue() {
     local node_id="${1:-}" reason="${2:-}" current updated
     [[ -n "$node_id" && -n "$reason" ]] || return 1
-    current=$(_state_declared_portability | jq -c '.issues')
+    current=$(_state_declared_issues) || return 1
     updated=$(jq -c --arg id "$node_id" --arg reason "$reason" \
         '. + [{node_id:$id,reason:$reason}] | unique | sort_by([.node_id,.reason])' <<< "$current") || return 1
     state_portability_set_issues "$updated"
@@ -763,7 +773,7 @@ state_portability_add_issue() {
 state_portability_remove_issue() {
     local node_id="${1:-}" reason="${2:-}" current updated
     [[ -n "$node_id" && -n "$reason" ]] || return 1
-    current=$(_state_declared_portability | jq -c '.issues')
+    current=$(_state_declared_issues) || return 1
     updated=$(jq -c --arg id "$node_id" --arg reason "$reason" \
         'map(select(.node_id != $id or .reason != $reason))' <<< "$current") || return 1
     state_portability_set_issues "$updated"
@@ -772,7 +782,7 @@ state_portability_remove_issue() {
 state_portability_remove_node() {
     local node_id="${1:-}" current updated
     [[ -n "$node_id" ]] || return 1
-    current=$(_state_declared_portability | jq -c '.issues')
+    current=$(_state_declared_issues) || return 1
     updated=$(jq -c --arg id "$node_id" 'map(select(.node_id != $id))' <<< "$current") || return 1
     state_portability_set_issues "$updated"
 }
