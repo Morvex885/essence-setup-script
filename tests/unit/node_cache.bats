@@ -1,7 +1,7 @@
 #!/usr/bin/env bats
 # Tests for node config cache: _reset_node_cache, _get_node_config, _prefetch_node_configs
 #
-# Cache tests run in isolated subshells to avoid declare -A global leakage.
+# Cache tests run in isolated subshells to avoid global state leakage.
 
 setup() {
     load '../helpers/test_helper'
@@ -19,7 +19,7 @@ teardown() {
 # Helper: run cache operations in a clean subprocess
 run_cache_test() {
     local script="$1"
-    bash -c "
+    "${BASH:-bash}" -c "
         source '$PROJECT_ROOT/common/common.sh'
         error() { echo \"\$*\" >&2; return 1; }
         export CONFIG_JSON='$CONFIG_JSON'
@@ -45,13 +45,18 @@ run_cache_test() {
     " 2>/dev/null
 }
 
-@test "_reset_node_cache: clears both arrays" {
+@test "_reset_node_cache: clears cache and tracking sets" {
     run run_cache_test '
-        NODE_CONFIG_CACHE["test"]="data"
-        NODE_CONFIG_FAILED["bad"]=1
+        _node_config_cache_set "test" "data"
+        NODE_CONFIG_FAILED+=("bad")
+        SCRIPTS_UPLOADED+=("uploaded")
+        AWG_PEERS_CHECKED+=("checked")
         _reset_node_cache
-        [[ ${#NODE_CONFIG_CACHE[@]} -eq 0 ]] || { echo "FAIL: cache not empty"; exit 1; }
+        [[ ${#NODE_CONFIG_CACHE_KEYS[@]} -eq 0 ]] || { echo "FAIL: cache keys not empty"; exit 1; }
+        [[ ${#NODE_CONFIG_CACHE_VALUES[@]} -eq 0 ]] || { echo "FAIL: cache values not empty"; exit 1; }
         [[ ${#NODE_CONFIG_FAILED[@]} -eq 0 ]] || { echo "FAIL: failed not empty"; exit 1; }
+        [[ ${#SCRIPTS_UPLOADED[@]} -eq 0 ]] || { echo "FAIL: uploaded not empty"; exit 1; }
+        [[ ${#AWG_PEERS_CHECKED[@]} -eq 0 ]] || { echo "FAIL: checked not empty"; exit 1; }
         echo "OK"
     '
     assert_success
@@ -60,7 +65,7 @@ run_cache_test() {
 
 @test "_get_node_config: returns cached config" {
     run run_cache_test '
-        NODE_CONFIG_CACHE["de-vps"]="cached content"
+        _node_config_cache_set "de-vps" "cached content"
         _get_node_config "de-vps"
     '
     assert_success
@@ -69,7 +74,7 @@ run_cache_test() {
 
 @test "_get_node_config: returns 1 for failed node" {
     run run_cache_test '
-        NODE_CONFIG_FAILED["bad"]=1
+        NODE_CONFIG_FAILED+=("bad")
         _get_node_config "bad"
     '
     assert_failure
@@ -102,8 +107,7 @@ run_cache_test() {
 
 @test "_prefetch: skips already cached node" {
     run run_cache_test '
-        NODE_CONFIG_CACHE["de-vps"]="already here"
-        _prefetch_node_configs "de-vps"
+        _node_config_cache_set "de-vps" "already here"
         _get_node_config "de-vps"
     '
     assert_success
@@ -112,8 +116,7 @@ run_cache_test() {
 
 @test "_prefetch: skips already failed node" {
     run run_cache_test '
-        NODE_CONFIG_FAILED["de-vps"]=1
-        SSH_MOCK_OUTPUT="should not see this"
+        NODE_CONFIG_FAILED+=("de-vps")
         _prefetch_node_configs "de-vps"
         _get_node_config "de-vps"
     '
@@ -132,9 +135,30 @@ run_cache_test() {
     run run_cache_test '
         SSH_MOCK_OUTPUT="test config"
         _prefetch_node_configs "de-vps" "ru-vps"
-        echo "$(echo "${!NODE_CONFIG_CACHE[*]}" | tr " " "\n" | sort | tr "\n" " ")"
+        printf '%s\n' "${NODE_CONFIG_CACHE_KEYS[@]}"
     '
     assert_success
     assert_output --partial "de-vps"
     assert_output --partial "ru-vps"
+}
+
+@test "_node_config_cache_delete: middle removal preserves alignment on append" {
+    run run_cache_test '
+        _node_config_cache_set "first" "one"
+        _node_config_cache_set "middle" "two"
+        _node_config_cache_set "last" "three"
+        _node_config_cache_delete "middle"
+        _node_config_cache_set "appended" "four"
+        _get_node_config "first"
+        _get_node_config "last"
+        _get_node_config "appended"
+        [[ "${NODE_CONFIG_CACHE_KEYS[0]}" == "first" ]] || exit 1
+        [[ "${NODE_CONFIG_CACHE_VALUES[0]}" == "one" ]] || exit 1
+        [[ "${NODE_CONFIG_CACHE_KEYS[2]}" == "last" ]] || exit 1
+        [[ "${NODE_CONFIG_CACHE_VALUES[2]}" == "three" ]] || exit 1
+        [[ "${NODE_CONFIG_CACHE_KEYS[3]}" == "appended" ]] || exit 1
+        [[ "${NODE_CONFIG_CACHE_VALUES[3]}" == "four" ]] || exit 1
+    '
+    assert_success
+    assert_output $'one\nthree\nfour'
 }

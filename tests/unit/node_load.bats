@@ -9,10 +9,6 @@ setup() {
     override_pass_key
     load_fixture_config
 
-    # Re-encode the password in fixture with the deterministic key
-    local encoded
-    encoded=$(node_pass_encode "testpass123")
-    jq_w --arg p "$encoded" '.nodes[1].pass = $p'
 }
 
 teardown() {

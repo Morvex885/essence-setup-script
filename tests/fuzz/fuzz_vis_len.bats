@@ -13,7 +13,11 @@ setup() {
     for ((i = 0; i < FUZZ_ITERATIONS; i++)); do
         local len=$((RANDOM % 100))
         local input
-        input=$(head -c "$len" /dev/urandom | base64 | head -c "$len")
+        if (( len == 0 )); then
+            input=""
+        else
+            input=$(dd if=/dev/urandom bs=1 count="$len" 2>/dev/null | base64 | dd bs=1 count="$len" 2>/dev/null)
+        fi
         local result
         result=$(_vis_len "$input")
         [[ "$result" =~ ^[0-9]+$ ]] || {
@@ -56,9 +60,9 @@ setup() {
         local input
         local strategy=$((RANDOM % 3))
         case $strategy in
-            0) input=$(random_pick DICT_UTF8_EDGE) ;;
-            1) input="$(random_ascii $((RANDOM % 10)))$(random_pick DICT_UTF8_EDGE)$(random_ascii $((RANDOM % 10)))" ;;
-            2) input=$(head -c $((RANDOM % 50 + 1)) /dev/urandom | tr -d '\0') ;;
+            0) input=$(random_pick "${DICT_UTF8_EDGE[@]}") ;;
+            1) input="$(random_ascii $((RANDOM % 10)))$(random_pick "${DICT_UTF8_EDGE[@]}")$(random_ascii $((RANDOM % 10)))" ;;
+            2) input=$(LC_ALL=C dd if=/dev/urandom bs=1 count=$((RANDOM % 50 + 1)) 2>/dev/null | LC_ALL=C tr -d '\000') ;;
         esac
         local result
         result=$(_vis_len "$input")

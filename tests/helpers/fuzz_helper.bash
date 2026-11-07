@@ -88,11 +88,11 @@ random_ascii() {
     random_string "$1" "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 }
 
-# random_pick <array_name>
-# Echoes a random element from the named array
+# random_pick [items...]
+# Echoes a random element from the supplied values.
 random_pick() {
-    local -n _arr=$1
-    printf '%s' "${_arr[RANDOM % ${#_arr[@]}]}"
+    (($# > 0)) || return 1
+    printf '%s' "${@:$((RANDOM % $# + 1)):1}"
 }
 
 # random_utf8 <num_chars>
@@ -138,12 +138,13 @@ random_tag() {
 
 # ─── Mutation Functions ───────────────────────────────────────────────────────
 
-# mutate_inject <string> <dict_array_name>
-# Injects a random token from the dictionary at a random position in the string
+# mutate_inject <string> <tokens...>
+# Injects a random token from the supplied values at a random position.
 mutate_inject() {
     local str="$1"
-    local -n _dict=$2
-    local token="${_dict[RANDOM % ${#_dict[@]}]}"
+    shift
+    (($# > 0)) || return 1
+    local token="${@:$((RANDOM % $# + 1)):1}"
     local pos
     if [[ ${#str} -eq 0 ]]; then
         pos=0
@@ -183,7 +184,7 @@ mutate_repeat() {
 
 # ─── High-Level Fuzz Strategy ─────────────────────────────────────────────────
 
-# fuzz_mutated_input <valid_string> <dict_array_name>
+# fuzz_mutated_input <valid_string> <tokens...>
 # Applies a random mutation strategy to the input:
 #   0 = inject token from dict
 #   1 = replace random byte
@@ -191,12 +192,13 @@ mutate_repeat() {
 #   3 = pure dict payload
 fuzz_mutated_input() {
     local str="$1"
-    local dict_name="$2"
+    shift
+    (($# > 0)) || return 1
     local strategy=$((RANDOM % 4))
     case $strategy in
-        0) mutate_inject "$str" "$dict_name" ;;
+        0) mutate_inject "$str" "$@" ;;
         1) mutate_replace_byte "$str" ;;
         2) mutate_repeat "$str" ;;
-        3) random_pick "$dict_name" ;;
+        3) random_pick "$@" ;;
     esac
 }

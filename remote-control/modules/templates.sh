@@ -13,12 +13,18 @@
 #   - Если целевая группа входит в список → оставить содержимое, убрать маркеры
 #   - Если не входит → удалить блок целиком (маркеры + содержимое)
 
-TEMPLATES_DIR="$SCRIPT_DIR/templates"
+BUILTIN_TEMPLATES_DIR="$SCRIPT_DIR/templates"
+if [[ -z ${TEMPLATES_DIR:-} || ${CONFIG_SOURCE:-local} != github ]]; then
+    TEMPLATES_DIR="${TEMPLATES_DIR:-$CONFIG_DIR/templates}"
+fi
 
 _find_template() {
     local name="${1:-default.yaml}"
+    [[ "$name" =~ ^[A-Za-z0-9._-]+\.yaml$ ]] || { echo ""; return; }
     if [[ -f "$TEMPLATES_DIR/$name" ]]; then
         echo "$TEMPLATES_DIR/$name"
+    elif [[ ${CONFIG_SOURCE:-local} != github && -f "$BUILTIN_TEMPLATES_DIR/$name" ]]; then
+        echo "$BUILTIN_TEMPLATES_DIR/$name"
     else
         echo ""
     fi
@@ -42,13 +48,19 @@ _template_name_for_group() {
     echo "$tpl"
 }
 
-# Список файлов шаблонов в templates/
+# Список пользовательских и встроенных шаблонов без дублей.
 _list_templates() {
-    local templates=()
-    while IFS= read -r f; do
-        templates+=("$(basename "$f")")
-    done < <(find "$TEMPLATES_DIR" -maxdepth 1 -name '*.yaml' -type f 2>/dev/null | sort)
-    echo "${templates[@]}"
+    local -a templates=()
+    local dir f name
+    for dir in "$TEMPLATES_DIR" "$BUILTIN_TEMPLATES_DIR"; do
+        [[ -d "$dir" ]] || continue
+        for f in "$dir"/*.yaml; do
+            [[ -f "$f" ]] || continue
+            name=$(basename "$f")
+            array_contains "$name" "${templates[@]}" || templates+=("$name")
+        done
+    done
+    [[ ${#templates[@]} -gt 0 ]] && printf '%s\n' "${templates[@]}" | sort
 }
 
 # process_template <template_file> <target_group>

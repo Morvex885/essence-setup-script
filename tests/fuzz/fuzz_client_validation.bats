@@ -42,7 +42,7 @@ matches() {
         local name
         name=$(random_string "$len" "$valid_charset")
         local invalid_char
-        invalid_char=$(random_pick invalid_chars)
+        invalid_char=$(random_pick "${invalid_chars[@]}")
         local pos=$((RANDOM % ${#name}))
         name="${name:0:$pos}${invalid_char}${name:$pos}"
         run matches "$name"
@@ -124,16 +124,16 @@ matches() {
         local strategy=$((RANDOM % 3))
         case $strategy in
             0) # Pure injection payload
-                name=$(random_pick DICT_SHELL_INJECTION)
+                name=$(random_pick "${DICT_SHELL_INJECTION[@]}")
                 ;;
             1) # Valid name + injected shell token
                 name=$(random_ascii $((RANDOM % 10 + 1)))
-                name=$(mutate_inject "$name" DICT_SHELL_INJECTION)
+                name=$(mutate_inject "$name" "${DICT_SHELL_INJECTION[@]}")
                 ;;
             2) # Multiple injections
                 name=$(random_ascii $((RANDOM % 5 + 1)))
-                name=$(mutate_inject "$name" DICT_SHELL_INJECTION)
-                name=$(mutate_inject "$name" DICT_SHELL_INJECTION)
+                name=$(mutate_inject "$name" "${DICT_SHELL_INJECTION[@]}")
+                name=$(mutate_inject "$name" "${DICT_SHELL_INJECTION[@]}")
                 ;;
         esac
         # Bash cannot carry NUL and command substitution strips trailing newlines.
@@ -150,7 +150,7 @@ matches() {
 @test "fuzz client validation: path traversal — pure payloads rejected" {
     for ((i = 0; i < FUZZ_ITERATIONS; i++)); do
         local name
-        name=$(random_pick DICT_PATH_TRAVERSAL)
+        name=$(random_pick "${DICT_PATH_TRAVERSAL[@]}")
         [[ -z "$name" ]] && continue
         run matches "$name"
         assert_failure
@@ -164,15 +164,15 @@ matches() {
         case $strategy in
             0) # Valid name + traversal token injected
                 name=$(random_ascii $((RANDOM % 10 + 1)))
-                name=$(mutate_inject "$name" DICT_PATH_TRAVERSAL)
+                name=$(mutate_inject "$name" "${DICT_PATH_TRAVERSAL[@]}")
                 ;;
             1) # Multiple traversal injections
                 name=$(random_ascii $((RANDOM % 5 + 1)))
-                name=$(mutate_inject "$name" DICT_PATH_TRAVERSAL)
-                name=$(mutate_inject "$name" DICT_PATH_TRAVERSAL)
+                name=$(mutate_inject "$name" "${DICT_PATH_TRAVERSAL[@]}")
+                name=$(mutate_inject "$name" "${DICT_PATH_TRAVERSAL[@]}")
                 ;;
             2) # Traversal token + random suffix
-                name="$(random_pick DICT_PATH_TRAVERSAL)$(random_ascii $((RANDOM % 10 + 1)))"
+                name="$(random_pick "${DICT_PATH_TRAVERSAL[@]}")$(random_ascii $((RANDOM % 10 + 1)))"
                 ;;
         esac
         [[ -z "$name" ]] && continue

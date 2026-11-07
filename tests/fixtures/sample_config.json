@@ -1,19 +1,28 @@
 {
+  "schema_version": 2,
   "nodes": [
     {
+      "id": "11111111111111111111111111111111",
       "name": "de-vps",
       "ip": "1.2.3.4",
       "port": 22,
       "user": "root",
-      "auth": "key"
+      "auth": "key",
+      "identity": "system",
+      "secret_id": null,
+      "tag": "",
+      "aliases": {}
     },
     {
+      "id": "22222222222222222222222222222222",
       "name": "ru-vps",
       "ip": "5.6.7.8",
       "port": 2222,
       "user": "admin",
       "auth": "password",
-      "pass": "U2FsdGVkX1/o46gW17tlHzYLnFoGfBvacfhDIJSVJTc=",
+      "identity": null,
+      "secret_id": "node:22222222222222222222222222222222:ssh-password",
+      "tag": "",
       "aliases": {
         "vless-reality": "RU-VLESS"
       }

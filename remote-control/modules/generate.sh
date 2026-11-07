@@ -2,60 +2,69 @@
 # ─── Генерация клиентских конфигов ─────────────────────────────────────────
 
 edit_template() {
-    local templates=()
-    while IFS= read -r f; do
-        templates+=("$(basename "$f")")
-    done < <(find "$TEMPLATES_DIR" -maxdepth 1 -name '*.yaml' -type f 2>/dev/null | sort)
-
-    if [[ ${#templates[@]} -eq 0 ]]; then
-        warn "Нет шаблонов в $TEMPLATES_DIR/"
-        return
-    fi
-
-    echo ""
-    echo -e "  Выберите шаблон для редактирования:"
-    local i=1
-    for t in "${templates[@]}"; do
-        echo -e "  ${GREEN}${i})${NC} $t"
-        i=$((i + 1))
-    done
-    echo -e "  ${GREEN}n)${NC} Создать новый шаблон"
-    echo ""
-    read -rp "Выберите: " TPL_CHOICE
-
-    local template=""
-    if [[ "$TPL_CHOICE" == "n" || "$TPL_CHOICE" == "N" ]]; then
-        read -rp "Имя нового шаблона (без .yaml): " TPL_NAME
-        [[ -z "$TPL_NAME" ]] && { warn "Имя не указано."; return; }
-
-        template="$TEMPLATES_DIR/${TPL_NAME}.yaml"
-        if [[ -f "$template" ]]; then
-            warn "Шаблон '${TPL_NAME}.yaml' уже существует."
-            return
-        fi
-
-        local default_tpl="$TEMPLATES_DIR/default.yaml"
-        if [[ -f "$default_tpl" ]]; then
-            cp "$default_tpl" "$template"
-            info "Скопирован default.yaml как основа"
+    local templates=() template_name
+    while IFS= read -r template_name; do
+        [[ -n "$template_name" ]] && templates+=("$template_name")
+    done < <(_list_templates)
+    while true; do
+        echo ""
+        box_top
+        box_center "Редактирование шаблона"
+        box_mid
+        if [[ ${#templates[@]} -eq 0 ]]; then
+            box_line " Нет шаблонов" " ${DIM}Нет шаблонов${NC}"
         else
-            touch "$template"
+            for (( i=0; i<${#templates[@]}; i++ )); do
+                box_line " $((i+1))) ${templates[$i]}" \
+                    " ${GREEN}$((i+1)))${NC} ${templates[$i]}"
+            done
         fi
-    elif [[ "$TPL_CHOICE" =~ ^[0-9]+$ ]] && (( TPL_CHOICE >= 1 && TPL_CHOICE <= ${#templates[@]} )); then
-        template="$TEMPLATES_DIR/${templates[$((TPL_CHOICE - 1))]}"
-    else
-        warn "Неверный выбор."
-        return
-    fi
-
-    if command -v nano > /dev/null 2>&1; then
-        nano "$template"
-    elif command -v vi > /dev/null 2>&1; then
-        vi "$template"
-    else
-        warn "Редактор не найден. Отредактируйте вручную:"
-        info "$template"
-    fi
+        menu_item n "Создать новый шаблон" GREEN
+        menu_item 0 "Отмена" NC
+        box_bot
+        echo ""
+        local TPL_CHOICE
+        if ! IFS= read -rp "  Выберите: " TPL_CHOICE; then
+            return 1
+        fi
+        TPL_CHOICE="${TPL_CHOICE%$'\r'}"
+        local template="" source=""
+        mkdir -p "$TEMPLATES_DIR" || return 1
+        if [[ "$TPL_CHOICE" == n || "$TPL_CHOICE" == N ]]; then
+            read -rp "Имя нового шаблона (без .yaml): " TPL_NAME
+            if [[ -z "$TPL_NAME" || ! "$TPL_NAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
+                warn "Имя может содержать только буквы, цифры, точку, - и _"
+                return 1
+            fi
+            template="$TEMPLATES_DIR/${TPL_NAME}.yaml"
+            [[ -f "$template" ]] && { warn "Шаблон '${TPL_NAME}.yaml' уже существует."; return 1; }
+            source=$(_find_template "default.yaml")
+            if [[ -n "$source" ]]; then
+                cp "$source" "$template" || return 1
+            else
+                : > "$template" || return 1
+            fi
+        elif menu_index_valid "$TPL_CHOICE" "${#templates[@]}"; then
+            source=$(_find_template "${templates[$((TPL_CHOICE - 1))]}")
+            [[ -n "$source" ]] || { warn "Шаблон не найден."; return 1; }
+            template="$TEMPLATES_DIR/${templates[$((TPL_CHOICE - 1))]}"
+            [[ "$source" == "$template" ]] || cp "$source" "$template" || return 1
+        elif [[ "$TPL_CHOICE" == 0 ]]; then
+            return 1
+        else
+            warn "Неверный выбор."
+            continue
+        fi
+        if command -v nano > /dev/null 2>&1; then
+            nano "$template"
+        elif command -v vi > /dev/null 2>&1; then
+            vi "$template"
+        else
+            warn "Редактор не найден. Отредактируйте вручную:"
+            info "$template"
+        fi
+        return 0
+    done
 }
 
 generate_menu() {
@@ -63,34 +72,34 @@ generate_menu() {
         echo ""
         box_top
         box_center "Генерация конфигов"
-        box_bot
-
-        # Показываем группы и их шаблоны
+        box_mid
         groups_list
         if [[ ${#GRP_LIST[@]} -gt 0 ]]; then
-            echo ""
+            local g tpl client_count
             for g in "${GRP_LIST[@]}"; do
-                local tpl
                 tpl=$(_template_name_for_group "$g")
-                local client_count
                 client_count=$(jq_r --arg g "$g" '[.clients[] | select(.group==$g)] | length')
-                echo -e "  ${CYAN}$g${NC} ${DIM}— $tpl, $client_count клиентов${NC}"
+                box_line " ${g}: ${tpl}, ${client_count} клиентов"
             done
+        else
+            box_line " Нет групп" " ${DIM}Нет групп${NC}"
         fi
-
+        box_mid
+        menu_item g "По группе" GREEN
+        menu_item a "Всем клиентам" GREEN
+        menu_item t "Редактировать шаблон" YELLOW
+        menu_item 0 "Назад" NC
+        box_bot
         echo ""
-        echo -e "  ${GREEN}g)${NC} По группе"
-        echo -e "  ${GREEN}a)${NC} Всем клиентам"
-        echo -e "  ${YELLOW}t)${NC} Редактировать шаблон"
-        echo -e "  ${NC}0)${NC} Назад"
-        echo ""
-        read -rp "Выберите: " GEN_CHOICE
-
+        if ! IFS= read -rp "  Выберите действие: " GEN_CHOICE; then
+            return 0
+        fi
+        GEN_CHOICE="${GEN_CHOICE%$'\r'}"
         case "$GEN_CHOICE" in
             g|G) generate_by_group ;;
             a|A) generate_all ;;
-            t) edit_template ;;
-            0) return ;;
+            t|T) state_action "edit_template" edit_template ;;
+            0) return 0 ;;
             *) warn "Неверный выбор." ;;
         esac
     done
@@ -115,7 +124,9 @@ generate_by_group() {
         for _ex in "${_group_nodes[@]}"; do [[ "$_ex" == "$_cn" ]] && _already=true; done
         $_already || _group_nodes+=("$_cn")
     done < <(jq_r --arg g "$SELECTED_GROUP" '.clients[] | select(.group==$g and .inherit_nodes_from_group==false) | .nodes // [] | .[]')
-    [[ ${#_group_nodes[@]} -gt 0 ]] && _sync_listeners_on_nodes "${_group_nodes[@]}"
+    if [[ ${#_group_nodes[@]} -gt 0 ]]; then
+        _sync_listeners_on_nodes "${_group_nodes[@]}" || return 1
+    fi
 
     _subscription_prompt_refresh
 }
@@ -133,8 +144,6 @@ generate_all() {
     # чтобы сделать AWG peers + prefetch конфигов одним проходом
     local all_client_names=()
     local all_unique_nodes=()
-    declare -A _seen_nodes=()
-    declare -A _seen_clients=()
 
     for g in "${GRP_LIST[@]}"; do
         local _gnodes_csv
@@ -142,36 +151,36 @@ generate_all() {
         local -a _gnodes
         IFS=',' read -ra _gnodes <<< "$_gnodes_csv"
         for _n in "${_gnodes[@]}"; do
-            [[ -z "$_n" || -n "${_seen_nodes[$_n]+x}" ]] && continue
-            _seen_nodes[$_n]=1
-            all_unique_nodes+=("$_n")
+            [[ -z "$_n" ]] && continue
+            if ! array_contains "$_n" "${all_unique_nodes[@]}"; then
+                all_unique_nodes+=("$_n")
+            fi
         done
 
-        local _gcl
-        mapfile -t _gcl < <(jq_r --arg g "$g" \
-            '.clients[] | select(.group==$g) | "\(.name)|\(if .inherit_nodes_from_group == false then false else true end)|\(.nodes // [] | join(","))"')
-        for _cl in "${_gcl[@]}"; do
+        while IFS= read -r _cl; do
             local _cname="${_cl%%|*}"
-            if [[ -z "${_seen_clients[$_cname]+x}" ]]; then
-                _seen_clients[$_cname]=1
+            if ! array_contains "$_cname" "${all_client_names[@]}"; then
                 all_client_names+=("$_cname")
             fi
             local _rest="${_cl#*|}"
             local _inherit="${_rest%%|*}"
             local _own="${_rest#*|}"
             if [[ "$_inherit" != "true" && -n "$_own" ]]; then
+                local -a _cnodes
                 IFS=',' read -ra _cnodes <<< "$_own"
                 for _n in "${_cnodes[@]}"; do
-                    [[ -z "$_n" || -n "${_seen_nodes[$_n]+x}" ]] && continue
-                    _seen_nodes[$_n]=1
-                    all_unique_nodes+=("$_n")
+                    [[ -z "$_n" ]] && continue
+                    if ! array_contains "$_n" "${all_unique_nodes[@]}"; then
+                        all_unique_nodes+=("$_n")
+                    fi
                 done
             fi
-        done
+        done < <(jq_r --arg g "$g" \
+            '.clients[] | select(.group==$g) | "\(.name)|\(if .inherit_nodes_from_group == false then false else true end)|\(.nodes // [] | join(","))"')
     done
 
     # Один проход: AWG peers на всех нодах для всех клиентов
-    _ensure_all_awg_peers all_client_names "${all_unique_nodes[@]}"
+    _ensure_all_awg_peers "${#all_client_names[@]}" "${all_client_names[@]}" "${all_unique_nodes[@]}"
     # Один проход: предзагрузка конфигов
     _prefetch_node_configs "${all_unique_nodes[@]}"
 
@@ -181,22 +190,25 @@ generate_all() {
     done
 
     # Синхронизация per-client users на нодах
-    _sync_listeners_on_nodes "${all_unique_nodes[@]}"
+    if ! _sync_listeners_on_nodes "${all_unique_nodes[@]}"; then
+        return 1
+    fi
 
     echo ""
     success "Все конфиги обновлены."
     info "Конфиги: $GENERATED_DIR/"
     _subscription_prompt_refresh
 }
-
 # ─── Кеш конфигов нод ──────────────────────────────────────────────────────
-declare -A NODE_CONFIG_CACHE
-declare -A NODE_CONFIG_FAILED
-declare -A SCRIPTS_UPLOADED
-declare -A AWG_PEERS_CHECKED
+NODE_CONFIG_CACHE_KEYS=()
+NODE_CONFIG_CACHE_VALUES=()
+NODE_CONFIG_FAILED=()
+SCRIPTS_UPLOADED=()
+AWG_PEERS_CHECKED=()
 
 _reset_node_cache() {
-    NODE_CONFIG_CACHE=()
+    NODE_CONFIG_CACHE_KEYS=()
+    NODE_CONFIG_CACHE_VALUES=()
     NODE_CONFIG_FAILED=()
     SCRIPTS_UPLOADED=()
     AWG_PEERS_CHECKED=()
@@ -205,17 +217,43 @@ _reset_node_cache() {
 # Получить client-config.txt из кеша (без SSH)
 _get_node_config() {
     local nname="$1"
+    local i
 
-    if [[ -n "${NODE_CONFIG_CACHE[$nname]+x}" ]]; then
-        echo "${NODE_CONFIG_CACHE[$nname]}"
-        return 0
-    fi
+    for i in "${!NODE_CONFIG_CACHE_KEYS[@]}"; do
+        if [[ "${NODE_CONFIG_CACHE_KEYS[$i]}" == "$nname" ]]; then
+            echo "${NODE_CONFIG_CACHE_VALUES[$i]}"
+            return 0
+        fi
+    done
 
-    if [[ -n "${NODE_CONFIG_FAILED[$nname]+x}" ]]; then
-        return 1
-    fi
+    array_contains "$nname" "${NODE_CONFIG_FAILED[@]}" && return 1
 
     # Не должно вызываться напрямую — только после _prefetch
+    return 1
+}
+
+_node_config_cache_set() {
+    local nname="$1" value="$2"
+    local i
+    for i in "${!NODE_CONFIG_CACHE_KEYS[@]}"; do
+        if [[ "${NODE_CONFIG_CACHE_KEYS[$i]}" == "$nname" ]]; then
+            NODE_CONFIG_CACHE_VALUES[$i]="$value"
+            return 0
+        fi
+    done
+    NODE_CONFIG_CACHE_KEYS+=("$nname")
+    NODE_CONFIG_CACHE_VALUES+=("$value")
+}
+
+_node_config_cache_delete() {
+    local nname="$1"
+    local i
+    for i in "${!NODE_CONFIG_CACHE_KEYS[@]}"; do
+        if [[ "${NODE_CONFIG_CACHE_KEYS[$i]}" == "$nname" ]]; then
+            unset "NODE_CONFIG_CACHE_KEYS[$i]" "NODE_CONFIG_CACHE_VALUES[$i]"
+            return 0
+        fi
+    done
     return 1
 }
 
@@ -225,11 +263,14 @@ _prefetch_node_configs() {
 
     for nname in "${nodes[@]}"; do
         # Уже в кеше или уже провалилась
-        [[ -n "${NODE_CONFIG_CACHE[$nname]+x}" || -n "${NODE_CONFIG_FAILED[$nname]+x}" ]] && continue
+        if array_contains "$nname" "${NODE_CONFIG_CACHE_KEYS[@]}" ||
+           array_contains "$nname" "${NODE_CONFIG_FAILED[@]}"; then
+            continue
+        fi
 
         if ! node_load_by_name "$nname"; then
             warn "Нода $nname не найдена."
-            NODE_CONFIG_FAILED[$nname]=1
+            NODE_CONFIG_FAILED+=("$nname")
             continue
         fi
 
@@ -238,23 +279,37 @@ _prefetch_node_configs() {
         local remote_config
         remote_config=$(ssh_run -- "cat /etc/mihomo/client-config.txt 2>/dev/null; cat /etc/mihomo/amnezia/*/mihomo-proxy.yaml 2>/dev/null; true") || {
             warn "Не удалось получить конфиг с $nname"
-            NODE_CONFIG_FAILED[$nname]=1
+            NODE_CONFIG_FAILED+=("$nname")
             continue
         }
 
-        NODE_CONFIG_CACHE[$nname]="$remote_config"
+        _node_config_cache_set "$nname" "$remote_config"
         success "$nname — конфиг загружен"
     done
 }
 
-# Батч создание AWG peers на всех нодах для всех клиентов группы
+# Батч создание AWG peers на всех нодах для всех клиентов группы.
+# Первый аргумент — число клиентских имён, затем клиентские имена и ноды.
 _ensure_all_awg_peers() {
-    local -n _client_names=$1
-    local nodes=("${@:2}")
+    [[ $# -ge 1 ]] || return 1
+
+    local client_count="$1"
+    [[ "$client_count" =~ ^[0-9]+$ ]] || return 1
+    client_count=$((10#$client_count))
+    shift
+    (( $# >= client_count )) || return 1
+
+    local -a client_names=()
+    local i
+    for (( i=0; i<client_count; i++ )); do
+        client_names+=("$1")
+        shift
+    done
+    local nodes=("$@")
 
     for nname in "${nodes[@]}"; do
-        [[ -n "${NODE_CONFIG_FAILED[$nname]+x}" ]] && continue
-        [[ -n "${AWG_PEERS_CHECKED[$nname]+x}" ]] && continue
+        array_contains "$nname" "${NODE_CONFIG_FAILED[@]}" && continue
+        array_contains "$nname" "${AWG_PEERS_CHECKED[@]}" && continue
 
         if ! node_load_by_name "$nname"; then
             continue
@@ -267,7 +322,7 @@ _ensure_all_awg_peers() {
 
         # AWG не установлен на ноде
         if [[ "$check_result" == "NO_AWG" ]]; then
-            AWG_PEERS_CHECKED[$nname]=1
+            AWG_PEERS_CHECKED+=("$nname")
             continue
         fi
 
@@ -278,22 +333,25 @@ _ensure_all_awg_peers() {
         # Определяем какие peers нужно создать
         local missing=()
         local cname
-        for cname in "${_client_names[@]}"; do
+        for cname in "${client_names[@]}"; do
             if ! echo "$existing_peers" | grep -qxF "$cname"; then
                 missing+=("$cname")
             fi
         done
 
         if [[ ${#missing[@]} -eq 0 ]]; then
-            AWG_PEERS_CHECKED[$nname]=1
+            AWG_PEERS_CHECKED+=("$nname")
             continue
         fi
 
         # Создаём все недостающие peers за один SSH
         info "Создаю AWG peers на $nname: ${missing[*]}..."
-        if [[ -z "${SCRIPTS_UPLOADED[$nname]+x}" ]]; then
-            upload_scripts
-            SCRIPTS_UPLOADED[$nname]=1
+        if ! array_contains "$nname" "${SCRIPTS_UPLOADED[@]}"; then
+            if ! upload_scripts; then
+                warn "$nname: не удалось загрузить скрипты; peers не изменены."
+                continue
+            fi
+            SCRIPTS_UPLOADED+=("$nname")
         fi
 
         local peers_cmd="source ${REMOTE_DIR}/modules/amneziawg.sh"
@@ -306,9 +364,27 @@ _ensure_all_awg_peers() {
         }
 
         # Инвалидируем кеш — конфиг ноды изменился (новые peers)
-        unset "NODE_CONFIG_CACHE[$nname]"
-        AWG_PEERS_CHECKED[$nname]=1
+        _node_config_cache_delete "$nname"
+        AWG_PEERS_CHECKED+=("$nname")
     done
+}
+
+_render_client_config() {
+    local processed_template="$1"
+    local proxy_entries="$2"
+    local found_anchor=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        printf '%s\n' "$line"
+        if [[ "$line" == "proxies:" ]]; then
+            found_anchor=1
+            if [[ -n "$proxy_entries" ]]; then
+                printf '%s\n' "$proxy_entries"
+            fi
+        fi
+    done <<< "$processed_template"
+
+    [[ -z "$proxy_entries" || "$found_anchor" -eq 1 ]]
 }
 
 _generate_group() {
@@ -329,7 +405,9 @@ _generate_group() {
 
     # Клиенты группы
     local group_clients=()
-    mapfile -t group_clients < <(jq_r --arg g "$group" \
+    while IFS= read -r client_line; do
+        group_clients+=("$client_line")
+    done < <(jq_r --arg g "$group" \
         '.clients[] | select(.group==$g) | "\(.name)|\(.group)|\(if .inherit_nodes_from_group == false then false else true end)|\(.nodes // [] | join(","))"')
 
     if [[ ${#group_clients[@]} -eq 0 ]]; then
@@ -356,21 +434,18 @@ _generate_group() {
 
     # Дедупликация нод
     local unique_nodes=()
-    declare -A _seen=()
     local -a _all
     local _n
     IFS=',' read -ra _all <<< "$all_nodes_csv"
     for _n in "${_all[@]}"; do
-        [[ -z "$_n" || -n "${_seen[$_n]+x}" ]] && continue
-        _seen[$_n]=1
-        unique_nodes+=("$_n")
+        [[ -z "$_n" ]] && continue
+        if ! array_contains "$_n" "${unique_nodes[@]}"; then
+            unique_nodes+=("$_n")
+        fi
     done
 
     # Фаза 2: батч AWG peers (до загрузки конфигов)
-    _ensure_all_awg_peers client_names "${unique_nodes[@]}"
-
-    # Фаза 3: предзагрузка конфигов (один SSH на ноду)
-    _prefetch_node_configs "${unique_nodes[@]}"
+    _ensure_all_awg_peers "${#client_names[@]}" "${client_names[@]}" "${unique_nodes[@]}"
 
     # Обрабатываем шаблон
     local processed
@@ -393,7 +468,10 @@ _generate_group() {
         fi
 
         local client_dir="$GENERATED_DIR/$group/$client_name"
-        mkdir -p "$client_dir"
+        if ! mkdir -p "$client_dir"; then
+            warn "$client_name — config.yaml не сгенерирован"
+            continue
+        fi
 
         # Получаем прокси из кеша
         local proxy_entries=""
@@ -404,24 +482,44 @@ _generate_group() {
         # Проверяем уникальность имён прокси
         if [[ -n "$proxy_entries" ]]; then
             local dup_names
-            dup_names=$(echo "$proxy_entries" | grep -oP '(?<=- name: ")[^"]+' | sort | uniq -d)
+            dup_names=$(printf '%s\n' "$proxy_entries" | sed -n 's/^  - name: "\([^"]*\)"$/\1/p' | sort | uniq -d)
             if [[ -n "$dup_names" ]]; then
-                warn "$client_name: дубликаты имён прокси:" >&2
+                warn "$client_name: повторяющиеся имена прокси:" >&2
                 while IFS= read -r dn; do
                     warn "  '$dn' — задайте алиас через P → Переименовать" >&2
                 done <<< "$dup_names"
-                warn "$client_name — пропущен (дубликаты proxy names)" >&2
+                warn "$client_name — пропущен (повторяющиеся имена прокси)" >&2
                 continue
             fi
         fi
 
-        local config="$processed"
-        if [[ -n "$proxy_entries" ]]; then
-            config=$(echo "$config" | awk -v proxies="$proxy_entries" '/^proxies:$/ { print; print proxies; next } 1')
+        local config=""
+        if ! config=$(_render_client_config "$processed" "$proxy_entries"); then
+            warn "$client_name — config.yaml не сгенерирован"
+            continue
         fi
 
         # Убираем дублирующиеся пустые строки (артефакты удалённых блоков)
-        echo "$config" | cat -s > "$client_dir/config.yaml"
+        local config_tmp=""
+        if ! config_tmp=$(umask 077; mktemp "$client_dir/.config.yaml.XXXXXX"); then
+            warn "$client_name — config.yaml не сгенерирован"
+            continue
+        fi
+        if ! cat -s > "$config_tmp" <<< "$config"; then
+            rm -f "$config_tmp"
+            warn "$client_name — config.yaml не сгенерирован"
+            continue
+        fi
+        if ! grep -q '[^[:space:]]' "$config_tmp"; then
+            rm -f "$config_tmp"
+            warn "$client_name — config.yaml не сгенерирован"
+            continue
+        fi
+        if ! mv "$config_tmp" "$client_dir/config.yaml"; then
+            rm -f "$config_tmp"
+            warn "$client_name — config.yaml не сгенерирован"
+            continue
+        fi
 
         success "$client_name — сгенерирован"
     done
@@ -516,9 +614,9 @@ _fetch_proxies_for_client() {
                             ;;
                     esac
                 fi
-                # AWG: переименовать proxy → "node AmneziaWG 2.0"
+                # AWG: переименовать proxy → "AmneziaWG 3.1"
                 if [[ -n "$block" && "$conn_name" == "AWG" ]]; then
-                    local awg_display="AmneziaWG 2.0"
+                    local awg_display="AmneziaWG 3.1"
                     block="  - name: \"${awg_display}\""$'\n'"$(echo "$block" | tail -n +2)"
                 fi
                 [[ -n "$block" ]] && filtered="${filtered}${block}"$'\n'
@@ -566,24 +664,23 @@ _sync_node_listeners() {
 
     # Собираем всех клиентов, привязанных к этой ноде (через группы и кастомные ноды)
     local users_data
-    users_data=$(jq_r --arg n "$nname" '
-        . as $root |
-        [.clients[] |
-            select(
-                (.inherit_nodes_from_group != false and
-                    (.group as $g | any(
-                        $root.connections[];
-                        .node == $n and any(.groups[]?; .name == $g)
-                    ))) or
-                (.inherit_nodes_from_group == false and
-                    (.nodes // [] | index($n)))
-            ) |
-            {name: .name, vless_uuid: .credentials.vless_uuid, hy2_password: .credentials.hy2_password}
-        ] | .[] | "\(.name) \(.vless_uuid) \(.hy2_password)"
-    ' 2>/dev/null) || true
-
-    [[ -z "$users_data" ]] && return 0
-
+    users_data=$(set -o pipefail
+        jq_r --arg n "$nname" '
+            . as $root |
+            [.clients[] |
+                select(
+                    (.inherit_nodes_from_group != false and
+                        (.group as $g | any(
+                            $root.connections[];
+                            .node == $n and any(.groups[]?; .name == $g)
+                        ))) or
+                    (.inherit_nodes_from_group == false and
+                        (.nodes // [] | index($n)))
+                ) |
+                {name: .name, vless_uuid: .credentials.vless_uuid, hy2_password: .credentials.hy2_password}
+            ] | .[] | "\(.name) \(.vless_uuid) \(.hy2_password)"
+        ' 2>/dev/null
+    ) || return 1
     # Определяем какие listener'ы есть на ноде (из кешированного конфига)
     local remote_config
     remote_config=$(_get_node_config "$nname") || return 1
@@ -624,55 +721,52 @@ _sync_node_listeners() {
     hy2_users="${hy2_users%$'\n'}"
 
     # Загружаем скрипты если ещё не загружены
-    if [[ -z "${SCRIPTS_UPLOADED[$nname]+x}" ]]; then
-        upload_scripts
-        SCRIPTS_UPLOADED[$nname]=1
+    if ! array_contains "$nname" "${SCRIPTS_UPLOADED[@]}"; then
+        if ! upload_scripts; then
+            warn "$nname: не удалось загрузить скрипты; listeners не изменены."
+            return 1
+        fi
+        SCRIPTS_UPLOADED+=("$nname")
     fi
 
     # Формируем SSH-команду: sync каждого listener'а + restart
     local sync_cmd="source ${REMOTE_DIR}/common/listener-users.sh"
-    local has_changes=false
-
-    if $has_vless_tcp && [[ -n "$vless_tcp_users" ]]; then
+    if $has_vless_tcp; then
         sync_cmd+=" && _sync_listener_users 'vless-tcp' $(printf '%q' "$vless_tcp_users")"
-        has_changes=true
     fi
-    if $has_vless_xhttp && [[ -n "$vless_xhttp_users" ]]; then
+    if $has_vless_xhttp; then
         sync_cmd+=" && _sync_listener_users 'vless-xhttp' $(printf '%q' "$vless_xhttp_users")"
-        has_changes=true
     fi
-    if $has_vless_grpc && [[ -n "$vless_grpc_users" ]]; then
+    if $has_vless_grpc; then
         sync_cmd+=" && _sync_listener_users 'vless-grpc' $(printf '%q' "$vless_grpc_users")"
-        has_changes=true
     fi
-    if $has_hy2 && [[ -n "$hy2_users" ]]; then
+    if $has_hy2; then
         sync_cmd+=" && _sync_listener_users 'hy2' $(printf '%q' "$hy2_users")"
-        has_changes=true
     fi
-
-    if ! $has_changes; then
-        return 0
-    fi
-
     # Restart mihomo после sync
     sync_cmd+=" && systemctl restart mihomo"
 
     if ssh_run -- "$sync_cmd" 2>/dev/null; then
         success "$nname — listeners обновлены"
-    else
-        warn "$nname — не удалось обновить listeners"
+        return 0
     fi
+    warn "$nname — не удалось обновить listeners"
+    return 1
 }
 
 # Синхронизирует listeners на всех указанных нодах
 _sync_listeners_on_nodes() {
-    local nodes=("$@")
+    local nodes=("$@") nname rc=0
 
     echo ""
     info "Синхронизация users на нодах..."
 
     for nname in "${nodes[@]}"; do
-        [[ -n "${NODE_CONFIG_FAILED[$nname]+x}" ]] && continue
-        _sync_node_listeners "$nname"
+        if array_contains "$nname" "${NODE_CONFIG_FAILED[@]}"; then
+            rc=1
+            continue
+        fi
+        _sync_node_listeners "$nname" || rc=1
     done
+    return "$rc"
 }

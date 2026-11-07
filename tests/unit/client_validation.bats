@@ -130,3 +130,21 @@ matches() {
     run matches $'cli\nent'
     assert_failure
 }
+
+@test "custom node editor preserves the client's current selections" {
+    cat > "$CONFIG_JSON" <<'EOF'
+{"schema_version":2,"nodes":[
+  {"id":"00000000000000000000000000000001","name":"node-a","ip":"127.0.0.1","port":22,"user":"root","auth":"key","identity":"system","secret_id":null,"aliases":{}},
+  {"id":"00000000000000000000000000000002","name":"node-b","ip":"127.0.0.2","port":22,"user":"root","auth":"key","identity":"system","secret_id":null,"aliases":{}}
+],"groups":[{"name":"PC","template":"default.yaml"}],"clients":[{"name":"client","group":"PC","inherit_nodes_from_group":false,"nodes":["node-a"],"connections":[]}],"connections":[]}
+EOF
+    nodes_count() { jq_r '.nodes | length'; }
+    toggle_select() {
+        CAPTURED_FLAGS="${TOGGLE_SELECT_FLAGS[*]}"
+    }
+
+    _set_custom_nodes "client" "PC"
+    [[ "$CAPTURED_FLAGS" == "1 0" ]]
+    run jq -c '.clients[0].nodes' "$CONFIG_JSON"
+    assert_output '["node-a"]'
+}

@@ -2,68 +2,80 @@
 # ─── Подключения нод (per-group) ────────────────────────────────────────────
 
 # Кеш кол-ва обнаруженных подключений per нода. Заполняется _sync_all_connections.
-declare -A NODE_DISC_COUNT
+NODE_DISC_NAMES=()
+NODE_DISC_COUNTS=()
 
 connections_menu() {
     local _conn_synced=0
     while true; do
         local node_count
         node_count=$(nodes_count)
-
         if [[ "$node_count" -gt 0 && "$_conn_synced" -eq 0 ]]; then
             _sync_all_connections
             _conn_synced=1
         fi
-
         echo ""
         box_top
         box_center "Подключения нод для групп"
-        box_bot
-
+        box_mid
         if [[ "$node_count" -eq 0 ]]; then
-            echo ""
-            echo -e "  ${DIM}Нет нод${NC}"
+            box_line " Нет нод" " ${DIM}Нет нод${NC}"
         else
-            # Обзор: нода × группа → кол-во подключений
             _show_connections_overview
-            echo ""
-            local i=1
+            local i=1 nname nip
             while IFS=$'\t' read -r nname nip; do
-                echo -e "  ${GREEN}${i})${NC} $nname ${DIM}$nip${NC}"
+                box_line " ${i}) ${nname} ${nip}" " ${CYAN}${i})${NC} ${nname} ${DIM}${nip}${NC}"
                 i=$((i + 1))
             done < <(jq_r '.nodes[] | "\(.name)\t\(.ip)"')
         fi
-        echo ""
+        box_mid
         if [[ "$node_count" -gt 0 ]]; then
-            echo -e "  ${YELLOW}r)${NC} Переименовать подключения"
-            echo -e "  ${CYAN}s)${NC} Синхронизировать с нодами"
+            menu_item r "Переименовать подключения" YELLOW
+            menu_item s "Синхронизировать с нодами" CYAN
         fi
-        echo -e "  ${NC}0)${NC} Назад"
+        menu_item 0 "Назад" NC
+        box_bot
         echo ""
-        read -rp "  Выберите ноду: " CONN_CHOICE
-
-        if [[ "$CONN_CHOICE" == "0" ]]; then
-            return
-        elif [[ "$CONN_CHOICE" == "r" || "$CONN_CHOICE" == "R" ]]; then
-            _rename_connections
-        elif [[ "$CONN_CHOICE" == "s" || "$CONN_CHOICE" == "S" ]]; then
-            _sync_all_connections
-        elif [[ "$CONN_CHOICE" =~ ^[0-9]+$ ]] && (( CONN_CHOICE >= 1 && CONN_CHOICE <= node_count )); then
-            _configure_node_connections "$CONN_CHOICE"
-        else
-            warn "Неверный выбор."
+        if ! IFS= read -rp "  Выберите ноду: " CONN_CHOICE; then
+            return 0
         fi
+        CONN_CHOICE="${CONN_CHOICE%$'\r'}"
+        case "$CONN_CHOICE" in
+            0) return 0 ;;
+            r|R)
+                if [[ "$node_count" -gt 0 ]]; then
+                    state_action "rename_connections" _rename_connections
+                else
+                    warn "Неверный выбор."
+                fi
+                ;;
+            s|S)
+                if [[ "$node_count" -gt 0 ]]; then
+                    state_action "sync_connections" _sync_all_connections
+                else
+                    warn "Неверный выбор."
+                fi
+                ;;
+            *)
+                if menu_index_valid "$CONN_CHOICE" "$node_count"; then
+                    state_action "configure_connections" _configure_node_connections "$CONN_CHOICE"
+                else
+                    warn "Неверный выбор."
+                fi
+                ;;
+        esac
     done
 }
 
 # Очищает .connections для ноды от proxy, которых нет в обнаруженном списке.
 # Удаляет пустые группы и пустые ноды.
-# Args: $1 — имя ноды; $2 — имя массива bash с обнаруженными подключениями.
+# Args: $1 — имя ноды; остальные аргументы — обнаруженные подключения.
 _purge_stale_connections() {
     local nname="$1"
-    local -n _disc_arr=$2
+    shift
+    local -a discovered=("$@")
     local disc_json
-    disc_json=$(printf '%s\n' "${_disc_arr[@]}" | jq -R . | jq -s .)
+    disc_json=$(printf '%s\n' "${discovered[@]}" | jq -R . | jq -s .)
     jq_w --arg n "$nname" --argjson valid "$disc_json" '
         .connections |= map(
             if .node==$n then
@@ -73,19 +85,51 @@ _purge_stale_connections() {
         | .connections |= [.[] | select(.groups | length > 0)]'
 }
 
+_node_disc_count_reset() {
+    NODE_DISC_NAMES=()
+    NODE_DISC_COUNTS=()
+}
+
+_node_disc_count_set() {
+    local nname="$1" count="$2"
+    local i
+    for i in "${!NODE_DISC_NAMES[@]}"; do
+        if [[ "${NODE_DISC_NAMES[$i]}" == "$nname" ]]; then
+            NODE_DISC_COUNTS[$i]="$count"
+            return 0
+        fi
+    done
+    NODE_DISC_NAMES+=("$nname")
+    NODE_DISC_COUNTS+=("$count")
+}
+
+_node_disc_count_get() {
+    local nname="$1"
+    local i
+    for i in "${!NODE_DISC_NAMES[@]}"; do
+        if [[ "${NODE_DISC_NAMES[$i]}" == "$nname" ]]; then
+            echo "${NODE_DISC_COUNTS[$i]}"
+            return 0
+        fi
+    done
+    echo "?"
+}
+
 # Прогоняет sync для всех нод: SSH discover + purge stale.
-# Offline-ноды — warn и пропуск (stale-данные сохраняются).
 _sync_all_connections() {
     local nodes=()
-    mapfile -t nodes < <(jq_r '.nodes[].name')
+    while IFS= read -r node_name; do
+        nodes+=("$node_name")
+    done < <(jq_r '.nodes[].name')
     [[ ${#nodes[@]} -eq 0 ]] && return
 
     info "Синхронизирую подключения с нодами..."
     local ok=0 fail=0
+    local _save_id="${NODE_ID:-}" _save_identity="${NODE_IDENTITY:-}" _save_tag="${NODE_TAG:-}"
     local _save_node="$NODE_NAME" _save_ip="$SERVER_IP" _save_port="$SERVER_PORT"
     local _save_user="$SERVER_USER" _save_pass="$SERVER_PASS" _save_auth="$SERVER_AUTH"
 
-    NODE_DISC_COUNT=()
+    _node_disc_count_reset
 
     for nname in "${nodes[@]}"; do
         if ! node_load_by_name "$nname"; then
@@ -97,7 +141,7 @@ _sync_all_connections() {
         local discovered
         discovered=$(_discover_connections)
         if [[ -z "$discovered" ]]; then
-            warn "$nname: offline или пусто, пропуск"
+            warn "$nname: нода недоступна или не вернула данные, пропуск"
             fail=$((fail + 1))
             continue
         fi
@@ -107,48 +151,45 @@ _sync_all_connections() {
             [[ -n "$line" ]] && disc_arr+=("$line")
         done <<< "$discovered"
 
-        NODE_DISC_COUNT[$nname]=${#disc_arr[@]}
-        _purge_stale_connections "$nname" disc_arr
+        _node_disc_count_set "$nname" "${#disc_arr[@]}"
+        _purge_stale_connections "$nname" "${disc_arr[@]}"
         ok=$((ok + 1))
     done
 
+    NODE_ID="$_save_id" NODE_IDENTITY="$_save_identity" NODE_TAG="$_save_tag"
     NODE_NAME="$_save_node" SERVER_IP="$_save_ip" SERVER_PORT="$_save_port"
     SERVER_USER="$_save_user" SERVER_PASS="$_save_pass" SERVER_AUTH="$_save_auth"
 
     success "Синхронизировано: $ok/${#nodes[@]} нод"
-    [[ $fail -gt 0 ]] && warn "Не доступно: $fail"
+    if [[ $fail -gt 0 ]]; then
+        warn "Не доступно: $fail"
+        return 1
+    fi
+    return 0
 }
 
 _show_connections_overview() {
     groups_list
     [[ ${#GRP_LIST[@]} -eq 0 ]] && return
-
-    echo ""
+    local nname _nip g cnt total color plain colored
     while IFS=$'\t' read -r nname _nip; do
-        local line="  ${nname}"
-        # Паддинг до 12 символов
-        local pad=$((12 - ${#nname}))
-        (( pad > 0 )) && line+=$(printf '%*s' "$pad" "")
-
-        local total="${NODE_DISC_COUNT[$nname]:-?}"
+        total=$(_node_disc_count_get "$nname")
+        box_line " ${nname}"
         for g in "${GRP_LIST[@]}"; do
-            local cnt
             cnt=$(jq_r --arg n "$nname" --arg g "$g" \
                 '.connections[] | select(.node==$n) | .groups[] | select(.name==$g) | .proxies | length')
             cnt="${cnt:-0}"
-            local color
-            if [[ "$total" == "?" ]]; then
-                color="$DIM"
-            elif [[ "$cnt" -eq 0 ]]; then
+            if [[ "$total" == "?" || "$cnt" -eq 0 ]]; then
                 color="$DIM"
             elif [[ "$cnt" -ge "$total" ]]; then
                 color="$GREEN"
             else
                 color="$YELLOW"
             fi
-            line+=" ${g}: ${color}${cnt}/${total}${NC} "
+            plain="    ${g}: ${cnt}/${total}"
+            colored="    ${!color}${g}: ${cnt}/${total}${NC}"
+            box_line "$plain" "$colored"
         done
-        echo -e "$line"
     done < <(jq_r '.nodes[] | "\(.name)\t\(.ip)"')
 }
 
@@ -173,8 +214,8 @@ _configure_node_connections() {
 
     success "Обнаружено ${#disc_arr[@]} подключений"
 
-    NODE_DISC_COUNT[$nname]=${#disc_arr[@]}
-    _purge_stale_connections "$nname" disc_arr
+    _node_disc_count_set "$nname" "${#disc_arr[@]}"
+    _purge_stale_connections "$nname" "${disc_arr[@]}"
 
     groups_list
     while true; do
@@ -206,7 +247,7 @@ _configure_node_connections() {
         if [[ "$_pick" == "0" ]]; then
             return
         elif [[ "$_pick" == "b" || "$_pick" == "B" ]]; then
-            _batch_assign_connections "$nname" disc_arr
+            _batch_assign_connections "$nname" "${disc_arr[@]}"
         else
             warn "Неверный выбор."
         fi
@@ -217,19 +258,27 @@ _configure_node_connections() {
 
 _batch_assign_connections() {
     local nname="$1"
-    local -n _batch_disc=$2
+    shift
+    local -a batch_disc=("$@")
 
-    # Шаг 1: выбрать подключения
     local flags=()
-    for d in "${_batch_disc[@]}"; do
+    local d
+    for d in "${batch_disc[@]}"; do
         flags+=(0)
     done
 
-    toggle_select "${CYAN}$nname${NC} — подключения" _batch_disc flags
+    TOGGLE_SELECT_ITEMS=("${batch_disc[@]}")
+    TOGGLE_SELECT_FLAGS=("${flags[@]}")
+    toggle_select "$nname — подключения"
+    local toggle_rc=$?
+    flags=("${TOGGLE_SELECT_FLAGS[@]}")
+    TOGGLE_SELECT_ITEMS=()
+    TOGGLE_SELECT_FLAGS=()
+    (( toggle_rc == 0 )) || return 1
 
     local selected_csv=""
     local i=0
-    for d in "${_batch_disc[@]}"; do
+    for d in "${batch_disc[@]}"; do
         if [[ "${flags[$i]}" == "1" ]]; then
             [[ -n "$selected_csv" ]] && selected_csv+=","
             selected_csv+="$d"
@@ -239,16 +288,23 @@ _batch_assign_connections() {
 
     if [[ -z "$selected_csv" ]]; then
         warn "Ничего не выбрано."
-        return
+        return 1
     fi
 
-    # Шаг 2: выбрать группы
     local grp_flags=()
+    local g
     for g in "${GRP_LIST[@]}"; do
         grp_flags+=(0)
     done
 
-    toggle_select "${CYAN}$nname${NC} — группы" GRP_LIST grp_flags
+    TOGGLE_SELECT_ITEMS=("${GRP_LIST[@]}")
+    TOGGLE_SELECT_FLAGS=("${grp_flags[@]}")
+    toggle_select "$nname — группы"
+    toggle_rc=$?
+    grp_flags=("${TOGGLE_SELECT_FLAGS[@]}")
+    TOGGLE_SELECT_ITEMS=()
+    TOGGLE_SELECT_FLAGS=()
+    (( toggle_rc == 0 )) || return 1
 
     local applied=0
     i=0
@@ -389,31 +445,17 @@ _extract_names_by_keyword() {
     echo "$names"
 }
 
-_append_lines() {
-    local -n _result=$1
-    local lines="$2" prefix="${3:-}"
-    while IFS= read -r n; do
-        [[ -n "$n" ]] && _result="${_result}${prefix}${n}"$'\n'
-    done <<< "$lines"
-}
 
 _discover_connections() {
-    local result=""
-
     local remote_config
     remote_config=$(ssh_run -- "cat /etc/mihomo/client-config.txt 2>/dev/null") || return
 
-    _append_lines result "$(_extract_names_by_keyword "$remote_config" "vless")"
-    _append_lines result "$(_extract_names_by_keyword "$remote_config" "hy2\|hysteria")"
-
-    local cascade_names
-    cascade_names=$(echo "$remote_config" | grep -i 'name:.*cascade' | sed 's/.*name: *//;s/"//g' | sed 's/^ *//')
-    _append_lines result "$cascade_names"
-
-    # AWG: обнаруживаем по секции в client-config.txt (без лишнего SSH)
-    if echo "$remote_config" | grep -q '^--- AmneziaWG ---'; then
-        result+="AWG"$'\n'
-    fi
-
-    echo "$result" | grep -v '^$' | sort -u
+    {
+        _extract_names_by_keyword "$remote_config" "vless"
+        _extract_names_by_keyword "$remote_config" "hy2\|hysteria"
+        echo "$remote_config" | grep -i 'name:.*cascade' | sed 's/.*name: *//;s/"//g' | sed 's/^ *//'
+        if echo "$remote_config" | grep -q '^--- AmneziaWG ---'; then
+            echo "AWG"
+        fi
+    } | grep -v '^$' | sort -u
 }

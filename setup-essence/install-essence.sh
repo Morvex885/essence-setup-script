@@ -5,6 +5,11 @@
 #   sudo bash install-essence.sh                          # публичный репо
 #   sudo GITHUB_TOKEN=ghp_xxx bash install-essence.sh     # приватный репо
 
+if (( BASH_VERSINFO[0] < 3 || ( BASH_VERSINFO[0] == 3 && BASH_VERSINFO[1] < 2) )); then
+    printf '  [✗] Требуется Bash 3.2 или новее.\n' >&2
+    exit 1
+fi
+
 set -euo pipefail
 
 REPO="Morvex885/essence-setup-script"
@@ -87,8 +92,19 @@ main() {
 
     # Получаем последнюю версию
     info "Проверяем последнюю версию..."
-    local latest
-    latest=$(get_latest_tag 2>/dev/null) || error "Не удалось получить версию из GitHub.\nДля приватного репо укажите токен: sudo GITHUB_TOKEN=ghp_xxx bash install-essence.sh"
+    local latest latest_error latest_detail
+    latest_error=$(umask 077; mktemp)
+    if ! latest=$(get_latest_tag 2>"$latest_error"); then
+        latest_detail=$(LC_ALL=C tr -cd '\11\12\15\40-\176\200-\377' < "$latest_error" |
+            tr '\r\n' '  ' | cut -c1-300)
+        rm -f "$latest_error"
+        [[ -n "$latest_detail" ]] && warn "Ответ GitHub: $latest_detail"
+        if [[ "$latest_detail" == *"401"* ]]; then
+            error "GitHub подтвердил ошибку авторизации. Проверьте GITHUB_TOKEN."
+        fi
+        error "Не удалось получить версию из GitHub. Проверьте сеть и наличие релиза."
+    fi
+    rm -f "$latest_error"
     [[ -z "$latest" ]] && error "GitHub не вернул версию. Возможно, ещё нет ни одного релиза."
 
     # Проверяем текущую версию

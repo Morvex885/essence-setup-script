@@ -2,29 +2,34 @@
 # ─── Hysteria2 ───────────────────────────────────────────────────────────────
 
 hy2_menu() {
-    echo ""
-    box_top
-    box_center "Hysteria2"
-    box_bot
-    echo ""
-    if grep -q '# --- hy2 ---' /etc/mihomo/config.yaml 2>/dev/null; then
-        echo -e "  Статус: ${GREEN}установлен${NC}"
-    else
-        echo -e "  Статус: ${RED}не установлен${NC}"
-    fi
-    echo ""
-    echo -e "  ${GREEN}1)${NC} Установить Hysteria2"
-    echo -e "  ${RED}2)${NC} Удалить Hysteria2"
-    echo -e "  ${NC}0)${NC} Назад"
-    echo ""
-    read -rp "Выберите действие [0-2]: " HY2_MENU_CHOICE
-
-    case "$HY2_MENU_CHOICE" in
-        1) install_hy2 ;;
-        2) uninstall_hy2 ;;
-        0) return ;;
-        *) warn "Неверный выбор." ;;
-    esac
+    local choice
+    while true; do
+        echo ""
+        box_top
+        box_center "Hysteria2"
+        box_mid
+        if grep -q '# --- hy2 ---' /etc/mihomo/config.yaml 2>/dev/null; then
+            box_line " Статус: установлен" " ${GREEN}Статус: установлен${NC}"
+        else
+            box_line " Статус: не установлен" " ${DIM}Статус: не установлен${NC}"
+        fi
+        box_mid
+        menu_item 1 "Установить Hysteria2" GREEN
+        menu_item 2 "Удалить Hysteria2" RED
+        menu_item 0 "Назад" NC
+        box_bot
+        echo ""
+        if ! IFS= read -rp "  Выберите действие: " choice; then
+            return 0
+        fi
+        choice="${choice%$'\r'}"
+        case "$choice" in
+            1) install_hy2 || warn "Установка Hysteria2 завершилась ошибкой." ;;
+            2) uninstall_hy2 || warn "Удаление Hysteria2 завершилось ошибкой." ;;
+            0) return 0 ;;
+            *) warn "Неверный выбор." ;;
+        esac
+    done
 }
 
 install_hy2() {
@@ -41,7 +46,10 @@ install_hy2() {
     fi
 
     # ── Ввод параметров ──────────────────────────────────────────────────────
-    DEFAULT_PORT=$(gen_free_port 10000 65535)
+    DEFAULT_PORT=$(gen_free_port 10000 65535) || {
+        warn "Не удалось подобрать порт для Hysteria2."
+        return 1
+    }
     read -rp "Порт для Hysteria2 [Enter = $DEFAULT_PORT]: " HY2_PORT
     [[ -z "$HY2_PORT" ]] && HY2_PORT="$DEFAULT_PORT"
     while true; do
@@ -53,7 +61,7 @@ install_hy2() {
             break
         fi
         read -rp "Новый порт: " HY2_PORT
-        [[ -z "$HY2_PORT" ]] && { warn "Порт не указан"; return; }
+        [[ -z "$HY2_PORT" ]] && { warn "Порт не указан"; return 1; }
     done
 
     DEFAULT_USER="vpn"
@@ -64,17 +72,28 @@ install_hy2() {
     read -rp "Пароль [Enter = $DEFAULT_PASS]: " HY2_PASS
     [[ -z "$HY2_PASS" ]] && HY2_PASS="$DEFAULT_PASS"
 
-    echo ""
-    echo -e "  Через какой прокси пускать трафик?"
-    echo -e "  ${GREEN}1)${NC} outbound (по умолчанию)"
-    echo -e "  ${NC}2)${NC} DIRECT"
-    read -rp "Выберите [Enter = 1]: " PROXY_CHOICE
-    PROXY_CHOICE="${PROXY_CHOICE:-1}"
-    case "$PROXY_CHOICE" in
-        1) HY2_PROXY="outbound" ;;
-        2) HY2_PROXY="DIRECT" ;;
-        *) warn "Неверный выбор."; return ;;
-    esac
+    while true; do
+        echo ""
+        box_top
+        box_center "Прокси для Hysteria2"
+        box_mid
+        menu_item 1 "Через outbound" GREEN
+        menu_item 2 "Напрямую (DIRECT)" CYAN
+        menu_item 0 "Отмена" NC
+        box_bot
+        echo ""
+        if ! IFS= read -rp "  Выберите действие [Enter = 1]: " PROXY_CHOICE; then
+            return 1
+        fi
+        PROXY_CHOICE="${PROXY_CHOICE%$'\r'}"
+        PROXY_CHOICE="${PROXY_CHOICE:-1}"
+        case "$PROXY_CHOICE" in
+            1) HY2_PROXY="outbound"; break ;;
+            2) HY2_PROXY="DIRECT"; break ;;
+            0) return 1 ;;
+            *) warn "Неверный выбор." ;;
+        esac
+    done
 
     echo ""
     info "Obfs salamander — маскирует QUIC-трафик Hysteria2 под случайные байты,"
@@ -104,7 +123,10 @@ install_hy2() {
     openssl req -new -newkey rsa:2048 -days 3650 -nodes -x509 \
         -subj "/C=US/ST=Denial/L=Springfield/O=Dis/CN=www.google.de" \
         -keyout /etc/mihomo/certs/hy2/server.key \
-        -out    /etc/mihomo/certs/hy2/server.crt 2>/dev/null || error "Не удалось создать сертификат"
+        -out    /etc/mihomo/certs/hy2/server.crt 2>/dev/null || {
+        warn "Не удалось создать сертификат"
+        return 1
+    }
     chmod 600 /etc/mihomo/certs/hy2/server.key
     success "Сертификат: /etc/mihomo/certs/hy2/server.crt"
 

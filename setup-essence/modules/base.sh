@@ -13,9 +13,12 @@ install_base() {
     STEP=$((STEP + 1))
     echo ""
     info "Шаг $STEP/$TOTAL_STEPS: Установка зависимостей..."
-    apt_wait
-    DEBIAN_FRONTEND=noninteractive apt-get update -q
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -q curl wget unzip ufw openssl uuid-runtime dnsutils cron || error "Не удалось установить зависимости"
+    if ! apt_wait ||
+       ! DEBIAN_FRONTEND=noninteractive apt-get update -q ||
+       ! DEBIAN_FRONTEND=noninteractive apt-get install -y -q curl wget unzip ufw openssl uuid-runtime dnsutils cron; then
+        warn "Не удалось установить зависимости"
+        return 1
+    fi
     success "Зависимости установлены"
 
     # ─── Шаг 2: Оптимизация сети ─────────────────────────────────────────────
@@ -61,9 +64,10 @@ SYSCTLEOF
     # ─── Шаг 3: Mihomo ──────────────────────────────────────────────────────
     STEP=$((STEP + 1))
     echo ""
-    info "Шаг $STEP/$TOTAL_STEPS: Установка Mihomo..."
-    _install_mihomo_binary
-
+    if ! _install_mihomo_binary; then
+        warn "Не удалось установить Mihomo."
+        return 1
+    fi
     # ─── Шаг 4: Конфиг + systemd ────────────────────────────────────────────
     STEP=$((STEP + 1))
     echo ""
@@ -95,39 +99,47 @@ SYSCTLEOF
 }
 
 # ─── Вспомогательные функции ──────────────────────────────────────────────────
-
 _install_mihomo_binary() {
-    LATEST=$(curl -s https://api.github.com/repos/MetaCubeX/mihomo/releases/latest \
-        | grep '"tag_name"' | cut -d'"' -f4)
-    [[ -z "$LATEST" ]] && error "Не удалось получить актуальную версию Mihomo с GitHub."
-    info "Версия: $LATEST"
+    local latest
+    latest=$(curl -s https://api.github.com/repos/MetaCubeX/mihomo/releases/latest |
+        grep '"tag_name"' | cut -d'"' -f4)
+    if [[ -z "$latest" ]]; then
+        warn "Не удалось получить актуальную версию Mihomo с GitHub."
+        return 1
+    fi
+    info "Версия: $latest"
 
+    local arch
     case "$(uname -m)" in
-        aarch64|arm64)
-            MIHOMO_ARCH="arm64"
-            ;;
-        armv7l|armv7)
-            MIHOMO_ARCH="armv7"
-            ;;
+        aarch64|arm64) arch="arm64" ;;
+        armv7l|armv7) arch="armv7" ;;
         *)
-            CPU_FLAGS=$(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null || echo "")
-            if echo "$CPU_FLAGS" | grep -qw "avx2"; then
-                MIHOMO_ARCH="amd64-v3"
-            elif echo "$CPU_FLAGS" | grep -qw "sse4_2"; then
-                MIHOMO_ARCH="amd64-v2"
+            local cpu_flags
+            cpu_flags=$(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null || echo "")
+            if echo "$cpu_flags" | grep -qw "avx2"; then
+                arch="amd64-v3"
+            elif echo "$cpu_flags" | grep -qw "sse4_2"; then
+                arch="amd64-v2"
             else
-                MIHOMO_ARCH="amd64"
+                arch="amd64"
             fi
             ;;
     esac
-    info "Архитектура CPU: $MIHOMO_ARCH"
-
-    curl -Lo /tmp/mihomo.gz \
-        "https://github.com/MetaCubeX/mihomo/releases/download/${LATEST}/mihomo-linux-${MIHOMO_ARCH}-${LATEST}.gz"
-    gunzip -f /tmp/mihomo.gz
-    mv /tmp/mihomo /usr/local/bin/mihomo
-    chmod +x /usr/local/bin/mihomo
-    success "Mihomo установлен: $(/usr/local/bin/mihomo -v 2>&1 | head -1)"
+    local download_dir
+    download_dir=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/essence-mihomo.XXXXXX") || {
+        warn "Не удалось подготовить временный каталог для Mihomo."
+        return 1
+    }
+    if ! curl -fLo "$download_dir/mihomo.gz" \
+        "https://github.com/MetaCubeX/mihomo/releases/download/${latest}/mihomo-linux-${arch}-${latest}.gz" ||
+       ! gunzip -f "$download_dir/mihomo.gz" ||
+       ! mv "$download_dir/mihomo" /usr/local/bin/mihomo ||
+       ! chmod +x /usr/local/bin/mihomo; then
+        rm -rf -- "$download_dir"
+        warn "Не удалось скачать или установить бинарник Mihomo."
+        return 1
+    fi
+    rm -rf -- "$download_dir"
 }
 
 _write_config_skeleton() {

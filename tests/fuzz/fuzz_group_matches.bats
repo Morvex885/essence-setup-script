@@ -30,7 +30,8 @@ setup() {
         local tag
         tag=$(random_tag)
         local target
-        target=$(echo "$tag" | tr '/' '\n' | shuf | head -1)
+        IFS='/' read -r -a tag_parts <<< "$tag"
+        target="${tag_parts[RANDOM % ${#tag_parts[@]}]}"
         local result
         result=$(_group_matches "$tag" "$target")
         [[ "$result" == "1" ]] || {
@@ -85,7 +86,8 @@ setup() {
         local base_tag
         base_tag=$(random_tag)
         local known_elem
-        known_elem=$(echo "$base_tag" | tr '/' '\n' | shuf | head -1)
+        IFS='/' read -r -a tag_parts <<< "$base_tag"
+        known_elem="${tag_parts[RANDOM % ${#tag_parts[@]}]}"
         local tag="$base_tag"
         # Randomly add leading and/or trailing slashes
         (( RANDOM % 2 )) && tag="/$tag"
@@ -113,6 +115,11 @@ setup() {
         first_elem=$(echo "$tag" | cut -d/ -f1)
         if [[ ${#first_elem} -ge 2 ]]; then
             local partial="${first_elem:0:$((${#first_elem} - 1))}"
+            # Avoid generating a target that is also an exact later component.
+            if [[ "$tag" == "$partial" || "$tag" == "$partial/"* ||
+                  "$tag" == */"$partial" || "$tag" == */"$partial/"* ]]; then
+                continue
+            fi
             local result
             result=$(_group_matches "$tag" "$partial")
             [[ "$result" == "0" ]] || {
@@ -128,7 +135,8 @@ setup() {
         local base_tag
         base_tag=$(random_tag)
         local elem
-        elem=$(echo "$base_tag" | tr '/' '\n' | shuf | head -1)
+        IFS='/' read -r -a tag_parts <<< "$base_tag"
+        elem="${tag_parts[RANDOM % ${#tag_parts[@]}]}"
         # Duplicate the element 1-4 times
         local dups=$((RANDOM % 4 + 1))
         local tag="$base_tag"

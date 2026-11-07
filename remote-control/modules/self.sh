@@ -3,21 +3,39 @@
 
 # ─── Пароль для доступа к скрипту ────────────────────────────────────────────
 
-_script_pass_file() { echo "$CONFIG_DIR/.auth"; }
+_script_pass_file() { echo "${SCRIPT_AUTH_FILE:-$CONFIG_DIR/.auth}"; }
 
 _hash_pass() {
     local salt
     salt=$(openssl rand -hex 8)
     openssl passwd -6 -salt "$salt" "$1"
 }
+_script_password_hash_salt() {
+    local stored="$1"
+    [[ "$stored" =~ ^\$6\$(rounds=[0-9]+\$)?([./A-Za-z0-9]+)\$[./A-Za-z0-9]+$ ]] || return 1
+    printf '%s%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+}
+
 
 _verify_pass() {
     local stored="$1" input="$2"
     local salt
-    salt=$(echo "$stored" | cut -d'$' -f3)
+    salt=$(_script_password_hash_salt "$stored") || return 1
     local input_hash
     input_hash=$(openssl passwd -6 -salt "$salt" "$input")
     [[ "$input_hash" == "$stored" ]]
+}
+
+_write_script_password() {
+    local passfile="$1" password="$2" tmp
+    mkdir -p "$(dirname "$passfile")" || return 1
+    tmp=$(umask 077; mktemp "${passfile}.tmp.XXXXXX") || return 1
+    if ! _hash_pass "$password" > "$tmp" ||
+       ! chmod 600 "$tmp" ||
+       ! mv "$tmp" "$passfile"; then
+        rm -f "$tmp"
+        return 1
+    fi
 }
 
 check_script_password() {
@@ -30,16 +48,23 @@ check_script_password() {
     [[ -z "$stored" ]] && return 0
 
     echo ""
-    local attempts=3
-    while (( attempts > 0 )); do
-        read -rsp "  Введите пароль: " _input; echo ""
-        if _verify_pass "$stored" "$_input"; then
-            return 0
-        fi
-        attempts=$((attempts - 1))
-        (( attempts > 0 )) && warn "Неверный пароль. Осталось попыток: $attempts"
+    while true; do
+        local attempts=3 _input
+        while (( attempts > 0 )); do
+            if ! read -rsp "  Введите пароль: " _input; then
+                echo ""
+                return 1
+            fi
+            echo ""
+            if _verify_pass "$stored" "$_input"; then
+                return 0
+            fi
+            attempts=$((attempts - 1))
+            (( attempts > 0 )) && warn "Неверный пароль. Осталось попыток: $attempts"
+        done
+        warn "Доступ запрещён."
+        startup_recovery_menu "Восстановление доступа" true || return 1
     done
-    error "Доступ запрещён."
 }
 
 set_script_password() {
@@ -65,8 +90,10 @@ set_script_password() {
                 [[ -z "$_new" ]] && { warn "Пароль не может быть пустым."; return; }
                 read -rsp "  Повторите: " _confirm; echo ""
                 [[ "$_new" != "$_confirm" ]] && { warn "Пароли не совпадают."; return; }
-                _hash_pass "$_new" > "$passfile"
-                chmod 600 "$passfile"
+                _write_script_password "$passfile" "$_new" || {
+                    warn "Не удалось атомарно сохранить пароль."
+                    return 1
+                }
                 success "Пароль изменён"
                 ;;
             2)
@@ -85,8 +112,10 @@ set_script_password() {
         [[ -z "$_new" ]] && { warn "Пароль не может быть пустым."; return; }
         read -rsp "  Повторите: " _confirm; echo ""
         [[ "$_new" != "$_confirm" ]] && { warn "Пароли не совпадают."; return; }
-        _hash_pass "$_new" > "$passfile"
-        chmod 600 "$passfile"
+        _write_script_password "$passfile" "$_new" || {
+            warn "Не удалось атомарно сохранить пароль."
+            return 1
+        }
         success "Пароль установлен"
     fi
 }
@@ -101,9 +130,6 @@ check_deps() {
     if [[ ${#missing[@]} -gt 0 ]]; then
         error "Не найдены утилиты: ${missing[*]}\nУстановите:\n  Linux:   sudo apt install ${missing[*]}\n  macOS:   brew install ${missing[*]}\n  Windows: winget install ${missing[*]}"
     fi
-
-    _ensure_config
-    chmod 600 "$CONFIG_JSON"
     check_update_start
 }
 

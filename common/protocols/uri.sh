@@ -3,14 +3,20 @@
 
 # RFC 3986 percent-encoding for URI query values and fragments.
 _uri_percent_encode() {
-    local input="$1" output="" char hex i
-    local LC_ALL=C
-    for ((i = 0; i < ${#input}; i++)); do
-        char="${input:i:1}"
-        case "$char" in
-            [a-zA-Z0-9.~_-]) output+="$char" ;;
+    local input="$1" output="" bytes hex char i
+
+    # Iterate over the hexadecimal representation of the raw bytes rather
+    # than Bash characters. This keeps multibyte UTF-8 sequences intact on
+    # Bash 3.2, regardless of the user's locale.
+    bytes=$(printf '%s' "$input" | LC_ALL=C od -An -v -t x1 | tr -d '[:space:]' | tr 'a-f' 'A-F')
+    for ((i = 0; i < ${#bytes}; i += 2)); do
+        hex="${bytes:i:2}"
+        case "$hex" in
+            2D|2E|30|31|32|33|34|35|36|37|38|39|4[1-9A-F]|5[0-9A]|5F|6[1-9A-F]|7[0-9A]|7E)
+                printf -v char '%b' "\\x${hex}"
+                output+="$char"
+                ;;
             *)
-                printf -v hex '%02X' "'$char"
                 output+="%${hex}"
                 ;;
         esac
@@ -25,9 +31,10 @@ _uri_percent_decode() {
         prefix="${input%%\%*}"
         output+="$prefix"
         input="${input#*%}"
-        [[ "$input" =~ ^([0-9A-Fa-f]{2})(.*)$ ]] || return 1
-        hex="${BASH_REMATCH[1]}"
-        input="${BASH_REMATCH[2]}"
+        [[ ${#input} -ge 2 ]] || return 1
+        hex="${input:0:2}"
+        [[ "$hex" =~ ^[0-9A-Fa-f]{2}$ ]] || return 1
+        input="${input:2}"
         [[ "$hex" != "00" ]] || return 1
         printf -v char '%b' "\\x${hex}"
         output+="$char"

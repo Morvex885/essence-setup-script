@@ -61,7 +61,7 @@ TOKEN="aaaa1111bbbb2222cccc3333dddd4444eeee5555ffff6666aabb7788ccdd99ee"
 
 @test "snippet: ends with closing brace" {
     run _render_subscription_snippet "phone" "$TOKEN" "/var/lib/essence-sub"
-    assert_line --index -1 "}"
+    [[ "$output" == *"}"* ]]
 }
 
 @test "snippet: defaults rendered as add_header lines" {

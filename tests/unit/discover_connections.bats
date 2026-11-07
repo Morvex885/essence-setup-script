@@ -107,3 +107,67 @@ some awg details' ""
     assert_line "vless-reality"
     refute_line "AWG"
 }
+
+_prepare_connection_sync_test() {
+    CONFIG_SOURCE=local
+    source "$PROJECT_ROOT/remote-control/modules/github-config.sh"
+    load_fixture_config
+    jq_w '.connections |= map(.groups |= map(.proxies = ["vless-reality", "stale-proxy"]))'
+    NODE_NAME=initial
+    SERVER_IP=127.0.0.1
+    SERVER_PORT=22
+    SERVER_USER=test
+    SERVER_PASS=
+    SERVER_AUTH=key
+    node_load_by_name() {
+        NODE_NAME="$1"
+        return 0
+    }
+}
+
+@test "_sync_all_connections: all nodes succeed and checkpoint state" {
+    _prepare_connection_sync_test
+    ssh_run() {
+        printf '  - name: "vless-reality"\n'
+        return 0
+    }
+
+    run state_action "sync_connections" _sync_all_connections
+    assert_success
+    [[ -f "$STATE_MANIFEST" ]]
+    run jq -e '
+        (.connections[] | select(.node == "de-vps") | .groups[].proxies) |
+        (index("vless-reality") != null and index("stale-proxy") == null)
+    ' "$CONFIG_JSON"
+    assert_success
+    run jq -e '
+        (.connections[] | select(.node == "ru-vps") | .groups[].proxies) |
+        (index("vless-reality") != null and index("stale-proxy") == null)
+    ' "$CONFIG_JSON"
+    assert_success
+}
+
+@test "_sync_all_connections: partial failure returns error without checkpoint" {
+    _prepare_connection_sync_test
+    ssh_run() {
+        if [[ "$NODE_NAME" == ru-vps ]]; then
+            return 1
+        fi
+        printf '  - name: "vless-reality"\n'
+        return 0
+    }
+
+    run state_action "sync_connections" _sync_all_connections
+    assert_failure
+    [[ ! -e "$STATE_MANIFEST" ]]
+    run jq -e '
+        (.connections[] | select(.node == "de-vps") | .groups[].proxies) |
+        (index("vless-reality") != null and index("stale-proxy") == null)
+    ' "$CONFIG_JSON"
+    assert_success
+    run jq -e '
+        (.connections[] | select(.node == "ru-vps") | .groups[].proxies) |
+        (index("vless-reality") != null and index("stale-proxy") != null)
+    ' "$CONFIG_JSON"
+    assert_success
+}

@@ -183,3 +183,15 @@ after" "PC"
     assert_success
     assert_output ""
 }
+
+@test "template list includes built-ins when local state directory is empty" {
+    export TEMPLATES_DIR="$BATS_TEST_TMPDIR/state-templates"
+    export BUILTIN_TEMPLATES_DIR="$BATS_TEST_TMPDIR/builtin-templates"
+    mkdir -p "$TEMPLATES_DIR" "$BUILTIN_TEMPLATES_DIR"
+    printf 'mode: rule\n' > "$BUILTIN_TEMPLATES_DIR/default.yaml"
+
+    run _list_templates
+    assert_success
+    assert_output 'default.yaml'
+    [[ "$(_find_template default.yaml)" == "$BUILTIN_TEMPLATES_DIR/default.yaml" ]]
+}

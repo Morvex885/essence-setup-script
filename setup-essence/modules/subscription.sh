@@ -58,28 +58,33 @@ setup_subscription() {
 
     if _load_sub_conf; then
         warn "Subscription hosting уже настроен (${SUB_HOSTNAME}:${SUB_PORT})."
-        confirm_yn "Перенастроить?" || return
-        remove_subscription
+        confirm_yn "Перенастроить?" || return 1
+        remove_subscription || return 1
     fi
 
     if ! _load_reality_conf; then
-        error "Reality не настроен. Сначала настройте VLESS Reality с сайтом-заглушкой."
+        warn "Reality не настроен. Сначала настройте VLESS Reality с сайтом-заглушкой."
+        return 1
     fi
 
     local reality_mode
     reality_mode=$(_detect_reality_mode)
     if [[ "$reality_mode" == "bare" ]]; then
-        error "Reality настроен без сайта (SNI bare). Перенастройте Reality с доменом или IP-сертификатом."
+        warn "Reality настроен без сайта (SNI bare). Перенастройте Reality с доменом или IP-сертификатом."
+        return 1
     fi
 
     local vless_site
-    vless_site=$(_detect_site_name) || error "Не найден TLS-сертификат. Перенастройте Reality."
+    vless_site=$(_detect_site_name) || {
+        warn "Не найден TLS-сертификат. Перенастройте Reality."
+        return 1
+    }
 
     local SERVER_IP
     SERVER_IP=$(curl -4 -s --max-time 5 ifconfig.me \
         || curl -4 -s --max-time 5 icanhazip.com \
         || curl -4 -s --max-time 5 api4.ipify.org)
-    [[ -z "$SERVER_IP" ]] && error "Не удалось определить внешний IP."
+    [[ -n "$SERVER_IP" ]] || { warn "Не удалось определить внешний IP."; return 1; }
 
     # ─── Домен подписки (всегда отдельный) ───────────────────────────────────
     echo ""
@@ -105,33 +110,53 @@ setup_subscription() {
     fi
 
     # ─── Порт ────────────────────────────────────────────────────────────────
-    echo ""
-    echo -e "  Порт для подписок:"
-    echo -e "  ${GREEN}1)${NC} 443 (через существующий nginx)"
-    echo -e "  ${GREEN}2)${NC} Свой порт ${DIM}[default: 2096]${NC}"
-    echo ""
-    read -rp "Выберите [1]: " PORT_CHOICE
-    PORT_CHOICE="${PORT_CHOICE:-1}"
-
     local SUB_PORT SUB_LISTEN SUB_MODE
-
-    if [[ "$PORT_CHOICE" == "1" ]]; then
-        SUB_PORT=443
-        if [[ "$reality_mode" == "self-steal" ]]; then
-            SUB_LISTEN="127.0.0.1:8443"
-            SUB_MODE="self-steal"
-        else
-            SUB_LISTEN="127.0.0.1:8445"
-            SUB_MODE="sni"
+    while true; do
+        echo ""
+        box_top
+        box_center "Порт хостинга подписок"
+        box_mid
+        menu_item 1 "443 (через существующий nginx)" GREEN
+        menu_item 2 "Свой порт (default: 2096)" GREEN
+        menu_item 0 "Отмена" NC
+        box_bot
+        echo ""
+        if ! IFS= read -rp "  Выберите действие [Enter = 1]: " PORT_CHOICE; then
+            return 1
         fi
-    elif [[ "$PORT_CHOICE" == "2" ]]; then
-        read -rp "Введите порт [2096]: " SUB_PORT
-        SUB_PORT="${SUB_PORT:-2096}"
-        SUB_LISTEN="0.0.0.0:${SUB_PORT}"
-        SUB_MODE="standalone"
-    else
-        warn "Неверный выбор."; return
-    fi
+        PORT_CHOICE="${PORT_CHOICE%$'\r'}"
+        PORT_CHOICE="${PORT_CHOICE:-1}"
+        case "$PORT_CHOICE" in
+            1)
+                SUB_PORT=443
+                if [[ "$reality_mode" == "self-steal" ]]; then
+                    SUB_LISTEN="127.0.0.1:8443"
+                    SUB_MODE="self-steal"
+                else
+                    SUB_LISTEN="127.0.0.1:8445"
+                    SUB_MODE="sni"
+                fi
+                break
+                ;;
+            2)
+                while true; do
+                    if ! IFS= read -rp "Введите порт [2096]: " SUB_PORT; then
+                        return 1
+                    fi
+                    SUB_PORT="${SUB_PORT%$'\r'}"
+                    SUB_PORT="${SUB_PORT:-2096}"
+                    if menu_index_valid "$SUB_PORT" 65535; then
+                        SUB_LISTEN="0.0.0.0:${SUB_PORT}"
+                        SUB_MODE="standalone"
+                        break 2
+                    fi
+                    warn "Порт должен быть числом от 1 до 65535."
+                done
+                ;;
+            0) return 1 ;;
+            *) warn "Неверный выбор." ;;
+        esac
+    done
 
     local SUB_BASE_URL="https://${SUB_HOSTNAME}:${SUB_PORT}"
     [[ "$SUB_PORT" == "443" ]] && SUB_BASE_URL="https://${SUB_HOSTNAME}"
@@ -146,41 +171,86 @@ setup_subscription() {
     echo ""
     confirm_yn "Всё верно?" || { info "Отменено."; return; }
 
-    local TOTAL_STEPS=4 STEP=0
+    local TOTAL_STEPS=3 STEP=0
+
+    # ─── Подготовка и раннее сохранение состояния ────────────────────────────
+    DEFAULT_EMAIL="user$(openssl rand -hex 4)@$(openssl rand -hex 3).com"
+    read -rp "Email для acme.sh [Enter = $DEFAULT_EMAIL]: " SUB_EMAIL
+    [[ -z "$SUB_EMAIL" ]] && SUB_EMAIL="$DEFAULT_EMAIL"
+
+    local NGINX_GROUP
+    NGINX_GROUP=$(ps -o group= -C nginx 2>/dev/null | sort -u | grep -v '^root$' | head -1)
+    [[ -z "$NGINX_GROUP" ]] && NGINX_GROUP=$(awk '/^[[:space:]]*user[[:space:]]+/{print $2; exit}' /etc/nginx/nginx.conf 2>/dev/null | tr -d ';')
+    NGINX_GROUP="${NGINX_GROUP:-www-data}"
+    if ! getent group "$NGINX_GROUP" >/dev/null 2>&1; then
+        warn "Группа nginx '$NGINX_GROUP' не найдена в системе"
+        return 1
+    fi
+    info "Nginx-группа: $NGINX_GROUP"
+
+    local sub_conf_tmp
+    sub_conf_tmp=$(umask 077; mktemp "${SUB_CONF}.tmp.XXXXXX") || {
+        warn "Не удалось сохранить конфигурацию подписок."
+        return 1
+    }
+    if ! cat > "$sub_conf_tmp" << EOF
+SUB_PORT=${SUB_PORT}
+SUB_HOSTNAME=${SUB_HOSTNAME}
+SUB_BASE_URL=${SUB_BASE_URL}
+SUB_DIR=${SUB_DIR}
+SUB_LISTEN=${SUB_LISTEN}
+SUB_MODE=${SUB_MODE}
+NGINX_GROUP=${NGINX_GROUP}
+EOF
+    then
+        rm -f "$sub_conf_tmp"
+        warn "Не удалось сохранить конфигурацию подписок."
+        return 1
+    fi
+    if ! mv "$sub_conf_tmp" "$SUB_CONF"; then
+        rm -f "$sub_conf_tmp"
+        warn "Не удалось сохранить конфигурацию подписок."
+        return 1
+    fi
 
     # ─── Шаг: Сертификат ─────────────────────────────────────────────────────
     STEP=$((STEP + 1))
     echo ""
     info "Шаг $STEP/$TOTAL_STEPS: Получение SSL сертификата для $SUB_HOSTNAME..."
 
-    DEFAULT_EMAIL="user$(openssl rand -hex 4)@$(openssl rand -hex 3).com"
-    read -rp "Email для acme.sh [Enter = $DEFAULT_EMAIL]: " SUB_EMAIL
-    [[ -z "$SUB_EMAIL" ]] && SUB_EMAIL="$DEFAULT_EMAIL"
-
-    ensure_acme_installed "$SUB_EMAIL"
-    mkdir -p /var/www/"$SUB_HOSTNAME"
+    if ! ensure_acme_installed "$SUB_EMAIL"; then
+        return 1
+    fi
+    mkdir -p /var/www/"$SUB_HOSTNAME" || return 1
 
     # Временный HTTP-конфиг для acme.sh challenge
     cat > /etc/nginx/sites-available/essence-sub-http << SUBHTTPEOF
 server {
     listen 80;
     server_name ${SUB_HOSTNAME};
-
     location /.well-known/acme-challenge/ {
         root /var/www/${SUB_HOSTNAME};
     }
-
     location / {
         return 301 https://\$host\$request_uri;
     }
 }
 SUBHTTPEOF
     ln -sf /etc/nginx/sites-available/essence-sub-http /etc/nginx/sites-enabled/essence-sub-http
-    nginx -t || error "Nginx конфиг невалиден"
-    systemctl reload nginx
-
-    issue_cert "$SUB_HOSTNAME" "/var/www/$SUB_HOSTNAME" "false"
-    install_cert "$SUB_HOSTNAME"
+    if ! nginx -t; then
+        rm -f /etc/nginx/sites-enabled/essence-sub-http /etc/nginx/sites-available/essence-sub-http
+        warn "Nginx конфиг невалиден"
+        return 1
+    fi
+    systemctl reload nginx || {
+        rm -f /etc/nginx/sites-enabled/essence-sub-http /etc/nginx/sites-available/essence-sub-http
+        return 1
+    }
+    if ! issue_cert "$SUB_HOSTNAME" "/var/www/$SUB_HOSTNAME" "false" ||
+       ! install_cert "$SUB_HOSTNAME"; then
+        rm -f /etc/nginx/sites-enabled/essence-sub-http /etc/nginx/sites-available/essence-sub-http
+        return 1
+    fi
 
     # Убираем временный HTTP-конфиг
     rm -f /etc/nginx/sites-enabled/essence-sub-http /etc/nginx/sites-available/essence-sub-http
@@ -192,15 +262,11 @@ SUBHTTPEOF
     echo ""
     info "Шаг $STEP/$TOTAL_STEPS: Настройка nginx..."
 
-    mkdir -p "$SUB_DIR"
+    if ! mkdir -p "$SUB_DIR"; then
+        warn "Не удалось создать каталог подписки."
+        return 1
+    fi
 
-    # Определяем группу nginx-воркера (www-data на Debian/Ubuntu, nginx на RHEL/Alpine, http на Arch)
-    local NGINX_GROUP
-    NGINX_GROUP=$(ps -o group= -C nginx 2>/dev/null | sort -u | grep -v '^root$' | head -1)
-    [[ -z "$NGINX_GROUP" ]] && NGINX_GROUP=$(awk '/^[[:space:]]*user[[:space:]]+/{print $2; exit}' /etc/nginx/nginx.conf 2>/dev/null | tr -d ';')
-    NGINX_GROUP="${NGINX_GROUP:-www-data}"
-    getent group "$NGINX_GROUP" >/dev/null 2>&1 || error "Группа nginx '$NGINX_GROUP' не найдена в системе"
-    info "Nginx-группа: $NGINX_GROUP"
 
     chown "root:${NGINX_GROUP}" "$SUB_DIR"
     chmod 2750 "$SUB_DIR"
@@ -261,15 +327,17 @@ NGINXEOF
         sed -i "/default.*mihomo;/i\\        ${SUB_HOSTNAME}   subscription;" /etc/nginx/nginx.conf
         sed -i "/upstream mihomo {/i\\    upstream subscription {\n        server 127.0.0.1:8445;\n    }" /etc/nginx/nginx.conf
     fi
-    # self-steal: второй server на том же 127.0.0.1:8443 — nginx разруливает по SNI, доп. настройка не нужна
+    # self-steal: второй server на том же 127.0.0.1:8443 — nginx разруливает по SNI
 
     if [[ "$SUB_MODE" == "standalone" ]]; then
         ufw allow "${SUB_PORT}/tcp" > /dev/null
         success "Порт $SUB_PORT открыт"
     fi
 
-    nginx -t || error "Nginx конфиг невалиден"
-    systemctl reload nginx || error "Nginx не перезагрузился"
+    if ! nginx -t || ! systemctl reload nginx; then
+        warn "Nginx конфигурация подписок не прошла проверку или не перезагрузилась."
+        return 1
+    fi
     success "Nginx настроен"
 
     # ─── Шаг: Cleanup timer ──────────────────────────────────────────────────
@@ -322,21 +390,6 @@ EOF
     systemctl enable --now essence-sub-cleanup.timer
     success "Автоочистка настроена (каждые 5 мин)"
 
-    # ─── Шаг: Сохранение конфига ─────────────────────────────────────────────
-    STEP=$((STEP + 1))
-    echo ""
-    info "Шаг $STEP/$TOTAL_STEPS: Сохранение конфигурации..."
-
-    cat > "$SUB_CONF" << EOF
-SUB_PORT=${SUB_PORT}
-SUB_HOSTNAME=${SUB_HOSTNAME}
-SUB_BASE_URL=${SUB_BASE_URL}
-SUB_DIR=${SUB_DIR}
-SUB_LISTEN=${SUB_LISTEN}
-SUB_MODE=${SUB_MODE}
-NGINX_GROUP=${NGINX_GROUP}
-EOF
-
     success "Subscription hosting настроен!"
     echo ""
     info "Base URL: ${SUB_BASE_URL}/sub/<token>"
@@ -346,54 +399,125 @@ EOF
 # ─── Удаление ───────────────────────────────────────────────────────────────
 
 remove_subscription() {
-    if ! _load_sub_conf; then
+    if [[ ! -f "$SUB_CONF" ]]; then
         warn "Subscription hosting не установлен."
-        return
+        return 0
+    fi
+    if ! _load_sub_conf; then
+        warn "Не удалось прочитать конфигурацию подписок."
+        return 1
     fi
 
     info "Удаляю subscription hosting..."
 
     # nginx
-    rm -f /etc/nginx/sites-enabled/essence-sub
-    rm -f /etc/nginx/sites-available/essence-sub
+    if ! rm -f \
+        /etc/nginx/sites-enabled/essence-sub \
+        /etc/nginx/sites-available/essence-sub \
+        /etc/nginx/sites-enabled/essence-sub-http \
+        /etc/nginx/sites-available/essence-sub-http
+    then
+        warn "Не удалось удалить nginx-конфигурацию подписок."
+        return 1
+    fi
 
     # stream-блок (SNI-режим)
     if [[ "$SUB_MODE" == "sni" ]]; then
-        sed -i "/${SUB_HOSTNAME}.*subscription;/d" /etc/nginx/nginx.conf
-        sed -i '/upstream subscription {/,/}/d' /etc/nginx/nginx.conf
+        if ! sed -i "/${SUB_HOSTNAME}.*subscription;/d" /etc/nginx/nginx.conf ||
+           ! sed -i '/upstream subscription {/,/}/d' /etc/nginx/nginx.conf
+        then
+            warn "Не удалось очистить nginx-конфигурацию подписок."
+            return 1
+        fi
     fi
 
     # limit_req_zone
-    sed -i '/zone=sub/d' /etc/nginx/nginx.conf
+    if ! sed -i '/zone=sub/d' /etc/nginx/nginx.conf; then
+        warn "Не удалось очистить nginx-конфигурацию подписок."
+        return 1
+    fi
 
     # ufw
     if [[ "$SUB_MODE" == "standalone" ]]; then
-        ufw delete allow "${SUB_PORT}/tcp" > /dev/null 2>&1
+        local ufw_rules
+        if ! ufw_rules=$(ufw show added 2>/dev/null); then
+            warn "Не удалось прочитать правила firewall подписок."
+            return 1
+        fi
+        if grep -Fxq "ufw allow ${SUB_PORT}/tcp" <<< "$ufw_rules" &&
+           ! ufw delete allow "${SUB_PORT}/tcp" > /dev/null 2>&1
+        then
+            warn "Не удалось удалить правило firewall подписок."
+            return 1
+        fi
     fi
 
-    nginx -t && systemctl reload nginx 2>/dev/null
+    if ! nginx -t; then
+        warn "Nginx конфигурация не прошла проверку после удаления подписок."
+        return 1
+    fi
+    if ! systemctl reload nginx 2>/dev/null; then
+        warn "Не удалось перезагрузить Nginx после удаления подписок."
+        return 1
+    fi
 
     # cleanup timer
-    systemctl disable --now essence-sub-cleanup.timer 2>/dev/null
-    rm -f /etc/systemd/system/essence-sub-cleanup.service
-    rm -f /etc/systemd/system/essence-sub-cleanup.timer
-    rm -f /usr/local/bin/essence-sub-cleanup
-    systemctl daemon-reload
+    if [[ -e /etc/systemd/system/essence-sub-cleanup.timer ||
+          -L /etc/systemd/system/essence-sub-cleanup.timer ]] &&
+       ! systemctl disable --now essence-sub-cleanup.timer 2>/dev/null
+    then
+        warn "Не удалось остановить таймер очистки подписок."
+        return 1
+    fi
+    if ! rm -f \
+        /etc/systemd/system/essence-sub-cleanup.service \
+        /etc/systemd/system/essence-sub-cleanup.timer \
+        /usr/local/bin/essence-sub-cleanup
+    then
+        warn "Не удалось удалить автоочистку подписок."
+        return 1
+    fi
+    if ! systemctl daemon-reload; then
+        warn "Не удалось обновить конфигурацию systemd."
+        return 1
+    fi
 
     # cert
     local ACME=~/.acme.sh/acme.sh
-    if [[ -f "$ACME" ]]; then
-        $ACME --remove -d "$SUB_HOSTNAME" 2>/dev/null
+    local acme_conf="$HOME/.acme.sh/${SUB_HOSTNAME}/${SUB_HOSTNAME}.conf"
+    local acme_ecc_conf="$HOME/.acme.sh/${SUB_HOSTNAME}_ecc/${SUB_HOSTNAME}.conf"
+    if [[ -x "$ACME" ]]; then
+        if [[ -f "$acme_conf" ]] &&
+           ! "$ACME" --remove -d "$SUB_HOSTNAME" 2>/dev/null
+        then
+            warn "Не удалось удалить регистрацию сертификата подписок."
+            return 1
+        fi
+        if [[ -f "$acme_ecc_conf" ]] &&
+           ! "$ACME" --remove -d "$SUB_HOSTNAME" --ecc 2>/dev/null
+        then
+            warn "Не удалось удалить регистрацию сертификата подписок."
+            return 1
+        fi
     fi
-    rm -rf /etc/nginx/ssl/"$SUB_HOSTNAME"
-    rm -rf /var/www/"$SUB_HOSTNAME"
+    if ! rm -rf \
+        /etc/nginx/ssl/"$SUB_HOSTNAME" \
+        /var/www/"$SUB_HOSTNAME" \
+        "$SUB_DIR" \
+        /etc/nginx/snippets/essence-sub
+    then
+        warn "Не удалось удалить файлы подписок."
+        return 1
+    fi
 
     # данные и конфиг
-    rm -rf "$SUB_DIR"
-    rm -rf /etc/nginx/snippets/essence-sub
-    rm -f "$SUB_CONF"
+    if ! rm -f "$SUB_CONF"; then
+        warn "Не удалось удалить конфигурацию подписок."
+        return 1
+    fi
 
     success "Subscription hosting удалён"
+    return 0
 }
 
 # ─── Статус ─────────────────────────────────────────────────────────────────
@@ -455,40 +579,44 @@ subscription_status() {
 subscription_menu() {
     while true; do
         echo ""
-        echo -e "  ${CYAN}── Subscription Hosting ─────────────────────${NC}"
-        echo ""
+        box_top
+        box_center "Subscription Hosting"
+        box_mid
         if _load_sub_conf 2>/dev/null; then
-            echo -e "  ${DIM}${SUB_BASE_URL}/sub/<token>${NC}"
-            echo ""
-            echo -e "  ${GREEN}1)${NC} Статус"
-            echo -e "  ${RED}2)${NC} Удалить"
+            box_line " ${SUB_BASE_URL}/sub/<token>"
+            box_mid
+            menu_item 1 "Статус" GREEN
+            menu_item 2 "Удалить" RED
         else
-            echo -e "  ${DIM}Не установлено${NC}"
-            echo ""
-            echo -e "  ${GREEN}1)${NC} Установить"
+            box_line " Не установлено" " ${DIM}Не установлено${NC}"
+            box_mid
+            menu_item 1 "Установить" GREEN
         fi
-        echo -e "  ${NC}0)${NC} Назад"
+        menu_item 0 "Назад" NC
+        box_bot
         echo ""
-        read -rp "  Выберите: " CHOICE
-
+        if ! IFS= read -rp "  Выберите действие: " CHOICE; then
+            return 0
+        fi
+        CHOICE="${CHOICE%$'\r'}"
         case "$CHOICE" in
             1)
                 if _load_sub_conf 2>/dev/null; then
-                    subscription_status
+                    subscription_status || warn "Не удалось показать статус подписок."
                 else
-                    setup_subscription
+                    setup_subscription || warn "Установка подписок завершилась ошибкой."
                 fi
                 ;;
             2)
                 if _load_sub_conf 2>/dev/null; then
-                    confirm_yn "Удалить subscription hosting?" || continue
-                    remove_subscription
+                    confirm_yn "Удалить subscription hosting?" && \
+                        remove_subscription || true
                 else
                     warn "Нечего удалять."
                 fi
                 ;;
-            0) return ;;
-            *) warn "Неверный выбор: $CHOICE" ;;
+            0) return 0 ;;
+            *) warn "Неверный выбор." ;;
         esac
     done
 }
