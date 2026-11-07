@@ -27,7 +27,7 @@ EOF
     printf '{"nodes":[{"name":"pw","ip":"127.0.0.1","port":22,"user":"root","auth":"password","pass":"bad"}],"groups":[],"clients":[],"connections":[]}\n' > "$CONFIG_JSON"
     before=$(cat "$CONFIG_JSON")
     _state_secret_decode() { return 1; }
-    run state_migrate_v1_to_v2
+    run state_format_migrate
     assert_failure
     [[ $(cat "$CONFIG_JSON") == "$before" ]]
 }
@@ -38,8 +38,39 @@ EOF
     state_open_local
     local first second
     first=$(cat "$CONFIG_JSON"); second=$(cat "$SECRETS_JSON")
-    state_migrate_v1_to_v2
+    state_format_migrate
     [[ $(cat "$CONFIG_JSON") == "$first" && $(cat "$SECRETS_JSON") == "$second" ]]
+}
+
+@test "state_format_migrate rejects unsupported configs without changes" {
+    local before content
+    for content in \
+        '{"schema_version":3,"nodes":[],"groups":[],"clients":[],"connections":[]}' \
+        '{"schema_version":0,"nodes":[],"groups":[],"clients":[],"connections":[]}' \
+        '{"schema_version":"2.0","nodes":[],"groups":[],"clients":[],"connections":[]}' \
+        '{"schema_version":2,"nodes":[{"name":"pw","pass":"inline"}],"groups":[],"clients":[],"connections":[]}' \
+        '{"schema_version":2,'; do
+        printf '%s\n' "$content" > "$CONFIG_JSON"
+        before=$(cat "$CONFIG_JSON")
+        run state_format_migrate
+        assert_failure
+        [[ $(cat "$CONFIG_JSON") == "$before" ]] || return 1
+    done
+}
+
+@test "migration chain stops on a missing step and runs steps in order" {
+    local log="$BATS_TEST_TMPDIR/steps"
+    _migrate_gap_1_to_2() { printf '1>2\n' >> "$log"; }
+    run format_migrate_chain gap 1 3
+    assert_failure
+    [[ "$(cat "$log")" == '1>2' ]] || return 1
+    rm -f "$log"
+    _migrate_probe_1_to_2() { printf '1>2 %s\n' "$1" >> "$log"; }
+    _migrate_probe_2_to_3() { printf '2>3 %s\n' "$1" >> "$log"; }
+    format_migrate_chain probe 1 3 arg
+    [[ "$(cat "$log")" == $'1>2 arg\n2>3 arg' ]]
+    run format_migrate_chain probe 3 1
+    assert_failure
 }
 
 @test "portable validation distinguishes ready and needs_setup" {

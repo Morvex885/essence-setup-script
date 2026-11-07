@@ -95,3 +95,27 @@ teardown() { teardown_test_env; }
         [[ "$status" == 1 && "$(cat "$IMPORTED")" == "runtime-$i" ]]
     done
 }
+
+@test "fuzz vault v1 migration preserves exact passwords and yields a valid snapshot" {
+    source_module 'github-config.sh'
+    local i password actual len vault="$STATE_DIR/vault.json" charset=$'abcXYZ0123 \t\r\n"\\Ж!?$[]'
+    for ((i=0; i<FUZZ_ITERATIONS; i++)); do
+        len=$((RANDOM % 100 + 1))
+        password=$(random_string "$len" "$charset"; printf '.')
+        password="${password%.}"
+        node_secret_set "$A" "$password"
+        node_secret_delete "$B"
+        jq -n --slurpfile config "$CONFIG_JSON" --slurpfile sec "$SECRETS_JSON" '{
+            vault_version:1,minimum_remote_control_version:"1.0.3",
+            portability:{status:"ready",issues:[]},access:{script_password_hash:null},
+            config:$config[0],secrets:$sec[0],templates:{},
+            ssh:{identities:{},known_hosts:""}}' > "$vault"
+        _migrate_vault_1_to_2 "$vault" || { echo "Migration failed at iteration $i"; return 1; }
+        github_config_validate "$vault" || { echo "Invalid snapshot at iteration $i"; return 1; }
+        printf '%s' "$password" > "$STATE_DIR/expected"
+        jq -e --arg a "node:$A:ssh-password" --arg b "$B" --rawfile expected "$STATE_DIR/expected" '
+            .vault_version==2 and .secrets.node_passwords=={($a):$expected} and
+            .portability.issues==[{node_id:$b,reason:"missing_secret"}]' "$vault" >/dev/null ||
+            { echo "Roundtrip mismatch at iteration $i"; return 1; }
+    done
+}

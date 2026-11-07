@@ -50,6 +50,21 @@ _state_version_valid() {
        "$minor" =~ ^[0-9]+$ && "$patch" =~ ^[0-9]+$ ]]
 }
 
+STATE_FORMAT_VERSION=2
+
+# format_migrate_chain <kind> <from> <to> [args…] — run _migrate_<kind>_<n>_to_<n+1> in order.
+format_migrate_chain() {
+    local kind="${1:?kind}" from="${2:?from}" to="${3:?to}" n step
+    shift 3
+    [[ "$from" =~ ^[1-9][0-9]*$ && "$to" =~ ^[1-9][0-9]*$ ]] || return 1
+    (( from <= to )) || return 1
+    for ((n = from; n < to; n++)); do
+        step="_migrate_${kind}_${n}_to_$((n + 1))"
+        declare -F "$step" >/dev/null 2>&1 || return 1
+        "$step" "$@" || return 1
+    done
+}
+
 _state_secret_decode() (
     set -o pipefail
     if declare -F node_pass_decode >/dev/null 2>&1; then
@@ -115,36 +130,42 @@ state_open_local() {
     SCRIPT_AUTH_FILE="$CONFIG_DIR/.auth"
     _state_ensure_dirs || return 1
     _ensure_config || return 1
-    state_migrate_v1_to_v2 || return 1
+    state_format_migrate || return 1
     _state_ensure_secrets || return 1
     state_validate false >/dev/null || return 1
     state_checkpoint || return 1
     return 0
 }
 
-# state_migrate_v1_to_v2 — validate/decrypt everything before touching source.
-state_migrate_v1_to_v2() {
+# state_format_migrate — bring local config.json to STATE_FORMAT_VERSION before validation.
+state_format_migrate() {
     [[ -f "$CONFIG_JSON" ]] || { _ensure_config || return 1; }
     jq -e . "$CONFIG_JSON" >/dev/null 2>&1 || {
         warn "config.json содержит некорректный JSON."
         return 1
     }
-
     local schema
     schema=$(jq -r '.schema_version // 1' "$CONFIG_JSON" 2>/dev/null) || return 1
-    [[ "$schema" == "2" ]] && {
-        # A v2 config must never retain the old inline password field.
-        if jq -e 'any(.nodes[]?; has("pass"))' "$CONFIG_JSON" >/dev/null 2>&1; then
-            warn "В конфигурации версии 2 пароль ноды нельзя хранить непосредственно в config.json."
-            return 1
-        fi
-        return 0
-    }
-    [[ "$schema" == "1" || "$schema" == "null" ]] || {
+    [[ "$schema" =~ ^[1-9][0-9]*$ ]] || {
         warn "Неподдерживаемая версия config.json: $schema"
         return 1
     }
+    if (( schema > STATE_FORMAT_VERSION )); then
+        warn "config.json создан более новой версией Remote Control (формат $schema). Обновите скрипт и запустите снова."
+        return 1
+    fi
+    if (( schema < STATE_FORMAT_VERSION )); then
+        format_migrate_chain state "$schema" "$STATE_FORMAT_VERSION" || return 1
+    fi
+    # A v2 config must never retain the old inline password field.
+    if jq -e 'any(.nodes[]?; has("pass"))' "$CONFIG_JSON" >/dev/null 2>&1; then
+        warn "В конфигурации версии 2 пароль ноды нельзя хранить непосредственно в config.json."
+        return 1
+    fi
+}
 
+# _migrate_state_1_to_2 — move inline node passwords into secrets.json (schema 1→2).
+_migrate_state_1_to_2() {
     local parent migration_dir config_tmp secrets_tmp manifest_tmp
     parent=$(dirname "$CONFIG_JSON")
     migration_dir=$(mktemp -d "$parent/.state-migration.XXXXXX") || return 1

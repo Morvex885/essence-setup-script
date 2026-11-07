@@ -22,12 +22,26 @@ GITHUB_LAST_AUTH_RELEVANT="${GITHUB_LAST_AUTH_RELEVANT:-false}"
 GITHUB_SESSION_REMOTE="${GITHUB_SESSION_REMOTE:-}"
 GITHUB_SESSION_BRANCH="${GITHUB_SESSION_BRANCH:-}"
 GITHUB_SESSION_ORIGIN="${GITHUB_SESSION_ORIGIN:-}"
+GITHUB_VAULT_FORMAT=2
+GITHUB_LAST_FORMAT="" GITHUB_LAST_FORMAT_VERSION="" GITHUB_LAST_FORMAT_REQUIRED=""
+GITHUB_LAST_SNAPSHOT_COUNTS=""
+
+# _github_vault_format_min_version <format> — oldest Remote Control that reads this vault format.
+_github_vault_format_min_version() {
+    case "$1" in
+        2) printf '%s\n' 1.1.0 ;;
+        *) return 1 ;;
+    esac
+}
 
 _github_clear_error() {
     GITHUB_LAST_STAGE=""
     GITHUB_LAST_ERROR=""
     GITHUB_LAST_HINT=""
     GITHUB_LAST_AUTH_RELEVANT=false
+    GITHUB_LAST_FORMAT=""
+    GITHUB_LAST_FORMAT_VERSION=""
+    GITHUB_LAST_FORMAT_REQUIRED=""
 }
 
 _github_safe_error() {
@@ -61,12 +75,19 @@ _github_record_error() {
     else
         GITHUB_LAST_HINT=""
     fi
+    # Only _github_record_format_error classifies a failure as a snapshot format problem.
+    GITHUB_LAST_FORMAT="" GITHUB_LAST_FORMAT_VERSION="" GITHUB_LAST_FORMAT_REQUIRED=""
 }
 _github_ensure_error() {
     if [[ -z ${GITHUB_LAST_ERROR:-} ]]; then
         _github_record_error "$1" "${2:-}" "${3:-false}" "${4:-}"
     fi
     return 1
+}
+# _github_record_format_error <outdated|newer|invalid> <stage> <message> [version] [required]
+_github_record_format_error() {
+    _github_record_error "$2" "$3"
+    GITHUB_LAST_FORMAT="$1" GITHUB_LAST_FORMAT_VERSION="${4:-}" GITHUB_LAST_FORMAT_REQUIRED="${5:-}"
 }
 
 _github_auth_failure_confirmed() {
@@ -400,7 +421,7 @@ _github_prompt_storage_mode() {
     esac
 }
 _github_prompt_existing_config_action() {
-    local allow_local="${1:-true}" mode_label
+    local allow_local="${1:-true}" outdated="${2:-false}" mode_label remote_action=remote
     GITHUB_EXISTING_ACTION=""
     case "${GITHUB_STORAGE_MODE:-}" in
         age) mode_label="зашифровано паролем" ;;
@@ -408,11 +429,15 @@ _github_prompt_existing_config_action() {
         *) return 1 ;;
     esac
     local options=("Загрузить конфигурацию из GitHub")
+    if [[ "$outdated" == true ]]; then
+        options=("Преобразовать и загрузить конфигурацию из GitHub")
+        remote_action=migrate
+    fi
     [[ "$allow_local" == true ]] && options+=("Заменить конфигурацию в GitHub текущей локальной")
     MENU_SELECT_CONTEXT=("Режим хранения: $mode_label")
     menu_select "Конфигурация GitHub" "Выберите конфигурацию" "${options[@]}" || return 1
     case "$MENU_SELECT_INDEX" in
-        1) GITHUB_EXISTING_ACTION=remote ;;
+        1) GITHUB_EXISTING_ACTION=$remote_action ;;
         2) GITHUB_EXISTING_ACTION=local ;;
     esac
 }
@@ -716,7 +741,8 @@ github_config_serialize() {
     local manifest=${STATE_MANIFEST:-${CONFIG_DIR:-.}/manifest.json}
     local known=${SSH_KNOWN_HOSTS:-${CONFIG_DIR:-.}/ssh/known_hosts}
     local tmp next template_list identity_list template name source pub portable_stage
-    local snapshot_hash builtin_hash
+    local snapshot_hash builtin_hash minimum
+    minimum=$(_github_vault_format_min_version "$GITHUB_VAULT_FORMAT") || return 1
     _github_exact_regular_file "$cfg" || return 1
     _github_exact_regular_file "$secrets" || return 1
     _github_exact_regular_file "$manifest" || return 1
@@ -755,10 +781,10 @@ github_config_serialize() {
     if ! jq -n --slurpfile config "$cfg" --slurpfile sec "$portable_stage/secrets.json" \
         --slurpfile password_issues "$portable_stage/issues.json" \
         --slurpfile man "$manifest" "${known_args[@]}" \
-        --arg minimum "${CURRENT_VERSION:-0.0.0}" \
+        --arg minimum "$minimum" --argjson format "$GITHUB_VAULT_FORMAT" \
         '([($man[0].portability.issues // [])[] | select(.reason != "missing_secret")] +
           $password_issues[0] | unique_by([.node_id,.reason])) as $issues |
-         {vault_version:2,minimum_remote_control_version:$minimum,
+         {vault_version:$format,minimum_remote_control_version:$minimum,
           portability:{status:(if ($issues|length)>0 then "needs_setup" else "ready" end),
                        issues:$issues},
           access:($man[0].access // {script_password_hash:null}),
@@ -886,13 +912,14 @@ github_config_validate() {
     local state=${1:?state json}
     _github_exact_regular_file "$state" || return 1
     if ! jq -se 'length==1 and (.[0]|type=="object")' "$state" >/dev/null 2>&1; then
-        _github_record_error "проверка формата конфигурации GitHub" \
+        _github_record_format_error invalid "проверка формата конфигурации GitHub" \
             "Снимок конфигурации имеет некорректную структуру."
         return 1
     fi
-    if ! jq -e '.vault_version==2 and .secrets.schema_version==2' "$state" >/dev/null 2>&1; then
-        _github_record_error "проверка формата конфигурации GitHub" \
-            "Неподдерживаемый формат конфигурации GitHub. Автоматическое преобразование не поддерживается."
+    if ! jq -e --argjson format "$GITHUB_VAULT_FORMAT" \
+            '.vault_version==$format and .secrets.schema_version==2' "$state" >/dev/null 2>&1; then
+        _github_record_format_error invalid "проверка формата конфигурации GitHub" \
+            "Снимок конфигурации имеет некорректную структуру."
         return 1
     fi
     if ! jq -e '
@@ -954,7 +981,7 @@ github_config_validate() {
             (.value.private|type=="string" and length>0) and
             (.value.public|type=="string" and length>0))
     ' "$state" >/dev/null 2>&1; then
-        _github_record_error "проверка формата конфигурации GitHub" \
+        _github_record_format_error invalid "проверка формата конфигурации GitHub" \
             "Снимок конфигурации имеет некорректную структуру."
         return 1
     fi
@@ -1145,7 +1172,7 @@ _github_plain_read() {
             return 1
         }
     done
-    if ! github_config_validate "$tmp" || ! chmod 600 "$tmp" ||
+    if ! chmod 600 "$tmp" ||
        ! mv "$tmp" "$out"; then
         rm -f "$tmp" "$next"
         return 1
@@ -1921,10 +1948,107 @@ github_config_switch_local() {
     export TEMPLATES_DIR SSH_IDENTITIES_DIR SSH_KNOWN_HOSTS SCRIPT_AUTH_FILE
     export GITHUB_WORKTREE GITHUB_IDENTITY GITHUB_RECIPIENT GITHUB_REMOTE GITHUB_OWNER
 }
+# _migrate_vault_1_to_2 <file> — device-bound secrets → portable plaintext; undecryptable → missing_secret.
+_migrate_vault_1_to_2() {
+    local file="${1:?vault file}" stage minimum
+    minimum=$(_github_vault_format_min_version 2) || return 1
+    jq -e '(.config|type=="object") and .config.schema_version==2 and
+           (.secrets|type=="object") and ((.secrets.schema_version // 1)==1) and
+           ((.secrets.node_passwords // {})|type=="object")' "$file" >/dev/null 2>&1 || return 1
+    stage=$(umask 077; mktemp -d "${file}.v1.XXXXXX") || return 1
+    if ! jq '.config' "$file" > "$stage/config.json" ||
+       ! jq '{schema_version:1,node_passwords:(.secrets.node_passwords // {})}' "$file" > "$stage/secrets.json" ||
+       ! chmod 600 "$stage/config.json" "$stage/secrets.json" ||
+       ! _state_secrets_export_portable "$stage/config.json" "$stage/secrets.json" \
+            "$stage/portable.json" "$stage/issues.json" ||
+       ! jq --slurpfile sec "$stage/portable.json" --slurpfile iss "$stage/issues.json" \
+            --arg minimum "$minimum" '
+            ([(.portability.issues // [])[] | select(.reason != "missing_secret")] + $iss[0]
+              | unique_by([.node_id,.reason])) as $issues |
+            .vault_version=2 | .minimum_remote_control_version=$minimum |
+            .secrets=$sec[0] |
+            .portability={status:(if ($issues|length)>0 then "needs_setup" else "ready" end),
+                          issues:$issues}' "$file" > "$stage/next.json" ||
+       ! chmod 600 "$stage/next.json" || ! mv "$stage/next.json" "$file"; then
+        rm -rf "$stage"
+        return 1
+    fi
+    rm -rf "$stage"
+}
+
+# github_config_upgrade <raw> <out> <strict|migrate> — check version/format, optionally migrate, validate.
+github_config_upgrade() {
+    local raw="${1:?raw}" out="${2:?out}" mode="${3:-strict}" version min work
+    if ! jq -se 'length==1 and (.[0]|type=="object")' "$raw" >/dev/null 2>&1; then
+        _github_record_format_error invalid "проверка формата конфигурации GitHub" \
+            "Снимок конфигурации имеет некорректную структуру."
+        return 1
+    fi
+    version=$(jq -r '.vault_version' "$raw" 2>/dev/null)
+    if [[ ! "$version" =~ ^[1-9][0-9]*$ ]]; then
+        _github_record_format_error invalid "проверка формата конфигурации GitHub" \
+            "Снимок конфигурации имеет некорректную структуру."
+        return 1
+    fi
+    min=$(jq -r '.minimum_remote_control_version // empty' "$raw" 2>/dev/null)
+    if [[ -n "$min" ]] && ! _state_version_valid "$min"; then
+        _github_record_format_error invalid "проверка формата конфигурации GitHub" \
+            "Снимок конфигурации имеет некорректную структуру." "$version" ""
+        return 1
+    fi
+    if [[ -n "${CURRENT_VERSION:-}" && -n "$min" ]] && _state_version_gt "$min"; then
+        _github_record_format_error newer "проверка версии конфигурации GitHub" \
+            "Конфигурация GitHub создана Remote Control ${min}; установлена версия ${CURRENT_VERSION}. Обновите скрипт и запустите снова." \
+            "$version" "$min"
+        return 1
+    fi
+    if (( version > GITHUB_VAULT_FORMAT )); then
+        _github_record_format_error newer "проверка версии конфигурации GitHub" \
+            "Конфигурация GitHub имеет формат v${version}; этот скрипт поддерживает до v${GITHUB_VAULT_FORMAT}. Обновите скрипт и запустите снова." \
+            "$version" ""
+        return 1
+    fi
+    work=$(_github_new_private_path "${out}.upgrade.XXXXXX") || {
+        _github_record_error "проверка формата конфигурации GitHub" \
+            "Не удалось создать защищённый временный файл состояния."
+        return 1
+    }
+    if ! cp "$raw" "$work"; then
+        _github_remove_private_path "$work"
+        _github_record_error "проверка формата конфигурации GitHub" \
+            "Не удалось подготовить снимок конфигурации к проверке."
+        return 1
+    fi
+    if (( version < GITHUB_VAULT_FORMAT )); then
+        if [[ "$mode" != migrate ]]; then
+            _github_remove_private_path "$work"
+            _github_record_format_error outdated "проверка формата конфигурации GitHub" \
+                "Конфигурация GitHub в формате v${version}; текущий формат v${GITHUB_VAULT_FORMAT}. Требуется преобразование." \
+                "$version" ""
+            return 1
+        fi
+        if ! format_migrate_chain vault "$version" "$GITHUB_VAULT_FORMAT" "$work"; then
+            _github_remove_private_path "$work"
+            _github_record_format_error invalid "преобразование конфигурации GitHub" \
+                "Не удалось преобразовать конфигурацию GitHub из формата v${version}." "$version" ""
+            return 1
+        fi
+    fi
+    if ! github_config_validate "$work" || ! chmod 600 "$work" || ! mv "$work" "$out"; then
+        _github_remove_private_path "$work"
+        return 1
+    fi
+    _github_remove_private_path "$work" ||
+        warn "Временный файл проверки конфигурации требует ручной очистки."
+}
+
+# github_config_open <worktree> [out] [strict|migrate] — read the snapshot; migrate only on request.
 github_config_open() {
     _github_clear_error
-    local root="${1:?worktree}" out="${2:-${CONFIG_DIR:-.}/runtime-state.json}"
-    local id decrypt_tmp
+    local root="${1:?worktree}" out="${2:-${CONFIG_DIR:-.}/runtime-state.json}" mode="${3:-strict}"
+    local id decrypt_tmp raw rc
+    [[ "$mode" == strict || "$mode" == migrate ]] || return 1
+    GITHUB_LAST_SNAPSHOT_COUNTS=""
     if [[ ! -d "$root" || -L "$root" ]]; then
         _github_record_error "подготовка рабочей копии конфигурации" \
             "Рабочая копия конфигурации GitHub недоступна."
@@ -1935,8 +2059,14 @@ github_config_open() {
     _github_storage_read || return 1
     _github_validate_tree "$root" "$GITHUB_STORAGE_MODE" || return 1
     _github_validate_tracked_tree "$GITHUB_STORAGE_MODE" || return 1
+    raw=$(_github_new_private_path "${out}.raw.XXXXXX") || {
+        _github_record_error "чтение конфигурации GitHub" \
+            "Не удалось создать защищённый временный файл состояния."
+        return 1
+    }
     if [[ $GITHUB_STORAGE_MODE == none ]]; then
-        if ! _github_plain_read "$out"; then
+        if ! _github_plain_read "$raw"; then
+            _github_remove_private_path "$raw"
             _github_ensure_error "чтение конфигурации GitHub" \
                 "Не удалось прочитать незашифрованную конфигурацию GitHub."
             return 1
@@ -1947,18 +2077,27 @@ github_config_open() {
            ! _github_exact_regular_file "$root/state.json.age" ||
            [[ ! -s "$root/recipient.txt" || ! -s "$root/unlock.age" ||
               ! -s "$root/state.json.age" ]]; then
+            _github_remove_private_path "$raw"
             _github_record_error "чтение конфигурации GitHub" \
                 "Зашифрованная конфигурация GitHub не содержит recipient."
             return 1
         fi
-        github_config_unlock || return 1
+        # The opened repository owns the encryption recipient; never keep a stale one.
+        GITHUB_RECIPIENT=$(tr -d '\r\n' < "$root/recipient.txt")
+        export GITHUB_RECIPIENT
+        if ! github_config_unlock; then
+            _github_remove_private_path "$raw"
+            return 1
+        fi
         id="${GITHUB_IDENTITY:-}"
         if ! _github_exact_regular_file "$id" || [[ ! -s "$id" ]]; then
+            _github_remove_private_path "$raw"
             _github_record_error "расшифровка конфигурации GitHub" \
                 "Не удалось разблокировать конфигурацию: пароль или ключ восстановления не подошёл."
             return 1
         fi
         decrypt_tmp=$(_github_new_private_path "${out}.tmp.XXXXXX") || {
+            _github_remove_private_path "$raw"
             _github_record_error "расшифровка конфигурации GitHub" \
                 "Не удалось создать защищённый временный файл состояния."
             return 1
@@ -1968,10 +2107,10 @@ github_config_open() {
                     "$root/state.json.age" >/dev/null 2>&1
              ) ||
            ! _github_exact_regular_file "$decrypt_tmp" ||
-           ! github_config_validate "$decrypt_tmp" ||
            ! chmod 600 "$decrypt_tmp" ||
-           ! mv "$decrypt_tmp" "$out"; then
+           ! mv "$decrypt_tmp" "$raw"; then
             _github_remove_private_path "$decrypt_tmp"
+            _github_remove_private_path "$raw"
             _github_ensure_error "расшифровка конфигурации GitHub" \
                 "Не удалось атомарно расшифровать конфигурацию GitHub."
             return 1
@@ -1979,6 +2118,13 @@ github_config_open() {
         _github_remove_private_path "$decrypt_tmp" ||
             warn "Защищённый staging-каталог расшифровки требует ручной очистки."
     fi
+    GITHUB_LAST_SNAPSHOT_COUNTS=$(jq -r '[(.config.nodes//[]|length),(.config.clients//[]|length),(.config.groups//[]|length)]|@tsv' "$raw" 2>/dev/null) ||
+        GITHUB_LAST_SNAPSHOT_COUNTS=""
+    rc=0
+    github_config_upgrade "$raw" "$out" "$mode" || rc=$?
+    _github_remove_private_path "$raw" ||
+        warn "Временный файл чтения конфигурации требует ручной очистки."
+    return "$rc"
 }
 
 _github_repo() { printf '%s/%s' "${GITHUB_OWNER:?}" "$GITHUB_REPO_NAME"; }
