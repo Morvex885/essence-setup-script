@@ -118,7 +118,8 @@ _pin_hosts() {
     mv "$STATE_DIR/next" "$CONFIG_JSON"
     _state_secrets_export_portable "$CONFIG_JSON" "$SECRETS_JSON" "$OUT" "$ISSUES"
     jq -e '.node_passwords=={}' "$OUT"
-    [[ "$(stat -c '%a' "$OUT")" == 600 && "$(stat -c '%a' "$ISSUES")" == 600 ]]
+    [[ "$(stat -c '%a' "$OUT" 2>/dev/null || stat -f '%Lp' "$OUT")" == 600 &&
+       "$(stat -c '%a' "$ISSUES" 2>/dev/null || stat -f '%Lp' "$ISSUES")" == 600 ]]
 }
 
 @test "cross-device export import preserves special characters and terminal newlines" {
@@ -136,7 +137,7 @@ _pin_hosts() {
     jq -e '.schema_version==1' "$STATE_DIR/imported"
     _state_secrets_export_portable "$CONFIG_JSON" "$STATE_DIR/imported" "$OUT" "$ISSUES"
     cmp "$STATE_DIR/logical-before" "$OUT"
-    [[ "$(stat -c '%a' "$STATE_DIR/imported")" == 600 ]]
+    [[ "$(stat -c '%a' "$STATE_DIR/imported" 2>/dev/null || stat -f '%Lp' "$STATE_DIR/imported")" == 600 ]]
 }
 
 @test "portable imports reject invalid values including JSON NUL without replacing output" {

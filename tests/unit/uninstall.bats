@@ -253,6 +253,21 @@ _load_fixture_uninstall() {
     [[ "$UNINSTALL_SSH_PORTS" == 2222 && "$UNINSTALL_PASSWORD_DISABLED" == true ]]
 }
 
+@test "without reality.conf only the Essence-created indented site is taken as Reality" {
+    _load_fixture_uninstall
+    local available="$FIXTURE_UNINSTALL_ROOT/etc/nginx/sites-available"
+    _load_reality_conf() { return 1; }
+    _uninstall_sshd_effective() { printf 'port 22\n'; }
+    printf 'server {\n    server_name aaa.example.test;\n    ssl_certificate /srv/ssl/aaa.pem;\n}\n' > "$available/aaa.example.test"
+    printf 'server {\n    server_name web.example.test;\n    ssl_certificate     %s/etc/nginx/ssl/web.example.test/fullchain.pem;\n}\n' \
+        "$FIXTURE_UNINSTALL_ROOT" > "$available/web.example.test"
+    _uninstall_prepare_targets
+    [[ "$UNINSTALL_REALITY_SITE" == web.example.test ]] || return 1
+    rm "$available/web.example.test"
+    _uninstall_prepare_targets
+    [[ -z "$UNINSTALL_REALITY_SITE" ]]
+}
+
 @test "kept SSH settings open every effective SSH port in UFW" {
     _load_fixture_uninstall
     : > "$FIXTURE_UNINSTALL_ROOT/etc/mihomo/config.yaml"

@@ -420,7 +420,7 @@ _harden_rollback_port() {
             ufw allow ${old_port}/tcp >/dev/null 2>&1 &&
             ufw delete allow ${new_port}/tcp >/dev/null 2>&1 || exit 1
         fi
-        if command -v firewall-cmd >/dev/null 2>&1; then
+        if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
             firewall-cmd --permanent --add-port=${old_port}/tcp >/dev/null 2>&1 &&
             firewall-cmd --permanent --remove-port=${new_port}/tcp >/dev/null 2>&1 &&
             firewall-cmd --reload >/dev/null 2>&1 || exit 1
@@ -498,7 +498,7 @@ _harden_change_port() {
             ufw delete allow 22/tcp >/dev/null 2>&1 &&
             ufw delete allow ${old_port}/tcp >/dev/null 2>&1 || exit 1
         fi
-        if command -v firewall-cmd >/dev/null 2>&1; then
+        if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
             firewall-cmd --permanent --add-port=${new_port}/tcp >/dev/null 2>&1 &&
             firewall-cmd --permanent --remove-service=ssh >/dev/null 2>&1 &&
             firewall-cmd --permanent --remove-port=${old_port}/tcp >/dev/null 2>&1 &&
