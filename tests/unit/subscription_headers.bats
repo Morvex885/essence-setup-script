@@ -22,7 +22,8 @@ setup() {
     {"name":"phone","group":"MOBILE"},
     {"name":"laptop","group":"PC"}
   ],
-  "connections": []
+  "connections": [],
+  "subscription_default_headers": []
 }
 EOF
 }
@@ -122,33 +123,32 @@ teardown() {
     assert_failure
 }
 
-@test "_ensure_default_headers writes defaults if missing" {
-    _ensure_default_headers
-    run jq_r '.subscription_default_headers | length'
+@test "built-in default headers apply when the key is missing and do not write config" {
+    jq_w 'del(.subscription_default_headers)'
+    cp "$CONFIG_JSON" "$BATS_TEST_TMPDIR/before.json"
+    run jq -r --argjson d "$_SUB_DEFAULT_HEADERS_JSON" '$d | length' <<< '{}'
     assert_output "2"
-    run jq_r '.subscription_default_headers[] | select(.name=="profile-update-interval") | .value'
+    run jq -r --argjson d "$_SUB_DEFAULT_HEADERS_JSON" '$d[] | select(.name=="profile-update-interval") | .value' <<< '{}'
     assert_output "24"
-    run jq_r '.subscription_default_headers[] | select(.name=="Content-Disposition") | .value'
+    run jq -r --argjson d "$_SUB_DEFAULT_HEADERS_JSON" '$d[] | select(.name=="Content-Disposition") | .value' <<< '{}'
     assert_output 'attachment; filename="config.yaml"'
+    _resolve_headers phone > /dev/null
+    cmp "$CONFIG_JSON" "$BATS_TEST_TMPDIR/before.json"
 }
 
-@test "_ensure_default_headers is idempotent" {
-    _ensure_default_headers
-    jq_w '.subscription_default_headers[0].value = "modified"'
-    _ensure_default_headers
-    # Не перезаписывает если уже есть
-    run jq_r '.subscription_default_headers[0].value'
-    assert_output "modified"
+@test "explicit empty default headers override the built-in ones" {
+    run _resolve_headers phone
+    assert_output "[]"
 }
 
 @test "inherit: defaults included in resolved headers" {
-    _ensure_default_headers
+    jq_w 'del(.subscription_default_headers)'
     run "${BASH:-bash}" -c "source '$PROJECT_ROOT/common/common.sh'; error() { return 1; }; export CONFIG_JSON='$CONFIG_JSON'; source '$PROJECT_ROOT/remote-control/modules/subscription.sh'; _resolve_headers phone | jq length"
     assert_output "2"
 }
 
 @test "inherit: group overrides default by name" {
-    _ensure_default_headers
+    jq_w 'del(.subscription_default_headers)'
     subscription_group_set_header "MOBILE" "profile-update-interval" "6"
     run "${BASH:-bash}" -c "source '$PROJECT_ROOT/common/common.sh'; error() { return 1; }; export CONFIG_JSON='$CONFIG_JSON'; source '$PROJECT_ROOT/remote-control/modules/subscription.sh'; _resolve_headers phone | jq -r '.[] | select(.name==\"profile-update-interval\") | .value'"
     assert_output "6"
@@ -172,7 +172,7 @@ teardown() {
 }
 
 @test "inherit: client overrides group which overrides default (chain)" {
-    _ensure_default_headers
+    jq_w 'del(.subscription_default_headers)'
     subscription_group_set_header "MOBILE" "profile-update-interval" "6"
     subscription_set_header "phone" "profile-update-interval" "1"
     run "${BASH:-bash}" -c "source '$PROJECT_ROOT/common/common.sh'; error() { return 1; }; export CONFIG_JSON='$CONFIG_JSON'; source '$PROJECT_ROOT/remote-control/modules/subscription.sh'; _resolve_headers phone | jq -r '.[] | select(.name==\"profile-update-interval\") | .value'"
@@ -180,7 +180,7 @@ teardown() {
 }
 
 @test "annotated: default source labelled" {
-    _ensure_default_headers
+    jq_w 'del(.subscription_default_headers)'
     run "${BASH:-bash}" -c "source '$PROJECT_ROOT/common/common.sh'; error() { return 1; }; export CONFIG_JSON='$CONFIG_JSON'; source '$PROJECT_ROOT/remote-control/modules/subscription.sh'; _resolve_headers_annotated phone | grep -c '|default$' || true"
     assert_output "2"
 }

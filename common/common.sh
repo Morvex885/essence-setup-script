@@ -1,5 +1,16 @@
 #!/bin/bash
 
+# ─── Локаль для проверок ─────────────────────────────────────────────────────
+# Диапазоны [A-Za-z] в [[ =~ ]] и glob следуют сортировке: в ru_RU и подобных
+# локалях они захватывают «é», «ö». LC_COLLATE=C (без export) делает их ASCII
+# только для этого bash; кодировка и язык сообщений не меняются. LC_ALL
+# перекрыл бы LC_COLLATE, поэтому он переносится в LANG.
+if [[ -n "${LC_ALL:-}" ]]; then
+    export LANG="$LC_ALL"
+    unset LC_ALL
+fi
+LC_COLLATE=C
+
 # ─── Цвета ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -181,6 +192,13 @@ gen_free_port() {
 run_with_timeout() {
     local seconds="$1"
     shift
+    # Опционально для noninteractive serve: timeout сам переустанавливает INT,
+    # поэтому ignored disposition задаётся ещё раз непосредственно перед exec.
+    # По умолчанию поведение установщика и shell-функций не меняется.
+    if [[ "${1:-}" == --ignore-int ]]; then
+        shift
+        set -- "${BASH:-bash}" -c 'trap "" INT; exec "$@"' timeout-child "$@"
+    fi
     local timeout_help
     if command -v timeout >/dev/null 2>&1; then
         timeout_help=$(timeout --help 2>&1)
@@ -221,6 +239,21 @@ EOF
         return 1
     }
 }
+
+# Логин и адрес SSH ноды remote-control (без якорей: bash добавляет ^…$, jq —
+# \A…\z). Первый символ не «-», поэтому значение не станет опцией
+# ssh/scp/ssh-keyscan; «:» допускает IPv6-литералы. Здесь, а не в модуле: их
+# используют и state.sh (проверка конфигурации), и nodes.sh (node_load).
+NODE_SSH_USER_RE='[A-Za-z_][A-Za-z0-9._-]{0,31}'
+NODE_SSH_HOST_RE='[A-Za-z0-9:][A-Za-z0-9.:_-]{0,252}'
+# jq-условие для записи ноды (аргументы --arg ure/hre): логин, адрес и ссылка
+# на SSH-ключ — system, пусто или собственный id ноды.
+NODE_SSH_FIELDS_JQ='(.user|type=="string" and test("\\A(?:" + $ure + ")\\z")) and
+    (.ip|type=="string" and test("\\A(?:" + $hre + ")\\z")) and
+    (.identity == null or .identity == "" or .identity == "system" or .identity == .id)'
+
+node_ssh_user_valid() { [[ "${1:-}" =~ ^${NODE_SSH_USER_RE}$ ]]; }
+node_ssh_host_valid() { [[ "${1:-}" =~ ^${NODE_SSH_HOST_RE}$ ]]; }
 
 jq_r() { jq -r "$@" "$CONFIG_JSON" | tr -d '\r'; }
 
@@ -268,7 +301,7 @@ menu_item() {
     local label="$2"
     local color="${3:-CYAN}"
     local color_value="${!color}"
-    box_line " ${key}) ${label}" " ${color_value}${key})${NC} ${label}"
+    box_line " ${key}) ${label}" " ${color_value}${key}) ${label}${NC}"
 }
 
 menu_index_valid() {
@@ -623,6 +656,20 @@ _cleanup_update_tmp() {
     _UPDATE_TMP=""
 }
 
+# _github_release_curl URL — curl с таймаутами; GITHUB_TOKEN передаётся конфигом
+# через stdin (--config -), а не в argv, где его видит /proc/<pid>/cmdline.
+_github_release_curl() {
+    local url="$1" token="${GITHUB_TOKEN:-}"
+    if [[ -z "$token" ]]; then
+        curl -fsSL --connect-timeout 3 --max-time 5 "$url"
+        return
+    fi
+    token="${token//\\/\\\\}"
+    token="${token//\"/\\\"}"
+    printf 'header = "Authorization: token %s"\n' "$token" |
+        curl -fsSL --connect-timeout 3 --max-time 5 --config - "$url"
+}
+
 check_update_start() {
     _cleanup_update_tmp
     _UPDATE_TMP=$(umask 077; mktemp) || return 1
@@ -631,12 +678,9 @@ check_update_start() {
         _UPDATE_TMP=""
         return 1
     }
-    local token="${GITHUB_TOKEN:-}"
-    local curl_args=(-fsSL --connect-timeout 3 --max-time 5)
-    [[ -n "$token" ]] && curl_args+=(-H "Authorization: token $token")
     if ! {
         (
-            curl "${curl_args[@]}" \
+            _github_release_curl \
                 "https://api.github.com/repos/${_REPO}/releases/latest" 2>/dev/null \
             | grep -o '"tag_name": *"[^"]*"' \
             | grep -o '"[^"]*"$' \

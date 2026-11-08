@@ -29,6 +29,8 @@ EOF
     _remote_scripts_probe() { REMOTE_SCRIPTS_STATE=ready; REMOTE_SCRIPTS_VERSION=1.2.3; }
     ssh_run() { printf 'action:%s\n' "$NODE_NAME" >> "$EVENTS"; }
     upload_scripts() { printf 'upload:%s\n' "$NODE_NAME" >> "$EVENTS"; }
+    # Сессия меню идёт в текущий stdio вместо /dev/tty.
+    _rc_tty_run() { "$@"; }
 }
 teardown() { teardown_test_env; }
 
@@ -53,22 +55,23 @@ mixed_probe() {
     return 0
 }
 
-@test "preflight probes every target before one denied-default review and cancellation has no mutations" {
+@test "preflight probes every target before one plan review and refusal has no mutations" {
     _remote_scripts_probe() { mixed_probe; }
-    local frame="$BATS_TEST_TMPDIR/frame"
-    confirm_yn() {
-        [ "$2" = N ] || return 2
+    rc_confirm_gate() {
         [ "$(cat "$EVENTS")" = $'probe:A\nprobe:B\nprobe:C' ] || return 2
         local output
-        output=$(cat "$frame")
+        output=$(printf '%s\n' "${CORE_PLAN_LINES[@]}")
         [[ "$output" == *'A  192.0.2.1:22 — будут загружены скрипты v1.2.3'* ]] || return 2
         [[ "$output" == *'B  192.0.2.2:22 — исключена:'* ]] || return 2
         [[ "$output" == *'C  192.0.2.3:22'* ]] || return 2
+        [[ "$CORE_PLAN_EXTRA" == *" 1.2.3" ]] || return 2
         printf 'confirm\n' >> "$EVENTS"
-        return 1
+        rc_fail confirmation_required ""
     }
-    _telegram_proxy_remote_run mtproto install true 1 2 3 > "$frame"
-    [ "$?" -eq 0 ]
+    local rc=0
+    core_telegram_run mtproto install 1 2 3 >/dev/null || rc=$?
+    [ "$rc" -eq 1 ]
+    [ "$RC_ERROR_CODE" = confirmation_required ]
     [ "$(cat "$EVENTS")" = $'probe:A\nprobe:B\nprobe:C\nconfirm' ]
     [ "${#TELEGRAM_PROXY_PLAN_PASS[@]}" -eq 0 ]
     [ "${#TELEGRAM_PROXY_PLAN_INDEX[@]}" -eq 0 ]
@@ -76,14 +79,14 @@ mixed_probe() {
 
 @test "approval uploads only old eligible node and executes frozen eligible targets" {
     _remote_scripts_probe() { mixed_probe; }
-    confirm_yn() {
+    rc_confirm_gate() {
         [ "$(cat "$EVENTS")" = $'probe:A\nprobe:B\nprobe:C' ] || return 2
         printf 'confirm\n' >> "$EVENTS"
         # The operation must use the snapshot, not this replacement config.
         jq_w '.nodes=[]' || return 2
     }
     upload_scripts() { touch "$REMOTE_DIR/A-uploaded"; printf 'upload:%s\n' "$NODE_NAME" >> "$EVENTS"; }
-    run _telegram_proxy_remote_run mtproto install true 1 2 3
+    run core_telegram_run mtproto install 1 2 3
     [ "$status" -eq 1 ]
     [ "$(grep -c '^confirm$' "$EVENTS")" -eq 1 ]
     [ "$(grep -c '^upload:A$' "$EVENTS")" -eq 1 ]
@@ -95,8 +98,8 @@ mixed_probe() {
 
 @test "local fingerprint mutation after approval blocks uploads and actions without another question" {
     _remote_scripts_probe() { mixed_probe; }
-    confirm_yn() { printf 'confirm\n' >> "$EVENTS"; printf 'changed\n' >> "$SETUP_DIR/modules/example.sh"; }
-    run _telegram_proxy_remote_run mtproto install true 1 2 3
+    rc_confirm_gate() { printf 'confirm\n' >> "$EVENTS"; printf 'changed\n' >> "$SETUP_DIR/modules/example.sh"; }
+    run core_telegram_run mtproto install 1 2 3
     [ "$status" -eq 1 ]
     [ "$(grep -c '^confirm$' "$EVENTS")" -eq 1 ]
     [ "$(grep -c '^upload:' "$EVENTS")" -eq 0 ]
@@ -105,8 +108,8 @@ mixed_probe() {
 
 @test "ready and newer backends restart without confirmation or per-worker preparation" {
     _remote_scripts_probe() { REMOTE_SCRIPTS_STATE=ready; REMOTE_SCRIPTS_VERSION=9.0.0; }
-    confirm_yn() { printf 'unexpected-confirm\n' >> "$EVENTS"; return 1; }
-    _telegram_proxy_remote_run backend restart false 3 1 >/dev/null
+    rc_confirm_gate() { printf 'unexpected-confirm\n' >> "$EVENTS"; return 1; }
+    core_telegram_run backend restart 3 1 >/dev/null
     [ "$?" -eq 0 ]
     [ "$(wc -l < "$EVENTS")" -eq 2 ]
     [ "$(grep -c '^action:' "$EVENTS")" -eq 2 ]
@@ -115,9 +118,9 @@ mixed_probe() {
 
 @test "all excluded produces failures with no question and cleans frozen credentials" {
     _remote_scripts_probe() { REMOTE_SCRIPTS_STATE=broken; REMOTE_SCRIPTS_VERSION=1.2.3; }
-    confirm_yn() { printf 'unexpected-confirm\n' >> "$EVENTS"; return 0; }
+    rc_confirm_gate() { printf 'unexpected-confirm\n' >> "$EVENTS"; return 0; }
     local rc=0
-    _telegram_proxy_remote_run mtproto install true 1 2 3 >/dev/null || rc=$?
+    core_telegram_run mtproto install 1 2 3 >/dev/null || rc=$?
     [ "$rc" -eq 1 ]
     [ ! -s "$EVENTS" ]
     [ "${#TELEGRAM_PROXY_PLAN_PASS[@]}" -eq 0 ]
@@ -125,8 +128,8 @@ mixed_probe() {
 
 @test "upload requires an exact ready version before action" {
     _remote_scripts_probe() { REMOTE_SCRIPTS_STATE=ready; REMOTE_SCRIPTS_VERSION=1.0.0; }
-    confirm_yn() { return 0; }
-    run _telegram_proxy_remote_run mtproto install true 1
+    rc_confirm_gate() { return 0; }
+    run core_telegram_run mtproto install 1
     [ "$status" -eq 1 ]
     [ "$(cat "$EVENTS")" = upload:A ]
 }
@@ -160,22 +163,20 @@ mixed_probe() {
     [ "$status" -ne 0 ]
 }
 
-@test "invalid requests neither consume confirmation input nor keep a previous plan" {
-    local input="$BATS_TEST_TMPDIR/input" remaining component action force idx
+@test "invalid requests neither consume input nor keep a previous plan" {
+    local input="$BATS_TEST_TMPDIR/input" remaining component idx
     printf 'y\n' > "$input"
     exec 7< "$input"
     for component in web shared backend mtproto; do
         TELEGRAM_PROXY_PLAN_PASS=(sensitive)
-        _telegram_proxy_remote_run "$component" unknown false 1 <&7 >/dev/null || true
+        core_telegram_run "$component" unknown 1 <&7 >/dev/null || true
         [ "${#TELEGRAM_PROXY_PLAN_PASS[@]}" -eq 0 ]
+        [ "$RC_ERROR_CODE" = usage ]
     done
     for idx in 0 01 1+1 4 ''; do
-        _telegram_proxy_remote_run web restart false "$idx" <&7 >/dev/null || true
+        core_telegram_run web restart "$idx" <&7 >/dev/null || true
+        [ "$RC_ERROR_CODE" = usage ]
     done
-    for action in update restart; do
-        _telegram_proxy_remote_run web "$action" true 1 <&7 >/dev/null || true
-    done
-    _telegram_proxy_remote_run mtproto refresh-ip true 1 <&7 >/dev/null || true
     IFS= read -r remaining <&7
     exec 7<&-
     [ "$remaining" = y ]
@@ -194,17 +195,18 @@ mixed_probe() {
     [ "$status" -eq 2 ]
 }
 
-@test "Enter refusal and EOF discard the entire plan before workers" {
-    local input="$BATS_TEST_TMPDIR/input" rc
-    for input_text in '' n; do
-        printf '%s\n' "$input_text" > "$input"
-        _telegram_proxy_remote_run mtproto install true 1 2 < "$input" >/dev/null
-        [ "$?" -eq 0 ]
+@test "refusal without --yes discards the entire plan before workers" {
+    local rc
+    for rc in 1 2; do
+        RC_CONFIRM_YES=0
+        core_telegram_run mtproto install 1 2 >/dev/null && return 1
+        [ "$RC_ERROR_CODE" = confirmation_required ]
         [ ! -s "$EVENTS" ]
         [ "${#TELEGRAM_PROXY_PLAN_PASS[@]}" -eq 0 ]
     done
-    _telegram_proxy_remote_run mtproto install true 1 < /dev/null >/dev/null
-    [ "$?" -eq 0 ]
+    RC_CONFIRM_YES=1 RC_CONFIRM_TOKEN=0000000000000000
+    core_telegram_run mtproto install 1 >/dev/null && return 1
+    [ "$RC_ERROR_CODE" = plan_changed ]
     [ ! -s "$EVENTS" ]
     [ "${#TELEGRAM_PROXY_PLAN_PASS[@]}" -eq 0 ]
 }
@@ -307,7 +309,7 @@ mixed_probe() {
         REMOTE_SCRIPTS_VERSION=1.0.0
         [[ ! -f "$BATS_TEST_TMPDIR/uploaded" ]] || REMOTE_SCRIPTS_VERSION=1.2.3
     }
-    confirm_yn() { return 0; }
+    rc_confirm_gate() { return 0; }
     upload_scripts() {
         info "Загружаем скрипты..."
         success "Скрипты загружены"
@@ -317,7 +319,7 @@ mixed_probe() {
         printf '%s\n' '{"installed":true,"web_enabled":false,"mtproto_enabled":true,"mtproto_ipv4":"8.8.8.8"}'
     }
     _telegram_proxy_mtproto_probe() { touch "$BATS_TEST_TMPDIR/mtproto-probed"; }
-    run _telegram_proxy_remote_run shared status false 1
+    run core_telegram_run shared status 1
     [ "$status" -eq 0 ]
     [ -e "$BATS_TEST_TMPDIR/uploaded" ]
     [ -e "$BATS_TEST_TMPDIR/mtproto-probed" ]
@@ -325,10 +327,10 @@ mixed_probe() {
 
 @test "failed noisy upload preserves redacted diagnostics without requesting server status" {
     _remote_scripts_probe() { REMOTE_SCRIPTS_STATE=ready; REMOTE_SCRIPTS_VERSION=1.0.0; }
-    confirm_yn() { return 0; }
+    rc_confirm_gate() { return 0; }
     upload_scripts() { printf 'upload failed token=upload-private-fixture\n' >&2; return 1; }
     ssh_run() { touch "$BATS_TEST_TMPDIR/status-requested"; }
-    run _telegram_proxy_remote_run shared status false 1
+    run core_telegram_run shared status 1
     [ "$status" -eq 1 ]
     [ ! -e "$BATS_TEST_TMPDIR/status-requested" ]
     [[ "$output" == *'upload failed'* && "$output" != *upload-private-fixture* ]]
@@ -347,49 +349,26 @@ EOF
     PATH="$BATS_TEST_TMPDIR:$PATH"
     REMOTE_DIR="$BATS_TEST_TMPDIR/path with spaces"
     run_with_timeout() { printf 'unexpected-timeout\n' >> "$EVENTS"; return 1; }
-    telegram_proxy_remote_open_menu 2
+    core_telegram_menu 2
     [ "$?" -eq 0 ]
     local options entry
     options=$(cat "$FAKE_SSH_JOURNAL")
     printf -v entry '%q' "$REMOTE_DIR/setup-essence.sh"
-    [[ "$options" == *$'\n-t\nroot@192.0.2.2\n'"bash $entry telegram-proxy menu" ]]
+    [[ "$options" == *$'\n-t\n--\nroot@192.0.2.2\n'"bash $entry telegram-proxy menu" ]]
     export FAKE_SSH_RC=2
-    run telegram_proxy_remote_open_menu 2
-    [ "$status" -eq 2 ]
+    core_telegram_menu 2 && return 1
+    [ "$RC_ERROR_CODE" = not_ready ]
     export FAKE_SSH_RC=255
-    run telegram_proxy_remote_open_menu 2
-    [ "$status" -eq 255 ]
+    core_telegram_menu 2 && return 1
+    [ "$RC_ERROR_CODE" = remote_failed ]
 }
 
 @test "unsupported menu keeps remote root context available for another selection" {
     ssh_run() { printf 'menu:%s\n' "$NODE_NAME" >> "$EVENTS"; return 2; }
-    telegram_proxy_remote_menu <<< $'1\n2\n1\n3\n0' >/dev/null
-    [ "$?" -eq 0 ]
+    core_telegram_menu 2 >/dev/null && return 1
+    [ "$RC_ERROR_CODE" = not_ready ]
+    core_telegram_menu 3 >/dev/null && return 1
     [ "$(cat "$EVENTS")" = $'menu:B\nmenu:C' ]
-}
-
-@test "menu zero EOF invalid keys and selector cancellation never start preflight" {
-    _remote_scripts_probe() { printf 'unexpected-probe\n' >> "$EVENTS"; return 1; }
-    local stream
-    for stream in $'0' '' $'10\n11\nconnection\n0' $'6\n1\n0\n0' $'7\n1' $'8\nunknown\n\n0\n0' $'1\n0\n0'; do
-        telegram_proxy_remote_menu <<< "$stream" >/dev/null
-        [ "$?" -eq 0 ]
-        [ ! -s "$EVENTS" ]
-        [ "${#TELEGRAM_PROXY_SELECTED[@]}" -eq 0 ]
-        [ "${#TOGGLE_SELECT_ITEMS[@]}" -eq 0 ]
-        [ "${#TOGGLE_SELECT_FLAGS[@]}" -eq 0 ]
-    done
-    TELEGRAM_PROXY_SELECTED=(2)
-    TOGGLE_SELECT_ITEMS=('stale')
-    TOGGLE_SELECT_FLAGS=(1)
-    telegram_proxy_remote_menu <<< $'6\n1\n0\n0' >/dev/null
-    [ "$?" -eq 0 ]
-    [ ! -s "$EVENTS" ]
-    [ "${#TELEGRAM_PROXY_SELECTED[@]}" -eq 0 ]
-    [ "${#TOGGLE_SELECT_ITEMS[@]}" -eq 0 ]
-    [ "${#TOGGLE_SELECT_FLAGS[@]}" -eq 0 ]
-    telegram_proxy_remote_menu < /dev/null >/dev/null
-    [ "$?" -eq 0 ]
 }
 
 @test "batch update and refresh have no force while destructive actions exercise real server grammar" {
@@ -407,8 +386,11 @@ shift
 telegram_proxy_cli "\$@"
 EOF
     ssh_run() { [[ "$1" == -- ]] || return 1; bash -c "$2"; }
-    confirm_yn() { return 0; }
-    telegram_proxy_remote_menu <<< $'5\n1\n\n4\n1\n\n3\n1\n\n9\n1\n\n0' >/dev/null
+    RC_CONFIRM_YES=1
+    core_telegram_run web update 1 >/dev/null
+    core_telegram_run mtproto refresh-ip 1 >/dev/null
+    core_telegram_run mtproto install 1 >/dev/null
+    core_telegram_run shared remove-all 1 >/dev/null
     [ "$?" -eq 0 ]
     [ -e "$REMOTE_DIR/updated" ]
     [ -e "$REMOTE_DIR/refreshed" ]
@@ -421,11 +403,11 @@ EOF
         printf '%s|%s\n' "$NODE_NAME" "$*" >> "$EVENTS"
         [[ "$1" == -t ]]
     }
-    telegram_proxy_remote_menu <<< $'6\n1\n\n7\n2\n\n1\n3\n0' >/dev/null
-    [ "$?" -eq 0 ]
+    core_telegram_run web restart 1 >/dev/null || true
+    core_telegram_run backend restart 2 >/dev/null || true
+    core_telegram_menu 3 >/dev/null
     [ "$(wc -l < "$EVENTS")" -eq 3 ]
     [[ "$(cat "$EVENTS")" == *'A|-- bash '*'web restart'*'B|-- bash '*'backend restart'*'C|-t -- bash '*'telegram-proxy menu'* ]]
-    [ "${#TELEGRAM_PROXY_SELECTED[@]}" -eq 0 ]
     [ "${#TELEGRAM_PROXY_PLAN_PASS[@]}" -eq 0 ]
     [ "${#TELEGRAM_PROXY_PLAN_INDEX[@]}" -eq 0 ]
     [ -z "$TELEGRAM_PROXY_BATCH_DIR" ]
@@ -433,16 +415,15 @@ EOF
 }
 
 @test "failed component-selected removal leaves one-node management usable and clears private state" {
-    confirm_yn() { printf 'confirm\n' >> "$EVENTS"; return 0; }
+    rc_confirm_gate() { printf 'confirm\n' >> "$EVENTS"; return 0; }
     ssh_run() {
         printf '%s|%s\n' "$NODE_NAME" "$*" >> "$EVENTS"
         [[ "$1" == -t ]]
     }
-    telegram_proxy_remote_menu <<< $'8\nw\n1\n\n1\n3\n0' >/dev/null
-    [ "$?" -eq 0 ]
+    core_telegram_run web remove 1 >/dev/null || true
+    core_telegram_menu 3 >/dev/null
     [ "$(wc -l < "$EVENTS")" -eq 3 ]
     [[ "$(cat "$EVENTS")" == 'confirm'*'A|-- bash '*'web remove --force'*'C|-t -- bash '*'telegram-proxy menu'* ]]
-    [ "${#TELEGRAM_PROXY_SELECTED[@]}" -eq 0 ]
     [ "${#TELEGRAM_PROXY_PLAN_PASS[@]}" -eq 0 ]
     [ "${#TELEGRAM_PROXY_PLAN_INDEX[@]}" -eq 0 ]
     [ -z "$TELEGRAM_PROXY_BATCH_DIR" ]
@@ -450,35 +431,37 @@ EOF
 }
 
 @test "batch abort terminates tracked process removes private files and wipes passwords" {
-    local dir="$BATS_TEST_TMPDIR/aborted-batch" receipt="$BATS_TEST_TMPDIR/abort-receipt"
-    mkdir "$dir"
-    printf 'private data\n' > "$dir/credentials"
+    local abort_dir="$BATS_TEST_TMPDIR/aborted-batch" receipt="$BATS_TEST_TMPDIR/abort-receipt"
+    mkdir "$abort_dir"
+    printf 'private data\n' > "$abort_dir/credentials"
     abort_fixture() (
-        TELEGRAM_PROXY_BATCH_DIR="$dir"
+        TELEGRAM_PROXY_BATCH_DIR="$abort_dir"
         TELEGRAM_PROXY_PLAN_PASS=(private-password)
         sleep 30 &
         local pid=$!
         TELEGRAM_PROXY_BATCH_PIDS="$pid"
-        trap 'printf "%s %s %s\n" "${#TELEGRAM_PROXY_PLAN_PASS[@]}" "${TELEGRAM_PROXY_BATCH_DIR:-empty}" "${TELEGRAM_PROXY_BATCH_PIDS:-empty}" > "$receipt"; ! kill -0 "$pid" 2>/dev/null || exit 1' EXIT
         _telegram_proxy_remote_batch_abort
+        printf "%s %s %s %s\n" "${#TELEGRAM_PROXY_PLAN_PASS[@]}" "${TELEGRAM_PROXY_BATCH_DIR:-empty}" \
+            "${TELEGRAM_PROXY_BATCH_PIDS:-empty}" "$TELEGRAM_PROXY_BATCH_ABORTED" > "$receipt"
+        ! kill -0 "$pid" 2>/dev/null
     )
     run abort_fixture
-    [ "$status" -eq 130 ]
-    [ ! -e "$dir" ]
-    [ "$(cat "$receipt")" = '0 empty empty' ]
+    [ "$status" -eq 0 ]
+    [ ! -e "$abort_dir" ]
+    [ "$(cat "$receipt")" = '0 empty empty 1' ]
 }
 
 @test "single-node menu rejects noncanonical indices before loading or preparing a node" {
     local index
     for index in '' 0 01 1+1 4 '-1'; do
-        run telegram_proxy_remote_open_menu "$index"
-        [ "$status" -eq 2 ]
+        core_telegram_menu "$index" >/dev/null && return 1
+        [ "$RC_ERROR_CODE" = usage ]
         [ ! -s "$EVENTS" ]
     done
 }
 
 @test "single-node missing and older bundles require consent and refusal never writes or opens SSH menu" {
-    local probe_state answer
+    local probe_state
     _remote_scripts_probe() {
         printf 'probe:%s\n' "$NODE_NAME" >> "$EVENTS"
         REMOTE_SCRIPTS_STATE="$probe_state"; REMOTE_SCRIPTS_VERSION=1.0.0
@@ -486,21 +469,16 @@ EOF
     upload_scripts() { touch "$REMOTE_DIR/uploaded"; }
     ssh_run() { touch "$REMOTE_DIR/menu-opened"; }
     for probe_state in missing ready; do
-        for answer in '' N EOF; do
-            : > "$EVENTS"
-            TELEGRAM_PROXY_PLAN_PASS=(stale-private-password)
-            if [[ "$answer" == EOF ]]; then
-                telegram_proxy_remote_open_menu 1 < /dev/null >/dev/null
-            else
-                telegram_proxy_remote_open_menu 1 <<< "$answer" >/dev/null
-            fi
-            [ "$?" -eq 0 ]
-            [ "$(cat "$EVENTS")" = probe:A ]
-            [ ! -e "$REMOTE_DIR/uploaded" ]
-            [ ! -e "$REMOTE_DIR/menu-opened" ]
-            [ "${#TELEGRAM_PROXY_PLAN_INDEX[@]}" -eq 0 ]
-            [ "${#TELEGRAM_PROXY_PLAN_PASS[@]}" -eq 0 ]
-        done
+        : > "$EVENTS"
+        TELEGRAM_PROXY_PLAN_PASS=(stale-private-password)
+        RC_CONFIRM_YES=0
+        core_telegram_menu 1 >/dev/null && return 1
+        [ "$RC_ERROR_CODE" = confirmation_required ]
+        [ "$(cat "$EVENTS")" = probe:A ]
+        [ ! -e "$REMOTE_DIR/uploaded" ]
+        [ ! -e "$REMOTE_DIR/menu-opened" ]
+        [ "${#TELEGRAM_PROXY_PLAN_INDEX[@]}" -eq 0 ]
+        [ "${#TELEGRAM_PROXY_PLAN_PASS[@]}" -eq 0 ]
     done
 }
 
@@ -512,8 +490,8 @@ EOF
             REMOTE_SCRIPTS_STATE=ready; REMOTE_SCRIPTS_VERSION=1.2.3
         fi
     }
-    confirm_yn() {
-        [ "$2" = N ] && [ "$(cat "$EVENTS")" = probe:A ] || return 2
+    rc_confirm_gate() {
+        [ "$(cat "$EVENTS")" = probe:A ] || return 2
         printf 'consent\n' >> "$EVENTS"
         jq_w '.nodes=[]' || return 2
         SERVER_IP=203.0.113.99
@@ -528,7 +506,7 @@ EOF
         bash -c "$3"
     }
     printf '#!/bin/bash\n[[ "$1 $2" == "telegram-proxy menu" ]] && touch "%s/menu-opened"\n' "$REMOTE_DIR" > "$REMOTE_DIR/setup-essence.sh"
-    telegram_proxy_remote_open_menu 1 >/dev/null
+    core_telegram_menu 1 >/dev/null
     [ "$?" -eq 0 ]
     [ "$(cat "$EVENTS")" = $'probe:A\nconsent\nupload:A:192.0.2.1\nprobe:A\nmenu:A:192.0.2.1' ]
     [ -e "$REMOTE_DIR/menu-opened" ]
@@ -538,14 +516,14 @@ EOF
 
 @test "single-node approval rejects a changed local bundle before any server mutation" {
     _remote_scripts_probe() { REMOTE_SCRIPTS_STATE=missing; }
-    confirm_yn() {
+    rc_confirm_gate() {
         printf 'consent\n' >> "$EVENTS"
         printf 'changed\n' >> "$COMMON_DIR/protocols/example.sh"
     }
     upload_scripts() { touch "$REMOTE_DIR/uploaded"; }
     ssh_run() { touch "$REMOTE_DIR/menu-opened"; }
     local rc=0
-    telegram_proxy_remote_open_menu 1 >/dev/null || rc=$?
+    core_telegram_menu 1 >/dev/null || rc=$?
     [ "$rc" -eq 1 ]
     [ "$(cat "$EVENTS")" = consent ]
     [ ! -e "$REMOTE_DIR/uploaded" ]
@@ -555,7 +533,7 @@ EOF
 
 @test "single-node failed upload and unverified published version never open the menu" {
     local failure rc
-    confirm_yn() { return 0; }
+    rc_confirm_gate() { return 0; }
     _remote_scripts_probe() {
         REMOTE_SCRIPTS_STATE=missing; REMOTE_SCRIPTS_VERSION=""
         if [[ -e "$REMOTE_DIR/uploaded" ]]; then
@@ -570,7 +548,7 @@ EOF
     for failure in upload version; do
         rm -f "$REMOTE_DIR/uploaded"
         rc=0
-        telegram_proxy_remote_open_menu 1 >/dev/null || rc=$?
+        core_telegram_menu 1 >/dev/null || rc=$?
         [ "$rc" -eq 1 ]
         [ -e "$REMOTE_DIR/uploaded" ]
         [ ! -e "$REMOTE_DIR/menu-opened" ]
@@ -584,13 +562,13 @@ EOF
         REMOTE_SCRIPTS_STATE="$probe_state"
         [[ "$probe_state" != unreachable ]]
     }
-    confirm_yn() { touch "$REMOTE_DIR/asked"; return 0; }
+    rc_confirm_gate() { touch "$REMOTE_DIR/asked"; return 0; }
     upload_scripts() { touch "$REMOTE_DIR/uploaded"; }
     ssh_run() { touch "$REMOTE_DIR/menu-opened"; }
     for probe_state in broken unknown unreachable; do
         TELEGRAM_PROXY_PLAN_PASS=(stale-private-password)
         rc=0
-        telegram_proxy_remote_open_menu 1 >/dev/null || rc=$?
+        core_telegram_menu 1 >/dev/null || rc=$?
         [ "$rc" -eq 1 ]
         [ ! -e "$REMOTE_DIR/asked" ]
         [ ! -e "$REMOTE_DIR/uploaded" ]
@@ -604,7 +582,7 @@ EOF
     local probe_version
     NODE_NAME=caller SERVER_IP=203.0.113.99 SERVER_PASS=caller-private-password
     _remote_scripts_probe() { REMOTE_SCRIPTS_STATE=ready; REMOTE_SCRIPTS_VERSION="$probe_version"; }
-    confirm_yn() { touch "$REMOTE_DIR/asked"; return 1; }
+    rc_confirm_gate() { touch "$REMOTE_DIR/asked"; return 1; }
     upload_scripts() { touch "$REMOTE_DIR/uploaded"; }
     ssh_run() {
         [[ "$1" == -t && "$2" == -- ]] || return 2
@@ -613,7 +591,7 @@ EOF
     }
     for probe_version in 1.2.3 9.0.0; do
         rm -f "$REMOTE_DIR/menu-opened"
-        telegram_proxy_remote_open_menu 2 >/dev/null
+        core_telegram_menu 2 >/dev/null
         [ "$?" -eq 0 ]
         [ -e "$REMOTE_DIR/menu-opened" ]
         [ ! -e "$REMOTE_DIR/asked" ]
@@ -622,5 +600,165 @@ EOF
         [ "$SERVER_IP" = 203.0.113.99 ]
         [ "$SERVER_PASS" = caller-private-password ]
         [ "${#TELEGRAM_PROXY_PLAN_PASS[@]}" -eq 0 ]
+    done
+}
+
+@test "batch worker children do not inherit SERVER_PASS in their environment" {
+    node_load() {
+        NODE_NAME="node-$1"; SERVER_IP="127.0.0.$1"; SERVER_PORT=22; SERVER_USER=root
+        SERVER_AUTH=password; SERVER_PASS='secret-pass-xyz'
+    }
+    ssh_run() { env > "$BATS_TEST_TMPDIR/worker-env"; }
+    prepared_batch web restart false 1 >/dev/null
+    [ -s "$BATS_TEST_TMPDIR/worker-env" ]
+    ! grep -q '^SERVER_PASS=' "$BATS_TEST_TMPDIR/worker-env" || return 1
+    ! grep -q 'secret-pass-xyz' "$BATS_TEST_TMPDIR/worker-env"
+}
+
+@test "batch keeps the caller's ignored INT trap after a normal run" {
+    trap '' INT
+    prepared_batch web restart false 1 >/dev/null
+    local current
+    current=$(trap -p INT)
+    trap - INT
+    [ "$current" = "trap -- '' SIGINT" ]
+}
+
+@test "batch abort cleans up, returns 130 and restores the caller's INT trap" {
+    local worker_started="$BATS_TEST_TMPDIR/worker.started" test_pid=$$
+    _telegram_proxy_remote_worker_body() { : > "$worker_started"; sleep 3; }
+    trap '' INT
+    (
+        for _ in $(seq 1 100); do [[ -e "$worker_started" ]] && break; sleep 0.1; done
+        kill -TERM "$test_pid"
+    ) &
+    local killer=$! rc=0
+    prepared_batch web restart false 1 >/dev/null 2>&1 || rc=$?
+    local current
+    current=$(trap -p INT)
+    trap - INT TERM
+    wait "$killer" 2>/dev/null || true
+    [ "$rc" -eq 130 ]
+    [ "$current" = "trap -- '' SIGINT" ]
+    [ -z "$TELEGRAM_PROXY_BATCH_DIR" ]
+    [ "${#TELEGRAM_PROXY_PLAN_PASS[@]}" -eq 0 ]
+}
+
+# Отдельный bash нужен для настоящих сигналов: фоновая подоболочка BATS
+# наследует SIG_IGN и скрывает замену serve-обработчика INT. Job control
+# запускающего shell даёт foreground-сценарию исходный SIG_DFL и свою группу.
+telegram_signal_fixture() {
+    local mode="$1" signal="$2" launch="${3:-foreground}"
+    local script="$BATS_TEST_TMPDIR/signal-fixture.sh" pid n ready=0 rc=0
+    {
+        declare -p PROJECT_ROOT CONFIG_DIR CONFIG_JSON SCRIPT_DIR TEMPLATES_DIR GENERATED_DIR \
+            BATS_TEST_TMPDIR SETUP_DIR COMMON_DIR VERSION_PATH CURRENT_VERSION
+        declare -f source_common
+        cat <<'EOF'
+source_common
+source "$PROJECT_ROOT/tests/helpers/cmd_helper.bash"
+for module in state nodes ssh telegram-proxy session cli serve cmd_nodes; do
+    source "$PROJECT_ROOT/remote-control/modules/$module.sh"
+done
+open_local_session || exit 3
+trap -p INT > "$BATS_TEST_TMPDIR/signal-initial-int"
+trap ':' TERM HUP
+_remote_scripts_probe() { REMOTE_SCRIPTS_STATE=ready; REMOTE_SCRIPTS_VERSION="$CURRENT_VERSION"; }
+check_update_start() { :; }
+ssh_run() {
+    printf '%s\n' "$TELEGRAM_PROXY_BATCH_DIR" > "$BATS_TEST_TMPDIR/signal-batch-dir"
+    : > "$BATS_TEST_TMPDIR/signal-started"
+    local n=0
+    while [[ ! -e "$BATS_TEST_TMPDIR/signal-release" && "$n" -lt 200 ]]; do
+        sleep 0.05
+        n=$((n + 1))
+    done
+    [[ -e "$BATS_TEST_TMPDIR/signal-release" ]] || return 9
+    : > "$BATS_TEST_TMPDIR/signal-completed"
+}
+record_signal_state() {
+    trap -p INT TERM HUP > "$BATS_TEST_TMPDIR/signal-restored-traps"
+    printf '%s %s %s\n' "$TELEGRAM_PROXY_BATCH_ABORTED" \
+        "${TELEGRAM_PROXY_BATCH_DIR:-empty}" "${#TELEGRAM_PROXY_PLAN_PASS[@]}" \
+        > "$BATS_TEST_TMPDIR/signal-state"
+}
+register_exit_cleanup record_signal_state
+if [[ "$1" == serve ]]; then
+    serve_main
+else
+    run_cmd telegram web-restart --node A
+    printf '%s\n' "$CMD_ENVELOPE"
+fi
+EOF
+    } > "$script"
+    printf '%s\n' '{"id":1,"argv":["telegram","web-restart","--node","A"]}' \
+        > "$BATS_TEST_TMPDIR/signal-request"
+    if [[ "$launch" == foreground ]]; then set -m; fi
+    bash "$script" "$mode" < "$BATS_TEST_TMPDIR/signal-request" \
+        > "$BATS_TEST_TMPDIR/signal-response" 2> "$BATS_TEST_TMPDIR/signal-stderr" &
+    pid=$!
+    set +m
+    for ((n=0; n<200; n++)); do
+        if [[ -e "$BATS_TEST_TMPDIR/signal-started" ]]; then ready=1; break; fi
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.05
+    done
+    if [[ "$ready" != 1 ]]; then
+        kill -TERM "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+        cat "$BATS_TEST_TMPDIR/signal-stderr" "$BATS_TEST_TMPDIR/signal-response"
+        return 1
+    fi
+    if [[ "$launch" == foreground ]]; then
+        kill "-$signal" -- "-$pid" || rc=$?
+    else
+        kill "-$signal" "$pid" || rc=$?
+    fi
+    : > "$BATS_TEST_TMPDIR/signal-release"
+    wait "$pid" || rc=$?
+    [[ "$rc" == 0 ]] || return "$rc"
+    [[ ! -e "$(cat "$BATS_TEST_TMPDIR/signal-batch-dir")" ]]
+    grep -Fx "trap -- ':' SIGTERM" "$BATS_TEST_TMPDIR/signal-restored-traps"
+    grep -Fx "trap -- ':' SIGHUP" "$BATS_TEST_TMPDIR/signal-restored-traps"
+}
+
+@test "foreground serve Telegram batch survives process-group Ctrl+C through dispatcher and workers" {
+    telegram_signal_fixture serve INT
+    [ ! -s "$BATS_TEST_TMPDIR/signal-initial-int" ]
+    [ -e "$BATS_TEST_TMPDIR/signal-completed" ]
+    [ "$(cat "$BATS_TEST_TMPDIR/signal-state")" = '0 empty 0' ]
+    grep -Fx "trap -- '' SIGINT" "$BATS_TEST_TMPDIR/signal-restored-traps"
+    jq -es 'map(select(.id == 1 and has("ok"))) |
+        length == 1 and .[0].ok and .[0].data.results == [
+            {"node":"A","code":0,"status":"ok","reason":null}]' \
+        "$BATS_TEST_TMPDIR/signal-response"
+}
+
+@test "background TUI-style serve preserves inherited ignored INT during Telegram batch" {
+    telegram_signal_fixture serve INT background
+    grep -Fx "trap -- '' SIGINT" "$BATS_TEST_TMPDIR/signal-initial-int"
+    [ -e "$BATS_TEST_TMPDIR/signal-completed" ]
+    [ "$(cat "$BATS_TEST_TMPDIR/signal-state")" = '0 empty 0' ]
+    grep -Fx "trap -- '' SIGINT" "$BATS_TEST_TMPDIR/signal-restored-traps"
+    jq -es 'map(select(.id == 1 and has("ok"))) | length == 1 and .[0].ok' \
+        "$BATS_TEST_TMPDIR/signal-response"
+}
+
+@test "ordinary foreground Telegram batch cancels INT and restores caller traps" {
+    telegram_signal_fixture batch INT
+    [ ! -s "$BATS_TEST_TMPDIR/signal-initial-int" ]
+    [ "$(cat "$BATS_TEST_TMPDIR/signal-state")" = '1 empty 0' ]
+    ! grep -q SIGINT "$BATS_TEST_TMPDIR/signal-restored-traps"
+    jq -e '.ok == false and .error.code == "remote_failed"' "$BATS_TEST_TMPDIR/signal-response"
+}
+
+@test "Telegram batch TERM and HUP still abort cleanly and restore caller traps" {
+    local signal
+    for signal in TERM HUP; do
+        rm -f "$BATS_TEST_TMPDIR"/signal-*
+        telegram_signal_fixture batch "$signal"
+        [ "$(cat "$BATS_TEST_TMPDIR/signal-state")" = '1 empty 0' ]
+        ! grep -q SIGINT "$BATS_TEST_TMPDIR/signal-restored-traps"
+        jq -e '.ok == false and .error.code == "remote_failed"' "$BATS_TEST_TMPDIR/signal-response"
     done
 }

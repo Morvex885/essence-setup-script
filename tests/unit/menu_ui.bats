@@ -58,23 +58,6 @@ teardown() {
     [[ "$(printf '%s\n' "$output" | wc -l | tr -d ' ')" -eq 2 ]]
 }
 
-@test "select_group redraws stable indexes and chooses second group" {
-    local input="$BATS_TEST_TMPDIR/group-input" screen="$BATS_TEST_TMPDIR/group-screen"
-    BOX_W=70
-    printf '2\n' > "$input"
-    select_group < "$input" > "$screen"
-    [[ "$SELECTED_GROUP" == PC ]]
-}
-
-@test "select_group rejects zero and EOF" {
-    if select_group <<< '0'; then
-        return 1
-    fi
-    if select_group </dev/null; then
-        return 1
-    fi
-}
-
 @test "menu_select validates input before publishing and clears context" {
     MENU_SELECT_CONTEXT=('context')
     MENU_SELECT_EMPTY='empty'
@@ -101,14 +84,4 @@ teardown() {
     } <<< sentinel
     [[ "$remaining" == sentinel && -z "$MENU_SELECT_INDEX" ]]
     [[ "${#MENU_SELECT_CONTEXT[@]}" == 0 && -z "$MENU_SELECT_EMPTY" ]]
-}
-
-@test "node_pick preserves config order without loading or contacting node" {
-    source_module nodes.sh
-    load '../helpers/mock_ssh'
-    reset_ssh_mocks
-    jq_w '.nodes=[{name:"alpha",ip:"192.0.2.1",port:22},{name:"beta",ip:"192.0.2.2",port:2222}]'
-    node_load() { return 99; }
-    node_pick 'Choose' <<< 2
-    [[ "$NODE_PICK_INDEX" == 2 && -z "$SSH_RUN_CALLS" ]]
 }

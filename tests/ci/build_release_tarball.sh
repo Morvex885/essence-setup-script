@@ -1,7 +1,7 @@
 #!/bin/bash
 # Собирает релизный архив essence-setup-<version>.tar.gz (+ .sha256) в <outdir>
 # и проверяет, что в нём есть каждый tracked-файл из common/, setup-essence/,
-# remote-control/ и VERSION — их требуют проверки `_need` установщиков.
+# remote-control/, VERSION и remote-control.cmd — их требуют установщики и launcher.
 # Использование: build_release_tarball.sh <version> [outdir]
 set -euo pipefail
 
@@ -17,19 +17,20 @@ cd "$PROJECT_ROOT"
 
 # Список заранее: при ошибке git ls-files set -e остановит скрипт,
 # а пустой список не даст проверке пройти вхолостую.
-files=$(git ls-files common setup-essence remote-control)
+files=$(git ls-files common setup-essence remote-control VERSION remote-control.cmd)
 [[ -n "$files" ]] || { echo "::error::git ls-files вернул пустой список" >&2; exit 1; }
 
 rm -rf "$OUT_DIR/dist"
 mkdir -p "$DIST/setup-essence/modules" "$DIST/remote-control/modules" \
-         "$DIST/remote-control/templates" "$DIST/common"
+         "$DIST/remote-control/templates" "$DIST/remote-control/tui" "$DIST/common"
 cp setup-essence/setup-essence.sh setup-essence/install-essence.sh "$DIST/setup-essence/"
 cp setup-essence/modules/*.sh "$DIST/setup-essence/modules/"
 cp remote-control/remote-control-essence.sh remote-control/install-remote-control.sh "$DIST/remote-control/"
 cp remote-control/modules/*.sh "$DIST/remote-control/modules/"
+cp remote-control/tui/*.sh "$DIST/remote-control/tui/"
 cp remote-control/templates/*.yaml "$DIST/remote-control/templates/"
 cp -r common/. "$DIST/common/"
-cp VERSION "$DIST/"
+cp VERSION remote-control.cmd "$DIST/"
 
 # Архив с корнем essence-setup/ → при распаковке --strip-components=1
 tar -czf "$OUT_DIR/$TARBALL" -C "$OUT_DIR/dist" essence-setup
@@ -42,5 +43,5 @@ while IFS= read -r f; do
         echo "::error::В архиве $TARBALL нет $f" >&2
         missing=1
     fi
-done <<<"$files"$'\n'VERSION
+done <<<"$files"
 exit "$missing"

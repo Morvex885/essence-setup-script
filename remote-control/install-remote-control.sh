@@ -53,10 +53,23 @@ unset _b
 
 # ─── GitHub API ───────────────────────────────────────────────────────────────
 _CURL_ARGS=(-fsSL)
-[[ -n "$TOKEN" ]] && _CURL_ARGS+=(-H "Authorization: token $TOKEN")
+
+# curl с токеном GitHub: заголовок идёт конфигом через stdin (--config -), а не
+# в argv, где его видит /proc/<pid>/cmdline. Без токена — обычный curl.
+_curl_gh() {
+    local token="$TOKEN"
+    if [[ -z "$token" ]]; then
+        curl "${_CURL_ARGS[@]}" "$@"
+        return
+    fi
+    token="${token//\\/\\\\}"
+    token="${token//\"/\\\"}"
+    printf 'header = "Authorization: token %s"\n' "$token" |
+        curl "${_CURL_ARGS[@]}" --config - "$@"
+}
 
 api_get() {
-    curl "${_CURL_ARGS[@]}" "$1"
+    _curl_gh "$1"
 }
 
 get_latest_tag() {
@@ -77,7 +90,7 @@ download_tarball() {
     fi
 
     info "Скачиваем ${tag} через curl..."
-    curl "${_CURL_ARGS[@]}" --location-trusted \
+    _curl_gh --location-trusted \
         "https://api.github.com/repos/${REPO}/tarball/${tag}" \
         -o "$dest"
 }
@@ -127,11 +140,12 @@ main() {
     tar -xzf "$tmp_dir/archive.tar.gz" -C "$tmp_dir/pkg" --strip-components=1
 
     # Устанавливаем файлы remote-control
-    mkdir -p "$INSTALL_DIR/modules" "$INSTALL_DIR/common" "$INSTALL_DIR/templates"
+    mkdir -p "$INSTALL_DIR/modules" "$INSTALL_DIR/tui" "$INSTALL_DIR/common" "$INSTALL_DIR/templates"
     cp "$tmp_dir/pkg/remote-control/remote-control-essence.sh"   "$INSTALL_DIR/"
     cp "$tmp_dir/pkg/remote-control/install-remote-control.sh"  "$INSTALL_DIR/"
     cp "$tmp_dir/pkg/VERSION"                                   "$INSTALL_DIR/"
     cp "$tmp_dir/pkg/remote-control/modules/"*.sh               "$INSTALL_DIR/modules/"
+    cp "$tmp_dir/pkg/remote-control/tui/"*.sh                   "$INSTALL_DIR/tui/"
     cp "$tmp_dir/pkg/remote-control/templates/"*.yaml           "$INSTALL_DIR/templates/" 2>/dev/null || true
     cp -r "$tmp_dir/pkg/common/."                               "$INSTALL_DIR/common/"
 
@@ -140,11 +154,20 @@ main() {
     cp "$tmp_dir/pkg/setup-essence/setup-essence.sh"              "$INSTALL_DIR/setup-essence/"
     cp "$tmp_dir/pkg/setup-essence/modules/"*.sh                 "$INSTALL_DIR/setup-essence/modules/"
 
-    for _need in common/common.sh common/cert.sh common/listener-users.sh \
-                 common/protocols/vless-tcp.sh common/protocols/vless-xhttp.sh \
-                 common/protocols/uri.sh common/protocols/hy2.sh \
-                 modules/state.sh modules/github-config.sh modules/nodes.sh \
-                 modules/ssh.sh modules/hardening.sh templates/default.yaml; do
+    # Список = все файлы, которые remote-control-essence.sh подключает через source
+    # (common/, modules/), плюс tui/ и common/protocols/ (их загружают на сервер).
+    for _need in common/common.sh common/cert.sh common/ensure-deps.sh common/listener-users.sh \
+                 common/protocols/hy2.sh common/protocols/iptables-dnat.sh common/protocols/uri.sh \
+                 common/protocols/vless-grpc.sh common/protocols/vless-tcp.sh \
+                 common/protocols/vless-xhttp.sh \
+                 modules/state.sh modules/github-config.sh modules/nodes.sh modules/ssh.sh \
+                 modules/telegram-proxy.sh modules/self.sh modules/groups.sh modules/clients.sh \
+                 modules/connections.sh modules/templates.sh modules/generate.sh \
+                 modules/hardening.sh modules/awg_peers.sh modules/subscription.sh \
+                 modules/source.sh modules/session.sh modules/cli.sh modules/serve.sh \
+                 modules/cmd_core.sh modules/cmd_nodes.sh modules/cmd_clients.sh \
+                 tui/main.sh tui/client.sh tui/system.sh tui/nodes.sh tui/clients.sh \
+                 templates/default.yaml; do
         [[ -f "$INSTALL_DIR/$_need" ]] ||
             error "Релиз-tarball повреждён: нет ${_need}. Сообщите об этом в issue."
     done
@@ -152,6 +175,7 @@ main() {
     chmod +x "$INSTALL_DIR/remote-control-essence.sh" \
               "$INSTALL_DIR/install-remote-control.sh" \
               "$INSTALL_DIR/modules/"*.sh \
+              "$INSTALL_DIR/tui/"*.sh \
               "$INSTALL_DIR/setup-essence/setup-essence.sh" \
               "$INSTALL_DIR/setup-essence/modules/"*.sh
 

@@ -1,15 +1,35 @@
 #!/usr/bin/env bats
+bats_require_minimum_version 1.5.0
 
 setup() {
     load '../helpers/test_helper'
-    load '../helpers/mock_ssh'
     setup_test_env
-    source_common
-    source_module "nodes.sh"
-    source_module "clients.sh"
-    source_module "subscription.sh"
+    load '../helpers/cmd_helper'
+    load_core
+    load '../helpers/mock_ssh'
     reset_ssh_mocks
+    open_local_session
+}
 
+teardown() {
+    unset -f rm sed cp nginx systemctl ssh_run scp_run openssl chown flock curl _rotation_fault mv
+    teardown_test_env
+}
+
+_prepare_safety() {
+    ALPHA_TOKEN=$(printf 'a1%.0s' {1..32})
+    BETA_TOKEN=$(printf 'b2%.0s' {1..32})
+    jq_w --arg a "$ALPHA_TOKEN" --arg b "$BETA_TOKEN" '.nodes = [{id:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",name:"old",ip:"192.0.2.1",port:22,user:"root",auth:"key"},{id:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",name:"new",ip:"192.0.2.2",port:2222,user:"root",auth:"key"}] | .clients = [{name:"alpha",group:"MOBILE",subscription:{token:$a,expires_at:"2030-01-01T00:00:00Z",created_at:"2026-01-01",headers:[{name:"User-Agent",value:"test"}]}},{name:"beta",group:"MOBILE",subscription:{token:$b}}] | .subscription_host = {node:"old",base_url:"https://old.example",sub_dir:"/stale/cache",nginx_group:"www-data"} | .subscription_default_headers = []'
+    mkdir -p "$GENERATED_DIR/MOBILE/alpha" "$GENERATED_DIR/MOBILE/beta"
+    printf 'proxies: []\n' > "$GENERATED_DIR/MOBILE/alpha/config.yaml"
+    printf 'proxies: []\n' > "$GENERATED_DIR/MOBILE/beta/config.yaml"
+    SSH_RUN_MOCK_OUTPUT=$'SUB_DIR=/custom/host\nSUB_BASE_URL=https://new.example\nNGINX_GROUP=www-data'
+    curl() { printf '200'; }
+    # Fixture has no state manifest to checkpoint.
+    state_checkpoint() { return 0; }
+}
+
+_prepare_rotation() {
     export OLD_TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     export NEW_TOKEN=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
     export SUB_DIR="$BATS_TEST_TMPDIR/subscriptions"
@@ -65,16 +85,6 @@ setup() {
         command rm "$@" || return $?
         if [[ "${1:-}" == -f ]] && _rotation_fault rm; then return 1; fi
     }
-    sed() {
-        if [[ "${1:-}" == -i ]]; then
-            # Linux sed -i semantics, also runnable on the macOS development host.
-            command sed "$2" "$3" > "$3.edit" || return 1
-            command mv "$3.edit" "$3" || return 1
-            _rotation_fault expiry && return 1
-            return 0
-        fi
-        command sed "$@"
-    }
     cp() {
         if [[ "${1:-}" == -p && "$2" == *'/.subscription-remove.'* && -e "$BATS_TEST_TMPDIR/fault-used" ]]; then
             if [[ "$RECOVERY_FAIL" == files && "$2" == */yaml ]] ||
@@ -83,7 +93,10 @@ setup() {
                 return 1
             fi
         fi
-        command cp "$@"
+        command cp "$@" || return 1
+        # Сбой после записи отредактированного expiry.list (замена или удаление токена).
+        if [[ "${*: -1}" == */expiry.list ]] && _rotation_fault expiry; then return 1; fi
+        return 0
     }
     nginx() {
         if _rotation_fault nginx; then return 1; fi
@@ -103,13 +116,251 @@ setup() {
         _rotation_fault reload && return 1
         return 0
     }
-    export -f ssh_run scp_run openssl chown flock curl _rotation_fault rm sed cp nginx systemctl
+    export -f ssh_run scp_run openssl chown flock curl _rotation_fault rm cp nginx systemctl
+    # Wrappers save through state_action; this fixture has no state manifest.
+    state_checkpoint() { return 0; }
 }
 
-teardown() {
-    unset -f rm sed cp nginx systemctl ssh_run scp_run openssl chown flock curl _rotation_fault
-    teardown_test_env
+@test 'host change with published tokens requires migration and preserves all state' {
+    _prepare_safety
+    cp "$CONFIG_JSON" "$BATS_TEST_TMPDIR/before-host.json"
+    run_cmd sub host --node new --yes
+    [ "$status" -eq 1 ]
+    [ "$(cmd_jq '.error.code')" = conflict ]
+    [[ "$(cmd_jq '.error.message')" == *'sub migrate --node new'* ]]
+    cmp -s "$CONFIG_JSON" "$BATS_TEST_TMPDIR/before-host.json"
+    [ "${#SSH_RUN_CALLS[@]}" -eq 0 ]
+    [ "${#SCP_RUN_CALLS[@]}" -eq 0 ]
 }
+
+@test 'host assignment allows initial host same host and change without tokens' {
+    _prepare_safety
+    run_cmd sub host --node old
+    [ "$status" -eq 0 ]
+    [ "$(cmd_jq '.data.node')" = old ]
+    jq_w 'del(.subscription_host)'
+    run_cmd sub host --node new
+    [ "$status" -eq 0 ]
+    [ "$(jq_r '.subscription_host.node')" = new ]
+    jq_w '.clients |= map(del(.subscription.token))'
+    run_cmd sub host --node old
+    [ "$status" -eq 0 ]
+    [ "$(jq_r '.subscription_host.node')" = old ]
+}
+
+@test 'migration preserves old data after second upload fails and conceals tokens' {
+    _prepare_safety
+    local before
+    before=$(jq_r '.subscription_host, .clients')
+    _sub_upload_config() { [[ "$5" != beta ]]; }
+    run_cmd sub migrate --node new --yes
+    [ "$status" -eq 1 ]
+    [ "$(jq_r '.subscription_host, .clients')" = "$before" ]
+    local command
+    # Link removal (_sub_remove_token) deletes the YAML and snippet; the expiry
+    # update only cleans up its own temporary file.
+    for command in "${SSH_RUN_CALLS[@]}"; do
+        [[ "$command" != *'rm -f "$yaml"'* && "$command" != *'rm -f "$snippet"'* ]] || return 1
+    done
+    refute_output --partial "$ALPHA_TOKEN"
+    refute_output --partial "$BETA_TOKEN"
+    [[ "$CMD_ENVELOPE" != *"$ALPHA_TOKEN"* && "$CMD_ENVELOPE" != *"$BETA_TOKEN"* ]] || return 1
+}
+
+@test 'migration never deletes old links if local host commit fails' {
+    _prepare_safety
+    _sub_upload_config() { return 0; }
+    jq_w() { return 1; }
+    run_cmd sub migrate --node new --yes
+    [ "$status" -eq 1 ]
+    [ "$(jq_r '.subscription_host.node')" = old ]
+    local command
+    for command in "${SSH_RUN_CALLS[@]}"; do
+        [[ "$command" != *'rm -f "$yaml"'* && "$command" != *'rm -f "$snippet"'* ]] || return 1
+    done
+}
+
+@test 'migration preserves old data when a published config is blank' {
+    _prepare_safety
+    printf ' \n\t\n' > "$GENERATED_DIR/MOBILE/beta/config.yaml"
+    local before
+    before=$(jq_r '.subscription_host, .clients')
+    run_cmd sub migrate --node new --yes
+    [ "$status" -eq 1 ]
+    [ "$(jq_r '.subscription_host, .clients')" = "$before" ]
+    [ "${#SSH_RUN_CALLS[@]}" -eq 0 ]
+}
+
+@test 'migration without --yes and to the current host leave files and metadata intact' {
+    _prepare_safety
+    local before
+    before=$(jq_r '.subscription_host, .clients')
+    run_cmd sub migrate --node new
+    [ "$status" -eq 2 ]
+    [ "$(cmd_jq '.error.code')" = confirmation_required ]
+    [ "$(jq_r '.subscription_host, .clients')" = "$before" ]
+    [ "${#SCP_RUN_CALLS[@]}" -eq 0 ]
+    run_cmd sub migrate --node old --yes
+    [ "$status" -eq 1 ]
+    [ "$(jq_r '.subscription_host, .clients')" = "$before" ]
+}
+
+@test 'unreachable subscription host retains host and subscription metadata' {
+    _prepare_safety
+    SSH_RUN_MOCK_EXIT=255
+    local before rc=0
+    before=$(jq_r '.subscription_host, .clients')
+    _subscription_revoke_silent alpha > /dev/null || rc=$?
+    [ "$rc" -eq 1 ]
+    [ "$(jq_r '.subscription_host, .clients')" = "$before" ]
+}
+
+@test 'failed remote revocation retains token expiry and headers' {
+    _prepare_safety
+    _sub_load_host() { _sub_save_ssh_ctx; node_load_by_name old; SSH_RUN_MOCK_EXIT=1; }
+    local before rc=0
+    before=$(jq_r '.clients[0].subscription')
+    _subscription_revoke_silent alpha > /dev/null || rc=$?
+    [ "$rc" -eq 1 ]
+    [ "$(jq_r '.clients[0].subscription')" = "$before" ]
+}
+
+@test 'rotation without --yes does not upload delete or expose token' {
+    _prepare_safety
+    local before
+    before=$(jq_r '.clients[0].subscription')
+    run_cmd sub rotate --client alpha
+    [ "$status" -eq 2 ]
+    [ "$(cmd_jq '.error.code')" = confirmation_required ]
+    [ "$(jq_r '.clients[0].subscription')" = "$before" ]
+    [ "${#SCP_RUN_CALLS[@]}" -eq 0 ]
+    local command
+    for command in "${SSH_RUN_CALLS[@]}"; do [[ "$command" != *'rm -f'* ]]; done
+    refute_output --partial "$ALPHA_TOKEN"
+    [[ "$CMD_ENVELOPE" != *"$ALPHA_TOKEN"* ]] || return 1
+}
+
+@test 'revoke without --yes keeps the token and remote untouched' {
+    _prepare_safety
+    local before
+    before=$(jq_r '.clients')
+    run_cmd sub revoke --client alpha
+    [ "$status" -eq 2 ]
+    [ "$(cmd_jq '.error.code')" = confirmation_required ]
+    [ "$(jq_r '.clients')" = "$before" ]
+    [ "${#SSH_RUN_CALLS[@]}" -eq 0 ]
+}
+
+@test 'publishing and listing conceal tokens in the log while explicit show exposes the link' {
+    _prepare_safety
+    run_cmd sub list
+    [ "$status" -eq 0 ]
+    [[ "$output$CMD_ENVELOPE" != *"$ALPHA_TOKEN"* && "$output$CMD_ENVELOPE" != *https://* ]] || return 1
+    run_cmd sub publish --client alpha
+    [ "$status" -eq 0 ]
+    refute_output --partial "$ALPHA_TOKEN"
+    refute_output --partial '/sub/'
+    run_cmd sub publish-all --yes
+    [ "$status" -eq 0 ]
+    refute_output --partial "$ALPHA_TOKEN"
+    refute_output --partial "$BETA_TOKEN"
+    refute_output --partial '/sub/'
+    run_cmd sub show --client alpha
+    [ "$status" -eq 0 ]
+    [ "$(cmd_jq '.data.url')" = "https://old.example/sub/$ALPHA_TOKEN" ]
+}
+
+@test 'invalid ttl leaves metadata and remote host untouched' {
+    _prepare_safety
+    local before
+    before=$(jq_r '.clients')
+    run_cmd sub publish --client alpha --ttl 1m
+    [ "$status" -eq 1 ]
+    [ "$(cmd_jq '.error.code')" = invalid ]
+    [ "$(jq_r '.clients')" = "$before" ]
+    [ "${#SSH_RUN_CALLS[@]}" -eq 0 ]
+    [ "${#SCP_RUN_CALLS[@]}" -eq 0 ]
+}
+
+@test 'client and group header commands persist valid changes and reject invalid ones' {
+    _prepare_safety
+    run_cmd sub headers --client alpha --set X-Test=value
+    [ "$status" -eq 0 ]
+    [ "$(jq_r '.clients[0].subscription.headers | map(select(.name=="X-Test")) | length')" -eq 1 ]
+    run_cmd sub headers --client alpha --unset X-Test
+    [ "$(jq_r '.clients[0].subscription.headers | map(select(.name=="X-Test")) | length')" -eq 0 ]
+    run_cmd sub headers --group MOBILE --set 'Invalid Header=value'
+    [ "$(cmd_jq '.error.code')" = invalid ]
+    run_cmd sub headers --group MOBILE --set X-Group=value
+    [ "$status" -eq 0 ]
+    [ "$(jq_r '.groups[] | select(.name=="MOBILE") | .subscription_headers[0].name')" = X-Group ]
+    run_cmd sub headers --default --set X-A=b
+    [ "$status" -eq 2 ]
+    [ "${#SSH_RUN_CALLS[@]}" -eq 0 ]
+}
+
+@test 'default headers come from the built-in constant without writing config' {
+    _prepare_safety
+    jq_w 'del(.subscription_default_headers)'
+    local before
+    before=$(jq_r '.')
+    run_cmd sub headers --default
+    [ "$status" -eq 0 ]
+    [ "$(cmd_jq -c '.data')" = '[{"name":"Content-Disposition","value":"attachment; filename=\"config.yaml\""},{"name":"profile-update-interval","value":"24"}]' ]
+    [ "$(jq_r '.')" = "$before" ]
+    run_cmd sub headers --client alpha
+    [ "$(cmd_jq '[.data[] | select(.source=="default")] | length')" -eq 2 ]
+    jq_w '.subscription_default_headers = []'
+    run_cmd sub headers --default
+    [ "$(cmd_jq -c '.data')" = '[]' ]
+}
+
+@test 'publishing does not add default headers to config' {
+    _prepare_safety
+    jq_w 'del(.subscription_default_headers)'
+    run_cmd sub publish --client alpha
+    [ "$status" -eq 0 ]
+    [ "$(jq_r 'has("subscription_default_headers")')" = false ]
+}
+
+@test 'failed uploads do not expose token-bearing remote diagnostics' {
+    _prepare_safety
+    SSH_RUN_MOCK_OUTPUT="nginx failed at /sub/$ALPHA_TOKEN and sub-$ALPHA_TOKEN.conf"
+    SSH_RUN_MOCK_EXIT=1
+    run _sub_upload_config "$GENERATED_DIR/MOBILE/alpha/config.yaml" "$ALPHA_TOKEN" /custom/host www-data alpha
+    assert_failure
+    refute_output --partial "$ALPHA_TOKEN"
+    run _sub_upload_batch /custom/host www-data "$GENERATED_DIR/MOBILE/alpha/config.yaml" "$ALPHA_TOKEN" alpha
+    assert_failure
+    refute_output --partial "$ALPHA_TOKEN"
+}
+
+@test 'migration without --yes reviews every client and writes nothing' {
+    _prepare_safety
+    run_cmd sub migrate --node new
+    [ "$status" -eq 2 ]
+    [ "${#SCP_RUN_CALLS[@]}" -eq 0 ]
+    local plan
+    plan=$(cmd_jq '.error.plan | join("\n")')
+    for word in alpha beta old new; do [[ "$plan" == *"$word"* ]] || return 1; done
+    [[ "$plan$output" != *"$ALPHA_TOKEN"* && "$plan$output" != *"$BETA_TOKEN"* ]] || return 1
+}
+
+@test 'sub host sets the host from the node and reports unreachable hosts' {
+    _prepare_safety
+    jq_w '.clients |= map(del(.subscription.token))'
+    run_cmd sub host --node new
+    [ "$status" -eq 0 ]
+    [ "$(jq_r '.subscription_host.node')" = new ]
+    [ "$(cmd_jq '.data.base_url')" = https://new.example ]
+    SSH_RUN_MOCK_EXIT=255
+    run_cmd sub host --node old
+    [ "$(cmd_jq '.error.code')" = remote_failed ]
+    [ "$(jq_r '.subscription_host.node')" = new ]
+}
+
+# ─── Откат ротации, миграции и отзыва подписок ───────────────────────────────
+
 
 assert_old_usable() {
     cmp "$SUB_DIR/$OLD_TOKEN.yaml" "$BATS_TEST_TMPDIR/expected.yaml"
@@ -121,12 +372,12 @@ assert_old_usable() {
 
 assert_failure_has_no_tokens() {
     assert_failure
-    [[ "$output" != *"$OLD_TOKEN"* ]]
-    [[ "$output" != *"$NEW_TOKEN"* ]]
+    [[ "$output" != *"$OLD_TOKEN"* && "$CMD_ENVELOPE" != *"$OLD_TOKEN"* ]]
+    [[ "$output" != *"$NEW_TOKEN"* && "$CMD_ENVELOPE" != *"$NEW_TOKEN"* ]]
 }
 
 failed_rotation() {
-    run subscription_rotate phone <<< 'y'
+    run_cmd sub rotate --client phone --yes
     assert_failure_has_no_tokens
     [[ -e "$BATS_TEST_TMPDIR/deleted-before-$FAIL_STAGE" ]]
     assert_old_usable
@@ -136,16 +387,19 @@ failed_rotation() {
 }
 
 @test "rotation restores a partially removed old link before cleaning the replacement" {
+    _prepare_rotation
     FAIL_STAGE=rm
     failed_rotation
 }
 
 @test "rotation restores expiry after an edit failed after changing the old token" {
+    _prepare_rotation
     FAIL_STAGE=expiry
     failed_rotation
 }
 
 @test "rotation restores old files and running route after nginx validation fails" {
+    _prepare_rotation
     FAIL_STAGE=nginx
     failed_rotation
 }
@@ -178,8 +432,10 @@ _prepare_migration_mock() {
 }
 
 @test "migration removes configured old-host artifacts only after new copies and host commit" {
+    _prepare_rotation
     _prepare_migration_mock
-    subscription_migrate <<< $'2\ny' > "$BATS_TEST_TMPDIR/migration.output"
+    run_cmd sub migrate --node new --yes
+    [ "$status" -eq 0 ]
     [[ "$(jq_r '.subscription_host.node')" == new ]]
     [[ "$(jq_r '.clients[0].subscription.token')" == "$OLD_TOKEN" ]]
     [[ -s "$MIGRATION_NEW_DIR/$OLD_TOKEN.yaml" && ! -e "$SUB_DIR/$OLD_TOKEN.yaml" ]]
@@ -191,9 +447,11 @@ _prepare_migration_mock() {
 }
 
 @test "migration of a subscription without TTL drops the stale new-host expiry entry" {
+    _prepare_rotation
     _prepare_migration_mock
     jq_w '.clients[0].subscription.expires_at = null'
-    subscription_migrate <<< $'2\ny' > "$BATS_TEST_TMPDIR/migration.output"
+    run_cmd sub migrate --node new --yes
+    [ "$status" -eq 0 ]
     [[ "$(jq_r '.subscription_host.node')" == new ]]
     [[ -s "$MIGRATION_NEW_DIR/$OLD_TOKEN.yaml" ]]
     printf 'stale 1\n' > "$BATS_TEST_TMPDIR/new-host.expiry"
@@ -201,15 +459,15 @@ _prepare_migration_mock() {
 }
 
 @test "failed expiry replacement keeps the new-host list and aborts before uploads" {
+    _prepare_rotation
     _prepare_migration_mock
     cp "$MIGRATION_NEW_DIR/expiry.list" "$BATS_TEST_TMPDIR/new-host.before"
     # Fail only the final replacement of the new host's expiry.list.
     mv() { [[ "${*: -1}" != */expiry.list ]] || return 1; command mv "$@"; }
     export -f mv
-    local rc=0
-    subscription_migrate <<< $'2\ny' > "$BATS_TEST_TMPDIR/migration.output" || rc=$?
+    run_cmd sub migrate --node new --yes
     unset -f mv
-    [[ "$rc" -ne 0 ]]
+    [[ "$status" -ne 0 ]]
     [[ "$(jq_r '.subscription_host.node')" == old ]]
     cmp "$MIGRATION_NEW_DIR/expiry.list" "$BATS_TEST_TMPDIR/new-host.before"
     [[ ! -e "$MIGRATION_NEW_DIR/$OLD_TOKEN.yaml" ]]
@@ -218,12 +476,14 @@ _prepare_migration_mock() {
 }
 
 @test "rotation restores the old link after a reload failed after applying new routes" {
+    _prepare_rotation
     FAIL_STAGE=reload
     failed_rotation
 }
 
 @test "successful rotation removes old artifacts and retains the usable new link and expiry" {
-    run subscription_rotate phone <<< 'y'
+    _prepare_rotation
+    run_cmd sub rotate --client phone --yes
     assert_success
     [[ ! -e "$SUB_DIR/$OLD_TOKEN.yaml" ]]
     [[ ! -e "$SUB_SNIPPETS_DIR/sub-$OLD_TOKEN.conf" ]]
@@ -238,7 +498,7 @@ _prepare_migration_mock() {
 
 failed_recovery() {
     FAIL_STAGE=expiry
-    run subscription_rotate phone <<< 'y'
+    run_cmd sub rotate --client phone --yes
     assert_failure_has_no_tokens
     [[ -e "$BATS_TEST_TMPDIR/deleted-before-expiry" ]]
     cmp "$CONFIG_JSON" "$BATS_TEST_TMPDIR/expected.json"
@@ -255,12 +515,14 @@ failed_recovery() {
 }
 
 @test "failed restoration of old files retains the replacement and private backups" {
+    _prepare_rotation
     RECOVERY_FAIL=files
     failed_recovery
     [[ ! -e "$SUB_DIR/$OLD_TOKEN.yaml" ]]
 }
 
 @test "failed restoration of expiry retains the replacement and local old metadata" {
+    _prepare_rotation
     RECOVERY_FAIL=expiry
     failed_recovery
     printf '%s 2000000000\ncccc 2100000000\n' "$NEW_TOKEN" > "$BATS_TEST_TMPDIR/new.expiry"
@@ -268,16 +530,19 @@ failed_recovery() {
 }
 
 @test "failed rollback nginx validation does not clean a live replacement" {
+    _prepare_rotation
     RECOVERY_FAIL=nginx
     failed_recovery
 }
 
 @test "failed rollback reload does not clean a live replacement" {
+    _prepare_rotation
     RECOVERY_FAIL=reload
     failed_recovery
 }
 
 @test "uncertain SSH completion preserves the replacement and never prints diagnostics" {
+    _prepare_rotation
     # Upload succeeds; lose transport only for removal to model an ambiguous result.
     _original_upload=$(declare -f _sub_upload_config)
     eval "${_original_upload/_sub_upload_config/_rotation_upload}"
@@ -285,7 +550,7 @@ failed_recovery() {
         _rotation_upload "$@" || return 1
         TRANSPORT_LOSS=true
     }
-    run subscription_rotate phone <<< 'y'
+    run_cmd sub rotate --client phone --yes
     assert_failure_has_no_tokens
     cmp "$CONFIG_JSON" "$BATS_TEST_TMPDIR/expected.json"
     cmp "$SUB_DIR/$NEW_TOKEN.yaml" "$GENERATED_DIR/MOBILE/phone/config.yaml"
@@ -293,9 +558,10 @@ failed_recovery() {
 }
 
 @test "rotation never cleans the replacement when the old link was already missing" {
+    _prepare_rotation
     command rm -f "$SUB_DIR/$OLD_TOKEN.yaml"
     FAIL_STAGE=expiry
-    run subscription_rotate phone <<< 'y'
+    run_cmd sub rotate --client phone --yes
     assert_failure_has_no_tokens
     cmp "$CONFIG_JSON" "$BATS_TEST_TMPDIR/expected.json"
     cmp "$SUB_DIR/$NEW_TOKEN.yaml" "$GENERATED_DIR/MOBILE/phone/config.yaml"
@@ -303,6 +569,7 @@ failed_recovery() {
 }
 
 @test "revoke preserves metadata and usable old artifacts on each post-deletion failure" {
+    _prepare_rotation
     local stage
     for stage in rm expiry nginx reload; do
         FAIL_STAGE="$stage"
@@ -315,6 +582,7 @@ failed_recovery() {
 }
 
 @test "migration-style cleanup preserves both hosts' copies when old removal fails" {
+    _prepare_rotation
     # Migration has already committed the new host; cleanup must not erase its copy
     # or local metadata when restoring an unsuccessful removal on the old host.
     mkdir -p "$BATS_TEST_TMPDIR/new-host"
@@ -329,9 +597,10 @@ failed_recovery() {
 }
 
 @test "rollback preserves absence of expiry when a subscription had no expiry file" {
+    _prepare_rotation
     command rm -f "$SUB_DIR/expiry.list"
     FAIL_STAGE=reload
-    run subscription_rotate phone <<< 'y'
+    run_cmd sub rotate --client phone --yes
     assert_failure_has_no_tokens
     [[ -e "$BATS_TEST_TMPDIR/deleted-before-reload" ]]
     cmp "$SUB_DIR/$OLD_TOKEN.yaml" "$BATS_TEST_TMPDIR/expected.yaml"
@@ -343,6 +612,7 @@ failed_recovery() {
 }
 
 @test "successful revoke removes only the old link and its expiry and retains headers" {
+    _prepare_rotation
     command cp "$SUB_DIR/$OLD_TOKEN.yaml" "$SUB_DIR/$NEW_TOKEN.yaml"
     printf 'location = /sub/%s { alias %s/%s.yaml; }\n' "$NEW_TOKEN" "$SUB_DIR" "$NEW_TOKEN" > "$SUB_SNIPPETS_DIR/sub-$NEW_TOKEN.conf"
     run _subscription_revoke_silent phone
@@ -359,6 +629,7 @@ failed_recovery() {
 }
 
 @test "legacy revoke removes the live link without attempting default headers writes" {
+    _prepare_rotation
     jq_w 'del(.subscription_default_headers)'
     jq 'del(.clients[0].subscription.token, .clients[0].subscription.expires_at, .clients[0].subscription.created_at)' "$CONFIG_JSON" > "$BATS_TEST_TMPDIR/revoked.json"
     REAL_MV=$(type -P mv)
@@ -375,7 +646,7 @@ failed_recovery() {
     SERVER_PASS=password SERVER_AUTH=password
     local context
     context=$(declare -p NODE_ID NODE_NAME NODE_IDENTITY NODE_TAG SERVER_IP SERVER_PORT SERVER_USER SERVER_PASS SERVER_AUTH)
-    subscription_revoke phone <<< 'y' > "$BATS_TEST_TMPDIR/revoke.output" 2>&1
+    run_cmd sub revoke --client phone --yes
     [ "$(declare -p NODE_ID NODE_NAME NODE_IDENTITY NODE_TAG SERVER_IP SERVER_PORT SERVER_USER SERVER_PASS SERVER_AUTH)" = "$context" ]
     [[ ! -e "$SUB_DIR/$OLD_TOKEN.yaml" ]]
     [[ ! -e "$SUB_SNIPPETS_DIR/sub-$OLD_TOKEN.conf" ]]
@@ -384,18 +655,31 @@ failed_recovery() {
     cmp "$SUB_DIR/expiry.list" "$BATS_TEST_TMPDIR/remaining.expiry"
     diff <(jq -S . "$CONFIG_JSON") <(jq -S . "$BATS_TEST_TMPDIR/revoked.json")
     [[ ! -e "$BATS_TEST_TMPDIR/default-promotion" ]]
-    run cat "$BATS_TEST_TMPDIR/revoke.output"
-    assert_success
+    [ "$status" -eq 0 ]
     [[ "$output" != *"$OLD_TOKEN"* && "$output" != *"$NEW_TOKEN"* ]]
     unset -f mv
 }
 
 @test "legacy revoke restores the live link and metadata after an ambiguous reload failure" {
+    _prepare_rotation
     jq_w 'del(.subscription_default_headers)'
     command cp "$CONFIG_JSON" "$BATS_TEST_TMPDIR/expected.json"
     FAIL_STAGE=reload
-    run subscription_revoke phone <<< 'y'
+    run_cmd sub revoke --client phone --yes
     assert_failure_has_no_tokens
     [[ -e "$BATS_TEST_TMPDIR/deleted-before-reload" ]]
     assert_old_usable
+}
+
+@test "sub migrate with no published subscriptions keeps host and reports no work" {
+    _prepare_safety
+    jq_w '.clients |= map(del(.subscription.token))'
+    local before
+    before=$(jq_r '.subscription_host')
+    run_cmd sub migrate --node new
+    [ "$status" -eq 0 ]
+    [ "$(cmd_jq '.data.migrated')" -eq 0 ]
+    [ "$(jq_r '.subscription_host')" = "$before" ]
+    [ "${#SSH_RUN_CALLS[@]}" -eq 0 ]
+    [[ "$output" == *'хост не изменён'* ]]
 }

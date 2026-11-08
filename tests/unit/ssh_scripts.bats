@@ -5,6 +5,14 @@ setup() {
     setup_test_env
     source_common
     source_module ssh.sh
+    source "$PROJECT_ROOT/remote-control/modules/nodes.sh"
+    source "$PROJECT_ROOT/remote-control/modules/cli.sh"
+    source "$PROJECT_ROOT/remote-control/modules/cmd_nodes.sh"
+    load '../helpers/cmd_helper'
+    RC_SESSION_OPEN=1 RC_SESSION_AUTHORIZED=1 CONFIG_SOURCE=local
+    jq '.nodes=[{id:"0123456789abcdef0123456789abcdef",name:"fixture",ip:"127.0.0.1",port:22,
+        user:"root",auth:"key",identity:"system",secret_id:null,tag:"T",aliases:{}}]' \
+        "$CONFIG_JSON" > "$CONFIG_JSON.new" && mv "$CONFIG_JSON.new" "$CONFIG_JSON"
     export NODE_NAME=fixture SERVER_USER=root SERVER_IP=127.0.0.1
     export REMOTE_DIR="$BATS_TEST_TMPDIR/server's scripts" SETUP_DIR="$BATS_TEST_TMPDIR/local/setup" \
         COMMON_DIR="$BATS_TEST_TMPDIR/local/common" VERSION_PATH="$BATS_TEST_TMPDIR/local/VERSION"
@@ -83,14 +91,17 @@ teardown() { teardown_test_env; }
     [[ ! -e "$BATS_TEST_TMPDIR/escaped" && ! -e "$REMOTE_DIR" ]]
 }
 
-@test "force cancellation preserves newer scripts, acceptance replaces them" {
+@test "forced upload waits for plan confirmation, confirmed force replaces newer scripts" {
     mkdir -p "$REMOTE_DIR"
     printf '1.2.4\n' > "$REMOTE_DIR/VERSION"
     printf 'manual edit\n' > "$REMOTE_DIR/setup-essence.sh"
     chmod +x "$REMOTE_DIR/setup-essence.sh"
-    ensure_remote_scripts_current --force <<< 'n'
+    run_cmd node upload-scripts --name fixture --force
+    [ "$(cmd_jq '.error.code')" = confirmation_required ]
+    cmd_jq '.error.plan | any(. == "Серверная версия: 1.2.4")' | grep -qx true
     [[ "$(cat "$REMOTE_DIR/setup-essence.sh")" == 'manual edit' ]]
-    ensure_remote_scripts_current --force <<< 'y'
+    run_cmd node upload-scripts --name fixture --force --yes
+    [ "$status" -eq 0 ]
     [[ "$(cat "$REMOTE_DIR/VERSION")" == 1.2.3 ]]
     [[ "$(cat "$REMOTE_DIR/setup-essence.sh")" == '#!/bin/bash' ]]
 }
@@ -127,24 +138,25 @@ teardown() { teardown_test_env; }
     [ "$REMOTE_SCRIPTS_VERSION" = 1.2.4 ]
     run ensure_remote_scripts_current
     assert_failure
-    run ensure_remote_scripts_current --force <<< 'n'
-    assert_success
+    run_cmd node upload-scripts --name fixture --force
+    [ "$status" -eq 2 ]
     [ "$(cat "$REMOTE_DIR/VERSION")" = 1.2.4 ]
-    ensure_remote_scripts_current --force <<< 'y'
+    run_cmd node upload-scripts --name fixture --force --yes
     [ "$(cat "$REMOTE_DIR/VERSION")" = 1.2.3 ]
     printf 'bad version\n' > "$REMOTE_DIR/VERSION"
     run ensure_remote_scripts_current
     assert_failure
-    ensure_remote_scripts_current --force <<< 'y'
+    ensure_remote_scripts_current --force
     [ "$(cat "$REMOTE_DIR/VERSION")" = 1.2.3 ]
 }
 
-@test "force EOF and invalid options cannot mutate remote tree" {
+@test "unconfirmed force and invalid options cannot mutate remote tree" {
     mkdir -p "$REMOTE_DIR"
     printf '1.2.4\n' > "$REMOTE_DIR/VERSION"
     printf 'manual\n' > "$REMOTE_DIR/setup-essence.sh"
     chmod +x "$REMOTE_DIR/setup-essence.sh"
-    ensure_remote_scripts_current --force < /dev/null
+    run_cmd node upload-scripts --name fixture --force --yes --plan-token 0000000000000000
+    [ "$(cmd_jq '.error.code')" = plan_changed ]
     [ "$(cat "$REMOTE_DIR/setup-essence.sh")" = manual ]
     run ensure_remote_scripts_current --unexpected
     [ "$status" -eq 2 ]

@@ -5,9 +5,16 @@ setup() {
     setup_test_env
     source_common
     source_module nodes.sh
+    source "$PROJECT_ROOT/remote-control/modules/ssh.sh"
+    source "$PROJECT_ROOT/remote-control/modules/hardening.sh"
+    source "$PROJECT_ROOT/remote-control/modules/cli.sh"
+    source "$PROJECT_ROOT/remote-control/modules/cmd_nodes.sh"
+    load '../helpers/cmd_helper'
     source "$TEST_HELPERS_DIR/mock_ssh.bash"
     state_open_local
     load_fixture_config
+    RC_SESSION_OPEN=1 RC_SESSION_AUTHORIZED=1
+    NAME=$(jq_r '.nodes[0].name')
     CONFIG_SOURCE=github
     ID=$(jq_r '.nodes[0].id')
     SSH_IDENTITIES_DIR="$CONFIG_DIR/identities"
@@ -23,8 +30,6 @@ setup() {
     cp "$CONFIG_JSON" "$BATS_TEST_TMPDIR/config.before"
     cp "$SECRETS_JSON" "$BATS_TEST_TMPDIR/secrets.before"
     cp "$STATE_MANIFEST" "$BATS_TEST_TMPDIR/manifest.before"
-    CONFIRMS=0
-    confirm_yn() { CONFIRMS=$((CONFIRMS+1)); [[ "$2" == N ]]; }
     github_config_checkpoint() { return 0; }
     github_sync_flush() { return 0; }
     CALL_LOG="$BATS_TEST_TMPDIR/ssh.calls"
@@ -92,7 +97,6 @@ assert_recovered_access() {
     [[ -f "$SSH_IDENTITIES_DIR/$ID" ]]
     [[ ! -e "$MASTER_STATE" ]]
     [[ "$(wc -l < "$REVOKE_COUNT" | tr -d ' ')" == 1 ]]
-    [[ "$CONFIRMS" == 1 ]]
     local leftovers=("$CONFIG_DIR"/.node-delete.*)
     [[ ! -e "${leftovers[0]}" ]]
     # The recovery made a fresh, key-authenticated login only AFTER adding
@@ -100,9 +104,16 @@ assert_recovered_access() {
     grep -q 'false|none||true' "$CALL_LOG"
 }
 
+# node delete через ядро (управляемый ключ, отзыв); журнал — в $BATS_TEST_TMPDIR/output.
+delete_managed() {
+    run_cmd node delete --name "$NAME" --revoke-key --yes
+    printf '%s\n' "$output" > "$BATS_TEST_TMPDIR/output"
+    [ "$status" -eq 0 ]
+}
+
 @test "local checkpoint failure after key revocation restores local state and key-only login" {
     state_checkpoint() { return 1; }
-    if delete_node <<< $'1\n2'; then return 1; fi
+    if delete_managed; then return 1; fi
     assert_recovered_access
 }
 
@@ -110,7 +121,7 @@ assert_recovered_access() {
     CONFIG_DIR="$CONFIG_DIR/$(printf '%0120d' 0)"
     mkdir -p "$CONFIG_DIR"
     state_checkpoint() { return 1; }
-    if delete_node <<< $'1\n2'; then return 1; fi
+    if delete_managed; then return 1; fi
     assert_recovered_access
 }
 
@@ -120,7 +131,7 @@ assert_recovered_access() {
         FLUSHES=$((FLUSHES+1))
         [[ "$FLUSHES" -ne 1 ]]
     }
-    if delete_node <<< $'1\n2'; then return 1; fi
+    if delete_managed; then return 1; fi
     [[ "$FLUSHES" == 2 ]]
     assert_recovered_access
 }
@@ -131,19 +142,18 @@ assert_recovered_access() {
         CHECKPOINTS=$((CHECKPOINTS+1))
         [[ "$CHECKPOINTS" -ne 1 ]]
     }
-    if delete_node <<< $'1\n2'; then return 1; fi
+    if delete_managed; then return 1; fi
     [[ "$CHECKPOINTS" == 2 ]]
     assert_recovered_access
 }
 
 @test "successful managed deletion revokes once closes connection and removes sensitive artifacts" {
-    delete_node <<< $'1\n2'
+    delete_managed
     [[ "$(jq_r --arg id "$ID" '[.nodes[] | select(.id==$id)] | length')" == 0 ]]
     if grep -qxF "$PUBKEY" "$REMOTE_HOME/.ssh/authorized_keys"; then return 1; fi
     grep -qxF 'ssh-ed25519 OTHER unrelated' "$REMOTE_HOME/.ssh/authorized_keys"
     [[ ! -e "$SSH_IDENTITIES_DIR/$ID" && ! -e "$SSH_IDENTITIES_DIR/$ID.pub" ]]
     [[ ! -e "$MASTER_STATE" ]]
-    [[ "$CONFIRMS" == 1 ]]
     [[ "$(wc -l < "$REVOKE_COUNT" | tr -d ' ')" == 1 ]]
     local leftovers=("$CONFIG_DIR"/.node-delete.*)
     [[ ! -e "${leftovers[0]}" ]]
@@ -152,7 +162,7 @@ assert_recovered_access() {
 @test "failed authorization recovery retains local node key backups and authenticated connection" {
     state_checkpoint() { return 1; }
     RESTORE_FAIL=true
-    if delete_node <<< $'1\n2' > "$BATS_TEST_TMPDIR/output"; then return 1; fi
+    if delete_managed; then return 1; fi
     cmp "$CONFIG_JSON" "$BATS_TEST_TMPDIR/config.before"
     cmp "$SECRETS_JSON" "$BATS_TEST_TMPDIR/secrets.before"
     [[ -f "$SSH_IDENTITIES_DIR/$ID" && -f "$MASTER_STATE" ]]
@@ -162,13 +172,12 @@ assert_recovered_access() {
     [[ -S "$socket" || -f "$socket" ]]
     grep -qF "$backup" "$BATS_TEST_TMPDIR/output"
     grep -qF "$socket" "$BATS_TEST_TMPDIR/output"
-    [[ "$CONFIRMS" == 1 ]]
     [[ "$(wc -l < "$REVOKE_COUNT" | tr -d ' ')" == 1 ]]
 }
 
 @test "backup preparation failure never revokes remote key" {
     mktemp() { return 1; }
-    if delete_node <<< $'1\n2'; then return 1; fi
+    if delete_managed; then return 1; fi
     [[ ! -e "$CALL_LOG" && ! -e "$REVOKE_COUNT" ]]
     cmp "$CONFIG_JSON" "$BATS_TEST_TMPDIR/config.before"
     grep -qxF "$PUBKEY" "$REMOTE_HOME/.ssh/authorized_keys"
@@ -187,9 +196,8 @@ assert_removed_without_recovery() {
     [[ "$(jq_r --arg id "$ID" '[.nodes[] | select(.id==$id)] | length')" == 0 ]]
     if grep -qxF "$PUBKEY" "$REMOTE_HOME/.ssh/authorized_keys"; then return 1; fi
     [[ ! -e "$MASTER_STATE" ]]
-    local backups=("$CONFIG_DIR"/.node-delete.*)
-    [[ -f "${backups[0]}/config" && -f "${backups[0]}/secrets" ]]
-    grep -qF "${backups[0]}" "$BATS_TEST_TMPDIR/output"
+    ! compgen -G "$CONFIG_DIR/.node-delete.*" || return 1
+    [ "$(cmd_jq '.error.code')" = partial ]
 }
 
 @test "rejected add rollback retains referenced identity secrets and recovery copies" {
@@ -240,7 +248,7 @@ assert_removed_without_recovery() {
         [[ "$1" == -f && "${2:-}" == "$SSH_IDENTITIES_DIR/$ID" ]] && return 77
         command rm "$@"
     }
-    if delete_node <<< $'1\n2' > "$BATS_TEST_TMPDIR/output"; then return 1; fi
+    if delete_managed; then return 1; fi
     assert_removed_without_recovery
     [[ -f "$SSH_IDENTITIES_DIR/$ID" ]]
 }
@@ -249,7 +257,7 @@ assert_removed_without_recovery() {
     SSH_KNOWN_HOSTS="$CONFIG_DIR/known_hosts"
     printf 'fixture\n' > "$SSH_KNOWN_HOSTS"
     ssh-keygen() { return 77; }
-    if delete_node <<< $'1\n2' > "$BATS_TEST_TMPDIR/output"; then return 1; fi
+    if delete_managed; then return 1; fi
     assert_removed_without_recovery
     [[ ! -f "$SSH_IDENTITIES_DIR/$ID" ]]
 }
@@ -265,7 +273,7 @@ assert_removed_without_recovery() {
     }
     github_sync_flush() { FLUSHES=$((FLUSHES+1)); }
     _github_report_last_error() { touch "$BATS_TEST_TMPDIR/reported"; }
-    if delete_node <<< $'1\n2' > "$BATS_TEST_TMPDIR/output"; then return 1; fi
+    if delete_managed; then return 1; fi
     assert_removed_without_recovery
     [[ "$CHECKPOINTS" == 2 && "$FLUSHES" == 1 && "$GITHUB_SYNC_STATUS" == pending ]]
     [[ -f "$BATS_TEST_TMPDIR/reported" ]]
@@ -280,7 +288,7 @@ assert_removed_without_recovery() {
         FLUSHES=$((FLUSHES+1))
         [[ "$FLUSHES" -eq 1 ]]
     }
-    delete_node <<< $'1\n2'
+    delete_managed
     [[ "$FLUSHES" == 2 && "$GITHUB_SYNC_STATUS" == pending ]]
     [[ "$(jq_r --arg id "$ID" '[.nodes[] | select(.id==$id)] | length')" == 0 ]]
     [[ ! -f "$SSH_IDENTITIES_DIR/$ID" ]]
@@ -324,7 +332,7 @@ assert_removed_without_recovery() {
     ssh-keygen() {
         [[ "$2" != *']:2222' ]]
     }
-    if delete_node <<< $'1\n2' > "$BATS_TEST_TMPDIR/output"; then return 1; fi
+    if delete_managed; then return 1; fi
     assert_removed_without_recovery
 }
 
@@ -336,6 +344,194 @@ assert_removed_without_recovery() {
         [[ "$2" != \[* ]] || return 77
         printf '%s\n' "$2" >> "$BATS_TEST_TMPDIR/removed-hosts"
     }
-    delete_node <<< $'1\n2'
+    delete_managed
     [[ "$(wc -l < "$BATS_TEST_TMPDIR/removed-hosts" | tr -d ' ')" == 1 ]]
+}
+
+# ─── Команды нод без вопросов ────────────────────────────────────────────────
+
+# Локальный режим с заглушками ssh-keyscan/ssh-keygen: отпечаток SHA256:fp-new.
+use_local_hostkey_stubs() {
+    CONFIG_SOURCE=local
+    export HOME="$BATS_TEST_TMPDIR/home"
+    mkdir -p "$HOME/.ssh" "$BATS_TEST_TMPDIR/bin"
+    printf '9.9.9.9 ssh-ed25519 OLD\n' > "$HOME/.ssh/known_hosts"
+    cat > "$BATS_TEST_TMPDIR/bin/ssh-keyscan" <<'EOF'
+#!/bin/bash
+echo "9.9.9.9 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINewKeyForTests"
+EOF
+    cat > "$BATS_TEST_TMPDIR/bin/ssh-keygen" <<'EOF'
+#!/bin/bash
+case "$1" in
+    -F) exit 1 ;;
+    -l*|-E) echo "256 SHA256:fp-new 9.9.9.9 (ED25519)" ;;
+    -R) grep -v "^$2 " "$4" > "$4.tmp"; mv "$4.tmp" "$4" ;;
+    *) exit 0 ;;
+esac
+EOF
+    chmod +x "$BATS_TEST_TMPDIR/bin/ssh-keyscan" "$BATS_TEST_TMPDIR/bin/ssh-keygen"
+    export PATH="$BATS_TEST_TMPDIR/bin:$PATH"
+}
+
+@test "node delete without --yes returns the plan and touches nothing" {
+    run_cmd node delete --name "$NAME" --revoke-key
+    [ "$status" -eq 2 ]
+    [ "$(cmd_jq '.error.code')" = confirmation_required ]
+    cmd_jq '.error.plan | any(startswith("Объём:"))' | grep -qx true
+    [[ ! -e "$CALL_LOG" ]]
+    cmp "$CONFIG_JSON" "$BATS_TEST_TMPDIR/config.before"
+}
+
+@test "node show lists delete options with labels for a managed key" {
+    run_cmd node show --name "$NAME"
+    [ "$status" -eq 0 ]
+    [ "$(cmd_jq '[.data.delete_options[] | "\(.scope):\(.revoke_key)"] | join(",")')" = \
+        "local:false,local:true,server:false,server:true" ]
+    cmd_jq '.data.delete_options | all(.label | length > 0)' | grep -qx true
+    CONFIG_SOURCE=local
+    run_cmd node show --name ru-vps
+    [ "$(cmd_jq '[.data.delete_options[] | .scope] | join(",")')" = "local,server" ]
+}
+
+@test "node shell and node setup-ssh answer with decision codes without SSH" {
+    _rc_tty_available() { return 1; }
+    run_cmd node shell --name "$NAME"
+    [ "$status" -eq 2 ]
+    [ "$(cmd_jq '.error.code')" = tty_required ]
+    [[ ! -e "$CALL_LOG" ]]
+
+    # План setup-ssh читает ключи серверов: без сети ключ не прочитан.
+    ssh-keyscan() { return 1; }
+    CONFIG_SOURCE=local
+    run_cmd node setup-ssh --yes
+    [ "$(cmd_jq '.error.code')" = invalid ]
+    CONFIG_SOURCE=github
+    state_actionable_ssh_setup_pending() { return 1; }
+    run_cmd node setup-ssh --yes
+    [ "$(cmd_jq '.error.code')" = nothing_pending ]
+    state_actionable_ssh_setup_pending() { return 0; }
+    jq_w '.nodes[0].identity="system"'
+    run_cmd node setup-ssh
+    [ "$status" -eq 2 ]
+    [ "$(cmd_jq '.error.code')" = key_provisioning_required ]
+    [ "$(cmd_jq '.error.nodes | join(",")')" = de-vps ]
+    run_cmd node setup-ssh --provision-keys maybe
+    [ "$(cmd_jq '.error.code')" = usage ]
+    run_cmd node setup-ssh --provision-keys no --on-failure defer
+    [ "$(cmd_jq '.error.code')" = confirmation_required ]
+    [[ ! -e "$CALL_LOG" ]]
+}
+
+@test "node add with --replace-host-key pins only a matching fingerprint" {
+    use_local_hostkey_stubs
+    ssh_run() { printf 'ok\n'; }
+    run_cmd node add --name fresh --ip 9.9.9.9 --auth key --tag T --replace-host-key SHA256:other
+    [ "$(cmd_jq '.error.code')" = host_key_mismatch ]
+    [ "$(jq_r '[.nodes[] | select(.name=="fresh")] | length')" = 0 ]
+    grep -q OLD "$HOME/.ssh/known_hosts"
+
+    run_cmd node add --name fresh --ip 9.9.9.9 --auth key --tag T --accept-new-host-key \
+        --replace-host-key SHA256:fp-new
+    [ "$status" -eq 2 ]
+    [ "$(cmd_jq '.error.code')" = confirmation_required ]
+    cmd_jq '.error.plan | any(. == "Новый отпечаток: SHA256:fp-new")' | grep -qx true
+    [ "$(jq_r '[.nodes[] | select(.name=="fresh")] | length')" = 0 ]
+    grep -q OLD "$HOME/.ssh/known_hosts"
+    local token
+    token=$(cmd_jq '.error.plan_token')
+    run_cmd node add --name fresh --ip 9.9.9.9 --auth key --tag T --accept-new-host-key \
+        --replace-host-key SHA256:fp-new --yes --plan-token "$token"
+    [ "$status" -eq 0 ]
+    [ "$(jq_r '[.nodes[] | select(.name=="fresh")] | length')" = 1 ]
+    ! grep -q OLD "$HOME/.ssh/known_hosts" || return 1
+    grep -q NewKeyForTests "$HOME/.ssh/known_hosts"
+
+    run_cmd node add --name other --ip 9.9.9.9 --auth key --tag T --host-key SHA256:fp-new \
+        --replace-host-key SHA256:fp-new
+    [ "$(cmd_jq '.error.code')" = usage ]
+}
+
+@test "node add reports a changed host key and an SSH failure with details" {
+    use_local_hostkey_stubs
+    ssh_run() { printf '@@@ REMOTE HOST IDENTIFICATION HAS CHANGED! @@@\n'; return 255; }
+    run_cmd node add --name fresh --ip 9.9.9.9 --auth key --tag T --accept-new-host-key
+    [ "$(cmd_jq '.error.code')" = host_key_changed ]
+    cmd_jq '.error | .host == "9.9.9.9" and .port == 22 and .fingerprints == ["SHA256:fp-new"]' | grep -qx true
+    ssh_run() { printf 'Permission denied (publickey).\n'; return 255; }
+    run_cmd node add --name fresh --ip 9.9.9.9 --auth key --tag T --accept-new-host-key
+    [ "$(cmd_jq '.error.code')" = remote_failed ]
+    cmd_jq '.error | (.reason | test("denied")) and .hint == "ssh-copy-id root@9.9.9.9"' | grep -qx true
+    [ "$(jq_r '[.nodes[] | select(.name=="fresh")] | length')" = 0 ]
+}
+
+@test "node trust-host-key checks the fingerprint, needs --yes and replaces old entries" {
+    use_local_hostkey_stubs
+    jq_w '.nodes[0].ip="9.9.9.9"'
+    run_cmd node trust-host-key --name "$NAME" --host-key SHA256:other
+    [ "$(cmd_jq '.error.code')" = host_key_mismatch ]
+    run_cmd node trust-host-key --name "$NAME" --host-key SHA256:fp-new
+    [ "$status" -eq 2 ]
+    [ "$(cmd_jq '.error.code')" = confirmation_required ]
+    cmd_jq '.error.plan | any(. == "Новый отпечаток: SHA256:fp-new")' | grep -qx true
+    grep -q OLD "$HOME/.ssh/known_hosts"
+    run_cmd node trust-host-key --name "$NAME" --host-key SHA256:fp-new --yes
+    [ "$status" -eq 0 ]
+    [ "$(cmd_jq '.data.fingerprint')" = SHA256:fp-new ]
+    ! grep -q OLD "$HOME/.ssh/known_hosts" || return 1
+    grep -q NewKeyForTests "$HOME/.ssh/known_hosts"
+}
+
+@test "node check reports a changed host key through ssh_probe" {
+    use_local_hostkey_stubs
+    jq_w '.nodes[0].ip="9.9.9.9"'
+    ssh_run() { printf 'REMOTE HOST IDENTIFICATION HAS CHANGED\n'; return 255; }
+    run_cmd node check --name "$NAME"
+    [ "$(cmd_jq '.error.code')" = host_key_changed ]
+    [ "$(cmd_jq '.error.fingerprints[0]')" = SHA256:fp-new ]
+    ssh_run() { printf 'ok\n'; }
+    run_cmd node check --name "$NAME"
+    [ "$status" -eq 0 ]
+    [ "$(cmd_jq '.data.reachable')" = true ]
+}
+
+@test "host key commands sort unique SHA256 fingerprints without Bash mapfile" {
+    use_local_hostkey_stubs
+    jq_w '.nodes[0].ip="9.9.9.9"'
+    mapfile() { printf '%s\n' called > "$BATS_TEST_TMPDIR/mapfile-called"; return 127; }
+    ssh-keygen() {
+        case "$1" in
+            -lf) printf '256 MD5:legacy 9.9.9.9 (ED25519)\n' ;;
+            -E) printf '%s\n' \
+                '256 SHA256:fp-z 9.9.9.9 (ED25519)' \
+                '256 SHA256:fp-a 9.9.9.9 (ECDSA)' \
+                '256 SHA256:fp-z 9.9.9.9 (ED25519)' ;;
+            *) return 1 ;;
+        esac
+    }
+    run_cmd node trust-host-key --name "$NAME" --host-key SHA256:other
+    [ "$(cmd_jq '.error.code')" = host_key_mismatch ]
+    [ "$(cmd_jq '.error.fingerprints | join(",")')" = SHA256:fp-a,SHA256:fp-z ]
+    run_cmd node trust-host-key --name "$NAME" --host-key SHA256:fp-a
+    [ "$status" -eq 2 ]
+    [ "$(cmd_jq '.error.code')" = confirmation_required ]
+    [[ ! -e "$BATS_TEST_TMPDIR/mapfile-called" ]]
+    grep -q OLD "$HOME/.ssh/known_hosts"
+}
+
+@test "host key commands reject an empty fingerprint scan without Bash mapfile or stale results" {
+    use_local_hostkey_stubs
+    jq_w '.nodes[0].ip="9.9.9.9"'
+    export TMPDIR="$BATS_TEST_TMPDIR/hostkey-tmp"
+    mkdir -p "$TMPDIR"
+    mapfile() { printf '%s\n' called > "$BATS_TEST_TMPDIR/mapfile-called"; return 127; }
+    ssh-keygen() { printf '256 MD5:legacy 9.9.9.9 (ED25519)\n'; }
+    NODE_HOSTKEY_FPS=(SHA256:stale)
+    NODE_HOSTKEY_SCAN=stale
+    run_cmd node trust-host-key --name "$NAME" --host-key SHA256:other
+    [ "$(cmd_jq '.error.code')" = remote_failed ]
+    [ "${#NODE_HOSTKEY_FPS[@]}" -eq 0 ]
+    [[ -z "$NODE_HOSTKEY_SCAN" && ! -e "$BATS_TEST_TMPDIR/mapfile-called" ]]
+    local leftovers=("$TMPDIR"/essence-hostkey.*)
+    [[ ! -e "${leftovers[0]}" ]]
+    grep -q OLD "$HOME/.ssh/known_hosts"
 }

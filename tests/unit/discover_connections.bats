@@ -5,6 +5,7 @@ setup() {
     load '../helpers/test_helper'
     setup_test_env
     source_common
+    source "$PROJECT_ROOT/remote-control/modules/ssh.sh"
     source "$PROJECT_ROOT/tests/helpers/mock_ssh.bash"
     source_module "nodes.sh"
     source_module "connections.sh"
@@ -125,14 +126,16 @@ _prepare_connection_sync_test() {
     }
 }
 
-@test "_sync_all_connections: all nodes succeed and checkpoint state" {
+# ssh_probe: «echo ok» отвечает ok, остальное — обнаружение.
+@test "core_conn_sync: all nodes succeed and checkpoint state" {
     _prepare_connection_sync_test
     ssh_run() {
+        [[ "${*: -1}" == "echo ok" ]] && { printf 'ok\n'; return 0; }
         printf '  - name: "vless-reality"\n'
         return 0
     }
 
-    run state_action "sync_connections" _sync_all_connections
+    run state_action "sync_connections" core_conn_sync
     assert_success
     [[ -f "$STATE_MANIFEST" ]]
     run jq -e '
@@ -147,19 +150,21 @@ _prepare_connection_sync_test() {
     assert_success
 }
 
-@test "_sync_all_connections: partial failure returns error without checkpoint" {
+@test "core_conn_sync: unreachable node makes the result partial and keeps the saved part" {
     _prepare_connection_sync_test
     ssh_run() {
         if [[ "$NODE_NAME" == ru-vps ]]; then
             return 1
         fi
+        [[ "${*: -1}" == "echo ok" ]] && { printf 'ok\n'; return 0; }
         printf '  - name: "vless-reality"\n'
         return 0
     }
 
-    run state_action "sync_connections" _sync_all_connections
-    assert_failure
-    [[ ! -e "$STATE_MANIFEST" ]]
+    state_action "sync_connections" core_conn_sync > "$BATS_TEST_TMPDIR/result" 2>&1 && return 1
+    [ "$RC_ERROR_CODE" = partial ]
+    jq -e '[.nodes[] | .status] == ["synced","unreachable"] and .ok == 1 and .failed == 1' <<< "$CONN_SYNC_JSON"
+    [[ -f "$STATE_MANIFEST" ]]
     run jq -e '
         (.connections[] | select(.node == "de-vps") | .groups[].proxies) |
         (index("vless-reality") != null and index("stale-proxy") == null)
@@ -185,27 +190,7 @@ _prepare_unavailable_connection_node() {
     ssh_run() { touch "$BATS_TEST_TMPDIR/ssh-calls.log"; return 1; }
 }
 
-@test "_configure_node_connections: unavailable password never discovers or mutates previous node" {
-    _prepare_unavailable_connection_node
-    local previous="$NODE_NAME" rc=0
-    _configure_node_connections 2 || rc=$?
-    [[ "$rc" == 1 ]]
-    [[ "$NODE_NAME" == "$previous" ]]
-    [[ ! -e "$BATS_TEST_TMPDIR/discovery" && ! -e "$BATS_TEST_TMPDIR/ssh-calls.log" ]]
-    cmp "$CONFIG_JSON" "$BATS_TEST_TMPDIR/config.before"
-}
-
-@test "_rename_connections: unavailable password never discovers or mutates previous node" {
-    _prepare_unavailable_connection_node
-    local previous="$NODE_NAME" rc=0
-    _rename_connections <<< "2" || rc=$?
-    [[ "$rc" == 1 ]]
-    [[ "$NODE_NAME" == "$previous" ]]
-    [[ ! -e "$BATS_TEST_TMPDIR/discovery" && ! -e "$BATS_TEST_TMPDIR/ssh-calls.log" ]]
-    cmp "$CONFIG_JSON" "$BATS_TEST_TMPDIR/config.before"
-}
-
-@test "_sync_all_connections: unavailable password skips discovery while valid node proceeds" {
+@test "core_conn_sync: unavailable password skips discovery while valid node proceeds" {
     _prepare_unavailable_connection_node
     local missing_before
     missing_before=$(jq -c '[.connections[] | select(.node=="ru-vps")]' "$CONFIG_JSON")
@@ -213,14 +198,24 @@ _prepare_unavailable_connection_node() {
         printf '%s\n' "$NODE_NAME" >> "$BATS_TEST_TMPDIR/discovered-nodes"
         printf '%s\n' vless-reality
     }
-    run _sync_all_connections
+    ssh_run() {
+        if [[ "${*: -1}" == "echo ok" ]]; then
+            printf '%s\n' "$NODE_NAME" >> "$BATS_TEST_TMPDIR/probed-nodes"
+            printf 'ok\n'
+            return 0
+        fi
+        touch "$BATS_TEST_TMPDIR/ssh-calls.log"
+        return 1
+    }
+    run core_conn_sync
     assert_failure
     [[ "$(cat "$BATS_TEST_TMPDIR/discovered-nodes")" == de-vps ]]
+    [[ "$(cat "$BATS_TEST_TMPDIR/probed-nodes")" == de-vps ]]
     [[ "$(jq -c '[.connections[] | select(.node=="ru-vps")]' "$CONFIG_JSON")" == "$missing_before" ]]
     [[ ! -e "$BATS_TEST_TMPDIR/ssh-calls.log" ]]
 }
 
-@test "_sync_all_connections: second promotion failure stops discovery and restores SSH context" {
+@test "core_conn_sync: second promotion failure stops discovery and restores SSH context" {
     _prepare_connection_sync_test
     source_module "nodes.sh"
     jq_w '
@@ -236,6 +231,7 @@ _prepare_unavailable_connection_node() {
     before_context=$(printf '%s\n' "$NODE_ID" "$NODE_IDENTITY" "$NODE_TAG" "$NODE_NAME" \
         "$SERVER_IP" "$SERVER_PORT" "$SERVER_USER" "$SERVER_PASS" "$SERVER_AUTH")
     ssh_run() {
+        [[ "${*: -1}" == "echo ok" ]] && { printf 'ok\n'; return 0; }
         printf '%s\n' "$NODE_NAME" >> "$BATS_TEST_TMPDIR/discovered"
         printf '  - name: "vless-reality"\n'
     }
@@ -254,13 +250,13 @@ _prepare_unavailable_connection_node() {
         "$mv_real" "$@"
     }
     local rc=0
-    state_action "sync_connections" _sync_all_connections \
+    state_action "sync_connections" core_conn_sync \
         > "$BATS_TEST_TMPDIR/result" 2>&1 || rc=$?
     [[ "$rc" -ne 0 ]]
     [[ "$(cat "$BATS_TEST_TMPDIR/promotions")" == 2 ]]
     [[ "$(cat "$BATS_TEST_TMPDIR/discovered")" == $'de-vps\nru-vps' ]]
-    [[ ! -e "$BATS_TEST_TMPDIR/completed" ]]
-    [[ ! -e "$STATE_MANIFEST" ]]
+    ! grep -q 'Синхронизировано' "$BATS_TEST_TMPDIR/completed" || return 1
+    jq -e '[.nodes[] | .status] == ["synced","save_failed","skipped"] and .stopped_at == "ru-vps"' <<< "$CONN_SYNC_JSON"
     [[ "$(printf '%s\n' "$NODE_ID" "$NODE_IDENTITY" "$NODE_TAG" "$NODE_NAME" \
         "$SERVER_IP" "$SERVER_PORT" "$SERVER_USER" "$SERVER_PASS" "$SERVER_AUTH")" == "$before_context" ]]
     run jq -e '
@@ -272,4 +268,60 @@ _prepare_unavailable_connection_node() {
             all(.groups[]; .proxies==["vless-reality","stale-proxy"]))
     ' "$CONFIG_JSON"
     assert_success
+}
+
+# ─── round 2: nodes ──────────────────────────────────────────────────────────
+
+# ssh_run выполняет удалённую команду локально, /etc/mihomo — в песочнице.
+_r2_local_remote() {
+    mkdir -p "$BATS_TEST_TMPDIR/etc/mihomo"
+    ssh_run() {
+        while [[ $# -gt 0 && "$1" != "--" ]]; do shift; done
+        shift
+        bash -c "${1//\/etc\/mihomo/$BATS_TEST_TMPDIR/etc/mihomo}"
+    }
+}
+
+@test "R2-M6: a reachable node without client-config.txt has no connections; a read error still fails" {
+    _r2_local_remote
+    run _discover_connections
+    assert_success
+    assert_output ""
+    printf '  - name: "vless-reality"\n' > "$BATS_TEST_TMPDIR/etc/mihomo/client-config.txt"
+    run _discover_connections
+    assert_success
+    assert_output "vless-reality"
+    rm "$BATS_TEST_TMPDIR/etc/mihomo/client-config.txt"
+    mkdir "$BATS_TEST_TMPDIR/etc/mihomo/client-config.txt"
+    run _discover_connections
+    assert_failure
+}
+
+@test "R2-M6: conn sync treats a node without client-config.txt as synced, not unreachable" {
+    _prepare_connection_sync_test
+    _r2_local_remote
+    state_action "sync_connections" core_conn_sync > "$BATS_TEST_TMPDIR/result" 2>&1
+    jq -e '[.nodes[] | .status] == ["synced","synced"] and .failed == 0' <<< "$CONN_SYNC_JSON"
+}
+
+@test "R2-M7: conn set failing after a saved group answers partial with the applied groups" {
+    source "$PROJECT_ROOT/remote-control/modules/github-config.sh"
+    source "$PROJECT_ROOT/remote-control/modules/cli.sh"
+    source "$PROJECT_ROOT/remote-control/modules/cmd_nodes.sh"
+    load '../helpers/cmd_helper'
+    RC_SESSION_OPEN=1 RC_SESSION_AUTHORIZED=1 CONFIG_SOURCE=local
+    load_fixture_config
+    eval "$(declare -f jq_w | sed '1s/jq_w/_r2_real_jq_w/')"
+    R2_WRITES=0
+    jq_w() { R2_WRITES=$((R2_WRITES + 1)); (( R2_WRITES != 2 )) || return 77; _r2_real_jq_w "$@"; }
+    run_cmd conn set --node de-vps --group ROUTER --group PC --proxy vless-r2
+    [ "$status" -eq 1 ]
+    [ "$(cmd_jq '.error.code')" = partial ]
+    cmd_jq '.data == {node:"de-vps", groups:["ROUTER","PC"], proxies:["vless-r2"], applied:["ROUTER"]}' | grep -qx true
+    [[ -f "$STATE_MANIFEST" ]]
+    jq -e '.connections[] | select(.node=="de-vps") | .groups[] | select(.name=="ROUTER") | .proxies == ["vless-r2"]' "$CONFIG_JSON"
+    R2_WRITES=1
+    run_cmd conn set --node de-vps --group MOBILE --proxy vless-r2
+    [ "$(cmd_jq '.error.code')" = failed ]
+    [ "$(cmd_jq '.data')" = null ]
 }

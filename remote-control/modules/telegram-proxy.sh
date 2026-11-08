@@ -2,27 +2,37 @@
 # ─── Telegram Proxy: remote lifecycle ─────────────────────────────────────────
 
 
-# Only the server menu owns interactive single-node Telegram actions.
-telegram_proxy_remote_open_menu() {
-    local index="${1:-}" rc confirm_rc upload_allowed=false fingerprint version
+# core_telegram_menu INDEX — серверное меню Telegram Proxy одной ноды по SSH на
+# /dev/tty. Загрузка скриптов — через rc_confirm_gate (отпечаток комплекта и
+# VERSION входят в токен). rc 2 удалённой стороны → not_ready.
+core_telegram_menu() {
+    local index="${1:-}" rc upload_allowed=false fingerprint version
     local NODE_NAME SERVER_IP SERVER_PORT SERVER_USER SERVER_PASS SERVER_AUTH NODE_TAG NODE_ID NODE_IDENTITY
     _telegram_proxy_remote_clear_plan
-    [[ $# -eq 1 ]] && menu_index_valid "$index" "$(nodes_count)" || return 2
-    _telegram_proxy_remote_preflight "$index" || { _telegram_proxy_remote_clear_plan; return 1; }
+    if ! menu_index_valid "$index" "$(nodes_count)"; then
+        rc_fail usage "Неверный номер ноды: $index."
+        return 1
+    fi
+    if ! _telegram_proxy_remote_preflight "$index"; then
+        _telegram_proxy_remote_clear_plan
+        rc_fail failed "Предварительная проверка ноды Telegram Proxy не выполнена."
+        return 1
+    fi
     if [[ "${TELEGRAM_PROXY_PLAN_STATE[0]}" == excluded ]]; then
+        rc_fail not_ready "Нода ${TELEGRAM_PROXY_PLAN_NAME[0]} недоступна для меню Telegram Proxy: ${TELEGRAM_PROXY_PLAN_REASON[0]}"
         _telegram_proxy_remote_clear_plan
         return 1
     fi
-    if _telegram_proxy_remote_confirm_plan shared menu; then
-        confirm_rc=0
-    else
-        confirm_rc=$?
+    if [[ "${TELEGRAM_PROXY_PLAN_STATE[0]}" == upload ]]; then
+        _telegram_proxy_remote_plan_lines shared menu || { _telegram_proxy_remote_clear_plan; return 1; }
+        CORE_PLAN_LINES=("$TELEGRAM_PROXY_PLAN_LABEL" "${TELEGRAM_PROXY_PLAN_LINES[@]}")
+        CORE_PLAN_EXTRA="${TELEGRAM_PROXY_PLAN_FINGERPRINT} ${TELEGRAM_PROXY_PLAN_VERSION}"
+        if ! rc_confirm_gate; then
+            _telegram_proxy_remote_clear_plan
+            return 1
+        fi
+        upload_allowed=true
     fi
-    case "$confirm_rc" in
-        0) ;;
-        1) info "Операция отменена."; _telegram_proxy_remote_clear_plan; return 0 ;;
-        *) _telegram_proxy_remote_clear_plan; return 1 ;;
-    esac
     NODE_NAME="${TELEGRAM_PROXY_PLAN_NAME[0]}"
     SERVER_IP="${TELEGRAM_PROXY_PLAN_IP[0]}"
     SERVER_PORT="${TELEGRAM_PROXY_PLAN_PORT[0]}"
@@ -32,18 +42,17 @@ telegram_proxy_remote_open_menu() {
     NODE_TAG="${TELEGRAM_PROXY_PLAN_TAG[0]}"
     NODE_ID="${TELEGRAM_PROXY_PLAN_ID[0]}"
     NODE_IDENTITY="${TELEGRAM_PROXY_PLAN_IDENTITY[0]}"
-    [[ "${TELEGRAM_PROXY_PLAN_STATE[0]}" == upload ]] && upload_allowed=true
     fingerprint="$TELEGRAM_PROXY_PLAN_FINGERPRINT"
     version="$TELEGRAM_PROXY_PLAN_VERSION"
     _telegram_proxy_remote_clear_plan
-    _telegram_proxy_remote_execute_prepared shared menu false "$upload_allowed" "$fingerprint" "$version"
+    _rc_tty_run _telegram_proxy_remote_execute_prepared shared menu false "$upload_allowed" "$fingerprint" "$version"
     rc=$?
     case "$rc" in
-        0) ;;
-        2) warn "Скрипты на ноде не поддерживают меню Telegram Proxy. Загрузите скрипты принудительно (u в меню ноды)." ;;
-        *) warn "SSH-сессия Telegram Proxy завершилась с ошибкой." ;;
+        0) return 0 ;;
+        2) rc_fail not_ready "Скрипты на ноде не поддерживают меню Telegram Proxy: загрузите их принудительно (node upload-scripts --force)." ;;
+        *) rc_fail remote_failed "SSH-сессия Telegram Proxy завершилась с ошибкой." ;;
     esac
-    return "$rc"
+    return 1
 }
 
 _telegram_proxy_remote_action_is_valid() {
@@ -159,7 +168,7 @@ _telegram_proxy_remote_preflight() {
                         state=ready; reason=""
                         _ver_gt "$version" "$REMOTE_SCRIPTS_VERSION" && state=upload
                         ;;
-                    *) reason="версия скриптов неизвестна или установка повреждена — используйте «u» в меню ноды" ;;
+                    *) reason="версия скриптов неизвестна или установка повреждена — загрузите их принудительно: node upload-scripts --force" ;;
                 esac
             fi
         else
@@ -183,46 +192,53 @@ _telegram_proxy_remote_preflight() {
     return 0
 }
 
-_telegram_proxy_remote_confirm_plan() {
-    local component="$1" action="$2" label explanation src suffix eligible=0 confirm=false
-    local -a lines
+# Builds the review for a prepared preflight plan without prompting:
+# TELEGRAM_PROXY_PLAN_LABEL, TELEGRAM_PROXY_PLAN_LINES (explanation, then one
+# line per node), TELEGRAM_PROXY_PLAN_NEEDS_CONFIRM (destructive pair or any
+# upload) and TELEGRAM_PROXY_PLAN_ELIGIBLE (nodes not excluded). rc 2 on an
+# unknown component/action pair.
+_telegram_proxy_remote_plan_lines() {
+    local component="$1" action="$2" explanation src suffix
+    TELEGRAM_PROXY_PLAN_LABEL=""
+    TELEGRAM_PROXY_PLAN_LINES=()
+    TELEGRAM_PROXY_PLAN_NEEDS_CONFIRM=false
+    TELEGRAM_PROXY_PLAN_ELIGIBLE=0
     case "$component:$action" in
         mtproto:install)
-            label="Включение MTProto Proxy"
+            TELEGRAM_PROXY_PLAN_LABEL="Включение MTProto Proxy"
             explanation="В межсетевом экране провайдера разрешите TCP/2398 и запретите TCP/8888. Служба MTProxy устанавливается автоматически."
-            confirm=true ;;
+            TELEGRAM_PROXY_PLAN_NEEDS_CONFIRM=true ;;
         web:remove|mtproto:remove)
-            [[ "$component" == web ]] && label="Отключение Web Proxy" || label="Отключение MTProto Proxy"
+            [[ "$component" == web ]] && TELEGRAM_PROXY_PLAN_LABEL="Отключение Web Proxy" ||
+                TELEGRAM_PROXY_PLAN_LABEL="Отключение MTProto Proxy"
             explanation="Ссылки этого способа перестанут работать. Служба MTProxy будет удалена, если это последний способ доступа."
-            confirm=true ;;
+            TELEGRAM_PROXY_PLAN_NEEDS_CONFIRM=true ;;
         shared:remove-all)
-            label="Отключение Telegram Proxy"
+            TELEGRAM_PROXY_PLAN_LABEL="Отключение Telegram Proxy"
             explanation="Web Proxy, MTProto Proxy и служба MTProxy будут удалены. Все ссылки перестанут работать."
-            confirm=true ;;
-        shared:status) label="Общий статус нод"; explanation="Проверка состояния Telegram Proxy." ;;
-        shared:menu) label="Меню Telegram Proxy"; explanation="Открытие серверного меню Telegram Proxy по SSH." ;;
-        backend:restart) label="Перезапуск службы MTProxy"; explanation="Подключения Web Proxy и MTProto Proxy будут прерваны." ;;
-        web:restart) label="Перезапуск Web Proxy"; explanation="Подключения Web Proxy будут прерваны." ;;
-        web:update) label="Обновление Web Proxy"; explanation="Обновление Web Proxy на выбранных нодах." ;;
-        mtproto:refresh-ip) label="Обновление IP-адреса MTProto Proxy"; explanation="Обновление адреса MTProto Proxy на выбранных нодах." ;;
+            TELEGRAM_PROXY_PLAN_NEEDS_CONFIRM=true ;;
+        shared:status) TELEGRAM_PROXY_PLAN_LABEL="Общий статус нод"; explanation="Проверка состояния Telegram Proxy." ;;
+        shared:menu) TELEGRAM_PROXY_PLAN_LABEL="Меню Telegram Proxy"; explanation="Открытие серверного меню Telegram Proxy по SSH." ;;
+        backend:restart) TELEGRAM_PROXY_PLAN_LABEL="Перезапуск службы MTProxy"; explanation="Подключения Web Proxy и MTProto Proxy будут прерваны." ;;
+        web:restart) TELEGRAM_PROXY_PLAN_LABEL="Перезапуск Web Proxy"; explanation="Подключения Web Proxy будут прерваны." ;;
+        web:update) TELEGRAM_PROXY_PLAN_LABEL="Обновление Web Proxy"; explanation="Обновление Web Proxy на выбранных нодах." ;;
+        mtproto:refresh-ip) TELEGRAM_PROXY_PLAN_LABEL="Обновление IP-адреса MTProto Proxy"; explanation="Обновление адреса MTProto Proxy на выбранных нодах." ;;
         *) return 2 ;;
     esac
-    lines=("$explanation")
+    TELEGRAM_PROXY_PLAN_LINES=("$explanation")
     for ((src=0; src<${#TELEGRAM_PROXY_PLAN_INDEX[@]}; src++)); do
         suffix=""
         case "${TELEGRAM_PROXY_PLAN_STATE[$src]}" in
             upload)
                 suffix=" — будут загружены скрипты v$TELEGRAM_PROXY_PLAN_VERSION"
-                confirm=true; eligible=$((eligible + 1)) ;;
-            ready) eligible=$((eligible + 1)) ;;
+                TELEGRAM_PROXY_PLAN_NEEDS_CONFIRM=true
+                TELEGRAM_PROXY_PLAN_ELIGIBLE=$((TELEGRAM_PROXY_PLAN_ELIGIBLE + 1)) ;;
+            ready) TELEGRAM_PROXY_PLAN_ELIGIBLE=$((TELEGRAM_PROXY_PLAN_ELIGIBLE + 1)) ;;
             excluded) suffix=" — исключена: ${TELEGRAM_PROXY_PLAN_REASON[$src]}" ;;
         esac
-        lines+=("${TELEGRAM_PROXY_PLAN_NAME[$src]}  ${TELEGRAM_PROXY_PLAN_IP[$src]}:${TELEGRAM_PROXY_PLAN_PORT[$src]}$suffix")
+        TELEGRAM_PROXY_PLAN_LINES+=("${TELEGRAM_PROXY_PLAN_NAME[$src]}  ${TELEGRAM_PROXY_PLAN_IP[$src]}:${TELEGRAM_PROXY_PLAN_PORT[$src]}$suffix")
     done
-    (( eligible > 0 )) || return 0
-    [[ "$confirm" == true ]] || return 0
-    review_frame "Подтверждение: $label" "${lines[@]}"
-    confirm_yn "Выполнить?" N
+    return 0
 }
 
 _telegram_proxy_remote_execute_prepared() {
@@ -477,35 +493,33 @@ _telegram_proxy_status_result() {
     fi
 }
 
+# Статус одной ноды строками журнала; данные — в TELEGRAM_PROXY_RESULT_*.
 _telegram_proxy_render_status_panel() {
-    local name="$1" address="$2" code="$3" reason="$4" summary="$5"
-    local label color line
+    local name="$1" address="$2" code="$3" reason="$4" summary="$5" line
     case "$code" in
         0)
-            label="успешно${reason:+ ($reason)}"
-            color="$GREEN"
-            [[ -n "$reason" ]] && color="$YELLOW"
+            if [[ -n "$reason" ]]; then
+                warn "Telegram Proxy ${name}${address:+ ($address)}: успешно ($reason)"
+            else
+                success "Telegram Proxy ${name}${address:+ ($address)}: успешно"
+            fi
             ;;
-        3) label="пропущено: не установлен"; color="$DIM" ;;
-        4) label="частично: ${reason:-внешняя доступность не подтверждена}"; color="$YELLOW" ;;
-        *) label="ошибка: ${reason:-не удалось получить статус}"; color="$RED" ;;
+        3) info "Telegram Proxy ${name}${address:+ ($address)}: пропущено — не установлен" ;;
+        4) warn "Telegram Proxy ${name}${address:+ ($address)}: частично — ${reason:-внешняя доступность не подтверждена}" ;;
+        *) warn "Telegram Proxy ${name}${address:+ ($address)}: ошибка — ${reason:-не удалось получить статус}" ;;
     esac
+    [[ -n "$summary" ]] || return 0
+    while IFS= read -r line; do
+        printf '    %s\n' "$line"
+    done <<< "$summary"
+}
 
-    echo ""
-    box_top
-    box_center "Статус Telegram Proxy"
-    box_mid
-    box_line " Нода: ${name}${address:+  $address}"
-    box_line " Итог: $label" " Итог: ${color}${label}${NC}"
-    if [[ -n "$summary" ]]; then
-        box_mid
-        while IFS= read -r line; do
-            [[ "$line" == "Внешняя доступность:" ]] && box_mid
-            box_line " $line"
-        done <<< "$summary"
-    fi
-    box_bot
-    echo ""
+# serve игнорирует Ctrl+C на всём дереве пакета. Не заменяем SIG_IGN
+# обработчиком отмены; обычный интерактивный вызов остаётся прерываемым.
+_telegram_proxy_install_abort_traps() {
+    local handler="$1"
+    [[ "$(trap -p INT)" == "trap -- '' SIGINT" ]] || trap "$handler" INT
+    trap "$handler" TERM
 }
 
 _telegram_proxy_remote_worker_body() {
@@ -523,7 +537,7 @@ _telegram_proxy_remote_worker_body() {
         : > "$result_file.done"
         exit 130
     }
-    trap '_telegram_proxy_remote_worker_abort' INT TERM
+    _telegram_proxy_install_abort_traps _telegram_proxy_remote_worker_abort
     local rc=1 out safe_out status_json status_result pipeline_rc
     (
         _telegram_proxy_remote_execute_prepared "$component" "$action" "$force" \
@@ -618,10 +632,7 @@ _telegram_proxy_fifo_dispatch_job() {
         : > "$result_file.done"
         return 1
     fi
-    NODE_NAME="$NODE_NAME" SERVER_IP="$SERVER_IP" SERVER_PORT="$SERVER_PORT" \
-    SERVER_USER="$SERVER_USER" SERVER_PASS="$SERVER_PASS" SERVER_AUTH="$SERVER_AUTH" \
-    NODE_TAG="$NODE_TAG" NODE_ID="$NODE_ID" NODE_IDENTITY="$NODE_IDENTITY" \
-    CURRENT_VERSION="${CURRENT_VERSION:-}" \
+    CURRENT_VERSION="${CURRENT_VERSION:-}"
     _telegram_proxy_remote_worker_body "$slot" "$source_index" "$component" "$action" \
         "$force" "$result_file" "$output_file" "$upload_allowed" "$fingerprint" "$version"
 }
@@ -666,7 +677,7 @@ _telegram_proxy_fifo_dispatcher() {
         done
         return 1
     }
-    trap '_telegram_proxy_fifo_dispatcher_abort' INT TERM
+    _telegram_proxy_install_abort_traps _telegram_proxy_fifo_dispatcher_abort
     while true; do
         _telegram_proxy_fifo_reap_finished && continue
         slot=0
@@ -724,6 +735,8 @@ _telegram_proxy_mtproto_probe() {
 
 TELEGRAM_PROXY_BATCH_DIR=""
 TELEGRAM_PROXY_BATCH_PIDS=""
+TELEGRAM_PROXY_BATCH_TRAPS=""
+TELEGRAM_PROXY_BATCH_ABORTED=0
 _telegram_proxy_remote_batch_abort() {
     local pid
     exec 9>&- 2>/dev/null || true
@@ -737,8 +750,20 @@ _telegram_proxy_remote_batch_abort() {
     TELEGRAM_PROXY_BATCH_DIR=""
     TELEGRAM_PROXY_BATCH_PIDS=""
     _telegram_proxy_remote_clear_plan
+    TELEGRAM_PROXY_BATCH_ABORTED=1
+    _telegram_proxy_batch_restore_traps
+}
+
+# Восстанавливает INT/TERM/HUP, сохранённые до пакета (например, `trap '' INT`
+# у serve); без сохранённых — сбрасывает на значения по умолчанию.
+_telegram_proxy_batch_restore_traps() {
     trap - INT TERM HUP
-    exit 130
+    [[ -z "$TELEGRAM_PROXY_BATCH_TRAPS" ]] || eval "$TELEGRAM_PROXY_BATCH_TRAPS"
+    TELEGRAM_PROXY_BATCH_TRAPS=""
+}
+
+_telegram_proxy_batch_aborted() {
+    [[ "${TELEGRAM_PROXY_BATCH_ABORTED:-0}" == 1 ]]
 }
 
 # FIFO source queue with four independent worker slots. Source indexes are
@@ -746,6 +771,10 @@ _telegram_proxy_remote_batch_abort() {
 # can be reused by the next source item without disturbing result ordering.
 telegram_proxy_remote_batch() {
     local component="${1:-}" action="${2:-}" force="${3:-false}"
+    # Machine-readable per-node outcome (same order as the plan); reasons are
+    # redacted like the printed summary.
+    local result_reason
+    TELEGRAM_PROXY_RESULT_NAMES=() TELEGRAM_PROXY_RESULT_CODES=() TELEGRAM_PROXY_RESULT_REASONS=()
     if [[ $# -ne 3 ]] || ! _telegram_proxy_remote_action_is_valid "$component" "$action" ||
        [[ "$force" != true && "$force" != false ]]; then
         _telegram_proxy_remote_clear_plan; return 2
@@ -772,11 +801,16 @@ telegram_proxy_remote_batch() {
     chmod 600 "$fifo" 2>/dev/null || true
     TELEGRAM_PROXY_BATCH_DIR="$dir"
     TELEGRAM_PROXY_BATCH_PIDS=""
-    trap '_telegram_proxy_remote_batch_abort' INT TERM HUP
+    TELEGRAM_PROXY_BATCH_ABORTED=0
+    trap -p INT TERM HUP > "$dir/traps" 2>/dev/null || true
+    TELEGRAM_PROXY_BATCH_TRAPS=$(cat "$dir/traps" 2>/dev/null)
+    _telegram_proxy_install_abort_traps _telegram_proxy_remote_batch_abort
+    trap '_telegram_proxy_remote_batch_abort' HUP
 
     local -a source_name source_ip source_port source_queued results outputs worker_pids
     local src cred_file worker_count line rc code reason j upload_allowed aggregate=0
     for ((src=0; src<count; src++)); do
+        _telegram_proxy_batch_aborted && return 130
         source_name[$src]="${TELEGRAM_PROXY_PLAN_NAME[$src]}"
         source_ip[$src]="${TELEGRAM_PROXY_PLAN_IP[$src]}"
         source_port[$src]="${TELEGRAM_PROXY_PLAN_PORT[$src]}"
@@ -801,7 +835,7 @@ telegram_proxy_remote_batch() {
             rm -rf "$dir"
             TELEGRAM_PROXY_BATCH_DIR=""; TELEGRAM_PROXY_BATCH_PIDS=""
             _telegram_proxy_remote_clear_plan
-            trap - INT TERM HUP
+            _telegram_proxy_batch_restore_traps
             return 1
         }
         chmod 600 "$cred_file" 2>/dev/null || true
@@ -815,7 +849,7 @@ telegram_proxy_remote_batch() {
     if (( worker_count > 0 )); then
         # O_RDWR keeps the producer open while the dispatcher starts, avoiding
         # the classic FIFO open/open deadlock on Bash 3.2.
-        exec 9<>"$fifo" || _telegram_proxy_remote_batch_abort
+        exec 9<>"$fifo" || { _telegram_proxy_remote_batch_abort; return 130; }
         (
             umask 077
             _telegram_proxy_fifo_dispatcher "$fifo" "$dir"
@@ -833,9 +867,10 @@ telegram_proxy_remote_batch() {
         exec 9>&-
         _telegram_proxy_remote_clear_plan
         if wait "${worker_pids[0]}" 2>/dev/null; then :; else :; fi
+        _telegram_proxy_batch_aborted && return 130
         local barrier_wait=0 barrier_limit="${SSH_RUN_TIMEOUT:-120}"
         barrier_limit=$((barrier_limit + 10))
-        while (( barrier_wait < barrier_limit )); do
+        while (( barrier_wait < barrier_limit )) && ! _telegram_proxy_batch_aborted; do
             local complete=0
             for ((src=0; src<count; src++)); do
                 [[ "${source_queued[$src]:-0}" != 1 || -e "$dir/r$src.done" ]] &&
@@ -853,7 +888,8 @@ telegram_proxy_remote_batch() {
         done
     fi
 
-    trap - INT TERM HUP
+    _telegram_proxy_batch_aborted && return 130
+    _telegram_proxy_batch_restore_traps
     info "Результаты Telegram Proxy:"
     for ((j=0; j<count; j++)); do
         if [[ -z "${results[$j]:-}" && -s "$dir/r$j" ]]; then
@@ -875,6 +911,11 @@ telegram_proxy_remote_batch() {
             0) ;;
             *) aggregate=1 ;;
         esac
+        result_reason="$reason"
+        [[ -n "$result_reason" ]] || result_reason="${outputs[$j]%%$'\n'*}"
+        TELEGRAM_PROXY_RESULT_NAMES[$j]="${source_name[$j]:-#${indexes[$j]}}"
+        TELEGRAM_PROXY_RESULT_CODES[$j]="$code"
+        TELEGRAM_PROXY_RESULT_REASONS[$j]=$(printf '%s\n' "$result_reason" | _telegram_proxy_redact)
         if [[ "$component:$action" == shared:status ]]; then
             _telegram_proxy_render_status_panel \
                 "${source_name[$j]:-#${indexes[$j]}}" "${source_ip[$j]:-}" \
@@ -900,195 +941,56 @@ telegram_proxy_remote_batch() {
     rm -rf -- "$dir"
     TELEGRAM_PROXY_BATCH_DIR=""
     TELEGRAM_PROXY_BATCH_PIDS=""
-    trap - INT TERM HUP
     _telegram_proxy_remote_clear_plan
     return "$aggregate"
 
 }
 
-TELEGRAM_PROXY_COMPONENT=""
-_telegram_proxy_remote_component_select() {
-    local choice
-    TELEGRAM_PROXY_COMPONENT=""
-    while true; do
-        echo ""
-        box_top
-        box_center "Способ доступа Telegram Proxy"
-        box_mid
-        menu_item w "Web Proxy" CYAN
-        menu_item m "MTProto Proxy" CYAN
-        menu_item 0 "Отмена" NC
-        box_bot
-        echo ""
-        if ! IFS= read -rp "  Выберите способ доступа: " choice; then
-            return 1
-        fi
-        choice="${choice%$'\r'}"
-        case "$choice" in
-            w|W) TELEGRAM_PROXY_COMPONENT=web; return 0 ;;
-            m|M) TELEGRAM_PROXY_COMPONENT=mtproto; return 0 ;;
-            0) return 1 ;;
-            *) warn "Неверный выбор." ;;
-        esac
-    done
-}
-
-_telegram_proxy_remote_run() {
-    local component="${1:-}" action="${2:-}" force="${3:-false}"
+# Non-interactive batch for the command core: validation and read-only
+# preflight of every node. A destructive action or
+# an upload goes through rc_confirm_gate (plan: label + lines; the bundle
+# fingerprint and VERSION are part of the token), so nothing is written
+# without --yes. Otherwise returns the batch aggregate (0/3/4/1) and leaves
+# TELEGRAM_PROXY_RESULT_* filled.
+core_telegram_run() {
+    local component="${1:-}" action="${2:-}"
+    local force=false index count
     _telegram_proxy_remote_clear_plan
-    (( $# >= 4 )) || return 2
-    shift 3
-    _telegram_proxy_remote_action_is_valid "$component" "$action" || return 2
-    [[ "$force" == true || "$force" == false ]] || return 2
-    if _telegram_proxy_remote_force_allowed "$component" "$action"; then
-        [[ "$force" == true ]] || return 2
-    else
-        [[ "$force" == false ]] || return 2
+    TELEGRAM_PROXY_RESULT_NAMES=() TELEGRAM_PROXY_RESULT_CODES=() TELEGRAM_PROXY_RESULT_REASONS=()
+    if (( $# < 3 )); then
+        rc_fail usage "Не выбраны ноды для операции Telegram Proxy."
+        return 1
     fi
-    local index count confirm_rc
+    shift 2
+    if ! _telegram_proxy_remote_action_is_valid "$component" "$action"; then
+        rc_fail usage "Неизвестная операция Telegram Proxy: $component $action."
+        return 1
+    fi
+    _telegram_proxy_remote_force_allowed "$component" "$action" && force=true
     count=$(nodes_count)
     for index in "$@"; do
-        menu_index_valid "$index" "$count" || return 2
-    done
-    _telegram_proxy_remote_preflight "$@" || { _telegram_proxy_remote_clear_plan; return 1; }
-    if _telegram_proxy_remote_confirm_plan "$component" "$action"; then
-        confirm_rc=0
-    else
-        confirm_rc=$?
-    fi
-    case "$confirm_rc" in
-        0) telegram_proxy_remote_batch "$component" "$action" "$force"; return $? ;;
-        1) info "Операция отменена."; _telegram_proxy_remote_clear_plan; return 0 ;;
-        *) _telegram_proxy_remote_clear_plan; return 1 ;;
-    esac
-}
-
-_telegram_proxy_remote_pick_multi() {
-    TELEGRAM_PROXY_SELECTED=()
-    TOGGLE_SELECT_ITEMS=()
-    TOGGLE_SELECT_FLAGS=()
-    local count
-    count=$(nodes_count)
-    if ! [[ "$count" =~ ^[1-9][0-9]*$ ]]; then
-        echo ""
-        box_top
-        box_center "Выбор нод Telegram Proxy"
-        box_mid
-        box_line " Нет нод для выбора" " ${DIM}Нет нод для выбора${NC}"
-        box_mid
-        menu_item 0 "Отмена" NC
-        box_bot
-        echo ""
-        return 1
-    fi
-    local -a labels flags
-    labels=()
-    flags=()
-    local name address
-    while IFS=$'\t' read -r name address; do
-        labels+=("$name  $address")
-        flags+=(0)
-    done < <(jq_r '.nodes[] | "\(.name)\t\(.ip):\(.port)"')
-    if ((${#labels[@]} == 0)); then
-        TOGGLE_SELECT_ITEMS=()
-        TOGGLE_SELECT_FLAGS=()
-        echo ""
-        box_top
-        box_center "Выбор нод Telegram Proxy"
-        box_mid
-        box_line " Нет нод для выбора" " ${DIM}Нет нод для выбора${NC}"
-        box_mid
-        menu_item 0 "Отмена" NC
-        box_bot
-        echo ""
-        return 1
-    fi
-    TOGGLE_SELECT_ITEMS=("${labels[@]}")
-    TOGGLE_SELECT_FLAGS=("${flags[@]}")
-    toggle_select "Выберите ноды Telegram Proxy"
-    local toggle_rc=$?
-    if (( toggle_rc != 0 )); then
-        TOGGLE_SELECT_ITEMS=()
-        TOGGLE_SELECT_FLAGS=()
-        return 1
-    fi
-    flags=("${TOGGLE_SELECT_FLAGS[@]}")
-    TOGGLE_SELECT_ITEMS=()
-    TOGGLE_SELECT_FLAGS=()
-    local i
-    for ((i=0; i<${#flags[@]}; i++)); do
-        [[ "${flags[$i]}" == 1 ]] && TELEGRAM_PROXY_SELECTED+=("$((i + 1))")
-    done
-    ((${#TELEGRAM_PROXY_SELECTED[@]} > 0)) || {
-        warn "Не выбрана ни одна нода."
-        return 1
-    }
-}
-
-telegram_proxy_remote_menu() {
-    local pick component
-    while true; do
-        echo ""
-        box_top
-        box_center "Telegram Proxy — несколько нод"
-        box_mid
-        box_line " Операции для нескольких нод."
-        box_line " Ссылки, секрет и Спонсорский тег — в «Управление одной нодой»."
-        box_mid
-        menu_item 1 "Управление одной нодой" CYAN
-        menu_item 2 "Общий статус нод" CYAN
-        menu_item 3 "Включить MTProto Proxy" GREEN
-        menu_item 4 "Обновить IP-адрес MTProto Proxy" YELLOW
-        menu_item 5 "Обновить Web Proxy" YELLOW
-        menu_item 6 "Перезапустить Web Proxy" YELLOW
-        menu_item 7 "Перезапустить службу MTProxy" YELLOW
-        menu_item 8 "Отключить способ доступа" RED
-        menu_item 9 "Отключить Telegram Proxy полностью" RED
-        menu_item 0 "Назад" NC
-        box_bot
-        echo ""
-        if ! IFS= read -rp "  Выберите действие: " pick; then
-            _telegram_proxy_remote_clear_plan
-            return 0
+        if ! menu_index_valid "$index" "$count"; then
+            rc_fail usage "Неверный номер ноды: $index."
+            return 1
         fi
-        pick="${pick%$'\r'}"
-        case "$pick" in
-            0) _telegram_proxy_remote_clear_plan; return 0 ;;
-            1)
-                node_pick "Telegram Proxy — выбор ноды" || continue
-                telegram_proxy_remote_open_menu "$NODE_PICK_INDEX" || true
-                ;;
-            2) _telegram_proxy_remote_batch_component shared status || continue ;;
-            3) _telegram_proxy_remote_batch_component mtproto install || continue ;;
-            4) _telegram_proxy_remote_batch_component mtproto refresh-ip || continue ;;
-            5) _telegram_proxy_remote_batch_component web update || continue ;;
-            6) _telegram_proxy_remote_batch_component web restart || continue ;;
-            7) _telegram_proxy_remote_batch_component backend restart || continue ;;
-            8)
-                _telegram_proxy_remote_component_select || continue
-                component="$TELEGRAM_PROXY_COMPONENT"
-                _telegram_proxy_remote_batch_component "$component" remove || continue
-                ;;
-            9) _telegram_proxy_remote_batch_component shared remove-all || continue ;;
-            *) warn "Неверный выбор." ;;
-        esac
     done
-}
-
-_telegram_proxy_remote_batch_component() {
-    local component="$1" action="$2" force=false rc
-    _telegram_proxy_remote_clear_plan
-    _telegram_proxy_remote_pick_multi || return 0
-    _telegram_proxy_remote_force_allowed "$component" "$action" && force=true
-    if _telegram_proxy_remote_run "$component" "$action" "$force" "${TELEGRAM_PROXY_SELECTED[@]}"; then
-        rc=0
-    else
-        rc=$?
+    if ! _telegram_proxy_remote_preflight "$@"; then
+        _telegram_proxy_remote_clear_plan
+        rc_fail failed "Предварительная проверка нод Telegram Proxy не выполнена."
+        return 1
     fi
-    TELEGRAM_PROXY_SELECTED=()
-    case "$rc" in
-        0|3|4) ;;
-        *) warn "Операция Telegram Proxy завершилась с ошибкой. Подробности по нодам выше." ;;
-    esac
-    return "$rc"
+    if ! _telegram_proxy_remote_plan_lines "$component" "$action"; then
+        _telegram_proxy_remote_clear_plan
+        rc_fail usage "Неизвестная операция Telegram Proxy: $component $action."
+        return 1
+    fi
+    if [[ "$TELEGRAM_PROXY_PLAN_NEEDS_CONFIRM" == true ]] && (( TELEGRAM_PROXY_PLAN_ELIGIBLE > 0 )); then
+        CORE_PLAN_LINES=("$TELEGRAM_PROXY_PLAN_LABEL" "${TELEGRAM_PROXY_PLAN_LINES[@]}")
+        CORE_PLAN_EXTRA="${TELEGRAM_PROXY_PLAN_FINGERPRINT} ${TELEGRAM_PROXY_PLAN_VERSION}"
+        if ! rc_confirm_gate; then
+            _telegram_proxy_remote_clear_plan
+            return 1
+        fi
+    fi
+    telegram_proxy_remote_batch "$component" "$action" "$force"
 }

@@ -62,3 +62,90 @@ teardown() {
     [ "$(pkg_name_for systemctl)" = systemctl ]
     [ "$(pkg_name_for useradd)" = useradd ]
 }
+
+# Fixture bundle models command behaviour; the official archive is exercised by
+# the separate installed-layout smoke, not downloaded during the unit suite.
+_age_fixture() {
+    export PATH="$FAKE_BIN:$ORIGINAL_PATH" XDG_CACHE_HOME="$BATS_TEST_TMPDIR/cache"
+    AGE_BIN=age AGE_KEYGEN_BIN=age-keygen
+    mkdir -p "$BATS_TEST_TMPDIR/bundle/age"
+    local f
+    for f in age age-keygen age-plugin-batchpass; do
+        printf '#!/bin/bash\nif [[ "$1" == --version ]]; then echo v1.3.2; else cat; fi\n' > "$BATS_TEST_TMPDIR/bundle/age/$f"
+        chmod +x "$BATS_TEST_TMPDIR/bundle/age/$f"
+    done
+    tar -czf "$BATS_TEST_TMPDIR/bundle.tar.gz" -C "$BATS_TEST_TMPDIR/bundle" age
+    printf '#!/bin/bash\necho v1.1.1\n' > "$FAKE_BIN/age"
+    chmod +x "$FAKE_BIN/age"
+    curl() {
+        printf '%s\n' "$*" >> "$INSTALL_JOURNAL"
+        cp "$BATS_TEST_TMPDIR/bundle.tar.gz" "${@: -1}"
+    }
+    sha256sum() { echo 'cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10  archive'; }
+    uname() { [[ "$1" == -s ]] && echo Linux || echo x86_64; }
+}
+
+@test "old system age installs a private versioned bundle and reuses it" {
+    _age_fixture
+    ensure_age_batchpass
+    [ "$AGE_BIN" = "$XDG_CACHE_HOME/remote-control-essence/tools/age-v1.3.2/age" ]
+    [ -x "$AGE_KEYGEN_BIN" ]
+    [ -x "$(dirname "$AGE_BIN")/age-plugin-batchpass" ]
+    [ "$("$FAKE_BIN/age" --version)" = v1.1.1 ]
+    [ "$(wc -l < "$INSTALL_JOURNAL")" -eq 1 ]
+    AGE_BIN=age AGE_KEYGEN_BIN=age-keygen
+    ensure_age_batchpass
+    [ "$(wc -l < "$INSTALL_JOURNAL")" -eq 1 ]
+}
+
+@test "compatible native toolchain is retained and explicit invalid override is rejected" {
+    _age_fixture
+    cp "$BATS_TEST_TMPDIR/bundle/age/"* "$FAKE_BIN/"
+    ensure_age_batchpass
+    [ "$AGE_BIN" = "$FAKE_BIN/age" ]
+    [ "$AGE_KEYGEN_BIN" = "$FAKE_BIN/age-keygen" ]
+    [ "$("$AGE_BIN" --version)" = v1.3.2 ]
+    [ ! -s "$INSTALL_JOURNAL" ]
+    cd "$BATS_TEST_TMPDIR"
+    AGE_BIN=./commands/age AGE_KEYGEN_BIN=./commands/age-keygen
+    ensure_age_batchpass
+    [ "$AGE_BIN" = "$FAKE_BIN/age" ]
+    [ "$AGE_KEYGEN_BIN" = "$FAKE_BIN/age-keygen" ]
+    [ ! -s "$INSTALL_JOURNAL" ]
+    AGE_BIN="$BATS_TEST_TMPDIR/missing-age"
+    ! ensure_age_batchpass || return 1
+    [ "$AGE_BIN" = "$BATS_TEST_TMPDIR/missing-age" ]
+    [ ! -s "$INSTALL_JOURNAL" ]
+    AGE_BIN=age AGE_KEYGEN_BIN=age-keygen
+    age() { echo v1.3.2; }
+    ! ensure_age_batchpass || return 1
+    [ ! -s "$INSTALL_JOURNAL" ]
+    unset -f age
+    AGE_BIN="$BATS_TEST_TMPDIR/not-executable"
+    printf '#!/bin/bash\n' > "$AGE_BIN"
+    ! ensure_age_batchpass || return 1
+    [ ! -s "$INSTALL_JOURNAL" ]
+}
+
+@test "unsupported and Termux platforms do not install a glibc bundle" {
+    _age_fixture
+    uname() { [[ "$1" == -s ]] && echo Linux || echo riscv64; }
+    ! ensure_age_batchpass || return 1
+    [ ! -s "$INSTALL_JOURNAL" ]
+    PM=termux
+    pm_install() { return 1; }
+    ! ensure_age_batchpass || return 1
+    [ ! -s "$INSTALL_JOURNAL" ]
+}
+
+@test "unsafe cache link and incorrect archive digest are rejected" {
+    _age_fixture
+    mkdir -p "$XDG_CACHE_HOME" "$BATS_TEST_TMPDIR/outside"
+    ln -s "$BATS_TEST_TMPDIR/outside" "$XDG_CACHE_HOME/remote-control-essence"
+    ! ensure_age_batchpass || return 1
+    [ ! -s "$INSTALL_JOURNAL" ]
+    rm "$XDG_CACHE_HOME/remote-control-essence"
+    sha256sum() { echo 'bad  archive'; }
+    ! ensure_age_batchpass || return 1
+    [ ! -e "$XDG_CACHE_HOME/remote-control-essence/tools/age-v1.3.2" ]
+}

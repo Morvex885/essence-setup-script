@@ -170,33 +170,6 @@ _node_context() {
     cmp "$STATE_MANIFEST" "$BATS_TEST_TMPDIR/manifest.before"
 }
 
-@test "node_prompt_password: cancellation EOF and empty input do not mutate" {
-    cp "$SECRETS_JSON" "$BATS_TEST_TMPDIR/secrets.before"
-    state_action() { touch "$BATS_TEST_TMPDIR/mutation"; return 0; }
-    run node_prompt_password 2 <<< "n"
-    assert_failure
-    run node_prompt_password 2 < /dev/null
-    assert_failure
-    run node_prompt_password 2 <<< $'y\n'
-    assert_failure
-    run node_prompt_password 2 <<< "y"
-    assert_failure
-    cmp "$SECRETS_JSON" "$BATS_TEST_TMPDIR/secrets.before"
-    [[ ! -e "$BATS_TEST_TMPDIR/mutation" ]]
-}
-
-@test "node_prompt_password: saves via state action without connecting" {
-    ssh_run() { touch "$BATS_TEST_TMPDIR/ssh-calls.log"; return 1; }
-    ssh_connect() { touch "$BATS_TEST_TMPDIR/ssh-calls.log"; return 1; }
-    upload_scripts() { touch "$BATS_TEST_TMPDIR/ssh-calls.log"; return 1; }
-    run node_prompt_password 2 <<< $'y\nsynthetic-replacement'
-    assert_success
-    [[ "$output" != *synthetic-replacement* ]]
-    node_load 2
-    [[ "$SERVER_PASS" == synthetic-replacement ]]
-    [[ ! -e "$BATS_TEST_TMPDIR/ssh-calls.log" ]]
-}
-
 @test "node_save_password: failed secret write restores original files and absent manifest" {
     local id
     id=$(jq_r '.nodes[1].id')
@@ -215,21 +188,40 @@ _node_context() {
     local id
     id=$(jq_r '.nodes[1].id')
     node_secret_delete "$id"
-    confirm_yn() { return 1; }
     _ssh_known_host_present() { [[ "$SERVER_IP" == 1.2.3.4 ]]; }
     _ssh_pin_host_key() { touch "$BATS_TEST_TMPDIR/ssh-calls.log"; return 1; }
     ssh_run() { touch "$BATS_TEST_TMPDIR/ssh-calls.log"; return 1; }
-    _github_initial_portable_onboarding
+    _github_initial_portable_onboarding no rollback
     jq -e --arg id "$id" '
         any(.portability.issues[]; .node_id==$id and .reason=="missing_secret") and
         any(.portability.issues[]; .node_id==$id and .reason=="missing_host_key")
     ' "$STATE_MANIFEST"
     [[ ! -e "$BATS_TEST_TMPDIR/ssh-calls.log" ]]
     _ssh_known_host_present() { return 0; }
-    _github_initial_portable_onboarding
+    _github_initial_portable_onboarding no rollback
     jq -e --arg id "$id" '
         any(.portability.issues[]; .node_id==$id and .reason=="missing_secret") and
         all(.portability.issues[]; .node_id!=$id or .reason!="missing_host_key")
     ' "$STATE_MANIFEST"
     [[ ! -e "$BATS_TEST_TMPDIR/ssh-calls.log" ]]
+}
+
+# ─── security round 1: nodes ───
+
+@test "node_load: refuses a login, address or key reference unsafe for ssh" {
+    local before="$BATS_TEST_TMPDIR/config.before" filter id
+    cp "$CONFIG_JSON" "$before"
+    id=$(jq -r '.nodes[0].id' "$before")
+    for filter in '.nodes[0].user="-oProxyCommand=touch /tmp/pwned #"' \
+        '.nodes[0].user="root\n-oProxyCommand=x"' '.nodes[0].user="a@b"' \
+        '.nodes[0].ip="-oProxyCommand=x"' '.nodes[0].ip="1.2.3.4 -p 2"' \
+        '.nodes[0].ip="1.2.3.4\n"' '.nodes[0].identity="../home/.ssh/id_victim"' \
+        '.nodes[0].identity=.nodes[1].id'; do
+        jq "$filter" "$before" > "$CONFIG_JSON"
+        run node_load 1
+        [ "$status" -eq 1 ] || { echo "accepted: $filter"; return 1; }
+    done
+    jq '.nodes[0].ip="2001:db8::1" | .nodes[0].identity=.nodes[0].id' "$before" > "$CONFIG_JSON"
+    node_load 1
+    [[ "$SERVER_IP" == 2001:db8::1 && "$NODE_IDENTITY" == "$id" ]]
 }
