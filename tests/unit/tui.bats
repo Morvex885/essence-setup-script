@@ -375,11 +375,11 @@ EOF
 _write_stub() {
     cat > "$FX/stub.sh" <<'EOF'
 tui_call() {
-    local key="$1_$2" n f resp i
+    local key="$1${2:+_$2}" command="$1${2:+ $2}" n f resp i
     printf '%s\n' "$*" >> "$FX/calls.log"
     [[ -z "${TUI_SECRETS:-}" ]] || printf '%s\n' "$(printf '%s' "$TUI_SECRETS" | jq -r '.password // empty')" >> "$FX/pw.log"
     [[ -z "${TUI_SECRETS:-}" ]] || printf '%s %s\n' "$*" "$TUI_SECRETS" >> "$FX/secrets.log"
-    n=$(grep -c -e "^$1 $2\( \|\$\)" "$FX/calls.log")
+    n=$(grep -c -e "^$command\( \|\$\)" "$FX/calls.log")
     f="$FX/$key.$n"
     [[ -f "$f" ]] || f="$FX/$key"
     [[ -f "$f" ]] || f="$FX/$1"
@@ -1588,6 +1588,19 @@ secrets() { cat "$BATS_TEST_TMPDIR/fx/secrets.log" 2>/dev/null || true; }
     fx self_version '{"ok":true,"data":{"current":"1.1.0","latest":null,"update_available":false,"checked":false}}'
     scr 'tui_settings' <<< $'u\n0'
     [[ "$output" == *'Не удалось проверить обновления'* && "$output" == *'Неверный выбор.'* ]]
+}
+
+@test "screens: settings reuse the version check but refresh password state on redraw" {
+    _system_fixtures
+    fx status.1 '{"ok":true,"data":{"script_password":false}}'
+    fx status.2 '{"ok":true,"data":{"script_password":true}}'
+    scr 'tui_settings' <<< $'z\n0'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *'Установить пароль запуска'* ]]
+    [[ "$output" == *'Сменить пароль запуска'* ]]
+    [[ "$output" == *'Убрать пароль запуска'* ]]
+    [ "$(calls | grep -c '^self version$')" -eq 1 ]
+    [ "$(calls | grep -c '^status$')" -eq 2 ]
 }
 
 @test "screens: first run creates a local configuration, starts the wizard or exits" {

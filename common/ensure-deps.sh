@@ -221,11 +221,15 @@ ensure_age_batchpass() {
         *) warn "Нет проверенного age bundle для $os/$arch: установите age >= 1.3.2 и age-plugin-batchpass вручную."; return 1 ;;
     esac
     (
-    mkdir "$tools/.age-v1.3.2.lock" 2>/dev/null || { warn "Установка age уже выполняется."; exit 1; }
+    mkdir "$tools/.age-v1.3.2.lock" 2>/dev/null || {
+        warn "Установка age уже выполняется. Если другой установки нет, удалите каталог: $tools/.age-v1.3.2.lock"
+        exit 1
+    }
     trap '[[ -z "${tmp:-}" ]] || rm -rf "$tmp"; rmdir "$tools/.age-v1.3.2.lock" 2>/dev/null || true' EXIT
     tmp=$(umask 077; mktemp -d "$tools/.age-v1.3.2.XXXXXX") || exit 1
     info "Устанавливаем проверенный age v1.3.2 в пользовательский cache..."
-    curl -fsSL "https://github.com/FiloSottile/age/releases/download/v1.3.2/age-v1.3.2-${os}-${arch}.tar.gz" -o "$tmp/age.tar.gz" || rc=1
+    curl -fsSL --connect-timeout 15 --max-time 300 \
+        "https://github.com/FiloSottile/age/releases/download/v1.3.2/age-v1.3.2-${os}-${arch}.tar.gz" -o "$tmp/age.tar.gz" || rc=1
     if (( rc == 0 )); then
         if command -v sha256sum >/dev/null 2>&1; then
             hash=$(sha256sum "$tmp/age.tar.gz") || rc=1

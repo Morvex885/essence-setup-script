@@ -897,6 +897,47 @@ _rc_lock_owner_field() {
     return 1
 }
 
+# Выбор чистильщика — внутри самого каталога: запоздавший конкурент не должен
+# переименовать уже новый лок по сохранённому PID. Cwd привязывает проверку и
+# очистку служебного каталога к прежнему inode, даже если путь уже заменён.
+_rc_lock_reclaim() (
+    local dir="$1" pid incomplete_stale=false elected=false interrupted=false ignore_int=false
+    [[ "$(trap -p INT)" == "trap -- '' SIGINT" ]] && ignore_int=true
+    [[ "$dir" == /* ]] || dir="$PWD/$dir"
+    cd "$dir" 2>/dev/null || return 1
+    pid=$(_rc_lock_owner_field owner pid) || pid=""
+    if [[ -n "$pid" && "$pid" != "$$" ]] && kill -0 "$pid" 2>/dev/null; then
+        return 1
+    fi
+    if [[ -z "$pid" && -n "$(find . -maxdepth 0 -mmin +1 2>/dev/null)" ]]; then
+        incomplete_stale=true
+    fi
+    # Во время mkdir сигнал откладывает выход до определения его результата:
+    # EXIT снимает только собственный выбор, а не чужой .reclaim при отказе.
+    trap '[[ "$elected" != true ]] || rmdir .reclaim 2>/dev/null || true' EXIT
+    trap 'interrupted=true' HUP TERM
+    [[ "$ignore_int" == true ]] || trap 'interrupted=true' INT
+    mkdir .reclaim 2>/dev/null || return 1
+    elected=true
+    trap 'exit 1' HUP TERM
+    [[ "$ignore_int" == true ]] || trap 'exit 1' INT
+    [[ "$interrupted" == false ]] || return 1
+    # SIGKILL нельзя перехватить: оставшийся .reclaim не удаляется конкурентом.
+    # По истечении RC_LOCK_WAIT вызывающий код вернёт безопасную диагностику.
+    [[ "$dir" -ef . ]] || return 1
+    pid=$(_rc_lock_owner_field owner pid) || pid=""
+    if [[ -z "$pid" ]]; then
+        [[ "$incomplete_stale" == true ]] || return 1
+    elif [[ "$pid" != "$$" ]] && kill -0 "$pid" 2>/dev/null; then
+        return 1
+    fi
+    # .reclaim остаётся внутри до rename: третьему процессу не открывается
+    # незаблокированный путь между повторной проверкой владельца и удалением.
+    rm -rf "$dir.stale.$$" 2>/dev/null
+    mv "$dir" "$dir.stale.$$" 2>/dev/null || return 1
+    rm -rf "$dir.stale.$$"
+)
+
 rc_lock_acquire() {
     local kind="${1:-mutation}" label="${2:-}" dir pid owner_kind owner_label deadline now stale wait_s
     dir=$(_rc_lock_dir)
@@ -938,17 +979,18 @@ rc_lock_acquire() {
             # подпроцесса этого же процесса ($$ в подоболочке — PID родителя).
             stale=true
         fi
-        if [[ "$stale" == true ]]; then
-            rm -rf "$dir.stale.$$" 2>/dev/null
-            if mv "$dir" "$dir.stale.$$" 2>/dev/null; then
-                rm -rf "$dir.stale.$$"
-                continue
-            fi
+        if [[ "$stale" == true ]] && _rc_lock_reclaim "$dir"; then
+            continue
         fi
+        pid=$(_rc_lock_owner_field "$dir/owner" pid) || pid=""
         owner_kind=$(_rc_lock_owner_field "$dir/owner" kind) || owner_kind=""
         owner_label=$(_rc_lock_owner_field "$dir/owner" label) || owner_label=""
         now=$(date +%s)
         if [[ "$owner_kind" == session ]] || (( now >= deadline )); then
+            if [[ -d "$dir/.reclaim" ]]; then
+                rc_fail locked "Не завершена очистка блокировки: $dir/.reclaim. Убедитесь, что другие операции не выполняются, и только затем удалите этот служебный каталог вручную."
+                return 1
+            fi
             rc_fail locked "Конфигурация занята другим процессом (PID ${pid:-?}: ${owner_label:-?}). Повторите после его завершения."
             return 1
         fi

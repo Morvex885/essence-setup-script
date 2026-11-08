@@ -514,6 +514,14 @@ _telegram_proxy_render_status_panel() {
     done <<< "$summary"
 }
 
+# serve игнорирует Ctrl+C на всём дереве пакета. Не заменяем SIG_IGN
+# обработчиком отмены; обычный интерактивный вызов остаётся прерываемым.
+_telegram_proxy_install_abort_traps() {
+    local handler="$1"
+    [[ "$(trap -p INT)" == "trap -- '' SIGINT" ]] || trap "$handler" INT
+    trap "$handler" TERM
+}
+
 _telegram_proxy_remote_worker_body() {
     local slot="${1:-}" source_index="${2:-}" component="${3:-}" action="${4:-}"
     local force="${5:-false}" result_file="${6:-}" output_file="${7:-}"
@@ -529,7 +537,7 @@ _telegram_proxy_remote_worker_body() {
         : > "$result_file.done"
         exit 130
     }
-    trap '_telegram_proxy_remote_worker_abort' INT TERM
+    _telegram_proxy_install_abort_traps _telegram_proxy_remote_worker_abort
     local rc=1 out safe_out status_json status_result pipeline_rc
     (
         _telegram_proxy_remote_execute_prepared "$component" "$action" "$force" \
@@ -669,7 +677,7 @@ _telegram_proxy_fifo_dispatcher() {
         done
         return 1
     }
-    trap '_telegram_proxy_fifo_dispatcher_abort' INT TERM
+    _telegram_proxy_install_abort_traps _telegram_proxy_fifo_dispatcher_abort
     while true; do
         _telegram_proxy_fifo_reap_finished && continue
         slot=0
@@ -796,7 +804,8 @@ telegram_proxy_remote_batch() {
     TELEGRAM_PROXY_BATCH_ABORTED=0
     trap -p INT TERM HUP > "$dir/traps" 2>/dev/null || true
     TELEGRAM_PROXY_BATCH_TRAPS=$(cat "$dir/traps" 2>/dev/null)
-    trap '_telegram_proxy_remote_batch_abort' INT TERM HUP
+    _telegram_proxy_install_abort_traps _telegram_proxy_remote_batch_abort
+    trap '_telegram_proxy_remote_batch_abort' HUP
 
     local -a source_name source_ip source_port source_queued results outputs worker_pids
     local src cred_file worker_count line rc code reason j upload_allowed aggregate=0

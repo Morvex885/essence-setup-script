@@ -503,10 +503,12 @@ _tui_wizard_loop() {
 # ─── Настройки ───────────────────────────────────────────────────────────────
 
 tui_settings() {
-    local checked available password_set
+    local checked available password_set version_data=""
+    tui_call self version && version_data="$TUI_DATA"
     while true; do
         checked=false available=false
-        if tui_call self version; then
+        if [[ -n "$version_data" ]]; then
+            TUI_DATA="$version_data"
             checked=$(tui_q '.checked')
             available=$(tui_q '.update_available')
             _tui_head "Настройки"

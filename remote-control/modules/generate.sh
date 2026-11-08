@@ -806,6 +806,7 @@ EOF
     cat <<'EOF'
 _sync_rc=0
 while IFS=' ' read -r _m _n; do
+    [ -n "$_m" ] || continue
     case "$_m" in vless-tcp|vless-xhttp|vless-grpc|hy2) ;; *) exit 1 ;; esac
     case "$_n" in ''|*[!0-9]*) exit 1 ;; esac
     _u=''

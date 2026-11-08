@@ -293,6 +293,59 @@ EOF
     [ ! -e "$RC_DIR/.rc-lock" ]
 }
 
+@test 'fresh incomplete lock waits without reclaiming the acquiring process directory' {
+    rc source init-local --json >/dev/null 2>&1
+    mkdir "$RC_DIR/.rc-lock"
+
+    RC_LOCK_WAIT=0 run --separate-stderr rc group add --name lab --json
+    [ "$status" -eq 1 ]
+    [ "$(jq -r '.error.code' <<< "$output")" = locked ]
+    [ -d "$RC_DIR/.rc-lock" ]
+    [ ! -e "$RC_DIR/.rc-lock/owner" ]
+    jq -e 'all(.groups[]; .name != "LAB")' "$RC_DIR/config.json" >/dev/null
+}
+
+@test 'aged incomplete lock is reclaimed without waiting for an absent owner' {
+    rc source init-local --json >/dev/null 2>&1
+    mkdir "$RC_DIR/.rc-lock"
+    touch -t 200001010000 "$RC_DIR/.rc-lock"
+
+    RC_LOCK_WAIT=0 run --separate-stderr rc group add --name lab --json
+    assert_success
+    [ ! -e "$RC_DIR/.rc-lock" ]
+    jq -e 'any(.groups[]; .name == "LAB")' "$RC_DIR/config.json" >/dev/null
+}
+
+@test 'abandoned reclaim election fails closed with a bounded manual recovery diagnostic' {
+    rc source init-local --json >/dev/null 2>&1
+    sleep 0 &
+    local dead=$!
+    wait "$dead"
+    mkdir -p "$RC_DIR/.rc-lock/.reclaim"
+    printf 'pid=%s\nkind=mutation\nlabel=dead\n' "$dead" > "$RC_DIR/.rc-lock/owner"
+
+    RC_LOCK_WAIT=0 run --separate-stderr rc group add --name lab --json
+    [ "$status" -eq 1 ]
+    [ "$(jq -r '.error.code' <<< "$output")" = locked ]
+    [[ "$(jq -r '.error.message' <<< "$output")" == *"$RC_DIR/.rc-lock/.reclaim"* ]]
+    [[ "$(jq -r '.error.message' <<< "$output")" == *'другие операции не выполняются'* ]]
+    [[ "$(jq -r '.error.message' <<< "$output")" == *'вручную'* ]]
+    [ -d "$RC_DIR/.rc-lock/.reclaim" ]
+    [ "$(cat "$RC_DIR/.rc-lock/owner")" = "$(printf 'pid=%s\nkind=mutation\nlabel=dead' "$dead")" ]
+    jq -e 'all(.groups[]; .name != "LAB")' "$RC_DIR/config.json" >/dev/null
+
+    # A reclaimer can also be killed while recovering an incomplete owner.
+    rm "$RC_DIR/.rc-lock/owner"
+    touch -t 200001010000 "$RC_DIR/.rc-lock"
+    RC_LOCK_WAIT=0 run --separate-stderr rc group add --name lab --json
+    [ "$status" -eq 1 ]
+    [ "$(jq -r '.error.code' <<< "$output")" = locked ]
+    [[ "$(jq -r '.error.message' <<< "$output")" == *"$RC_DIR/.rc-lock/.reclaim"* ]]
+    [ -d "$RC_DIR/.rc-lock/.reclaim" ]
+    [ ! -e "$RC_DIR/.rc-lock/owner" ]
+    jq -e 'all(.groups[]; .name != "LAB")' "$RC_DIR/config.json" >/dev/null
+}
+
 @test 'no arguments start the TUI over serve and leave no serve process' {
     cp -R "$PROJECT_ROOT/remote-control/tui" "$APP/"
     rc source init-local --json >/dev/null 2>&1

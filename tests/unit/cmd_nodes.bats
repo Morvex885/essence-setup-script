@@ -493,3 +493,45 @@ EOF
     [ "$status" -eq 0 ]
     [ "$(cmd_jq '.data.reachable')" = true ]
 }
+
+@test "host key commands sort unique SHA256 fingerprints without Bash mapfile" {
+    use_local_hostkey_stubs
+    jq_w '.nodes[0].ip="9.9.9.9"'
+    mapfile() { printf '%s\n' called > "$BATS_TEST_TMPDIR/mapfile-called"; return 127; }
+    ssh-keygen() {
+        case "$1" in
+            -lf) printf '256 MD5:legacy 9.9.9.9 (ED25519)\n' ;;
+            -E) printf '%s\n' \
+                '256 SHA256:fp-z 9.9.9.9 (ED25519)' \
+                '256 SHA256:fp-a 9.9.9.9 (ECDSA)' \
+                '256 SHA256:fp-z 9.9.9.9 (ED25519)' ;;
+            *) return 1 ;;
+        esac
+    }
+    run_cmd node trust-host-key --name "$NAME" --host-key SHA256:other
+    [ "$(cmd_jq '.error.code')" = host_key_mismatch ]
+    [ "$(cmd_jq '.error.fingerprints | join(",")')" = SHA256:fp-a,SHA256:fp-z ]
+    run_cmd node trust-host-key --name "$NAME" --host-key SHA256:fp-a
+    [ "$status" -eq 2 ]
+    [ "$(cmd_jq '.error.code')" = confirmation_required ]
+    [[ ! -e "$BATS_TEST_TMPDIR/mapfile-called" ]]
+    grep -q OLD "$HOME/.ssh/known_hosts"
+}
+
+@test "host key commands reject an empty fingerprint scan without Bash mapfile or stale results" {
+    use_local_hostkey_stubs
+    jq_w '.nodes[0].ip="9.9.9.9"'
+    export TMPDIR="$BATS_TEST_TMPDIR/hostkey-tmp"
+    mkdir -p "$TMPDIR"
+    mapfile() { printf '%s\n' called > "$BATS_TEST_TMPDIR/mapfile-called"; return 127; }
+    ssh-keygen() { printf '256 MD5:legacy 9.9.9.9 (ED25519)\n'; }
+    NODE_HOSTKEY_FPS=(SHA256:stale)
+    NODE_HOSTKEY_SCAN=stale
+    run_cmd node trust-host-key --name "$NAME" --host-key SHA256:other
+    [ "$(cmd_jq '.error.code')" = remote_failed ]
+    [ "${#NODE_HOSTKEY_FPS[@]}" -eq 0 ]
+    [[ -z "$NODE_HOSTKEY_SCAN" && ! -e "$BATS_TEST_TMPDIR/mapfile-called" ]]
+    local leftovers=("$TMPDIR"/essence-hostkey.*)
+    [[ ! -e "${leftovers[0]}" ]]
+    grep -q OLD "$HOME/.ssh/known_hosts"
+}

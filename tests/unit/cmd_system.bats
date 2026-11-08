@@ -37,6 +37,30 @@ teardown() { teardown_test_env; }
     [[ "$output$CMD_ENVELOPE" != *second* ]] || return 1
 }
 
+@test "self password-set rejects line breaks without installing or changing a password" {
+    local candidate
+    for candidate in $'first\nsecond' $'\nfirst' $'first\n'; do
+        RC_REQUEST_SECRETS=$(printf '%s' "$candidate" | jq -Rs '{password:.}')
+        run_cmd self password-set
+        [ "$status" -eq 1 ]
+        [ "$(cmd_jq '.error.code')" = invalid ]
+        [ ! -e "$passfile" ]
+    done
+    RC_REQUEST_SECRETS='{"password":"first"}'
+    run_cmd self password-set
+    [ "$status" -eq 0 ]
+    cp "$passfile" "$BATS_TEST_TMPDIR/password-before"
+    RC_REQUEST_SECRETS='{"password":"second\nline","current-password":"first"}'
+    run_cmd self password-set
+    [ "$status" -eq 1 ]
+    [ "$(cmd_jq '.error.code')" = invalid ]
+    cmp -s "$passfile" "$BATS_TEST_TMPDIR/password-before"
+    RC_REQUEST_SECRETS='{"password":"valid.","current-password":"first"}'
+    run_cmd self password-set
+    [ "$status" -eq 0 ]
+    [ "$(cat "$passfile")" = saved:valid. ]
+}
+
 @test "self password-remove is gated and keeps the hash on denial or wrong password" {
     printf 'saved:second\n' > "$passfile"
     RC_REQUEST_SECRETS='{"current-password":"second"}'

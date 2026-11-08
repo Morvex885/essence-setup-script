@@ -205,18 +205,17 @@ EOF
 
 @test "deferred key onboarding can complete all issues and reach ready" {
     _prepare_pending_key_node
+    _sec_onboarding_scan
+    SSH_ALLOW_PORTABLE_ONBOARDING=7 PORTABLE_IDENTITY_DEFER_CONFIG=9
     _provision_portable_identity() {
+        _ssh_known_host_present || return 1
+        _ssh_base_options || return 1
+        [[ "${SSH_BASE_OPTIONS[1]}" == StrictHostKeyChecking=yes ]] || return 1
+        [[ "$SSH_ALLOW_PORTABLE_ONBOARDING" == 1 && "$PORTABLE_IDENTITY_DEFER_CONFIG" == 1 ]] || return 1
         mkdir -p "$SSH_IDENTITIES_DIR"
         ssh-keygen -t ed25519 -N '' -q -f "$SSH_IDENTITIES_DIR/$1"
         NODE_IDENTITY="$1"
     }
-    _ssh_pin_host_key() {
-        local key_type key_data _
-        read -r key_type key_data _ < "$SSH_IDENTITIES_DIR/$NODE_ID.pub"
-        printf '%s %s %s\n' "$SERVER_IP" "$key_type" "$key_data" > "$SSH_KNOWN_HOSTS"
-    }
-    # План читает ключ сервера; без сети он не прочитан, закрепление — заглушка.
-    ssh-keyscan() { return 1; }
 
     state_actionable_ssh_setup_pending
     run_cmd node setup-ssh --provision-keys yes --yes
@@ -227,13 +226,19 @@ EOF
        "0123456789abcdef0123456789abcdef" ]]
     [[ "$(state_validate true)" == ready ]]
     ! state_actionable_ssh_setup_pending
+    [[ "$SSH_ALLOW_PORTABLE_ONBOARDING" == 7 && "$PORTABLE_IDENTITY_DEFER_CONFIG" == 9 ]]
+    grep -qxF "127.0.0.1 $LEGIT_PUB" "$SSH_KNOWN_HOSTS"
+    ! grep -qF "$EVIL_PUB" "$SSH_KNOWN_HOSTS"
 }
 
-@test "cancel after provisioning revokes and removes the deferred identity" {
+@test "pin cancellation never provisions the deferred identity and restores runtime flags" {
     _prepare_pending_key_node
     local node_id=0123456789abcdef0123456789abcdef
     REVOKED_ID=""
+    PROVISIONED=false
+    SSH_ALLOW_PORTABLE_ONBOARDING=7 PORTABLE_IDENTITY_DEFER_CONFIG=9
     _provision_portable_identity() {
+        PROVISIONED=true
         mkdir -p "$SSH_IDENTITIES_DIR"
         printf private > "$SSH_IDENTITIES_DIR/$1"
         printf public > "$SSH_IDENTITIES_DIR/$1.pub"
@@ -250,7 +255,8 @@ EOF
     fi
     [ "$RC_ERROR_CODE" = onboarding_failed ]
     [ "$(jq -r '.step' <<< "$RC_ERROR_EXTRA")" = pin ]
-    [[ "$REVOKED_ID" == "$node_id" ]]
+    [[ "$PROVISIONED" == false && -z "$REVOKED_ID" ]]
+    [[ "$SSH_ALLOW_PORTABLE_ONBOARDING" == 7 && "$PORTABLE_IDENTITY_DEFER_CONFIG" == 9 ]]
     [[ ! -e "$SSH_IDENTITIES_DIR/$node_id" ]]
     [[ ! -e "$SSH_IDENTITIES_DIR/$node_id.pub" ]]
     [[ "$(jq -r '.nodes | length' "$CONFIG_JSON")" == 1 ]]
@@ -283,7 +289,7 @@ _assert_onboarding_rolled_back() {
     local node_id=0123456789abcdef0123456789abcdef
     REVOKED_ID=""
     _ssh_pin_host_key() { printf '%s\n' pinned-host >> "$SSH_KNOWN_HOSTS"; }
-    state_portability_remove_issue() { return 77; }
+    state_portability_remove_issue() { [[ "$2" != missing_identity ]]; }
     _revoke_managed_remote_key() { REVOKED_ID="$1"; }
 
     if _github_initial_portable_onboarding yes rollback; then
@@ -297,7 +303,8 @@ _assert_onboarding_rolled_back() {
 @test "onboarding rollback keeps public key for manual cleanup when revocation fails" {
     _prepare_onboarding_rollback
     local node_id=0123456789abcdef0123456789abcdef
-    _ssh_pin_host_key() { return 1; }
+    _ssh_pin_host_key() { printf '%s\n' pinned-host >> "$SSH_KNOWN_HOSTS"; }
+    state_portability_remove_issue() { [[ "$2" != missing_identity ]]; }
     _revoke_managed_remote_key() { return 1; }
 
     run _github_initial_portable_onboarding yes rollback
@@ -1007,4 +1014,95 @@ _r2_assert_old_key_restored() {
     t1=$(cmd_jq '.error.plan_token')
     run_cmd node setup-ssh
     [ "$(cmd_jq '.error.plan_token')" = "$t1" ]
+}
+
+_rotation_provision_guard() {
+    _provision_portable_identity() { printf '%s\n' "$1" >> "$BATS_TEST_TMPDIR/provisioned"; return 1; }
+    ssh_run() { printf '%s\n' called >> "$BATS_TEST_TMPDIR/authenticated"; return 1; }
+    ssh() { printf '%s\n' called >> "$BATS_TEST_TMPDIR/authenticated"; return 1; }
+}
+
+@test "security: rotated host blocks setup-ssh provisioning before any authentication" {
+    _prepare_pending_key_node
+    SCAN_EXEC=evil-only
+    _sec_onboarding_scan
+    _rotation_provision_guard
+    cp "$CONFIG_JSON" "$BATS_TEST_TMPDIR/config.before"
+    cp "$STATE_MANIFEST" "$BATS_TEST_TMPDIR/manifest.before"
+    SSH_ALLOW_PORTABLE_ONBOARDING=7 PORTABLE_IDENTITY_DEFER_CONFIG=9
+
+    run_cmd node setup-ssh --provision-keys yes --yes
+    [ "$status" -eq 1 ]
+    [ "$(cmd_jq '.error.code')" = onboarding_failed ]
+    [ "$(cmd_jq '.error.step')" = pin ]
+    [ "$(cmd_jq '.error.rolled_back')" = true ]
+    [[ ! -e "$BATS_TEST_TMPDIR/provisioned" && ! -e "$BATS_TEST_TMPDIR/authenticated" ]]
+    [[ ! -e "$SSH_KNOWN_HOSTS" ]]
+    cmp "$CONFIG_JSON" "$BATS_TEST_TMPDIR/config.before"
+    cmp "$STATE_MANIFEST" "$BATS_TEST_TMPDIR/manifest.before"
+    [[ "$SSH_ALLOW_PORTABLE_ONBOARDING" == 7 && "$PORTABLE_IDENTITY_DEFER_CONFIG" == 9 ]]
+}
+
+@test "security: deferred rotation retains missing identity and host pin without authentication" {
+    _prepare_pending_key_node
+    SCAN_EXEC=evil-only
+    _sec_onboarding_scan
+    _rotation_provision_guard
+    run_cmd node setup-ssh --provision-keys yes --on-failure defer --yes
+    [ "$status" -eq 0 ]
+    [ "$(cmd_jq '.data.ready')" = false ]
+    [ "$(cmd_jq '.data.installed | length')" = 0 ]
+    [[ ! -e "$BATS_TEST_TMPDIR/provisioned" && ! -e "$BATS_TEST_TMPDIR/authenticated" ]]
+    [[ ! -e "$SSH_KNOWN_HOSTS" ]]
+    [ "$(jq -r '.nodes[0].identity' "$CONFIG_JSON")" = system ]
+    jq -e '[.portability.issues[].reason] | sort == ["missing_host_key","missing_identity"]' "$STATE_MANIFEST"
+}
+
+@test "security: preexisting unagreed host pin blocks provisioning and rollback restores it" {
+    _prepare_pending_key_node
+    _sec_onboarding_scan
+    _rotation_provision_guard
+    local node_id=0123456789abcdef0123456789abcdef
+    ONBOARDING_PLANNED_FPS="# plan"$'\n'"$node_id $LEGIT_FP"$'\n'
+    printf '127.0.0.1 %s\n' "$EVIL_PUB" > "$SSH_KNOWN_HOSTS"
+    cp "$SSH_KNOWN_HOSTS" "$BATS_TEST_TMPDIR/known.before"
+    cp "$STATE_MANIFEST" "$BATS_TEST_TMPDIR/manifest.before"
+    if _github_initial_portable_onboarding yes rollback; then return 1; fi
+    [ "$RC_ERROR_CODE" = onboarding_failed ]
+    [ "$(jq -r '.step' <<< "$RC_ERROR_EXTRA")" = pin ]
+    [[ ! -e "$BATS_TEST_TMPDIR/provisioned" && ! -e "$BATS_TEST_TMPDIR/authenticated" ]]
+    cmp "$SSH_KNOWN_HOSTS" "$BATS_TEST_TMPDIR/known.before"
+    cmp "$STATE_MANIFEST" "$BATS_TEST_TMPDIR/manifest.before"
+    [ "$(jq -r '.nodes[0].identity' "$CONFIG_JSON")" = system ]
+}
+
+@test "security: preexisting unagreed host pin is deferred without provisioning" {
+    _prepare_pending_key_node
+    _sec_onboarding_scan
+    _rotation_provision_guard
+    local node_id=0123456789abcdef0123456789abcdef
+    ONBOARDING_PLANNED_FPS="# plan"$'\n'"$node_id $LEGIT_FP"$'\n'
+    printf '127.0.0.1 %s\n' "$EVIL_PUB" > "$SSH_KNOWN_HOSTS"
+    _github_initial_portable_onboarding yes defer
+    [[ ! -e "$BATS_TEST_TMPDIR/provisioned" && ! -e "$BATS_TEST_TMPDIR/authenticated" ]]
+    ! ssh-keygen -F 127.0.0.1 -f "$SSH_KNOWN_HOSTS"
+    [ "$(jq -r '.nodes[0].identity' "$CONFIG_JSON")" = system ]
+    jq -e '[.portability.issues[].reason] | sort == ["missing_host_key","missing_identity"]' "$STATE_MANIFEST"
+}
+
+@test "provision failure after agreed host pin restores runtime flags and rolls the pin back" {
+    _prepare_pending_key_node
+    _sec_onboarding_scan
+    SSH_ALLOW_PORTABLE_ONBOARDING=7 PORTABLE_IDENTITY_DEFER_CONFIG=9
+    _provision_portable_identity() {
+        _ssh_known_host_present || return 77
+        [[ "$SSH_ALLOW_PORTABLE_ONBOARDING" == 1 && "$PORTABLE_IDENTITY_DEFER_CONFIG" == 1 ]] || return 77
+        printf '%s\n' attempted > "$BATS_TEST_TMPDIR/provisioned"
+        return 1
+    }
+    run_cmd node setup-ssh --provision-keys yes --yes
+    [ "$status" -eq 1 ]
+    [ "$(cmd_jq '.error.step')" = provision ]
+    [[ -e "$BATS_TEST_TMPDIR/provisioned" && ! -e "$SSH_KNOWN_HOSTS" ]]
+    [[ "$SSH_ALLOW_PORTABLE_ONBOARDING" == 7 && "$PORTABLE_IDENTITY_DEFER_CONFIG" == 9 ]]
 }

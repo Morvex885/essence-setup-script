@@ -38,8 +38,10 @@ setup() {
     export RECOVERY_REAL_CP="$(command -v cp)"
     export RECOVERY_REAL_RM="$(command -v rm)"
     export RECOVERY_REAL_MV="$(command -v mv)"
-    # План node setup-ssh читает ключи серверов; без сети они не прочитаны.
-    ssh-keyscan() { return 1; }
+    # План и закрепление используют один локально созданный ключ сервера.
+    ssh-keygen -q -t ed25519 -N '' -f "$CONFIG_DIR/server-host-key"
+    RECOVERY_HOST_PUB=$(cut -d' ' -f1,2 "$CONFIG_DIR/server-host-key.pub")
+    ssh-keyscan() { printf '%s %s\n' "${!#}" "$RECOVERY_HOST_PUB"; }
 }
 
 teardown() { teardown_test_env; }
@@ -112,16 +114,16 @@ _install_onboarding_transport() {
         printf 'fixture-private-key\n' > "$SSH_IDENTITIES_DIR/$1"
         printf 'fixture-public-key-%s\n' "$1" > "$SSH_IDENTITIES_DIR/$1.pub"
         printf 'installed\n' > "$CONFIG_DIR/remote-keys/$1"
-        printf 'partially-updated-known-hosts\n' > "$SSH_KNOWN_HOSTS"
+        printf '# partially-updated-known-hosts\n' >> "$SSH_KNOWN_HOSTS"
         NODE_IDENTITY="$1"
     }
     _ssh_pin_host_key() {
         printf '%s\n' "$NODE_ID" >> "$CONFIG_DIR/pin-attempts"
-        if [[ "$RECOVERY_BRANCH" == pin-cancel ]]; then
+        if [[ "$RECOVERY_BRANCH" == pin-cancel && "$NODE_ID" == "$RECOVERY_SECOND_ID" ]]; then
             _arm_restore_fault
             return 1
         fi
-        return 0
+        printf '%s %s\n' "$SERVER_IP" "$RECOVERY_HOST_PUB" >> "$SSH_KNOWN_HOSTS"
     }
     # Real key revocation loads the fixture public key and calls this sandbox
     # transport. No production revoke, config, manifest or node loader is replaced.
@@ -154,20 +156,21 @@ _assert_onboarding_rollback() {
     [[ "$output" != *'[✓]'* ]]
     [[ "$output" != *fixture-private-key* && "$output" != *fixture-public-key* ]]
     cmp "$CONFIG_DIR/original-config" "$CONFIG_JSON"
-    [[ "$(cat "$CONFIG_DIR/provision-attempts")" == "$RECOVERY_FIRST_ID"$'\n'"$RECOVERY_SECOND_ID" ]]
-    if [[ "$RECOVERY_BRANCH" == provision-cancel ]]; then
-        [[ ! -e "$CONFIG_DIR/pin-attempts" ]]
+    if [[ "$RECOVERY_BRANCH" == pin-cancel ]]; then
+        [[ "$(cat "$CONFIG_DIR/provision-attempts")" == "$RECOVERY_FIRST_ID" ]]
+    else
+        [[ "$(cat "$CONFIG_DIR/provision-attempts")" == "$RECOVERY_FIRST_ID"$'\n'"$RECOVERY_SECOND_ID" ]]
+    fi
+    [[ "$(cat "$CONFIG_DIR/pin-attempts")" == "$RECOVERY_FIRST_ID"$'\n'"$RECOVERY_SECOND_ID" ]]
+    if [[ "$RECOVERY_BRANCH" != identity-save ]]; then
         [[ "$(cat "$CONFIG_DIR/revoked-ids")" == "$RECOVERY_FIRST_ID" ]]
-    elif [[ "$RECOVERY_BRANCH" == pin-cancel ]]; then
-        [[ "$(cat "$CONFIG_DIR/pin-attempts")" == "$RECOVERY_FIRST_ID" ]]
     else
         [[ -f "$CONFIG_DIR/identity-save-rejected" ]]
-        [[ "$(cat "$CONFIG_DIR/pin-attempts")" == "$RECOVERY_FIRST_ID"$'\n'"$RECOVERY_SECOND_ID" ]]
     fi
     [[ ! -e "$SSH_IDENTITIES_DIR/$RECOVERY_FIRST_ID" && ! -e "$SSH_IDENTITIES_DIR/$RECOVERY_FIRST_ID.pub" ]]
     [[ ! -e "$SSH_IDENTITIES_DIR/$RECOVERY_SECOND_ID" && ! -e "$SSH_IDENTITIES_DIR/$RECOVERY_SECOND_ID.pub" ]]
     [[ ! -e "$CONFIG_DIR/remote-keys/$RECOVERY_FIRST_ID" && ! -e "$CONFIG_DIR/remote-keys/$RECOVERY_SECOND_ID" ]]
-    if [[ "$RECOVERY_BRANCH" != provision-cancel ]]; then
+    if [[ "$RECOVERY_BRANCH" == identity-save ]]; then
         [[ "$(cat "$CONFIG_DIR/revoked-ids")" == "$RECOVERY_FIRST_ID"$'\n'"$RECOVERY_SECOND_ID" ]]
     fi
 
@@ -186,19 +189,19 @@ _assert_onboarding_rollback() {
             cmp "$CONFIG_DIR/original-manifest" "$manifest_backup"
             [[ "$output" == *"$known_backup"* && "$output" == *"$manifest_backup"* ]]
             if [[ "$RECOVERY_FAULT" == copy-known ]]; then
-                [[ "$(cat "$SSH_KNOWN_HOSTS")" == partially-updated-known-hosts ]]
+                grep -qxF '# partially-updated-known-hosts' "$SSH_KNOWN_HOSTS"
             fi
             ;;
         remove-known)
             [[ "$(cat "$CONFIG_DIR/restore-fault-hit")" == remove ]]
             [[ -z "$known_backup" ]]
-            [[ "$(cat "$SSH_KNOWN_HOSTS")" == partially-updated-known-hosts ]]
+            grep -qxF '# partially-updated-known-hosts' "$SSH_KNOWN_HOSTS"
             cmp "$CONFIG_DIR/original-manifest" "$manifest_backup"
             [[ "$output" == *"$manifest_backup"* ]]
             ;;
         missing-known)
             [[ "$(cat "$CONFIG_DIR/missing-backup-path")" == "$known_backup" && ! -e "$known_backup" ]]
-            [[ "$(cat "$SSH_KNOWN_HOSTS")" == partially-updated-known-hosts ]]
+            grep -qxF '# partially-updated-known-hosts' "$SSH_KNOWN_HOSTS"
             cmp "$CONFIG_DIR/original-manifest" "$manifest_backup"
             [[ "$output" == *"$known_backup"* && "$output" == *"$manifest_backup"* ]]
             ;;
@@ -329,7 +332,7 @@ _r2_local_ssh_state() {
         ssh_run -- "install fixture-public-key-$1"
         NODE_IDENTITY="$1"
     }
-    _ssh_pin_host_key() { printf '%s pinned\n' "$SERVER_IP" >> "$SSH_KNOWN_HOSTS"; }
+    _ssh_pin_host_key() { printf '%s %s\n' "$SERVER_IP" "$RECOVERY_HOST_PUB" >> "$SSH_KNOWN_HOSTS"; }
     github_source_metadata_write() { _github_record_error x "injected metadata"; return 1; }
     local before; before=$(_r2_local_ssh_state)
     reset_ssh_mocks

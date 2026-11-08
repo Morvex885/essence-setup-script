@@ -135,8 +135,8 @@ onboarding_plan_lines() {
 
 # _onboarding_known_key_agreed ID — записи загруженной ноды ID в SSH_KNOWN_HOSTS
 # согласованы с планом onboarding_plan_lines: плана нет, нода была известна при
-# его построении или каждый её отпечаток показан в плане. Иначе (ключ записан
-# при входе accept-new и не совпал, ключ при плане не прочитан) — rc 1.
+# его построении или каждый её отпечаток показан в плане. Иначе (посторонняя
+# запись, ключ при плане не прочитан) — rc 1.
 _onboarding_known_key_agreed() {
     local node="${1:-}" id fp host known seen=false
     local -a planned=()
@@ -222,39 +222,11 @@ _github_initial_portable_onboarding() {
 }
 
 _github_portable_onboarding_steps() {
-    local provision="$1" on_failure="$2" id name
-    local -a key_ids=() node_rows=()
+    local provision="$1" on_failure="$2" id name needs_identity
+    local -a node_rows=()
     while IFS=$'\t' read -r id name; do
         [[ -n "$id" ]] && node_rows+=("$id"$'\t'"$name")
-        if [[ -n "$id" ]] && [[ "$(jq_r --arg id "$id" '.nodes[] | select(.id==$id) | (.auth=="key" and ((.identity // "system")=="system"))')" == true ]]; then
-            key_ids+=("$id")
-        fi
     done < <(jq_r '.nodes[] | [.id,.name] | @tsv')
-    for id in "${key_ids[@]}"; do
-        if [[ "$provision" != yes ]]; then
-            state_portability_add_issue "$id" missing_identity || return 1
-            continue
-        fi
-        name=$(jq_r --arg id "$id" '.nodes[] | select(.id==$id) | .name')
-        node_load_by_name "$name" || return 1
-        local previous_defer="${PORTABLE_IDENTITY_DEFER_CONFIG:-0}"
-        local previous_onboarding="${SSH_ALLOW_PORTABLE_ONBOARDING:-0}"
-        PORTABLE_IDENTITY_DEFER_CONFIG=1
-        SSH_ALLOW_PORTABLE_ONBOARDING=1
-        _provision_portable_identity "$id"
-        local provision_rc=$?
-        PORTABLE_IDENTITY_DEFER_CONFIG="$previous_defer"
-        SSH_ALLOW_PORTABLE_ONBOARDING="$previous_onboarding"
-        if [[ $provision_rc -eq 0 ]]; then
-            installed_ids+=("$id")
-        elif [[ "$on_failure" == defer ]]; then
-            warn "Переносимый SSH-ключ ноды «${name}» не создан; SSH-настройка отложена."
-            state_portability_add_issue "$id" missing_identity || return 1
-        else
-            ONBOARDING_FAIL_NODE="$name" ONBOARDING_FAIL_STEP=provision
-            return 1
-        fi
-    done
     for name in "${node_rows[@]}"; do
         id="${name%%$'\t'*}"
         name="${name#*$'\t'}"
@@ -275,22 +247,22 @@ _github_portable_onboarding_steps() {
         elif [[ $load_rc -ne 0 ]]; then
             return 1
         fi
-        if [[ "$id" == "" ]]; then continue; fi
         NODE_ID="$id"
-        if [[ ${#installed_ids[@]} -gt 0 ]] && [[ " ${installed_ids[*]} " == *" $id "* ]]; then NODE_IDENTITY="$id"; fi
+        needs_identity=$(jq_r --arg id "$id" '.nodes[] | select(.id==$id) | (.auth=="key" and ((.identity // "system")=="system"))') || return 1
+        if [[ "$needs_identity" == true && "$provision" != yes ]]; then
+            state_portability_add_issue "$id" missing_identity || return 1
+        fi
+        # Закрепление и проверка плана предшествуют любому входу на сервер,
+        # включая установку переносимого ключа через системную SSH-identity.
         local pin_rc=0 pin_host
         if _ssh_known_host_present; then
-            # Запись могла появиться при входе для установки ключа (accept-new):
-            # по согласованному плану она обязана совпасть с показанными отпечатками.
-            if _onboarding_known_key_agreed "$id"; then
-                state_portability_remove_issue "$id" missing_host_key || return 1
-                continue
+            if ! _onboarding_known_key_agreed "$id"; then
+                pin_host="$SERVER_IP"
+                [[ "${SERVER_PORT:-22}" != 22 ]] && pin_host="[$SERVER_IP]:$SERVER_PORT"
+                ssh-keygen -R "$pin_host" -f "$SSH_KNOWN_HOSTS" >/dev/null 2>&1 || return 1
+                warn "Ключ сервера ноды '${NODE_NAME}' не совпадает с согласованным в плане."
+                pin_rc=1
             fi
-            pin_host="$SERVER_IP"
-            [[ "${SERVER_PORT:-22}" != 22 ]] && pin_host="[$SERVER_IP]:$SERVER_PORT"
-            ssh-keygen -R "$pin_host" -f "$SSH_KNOWN_HOSTS" >/dev/null 2>&1 || return 1
-            warn "Ключ сервера ноды '${NODE_NAME}' не совпадает с согласованным в плане."
-            pin_rc=1
         else
             local previous_onboarding="${SSH_ALLOW_PORTABLE_ONBOARDING:-0}"
             SSH_ALLOW_PORTABLE_ONBOARDING=1
@@ -303,9 +275,47 @@ _github_portable_onboarding_steps() {
         elif [[ "$on_failure" == defer ]]; then
             warn "Не удалось закрепить SSH-ключ ноды '${NODE_NAME}'; SSH-настройка отложена."
             state_portability_add_issue "$id" missing_host_key || return 1
+            if [[ "$needs_identity" == true ]]; then
+                state_portability_add_issue "$id" missing_identity || return 1
+            fi
+            continue
         else
             warn "Не удалось закрепить SSH-ключ ноды '${NODE_NAME}'."
             ONBOARDING_FAIL_NODE="$name" ONBOARDING_FAIL_STEP=pin
+            return 1
+        fi
+        if [[ "$needs_identity" != true || "$provision" != yes ]]; then
+            continue
+        fi
+        local previous_defer="${PORTABLE_IDENTITY_DEFER_CONFIG:-0}"
+        local previous_onboarding="${SSH_ALLOW_PORTABLE_ONBOARDING:-0}"
+        PORTABLE_IDENTITY_DEFER_CONFIG=1
+        SSH_ALLOW_PORTABLE_ONBOARDING=1
+        _provision_portable_identity "$id"
+        local provision_rc=$?
+        PORTABLE_IDENTITY_DEFER_CONFIG="$previous_defer"
+        SSH_ALLOW_PORTABLE_ONBOARDING="$previous_onboarding"
+        if [[ $provision_rc -eq 0 ]]; then
+            installed_ids+=("$id")
+            # Сохраняем проверку после установки: посторонняя запись не должна
+            # попасть в переносимое состояние даже при изменении known_hosts.
+            if ! _onboarding_known_key_agreed "$id"; then
+                pin_host="$SERVER_IP"
+                [[ "${SERVER_PORT:-22}" != 22 ]] && pin_host="[$SERVER_IP]:$SERVER_PORT"
+                ssh-keygen -R "$pin_host" -f "$SSH_KNOWN_HOSTS" >/dev/null 2>&1 || return 1
+                warn "Ключ сервера ноды '${NODE_NAME}' не совпадает с согласованным в плане."
+                if [[ "$on_failure" == defer ]]; then
+                    state_portability_add_issue "$id" missing_host_key || return 1
+                else
+                    ONBOARDING_FAIL_NODE="$name" ONBOARDING_FAIL_STEP=pin
+                    return 1
+                fi
+            fi
+        elif [[ "$on_failure" == defer ]]; then
+            warn "Переносимый SSH-ключ ноды «${name}» не создан; SSH-настройка отложена."
+            state_portability_add_issue "$id" missing_identity || return 1
+        else
+            ONBOARDING_FAIL_NODE="$name" ONBOARDING_FAIL_STEP=provision
             return 1
         fi
     done

@@ -102,6 +102,10 @@ _self_auth_change() {
 core_self_password_set() {
     local new="${1:-}" file
     [[ -n "$new" ]] || { rc_fail invalid "Пароль не может быть пустым."; return 1; }
+    if [[ "$new" == *$'\n'* ]]; then
+        rc_fail invalid "Пароль не может содержать перевод строки."
+        return 1
+    fi
     file=$(_script_pass_file)
     if ! rc_locked script_password _self_auth_change "$file" _write_script_password "$file" "$new"; then
         [[ -n "${RC_ERROR_CODE:-}" ]] ||

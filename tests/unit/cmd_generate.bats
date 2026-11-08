@@ -126,3 +126,39 @@ teardown() { teardown_test_env; }
     [ "$(cmd_jq '.error.code')" = not_found ]
     [ -z "$(ls -A "$GENERATED_DIR")" ]
 }
+
+@test "listener sync without markers restarts mihomo and reports the node as successful" {
+    load_fixture_config
+    mkdir -p "$REMOTE_DIR/common"
+    printf '_sync_listener_users() { return 1; }\n' > "$REMOTE_DIR/common/listener-users.sh"
+    export RESTART_LOG="$BATS_TEST_TMPDIR/restarts"
+    systemctl() { printf '%s\n' "$*" >> "$RESTART_LOG"; }
+    export -f systemctl
+    _get_node_config() { printf '%s\n' '--- AmneziaWG ---' 'Address = 10.0.0.1/24'; }
+    ensure_remote_scripts_current() { return 0; }
+    ssh_run() { shift; bash -c "$1"; }
+    _generate_reset_results
+    _sync_listeners_on_nodes de-vps
+    [ "${GENERATE_NODE_OK[*]}" = de-vps ]
+    [ "${#GENERATE_NODE_FAILED[@]}" -eq 0 ]
+    [ "$(cat "$RESTART_LOG")" = 'restart mihomo' ]
+}
+
+@test "listener payload accepts blank input in both modes but rejects malformed records" {
+    mkdir -p "$REMOTE_DIR/common"
+    printf '_sync_listener_users() { return 0; }\n' > "$REMOTE_DIR/common/listener-users.sh"
+    export RESTART_LOG="$BATS_TEST_TMPDIR/restarts"
+    systemctl() { printf '%s\n' "$*" >> "$RESTART_LOG"; }
+    export -f systemctl
+    local mode payload
+    for mode in strict lenient; do
+        bash -c "$(_listener_users_remote_cmd "$mode")" <<< ''
+        for payload in 'invalid 0' 'vless-tcp x' 'vless-tcp 2'; do
+            if bash -c "$(_listener_users_remote_cmd "$mode")" <<< "$payload"; then
+                echo "accepted malformed listener record: $payload"
+                return 1
+            fi
+        done
+    done
+    [ "$(cat "$RESTART_LOG")" = 'restart mihomo' ]
+}

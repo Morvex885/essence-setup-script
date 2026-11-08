@@ -234,7 +234,7 @@ _node_hostkey_known() {
 # строк ssh-keyscan меняется от запуска к запуску, а отпечатки входят в план.
 # Вызывающий удаляет файл.
 _node_hostkey_scan() {
-    local ip="$1" port="$2" file out
+    local ip="$1" port="$2" file out fp
     NODE_HOSTKEY_SCAN="" NODE_HOSTKEY_FPS=()
     file=$(umask 077; mktemp "${TMPDIR:-/tmp}/essence-hostkey.XXXXXX") || return 1
     if ! ssh-keyscan -p "$port" "$ip" > "$file" 2>/dev/null || [[ ! -s "$file" ]]; then
@@ -245,7 +245,9 @@ _node_hostkey_scan() {
     if [[ "$out" != *SHA256:* ]]; then
         out=$(ssh-keygen -E sha256 -lf "$file" 2>/dev/null) || out=""
     fi
-    mapfile -t NODE_HOSTKEY_FPS < <(awk '$2 ~ /^SHA256:/ { print $2 }' <<< "$out" | LC_ALL=C sort -u)
+    while IFS= read -r fp; do
+        NODE_HOSTKEY_FPS+=("$fp")
+    done < <(awk '$2 ~ /^SHA256:/ { print $2 }' <<< "$out" | LC_ALL=C sort -u)
     if [[ ${#NODE_HOSTKEY_FPS[@]} -eq 0 ]]; then
         rm -f "$file"
         return 1

@@ -2690,6 +2690,28 @@ _r2_connect() {
     [ "$status" -eq 0 ] || { printf 'connect: %s\n' "$CMD_ENVELOPE"; return 1; }
 }
 
+# Existing repository in the supported legacy format (local unless connected).
+_r2_legacy_repo() {
+    _r2_core || return 1
+    _r2_connect || return 1
+    if [[ "${1:-local}" == local ]]; then
+        run_cmd source github-switch-local
+        [ "$status" -eq 0 ] || return 1
+    fi
+    local updater="$BATS_TEST_TMPDIR/r2-legacy-updater"
+    git clone "$REMOTE" "$updater" >/dev/null 2>&1 || return 1
+    git -C "$updater" config user.name fixture
+    git -C "$updater" config user.email fixture@example.invalid
+    jq '.vault_version=1 | .minimum_remote_control_version="1.0.3"' \
+        "$updater/manifest.json" > "$updater/manifest.next" &&
+        mv "$updater/manifest.next" "$updater/manifest.json" || return 1
+    jq '.schema_version=1' "$updater/secrets.json" > "$updater/secrets.next" &&
+        mv "$updater/secrets.next" "$updater/secrets.json" || return 1
+    git -C "$updater" add manifest.json secrets.json
+    git -C "$updater" commit -m vault-v1 >/dev/null || return 1
+    git -C "$updater" push origin main >/dev/null 2>&1
+}
+
 @test "R2-L10: connect _required answers remove the cache paths they created" {
     _r2_core
     local before; before=$(_r2_local_files)
@@ -2769,6 +2791,80 @@ _r2_connect() {
     [ "$status" -eq 0 ]
     [ -e "$BATS_TEST_TMPDIR/r2-privatized" ]
     [ "$CONFIG_SOURCE" = github ]
+}
+
+@test "connect --existing migrate --make-private uses one complete plan before any remote write" {
+    _r2_legacy_repo || return 1
+    R2_PUBLIC=1
+    local before secrets_before remote_before token plan
+    before=$(_r2_local_files)
+    secrets_before=$(_hash_file "$SECRETS_JSON")
+    remote_before=$(git --git-dir="$REMOTE" rev-parse main)
+
+    run_cmd source github-connect --login test-owner --existing migrate --make-private
+    [ "$status" -eq 2 ]
+    [ "$(cmd_jq -r .error.code)" = confirmation_required ]
+    token=$(cmd_jq -r .error.plan_token)
+    plan=$(cmd_jq -c .error.plan)
+    [ ! -e "$BATS_TEST_TMPDIR/r2-privatized" ]
+    [ "$(git --git-dir="$REMOTE" rev-parse main)" = "$remote_before" ]
+    [ "$(_r2_local_files)" = "$before" ]
+    [ "$(_hash_file "$SECRETS_JSON")" = "$secrets_before" ]
+    [ "$CONFIG_SOURCE" = local ]
+    [ "$RC_SESSION_OPEN" = 1 ] && [ "$RC_SESSION_AUTHORIZED" = 1 ]
+
+    # Refusing the plan and asking again must offer the same single token.
+    run_cmd source github-connect --login test-owner --existing migrate --make-private
+    [ "$(cmd_jq -r .error.code)" = confirmation_required ]
+    [ "$(cmd_jq -r .error.plan_token)" = "$token" ]
+    [ "$(cmd_jq -c .error.plan)" = "$plan" ]
+    [ ! -e "$BATS_TEST_TMPDIR/r2-privatized" ]
+    [ "$(git --git-dir="$REMOTE" rev-parse main)" = "$remote_before" ]
+    [ "$(_r2_local_files)" = "$before" ]
+    [ "$(_hash_file "$SECRETS_JSON")" = "$secrets_before" ]
+
+    run_cmd source github-connect --login test-owner --existing migrate --make-private \
+        --yes --plan-token "stale-$token"
+    [ "$status" -eq 2 ]
+    [ "$(cmd_jq -r .error.code)" = plan_changed ]
+    [ "$(cmd_jq -r .error.plan_token)" = "$token" ]
+    [ "$(cmd_jq -c .error.plan)" = "$plan" ]
+    [ ! -e "$BATS_TEST_TMPDIR/r2-privatized" ]
+    [ "$(git --git-dir="$REMOTE" rev-parse main)" = "$remote_before" ]
+    [ "$(_r2_local_files)" = "$before" ]
+    [ "$(_hash_file "$SECRETS_JSON")" = "$secrets_before" ]
+    [ "$CONFIG_SOURCE" = local ]
+    [ "$RC_SESSION_OPEN" = 1 ] && [ "$RC_SESSION_AUTHORIZED" = 1 ]
+
+    run_cmd source github-connect --login test-owner --existing migrate --make-private \
+        --yes --plan-token "$token"
+    [ "$status" -eq 0 ]
+    [ "$(cmd_jq -r .ok)" = true ]
+    [ -e "$BATS_TEST_TMPDIR/r2-privatized" ]
+    [ "$CONFIG_SOURCE" = github ]
+    jq -e '.type=="github"' "$CONFIG_DIR/source.json" >/dev/null
+    git --git-dir="$REMOTE" show main:manifest.json | jq -e '.vault_version==2' >/dev/null
+    git --git-dir="$REMOTE" merge-base --is-ancestor "$remote_before" main
+    [ "$(git --git-dir="$REMOTE" rev-parse main)" != "$remote_before" ]
+    [ "${#SSH_RUN_CALLS[@]}" -eq 0 ]
+}
+
+@test "standalone github-migrate-format still requires its own migration confirmation" {
+    _r2_legacy_repo connected || return 1
+    github_config_close || return 1
+    RC_SESSION_OPEN=0
+    local remote_before token
+    remote_before=$(git --git-dir="$REMOTE" rev-parse main)
+    run_cmd source github-migrate-format
+    [ "$status" -eq 2 ]
+    [ "$(cmd_jq -r .error.code)" = confirmation_required ]
+    token=$(cmd_jq -r .error.plan_token)
+    [ "$(git --git-dir="$REMOTE" rev-parse main)" = "$remote_before" ]
+    run_cmd source github-migrate-format --yes --plan-token "$token"
+    [ "$status" -eq 0 ]
+    [ "$(cmd_jq -r .data.published)" = true ]
+    git --git-dir="$REMOTE" show main:manifest.json | jq -e '.vault_version==2' >/dev/null
+    [ "${#SSH_RUN_CALLS[@]}" -eq 0 ]
 }
 
 @test "R2-H8: replace-with-local rc 3 closes the session so stale state cannot overwrite the publication" {

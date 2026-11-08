@@ -643,3 +643,122 @@ EOF
     [ -z "$TELEGRAM_PROXY_BATCH_DIR" ]
     [ "${#TELEGRAM_PROXY_PLAN_PASS[@]}" -eq 0 ]
 }
+
+# Отдельный bash нужен для настоящих сигналов: фоновая подоболочка BATS
+# наследует SIG_IGN и скрывает замену serve-обработчика INT. Job control
+# запускающего shell даёт foreground-сценарию исходный SIG_DFL и свою группу.
+telegram_signal_fixture() {
+    local mode="$1" signal="$2" launch="${3:-foreground}"
+    local script="$BATS_TEST_TMPDIR/signal-fixture.sh" pid n ready=0 rc=0
+    {
+        declare -p PROJECT_ROOT CONFIG_DIR CONFIG_JSON SCRIPT_DIR TEMPLATES_DIR GENERATED_DIR \
+            BATS_TEST_TMPDIR SETUP_DIR COMMON_DIR VERSION_PATH CURRENT_VERSION
+        declare -f source_common
+        cat <<'EOF'
+source_common
+source "$PROJECT_ROOT/tests/helpers/cmd_helper.bash"
+for module in state nodes ssh telegram-proxy session cli serve cmd_nodes; do
+    source "$PROJECT_ROOT/remote-control/modules/$module.sh"
+done
+open_local_session || exit 3
+trap -p INT > "$BATS_TEST_TMPDIR/signal-initial-int"
+trap ':' TERM HUP
+_remote_scripts_probe() { REMOTE_SCRIPTS_STATE=ready; REMOTE_SCRIPTS_VERSION="$CURRENT_VERSION"; }
+check_update_start() { :; }
+ssh_run() {
+    printf '%s\n' "$TELEGRAM_PROXY_BATCH_DIR" > "$BATS_TEST_TMPDIR/signal-batch-dir"
+    : > "$BATS_TEST_TMPDIR/signal-started"
+    local n=0
+    while [[ ! -e "$BATS_TEST_TMPDIR/signal-release" && "$n" -lt 200 ]]; do
+        sleep 0.05
+        n=$((n + 1))
+    done
+    [[ -e "$BATS_TEST_TMPDIR/signal-release" ]] || return 9
+    : > "$BATS_TEST_TMPDIR/signal-completed"
+}
+record_signal_state() {
+    trap -p INT TERM HUP > "$BATS_TEST_TMPDIR/signal-restored-traps"
+    printf '%s %s %s\n' "$TELEGRAM_PROXY_BATCH_ABORTED" \
+        "${TELEGRAM_PROXY_BATCH_DIR:-empty}" "${#TELEGRAM_PROXY_PLAN_PASS[@]}" \
+        > "$BATS_TEST_TMPDIR/signal-state"
+}
+register_exit_cleanup record_signal_state
+if [[ "$1" == serve ]]; then
+    serve_main
+else
+    run_cmd telegram web-restart --node A
+    printf '%s\n' "$CMD_ENVELOPE"
+fi
+EOF
+    } > "$script"
+    printf '%s\n' '{"id":1,"argv":["telegram","web-restart","--node","A"]}' \
+        > "$BATS_TEST_TMPDIR/signal-request"
+    if [[ "$launch" == foreground ]]; then set -m; fi
+    bash "$script" "$mode" < "$BATS_TEST_TMPDIR/signal-request" \
+        > "$BATS_TEST_TMPDIR/signal-response" 2> "$BATS_TEST_TMPDIR/signal-stderr" &
+    pid=$!
+    set +m
+    for ((n=0; n<200; n++)); do
+        if [[ -e "$BATS_TEST_TMPDIR/signal-started" ]]; then ready=1; break; fi
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.05
+    done
+    if [[ "$ready" != 1 ]]; then
+        kill -TERM "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+        cat "$BATS_TEST_TMPDIR/signal-stderr" "$BATS_TEST_TMPDIR/signal-response"
+        return 1
+    fi
+    if [[ "$launch" == foreground ]]; then
+        kill "-$signal" -- "-$pid" || rc=$?
+    else
+        kill "-$signal" "$pid" || rc=$?
+    fi
+    : > "$BATS_TEST_TMPDIR/signal-release"
+    wait "$pid" || rc=$?
+    [[ "$rc" == 0 ]] || return "$rc"
+    [[ ! -e "$(cat "$BATS_TEST_TMPDIR/signal-batch-dir")" ]]
+    grep -Fx "trap -- ':' SIGTERM" "$BATS_TEST_TMPDIR/signal-restored-traps"
+    grep -Fx "trap -- ':' SIGHUP" "$BATS_TEST_TMPDIR/signal-restored-traps"
+}
+
+@test "foreground serve Telegram batch survives process-group Ctrl+C through dispatcher and workers" {
+    telegram_signal_fixture serve INT
+    [ ! -s "$BATS_TEST_TMPDIR/signal-initial-int" ]
+    [ -e "$BATS_TEST_TMPDIR/signal-completed" ]
+    [ "$(cat "$BATS_TEST_TMPDIR/signal-state")" = '0 empty 0' ]
+    grep -Fx "trap -- '' SIGINT" "$BATS_TEST_TMPDIR/signal-restored-traps"
+    jq -es 'map(select(.id == 1 and has("ok"))) |
+        length == 1 and .[0].ok and .[0].data.results == [
+            {"node":"A","code":0,"status":"ok","reason":null}]' \
+        "$BATS_TEST_TMPDIR/signal-response"
+}
+
+@test "background TUI-style serve preserves inherited ignored INT during Telegram batch" {
+    telegram_signal_fixture serve INT background
+    grep -Fx "trap -- '' SIGINT" "$BATS_TEST_TMPDIR/signal-initial-int"
+    [ -e "$BATS_TEST_TMPDIR/signal-completed" ]
+    [ "$(cat "$BATS_TEST_TMPDIR/signal-state")" = '0 empty 0' ]
+    grep -Fx "trap -- '' SIGINT" "$BATS_TEST_TMPDIR/signal-restored-traps"
+    jq -es 'map(select(.id == 1 and has("ok"))) | length == 1 and .[0].ok' \
+        "$BATS_TEST_TMPDIR/signal-response"
+}
+
+@test "ordinary foreground Telegram batch cancels INT and restores caller traps" {
+    telegram_signal_fixture batch INT
+    [ ! -s "$BATS_TEST_TMPDIR/signal-initial-int" ]
+    [ "$(cat "$BATS_TEST_TMPDIR/signal-state")" = '1 empty 0' ]
+    ! grep -q SIGINT "$BATS_TEST_TMPDIR/signal-restored-traps"
+    jq -e '.ok == false and .error.code == "remote_failed"' "$BATS_TEST_TMPDIR/signal-response"
+}
+
+@test "Telegram batch TERM and HUP still abort cleanly and restore caller traps" {
+    local signal
+    for signal in TERM HUP; do
+        rm -f "$BATS_TEST_TMPDIR"/signal-*
+        telegram_signal_fixture batch "$signal"
+        [ "$(cat "$BATS_TEST_TMPDIR/signal-state")" = '1 empty 0' ]
+        ! grep -q SIGINT "$BATS_TEST_TMPDIR/signal-restored-traps"
+        jq -e '.ok == false and .error.code == "remote_failed"' "$BATS_TEST_TMPDIR/signal-response"
+    done
+}

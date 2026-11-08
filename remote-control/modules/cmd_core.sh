@@ -620,7 +620,11 @@ cli_cmd_self_uninstall() {
 cli_cmd_self_password_set() {
     local new
     core_self_password_check_current || return 1
-    new=$(rc_secret password) || new=""
+    if new=$(rc_secret password && printf '.'); then
+        new="${new%.}"
+    else
+        new=""
+    fi
     core_self_password_set "$new" || return 1
     CLI_DATA=$(jq -cn '{password_set:true}')
 }

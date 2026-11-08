@@ -481,9 +481,8 @@ _github_format_migrate_prepare() {
         [.config.nodes[] | select(.id as $i | $ids | index($i)) | .name] | join(", ")' \
         "$candidate" 2>/dev/null) || names=""
     _github_plaintext_review_lines
-    CORE_PLAN_LINES=("Преобразование конфигурации GitHub"
-        "Репозиторий: ${GITHUB_OWNER:-?}/${GITHUB_REPO_NAME} (ветка ${GITHUB_BRANCH})"
-        "Формат: v${from} → v${GITHUB_VAULT_FORMAT}"
+    _github_plan_begin "Преобразование конфигурации GitHub"
+    CORE_PLAN_LINES+=("Формат: v${from} → v${GITHUB_VAULT_FORMAT}"
         "Устройства с Remote Control старше ${minimum} перестанут читать конфигурацию."
         "Предыдущая версия останется в истории Git."
         "${GITHUB_PLAINTEXT_REVIEW_LINES[@]}")
@@ -1391,15 +1390,18 @@ github_enable_local() {
             _github_enable_rollback "$source_backup" "$source_had_file" "$tmp_state"
             return 1
         fi
-        # --existing remote|migrate publish nothing from this computer: consent is
-        # needed only to make a public repository private (--make-private).
-        if [[ "$GITHUB_EXISTING_ACTION" != local && -n "${GITHUB_REPO_PENDING:-}" ]]; then
-            _github_plan_begin "Подключение GitHub"
-            if [[ "$GITHUB_EXISTING_ACTION" == remote ]]; then
-                CORE_PLAN_LINES+=("Будет использована конфигурация GitHub: $(_github_counts_json_label "$remote_counts").")
-            else
-                CORE_PLAN_LINES+=("Конфигурация GitHub будет преобразована в текущий формат.")
+        # Migration and any pending privacy change share one complete plan before
+        # the first remote write; the prepared candidate is published below.
+        if [[ "$GITHUB_EXISTING_ACTION" == migrate ]]; then
+            if ! _github_format_migrate_prepare "$tmp_state" "$connect_from"; then
+                _github_ensure_error "преобразование конфигурации GitHub" \
+                    "Не удалось преобразовать конфигурацию GitHub."
+                _github_enable_rollback "$source_backup" "$source_had_file" "$tmp_state"
+                return 1
             fi
+        elif [[ "$GITHUB_EXISTING_ACTION" == remote && -n "${GITHUB_REPO_PENDING:-}" ]]; then
+            _github_plan_begin "Подключение GitHub"
+            CORE_PLAN_LINES+=("Будет использована конфигурация GitHub: $(_github_counts_json_label "$remote_counts").")
             if ! _github_plan_confirm; then
                 _github_enable_rollback "$source_backup" "$source_had_file" "$tmp_state"
                 return 1
@@ -1410,12 +1412,6 @@ github_enable_local() {
             return 1
         fi
         if [[ "$GITHUB_EXISTING_ACTION" == migrate ]]; then
-            if ! _github_format_migrate_prepare "$tmp_state" "$connect_from"; then
-                _github_ensure_error "преобразование конфигурации GitHub" \
-                    "Не удалось преобразовать конфигурацию GitHub."
-                _github_enable_rollback "$source_backup" "$source_had_file" "$tmp_state"
-                return 1
-            fi
             CONFIG_SOURCE=github
             if ! github_config_checkpoint "$tmp_state"; then
                 _github_ensure_error "подготовка конфигурации к отправке" \
