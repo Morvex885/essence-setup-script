@@ -31,28 +31,3 @@ teardown() {
     [[ "${TOGGLE_SELECT_FLAGS[0]}" == 1 ]]
     [[ "${TOGGLE_SELECT_FLAGS[1]}" == 1 ]]
 }
-
-@test "node discovery count tracks two names and updates an existing name" {
-    _node_disc_count_reset
-    _node_disc_count_set 'de-vps' 2
-    _node_disc_count_set 'ru-vps' 4
-    [[ "$(_node_disc_count_get 'de-vps')" == 2 ]]
-    [[ "$(_node_disc_count_get 'ru-vps')" == 4 ]]
-
-    _node_disc_count_set 'de-vps' 7
-    [[ "$(_node_disc_count_get 'de-vps')" == 7 ]]
-    [[ "$(_node_disc_count_get 'ru-vps')" == 4 ]]
-}
-
-@test "subscription selectors write selected values to the shared result" {
-    _select_client 'Choose client' <<< $'1\n'
-    [[ "$SUBSCRIPTION_SELECT_RESULT" == 'my-router' ]]
-
-    _select_group 'Choose group' <<< $'1\n'
-    [[ "$SUBSCRIPTION_SELECT_RESULT" == 'ROUTER' ]]
-
-    jq_w --arg n 'my-router' --arg t 'test-token' \
-        '.clients |= map(if .name == $n then .subscription = {token: $t} else . end)'
-    _select_client_with_sub 'Choose subscribed client' <<< $'1\n'
-    [[ "$SUBSCRIPTION_SELECT_RESULT" == 'my-router' ]]
-}

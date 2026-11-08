@@ -8,6 +8,8 @@ setup() {
     source_module 'state.sh'
     source_module 'nodes.sh'
     source_module 'github-config.sh'
+    # Bare-module fault fixtures model an already available batchpass dependency.
+    ensure_age_batchpass() { return 0; }
     printf '{"schema_version":1,"node_passwords":{}}\n' > "$CONFIG_DIR/secrets.json"
     printf '{"schema_version":2,"portability":{"status":"ready","issues":[]},"access":{"script_password_hash":null},"templates":{}}\n' > "$CONFIG_DIR/manifest.json"
     export SECRETS_JSON="$CONFIG_DIR/secrets.json" STATE_MANIFEST="$CONFIG_DIR/manifest.json"
@@ -96,17 +98,24 @@ _assert_diagnostic_field_redacted() {
 }
 
 
-@test "storage mode selection rejects noncanonical indices before choosing plaintext" {
-    run "${BASH:-bash}" -c "source '$PROJECT_ROOT/common/common.sh'; source '$PROJECT_ROOT/remote-control/modules/github-config.sh'; _github_prompt_storage_mode <<< \$'01\n1+1\n\n2\r'; rc=\$?; [[ \$rc == 0 && \$GITHUB_STORAGE_MODE == none ]]"
-    assert_success
+@test "storage mode decision accepts only age or none" {
+    GITHUB_DECISION_STORAGE=none
+    _github_decide_storage_mode
+    [[ "$GITHUB_STORAGE_MODE" == none ]] || return 1
+    GITHUB_DECISION_STORAGE=age
+    _github_decide_storage_mode
+    [[ "$GITHUB_STORAGE_MODE" == age ]] || return 1
 }
 
-@test "storage mode cancellation and EOF clear the previous selection" {
-    run "${BASH:-bash}" -c "source '$PROJECT_ROOT/common/common.sh'; source '$PROJECT_ROOT/remote-control/modules/github-config.sh'; GITHUB_STORAGE_MODE=age; _github_prompt_storage_mode <<< 0; rc=\$?; [[ \$rc == 1 && -z \$GITHUB_STORAGE_MODE ]]"
-    assert_success
-    run "${BASH:-bash}" -c "source '$PROJECT_ROOT/common/common.sh'; source '$PROJECT_ROOT/remote-control/modules/github-config.sh'; GITHUB_STORAGE_MODE=age; _github_prompt_storage_mode </dev/null; rc=\$?; [[ \$rc == 1 && -z \$GITHUB_STORAGE_MODE ]]"
-    assert_success
-
+@test "missing or unknown storage decision clears the previous selection" {
+    local value rc
+    for value in '' 1 plaintext; do
+        GITHUB_STORAGE_MODE=age GITHUB_DECISION_STORAGE="$value" rc=0
+        _github_decide_storage_mode || rc=$?
+        [[ "$rc" -eq 1 && -z "$GITHUB_STORAGE_MODE" ]] || return 1
+        [[ "$RC_ERROR_CODE" == storage_mode_required ]] || return 1
+        [[ "$(jq -c .choices <<< "$RC_ERROR_EXTRA")" == '["age","none"]' ]] || return 1
+    done
 }
 
 
@@ -213,7 +222,8 @@ _assert_diagnostic_field_redacted() {
     chmod 600 "$identity" || return 1
     cat > "$keygen" <<'EOF'
 #!/bin/bash
-[[ "$1" == -y && -f "${2:-}" ]]
+[[ "$1" == -y && "$(cat "${2:-}")" == AGE-SECRET-KEY-CALLER ]] || exit 1
+printf 'age1callerrecipient\n'
 EOF
     cat > "$age" <<'EOF'
 #!/bin/bash
@@ -222,11 +232,13 @@ EOF
     chmod +x "$keygen" "$age" || return 1
     mkdir -p "$CONFIG_DIR/worktree" || return 1
     printf 'encrypted-unlock\n' > "$CONFIG_DIR/worktree/unlock.age" || return 1
+    printf 'age1repositoryrecipient\n' > "$CONFIG_DIR/worktree/recipient.txt" || return 1
     GITHUB_WORKTREE="$CONFIG_DIR/worktree"
     GITHUB_IDENTITY="$identity"
     AGE_KEYGEN_BIN="$keygen"
     AGE_BIN="$age"
     github_config_unlock </dev/null || rc=$?
+    [[ "$RC_ERROR_CODE" == vault_password_required ]] || return 1
     [[ "$rc" -ne 0 ]] || return 1
     [[ "$GITHUB_IDENTITY" == "$identity" ]] || return 1
     [[ "$(cat "$identity")" == AGE-SECRET-KEY-CALLER ]]
@@ -372,7 +384,7 @@ EOF
     success() { printf 'completed\n' > "$completion"; }
     github_sync_flush() { printf 'pushed\n' > "$pushed"; }
 
-    state_action add_group add_group <<< 'REJECTED' \
+    state_action add_group core_group_add REJECTED \
         > "$BATS_TEST_TMPDIR/rejected-group-output" 2>&1 || rc=$?
 
     [[ "$rc" -ne 0 ]] || return 1
@@ -541,6 +553,43 @@ EOF
     return 0
 }
 
+@test "missing batchpass dependencies reject age operations before mutating the vault" {
+    GITHUB_WORKTREE="$CONFIG_DIR/dependency-worktree" GITHUB_STORAGE_MODE=age
+    mkdir -p "$GITHUB_WORKTREE" || return 1
+    printf 'age1existing\n' > "$GITHUB_WORKTREE/recipient.txt"
+    printf 'existing-unlock\n' > "$GITHUB_WORKTREE/unlock.age"
+    printf 'existing-state\n' > "$GITHUB_WORKTREE/state.json.age"
+    printf 'existing-identity\n' > "$CONFIG_DIR/dependency-identity"
+    chmod 600 "$GITHUB_WORKTREE/unlock.age" "$GITHUB_WORKTREE/state.json.age" \
+        "$CONFIG_DIR/dependency-identity" || return 1
+    GITHUB_IDENTITY="$CONFIG_DIR/dependency-identity" GITHUB_RECIPIENT=age1existing
+    GITHUB_SECRET_VAULT_PASSWORD=old-password GITHUB_SECRET_NEW_VAULT_PASSWORD=new-password
+    local state="$CONFIG_DIR/dependency-state.json" before operation rc
+    _write_valid_logical_state "$state" || return 1
+    before=$(find "$CONFIG_DIR" -print | LC_ALL=C sort) || return 1
+    ensure_age_batchpass() { return 1; }
+    for operation in github_config_age_init github_config_unlock \
+        github_config_checkpoint github_config_rewrap_master; do
+        rc=0 RC_ERROR_CODE=""
+        if [[ "$operation" == github_config_checkpoint ]]; then
+            "$operation" "$state" || rc=$?
+        else
+            "$operation" || rc=$?
+        fi
+        [[ "$rc" -ne 0 && "$RC_ERROR_CODE" == deps_missing ]] || return 1
+        [[ "$GITHUB_IDENTITY" == "$CONFIG_DIR/dependency-identity" &&
+           "$GITHUB_RECIPIENT" == age1existing ]] || return 1
+        [[ "$(cat "$GITHUB_IDENTITY")" == existing-identity ]] || return 1
+        [[ "$(cat "$GITHUB_WORKTREE/recipient.txt")" == age1existing ]] || return 1
+        [[ "$(cat "$GITHUB_WORKTREE/unlock.age")" == existing-unlock ]] || return 1
+        [[ "$(cat "$GITHUB_WORKTREE/state.json.age")" == existing-state ]] || return 1
+        [[ "$(_file_mode "$GITHUB_IDENTITY")" == 600 &&
+           "$(_file_mode "$GITHUB_WORKTREE/unlock.age")" == 600 &&
+           "$(_file_mode "$GITHUB_WORKTREE/state.json.age")" == 600 ]] || return 1
+        [[ "$(find "$CONFIG_DIR" -print | LC_ALL=C sort)" == "$before" ]] || return 1
+    done
+}
+
 @test "age partial state output preserves old ciphertext and mode" {
     export GITHUB_WORKTREE="$CONFIG_DIR/worktree" GITHUB_STORAGE_MODE=age
     mkdir -p "$GITHUB_WORKTREE" || return 1
@@ -597,23 +646,14 @@ EOF
     _write_valid_logical_state "$AGE_STATE_FIXTURE" || return 1
     cat > "$BATS_TEST_TMPDIR/age-keygen" <<'EOF'
 #!/bin/bash
-printf 'age1identityrecipient\n'
+[[ "$1" == -y && "$(cat "$2")" == AGE-SECRET-KEY-FIXTURE ]] || exit 1
+printf 'age1repositoryrecipient\n'
 EOF
     cat > "$BATS_TEST_TMPDIR/age" <<'EOF'
 #!/bin/bash
-out="" in=""
-while (($#)); do
-    case "$1" in
-        -o) out="$2"; shift 2 ;;
-        -i) shift 2 ;;
-        -d) shift ;;
-        *) in="$1"; shift ;;
-    esac
-done
-case "$in" in
-    *state.json.age) cp "$AGE_STATE_FIXTURE" "$out" ;;
-    *) printf 'identity\n' > "$out" ;;
-esac
+[[ $# -eq 6 && "$1" == -d && "$2" == -i && "$4" == -o ]] || exit 1
+[[ "$(cat "$3")" == AGE-SECRET-KEY-FIXTURE && "$6" == *state.json.age ]] || exit 1
+cp "$AGE_STATE_FIXTURE" "$5"
 EOF
     chmod +x "$BATS_TEST_TMPDIR/age" "$BATS_TEST_TMPDIR/age-keygen"
     export AGE_BIN="$BATS_TEST_TMPDIR/age" AGE_KEYGEN_BIN="$BATS_TEST_TMPDIR/age-keygen"
@@ -634,16 +674,12 @@ EOF
     unlock_mode=$(_file_mode "$unlock") || return 1
     cat > "$age" <<'EOF'
 #!/bin/bash
-out=""
-decrypt=false
-while (($#)); do
-    case "$1" in
-        -d) decrypt=true; shift ;;
-        -o) out="${2:-}"; shift 2 ;;
-        *) shift ;;
-    esac
-done
-if [[ "$decrypt" == true ]]; then
+[[ $# -eq 6 && "$2" == -j && "$3" == batchpass && "$4" == -o ]] || exit 1
+[[ "${AGE_PASSPHRASE_FD:-}" == 9 && /dev/fd/0 -ef /dev/null ]] || exit 1
+IFS= read -r pw <&9 || [[ -n "$pw" ]] || exit 1
+out="$5"
+if [[ "$1" == -d ]]; then
+    [[ "$pw" == old-password && "$(cat "$6")" == old-unlock-exact ]] || exit 1
     printf 'AGE-SECRET-KEY-TEST\n' > "$out"
     if [[ "${OSTYPE:-}" == darwin* ]]; then
         stat -f '%Lp' "$out"
@@ -652,6 +688,7 @@ if [[ "$decrypt" == true ]]; then
     fi > "$PARTIAL_MODE_MARKER"
     exit 0
 fi
+[[ "$1" == -e && "$pw" == new-password && "$(cat "$6")" == AGE-SECRET-KEY-TEST ]] || exit 1
 printf 'partial-unlock\n' > "$out"
 if [[ "${OSTYPE:-}" == darwin* ]]; then
     stat -f '%Lp' "$out"
@@ -663,7 +700,8 @@ EOF
     chmod +x "$age" || return 1
     export AGE_BIN="$age" PARTIAL_MODE_MARKER="$mode_marker"
 
-    run github_config_rewrap_master <<< $'old-password\nnew-password\nnew-password\n'
+    GITHUB_SECRET_VAULT_PASSWORD=old-password GITHUB_SECRET_NEW_VAULT_PASSWORD=new-password
+    run github_config_rewrap_master
     assert_failure
     [[ "$(cat "$unlock")" == "old-unlock-exact" ]] || return 1
     [[ "$(_file_mode "$unlock")" == "$unlock_mode" ]] || return 1
@@ -696,10 +734,11 @@ KEY
 EOF
     cat > "$age" <<'EOF'
 #!/bin/bash
-out=""
-while (($#)); do
-    if [[ "$1" == -o ]]; then out="${2:-}"; shift 2; else shift; fi
-done
+[[ $# -eq 6 && "$1" == -e && "$2" == -j && "$3" == batchpass && "$4" == -o ]] || exit 1
+[[ "${AGE_PASSPHRASE_FD:-}" == 9 && /dev/fd/0 -ef /dev/null ]] || exit 1
+IFS= read -r pw <&9 || [[ -n "$pw" ]] || exit 1
+[[ "$pw" == master-password && "$(cat "$6")" == *AGE-SECRET-KEY-NEW* ]] || exit 1
+out="$5"
 printf 'partial-unlock\n' > "$out"
 if [[ "${OSTYPE:-}" == darwin* ]]; then
     stat -f '%Lp' "$out"
@@ -714,7 +753,8 @@ EOF
     GITHUB_RECIPIENT=old-recipient
 
     local age_init_rc=0
-    github_config_age_init <<< $'master-password\nmaster-password\n' || age_init_rc=$?
+    GITHUB_SECRET_NEW_VAULT_PASSWORD=master-password
+    github_config_age_init || age_init_rc=$?
     [[ "$age_init_rc" -ne 0 ]] || return 1
     [[ -f "$recipient" ]] || return 1
     [[ -f "$unlock" ]] || return 1
@@ -916,15 +956,17 @@ _portable_password_transport_roundtrip() {
     mkdir -p "$GITHUB_WORKTREE"
     git -C "$GITHUB_WORKTREE" init >/dev/null || return 1
     if [[ "$mode" == age ]]; then
-        command -v age >/dev/null || return 1
-        command -v age-keygen >/dev/null || return 1
+        { command -v age >/dev/null && command -v age-keygen >/dev/null; } || skip "age не установлен"
         AGE_BIN=$(command -v age)
         AGE_KEYGEN_BIN=$(command -v age-keygen)
+        source "$PROJECT_ROOT/common/ensure-deps.sh"
+        _age_batchpass_valid "$AGE_BIN" "$AGE_KEYGEN_BIN" || skip "age >=1.3.2 с batchpass не установлен"
         GITHUB_UNLOCK_FILE="$BATS_TEST_TMPDIR/portable-agekey"
         "$AGE_KEYGEN_BIN" -o "$GITHUB_UNLOCK_FILE" >/dev/null 2>&1 || return 1
         GITHUB_RECIPIENT=$("$AGE_KEYGEN_BIN" -y "$GITHUB_UNLOCK_FILE") || return 1
         printf '%s\n' "$GITHUB_RECIPIENT" > "$GITHUB_WORKTREE/recipient.txt"
-        "$AGE_BIN" -r "$GITHUB_RECIPIENT" -o "$GITHUB_WORKTREE/unlock.age" "$GITHUB_UNLOCK_FILE" || return 1
+        printf '%s' portable-vault-password |
+            _github_age_passphrase -e "$GITHUB_UNLOCK_FILE" "$GITHUB_WORKTREE/unlock.age" || return 1
         GITHUB_IDENTITY=""
     fi
     run github_config_checkpoint "$logical"
@@ -1097,5 +1139,296 @@ _prepare_v1_plain_worktree() {
         run github_config_checkpoint "$CONFIG_DIR/unsupported.json"
         assert_failure
         diff -r "$before" "$GITHUB_WORKTREE" || return 1
+    done
+}
+
+# ─── security round 1: github (S-M10, S-M11) ────────────────────────────────
+
+# Расшифрованные ключи age сеанса в CONFIG_DIR.
+_session_keys_left() {
+    find "$CONFIG_DIR" \( -name output -o -name '.recovery-key.*' -o -name '.unlock-check.*' \) -print
+}
+
+@test "import-recovery-key removes the previous session key and close leaves no decrypted key" {
+    _configure_managed_recovery_roots
+    local external="$BATS_TEST_TMPDIR/external" first second
+    mkdir -p "$external" || return 1
+    printf 'AGE-SECRET-KEY-RECOVERY\n' > "$external/recovery.key"
+    printf '#!/bin/bash\n[[ "$1" == -y ]] && grep -q AGE-SECRET "$2" && echo age1x\n' > "$external/keygen"
+    chmod +x "$external/keygen" || return 1
+    AGE_KEYGEN_BIN="$external/keygen"
+    # Ключ сеанса после разблокировки паролем: .github-private.*/output.
+    first=$(_github_new_private_path "$CONFIG_DIR/.unlock-check.XXXXXX") || return 1
+    printf 'AGE-SECRET-KEY-DECRYPTED\n' > "$first"
+    GITHUB_IDENTITY="$first"
+    github_config_import_recovery "$external/recovery.key" || return 1
+    [[ ! -e "$first" && ! -e "$(dirname "$first")" ]] || return 1
+    second="$GITHUB_IDENTITY"
+    github_config_import_recovery "$external/recovery.key" || return 1
+    [[ ! -e "$second" && -f "$GITHUB_IDENTITY" ]] || return 1
+    GITHUB_WORKTREE="" GITHUB_SESSION_ID=""
+    github_config_close || return 1
+    [ -z "$(_session_keys_left)" ]
+    # Сохранённый на устройстве ключ импорт не удаляет.
+    mkdir -p "$(dirname "$GITHUB_UNLOCK_FILE")"
+    printf 'AGE-SECRET-KEY-REMEMBERED\n' > "$GITHUB_UNLOCK_FILE"
+    GITHUB_IDENTITY="$GITHUB_UNLOCK_FILE"
+    github_config_import_recovery "$external/recovery.key" || return 1
+    [ "$(cat "$GITHUB_UNLOCK_FILE")" = AGE-SECRET-KEY-REMEMBERED ]
+}
+
+@test "unlock by password removes an imported key that does not fit the vault" {
+    local bin="$BATS_TEST_TMPDIR/age-bin" imported="$CONFIG_DIR/.recovery-key.test"
+    mkdir -p "$bin" "$CONFIG_DIR/worktree" || return 1
+    cat > "$bin/age-keygen" <<'EOF'
+#!/bin/bash
+[[ "$1" == -y ]] || exit 1
+case "$(cat "$2")" in
+    AGE-SECRET-KEY-OTHER) printf 'age1other\n' ;;
+    AGE-SECRET-KEY-DECRYPTED) printf 'age1vault\n' ;;
+    *) exit 1 ;;
+esac
+EOF
+    cat > "$bin/age" <<'EOF'
+#!/bin/bash
+# Пароль доступа приходит только через batchpass fd 9, не stdin.
+[[ $# -eq 6 && "$1" == -d && "$2" == -j && "$3" == batchpass && "$4" == -o ]] || exit 1
+[[ "${AGE_PASSPHRASE_FD:-}" == 9 && /dev/fd/0 -ef /dev/null ]] || exit 1
+IFS= read -r pw <&9 || [[ -n "$pw" ]] || exit 1
+[[ "$pw" == vault-pass && "$(cat "$6")" == encrypted-unlock ]] || exit 1
+out="$5"
+printf 'AGE-SECRET-KEY-DECRYPTED\n' > "$out"
+EOF
+    chmod +x "$bin/age" "$bin/age-keygen" || return 1
+    printf 'encrypted-unlock\n' > "$CONFIG_DIR/worktree/unlock.age"
+    printf 'age1vault\n' > "$CONFIG_DIR/worktree/recipient.txt"
+    printf 'AGE-SECRET-KEY-OTHER\n' > "$imported"
+    AGE_BIN="$bin/age" AGE_KEYGEN_BIN="$bin/age-keygen"
+    GITHUB_WORKTREE="$CONFIG_DIR/worktree" GITHUB_IDENTITY="$imported"
+    GITHUB_SECRET_VAULT_PASSWORD=vault-pass
+    local recipient rc
+    for recipient in '' age1mismatched; do
+        printf '%s\n' "$recipient" > "$GITHUB_WORKTREE/recipient.txt"
+        rc=0
+        github_config_unlock </dev/null || rc=$?
+        [[ "$rc" -ne 0 && "$GITHUB_LAST_FORMAT" == invalid ]] || return 1
+        [[ "$GITHUB_IDENTITY" == "$imported" &&
+           "$(cat "$imported")" == AGE-SECRET-KEY-OTHER ]] || return 1
+        [[ "$(_session_keys_left)" == "$imported" ]] || return 1
+    done
+    printf 'age1vault\n' > "$GITHUB_WORKTREE/recipient.txt"
+    github_config_unlock </dev/null || return 1
+    [[ ! -e "$imported" ]] || return 1
+    [ "$(cat "$GITHUB_IDENTITY")" = AGE-SECRET-KEY-DECRYPTED ]
+    GITHUB_WORKTREE="" GITHUB_SESSION_ID=""
+    github_config_close || return 1
+    [ -z "$(_session_keys_left)" ]
+}
+
+@test "config close removes a plaintext runtime-vault.json left by older versions" {
+    printf '{"secrets":"plaintext"}\n' > "$CONFIG_DIR/runtime-vault.json"
+    GITHUB_WORKTREE="" GITHUB_SESSION_ID="" GITHUB_IDENTITY=""
+    github_config_close || return 1
+    [[ ! -e "$CONFIG_DIR/runtime-vault.json" ]]
+}
+
+# ─── round 2: github (keys) ─────────────────────────────────────────────────
+
+# In-process core with a local bare repository behind the GitHub URL and a fake age
+# that wraps unlock.age using batchpass fd 9 and binds native payloads to their
+# recipient; age-keygen derives the recipient from the key, never opens scrypt.
+_r2_age_core() {
+    export REMOTE="$BATS_TEST_TMPDIR/r2-remote.git" GIT_CONFIG_GLOBAL="$BATS_TEST_TMPDIR/r2-gitconfig"
+    export GIT_CONFIG_NOSYSTEM=1
+    git init -q --bare -b main "$REMOTE" || return 1
+    git config --global user.name test
+    git config --global user.email test@example.invalid
+    git config --global url."file://$REMOTE".insteadOf \
+        "https://github.com/test-owner/essence-remote-control-config.git"
+    mkdir -p "$BATS_TEST_TMPDIR/r2-bin"
+    cat > "$BATS_TEST_TMPDIR/r2-bin/age-keygen" <<'EOF'
+#!/bin/bash
+if [[ "${1:-}" == -y ]]; then
+    k=$(grep -v '^#' "$2" | head -1); [[ "$k" == AGE-SECRET-KEY-* ]] || exit 1
+    printf 'age1%s\n' "$(printf '%s' "$k" | sha256sum | cut -c1-20)"
+else
+    k="AGE-SECRET-KEY-$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    printf '# public key: age1%s\n%s\n' "$(printf '%s' "$k" | sha256sum | cut -c1-20)" "$k"
+fi
+EOF
+    cat > "$BATS_TEST_TMPDIR/r2-bin/age" <<'EOF'
+#!/bin/bash
+out="" input="" mode="" identity="" recipient="" plugin=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -e|-d) [[ -z "$mode" ]] || exit 1; mode="$1"; shift ;;
+        -j) [[ "$2" == batchpass ]] || exit 1; plugin="$2"; shift 2 ;;
+        -i) identity="$2"; shift 2 ;;
+        -r) recipient="$2"; shift 2 ;;
+        -o) out="$2"; shift 2 ;;
+        -*) exit 1 ;;
+        *) [[ -z "$input" ]] || exit 1; input="$1"; shift ;;
+    esac
+done
+[[ -n "$out" && -s "$input" ]] || exit 1
+if [[ -n "$plugin" ]]; then
+    [[ -z "$identity$recipient" && "${AGE_PASSPHRASE_FD:-}" == 9 ]] || exit 1
+    [[ /dev/fd/0 -ef /dev/null ]] || exit 1
+    IFS= read -r pw <&9 || [[ -n "$pw" ]] || exit 1
+fi
+if [[ "$mode" != -d ]]; then
+    if [[ "$plugin" == batchpass && "$mode" == -e ]]; then
+        { printf 'FAKEPW:%s\n' "$pw"
+          printf 'IDSHA:%s\n' "$(grep -v '^#' "$input" | head -1 | sha256sum | cut -c1-20)"
+          cat "$input"; } > "$out"
+    else
+        [[ -n "$recipient" && -z "$plugin$identity" ]] || exit 1
+        { printf 'FAKERECIPIENT:%s\n' "$recipient"; cat "$input"; } > "$out"
+    fi
+    exit 0
+fi
+first=$(head -1 "$input")
+if [[ "$first" == FAKEPW:* ]]; then
+    [[ "$plugin" == batchpass && -z "$identity" && "FAKEPW:$pw" == "$first" ]] || exit 1
+    tail -n +3 "$input" > "$out"
+else
+    [[ -z "$plugin$recipient" && -s "$identity" ]] || exit 1
+    public=$("$AGE_KEYGEN_BIN" -y "$identity") || exit 1
+    [[ "$first" == "FAKERECIPIENT:$public" ]] || exit 1
+    tail -n +2 "$input" > "$out"
+fi
+EOF
+    chmod +x "$BATS_TEST_TMPDIR/r2-bin/age" "$BATS_TEST_TMPDIR/r2-bin/age-keygen"
+    load '../helpers/cmd_helper'
+    load_core
+    ensure_age_batchpass() { return 0; }
+    load '../helpers/mock_ssh'
+    export AGE_BIN="$BATS_TEST_TMPDIR/r2-bin/age" AGE_KEYGEN_BIN="$BATS_TEST_TMPDIR/r2-bin/age-keygen"
+    BUILTIN_TEMPLATES_DIR="$PROJECT_ROOT/remote-control/templates"
+    _github_ensure_deps() { return 0; }
+    _github_prepare_account() { return 0; }
+    _github_gh() {
+        shift
+        case "$1 $2" in
+            "api user") printf 'test-owner\n' ;;
+            "repo view") printf '{"visibility":"PRIVATE"}\n' ;;
+            *) return 1 ;;
+        esac
+    }
+    load_fixture_template
+    open_local_session
+}
+
+# _r2_age_connect [--remember-key] — new encrypted vault, access password vpw.
+_r2_age_connect() {
+    RC_REQUEST_SECRETS='{"new-vault-password":"vpw"}'
+    run_cmd source github-connect --login test-owner --storage age --yes "$@"
+    RC_REQUEST_SECRETS='{}'
+    [ "$status" -eq 0 ] || { printf 'connect: %s\n' "$CMD_ENVELOPE"; return 1; }
+}
+
+# A native identity matches recipient.txt; it cannot decrypt scrypt unlock.age.
+_r2_key_matches_recipient() {
+    local public
+    public=$("$AGE_KEYGEN_BIN" -y "$1") || return 1
+    [[ "$public" == "$(tr -d '\r\n' < "$GITHUB_WORKTREE/recipient.txt")" ]]
+}
+
+@test "age mock enforces batchpass passwords and native recipient binding" {
+    _r2_age_core
+    _r2_age_connect
+    local out="$BATS_TEST_TMPDIR/mock-decrypted" other="$BATS_TEST_TMPDIR/other.key"
+    run "$AGE_BIN" -d -i "$GITHUB_IDENTITY" -o "$out" "$GITHUB_WORKTREE/unlock.age"
+    assert_failure
+    [[ ! -e "$out" ]] || return 1
+    run "$AGE_BIN" -p -o "$out" "$GITHUB_IDENTITY"
+    assert_failure
+    [[ ! -e "$out" ]] || return 1
+    run "$AGE_BIN" -d -j batchpass -o "$out" "$GITHUB_WORKTREE/unlock.age"
+    assert_failure
+    [[ ! -e "$out" ]] || return 1
+    if printf '%s' wrong-password |
+        _github_age_passphrase -d "$GITHUB_WORKTREE/unlock.age" "$out"; then
+        return 1
+    fi
+    [[ ! -e "$out" ]] || return 1
+    printf '%s' vpw | _github_age_passphrase -d "$GITHUB_WORKTREE/unlock.age" "$out" || return 1
+    cmp -s "$GITHUB_IDENTITY" "$out" || return 1
+    rm -f "$out"
+    "$AGE_KEYGEN_BIN" > "$other" || return 1
+    run "$AGE_BIN" -d -i "$other" -o "$out" "$GITHUB_WORKTREE/state.json.age"
+    assert_failure
+    [[ ! -e "$out" ]]
+}
+
+@test "R2-L11: connect --remember-key keeps the key of the new vault on this device" {
+    _r2_age_core
+    _r2_age_connect --remember-key
+    [ -f "$GITHUB_UNLOCK_FILE" ]
+    [ "$(_file_mode "$GITHUB_UNLOCK_FILE")" = 600 ]
+    _r2_key_matches_recipient "$GITHUB_UNLOCK_FILE"
+    run_cmd source status
+    [ "$(cmd_jq -r .data.key_saved)" = true ]
+}
+
+@test "R2-L11: connect without --remember-key saves no key" {
+    _r2_age_core
+    _r2_age_connect
+    [ ! -e "$GITHUB_UNLOCK_FILE" ]
+}
+
+@test "R2-M16: rotate-key replaces a saved key with the new one" {
+    _r2_age_core
+    _r2_age_connect --remember-key
+    local old; old=$(cat "$GITHUB_UNLOCK_FILE")
+    RC_REQUEST_SECRETS='{"new-vault-password":"vpw2"}'
+    run_cmd source github-rotate-key --yes
+    [ "$status" -eq 0 ]
+    [ "$(cat "$GITHUB_UNLOCK_FILE")" != "$old" ]
+    cmp -s "$GITHUB_UNLOCK_FILE" "$GITHUB_IDENTITY"
+    _r2_key_matches_recipient "$GITHUB_UNLOCK_FILE"
+    run_cmd source status
+    [ "$(cmd_jq -r .data.key_saved)" = true ]
+}
+
+@test "R2-M16: rotate-key saves no key when none was saved" {
+    _r2_age_core
+    _r2_age_connect
+    RC_REQUEST_SECRETS='{"new-vault-password":"vpw2"}'
+    run_cmd source github-rotate-key --yes
+    [ "$status" -eq 0 ]
+    [ ! -e "$GITHUB_UNLOCK_FILE" ]
+}
+
+@test "R2-M15: import-recovery-key rejects a key of another vault and keeps the working key" {
+    _r2_age_core
+    _r2_age_connect
+    # Recovery keys must live outside CONFIG_DIR (which is BATS_TEST_TMPDIR here).
+    local working="$GITHUB_IDENTITY" external="${BATS_RUN_TMPDIR:?}/r2-recovery-$BATS_TEST_NUMBER"
+    mkdir -p "$external"
+    "$AGE_KEYGEN_BIN" > "$external/other.key"
+    run_cmd source github-import-recovery-key --file "$external/other.key"
+    [ "$status" -eq 1 ]
+    [ "$(cmd_jq -r .error.code)" = invalid ]
+    [[ "$(cmd_jq -r .error.message)" == *"не подходит к текущему хранилищу"* ]]
+    [ "$GITHUB_IDENTITY" = "$working" ] && [ -f "$working" ]
+    [ -z "$(find "$CONFIG_DIR" -maxdepth 1 -name '.recovery-key.*')" ]
+    cp "$working" "$external/own.key"
+    run_cmd source github-import-recovery-key --file "$external/own.key"
+    [ "$status" -eq 0 ]
+    [ "$GITHUB_IDENTITY" != "$working" ]
+    _r2_key_matches_recipient "$GITHUB_IDENTITY"
+}
+
+@test "batchpass password contract rejects trailing CR or LF without normalizing the secret" {
+    local secret rc
+    for secret in $'line-password\r' $'line-password\n'; do
+        GITHUB_SECRET_NEW_VAULT_PASSWORD="$secret"
+        rc_error_reset
+        rc=0
+        github_config_new_master || rc=$?
+        [ "$rc" -eq 1 ]
+        [ "$RC_ERROR_CODE" = invalid ]
+        [ -z "${GITHUB_MASTER_PASSWORD:-}" ]
     done
 }

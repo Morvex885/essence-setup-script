@@ -3,12 +3,10 @@
 setup() {
     load '../helpers/test_helper'
     setup_test_env
-    source_common
-    source_module 'nodes.sh'
-    source_module 'groups.sh'
-    source_module 'templates.sh'
-    source_module 'generate.sh'
-    source "$PROJECT_ROOT/tests/helpers/mock_ssh.bash"
+    load '../helpers/cmd_helper'
+    load_core
+    load '../helpers/mock_ssh'
+    open_local_session
     REMOTE_DIR="$BATS_TEST_TMPDIR/remote"
     printf 'proxies:\nproxy-groups: []\n' > "$TEMPLATES_DIR/default.yaml"
     jq_w '.groups=[{name:"PC",template:"default.yaml"},{name:"MOBILE",template:"missing.yaml"}] | .clients=[{name:"bad",group:"PC"},{name:"good",group:"PC"},{name:"skipped",group:"MOBILE"}]'
@@ -19,9 +17,13 @@ teardown() { teardown_test_env; }
 @test "generation continues after write failures and reports each actual client outcome" {
     mkdir -p "$GENERATED_DIR/PC"
     printf 'blocked\n' > "$GENERATED_DIR/PC/bad"
-    local rc=0
-    generate_all </dev/null || rc=$?
-    [ "$rc" -eq 1 ]
+    run_cmd generate --all
+    [ "$status" -eq 1 ]
+    [ "$(cmd_jq '.error.code')" = partial ]
+    [ "$(cmd_jq -c '.data.failed')" = '["bad"]' ]
+    [ "$(cmd_jq -c '.data.ok')" = '["good"]' ]
+    [ "$(cmd_jq -c '.data.skipped')" = '["skipped"]' ]
+    [ "$(cmd_jq '.data.dir')" = "$GENERATED_DIR" ]
     [ "${GENERATE_CLIENT_FAILED[*]}" = bad ]
     [ "${GENERATE_CLIENT_OK[*]}" = good ]
     [ "${GENERATE_CLIENT_SKIPPED[*]}" = skipped ]
@@ -33,7 +35,9 @@ teardown() { teardown_test_env; }
 @test "a new generation resets old failures while missing templates remain nonfatal skips" {
     GENERATE_CLIENT_FAILED=(old-client)
     GENERATE_NODE_FAILED=(old-node)
-    generate_all </dev/null
+    run_cmd generate --all
+    [ "$status" -eq 0 ]
+    [ "$(cmd_jq -c '.data | [.failed, .nodes_failed]')" = '[[],[]]' ]
     [ "${#GENERATE_CLIENT_FAILED[@]}" -eq 0 ]
     [ "${#GENERATE_NODE_FAILED[@]}" -eq 0 ]
     [ "${GENERATE_CLIENT_OK[*]}" = 'bad good' ]
@@ -77,9 +81,8 @@ teardown() { teardown_test_env; }
     mkdir -p "$GENERATED_DIR/PC/my-pc"
     printf 'previous\n' > "$GENERATED_DIR/PC/my-pc/config.yaml"
     SSH_RUN_MOCK_EXIT=1
-    local rc=0
-    generate_all </dev/null || rc=$?
-    [ "$rc" -eq 1 ]
+    run_cmd generate --all
+    [ "$status" -eq 1 ]
     array_contains my-pc "${GENERATE_CLIENT_FAILED[@]}"
     [ "${#GENERATE_CLIENT_OK[@]}" -eq 0 ]
     cmp -s "$GENERATED_DIR/PC/my-pc/config.yaml" <(printf 'previous\n')
@@ -100,66 +103,26 @@ teardown() { teardown_test_env; }
     cmp -s "$GENERATED_DIR/ROUTER/my-router/config.yaml" <(printf 'previous\n')
 }
 
-# Keep editor discovery independent of editors installed on the test host.
-_select_test_editor() {
-    TEST_TEMPLATE_EDITOR="$1"
-    command() {
-        if [[ "$1" == -v && ( "$2" == nano || "$2" == vi ) ]]; then
-            [[ "$2" == "$TEST_TEMPLATE_EDITOR" ]]
-            return $?
-        fi
-        builtin command "$@"
-    }
-    nano() {
-        printf 'partial editor change\n' >> "$1"
-        return 73
-    }
-    vi() {
-        printf 'partial editor change\n' >> "$1"
-        return 74
-    }
-}
-
-@test "template editing rejects failed nano and vi while retaining their partial changes" {
-    local editor before
-    before=$(jq -S . "$CONFIG_JSON")
-    for editor in nano vi; do
-        _select_test_editor "$editor"
-        printf 'original template\n' > "$TEMPLATES_DIR/default.yaml"
-        run edit_template <<< '1'
-        [ "$status" -ne 0 ]
-        cmp -s "$TEMPLATES_DIR/default.yaml" <(printf 'original template\npartial editor change\n')
-        [ "$(jq -S . "$CONFIG_JSON")" = "$before" ]
-    done
-}
-
-@test "new template editor failures leave partial files without assigning either template to the group" {
-    local editor before
-    before=$(jq -S . "$CONFIG_JSON")
-    for editor in nano vi; do
-        _select_test_editor "$editor"
-        run _create_new_template PC <<< "failed-$editor"
-        [ "$status" -ne 0 ]
-        cmp -s "$TEMPLATES_DIR/failed-$editor.yaml" \
-            <(cat "$TEMPLATES_DIR/default.yaml"; printf 'partial editor change\n')
-        [ "$(jq -S . "$CONFIG_JSON")" = "$before" ]
-    done
-}
-
-@test "no editor preserves manual editing and permits assigning a newly copied template" {
-    _select_test_editor none
-    local before
-    before=$(jq -S . "$CONFIG_JSON")
-    run edit_template <<< $'n\nmanual-edit'
+@test "generate by group and by client returns the same data shape" {
+    run_cmd generate --group PC
     [ "$status" -eq 0 ]
-    [[ "$output" == *"$TEMPLATES_DIR/manual-edit.yaml"* ]]
-    cmp -s "$TEMPLATES_DIR/manual-edit.yaml" "$TEMPLATES_DIR/default.yaml"
-    [ "$(jq -S . "$CONFIG_JSON")" = "$before" ]
-
-    run _create_new_template PC <<< 'manual-group'
+    [ "$(cmd_jq -c '.data.ok')" = '["bad","good"]' ]
+    [ -f "$GENERATED_DIR/PC/good/config.yaml" ]
+    rm -rf "$GENERATED_DIR/PC"
+    run_cmd generate --client good
     [ "$status" -eq 0 ]
-    [[ "$output" == *"$TEMPLATES_DIR/manual-group.yaml"* ]]
-    cmp -s "$TEMPLATES_DIR/manual-group.yaml" "$TEMPLATES_DIR/default.yaml"
-    jq -e '.groups[] | select(.name=="PC") | .template=="manual-group.yaml"' "$CONFIG_JSON"
-    jq -e '.groups[] | select(.name=="MOBILE") | .template=="missing.yaml"' "$CONFIG_JSON"
+    [ "$(cmd_jq -c '.data.ok')" = '["good"]' ]
+    [ -f "$GENERATED_DIR/PC/good/config.yaml" ]
+    [ ! -e "$GENERATED_DIR/PC/bad" ]
+}
+
+@test "generate rejects missing selector and unknown targets without writing" {
+    run_cmd generate
+    [ "$status" -eq 2 ]
+    [ "$(cmd_jq '.error.code')" = usage ]
+    run_cmd generate --group NOPE
+    [ "$(cmd_jq '.error.code')" = not_found ]
+    run_cmd generate --client nobody
+    [ "$(cmd_jq '.error.code')" = not_found ]
+    [ -z "$(ls -A "$GENERATED_DIR")" ]
 }

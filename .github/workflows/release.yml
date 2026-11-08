@@ -26,16 +26,17 @@ jobs:
           # Собираем дистрибутив в отдельную папку
           mkdir -p dist/essence-setup/setup-essence/modules
           mkdir -p dist/essence-setup/remote-control/modules
+          mkdir -p dist/essence-setup/remote-control/tui
           mkdir -p dist/essence-setup/remote-control/templates
           mkdir -p dist/essence-setup/common
           cp setup-essence/setup-essence.sh setup-essence/install-essence.sh dist/essence-setup/setup-essence/
           cp setup-essence/modules/*.sh dist/essence-setup/setup-essence/modules/
           cp remote-control/remote-control-essence.sh remote-control/install-remote-control.sh dist/essence-setup/remote-control/
           cp remote-control/modules/*.sh dist/essence-setup/remote-control/modules/
+          cp remote-control/tui/*.sh dist/essence-setup/remote-control/tui/
           cp remote-control/templates/*.yaml dist/essence-setup/remote-control/templates/ 2>/dev/null || true
-          cp common/common.sh dist/essence-setup/common/
-          cp common/ensure-deps.sh dist/essence-setup/common/
-          cp VERSION dist/essence-setup/
+          cp -R common/. dist/essence-setup/common/
+          cp VERSION remote-control.cmd dist/essence-setup/
 
           # Архивируем с корнем essence-setup/ → при распаковке --strip-components=1
           tar -czf "$TARBALL" -C dist essence-setup

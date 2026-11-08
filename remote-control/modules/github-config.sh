@@ -127,14 +127,47 @@ _github_ensure_deps() {
     local mode="${1:-}" remote="${2:-${GITHUB_REMOTE:-}}"
     if declare -F ensure_dep >/dev/null 2>&1; then
         ensure_dep git gh || return 1
-        if [[ "$mode" == age ]]; then ensure_dep age || return 1; fi
+        [[ "$mode" != age ]] || _github_require_age_batchpass || return 1
     else
         _github_require git || return 1
         if [[ "$remote" != /* && "$remote" != *.git && "$remote" != file://* ]]; then
             _github_require gh || return 1
         fi
-        [[ "$mode" != age ]] || _github_require "$AGE_BIN"
+        [[ "$mode" != age ]] || _github_require_age_batchpass
     fi
+}
+
+# Один dependency entrypoint для CLI/serve и внутренних age-операций.
+_github_require_age_batchpass() {
+    if declare -F ensure_age_batchpass >/dev/null 2>&1 && ensure_age_batchpass &&
+       [[ "$AGE_BIN" == /* && -x "$AGE_BIN" ]]; then
+        return 0
+    fi
+    _github_record_error "проверка зависимостей" \
+        "Требуются age 1.3.2 или новее, age-keygen и age-plugin-batchpass."
+    rc_fail deps_missing "$GITHUB_LAST_ERROR"
+    return 1
+}
+
+# Пароль поступает только через stdin; fd 9 локален вызову, serve fd 3 не меняется.
+# Payload читается из файла, а stdin age не используется для plugin-протокола.
+_github_age_passphrase() (
+    local mode="$1" input="$2" output="$3"
+    [[ "$AGE_BIN" == /* && -x "$AGE_BIN" ]] || return 1
+    umask 077
+    unset AGE_PASSPHRASE AGE_PASSPHRASE_FD AGEDEBUG \
+        AGE_PASSPHRASE_WORK_FACTOR AGE_PASSPHRASE_MAX_WORK_FACTOR
+    PATH="${AGE_BIN%/*}:$PATH" AGE_PASSPHRASE_FD=9 \
+        "$AGE_BIN" "$mode" -j batchpass -o "$output" "$input" 9<&0 </dev/null
+)
+
+_github_password_line_valid() {
+    case "$1" in
+        *$'\r'|*$'\n')
+            rc_fail invalid "Пароль доступа не должен заканчиваться переводом строки."
+            return 1
+            ;;
+    esac
 }
 _github_profile_dir() {
     local login="${1:-}"
@@ -208,7 +241,7 @@ _github_safe_web_output() {
 }
 
 _github_prepare_account() {
-    local login="${1:-}" interactive="${2:-false}" profile
+    local login="${1:-}" profile
     profile=$(_github_profile_dir "$login") || return 1
     if [[ -d "$profile" && ! -L "$profile" && -f "$profile/hosts.yml" ]]; then
         _github_account_login "$login"
@@ -217,20 +250,43 @@ _github_prepare_account() {
     if _github_import_account "$login" && _github_account_login "$login"; then
         return 0
     fi
-    if [[ "$interactive" == true ]]; then
-        _github_profile_prepare "$login" || return 1
-        if (umask 077
-            env -u GH_TOKEN -u GITHUB_TOKEN -u GH_HOST -u GH_PROMPT_DISABLED \
-                GH_CONFIG_DIR="$profile" \
-                "${GH_BIN:-gh}" auth login --hostname github.com --git-protocol https --web \
-                > >(_github_safe_web_output) 2> >(_github_safe_web_output)) &&
-           _github_account_login "$login"; then
-            return 0
-        fi
-    fi
     _github_record_error "авторизация аккаунта GitHub" \
         "Учётные данные аккаунта $login недоступны или не совпадают." true \
         "Выполните: GH_CONFIG_DIR=$profile gh auth login --hostname github.com --web"
+    return 1
+}
+
+# github_login_web LOGIN — вход gh через браузер в изолированный профиль
+# аккаунта. Без stdin gh не ждёт Enter: печатает код устройства и адрес, затем
+# ждёт подтверждения в браузере. Вывод gh очищается и идёт в журнал (stderr).
+github_login_web() {
+    local login="${1:-}" profile extra
+    _github_clear_error
+    if ! profile=$(_github_profile_dir "$login"); then
+        rc_fail usage "Некорректный логин GitHub: ${login}."
+        return 1
+    fi
+    if ! _github_ensure_deps; then
+        _github_record_error "проверка зависимостей" "Не удалось подготовить GitHub CLI."
+        return 1
+    fi
+    _github_profile_prepare "$login" || {
+        _github_record_error "авторизация аккаунта GitHub" \
+            "Не удалось подготовить профиль GitHub CLI для $login."
+        return 1
+    }
+    if (umask 077
+        env -u GH_TOKEN -u GITHUB_TOKEN -u GH_HOST -u GH_PROMPT_DISABLED \
+            GH_CONFIG_DIR="$profile" \
+            "${GH_BIN:-gh}" auth login --hostname github.com --git-protocol https --web \
+            < /dev/null > >(_github_safe_web_output) 2> >(_github_safe_web_output)) &&
+       _github_account_login "$login"; then
+        return 0
+    fi
+    extra=$(jq -cn --arg l "$login" \
+        --arg h "Выполните: GH_CONFIG_DIR=$profile gh auth login --hostname github.com --web" \
+        '{login:$l, hint:$h}')
+    rc_fail github_auth_required "Не удалось войти в GitHub как $login." "$extra"
     return 1
 }
 
@@ -246,71 +302,33 @@ _github_load_global_login() {
     GITHUB_GLOBAL_LOGIN="$output"
 }
 
+# _github_select_account — аккаунт из решения GITHUB_DECISION_LOGIN (--login).
+# Нет решения → usage; аккаунт не авторизован → github_auth_required.
 _github_select_account() {
-    local current_owner="${1:-}" login="" answer requested
+    local login="${GITHUB_DECISION_LOGIN:-}" extra
     _github_clear_error
+    if [[ -z "$login" ]]; then
+        rc_fail usage "Укажите аккаунт GitHub: --login LOGIN."
+        return 1
+    fi
+    if [[ ! "$login" =~ ^[A-Za-z0-9-]+$ ]]; then
+        rc_fail usage "Некорректный логин GitHub: ${login}."
+        return 1
+    fi
     if ! _github_ensure_deps; then
         _github_record_error "проверка зависимостей" "Не удалось подготовить GitHub CLI."
         return 1
     fi
-    if [[ -n "$current_owner" ]]; then
-        login="$current_owner"
-    elif _github_load_global_login; then
-        login="$GITHUB_GLOBAL_LOGIN"
+    if ! _github_prepare_account "$login"; then
+        if [[ "${GITHUB_LAST_AUTH_RELEVANT:-false}" == true ]]; then
+            extra=$(jq -cn --arg l "$login" --arg h "${GITHUB_LAST_HINT:-}" '{login:$l, hint:$h}')
+            rc_fail github_auth_required \
+                "Аккаунт GitHub $login не авторизован: source github-login --login $login." "$extra"
+        fi
+        return 1
     fi
-    while :; do
-        echo ""
-        box_top
-        box_center "Выбор аккаунта GitHub"
-        box_mid
-        box_line " Выбранный аккаунт: ${login:-не указан}"
-        box_mid
-        if [[ -n "$login" ]]; then
-            menu_item 1 "Продолжить с $login" CYAN
-        fi
-        menu_item 2 "Указать другой логин GitHub" CYAN
-        menu_item 0 "Отмена" NC
-        box_bot
-        echo ""
-        if ! IFS= read -rp "  Выберите действие: " answer; then
-            _github_record_error "выбор аккаунта GitHub" "Выбор аккаунта GitHub отменён."
-            return 1
-        fi
-        answer="${answer%$'\r'}"
-        case "$answer" in
-            1)
-                if [[ -z "$login" ]]; then
-                    warn "Неверный выбор."
-                    continue
-                fi
-                requested="$login"
-                ;;
-            2)
-                if ! IFS= read -rp "  Логин GitHub: " requested; then
-                    _github_record_error "выбор аккаунта GitHub" "Выбор аккаунта GitHub отменён."
-                    return 1
-                fi
-                requested="${requested%$'\r'}"
-                if [[ "$requested" == 0 ]]; then
-                    _github_record_error "выбор аккаунта GitHub" "Выбор аккаунта GitHub отменён."
-                    return 1
-                fi
-                if [[ ! "$requested" =~ ^[A-Za-z0-9-]+$ ]]; then
-                    warn "Неверный логин GitHub."
-                    continue
-                fi
-                ;;
-            0)
-                _github_record_error "выбор аккаунта GitHub" "Выбор аккаунта GitHub отменён."
-                return 1
-                ;;
-            *) warn "Неверный выбор."; continue ;;
-        esac
-        _github_prepare_account "$requested" true || return 1
-        GITHUB_OWNER="$requested"
-        export GITHUB_OWNER
-        return 0
-    done
+    GITHUB_OWNER="$login"
+    export GITHUB_OWNER
 }
 
 _github_transport_git() {
@@ -337,7 +355,9 @@ _github_remote_git() {
 }
 
 _github_run_with_timeout() {
-    run_with_timeout "$@"
+    local seconds="$1"
+    shift
+    run_with_timeout "$seconds" ${RC_SERVE_TIMEOUT_FLAG:+"$RC_SERVE_TIMEOUT_FLAG"} "$@"
 }
 
 _github_validate_tree() {
@@ -410,39 +430,55 @@ _github_validate_tree() {
     fi
 }
 
-_github_prompt_storage_mode() {
+# _github_decide_storage_mode — GITHUB_DECISION_STORAGE=age|none (--storage);
+# нет решения → storage_mode_required.
+_github_decide_storage_mode() {
     GITHUB_STORAGE_MODE=""
-    warn "В режиме без шифрования пароли SSH и приватные ключи доступны читателям репозитория и сохраняются в истории Git."
-    menu_select "Хранение конфигурации GitHub" "Выберите способ хранения" \
-        "Зашифровать паролем" "Хранить без шифрования" || return 1
-    case "$MENU_SELECT_INDEX" in
-        1) GITHUB_STORAGE_MODE=age ;;
-        2) GITHUB_STORAGE_MODE=none ;;
+    case "${GITHUB_DECISION_STORAGE:-}" in
+        age) GITHUB_STORAGE_MODE=age ;;
+        none)
+            warn "В режиме без шифрования пароли SSH и приватные ключи доступны читателям репозитория и сохраняются в истории Git."
+            GITHUB_STORAGE_MODE=none
+            ;;
+        *)
+            _github_record_error "выбор способа хранения" "Не выбран способ хранения конфигурации GitHub."
+            rc_fail storage_mode_required \
+                "Выберите способ хранения конфигурации GitHub: --storage age|none." \
+                '{"choices":["age","none"]}'
+            return 1
+            ;;
     esac
 }
-_github_prompt_existing_config_action() {
-    local allow_local="${1:-true}" outdated="${2:-false}" mode_label remote_action=remote
+
+# _github_decide_existing_action ALLOW_LOCAL OUTDATED REMOTE_COUNTS LOCAL_COUNTS —
+# GITHUB_DECISION_EXISTING (--existing) из допустимых вариантов: remote (или
+# migrate для устаревшего формата) и local, если ALLOW_LOCAL=true. Иначе
+# existing_config_action_required с вариантами и счётчиками ({nodes,clients,groups}|null).
+_github_decide_existing_action() {
+    local allow_local="${1:-true}" outdated="${2:-false}"
+    local remote_counts="${3:-null}" local_counts="${4:-null}" choice extra
+    local -a choices=(remote)
     GITHUB_EXISTING_ACTION=""
-    case "${GITHUB_STORAGE_MODE:-}" in
-        age) mode_label="зашифровано паролем" ;;
-        none) mode_label="без шифрования" ;;
-        *) return 1 ;;
-    esac
-    local options=("Загрузить конфигурацию из GitHub")
-    if [[ "$outdated" == true ]]; then
-        options=("Преобразовать и загрузить конфигурацию из GitHub")
-        remote_action=migrate
-    fi
-    [[ "$allow_local" == true ]] && options+=("Заменить конфигурацию в GitHub текущей локальной")
-    MENU_SELECT_CONTEXT=("Режим хранения: $mode_label")
-    menu_select "Конфигурация GitHub" "Выберите конфигурацию" "${options[@]}" || return 1
-    case "$MENU_SELECT_INDEX" in
-        1) GITHUB_EXISTING_ACTION=$remote_action ;;
-        2) GITHUB_EXISTING_ACTION=local ;;
-    esac
+    [[ "$outdated" == true ]] && choices=(migrate)
+    [[ "$allow_local" == true ]] && choices+=(local)
+    for choice in "${choices[@]}"; do
+        if [[ "${GITHUB_DECISION_EXISTING:-}" == "$choice" ]]; then
+            GITHUB_EXISTING_ACTION="$choice"
+            return 0
+        fi
+    done
+    _github_record_error "выбор версии конфигурации" "Не выбрано действие с конфигурацией GitHub."
+    extra=$(printf '%s\n' "${choices[@]}" | jq -R . | jq -sc \
+        --argjson r "$remote_counts" --argjson l "$local_counts" \
+        '{choices:., remote_counts:$r, local_counts:$l}')
+    rc_fail existing_config_action_required \
+        "В репозитории уже есть конфигурация: --existing $(IFS='|'; printf '%s' "${choices[*]}")." "$extra"
+    return 1
 }
+
+# GITHUB_DECISION_REMEMBER_KEY=1 — сохранить ключ расшифровки (--remember-key).
 _github_prompt_remember_unlock() {
-    confirm_yn "Сохранить ключ расшифровки на этом устройстве?" N
+    [[ "${GITHUB_DECISION_REMEMBER_KEY:-0}" == 1 ]]
 }
 
 _github_storage_init() {
@@ -487,40 +523,23 @@ _github_storage_read() {
         return 1
     }
 }
-github_config_prompt_master() {
+# github_config_new_master — новый пароль доступа из GITHUB_SECRET_NEW_VAULT_PASSWORD
+# (секрет new-vault-password); нет секрета → new_vault_password_required.
+github_config_new_master() {
     _github_clear_error
-    local first second
-    if ! read -rsp "Введите пароль доступа к зашифрованной конфигурации: " first; then
-        printf '\n'
-        _github_record_error "ввод пароля шифрования" "Не удалось прочитать пароль доступа."
+    if [[ -z "${GITHUB_SECRET_NEW_VAULT_PASSWORD:-}" ]]; then
+        _github_record_error "ввод пароля шифрования" "Новый пароль доступа не задан."
+        rc_fail new_vault_password_required \
+            "Требуется новый пароль доступа к конфигурации GitHub (секрет new-vault-password)."
         return 1
     fi
-    printf '\n'
-    [[ -n "$first" ]] || {
-        _github_record_error "ввод пароля шифрования" \
-            "Пароль доступа не может быть пустым."
-        return 1
-    }
-    if ! read -rsp "Повторите пароль доступа: " second; then
-        printf '\n'
-        _github_record_error "ввод пароля шифрования" "Не удалось прочитать пароль доступа."
-        return 1
-    fi
-    printf '\n'
-    [[ "$first" == "$second" ]] || {
-        _github_record_error "ввод пароля шифрования" \
-            "Введённые пароли доступа не совпадают."
-        return 1
-    }
-    GITHUB_MASTER_PASSWORD="$first"
+    _github_password_line_valid "$GITHUB_SECRET_NEW_VAULT_PASSWORD" || return 1
+    GITHUB_MASTER_PASSWORD="$GITHUB_SECRET_NEW_VAULT_PASSWORD"
 }
 github_config_age_init() {
     _github_clear_error
-    if ! _github_require "$AGE_BIN"; then
-        _github_record_error "проверка зависимостей" "Не найдена команда age: $AGE_BIN."
-        return 1
-    fi
-    github_config_prompt_master || return 1
+    _github_require_age_batchpass || return 1
+    github_config_new_master || return 1
     if ! _github_mkdir_secure "$GITHUB_CREDENTIALS_DIR" ||
        ! _github_validate_tree "$GITHUB_WORKTREE" auto; then
         unset GITHUB_MASTER_PASSWORD
@@ -546,13 +565,7 @@ github_config_age_init() {
         unset GITHUB_MASTER_PASSWORD
         return 1
     }
-    if command -v "$AGE_KEYGEN_BIN" >/dev/null 2>&1; then
-        (umask 077; "$AGE_KEYGEN_BIN" > "$identity" 2>/dev/null) || failed=true
-    else
-        (umask 077; "$AGE_BIN" -gen-key > "$identity" 2>/dev/null) ||
-            (umask 077; "$AGE_BIN" -keygen > "$identity" 2>/dev/null) ||
-            failed=true
-    fi
+    (umask 077; "$AGE_KEYGEN_BIN" > "$identity" 2>/dev/null) || failed=true
     recipient=$(sed -n 's/^# public key: *//p' "$identity" 2>/dev/null |
         tr -d '\r\n') || failed=true
     [[ -n "$recipient" ]] || failed=true
@@ -561,10 +574,8 @@ github_config_age_init() {
          ! chmod 644 "$recipient_tmp" ||
          ! _github_exact_regular_file "$identity" ||
          ! chmod 600 "$identity" ||
-         ! (umask 077
-             printf '%s\n%s\n' "$GITHUB_MASTER_PASSWORD" "$GITHUB_MASTER_PASSWORD" |
-                 "$AGE_BIN" -p -o "$unlock_tmp" "$identity" >/dev/null 2>&1
-         ) ||
+         ! { printf '%s' "$GITHUB_MASTER_PASSWORD" |
+                 _github_age_passphrase -e "$identity" "$unlock_tmp" >/dev/null 2>&1; } ||
          ! _github_exact_regular_file "$unlock_tmp" ||
          ! chmod 600 "$unlock_tmp"; }; then
         failed=true
@@ -637,80 +648,67 @@ github_config_age_init() {
 }
 github_config_unlock() {
     _github_clear_error
-    local attempts=3 pass id="${GITHUB_UNLOCK_FILE:-}" check
-    local original_identity="${GITHUB_IDENTITY:-}" imported_valid=false
-    if _github_exact_regular_file "$original_identity" &&
-       [[ -s "$original_identity" ]] &&
-       "$AGE_KEYGEN_BIN" -y "$original_identity" >/dev/null 2>&1; then
-        imported_valid=true
+    _github_require_age_batchpass || return 1
+    local id="${GITHUB_UNLOCK_FILE:-}" check public expected=""
+    local original_identity="${GITHUB_IDENTITY:-}"
+    if _github_exact_regular_file "$GITHUB_WORKTREE/recipient.txt"; then
+        expected=$(tr -d '\r' < "$GITHUB_WORKTREE/recipient.txt")
     fi
-    if [[ "$imported_valid" == true ]]; then
-        if ! check=$(_github_new_private_path "$CONFIG_DIR/.unlock-check.XXXXXX"); then
-            _github_record_error "расшифровка конфигурации GitHub" \
-                "Не удалось создать защищённый временный файл."
-            return 1
-        fi
-        if (umask 077
-            "$AGE_BIN" -d -i "$original_identity" -o "$check" \
-                "$GITHUB_WORKTREE/unlock.age" >/dev/null 2>&1
-        ) && _github_exact_regular_file "$check"; then
-            _github_remove_private_path "$check"
-            if _github_prompt_remember_unlock; then
-                if ! github_config_remember "$original_identity"; then
-                    warn "Не удалось сохранить ключ расшифровки на этом устройстве; текущий сеанс продолжится без сохранённого ключа."
-                    _github_clear_error
-                fi
+    if [[ "$expected" != age1* || "$expected" == *[!a-z0-9]* ]]; then
+        _github_record_format_error invalid "проверка recipient" \
+            "В зашифрованной конфигурации GitHub отсутствует единственный корректный recipient."
+        return 1
+    fi
+    # unlock.age — scrypt, а не шифрование на native identity. Сохранённый ключ
+    # проверяется по его публичному recipient, как при импорте recovery key.
+    if [[ -n "$expected" ]] && _github_exact_regular_file "$original_identity" &&
+       public=$("$AGE_KEYGEN_BIN" -y "$original_identity" 2>/dev/null) &&
+       [[ "$(printf '%s' "$public" | tr -d '\r')" == "$expected" ]]; then
+        if _github_prompt_remember_unlock; then
+            if ! github_config_remember "$original_identity"; then
+                warn "Не удалось сохранить ключ расшифровки на этом устройстве; текущий сеанс продолжится без сохранённого ключа."
+                _github_clear_error
             fi
-            GITHUB_IDENTITY="$original_identity"
-            export GITHUB_IDENTITY
-            return 0
         fi
-        _github_remove_private_path "$check"
+        GITHUB_IDENTITY="$original_identity"
+        export GITHUB_IDENTITY
+        return 0
     fi
-    if [[ "$id" != "$original_identity" ]] &&
+    if [[ -n "$expected" && "$id" != "$original_identity" ]] &&
        _github_exact_regular_file "$id" && [[ -s "$id" ]]; then
-        if ! check=$(_github_new_private_path "$CONFIG_DIR/.unlock-check.XXXXXX"); then
-            _github_record_error "расшифровка конфигурации GitHub" \
-                "Не удалось создать защищённый временный файл."
-            return 1
-        fi
-        if (umask 077
-            "$AGE_BIN" -d -i "$id" -o "$check" \
-                "$GITHUB_WORKTREE/unlock.age" >/dev/null 2>&1
-        ) && _github_exact_regular_file "$check"; then
-            _github_remove_private_path "$check"
+        if public=$("$AGE_KEYGEN_BIN" -y "$id" 2>/dev/null) &&
+           [[ "$(printf '%s' "$public" | tr -d '\r')" == "$expected" ]]; then
             GITHUB_IDENTITY="$id"
             export GITHUB_IDENTITY
+            _github_remove_ephemeral_identity "$original_identity"
             return 0
         fi
-        _github_remove_private_path "$check"
         warn "Сохранённый ключ расшифровки не подходит к текущему хранилищу."
     fi
-    while (( attempts > 0 )); do
-        if ! read -rsp "Введите пароль доступа к конфигурации (осталось попыток: $attempts): " pass; then
-            printf '\n'
-            GITHUB_IDENTITY="$original_identity"
-            export GITHUB_IDENTITY
-            _github_record_error "расшифровка конфигурации GitHub" \
-                "Не удалось прочитать пароль доступа."
-            return 1
-        fi
-        printf '\n'
+    # Пароль от ядра (секрет vault-password).
+    if [[ -n "${GITHUB_SECRET_VAULT_PASSWORD:-}" ]]; then
+        _github_password_line_valid "$GITHUB_SECRET_VAULT_PASSWORD" || return 1
+        GITHUB_IDENTITY="$original_identity"
+        export GITHUB_IDENTITY
         if ! check=$(_github_new_private_path "$CONFIG_DIR/.unlock-check.XXXXXX"); then
-            GITHUB_IDENTITY="$original_identity"
-            export GITHUB_IDENTITY
             _github_record_error "расшифровка конфигурации GitHub" \
                 "Не удалось создать защищённый временный файл."
             return 1
         fi
-        if [[ -n "$pass" ]] &&
-           (umask 077
-               printf '%s\n' "$pass" |
-                   "$AGE_BIN" -d -o "$check" "$GITHUB_WORKTREE/unlock.age" \
-                       >/dev/null 2>&1
-           ) && _github_exact_regular_file "$check"; then
+        if { printf '%s' "$GITHUB_SECRET_VAULT_PASSWORD" |
+                 _github_age_passphrase -d "$GITHUB_WORKTREE/unlock.age" "$check" >/dev/null 2>&1; } &&
+           _github_exact_regular_file "$check"; then
+            if ! public=$("$AGE_KEYGEN_BIN" -y "$check" 2>/dev/null) ||
+               [[ "$(printf '%s' "$public" | tr -d '\r')" != "$expected" ]]; then
+                _github_remove_private_path "$check"
+                _github_record_format_error invalid "проверка ключа конфигурации" \
+                    "Ключ из unlock.age не соответствует recipient текущего хранилища."
+                return 1
+            fi
             GITHUB_IDENTITY="$check"
             export GITHUB_IDENTITY
+            # An imported key that does not fit this vault is dropped from disk.
+            [[ "$original_identity" == "$id" ]] || _github_remove_ephemeral_identity "$original_identity"
             if _github_prompt_remember_unlock; then
                 if ! github_config_remember "$GITHUB_IDENTITY"; then
                     warn "Не удалось сохранить ключ расшифровки на этом устройстве; текущий сеанс продолжится без сохранённого ключа."
@@ -720,12 +718,16 @@ github_config_unlock() {
             return 0
         fi
         _github_remove_private_path "$check"
-        attempts=$((attempts - 1))
-    done
+        _github_record_error "расшифровка конфигурации GitHub" \
+            "Пароль доступа к конфигурации GitHub не подошёл."
+        rc_fail vault_password_invalid "Пароль доступа к конфигурации GitHub не подошёл."
+        return 1
+    fi
     GITHUB_IDENTITY="$original_identity"
     export GITHUB_IDENTITY
     _github_record_error "расшифровка конфигурации GitHub" \
-        "Не удалось разблокировать конфигурацию: пароль или ключ восстановления не подошёл."
+        "Требуется пароль доступа к конфигурации GitHub."
+    rc_fail vault_password_required "Требуется пароль доступа к конфигурации GitHub (секрет vault-password)."
     return 1
 }
 
@@ -1193,6 +1195,7 @@ github_config_checkpoint() {
     _github_clear_error
     local state=${1:-${CONFIG_DIR:-.}/runtime-state.json}
     local generated_state=false created_storage=false age_output age_tmp
+    [[ "${GITHUB_STORAGE_MODE:-none}" != age ]] || _github_require_age_batchpass || return 1
     if [[ ! -f "$state" ]]; then
         if ! state=$(umask 077; mktemp "$CONFIG_DIR/.runtime-state.XXXXXX"); then
             _github_record_error "подготовка снимка конфигурации GitHub" \
@@ -1539,17 +1542,35 @@ github_config_import_recovery() {
             "Не удалось скопировать ключ восстановления во временный файл."
         return 1
     fi
-    if ! "$AGE_KEYGEN_BIN" -y "$check" >/dev/null 2>&1; then
+    local public expected="${GITHUB_RECIPIENT:-}"
+    if ! public=$("$AGE_KEYGEN_BIN" -y "$check" 2>/dev/null) || [[ -z "$public" ]]; then
         rm -f "$check"
         GITHUB_IDENTITY="$old_identity"
         _github_record_error "импорт ключа восстановления" \
             "Файл не содержит корректный секретный ключ age."
         return 1
     fi
+    # The key must open this vault: its public key is the recipient of the opened
+    # repository. A key of another vault never replaces the working one.
+    if _github_exact_regular_file "${GITHUB_WORKTREE:-}/recipient.txt"; then
+        expected=$(tr -d '\r\n' < "$GITHUB_WORKTREE/recipient.txt")
+    fi
+    if [[ -n "$expected" && "$(printf '%s' "$public" | tr -d '\r\n')" != "$expected" ]]; then
+        rm -f "$check"
+        GITHUB_IDENTITY="$old_identity"
+        _github_record_error "импорт ключа восстановления" \
+            "Ключ восстановления не подходит к текущему хранилищу GitHub."
+        return 1
+    fi
     GITHUB_IDENTITY="$check"
     export GITHUB_IDENTITY
+    # The previous session key is no longer used; the remembered key file is kept.
+    [[ "$old_identity" == "$check" || "$old_identity" == "${GITHUB_UNLOCK_FILE:-}" ]] ||
+        _github_remove_ephemeral_identity "$old_identity"
     return 0
 }
+# github_config_rewrap_master — сменить пароль доступа: текущий из
+# GITHUB_SECRET_VAULT_PASSWORD, новый из GITHUB_SECRET_NEW_VAULT_PASSWORD.
 github_config_rewrap_master() {
     _github_clear_error
     if [[ ${GITHUB_STORAGE_MODE:-none} != age ]] ||
@@ -1559,37 +1580,22 @@ github_config_rewrap_master() {
             "Файл unlock.age недоступен."
         return 1
     fi
-    local old new _new identity_tmp unlock_tmp backup old_head=""
+    local old="${GITHUB_SECRET_VAULT_PASSWORD:-}" new="${GITHUB_SECRET_NEW_VAULT_PASSWORD:-}"
+    local identity_tmp unlock_tmp backup old_head=""
     local failure_stage failure_detail
     old_head=$(git -C "$GITHUB_WORKTREE" rev-parse HEAD 2>/dev/null) || old_head=""
-    if ! read -rsp "Текущий пароль доступа: " old; then
-        printf '\n'
-        _github_record_error "ввод нового пароля" "Не удалось прочитать пароль доступа."
+    if [[ -z "$old" ]]; then
+        _github_record_error "ввод нового пароля" "Текущий пароль доступа не задан."
+        rc_fail vault_password_required "Требуется текущий пароль доступа к конфигурации GitHub (секрет vault-password)."
         return 1
     fi
-    printf '\n'
-    if ! read -rsp "Новый пароль доступа: " new; then
-        printf '\n'
-        _github_record_error "ввод нового пароля" "Не удалось прочитать пароль доступа."
-        return 1
-    fi
-    printf '\n'
     if [[ -z "$new" ]]; then
-        _github_record_error "ввод нового пароля" \
-            "Новый пароль доступа не может быть пустым."
+        _github_record_error "ввод нового пароля" "Новый пароль доступа не задан."
+        rc_fail new_vault_password_required "Требуется новый пароль доступа к конфигурации GitHub (секрет new-vault-password)."
         return 1
     fi
-    if ! read -rsp "Повторите новый пароль доступа: " _new; then
-        printf '\n'
-        _github_record_error "ввод нового пароля" "Не удалось прочитать пароль доступа."
-        return 1
-    fi
-    printf '\n'
-    if [[ "$new" != "$_new" ]]; then
-        _github_record_error "ввод нового пароля" \
-            "Введённые новые пароли не совпадают."
-        return 1
-    fi
+    _github_password_line_valid "$old" && _github_password_line_valid "$new" || return 1
+    _github_require_age_batchpass || return 1
     identity_tmp=$(_github_new_private_path "$CONFIG_DIR/.rewrap-identity.XXXXXX") || {
         _github_record_error "подготовка смены пароля" \
             "Не удалось создать защищённый временный файл."
@@ -1606,11 +1612,8 @@ github_config_rewrap_master() {
     }
     if ! cp "$GITHUB_WORKTREE/unlock.age" "$backup" ||
        ! chmod 600 "$backup" ||
-       ! (umask 077
-           printf '%s\n' "$old" |
-               "$AGE_BIN" -d -o "$identity_tmp" \
-                   "$GITHUB_WORKTREE/unlock.age" >/dev/null 2>&1
-       ) ||
+       ! { printf '%s' "$old" |
+               _github_age_passphrase -d "$GITHUB_WORKTREE/unlock.age" "$identity_tmp" >/dev/null 2>&1; } ||
        ! _github_exact_regular_file "$identity_tmp" ||
        ! chmod 600 "$identity_tmp"; then
         _github_remove_private_path "$identity_tmp"
@@ -1618,12 +1621,11 @@ github_config_rewrap_master() {
         rm -f "$backup"
         _github_record_error "расшифровка ключа конфигурации" \
             "Текущий пароль доступа неверен или файл unlock.age повреждён."
+        rc_fail vault_password_invalid "Текущий пароль доступа неверен или файл unlock.age повреждён."
         return 1
     fi
-    if ! (umask 077
-            printf '%s\n%s\n' "$new" "$new" |
-                "$AGE_BIN" -p -o "$unlock_tmp" "$identity_tmp" >/dev/null 2>&1
-         ) ||
+    if ! { printf '%s' "$new" |
+               _github_age_passphrase -e "$identity_tmp" "$unlock_tmp" >/dev/null 2>&1; } ||
        ! _github_exact_regular_file "$unlock_tmp" ||
        ! chmod 600 "$unlock_tmp" ||
        ! mv "$unlock_tmp" "$GITHUB_WORKTREE/unlock.age"; then
@@ -1676,6 +1678,18 @@ github_config_rewrap_master() {
         warn "Новый пароль сохранён, но резервная копия требует ручной очистки."
     fi
 }
+# _github_rotation_keep_saved_key KEY_SAVED — a key saved on this device follows the
+# rotation: the old one no longer opens the vault. If the new key cannot be saved,
+# the stale one is removed (the next start asks for the access password).
+_github_rotation_keep_saved_key() {
+    [[ "${1:-false}" == true ]] || return 0
+    github_config_remember "${GITHUB_IDENTITY:-}" && return 0
+    github_config_forget >/dev/null 2>&1 || true
+    warn "Новый ключ не удалось сохранить на этом устройстве: следующий запуск попросит пароль доступа."
+    _github_clear_error
+}
+# github_config_rotate_vault_key — новый ключ age (пароль из
+# GITHUB_SECRET_NEW_VAULT_PASSWORD) после rc_confirm_gate.
 github_config_rotate_vault_key() {
     _github_clear_error
     if [[ ${GITHUB_STORAGE_MODE:-none} != age ]]; then
@@ -1683,12 +1697,20 @@ github_config_rotate_vault_key() {
             "Текущая конфигурация не использует шифрование age."
         return 1
     fi
-    warn "Будет создан новый ключ, и текущая конфигурация будет зашифрована заново. Пароли нод не изменятся."
-    warn "Старые версии в истории GitHub останутся доступны по прежнему ключу."
-    confirm_yn "Создать новый ключ шифрования?" N || return 1
+    if [[ -z "${GITHUB_SECRET_NEW_VAULT_PASSWORD:-}" ]]; then
+        _github_record_error "создание нового ключа шифрования" "Новый пароль доступа не задан."
+        rc_fail new_vault_password_required \
+            "Требуется новый пароль доступа к конфигурации GitHub (секрет new-vault-password)."
+        return 1
+    fi
+    CORE_PLAN_LINES=("Будет создан новый ключ, и текущая конфигурация будет зашифрована заново."
+        "Пароли нод не изменятся."
+        "Старые версии в истории GitHub останутся доступны по прежнему ключу.")
+    rc_confirm_gate || return 1
     local backup path failure_stage failure_detail failure_hint failure_auth
     local old_identity="${GITHUB_IDENTITY:-}" old_recipient="${GITHUB_RECIPIENT:-}"
-    local old_status="${GITHUB_SYNC_STATUS:-clean}" new_identity old_head=""
+    local old_status="${GITHUB_SYNC_STATUS:-clean}" new_identity old_head="" key_saved=false
+    _github_exact_regular_file "${GITHUB_UNLOCK_FILE:-}" && key_saved=true
     old_head=$(git -C "$GITHUB_WORKTREE" rev-parse HEAD 2>/dev/null) || old_head=""
     backup=$(umask 077; mktemp -d "$CONFIG_DIR/.vault-rotation.XXXXXX") || return 1
     for path in recipient.txt unlock.age state.json.age; do
@@ -1704,6 +1726,7 @@ github_config_rotate_vault_key() {
         if github_sync_flush; then
             rm -rf "$backup" ||
                 warn "Новый ключ опубликован, но резервная копия требует ручной очистки: $backup"
+            _github_rotation_keep_saved_key "$key_saved"
             if [[ "$old_identity" != "${GITHUB_IDENTITY:-}" ]] &&
                ! _github_remove_ephemeral_identity "$old_identity"; then
                 warn "Прежний временный ключ требует ручной очистки."
@@ -1716,6 +1739,7 @@ github_config_rotate_vault_key() {
             _github_report_last_error "Новый ключ сохранён локально, но не отправлен в GitHub"
             rm -rf "$backup" ||
                 warn "Резервная копия ротации требует ручной очистки: $backup"
+            _github_rotation_keep_saved_key "$key_saved"
             if [[ "$old_identity" != "${GITHUB_IDENTITY:-}" ]] &&
                ! _github_remove_ephemeral_identity "$old_identity"; then
                 warn "Прежний временный ключ требует ручной очистки."
@@ -2062,6 +2086,7 @@ github_config_open() {
     _github_storage_read || return 1
     _github_validate_tree "$root" "$GITHUB_STORAGE_MODE" || return 1
     _github_validate_tracked_tree "$GITHUB_STORAGE_MODE" || return 1
+    [[ "$GITHUB_STORAGE_MODE" != age ]] || _github_require_age_batchpass || return 1
     raw=$(_github_new_private_path "${out}.raw.XXXXXX") || {
         _github_record_error "чтение конфигурации GitHub" \
             "Не удалось создать защищённый временный файл состояния."
@@ -2140,7 +2165,7 @@ github_repository_delete() {
         return 1
     fi
     owner="${repo%%/*}"
-    _github_prepare_account "$owner" false || return 1
+    _github_prepare_account "$owner" || return 1
     if ! github_config_switch_local; then
         _github_ensure_error "сохранение локальной конфигурации перед удалением" \
             "Не удалось сохранить конфигурацию локально."
@@ -2153,23 +2178,6 @@ github_repository_delete() {
     fi
     if ! output=$(_github_gh "$owner" repo delete "$repo" --yes 2>&1); then
         _github_record_error "удаление репозитория GitHub" "$output"
-        return 1
-    fi
-}
-github_repository_open_settings() {
-    _github_clear_error
-    local repo="${1:-}" owner
-    if [[ ! "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
-        _github_record_error "открытие настроек репозитория GitHub" \
-            "Указан некорректный репозиторий GitHub."
-        return 1
-    fi
-    owner="${repo%%/*}"
-    _github_account_login "$owner" || return 1
-    if ! _github_gh "$owner" browse --settings --repo "$repo" \
-        >/dev/null 2>&1; then
-        _github_record_error "открытие настроек репозитория GitHub" \
-            "Не удалось открыть настройки репозитория GitHub."
         return 1
     fi
 }
@@ -2524,36 +2532,70 @@ github_account_switch_recover() {
     export GITHUB_ACCOUNT_SWITCH_OLD_REPO GITHUB_ACCOUNT_SWITCH_NEW_REPO
     export GITHUB_ACCOUNT_SWITCH_BRANCH GITHUB_ACCOUNT_SWITCH_INITIAL_LOGIN
     phase=$(jq -er '.phase' "$marker") || return 1
+    local stage="восстановление смены аккаунта GitHub" new_login="${GITHUB_ACCOUNT_SWITCH_NEW_REPO%%/*}"
+    local remote_refs
     case "$phase" in
         prepared)
-            github_account_switch_rollback
+            github_account_switch_rollback ||
+                _github_ensure_error "$stage" "Не удалось отменить незавершённую смену аккаунта."
             ;;
         push_unknown)
-            expected=$(jq -er '.expected_head // empty' "$marker") || return 1
+            expected=$(jq -er '.expected_head // empty' "$marker") || expected=""
             target_store="$GITHUB_ACCOUNT_SWITCH_DIR/target-store.git"
-            [[ -n "$expected" && -d "$target_store" && ! -L "$target_store" ]] || return 1
-            _github_account_login "${GITHUB_ACCOUNT_SWITCH_NEW_REPO%%/*}" || return 1
-            _github_transport_git "${GITHUB_ACCOUNT_SWITCH_NEW_REPO%%/*}" 30 \
+            [[ -n "$expected" && -d "$target_store" && ! -L "$target_store" ]] || {
+                _github_record_error "$stage" \
+                    "Транзакция смены аккаунта GitHub неполна и требует ручного вмешательства."
+                return 1
+            }
+            _github_account_login "$new_login" || return 1
+            remote_refs=$(_github_transport_git "$new_login" 30 --git-dir="$target_store" \
+                ls-remote origin "refs/heads/$GITHUB_ACCOUNT_SWITCH_BRANCH" 2>/dev/null) || {
+                _github_record_error "$stage" \
+                    "Не удалось проверить отправку в $GITHUB_ACCOUNT_SWITCH_NEW_REPO."
+                return 1
+            }
+            # No branch on the remote: the push never landed (new or empty repository).
+            if [[ -z "$remote_refs" ]]; then
+                github_account_switch_rollback ||
+                    _github_ensure_error "$stage" "Не удалось отменить незавершённую смену аккаунта."
+                return
+            fi
+            _github_transport_git "$new_login" 30 \
                 --git-dir="$target_store" fetch --no-tags origin \
                 "$GITHUB_ACCOUNT_SWITCH_BRANCH:refs/remotes/origin/$GITHUB_ACCOUNT_SWITCH_BRANCH" \
-                >/dev/null 2>&1 || return 1
+                >/dev/null 2>&1 || {
+                _github_record_error "$stage" \
+                    "Не удалось загрузить $GITHUB_ACCOUNT_SWITCH_NEW_REPO для проверки отправки."
+                return 1
+            }
             head=$(git --git-dir="$target_store" rev-parse \
-                "refs/remotes/origin/$GITHUB_ACCOUNT_SWITCH_BRANCH") || return 1
+                "refs/remotes/origin/$GITHUB_ACCOUNT_SWITCH_BRANCH" 2>/dev/null) || {
+                _github_record_error "$stage" "Не удалось прочитать загруженную ветку $GITHUB_ACCOUNT_SWITCH_BRANCH."
+                return 1
+            }
             if [[ "$head" == "$expected" ]] ||
                git --git-dir="$target_store" merge-base --is-ancestor "$expected" "$head"; then
                 _github_account_switch_write_marker target_committed "$head" \
-                    "$old_state_available" "$repo_created" "$repo_privatized" || return 1
+                    "$old_state_available" "$repo_created" "$repo_privatized" || {
+                    _github_record_error "$stage" "Не удалось записать подтверждённую отправку."
+                    return 1
+                }
                 if declare -F _config_source_materialize_state >/dev/null 2>&1; then
-                    _github_account_switch_finish_target || return 1
+                    _github_account_switch_finish_target ||
+                        _github_ensure_error "$stage" "Не удалось завершить смену аккаунта локально." ||
+                        return 1
                     github_account_switch_recover
                 fi
             else
-                github_account_switch_rollback
+                github_account_switch_rollback ||
+                    _github_ensure_error "$stage" "Не удалось отменить незавершённую смену аккаунта."
             fi
             ;;
         target_committed)
             if declare -F _config_source_materialize_state >/dev/null 2>&1; then
-                _github_account_switch_finish_target || return 1
+                _github_account_switch_finish_target ||
+                    _github_ensure_error "$stage" "Не удалось завершить смену аккаунта локально." ||
+                    return 1
                 github_account_switch_recover
             fi
             ;;
@@ -2644,6 +2686,7 @@ github_sync_init() {
     local init_mode="${2:-resume}"
     local allow_make_private="${3:-false}"
     _github_clear_error
+    GITHUB_REPO_PENDING="" GITHUB_REPO_PENDING_NAME=""
     case "$init_mode" in
         resume|onboarding) ;;
         *) _github_record_error "подготовка локального репозитория" "Неизвестный режим инициализации GitHub."; return 1 ;;
@@ -2660,7 +2703,7 @@ github_sync_init() {
                   -f "$profile/hosts.yml" && ! -L "$profile/hosts.yml" ]]; then
                 safe_profile=true
             fi
-            if ! _github_prepare_account "$GITHUB_OWNER" false; then
+            if ! _github_prepare_account "$GITHUB_OWNER"; then
                 [[ "$init_mode" == resume && "$safe_profile" == true &&
                    "${GITHUB_LAST_AUTH_RELEVANT:-true}" == false ]] || return 1
                 [[ -d "$GITHUB_STORE/objects" && ! -L "$GITHUB_STORE" ]] || return 1
@@ -2698,7 +2741,7 @@ github_sync_init() {
         return 1
     fi
 
-    local repo remote_view remote_view_lc create_output
+    local repo remote_view remote_view_lc
     local git_output fetch_output fetch_ok=true local_oid="" remote_oid=""
     local current_origin="" remote_changed=false auth_failure=false
     if [[ "$GITHUB_REMOTE" == https://github.com/* ||
@@ -2727,44 +2770,35 @@ github_sync_init() {
                     "Репозиторий $repo не найден."
                 return 1
             fi
-            info "Репозиторий $repo не найден."
-            if ! confirm_yn "Создать приватный репозиторий $repo?" N; then
+            if [[ "${GITHUB_DECISION_CREATE_REPO:-0}" != 1 ]]; then
                 _github_record_error "создание приватного репозитория" \
-                    "Создание репозитория $repo отменено."
+                    "Репозиторий $repo не найден."
+                rc_fail repo_create_required \
+                    "Репозиторий $repo не найден: создайте его флагом --create-repo." \
+                    "$(jq -cn --arg r "$repo" '{repo:$r}')"
                 return 1
             fi
-            if ! create_output=$(_github_gh "$GITHUB_OWNER" repo create "$repo" \
-                --private --description "Essence Remote Control configuration" 2>&1); then
-                auth_failure=false
-                _github_auth_failure_confirmed "$create_output" && auth_failure=true
-                _github_record_error "создание приватного репозитория" \
-                    "$create_output" "$auth_failure"
-                return 1
-            fi
+            # Created only after consent: github_repo_apply_pending.
+            GITHUB_REPO_PENDING=create GITHUB_REPO_PENDING_NAME="$repo"
             remote_view='{"visibility":"PRIVATE"}'
-            GITHUB_ACCOUNT_SWITCH_REPO_CREATED=true
         fi
         if ! printf '%s' "$remote_view" |
             jq -e '.visibility == "PRIVATE"' >/dev/null 2>&1; then
-            if [[ "$allow_make_private" != true ]] ||
-               ! confirm_yn "Репозиторий $repo публичный. Сделать его приватным?" N; then
+            if [[ "$allow_make_private" != true ]]; then
                 _github_record_error "проверка приватного репозитория" \
                     "Репозиторий $repo должен быть приватным."
                 return 1
             fi
-            if ! git_output=$(_github_gh "$GITHUB_OWNER" repo edit "$repo" \
-                --visibility private --accept-visibility-change-consequences 2>&1); then
-                _github_record_error "изменение видимости репозитория" "$git_output"
-                return 1
-            fi
-            GITHUB_ACCOUNT_SWITCH_REPO_PRIVATIZED=true
-            if ! remote_view=$(_github_gh "$GITHUB_OWNER" repo view "$repo" \
-                --json visibility 2>&1) ||
-               ! printf '%s' "$remote_view" | jq -e '.visibility == "PRIVATE"' >/dev/null 2>&1; then
+            if [[ "${GITHUB_DECISION_MAKE_PRIVATE:-0}" != 1 ]]; then
                 _github_record_error "проверка приватного репозитория" \
-                    "Не удалось подтвердить приватность репозитория $repo."
+                    "Репозиторий $repo должен быть приватным."
+                rc_fail repo_private_required \
+                    "Репозиторий $repo публичный: сделайте его приватным флагом --make-private." \
+                    "$(jq -cn --arg r "$repo" '{repo:$r}')"
                 return 1
             fi
+            # Reading a public repository changes nothing; privatized after consent.
+            GITHUB_REPO_PENDING=private GITHUB_REPO_PENDING_NAME="$repo"
         fi
         GITHUB_REMOTE="https://github.com/$repo.git"
     fi
@@ -2834,7 +2868,10 @@ github_sync_init() {
             fi
             GITHUB_SYNC_STATUS=clean
         else
-            if ! remote_refs=$(_github_remote_git 15 ls-remote \
+            if [[ "$GITHUB_REPO_PENDING" == create ]]; then
+                # The repository is created after consent; until then it is empty.
+                remote_refs=""
+            elif ! remote_refs=$(_github_remote_git 15 ls-remote \
                 "$GITHUB_REMOTE" "refs/heads/$GITHUB_BRANCH" 2>/dev/null); then
                 if [[ "$GITHUB_REMOTE" == https://github.com/* ]]; then
                     _github_record_error "загрузка репозитория GitHub" "$fetch_output"
@@ -3018,6 +3055,39 @@ github_sync_init() {
     }
     export GITHUB_WORKTREE GITHUB_SESSION_ID GITHUB_SESSION_REMOTE GITHUB_SESSION_BRANCH
     export GITHUB_SESSION_ORIGIN
+}
+# github_repo_apply_pending — после согласия: создать или сделать приватным
+# репозиторий, отложенный github_sync_init (GITHUB_REPO_PENDING=create|private).
+github_repo_apply_pending() {
+    local repo="${GITHUB_REPO_PENDING_NAME:-}" output auth_failure=false
+    case "${GITHUB_REPO_PENDING:-}" in
+        "") return 0 ;;
+        create)
+            if ! output=$(_github_gh "${repo%%/*}" repo create "$repo" \
+                --private --description "Essence Remote Control configuration" 2>&1); then
+                _github_auth_failure_confirmed "$output" && auth_failure=true
+                _github_record_error "создание приватного репозитория" "$output" "$auth_failure"
+                return 1
+            fi
+            GITHUB_ACCOUNT_SWITCH_REPO_CREATED=true
+            ;;
+        private)
+            if ! output=$(_github_gh "${repo%%/*}" repo edit "$repo" \
+                --visibility private --accept-visibility-change-consequences 2>&1); then
+                _github_record_error "изменение видимости репозитория" "$output"
+                return 1
+            fi
+            GITHUB_ACCOUNT_SWITCH_REPO_PRIVATIZED=true
+            if ! output=$(_github_gh "${repo%%/*}" repo view "$repo" --json visibility 2>&1) ||
+               ! printf '%s' "$output" | jq -e '.visibility == "PRIVATE"' >/dev/null 2>&1; then
+                _github_record_error "проверка приватного репозитория" \
+                    "Не удалось подтвердить приватность репозитория $repo."
+                return 1
+            fi
+            ;;
+        *) return 1 ;;
+    esac
+    GITHUB_REPO_PENDING="" GITHUB_REPO_PENDING_NAME=""
 }
 github_sync_status() {
     printf '%s\n' "${GITHUB_SYNC_STATUS:-clean}"
@@ -3276,6 +3346,17 @@ _github_runtime_restore() {
     rm -rf "$stage" "$retired"
 }
 
+# _github_fetch_drop_identities KEEP ID…: remove the reopen's ephemeral keys,
+# never the one the kept session still uses.
+_github_fetch_drop_identities() {
+    local keep="${1:-}" identity
+    shift
+    for identity in "$@"; do
+        [[ -z "$identity" || "$identity" == "$keep" ]] ||
+            _github_remove_ephemeral_identity "$identity" || true
+    done
+}
+
 github_sync_fetch() {
     _github_clear_error
     if [[ -z "${GITHUB_STORE:-}" || ! -d "$GITHUB_STORE" ]]; then
@@ -3303,8 +3384,11 @@ github_sync_fetch() {
     local old_state_dir="${STATE_DIR:-}" runtime_snapshot="" has_runtime_snapshot=false
     local old_auth="${SCRIPT_AUTH_FILE:-$CONFIG_DIR/.auth}"
     local old_storage_mode="${GITHUB_STORAGE_MODE:-}" runtime_var runtime_index
+    # The session target (GITHUB_REMOTE…) too: startup rewrites it as owner/name,
+    # and a stale value fails the session target guard on every later push.
     local -a runtime_vars=(CONFIG_SOURCE CONFIG_DIR LOCAL_CONFIG_JSON STATE_DIR CONFIG_JSON
-        SECRETS_JSON STATE_MANIFEST TEMPLATES_DIR SSH_IDENTITIES_DIR SSH_KNOWN_HOSTS SCRIPT_AUTH_FILE)
+        SECRETS_JSON STATE_MANIFEST TEMPLATES_DIR SSH_IDENTITIES_DIR SSH_KNOWN_HOSTS SCRIPT_AUTH_FILE
+        GITHUB_REMOTE GITHUB_OWNER GITHUB_BRANCH GITHUB_REPO_NAME)
     # Bash 3.2: indexed arrays and ${!name+x} instead of local -A and [[ -v ]].
     local -a runtime_values=() runtime_set=()
     for ((runtime_index = 0; runtime_index < ${#runtime_vars[@]}; runtime_index++)); do
@@ -3316,7 +3400,7 @@ github_sync_fetch() {
     done
     local new_worktree new_session new_identity new_recipient
     local new_session_remote new_session_branch new_session_origin new_status
-    local failure_stage failure_detail failure_hint failure_auth
+    local failure_stage failure_detail failure_hint failure_auth identity_copy="" failed_identity
     if [[ -n "$old_state_dir" ]]; then
         runtime_snapshot=$(umask 077; mktemp -d "$CONFIG_DIR/.fetch-runtime.XXXXXX") || {
             _github_record_error "резервное копирование рабочего состояния" \
@@ -3334,6 +3418,19 @@ github_sync_fetch() {
     GITHUB_WORKTREE=""
     GITHUB_SESSION_ID=""
     GITHUB_IDENTITY=""
+    # The reopen tries a private copy of the session key first, so the vault
+    # password is not asked again within the session; each session removes its
+    # own copy on close. A key rotated elsewhere does not fit: unlock falls back.
+    if [[ -n "$old_identity" && "$old_identity" != "${GITHUB_UNLOCK_FILE:-}" ]] &&
+       _github_exact_regular_file "$old_identity" && [[ -s "$old_identity" ]] &&
+       identity_copy=$(_github_new_private_path "$CONFIG_DIR/.github-identity.XXXXXX"); then
+        if (umask 077; cp "$old_identity" "$identity_copy"); then
+            GITHUB_IDENTITY="$identity_copy"
+        else
+            _github_remove_private_path "$identity_copy" || true
+            identity_copy=""
+        fi
+    fi
     GITHUB_RECIPIENT=""
     GITHUB_SESSION_REMOTE=""
     GITHUB_SESSION_BRANCH=""
@@ -3343,10 +3440,12 @@ github_sync_fetch() {
         failure_detail="${GITHUB_LAST_ERROR:-}"
         failure_hint="${GITHUB_LAST_HINT:-}"
         failure_auth="${GITHUB_LAST_AUTH_RELEVANT:-false}"
+        failed_identity="${GITHUB_IDENTITY:-}"
         if [[ -n "${GITHUB_WORKTREE:-}" || -n "${GITHUB_SESSION_ID:-}" ]] &&
            ! github_config_close; then
             _github_report_last_error "Не удалось очистить неудачную новую GitHub-сессию"
         fi
+        _github_fetch_drop_identities "$old_identity" "$failed_identity" "$identity_copy"
         if [[ "$has_runtime_snapshot" == true ]] &&
            ! _github_runtime_restore "$runtime_snapshot" "$old_state_dir" "$old_auth"; then
             failure_stage="откат рабочего состояния после загрузки"
@@ -3377,6 +3476,7 @@ github_sync_fetch() {
         return 1
     fi
     if [[ -z "${GITHUB_WORKTREE:-}" || -z "${GITHUB_SESSION_ID:-}" ]]; then
+        _github_fetch_drop_identities "$old_identity" "${GITHUB_IDENTITY:-}" "$identity_copy"
         for ((runtime_index = 0; runtime_index < ${#runtime_vars[@]}; runtime_index++)); do
             runtime_var="${runtime_vars[$runtime_index]}"
             if [[ ${runtime_set[$runtime_index]:-} == true ]]; then
@@ -3435,6 +3535,7 @@ github_sync_fetch() {
         if ! github_config_close; then
             _github_report_last_error "Не удалось очистить новую GitHub-сессию после ошибки замены"
         fi
+        _github_fetch_drop_identities "$old_identity" "$new_identity" "$identity_copy"
         if [[ "$has_runtime_snapshot" == true ]] &&
            ! _github_runtime_restore "$runtime_snapshot" "$old_state_dir" "$old_auth"; then
             failure_stage="откат рабочего состояния после загрузки"
@@ -3462,6 +3563,8 @@ github_sync_fetch() {
         GITHUB_LAST_HINT="$failure_hint"; GITHUB_LAST_AUTH_RELEVANT="$failure_auth"
         return 1
     fi
+    [[ "$identity_copy" == "$new_identity" ]] ||
+        _github_fetch_drop_identities "$old_identity" "$identity_copy"
     GITHUB_WORKTREE="$new_worktree"; GITHUB_SESSION_ID="$new_session"
     GITHUB_IDENTITY="$new_identity"; GITHUB_RECIPIENT="$new_recipient"
     GITHUB_SESSION_REMOTE="$new_session_remote"
@@ -3475,7 +3578,7 @@ github_sync_fetch() {
         warn "Снимок завершённой загрузки требует ручной очистки: $runtime_snapshot"
 }
 
-state_action() {
+_state_action_run() {
     local label=$1 fn=$2
     shift 2
     if [[ ${CONFIG_SOURCE:-local} == github ]]; then
@@ -3490,7 +3593,7 @@ state_action() {
     fi
     "$fn" "$@"
     local rc=$?
-    if [[ $rc -ne 0 ]]; then
+    if ! _state_action_persists "$rc"; then
         if [[ ${CONFIG_SOURCE:-local} == github && -z ${GITHUB_LAST_ERROR:-} ]]; then
             _github_record_error "изменение локальной конфигурации" \
                 "Не удалось выполнить изменение конфигурации."
@@ -3521,7 +3624,7 @@ state_action() {
             _github_report_last_error "Не удалось отправить изменение в GitHub"
             warn "Изменения сохранены локально и ожидают отправки."
             GITHUB_SYNC_STATUS=pending
-            return 0
+            return "$rc"
         fi
     else
         if ! state_checkpoint; then
@@ -3529,7 +3632,7 @@ state_action() {
             return 1
         fi
     fi
-    return 0
+    return "$rc"
 }
 
 github_config_close() {
@@ -3587,5 +3690,7 @@ github_config_close() {
     unset GITHUB_MASTER_PASSWORD
     export GITHUB_WORKTREE GITHUB_SESSION_ID GITHUB_IDENTITY GITHUB_RECIPIENT
     export GITHUB_SESSION_REMOTE GITHUB_SESSION_BRANCH GITHUB_SESSION_ORIGIN
+    # Plaintext snapshot left by older versions (secrets of every node).
+    [[ -z "${CONFIG_DIR:-}" ]] || rm -f "$CONFIG_DIR/runtime-vault.json"
 }
 

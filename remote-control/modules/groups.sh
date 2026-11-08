@@ -1,14 +1,6 @@
 #!/bin/bash
 # ─── Группы клиентов ────────────────────────────────────────────────────────
 
-groups_list() {
-    _ensure_config
-    GRP_LIST=()
-    while IFS= read -r group_name; do
-        GRP_LIST+=("$group_name")
-    done < <(jq_r '.groups[].name')
-}
-
 _group_client_count() {
     jq_r --arg g "$1" '[.clients[] | select(.group==$g)] | length'
 }
@@ -19,91 +11,51 @@ _group_nodes_csv() {
         | unique | join(",")'
 }
 
-_group_nodes_display() {
-    local csv
-    csv=$(_group_nodes_csv "$1")
-    [[ -z "$csv" ]] && { echo "-"; return; }
-    echo "${csv//,/, }"
+_group_exists() {
+    [[ -n "${1:-}" && "$(jq_r --arg g "$1" 'any(.groups[]; .name==$g)')" == true ]]
 }
 
-groups_menu() {
-    while true; do
-        echo ""
-        box_top
-        box_center "Группы"
-        box_mid
-        groups_list
-        if [[ ${#GRP_LIST[@]} -gt 0 ]]; then
-            local i=1 g count tpl tpl_display node_count gn_csv
-            for g in "${GRP_LIST[@]}"; do
-                count=$(_group_client_count "$g")
-                tpl=$(jq_r --arg g "$g" '.groups[] | select(.name==$g) | .template // "default.yaml"')
-                tpl_display=""
-                [[ "$tpl" != "default.yaml" ]] && tpl_display=" [$tpl]"
-                node_count=0
-                gn_csv=$(_group_nodes_csv "$g")
-                [[ -n "$gn_csv" ]] && node_count=$(echo "$gn_csv" | tr ',' '\n' | wc -l | tr -d ' ')
-                box_line " ${g} — ${count} клиентов, ${node_count} нод${tpl_display}"
-                i=$((i + 1))
-            done
-        else
-            box_line " Нет групп" " ${DIM}Нет групп${NC}"
-        fi
-        box_mid
-        menu_item a "Добавить группу" GREEN
-        menu_item d "Удалить группу" RED
-        menu_item t "Поменять шаблон группе" CYAN
-        menu_item 0 "Назад" NC
-        box_bot
-        echo ""
-        if ! IFS= read -rp "  Выберите действие: " GRP_CHOICE; then
-            return 0
-        fi
-        GRP_CHOICE="${GRP_CHOICE%$'\r'}"
-        case "$GRP_CHOICE" in
-            a|A) state_action "add_group" add_group ;;
-            d|D) state_action "delete_group" delete_group ;;
-            t|T) state_action "assign_template" assign_template_to_group ;;
-            0) return 0 ;;
-            *) warn "Неверный выбор." ;;
-        esac
-    done
-}
-
-add_group() {
-    echo ""
-    IFS= read -rp "  Название группы: " GROUP_NAME || return 1
-    GROUP_NAME="${GROUP_NAME%$'\r'}"
-    [[ -z "$GROUP_NAME" ]] && { warn "Название не указано."; return; }
-
-    GROUP_NAME=$(echo "$GROUP_NAME" | tr '[:lower:]' '[:upper:]')
-
-    if jq_r '.groups[].name' | grep -qx "$GROUP_NAME"; then
-        warn "Группа '$GROUP_NAME' уже существует."
-        return
+# core_group_add NAME — имя приводится к верхнему регистру; допустимые символы —
+# как у клиента (имя группы становится каталогом в $GENERATED_DIR).
+# Результат: CORE_GROUP_ADD_NAME.
+core_group_add() {
+    local name
+    CORE_GROUP_ADD_NAME=""
+    name=$(printf '%s' "${1:-}" | tr '[:lower:]' '[:upper:]')
+    [[ -n "$name" ]] || { rc_fail invalid "Название группы не указано."; return 1; }
+    if [[ ! "$name" =~ ^[A-Z0-9._-]+$ || "$name" =~ ^\.+$ ]]; then
+        rc_fail invalid "Название группы может содержать только буквы, цифры, точку, - и _"
+        return 1
+    fi
+    if _group_exists "$name"; then
+        rc_fail conflict "Группа '$name' уже существует."
+        return 1
     fi
 
-    jq_w --arg g "$GROUP_NAME" '.groups += [{name: $g, template: "default.yaml"}]' || return 1
-    success "Группа $GROUP_NAME добавлена"
+    jq_w --arg g "$name" '.groups += [{name: $g, template: "default.yaml"}]' || return 1
+    CORE_GROUP_ADD_NAME="$name"
+    success "Группа $name добавлена"
 }
 
-delete_group() {
-    groups_list
-    MENU_SELECT_EMPTY="Нет групп"
-    menu_select "Удаление группы" "Выберите группу" "${GRP_LIST[@]}" || return 1
-    local target="${GRP_LIST[$((MENU_SELECT_INDEX - 1))]}"
-
-    # Проверяем есть ли клиенты в этой группе
-    local count
-    count=$(_group_client_count "$target")
-    if [[ "$count" -gt 0 ]]; then
-        warn "В группе '$target' есть клиенты. Сначала удалите их."
-        return
+_group_delete_check() {
+    local name="${1:-}" count
+    _group_exists "$name" || { rc_fail not_found "Группа '$name' не найдена."; return 1; }
+    count=$(_group_client_count "$name")
+    if [[ "${count:-0}" -gt 0 ]]; then
+        rc_fail conflict "В группе '$name' есть клиенты. Сначала удалите их."
+        return 1
     fi
+}
 
-    review_frame "Удаление группы" "Группа: $target" "Назначения подключений этой группе будут удалены."
-    confirm_yn "Удалить группу '$target'?" N || { info "Отменено."; return 1; }
+core_group_delete_plan() {
+    CORE_PLAN_LINES=()
+    _group_delete_check "${1:-}" || return 1
+    CORE_PLAN_LINES=("Группа: $1" "Назначения подключений этой группе будут удалены.")
+}
 
+core_group_delete() {
+    local target="${1:-}"
+    _group_delete_check "$target" || return 1
     jq_w --arg g "$target" '
         .groups |= map(select(.name != $g)) |
         .connections |= map(.groups |= [.[] | select(.name!=$g)]) |
@@ -111,113 +63,19 @@ delete_group() {
     success "Группа $target удалена"
 }
 
-# Выбор группы из списка, возвращает имя в SELECTED_GROUP
-select_group() {
-    SELECTED_GROUP=""
-    groups_list
-    MENU_SELECT_EMPTY="Нет групп"
-    menu_select "Выбор группы" "Выберите группу" "${GRP_LIST[@]}" || return 1
-    SELECTED_GROUP="${GRP_LIST[$((MENU_SELECT_INDEX - 1))]}"
-}
-
-assign_template_to_group() {
-    if ! select_group; then
+# core_group_set_template GROUP TEMPLATE — суффикс .yaml необязателен.
+# Результат: CORE_GROUP_TEMPLATE (имя с .yaml).
+core_group_set_template() {
+    local group="${1:-}" template="${2:-}"
+    CORE_GROUP_TEMPLATE=""
+    _group_exists "$group" || { rc_fail not_found "Группа '$group' не найдена."; return 1; }
+    [[ -n "$template" && "$template" != *.yaml ]] && template="${template}.yaml"
+    if [[ -z "$template" ]] || ! _list_templates | grep -qxF -- "$template"; then
+        rc_fail not_found "Шаблон '$template' не найден."
         return 1
     fi
-    local group="$SELECTED_GROUP" current_tpl templates=() template_name
-    current_tpl=$(_template_name_for_group "$group")
-    while IFS= read -r template_name; do
-        [[ -n "$template_name" ]] && templates+=("$template_name")
-    done < <(_list_templates)
-
-    while true; do
-        echo ""
-        box_top
-        box_center "Шаблон группы: $group"
-        box_mid
-        box_line " Текущий: $current_tpl" " ${DIM}Текущий: $current_tpl${NC}"
-        box_mid
-        local t
-        for (( i=0; i<${#templates[@]}; i++ )); do
-            if [[ "${templates[$i]}" == "$current_tpl" ]]; then
-                menu_item "$((i+1))" "${templates[$i]} (текущий)" CYAN
-            else
-                menu_item "$((i+1))" "${templates[$i]}" CYAN
-            fi
-        done
-        menu_item n "Создать новый шаблон" GREEN
-        menu_item 0 "Отмена" NC
-        box_bot
-        echo ""
-        local TPL_CHOICE
-        if ! IFS= read -rp "  Выберите шаблон: " TPL_CHOICE; then
-            return 1
-        fi
-        TPL_CHOICE="${TPL_CHOICE%$'\r'}"
-        if [[ "$TPL_CHOICE" == n || "$TPL_CHOICE" == N ]]; then
-            _create_new_template "$group"
-            return $?
-        fi
-        [[ "$TPL_CHOICE" == 0 ]] && return 1
-        if ! menu_index_valid "$TPL_CHOICE" "${#templates[@]}"; then
-            warn "Неверный выбор."
-            continue
-        fi
-        local selected="${templates[$((TPL_CHOICE - 1))]}"
-        jq_w --arg g "$group" --arg t "$selected" \
-            '.groups |= map(if .name==$g then .template=$t else . end)' || return 1
-        success "Группа $group: шаблон — $selected"
-        return 0
-    done
-}
-
-_create_new_template() {
-    local group="$1"
-
-    if ! IFS= read -rp "  Имя нового шаблона (без .yaml): " TPL_NAME; then
-        return 1
-    fi
-    TPL_NAME="${TPL_NAME%$'\r'}"
-    if [[ -z "$TPL_NAME" || ! "$TPL_NAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
-        warn "Имя может содержать только буквы, цифры, точку, - и _"
-        return 1
-    fi
-
-    local new_file="$TEMPLATES_DIR/${TPL_NAME}.yaml"
-    if [[ -f "$new_file" ]]; then
-        warn "Шаблон '${TPL_NAME}.yaml' уже существует."
-        return 1
-    fi
-
-    # Копируем доступный default.yaml как основу.
-    mkdir -p "$TEMPLATES_DIR" || return 1
-    local default_tpl
-    default_tpl=$(_find_template "default.yaml")
-    if [[ -n "$default_tpl" ]]; then
-        cp "$default_tpl" "$new_file" || return 1
-        info "Скопирован default.yaml как основа"
-    else
-        : > "$new_file" || return 1
-        warn "default.yaml не найден — создан пустой шаблон"
-    fi
-
-    # Открываем редактор
-    if command -v nano > /dev/null 2>&1; then
-        nano "$new_file" || {
-            warn "Редактор завершился с ошибкой. Изменения шаблона не подтверждены."
-            return 1
-        }
-    elif command -v vi > /dev/null 2>&1; then
-        vi "$new_file" || {
-            warn "Редактор завершился с ошибкой. Изменения шаблона не подтверждены."
-            return 1
-        }
-    else
-        info "Отредактируйте вручную: $new_file"
-    fi
-
-    # Назначаем группе
-    jq_w --arg g "$group" --arg t "${TPL_NAME}.yaml" \
+    jq_w --arg g "$group" --arg t "$template" \
         '.groups |= map(if .name==$g then .template=$t else . end)' || return 1
-    success "Группа $group: шаблон — ${TPL_NAME}.yaml"
+    CORE_GROUP_TEMPLATE="$template"
+    success "Группа $group: шаблон — $template"
 }

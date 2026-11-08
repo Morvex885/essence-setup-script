@@ -1,4 +1,5 @@
 #!/usr/bin/env bats
+bats_require_minimum_version 1.5.0
 
 setup() {
     load '../helpers/test_helper'
@@ -44,6 +45,9 @@ if [[ "$1" == passwd && "$2" == -6 ]]; then
         if [[ "$1" == -salt ]]; then
             salt="$2"
             shift 2
+        elif [[ "$1" == -stdin ]]; then
+            IFS= read -r password
+            shift
         else
             password="$1"
             shift
@@ -162,7 +166,8 @@ if [[ "$1" == repo && "$2" == view ]]; then
         printf '%s\n' 'repository not found' >&2
         exit 1
     fi
-    if [[ "${GH_MODE:-success}" == public && ! -f "${GH_PRIVATE_MARKER:-}" ]]; then
+    if [[ "${GH_MODE:-success}" == public || "$3" == "${GH_PUBLIC_REPO:-}" ]] &&
+       [[ ! -f "${GH_PRIVATE_MARKER:-}" ]]; then
         printf '%s\n' '{"visibility":"PUBLIC"}'
     else
         printf '%s\n' '{"visibility":"PRIVATE"}'
@@ -236,6 +241,37 @@ _file_mode() {
     esac
 }
 
+# _rc ARGV… — разовая команда entrypoint без stdin (status/output).
+_rc() {
+    run "$APP/remote-control-essence.sh" "$@" < /dev/null
+}
+
+# _rc_secrets JSON ARGV… — разовая команда с секретами через --secrets-stdin.
+_rc_secrets() {
+    local json="$1"
+    shift
+    run bash -c 'printf "%s" "$1" | "$0" "${@:2}" --secrets-stdin' \
+        "$APP/remote-control-essence.sh" "$json" "$@"
+}
+
+# _connect_github ARGV… — source github-connect аккаунтом test-owner с согласием
+# на план (--yes): план подключения проверяется в cmd_system.bats.
+_connect_github() {
+    _rc source github-connect --login test-owner --yes "$@"
+}
+
+# _serve_requests ARGV_JSON… — один процесс serve, запросы с id 1, 2, …
+_serve_requests() {
+    bats_require_minimum_version 1.5.0
+    local argv id=0 lines=""
+    for argv in "$@"; do
+        id=$((id + 1))
+        lines+="$(jq -cn --argjson a "$argv" --argjson id "$id" '{id:$id, argv:$a}')"$'\n'
+    done
+    run --separate-stderr bash -c 'printf "%s" "$1" | "$0" serve' \
+        "$APP/remote-control-essence.sh" "$lines"
+}
+
 _runtime_fingerprint() {
     local root="$1" path rel mode hash
     [[ -d "$root" ]] || return 1
@@ -303,14 +339,14 @@ _assert_runtime_secure_modes() {
 
 _establish_materialization_source() {
     local password_hash
-    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source init-local
     assert_success
-    run bash -c 'printf "i\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _connect_github --storage none
     assert_success
     _publish_key_node_state ready || return 1
     password_hash=$(openssl passwd -6 -salt fixture secret-pass) || return 1
     _publish_remote_access_hash "$password_hash" || return 1
-    run bash -c 'printf "secret-pass\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    RC_SCRIPT_PASSWORD=secret-pass _rc session open
     assert_success
 
     MATERIALIZE_CONFIG_DIR="$HOME/.config/remote-control-essence"
@@ -505,11 +541,13 @@ fi
 EOF
     cat > "$BIN/age" <<'EOF'
 #!/bin/bash
-out="" input="" decrypting=false identity=false
+out="" input="" decrypting=false identity=false batchpass=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -d) decrypting=true; shift ;;
-        -p) shift ;;
+        -p) exit 90 ;;
+        -e) shift ;;
+        -j) [[ "$2" == batchpass ]] || exit 91; batchpass=true; shift 2 ;;
         -i) identity=true; shift 2 ;;
         -r) shift 2 ;;
         -o) out="$2"; shift 2 ;;
@@ -517,13 +555,29 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 [[ -n "$out" && -n "$input" ]] || exit 1
-if [[ "$decrypting" == true && "$identity" == false &&
-      -n "${AGE_PASSWORD_DECRYPT_MARKER:-}" ]]; then
-    printf '%s\n' unlock >> "$AGE_PASSWORD_DECRYPT_MARKER"
+if [[ "$batchpass" == true ]]; then
+    [[ "${AGE_PASSPHRASE_FD:-}" == 9 && -z "${AGE_PASSPHRASE:-}" ]] || exit 92
+    IFS= read -r passphrase <&9 || [[ -n "$passphrase" ]] || exit 93
+fi
+if [[ "$decrypting" == true && "$identity" == false ]]; then
+    [[ "$passphrase" != wrong-pass ]] || exit 1
+    if [[ -n "${AGE_PASSWORD_DECRYPT_MARKER:-}" ]]; then
+        printf '%s\n' unlock >> "$AGE_PASSWORD_DECRYPT_MARKER"
+    fi
 fi
 cp "$input" "$out"
 EOF
     chmod +x "$BIN/age" "$BIN/age-keygen"
+    # Dependency installation is a separate test double here; real-age cases
+    # below exercise the actual ensure_age_batchpass and official binaries.
+    cat >> "$APP/common/ensure-deps.sh" <<'EOF'
+
+ensure_age_batchpass() {
+    ensure_dep age || return 1
+    AGE_BIN=$(command -v age) || return 1
+    AGE_KEYGEN_BIN=$(command -v age-keygen) || return 1
+}
+EOF
 }
 _set_local_marker() {
     local config_dir="$1" marker="$2" tmp="$BATS_TEST_TMPDIR/config-marker.tmp"
@@ -565,13 +619,13 @@ _assert_no_global_auth_mutation() {
 
 
 _prepare_existing_plaintext_vault() {
-    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source init-local
     assert_success
     local config_dir="$HOME/.config/remote-control-essence"
     _set_local_marker "$config_dir" local
-    run bash -c 'printf "i\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _connect_github --storage none
     assert_success
-    run bash -c 'printf "i\nE\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source github-switch-local
     assert_success
 }
 
@@ -580,37 +634,22 @@ _prepare_existing_plaintext_vault() {
 @test "first local source selection does not probe GitHub" {
     export GH_CALLS_FILE="$BATS_TEST_TMPDIR/gh-calls"
 
-    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source init-local
 
     assert_success
-    assert_output --partial "Источник конфигурации"
+    assert_output --partial "Локальная конфигурация создана"
     [[ ! -s "$GH_CALLS_FILE" ]] || return 1
-    [[ "$output" != *"Не удалось открыть источник GitHub"* ]] || return 1
-}
-
-@test "menu operations accepts CRLF and opens scoped Telegram menu" {
-    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
-    assert_success
-    local config_dir="$HOME/.config/remote-control-essence"
-    jq '.nodes = [{id:"33333333333333333333333333333333",name:"fixture-node",ip:"127.0.0.1",port:22,user:"root",auth:"key",identity:"system",secret_id:null,tag:"",aliases:{}}]' \
-        "$config_dir/config.json" > "$config_dir/config.tmp"
-    mv "$config_dir/config.tmp" "$config_dir/config.json"
-
-    run bash -c 'printf "1\r\nt\r\n0\r\n0\r\n0\r\n" | "$0"' "$APP/remote-control-essence.sh"
-    assert_success
-    [[ "$output" != *"Неверный выбор."* ]]
 }
 
 @test "plaintext GitHub source persists and restarts from installed layout" {
-    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source init-local
     assert_success
 
-    run bash -c 'printf "i\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _connect_github --storage none
     assert_success
     local config_dir="$HOME/.config/remote-control-essence"
     local github_link=$'\033]8;;https://github.com/test-owner/essence-remote-control-config\033\\GitHub\033]8;;\033\\'
     assert_output --partial "Источник GitHub подключён."
-    [[ "$output" == *"Источник конфигурации: ${github_link}"* ]] || return 1
     jq -e 'type == "object" and .type == "github" and .private_verified == true' \
         "$config_dir/source.json"
     [[ "$(git --git-dir="$config_dir/github-store.git" show main:storage.json | jq -r '.encryption')" == none ]] || return 1
@@ -627,35 +666,25 @@ _prepare_existing_plaintext_vault() {
     [[ "$session_worktree_found" == false ]] || return 1
     [[ -f "$config_dir/github-runtime/config.json" ]] || return 1
 
-    run bash -c 'printf "i\n0\n0\n" | "$0"' "$APP/remote-control-essence.sh"
-
+    _rc source status
     assert_success
-    assert_output --partial "Источник конфигурации: ${github_link} • синхронизировано"
-    [[ "$output" != *"Выбран аккаунт GitHub: test-owner"* ]] || return 1
-    [[ "$output" != *"Завершить отложенную SSH-настройку"* ]] || return 1
-    assert_output --partial "Источник конфигурации GitHub"
-    assert_output --partial "Состояние синхронизации: синхронизировано"
-    [[ "$output" != *"Сменить пароль доступа"* ]] || return 1
-    [[ "$output" != *"Создать новый ключ шифрования"* ]] || return 1
-    [[ "$output" != *"Импортировать ключ восстановления"* ]] || return 1
-    [[ "$output" != *"Текущая конфигурация будет зашифрована заново"* ]] || return 1
-    [[ "$output" != *"Старые версии в GitHub потребуют прежний ключ"* ]] || return 1
-    [[ "$output" != *"Пароли нод при этом не меняются"* ]] || return 1
+    assert_output --partial "type: github"
+    assert_output --partial "storage: none"
+    assert_output --partial "sync: clean"
     [[ -f "$config_dir/github-runtime/config.json" ]] || return 1
-    run bash -c 'printf "0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc session open
     assert_success
 
-    run bash -c 'printf "i\nR\n0\n" | "$0"' "$APP/remote-control-essence.sh"
-    assert_success
-    assert_output --partial "Неверный выбор."
-    [[ "$output" != *"Текущий пароль доступа"* ]] || return 1
+    _rc source github-rewrap-password
+    [ "$status" -eq 1 ]
+    assert_output --partial "без шифрования"
 }
 
 @test "opening encrypted GitHub menu preserves the published state" {
     _install_fake_age
-    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source init-local
     assert_success
-    run bash -c 'printf "i\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _connect_github --storage none
     assert_success
 
     local updater="$BATS_TEST_TMPDIR/age-updater"
@@ -688,8 +717,7 @@ _prepare_existing_plaintext_vault() {
 
     local before
     before=$(git --git-dir="$REMOTE" rev-parse main) || return 1
-    run bash -c 'printf "access-pass\nn\ni\n0\n0\n" | "$0"' \
-        "$APP/remote-control-essence.sh"
+    RC_VAULT_PASSWORD=access-pass _rc session open
     assert_success
     [[ "$(git --git-dir="$REMOTE" rev-parse main)" == "$before" ]] || return 1
     jq -e '.schema_version==1 and .node_passwords=={}' \
@@ -698,9 +726,9 @@ _prepare_existing_plaintext_vault() {
 
 @test "failed encrypted GitHub actions retain the selected source and invoke each operation" {
     _install_fake_age
-    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source init-local
     assert_success
-    run bash -c 'printf "i\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _connect_github --storage none
     assert_success
 
     local updater="$BATS_TEST_TMPDIR/empty-diagnostic-age-updater"
@@ -731,7 +759,7 @@ _prepare_existing_plaintext_vault() {
     git -C "$updater" commit -m empty-diagnostic-encrypted-state >/dev/null
     git -C "$updater" push origin main >/dev/null
 
-    export FAILED_GITHUB_ACTIONS="$BATS_TEST_TMPDIR/failed-github-actions"
+    export FAILED_GITHUB_ACTIONS="$BATS_TEST_TMPDIR/failed-github-actions" RC_VAULT_PASSWORD=access-pass
     cat >> "$APP/modules/github-config.sh" <<'EOF'
 github_config_rewrap_master() { printf 'rewrap\n' >> "$FAILED_GITHUB_ACTIONS"; _github_clear_error; return 1; }
 github_config_rotate_vault_key() { printf 'rotate\n' >> "$FAILED_GITHUB_ACTIONS"; _github_clear_error; return 1; }
@@ -739,20 +767,25 @@ github_config_import_recovery() { printf 'import\n' >> "$FAILED_GITHUB_ACTIONS";
 github_config_switch_local() { printf 'local\n' >> "$FAILED_GITHUB_ACTIONS"; _github_clear_error; return 1; }
 EOF
 
-    run bash -c 'printf "access-pass\nn\ni\nR\nV\nI\n/tmp/missing-recovery-key\nE\n0\n" | "$0"' \
-        "$APP/remote-control-essence.sh"
-    assert_success
+    _rc_secrets '{"vault-password":"old-pass","new-vault-password":"new-pass"}' source github-rewrap-password
+    [ "$status" -eq 1 ] || return 1
+    _rc_secrets '{"new-vault-password":"new-pass"}' source github-rotate-key --yes
+    [ "$status" -eq 1 ] || return 1
+    _rc source github-import-recovery-key --file /tmp/missing-recovery-key
+    [ "$status" -eq 1 ] || return 1
+    _rc source github-switch-local
+    [ "$status" -eq 1 ] || return 1
     [[ "$(cat "$FAILED_GITHUB_ACTIONS")" == $'rewrap\nrotate\nimport\nlocal' ]] || return 1
     jq -e '.type=="github"' "$HOME/.config/remote-control-essence/source.json" || return 1
 }
 @test "ready GitHub state preserves node SSH resources after startup" {
-    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source init-local
     assert_success
-    run bash -c 'printf "i\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _connect_github --storage none
     assert_success
     _publish_key_node_state ready
 
-    run bash -c 'printf "0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc session open
     assert_success
     local runtime="$HOME/.config/remote-control-essence/github-runtime"
     jq -e '.portability=={status:"ready",issues:[]}' "$runtime/manifest.json" || return 1
@@ -761,9 +794,9 @@ EOF
 }
 
 @test "deferred SSH action resolves resources and persists readiness across restart" {
-    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source init-local
     assert_success
-    run bash -c 'printf "i\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _connect_github --storage none
     assert_success
     _publish_key_node_state needs-setup
 
@@ -782,15 +815,16 @@ cat "$SSH_SCAN_FILE"
 EOF
     chmod +x "$BIN/ssh" "$BIN/ssh-keyscan"
 
-    run bash -c 'printf "H\ny\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    run bash -c '"$0" node setup-ssh --provision-keys yes --yes < /dev/null' "$APP/remote-control-essence.sh"
     assert_success
     assert_output --partial "Отложенная SSH-настройка нод завершена"
+    assert_output --partial "ready: да"
     local runtime="$HOME/.config/remote-control-essence/github-runtime"
     jq -e '.portability=={status:"ready",issues:[]}' "$runtime/manifest.json" || return 1
     [[ -s "$runtime/ssh/identities/0123456789abcdef0123456789abcdef" ]] || return 1
     ssh-keygen -F 127.0.0.1 -f "$runtime/ssh/known_hosts" >/dev/null || return 1
 
-    run bash -c 'printf "0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc session open
     assert_success
     jq -e '.portability=={status:"ready",issues:[]}' "$runtime/manifest.json" || return 1
     [[ "$(git --git-dir="$REMOTE" show main:manifest.json |
@@ -800,12 +834,11 @@ EOF
 @test "direct GitHub selection initializes local recovery and empty plaintext repository" {
     git --git-dir="$REMOTE" update-ref -d refs/heads/main
 
-    run bash -c 'printf "2\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _connect_github --storage none
 
     assert_success
     assert_output --partial "Источник GitHub подключён."
     [[ "$output" != *"jq: error"* ]] || return 1
-    [[ "$output" != *"Не удалось выбрать источник конфигурации."* ]] || return 1
     local config_dir="$HOME/.config/remote-control-essence"
     jq -e 'type == "object" and .schema_version == 2' "$config_dir/config.json"
     jq -e 'type == "object" and .schema_version == 2' \
@@ -822,12 +855,11 @@ EOF
     old_remote=$(git --git-dir="$REMOTE" rev-parse main)
     rm -rf "$HOME/.config/remote-control-essence"
 
-    run bash -c 'printf "2\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _connect_github --existing local
 
     assert_success
     assert_output --partial "Источник GitHub подключён."
     [[ "$output" != *"jq: error"* ]] || return 1
-    [[ "$output" != *"Не удалось выбрать источник конфигурации."* ]] || return 1
     local config_dir="$HOME/.config/remote-control-essence" new_remote
     new_remote=$(git --git-dir="$REMOTE" rev-parse main)
     [[ "$new_remote" != "$old_remote" ]] || return 1
@@ -843,9 +875,9 @@ EOF
 @test "plaintext GitHub source initializes empty private repository" {
     git --git-dir="$REMOTE" update-ref -d refs/heads/main
 
-    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source init-local
     assert_success
-    run bash -c 'printf "i\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _connect_github --storage none
     assert_success
     assert_output --partial "Источник GitHub подключён."
     git --git-dir="$REMOTE" show-ref --verify --quiet refs/heads/main
@@ -854,10 +886,10 @@ EOF
     git --git-dir="$REMOTE" update-ref -d refs/heads/main
     _install_fake_age
 
-    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source init-local
     assert_success
-    run bash -c 'printf "i\n1\n1\naccess-pass\naccess-pass\n0\n" | "$0"' \
-        "$APP/remote-control-essence.sh"
+    _rc_secrets '{"new-vault-password":"access-pass"}' \
+        source github-connect --login test-owner --storage age
     assert_success
     local config_dir="$HOME/.config/remote-control-essence"
     assert_output --partial "Источник GitHub подключён."
@@ -874,47 +906,43 @@ EOF
     done
     [[ -f "$config_dir/github-runtime/config.json" ]] || return 1
 
-    run bash -c 'printf "access-pass\nn\n0\n" | "$0"' \
-        "$APP/remote-control-essence.sh"
+    RC_VAULT_PASSWORD=access-pass _rc session open
     assert_success
-    assert_output --partial "синхронизировано"
+    assert_output --partial "sync: clean"
 
-    run bash -c 'printf "access-pass\nn\ni\n0\n0\n" | "$0"' \
-        "$APP/remote-control-essence.sh"
+    RC_VAULT_PASSWORD=access-pass _rc source status
     assert_success
-    assert_output --partial "Сменить пароль доступа"
+    assert_output --partial "storage: age"
 }
 
 @test "script password hash persists through GitHub and protects the next process" {
-    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source init-local
     assert_success
-    run bash -c 'printf "i\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _connect_github --storage none
     assert_success
 
-    run bash -c 'printf "l\n1\nsecret-pass\nsecret-pass\n0\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    run bash -c 'printf "%s" "{\"password\":\"secret-pass\"}" | "$0" self password-set --secrets-stdin' "$APP/remote-control-essence.sh"
     assert_success
     [[ "$(git --git-dir="$REMOTE" show main:manifest.json |
         jq -r '.access.script_password_hash | startswith("$6$")')" == true ]] || return 1
 
-    run bash -c 'printf "secret-pass\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    RC_SCRIPT_PASSWORD=secret-pass _rc session open
     assert_success
-    [[ "$output" != *"Доступ запрещён."* ]] || return 1
 
     local rounds_hash config_dir="$HOME/.config/remote-control-essence"
     rounds_hash=$(openssl passwd -6 -salt 'rounds=100000$fixture' secret-pass) || return 1
     _publish_remote_access_hash "$rounds_hash" || return 1
 
-    run bash -c 'printf "secret-pass\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    RC_SCRIPT_PASSWORD=secret-pass _rc session open
     assert_success
-    [[ "$output" != *"Доступ запрещён."* ]] || return 1
     [[ "$(cat "$config_dir/.auth")" == "$rounds_hash" ]] || return 1
 }
 @test "format recovery requires the script password and keeps its hash on replace" {
-    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source init-local
     assert_success
-    run bash -c 'printf "i\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _connect_github --storage none
     assert_success
-    run bash -c 'printf "l\n1\nsecret-pass\nsecret-pass\n0\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    run bash -c 'printf "%s" "{\"password\":\"secret-pass\"}" | "$0" self password-set --secrets-stdin' "$APP/remote-control-essence.sh"
     assert_success
     local config_dir="$HOME/.config/remote-control-essence" updater="$BATS_TEST_TMPDIR/v1-auth" head
     git clone "$REMOTE" "$updater" >/dev/null 2>&1 || return 1
@@ -926,12 +954,11 @@ EOF
     git -C "$updater" push origin main >/dev/null 2>&1 || return 1
     head=$(git --git-dir="$REMOTE" rev-parse main)
 
-    run bash -c 'printf "wrong\nwrong\nwrong\n2\ny\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc_secrets '{"script-password":"wrong"}' source github-replace-with-local --yes
     assert_failure
-    [[ "$output" != *"Заменить GitHub"* ]] || return 1
     [[ "$(git --git-dir="$REMOTE" rev-parse main)" == "$head" ]] || return 1
 
-    run bash -c 'printf "secret-pass\n2\ny\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc_secrets '{"script-password":"secret-pass"}' source github-replace-with-local --yes
     assert_success
     [[ "$(git --git-dir="$REMOTE" rev-parse main)" != "$head" ]] || return 1
     [[ -s "$config_dir/.auth" ]] || return 1
@@ -939,11 +966,11 @@ EOF
         "$(cat "$config_dir/.auth")" ]]
 }
 @test "format recovery asks again when the migrated snapshot carries another script password" {
-    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source init-local
     assert_success
-    run bash -c 'printf "i\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _connect_github --storage none
     assert_success
-    run bash -c 'printf "l\n1\nsecret-pass\nsecret-pass\n0\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc_secrets '{"password":"secret-pass"}' self password-set
     assert_success
     local updater="$BATS_TEST_TMPDIR/v1-rotated" rotated
     rotated=$(openssl passwd -6 -salt fixture rotated-pass) || return 1
@@ -957,11 +984,12 @@ EOF
     git -C "$updater" commit -am vault-v1 >/dev/null || return 1
     git -C "$updater" push origin main >/dev/null 2>&1 || return 1
 
-    run bash -c 'printf "secret-pass\n1\ny\nwrong\nwrong\nwrong\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc_secrets '{"script-password":"secret-pass"}' source github-migrate-format --yes
+    assert_success
+    RC_SCRIPT_PASSWORD=secret-pass _rc status
     assert_failure
-    assert_output --partial "Доступ запрещён."
-    [[ "$output" != *"Источник конфигурации: GitHub"* ]] || return 1
-    run bash -c 'printf "rotated-pass\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    assert_output --partial "Неверный пароль запуска."
+    RC_SCRIPT_PASSWORD=rotated-pass _rc session open
     assert_success
 }
 
@@ -972,7 +1000,7 @@ EOF
     local remote_head
     remote_head=$(git --git-dir="$REMOTE" rev-parse main)
 
-    run bash -c 'printf "i\n1\n1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _connect_github --existing remote
     assert_success
     [[ "$(jq -r '.marker' "$config_dir/github-runtime/config.json")" == remote ]] || return 1
     [[ "$(jq -r '.marker' "$config_dir/config.json")" == local ]] || return 1
@@ -989,7 +1017,7 @@ EOF
     local old_remote new_remote
     old_remote=$(git --git-dir="$REMOTE" rev-parse main)
 
-    run bash -c 'printf "i\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _connect_github --existing local
     assert_success
     new_remote=$(git --git-dir="$REMOTE" rev-parse main)
     [[ "$new_remote" != "$old_remote" ]] || return 1
@@ -1007,9 +1035,9 @@ EOF
     checksum=$(_hash_file "$config_dir/config.json")
     remote_head=$(git --git-dir="$REMOTE" rev-parse main)
 
-    run bash -c 'printf "i\n1\n0\n0\n" | "$0"' "$APP/remote-control-essence.sh"
-    assert_success
-    assert_output --partial "выбор версии конфигурации"
+    _connect_github
+    [ "$status" -eq 2 ]
+    assert_output --partial "--existing remote|local"
     [[ ! -e "$config_dir/source.json" ]] || return 1
     [[ "$(_hash_file "$config_dir/config.json")" == "$checksum" ]] || return 1
     [[ "$(git --git-dir="$REMOTE" rev-parse main)" == "$remote_head" ]] || return 1
@@ -1017,7 +1045,7 @@ EOF
 
 @test "existing age vault inherits storage mode and unlocks only once" {
     _install_fake_age
-    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source init-local
     assert_success
     local config_dir="$HOME/.config/remote-control-essence"
     _set_local_marker "$config_dir" local
@@ -1079,8 +1107,8 @@ EOF
 
 
 
-    run bash -c 'printf "i\n1\naccess-pass\nn\n1\n0\n" | "$0"' \
-        "$APP/remote-control-essence.sh"
+    _rc_secrets '{"vault-password":"access-pass"}' \
+        source github-connect --login test-owner --existing remote
     export PATH="$original_path"
     assert_success
     [[ -f "$AGE_INSTALL_MARKER" ]] || return 1
@@ -1091,7 +1119,7 @@ EOF
     [[ "$(jq -r '.marker' "$config_dir/config.json")" == local ]] || return 1
 }
 @test "tracked GitHub data without storage metadata is rejected before writing" {
-    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source init-local
     assert_success
     local config_dir="$HOME/.config/remote-control-essence"
     local checksum remote_head orphan="$BATS_TEST_TMPDIR/orphan"
@@ -1106,8 +1134,8 @@ EOF
     git -C "$orphan" push --force origin main >/dev/null
     remote_head=$(git --git-dir="$REMOTE" rev-parse main)
 
-    run bash -c 'printf "i\n1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
-    assert_success
+    _connect_github --storage none
+    [ "$status" -eq 1 ]
     assert_output --partial "проверка существующего репозитория GitHub"
     assert_output --partial "В репозитории есть данные, но отсутствует корректная конфигурация Essence."
     [[ ! -e "$config_dir/source.json" ]] || return 1
@@ -1118,31 +1146,32 @@ EOF
 
 
 @test "failed GitHub enable preserves local source and config" {
-    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source init-local
     assert_success
     local config_dir="$HOME/.config/remote-control-essence"
     local checksum
     checksum=$(_hash_file "$config_dir/config.json")
 
-    run env GH_MODE=fail bash -c 'printf "i\n1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
-    assert_success
+    GH_MODE=fail _connect_github --storage none
+    [ "$status" -eq 1 ]
     assert_output --partial "Не удалось подключить GitHub (этап: проверка приватного репозитория): permission denied"
-    assert_output --partial "Выбранный аккаунт: test-owner"
     [[ "$output" != *"gh auth login"* ]] || return 1
-    [[ "$output" == *"Источник конфигурации: локальный"* ]] || return 1
-    [[ "$output" != *"Источник GitHub подключён."* ]] || return 1
     [[ "$(_hash_file "$config_dir/config.json")" == "$checksum" ]] || return 1
     [[ ! -e "$config_dir/source.json" ]] || return 1
 }
 
 @test "failed first attempt can retry GitHub enable in one process" {
-    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source init-local
     assert_success
     export GH_MODE=retry GH_COUNT_FILE="$BATS_TEST_TMPDIR/gh-count"
     printf '0\n' > "$GH_COUNT_FILE"
 
-    run bash -c 'printf "i\n1\ni\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _serve_requests '["session","open"]' \
+        '["source","github-connect","--login","test-owner","--storage","none","--yes"]' \
+        '["source","github-connect","--login","test-owner","--storage","none","--yes"]'
     assert_success
+    printf '%s\n' "$output" | jq -se 'any(.[]; .id == 2 and .ok == false)' >/dev/null || return 1
+    printf '%s\n' "$output" | jq -se 'any(.[]; .id == 3 and .ok)' >/dev/null || return 1
     assert_output --partial "Не удалось подключить GitHub (этап: проверка приватного репозитория): permission denied"
     [[ "$output" != *"gh auth login"* ]] || return 1
     assert_output --partial "Источник GitHub подключён."
@@ -1151,15 +1180,19 @@ EOF
 }
 
 @test "explicit GitHub login with unavailable token and failed web auth never reaches repository" {
-    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source init-local
     assert_success
     export GH_CALLS_FILE="$BATS_TEST_TMPDIR/gh-calls"
     export GH_SCOPE_CALLS_FILE="$BATS_TEST_TMPDIR/gh-scopes"
 
-    run env GH_TOKEN_UNAVAILABLE_LOGIN=alternate-owner GH_MODE=web-fail \
-        bash -c 'printf "i\n2\nalternate-owner\n0\n" | "$0"' "$APP/remote-control-essence.sh"
-    assert_success
-    assert_output --partial "Не удалось подключить GitHub"
+    GH_TOKEN_UNAVAILABLE_LOGIN=alternate-owner GH_MODE=web-fail \
+        _rc source github-connect --login alternate-owner --storage none
+    [ "$status" -eq 2 ]
+    assert_output --partial "source github-login --login alternate-owner"
+    GH_TOKEN_UNAVAILABLE_LOGIN=alternate-owner GH_MODE=web-fail \
+        _rc source github-login --login alternate-owner
+    [ "$status" -eq 2 ]
+    assert_output --partial "Не удалось войти в GitHub как alternate-owner."
     [[ "$output" != *"ghp_WebSecret123"* ]] || return 1
     [[ "$output" != *"ghp_FixtureToken_"* ]] || return 1
     [[ ! -e "$HOME/.config/remote-control-essence/source.json" ]] || return 1
@@ -1170,12 +1203,12 @@ EOF
     _assert_no_global_auth_mutation
 }
 @test "GitHub connection error redacts credentials and tokens" {
-    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source init-local
     assert_success
 
 
-    run env GH_MODE=secret-fail bash -c 'printf "i\n1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
-    assert_success
+    GH_MODE=secret-fail _connect_github --storage none
+    [ "$status" -eq 1 ]
     assert_output --partial "Не удалось подключить GitHub (этап: проверка приватного репозитория):"
     [[ "$output" != *"password@github.com"* ]] || return 1
     [[ "$output" != *"ghp_SecretValue123456789"* ]] || return 1
@@ -1184,7 +1217,7 @@ EOF
 }
 
 @test "saved GitHub source reopens cached config during account API timeout" {
-    run bash -c 'printf "2\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _connect_github --storage none
     assert_success
     local config_dir="$HOME/.config/remote-control-essence"
     local source_hash global_login
@@ -1194,9 +1227,8 @@ EOF
     export GH_CALLS_FILE="$BATS_TEST_TMPDIR/gh-offline-calls"
     : > "$GH_CALLS_FILE"
 
-    run env GH_MODE=api-timeout bash -c 'printf "0\n" | "$0"' "$APP/remote-control-essence.sh"
+    GH_MODE=api-timeout _rc session open
     assert_success
-    assert_output --partial "Essence — управление нодами"
     cmp "$BATS_TEST_TMPDIR/cached-config.json" "$config_dir/github-runtime/config.json" || return 1
     [[ "$(_hash_file "$config_dir/source.json")" == "$source_hash" ]] || return 1
     [[ "$(cat "$GH_ACTIVE_LOGIN_FILE")" == "$global_login" ]] || return 1
@@ -1207,14 +1239,14 @@ EOF
     _assert_no_global_auth_mutation
 }
 @test "saved profile API failure blocks repository access without changing global login" {
-    run bash -c 'printf "2\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _connect_github --storage none
     assert_success
     local config_dir="$HOME/.config/remote-control-essence"
     local source_hash=$(_hash_file "$config_dir/source.json")
     export GH_CALLS_FILE="$BATS_TEST_TMPDIR/gh-calls"
     : > "$GH_CALLS_FILE"
 
-    run env GH_MODE=auth-fail bash -c 'printf "0\n" | "$0"' "$APP/remote-control-essence.sh"
+    GH_MODE=auth-fail _rc session open
     assert_failure
     assert_output --partial "GH_CONFIG_DIR=$config_dir/credentials/gh/test-owner gh auth login --hostname github.com --web"
     [[ "$(_hash_file "$config_dir/source.json")" == "$source_hash" ]] || return 1
@@ -1224,7 +1256,7 @@ EOF
 }
 
 @test "saved profile mismatch never falls back to global account or reimports credentials" {
-    run bash -c 'printf "2\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _connect_github --storage none
     assert_success
     local config_dir="$HOME/.config/remote-control-essence" profile="$HOME/.config/remote-control-essence/credentials/gh/test-owner"
     local source_hash=$(_hash_file "$config_dir/source.json")
@@ -1232,7 +1264,7 @@ EOF
     export GH_CALLS_FILE="$BATS_TEST_TMPDIR/gh-calls"
     : > "$GH_CALLS_FILE"
 
-    run bash -c 'printf "0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc session open
     assert_failure
     assert_output --partial "Профиль test-owner авторизован как alternate-owner."
     [[ "$(_hash_file "$config_dir/source.json")" == "$source_hash" ]] || return 1
@@ -1248,22 +1280,23 @@ EOF
     export GH_CREATE_COUNT_FILE="$BATS_TEST_TMPDIR/gh-create-count"
     export GH_REPO_STATE_FILE="$BATS_TEST_TMPDIR/gh-repo-created"
     printf '0\n' > "$GH_CREATE_COUNT_FILE"
-    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source init-local
     assert_success
-    run bash -c 'printf "i\n1\ny\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _connect_github --create-repo --storage none
     assert_success
 
-    run bash -c 'printf "i\nE\ni\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _serve_requests '["session","open"]' '["source","github-switch-local"]' \
+        '["source","github-connect","--login","test-owner","--existing","local","--yes"]'
     assert_success
+    printf '%s\n' "$output" | jq -se 'any(.[]; .id == 3 and .ok)' >/dev/null || return 1
     assert_output --partial "Источник GitHub подключён."
-    [[ "$output" != *"Не удалось подключить GitHub"* ]] || return 1
     jq -e 'type == "object" and .type == "github" and .private_verified == true' \
         "$HOME/.config/remote-control-essence/source.json"
     [[ "$(cat "$GH_CREATE_COUNT_FILE")" == 1 ]] || return 1
 }
 
 @test "legacy exact local source marker migrates on the next process" {
-    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source init-local
     assert_success
     local config_dir="$HOME/.config/remote-control-essence"
     local checksum
@@ -1271,31 +1304,29 @@ EOF
     printf '%s\n' '{"type":"local"}' > "$config_dir/source.json"
     chmod 600 "$config_dir/source.json"
 
-    run bash -c 'printf "0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc session open
     assert_success
-    assert_output --partial "Источник конфигурации: локальный"
-    [[ "$output" != *"source.json содержит неподдерживаемый"* ]] || return 1
+    assert_output --partial "source: local"
     [[ "$(_hash_file "$config_dir/config.json")" == "$checksum" ]] || return 1
     [[ ! -e "$config_dir/source.json" ]] || return 1
 }
 
 @test "switching from GitHub to local persists without source metadata" {
-    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source init-local
     assert_success
-    run bash -c 'printf "i\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _connect_github --storage none
     assert_success
     local config_dir="$HOME/.config/remote-control-essence"
 
-    run bash -c 'printf "i\nE\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source github-switch-local
     assert_success
     local checksum
     checksum=$(_hash_file "$config_dir/config.json")
     [[ ! -e "$config_dir/source.json" ]] || return 1
 
-    run bash -c 'printf "0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc session open
     assert_success
-    assert_output --partial "Источник конфигурации: локальный"
-    [[ "$output" != *"source.json содержит неподдерживаемый"* ]] || return 1
+    assert_output --partial "source: local"
     [[ "$(_hash_file "$config_dir/config.json")" == "$checksum" ]] || return 1
     [[ ! -e "$config_dir/source.json" ]] || return 1
 }
@@ -1303,9 +1334,9 @@ EOF
     _prepare_alternate_remote
     export GH_CALLS_FILE="$BATS_TEST_TMPDIR/gh-calls"
     export GH_SCOPE_CALLS_FILE="$BATS_TEST_TMPDIR/gh-scopes"
-    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source init-local
     assert_success
-    run bash -c 'printf "i\n2\nalternate-owner\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source github-connect --login alternate-owner --storage none --yes
     assert_success
     local config_dir="$HOME/.config/remote-control-essence"
     jq -e '.repo == "alternate-owner/essence-remote-control-config" and (keys | sort == ["branch","private_verified","repo","type"])' \
@@ -1324,7 +1355,7 @@ EOF
 }
 
 @test "missing repository defaults to refusal without creating or changing local state" {
-    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source init-local
     assert_success
     local config_dir="$HOME/.config/remote-control-essence"
     local checksum
@@ -1332,10 +1363,9 @@ EOF
     export GH_MODE=missing GH_CALLS_FILE="$BATS_TEST_TMPDIR/gh-calls"
     export GH_CREATE_COUNT_FILE="$BATS_TEST_TMPDIR/gh-create-count"
     printf '0\n' > "$GH_CREATE_COUNT_FILE"
-    run bash -c 'printf "i\n1\n\n0\n" | "$0"' "$APP/remote-control-essence.sh"
-    assert_success
-    assert_output --partial "Репозиторий test-owner/essence-remote-control-config не найден."
-    assert_output --partial "Продолжаем использовать локальную конфигурацию."
+    _connect_github --storage none
+    [ "$status" -eq 2 ]
+    assert_output --partial "Репозиторий test-owner/essence-remote-control-config не найден"
     [[ "$(_hash_file "$config_dir/config.json")" == "$checksum" ]] || return 1
     [[ ! -e "$config_dir/source.json" ]] || return 1
     [[ "$(cat "$GH_CREATE_COUNT_FILE")" == 0 ]] || return 1
@@ -1347,9 +1377,9 @@ EOF
     export GH_CREATE_COUNT_FILE="$BATS_TEST_TMPDIR/gh-create-count"
     printf '0\n' > "$GH_CREATE_COUNT_FILE"
 
-    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source init-local
     assert_success
-    run bash -c 'printf "i\n1\ny\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _connect_github --create-repo --storage none
     assert_success
 
     [[ "$(cat "$GH_CREATE_COUNT_FILE")" == 1 ]] || return 1
@@ -1363,13 +1393,13 @@ EOF
     export GH_CREATE_COUNT_FILE="$BATS_TEST_TMPDIR/gh-create-count"
     printf '0\n' > "$GH_CREATE_COUNT_FILE"
 
-    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source init-local
     assert_success
-    run bash -c 'printf "i\n1\ny\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _connect_github --create-repo --storage none
     assert_success
     printf '0\n' > "$GH_CREATE_COUNT_FILE"
 
-    run bash -c 'printf "0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc session open
     assert_failure
     assert_output --partial "Не удалось открыть источник GitHub (этап: проверка приватного репозитория): Репозиторий test-owner/essence-remote-control-config не найден."
     [[ "$(cat "$GH_CREATE_COUNT_FILE")" == 0 ]] || return 1
@@ -1377,34 +1407,33 @@ EOF
 }
 
 @test "GitHub delete defaults to refusal and keeps source metadata" {
-    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source init-local
     assert_success
-    run bash -c 'printf "i\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _connect_github --storage none
     assert_success
     local config_dir="$HOME/.config/remote-control-essence"
     export GH_CALLS_FILE="$BATS_TEST_TMPDIR/gh-calls"
     export GH_DELETE_MARKER="$BATS_TEST_TMPDIR/gh-delete"
 
-    run bash -c 'printf "i\nD\n\n0\n" | "$0"' "$APP/remote-control-essence.sh"
-    assert_success
+    _rc source github-delete-repo
+    [ "$status" -eq 2 ]
     [[ -f "$config_dir/source.json" ]] || return 1
     [[ ! -e "$GH_DELETE_MARKER" ]] || return 1
     [[ "$(grep -c '^repo delete ' "$GH_CALLS_FILE" || true)" == 0 ]] || return 1
 }
 
 @test "successful GitHub delete preserves local files and disables source" {
-    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source init-local
     assert_success
-    run bash -c 'printf "i\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _connect_github --storage none
     assert_success
     local config_dir="$HOME/.config/remote-control-essence"
     export GH_CALLS_FILE="$BATS_TEST_TMPDIR/gh-calls"
     export GH_DELETE_MARKER="$BATS_TEST_TMPDIR/gh-delete"
 
-    run bash -c 'printf "i\nD\ny\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source github-delete-repo --yes
     assert_success
     assert_output --partial "Репозиторий test-owner/essence-remote-control-config удалён."
-    assert_output --partial "Источник конфигурации: локальный"
     [[ -f "$GH_DELETE_MARKER" ]] || return 1
     [[ "$(grep -c '^repo delete test-owner/essence-remote-control-config --yes$' "$GH_CALLS_FILE" || true)" == 1 ]] || return 1
     [[ ! -e "$config_dir/source.json" ]] || return 1
@@ -1413,10 +1442,11 @@ EOF
     jq -e 'type == "object" and .schema_version == 2' "$config_dir/manifest.json"
 }
 
-@test "failed GitHub delete opens settings and keeps local source" {
-    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+@test "failed GitHub delete reports the settings link and keeps local source" {
+    bats_require_minimum_version 1.5.0
+    _rc source init-local
     assert_success
-    run bash -c 'printf "i\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _connect_github --storage none
     assert_success
     local config_dir="$HOME/.config/remote-control-essence"
     export GH_CALLS_FILE="$BATS_TEST_TMPDIR/gh-calls"
@@ -1424,28 +1454,29 @@ EOF
     export GH_BROWSE_MARKER="$BATS_TEST_TMPDIR/gh-browse"
     export GH_DELETE_FAIL=true
 
-    run bash -c 'printf "i\nD\ny\n0\n" | "$0"' "$APP/remote-control-essence.sh"
-    assert_success
-    assert_output --partial "Открыта страница настроек test-owner/essence-remote-control-config"
+    run --separate-stderr "$APP/remote-control-essence.sh" source github-delete-repo --yes --json < /dev/null
+    [ "$status" -eq 1 ]
+    jq -e '.error.code == "remote_failed" and
+        .error.settings_url == "https://github.com/test-owner/essence-remote-control-config/settings"' <<< "$output"
     [[ -f "$config_dir/config.json" ]] || return 1
     [[ ! -e "$config_dir/source.json" ]] || return 1
-    [[ -f "$GH_DELETE_MARKER" && -f "$GH_BROWSE_MARKER" ]] || return 1
+    [[ -f "$GH_DELETE_MARKER" && ! -e "$GH_BROWSE_MARKER" ]] || return 1
     [[ "$(grep -c '^repo delete test-owner/essence-remote-control-config --yes$' "$GH_CALLS_FILE" || true)" == 1 ]] || return 1
-    [[ "$(grep -c '^browse --settings --repo test-owner/essence-remote-control-config$' "$GH_CALLS_FILE" || true)" == 1 ]] || return 1
-    [[ "$output" != *"ghp_DeleteSecret123"* ]] || return 1
+    [[ "$(grep -c '^browse ' "$GH_CALLS_FILE" || true)" == 0 ]] || return 1
+    [[ "$output$stderr" != *"ghp_DeleteSecret123"* ]] || return 1
 }
 
-@test "failed settings fallback prints a clickable repository settings link" {
-    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+@test "failed GitHub delete prints the repository settings link" {
+    _rc source init-local
     assert_success
-    run bash -c 'printf "i\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _connect_github --storage none
     assert_success
     local config_dir="$HOME/.config/remote-control-essence"
     export GH_CALLS_FILE="$BATS_TEST_TMPDIR/gh-calls"
     export GH_DELETE_FAIL=true GH_BROWSE_FAIL=true
 
-    run bash -c 'printf "i\nD\ny\n0\n" | "$0"' "$APP/remote-control-essence.sh"
-    assert_success
+    _rc source github-delete-repo --yes
+    [ "$status" -eq 1 ]
     assert_output --partial "https://github.com/test-owner/essence-remote-control-config/settings"
     [[ ! -e "$config_dir/source.json" ]] || return 1
     [[ "$output" != *"ghp_DeleteSecret123"* ]] || return 1
@@ -1467,9 +1498,8 @@ EOF
         marker="$BATS_TEST_TMPDIR/materialize-$fault.calls"
         rm -f "$marker" || return 1
 
-        run env MATERIALIZE_FAULT="$fault" MATERIALIZE_FAULT_MARKER="$marker" \
-            bash -c 'printf "secret-pass\n0\n" | "$0"' \
-            "$APP/remote-control-essence.sh"
+        MATERIALIZE_FAULT="$fault" MATERIALIZE_FAULT_MARKER="$marker" RC_SCRIPT_PASSWORD=secret-pass \
+            _rc session open
         [[ "$status" -ne 0 ]] || failures=$((failures + 1))
         [[ -s "$marker" ]] || failures=$((failures + 1))
         new_runtime=$(_runtime_fingerprint "$MATERIALIZE_RUNTIME") ||
@@ -1482,9 +1512,8 @@ EOF
         new_temps=$(_materialization_temp_inventory "$MATERIALIZE_CONFIG_DIR") || return 1
         [[ "$new_temps" == "$old_temps" ]] || failures=$((failures + 1))
 
-        run env MATERIALIZE_FAULT=none MATERIALIZE_FAULT_MARKER="$marker" \
-            bash -c 'printf "secret-pass\n0\n" | "$0"' \
-            "$APP/remote-control-essence.sh"
+        MATERIALIZE_FAULT=none MATERIALIZE_FAULT_MARKER="$marker" RC_SCRIPT_PASSWORD=secret-pass \
+            _rc session open
         [[ "$status" -eq 0 ]] || failures=$((failures + 1))
         [[ "$(jq -r '.marker' "$MATERIALIZE_RUNTIME/config.json" 2>/dev/null || true)" == "$expected" ]] ||
             failures=$((failures + 1))
@@ -1509,9 +1538,8 @@ EOF
     old_auth_mode=$(_file_mode "$MATERIALIZE_CONFIG_DIR/.auth") || return 1
     old_temps=$(_materialization_temp_inventory "$MATERIALIZE_CONFIG_DIR") || return 1
 
-    run env MATERIALIZE_FAULT=auth-rm MATERIALIZE_FAULT_MARKER="$marker" \
-        bash -c 'printf "secret-pass\n0\n" | "$0"' \
-        "$APP/remote-control-essence.sh"
+    MATERIALIZE_FAULT=auth-rm MATERIALIZE_FAULT_MARKER="$marker" RC_SCRIPT_PASSWORD=secret-pass \
+        _rc session open
     [[ "$status" -ne 0 ]] || failures=$((failures + 1))
     [[ "$(cat "$marker" 2>/dev/null || true)" == auth-rm ]] || failures=$((failures + 1))
     new_runtime=$(_runtime_fingerprint "$MATERIALIZE_RUNTIME") ||
@@ -1524,8 +1552,7 @@ EOF
     new_temps=$(_materialization_temp_inventory "$MATERIALIZE_CONFIG_DIR") || return 1
     [[ "$new_temps" == "$old_temps" ]] || failures=$((failures + 1))
 
-    run env MATERIALIZE_FAULT=none MATERIALIZE_FAULT_MARKER="$marker" \
-        bash -c 'printf "0\n" | "$0"' "$APP/remote-control-essence.sh"
+    MATERIALIZE_FAULT=none MATERIALIZE_FAULT_MARKER="$marker" _rc session open
     [[ "$status" -eq 0 ]] || failures=$((failures + 1))
     [[ ! -e "$MATERIALIZE_CONFIG_DIR/.auth" ]] || failures=$((failures + 1))
     [[ "$(jq -r '.marker' "$MATERIALIZE_RUNTIME/config.json" 2>/dev/null || true)" == auth-null ]] ||
@@ -1543,9 +1570,8 @@ EOF
     old_runtime=$(_runtime_fingerprint "$MATERIALIZE_RUNTIME") || return 1
     rm -f "$marker" || return 1
 
-    run env MATERIALIZE_FAULT=runtime-rollback MATERIALIZE_FAULT_MARKER="$marker" \
-        bash -c 'printf "secret-pass\n0\n" | "$0"' \
-        "$APP/remote-control-essence.sh"
+    MATERIALIZE_FAULT=runtime-rollback MATERIALIZE_FAULT_MARKER="$marker" RC_SCRIPT_PASSWORD=secret-pass \
+        _rc session open
     assert_failure
     [[ "$(cat "$marker")" == $'publish-fail\nruntime-restore-fail' ]] || return 1
     retired=$(find "$MATERIALIZE_CONFIG_DIR" -mindepth 1 -maxdepth 1 \
@@ -1566,9 +1592,8 @@ EOF
     old_auth_mode=$(_file_mode "$MATERIALIZE_CONFIG_DIR/.auth") || return 1
     rm -f "$marker" || return 1
 
-    run env MATERIALIZE_FAULT=auth-rollback MATERIALIZE_FAULT_MARKER="$marker" \
-        bash -c 'printf "secret-pass\n0\n" | "$0"' \
-        "$APP/remote-control-essence.sh"
+    MATERIALIZE_FAULT=auth-rollback MATERIALIZE_FAULT_MARKER="$marker" RC_SCRIPT_PASSWORD=secret-pass \
+        _rc session open
     assert_failure
     [[ "$(cat "$marker")" == $'auth-rm\nauth-restore-fail' ]] || return 1
     [[ "$(_runtime_fingerprint "$MATERIALIZE_RUNTIME")" == "$old_runtime" ]] || return 1
@@ -1598,6 +1623,7 @@ EOF
     chmod +x "$APP/common/ensure-deps.sh" "$BIN/curl" || return 1
     export ENSURE_DEPS_LOG="$deps_log" UPDATE_CHECK_LOG="$update_log"
 
+    cp -R "$PROJECT_ROOT/remote-control/tui" "$APP/"
     run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
     [[ "$status" -eq 0 ]] || failures=$((failures + 1))
     for dep in jq openssl ssh scp base64; do
@@ -1617,35 +1643,34 @@ EOF
 }
 
 @test "readable incomplete GitHub metadata reports the GitHub diagnostic" {
-    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source init-local
     assert_success
     local config_dir="$HOME/.config/remote-control-essence"
     printf '%s\n' '{"type":"github","repo":"test-owner/essence-remote-control-config"}' \
         > "$config_dir/source.json"
 
-    run bash -c 'printf "0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc session open
     assert_failure
     assert_output --partial "source.json содержит неполные или некорректные параметры GitHub."
     assert_output --partial "этап: проверка настроек источника GitHub"
 }
 
 @test "malformed source metadata keeps the generic startup fallback" {
-    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source init-local
     assert_success
     local config_dir="$HOME/.config/remote-control-essence"
     printf '%s\n' '{not-json' > "$config_dir/source.json"
 
-    run bash -c 'printf "0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc session open
     assert_failure
     assert_output --partial "Не удалось открыть источник конфигурации."
-    [[ "$output" != *"этап: проверка настроек источника GitHub"* ]] || return 1
 }
 
 @test "global B cannot migrate saved A; restart fetch and push stay on A" {
     _prepare_alternate_remote
     export GH_CALLS_FILE="$BATS_TEST_TMPDIR/gh-calls"
     export GH_SCOPE_CALLS_FILE="$BATS_TEST_TMPDIR/gh-scopes"
-    run bash -c 'printf "2\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _connect_github --storage none
     assert_success
     local config_dir="$HOME/.config/remote-control-essence" source_hash global_config_hash b_head
     source_hash=$(_hash_file "$config_dir/source.json")
@@ -1656,7 +1681,7 @@ EOF
     : > "$GH_CALLS_FILE"
     : > "$GH_SCOPE_CALLS_FILE"
 
-    run bash -c 'printf "i\nF\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source github-fetch
     assert_success
     assert_output --partial "Конфигурация загружена из GitHub."
     jq -e '.marker == "fetched-from-a"' "$config_dir/github-runtime/config.json"
@@ -1670,7 +1695,7 @@ EOF
     git -C "$pending" add config.json
     git -C "$pending" commit -m local-pending >/dev/null || return 1
     git -C "$pending" push "$config_dir/github-store.git" HEAD:refs/heads/main >/dev/null || return 1
-    run bash -c 'printf "i\nP\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source github-push
     assert_success
     assert_output --partial "Локальная конфигурация отправлена в GitHub."
     jq -e '.marker == "pushed-to-a"' <(git --git-dir="$REMOTE" show main:config.json)
@@ -1680,7 +1705,6 @@ EOF
     [[ "$(_hash_file "$GIT_CONFIG_GLOBAL")" == "$global_config_hash" ]] || return 1
     [[ "$(git --git-dir="$config_dir/github-store.git" config --get remote.origin.url)" == \
         "https://github.com/test-owner/essence-remote-control-config.git" ]] || return 1
-    [[ "$output" != *"Сменить аккаунт для конфигурации"* ]] || return 1
     grep -q '^test-owner repo view test-owner/' "$GH_SCOPE_CALLS_FILE"
     ! grep -q '^alternate-owner ' "$GH_SCOPE_CALLS_FILE" || return 1
     ! grep -q 'ghp_FixtureToken_' "$GH_CALLS_FILE" || return 1
@@ -1692,14 +1716,14 @@ EOF
     _prepare_alternate_remote
     export GH_CALLS_FILE="$BATS_TEST_TMPDIR/gh-calls"
     export GH_SCOPE_CALLS_FILE="$BATS_TEST_TMPDIR/gh-scopes"
-    run bash -c 'printf "2\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _connect_github --storage none
     assert_success
     local config_dir="$HOME/.config/remote-control-essence" a_head global_config_hash
     a_head=$(git --git-dir="$REMOTE" rev-parse main)
     global_config_hash=$(_hash_file "$GIT_CONFIG_GLOBAL")
     : > "$GH_SCOPE_CALLS_FILE"
 
-    run bash -c 'printf "i\nC\n2\nalternate-owner\ny\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source github-change-account --login alternate-owner --storage none --yes
     assert_success
     jq -e '.repo == "alternate-owner/essence-remote-control-config"' "$config_dir/source.json"
     [[ "$(git --git-dir="$config_dir/github-store.git" config --get remote.origin.url)" == \
@@ -1715,7 +1739,7 @@ EOF
 
 @test "C to a repository with an old snapshot format aborts without changes" {
     _prepare_alternate_remote
-    run bash -c 'printf "2\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _connect_github --storage none
     assert_success
     local config_dir="$HOME/.config/remote-control-essence" a_head b_head seed="$BATS_TEST_TMPDIR/v1-alternate"
     local source_hash
@@ -1730,10 +1754,10 @@ EOF
     b_head=$(git --git-dir="$ALTERNATE_REMOTE" rev-parse main)
     source_hash=$(_hash_file "$config_dir/source.json")
 
-    run bash -c 'printf "i\nC\n2\nalternate-owner\ny\n0\n0\n" | "$0"' "$APP/remote-control-essence.sh"
-    assert_success
+    _rc source github-change-account --login alternate-owner
+    [ "$status" -eq 1 ]
     assert_output --partial "Смена аккаунта прервана."
-    assert_output --partial "Отключите синхронизацию (e)"
+    assert_output --partial "source github-switch-local"
     [[ "$(_hash_file "$config_dir/source.json")" == "$source_hash" ]] || return 1
     [[ "$(git --git-dir="$REMOTE" rev-parse main)" == "$a_head" ]] || return 1
     [[ "$(git --git-dir="$ALTERNATE_REMOTE" rev-parse main)" == "$b_head" ]] || return 1
@@ -1743,7 +1767,7 @@ EOF
 @test "c cancellation and failed B authorization preserve A source cache and remotes" {
     _prepare_alternate_remote
     export GH_CALLS_FILE="$BATS_TEST_TMPDIR/gh-calls"
-    run bash -c 'printf "2\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _connect_github --storage none
     assert_success
     local config_dir="$HOME/.config/remote-control-essence" source_hash cache_hash a_head b_head
     source_hash=$(_hash_file "$config_dir/source.json")
@@ -1751,14 +1775,14 @@ EOF
     a_head=$(git --git-dir="$REMOTE" rev-parse main)
     b_head=$(git --git-dir="$ALTERNATE_REMOTE" rev-parse main)
 
-    run bash -c 'printf "i\nc\n0\n0\n" | "$0"' "$APP/remote-control-essence.sh"
-    assert_success
-    assert_output --partial "Выбор аккаунта GitHub отменён."
+    _rc source github-change-account
+    [ "$status" -eq 2 ]
+    assert_output --partial "--login"
     [[ "$(_hash_file "$config_dir/source.json")" == "$source_hash" ]] || return 1
     : > "$GH_CALLS_FILE"
-    run env GH_TOKEN_UNAVAILABLE_LOGIN=alternate-owner GH_MODE=web-fail \
-        bash -c 'printf "i\nC\n2\nalternate-owner\n0\n" | "$0"' "$APP/remote-control-essence.sh"
-    assert_success
+    GH_TOKEN_UNAVAILABLE_LOGIN=alternate-owner GH_MODE=web-fail \
+        _rc source github-change-account --login alternate-owner
+    [ "$status" -eq 2 ]
     [[ "$(_hash_file "$config_dir/source.json")" == "$source_hash" ]] || return 1
     [[ "$(_hash_file "$config_dir/github-runtime/config.json")" == "$cache_hash" ]] || return 1
     [[ "$(git --git-dir="$REMOTE" rev-parse main)" == "$a_head" ]] || return 1
@@ -1773,7 +1797,7 @@ EOF
 @test "cancel after opening B restores A session for same-process fetch" {
     _prepare_alternate_remote
     export GH_CALLS_FILE="$BATS_TEST_TMPDIR/gh-calls"
-    run bash -c 'printf "2\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _connect_github --storage none
     assert_success
     local source="$HOME/.config/remote-control-essence/source.json" a_head b_head
     local seed="$BATS_TEST_TMPDIR/alternate-seed"
@@ -1784,9 +1808,13 @@ EOF
     a_head=$(git --git-dir="$REMOTE" rev-parse main)
     b_head=$(git --git-dir="$ALTERNATE_REMOTE" rev-parse main)
 
-    run bash -c 'printf "i\nC\n2\nalternate-owner\nN\nF\n0\n" | "$0"' \
-        "$APP/remote-control-essence.sh"
+    _serve_requests '["session","open"]' \
+        '["source","github-change-account","--login","alternate-owner"]' \
+        '["source","github-fetch"]'
     assert_success
+    printf '%s\n' "$output" | jq -se 'any(.[]; .id == 2 and .error.code == "target_replace_required" and
+        .error.tracked_files == 1)' >/dev/null || return 1
+    printf '%s\n' "$output" | jq -se 'any(.[]; .id == 3 and .ok)' >/dev/null || return 1
     assert_output --partial "Конфигурация загружена из GitHub."
     jq -e '.repo == "test-owner/essence-remote-control-config"' "$source" || return 1
     [[ "$(git --git-dir="$REMOTE" rev-parse main)" == "$a_head" ]] || return 1
@@ -1796,7 +1824,7 @@ EOF
 @test "rejected B push suspends the switch and same-process fetch rolls back to A" {
     _prepare_alternate_remote
     export GH_CALLS_FILE="$BATS_TEST_TMPDIR/gh-calls"
-    run bash -c 'printf "2\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _connect_github --storage none
     assert_success
     local config_dir="$HOME/.config/remote-control-essence" a_head b_head
     a_head=$(git --git-dir="$REMOTE" rev-parse main)
@@ -1804,12 +1832,14 @@ EOF
     printf '#!/bin/sh\nexit 1\n' > "$ALTERNATE_REMOTE/hooks/pre-receive"
     chmod +x "$ALTERNATE_REMOTE/hooks/pre-receive"
 
-    run bash -c 'printf "i\nC\n2\nalternate-owner\ny\n2\nP\nF\n0\n" | "$0"' \
-        "$APP/remote-control-essence.sh"
+    _serve_requests '["session","open"]' \
+        '["source","github-change-account","--login","alternate-owner","--storage","none","--yes"]' \
+        '["source","github-push"]' '["source","github-fetch"]'
     assert_success
+    printf '%s\n' "$output" | jq -se 'any(.[]; .id == 3 and .ok == false)' >/dev/null || return 1
+    printf '%s\n' "$output" | jq -se 'any(.[]; .id == 4 and .ok)' >/dev/null || return 1
     assert_output --partial "Результат отправки в новый репозиторий не подтверждён."
     assert_output --partial "Не удалось отправить конфигурацию в GitHub"
-    refute_output --partial "Локальная конфигурация отправлена в GitHub."
     assert_output --partial "Конфигурация загружена из GitHub."
     jq -e '.repo == "test-owner/essence-remote-control-config"' "$config_dir/source.json" || return 1
     [[ "$(git --git-dir="$config_dir/github-store.git" config --get remote.origin.url)" == \
@@ -1822,7 +1852,7 @@ EOF
 @test "missing A profile and token never selects global B or writes either repository" {
     _prepare_alternate_remote
     export GH_CALLS_FILE="$BATS_TEST_TMPDIR/gh-calls"
-    run bash -c 'printf "2\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _connect_github --storage none
     assert_success
     local config_dir="$HOME/.config/remote-control-essence" source_hash cache_hash a_head b_head
     source_hash=$(_hash_file "$config_dir/source.json")
@@ -1833,8 +1863,7 @@ EOF
     printf 'alternate-owner\n' > "$GH_ACTIVE_LOGIN_FILE"
     : > "$GH_CALLS_FILE"
 
-    run env GH_TOKEN_UNAVAILABLE_LOGIN=test-owner bash -c 'printf "0\n" | "$0"' \
-        "$APP/remote-control-essence.sh"
+    GH_TOKEN_UNAVAILABLE_LOGIN=test-owner _rc session open
     assert_failure
     assert_output --partial "GH_CONFIG_DIR=$config_dir/credentials/gh/test-owner gh auth login --hostname github.com --web"
     [[ "$(_hash_file "$config_dir/source.json")" == "$source_hash" ]] || return 1
@@ -1850,7 +1879,7 @@ EOF
 @test "startup imports only saved A token when global gh points to B" {
     export GH_CALLS_FILE="$BATS_TEST_TMPDIR/gh-calls"
     export GH_SCOPE_CALLS_FILE="$BATS_TEST_TMPDIR/gh-scopes"
-    run bash -c 'printf "2\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _connect_github --storage none
     assert_success
     local config_dir="$HOME/.config/remote-control-essence" source_hash
     source_hash=$(_hash_file "$config_dir/source.json")
@@ -1859,7 +1888,7 @@ EOF
     : > "$GH_CALLS_FILE"
     : > "$GH_SCOPE_CALLS_FILE"
 
-    run bash -c 'printf "0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc session open
     assert_success
     [[ "$(_hash_file "$config_dir/source.json")" == "$source_hash" ]] || return 1
     [[ "$(sed -n 's/^user: //p' "$config_dir/credentials/gh/test-owner/hosts.yml")" == test-owner ]] || return 1
@@ -1871,11 +1900,13 @@ EOF
     _assert_no_global_auth_mutation alternate-owner
 }
 
-@test "interactive selection permits isolated web authorization when targeted token is absent" {
+@test "web login permits isolated authorization when targeted token is absent" {
     export GH_CALLS_FILE="$BATS_TEST_TMPDIR/gh-calls"
     export GH_SCOPE_CALLS_FILE="$BATS_TEST_TMPDIR/gh-scopes"
-    run env GH_TOKEN_UNAVAILABLE_LOGIN=test-owner GH_WEB_LOGIN=test-owner \
-        bash -c 'printf "2\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    GH_TOKEN_UNAVAILABLE_LOGIN=test-owner GH_WEB_LOGIN=test-owner \
+        _rc source github-login --login test-owner
+    assert_success
+    GH_TOKEN_UNAVAILABLE_LOGIN=test-owner _connect_github --storage none
     assert_success
     local config_dir="$HOME/.config/remote-control-essence"
     jq -e '.repo == "test-owner/essence-remote-control-config"' "$config_dir/source.json"
@@ -1886,23 +1917,17 @@ EOF
     _assert_no_global_auth_mutation
 }
 
-@test "account picker frames invalid and empty input, and 0 or EOF cancels" {
+@test "GitHub connect requires a valid login before any repository call" {
     export GH_CALLS_FILE="$BATS_TEST_TMPDIR/gh-calls"
-    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source init-local
     assert_success
-    run bash -c 'printf "i\nbogus\n\n2\nbad/login\n0\n0\n" | "$0"' "$APP/remote-control-essence.sh"
-    assert_success
-    assert_output --partial "Выбор аккаунта GitHub"
-    assert_output --partial "Неверный выбор."
-    assert_output --partial "Неверный логин GitHub."
-    [[ "$output" == *"╔"* && "$output" == *"╠"* && "$output" == *"╚"* ]] || return 1
+    _rc source github-connect --storage none
+    [ "$status" -eq 2 ]
+    assert_output --partial "--login"
+    _rc source github-connect --login bad/login --storage none
+    [ "$status" -eq 2 ]
+    assert_output --partial "Некорректный логин GitHub"
     [[ ! -e "$HOME/.config/remote-control-essence/source.json" ]] || return 1
-    run bash -c 'printf "i\n" | "$0"' "$APP/remote-control-essence.sh"
-    assert_success
-    assert_output --partial "Выбор аккаунта GitHub отменён."
-    run bash -c 'printf "i\n2\n0\n0\n" | "$0"' "$APP/remote-control-essence.sh"
-    assert_success
-    assert_output --partial "Выбор аккаунта GitHub отменён."
     ! grep -q '^repo ' "$GH_CALLS_FILE" || return 1
     _assert_no_global_auth_mutation
 }
@@ -1970,12 +1995,12 @@ _portable_get_runtime_password() (
 _portable_prepare_two_devices() {
     _portable_install_device_wrappers || return 1
     export PORTABLE_HOME_A="$HOME"
-    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source init-local
     assert_success
     _portable_seed_local_passwords || return 1
     local original="$HOME/.config/remote-control-essence/secrets.json" original_hash
     original_hash=$(_hash_file "$original")
-    run bash -c 'printf "i\n1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _connect_github --storage none
     assert_success
     [[ "$output" != *synthetic-portable* && "$output" != *bad-device-a-ciphertext* ]] || return 1
     [[ "$(_hash_file "$original")" == "$original_hash" ]] || return 1
@@ -1985,9 +2010,9 @@ _portable_prepare_two_devices() {
     jq -e '.vault_version==2 and .portability=={status:"needs_setup",issues:[{node_id:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",reason:"missing_secret"}]}' "$BATS_TEST_TMPDIR/published-manifest.json" || return 1
     export HOME="$BATS_TEST_TMPDIR/device-b-home" TEST_MACHINE_ID=22222222222222222222222222222222
     mkdir -p "$HOME"
-    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source init-local
     assert_success
-    run bash -c 'printf "i\n1\n1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _connect_github --existing remote
     assert_success
     export PORTABLE_CONFIG="$HOME/.config/remote-control-essence"
     export PORTABLE_RUNTIME="$PORTABLE_CONFIG/github-runtime"
@@ -2005,7 +2030,8 @@ _portable_prepare_two_devices() {
     local config_hash before_temps
     config_hash=$(_hash_file "$PORTABLE_RUNTIME/config.json")
     before_temps=$(_materialization_temp_inventory "$PORTABLE_CONFIG")
-    run bash -c 'printf "2\nY\nsynthetic-repaired-b\n0\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    run bash -c 'printf "%s\n" "$1" | "$0" node password --name portable-b --password-stdin' \
+        "$APP/remote-control-essence.sh" synthetic-repaired-b
     assert_success
     [[ "$output" != *synthetic-repaired-b* && "$output" != *synthetic-portable-a* ]] || return 1
     [[ "$(_hash_file "$PORTABLE_RUNTIME/config.json")" == "$config_hash" ]] || return 1
@@ -2014,7 +2040,7 @@ _portable_prepare_two_devices() {
     [[ "$(_materialization_temp_inventory "$PORTABLE_CONFIG")" == "$before_temps" ]] || return 1
     [[ ! -s "$PORTABLE_SSH_LOG" ]] || return 1
     export HOME="$PORTABLE_HOME_A" TEST_MACHINE_ID=11111111111111111111111111111111
-    run bash -c 'printf "0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc session open
     assert_success
     local runtime="$HOME/.config/remote-control-essence/github-runtime"
     [[ "$(_portable_get_runtime_password "$runtime" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)" == synthetic-portable-a ]] || return 1
@@ -2023,18 +2049,22 @@ _portable_prepare_two_devices() {
     [[ ! -s "$PORTABLE_SSH_LOG" ]]
 }
 
-@test "portable password actual entrypoint cancellation EOF and empty input preserve local secrets" {
+@test "portable password actual entrypoint empty or absent password input preserves local secrets" {
     _portable_prepare_two_devices || return 1
     _portable_reopen_local || return 1
     local root="$PORTABLE_CONFIG" before input
     before="$(_hash_file "$root/secrets.json") $(_hash_file "$root/manifest.json") $(_hash_file "$root/config.json")"
-    for input in $'2\nN\n0\n' $'2\nY\n\n0\n' $'2\n' $'2\nY\n'; do
-        run bash -c 'printf "%s" "$1" | "$0"' "$APP/remote-control-essence.sh" "$input"
-        assert_success
+    for input in '' $'\n' $'\r\n'; do
+        run bash -c 'printf "%s" "$1" | "$0" node password --name portable-b --password-stdin' \
+            "$APP/remote-control-essence.sh" "$input"
+        [ "$status" -eq 2 ]
         [[ "$(_hash_file "$root/secrets.json") $(_hash_file "$root/manifest.json") $(_hash_file "$root/config.json")" == "$before" ]] || return 1
         [[ ! -s "$PORTABLE_SSH_LOG" ]] || return 1
     done
-    run bash -c 'printf "0\n" | "$0"' "$APP/remote-control-essence.sh"
+    run bash -c '"$0" node password --name portable-b < /dev/null' "$APP/remote-control-essence.sh"
+    [ "$status" -eq 2 ]
+    [[ "$(_hash_file "$root/secrets.json") $(_hash_file "$root/manifest.json") $(_hash_file "$root/config.json")" == "$before" ]] || return 1
+    _rc session open
     assert_success
     [[ "$(_portable_get_runtime_password "$root" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)" == synthetic-portable-a ]] || return 1
     run _portable_get_runtime_password "$root" bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
@@ -2057,8 +2087,9 @@ fi
 exec "$PORTABLE_REAL_MV" "$@"
 EOF
     chmod +x "$BIN/mv"
-    run bash -c 'printf "2\nY\nsynthetic-write-failure\n0\n" | "$0"' "$APP/remote-control-essence.sh"
-    assert_success
+    run bash -c 'printf "%s\n" "$1" | "$0" node password --name portable-b --password-stdin' \
+        "$APP/remote-control-essence.sh" synthetic-write-failure
+    [ "$status" -eq 1 ]
     [[ -f "$PORTABLE_WRITE_FAULT" ]] || return 1
     [[ "$output" != *synthetic-write-failure* ]] || return 1
     [[ "$(_hash_file "$root/secrets.json") $(_hash_file "$root/manifest.json")" == "$before" ]] || return 1
@@ -2081,7 +2112,7 @@ EOF
     git -C "$updater" push origin main >/dev/null || return 1
     local main_before
     main_before=$(git --git-dir="$REMOTE" rev-parse main)
-    run bash -c 'printf "0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc session open
     assert_failure
     [[ "$(git --git-dir="$REMOTE" rev-parse main)" == "$main_before" ]] || return 1
     [[ "$(_runtime_fingerprint "$PORTABLE_RUNTIME")" == "$before" ]] || return 1
@@ -2115,11 +2146,13 @@ _portable_use_device_a() {
     _portable_prepare_two_devices || return 1
     _portable_publish_v1 || return 1
     _portable_use_device_a
-    run bash -c 'printf "1\ny\n0\n" | "$0"' "$APP/remote-control-essence.sh"
-    assert_success
-    [[ "$output" != *Повторить* && "$output" != *synthetic-portable* ]] || return 1
+    _rc source github-migrate-format
+    [ "$status" -eq 2 ]
     assert_output --partial "будут храниться в GitHub без шифрования"
     assert_output --partial "навсегда останутся в истории Git."
+    _rc source github-migrate-format --yes
+    assert_success
+    [[ "$output" != *synthetic-portable* ]] || return 1
     git --git-dir="$REMOTE" show main:manifest.json > "$BATS_TEST_TMPDIR/m.json" || return 1
     jq -e '.vault_version==2 and .minimum_remote_control_version=="1.1.0" and
         .portability.issues==[{node_id:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",reason:"missing_secret"}]' "$BATS_TEST_TMPDIR/m.json" || return 1
@@ -2128,6 +2161,8 @@ _portable_use_device_a() {
     git --git-dir="$REMOTE" merge-base --is-ancestor "$PORTABLE_V1_COMMIT" main || return 1
     [[ "$(git --git-dir="$REMOTE" rev-parse main)" != "$PORTABLE_V1_COMMIT" ]] || return 1
     [[ "$(_portable_get_runtime_password "$HOME/.config/remote-control-essence/github-runtime" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)" == synthetic-portable-a ]] || return 1
+    # The plaintext logical snapshot is not kept next to the runtime (S-M11).
+    [[ ! -e "$HOME/.config/remote-control-essence/runtime-vault.json" ]] || return 1
     [[ ! -s "$PORTABLE_SSH_LOG" ]]
 }
 
@@ -2140,12 +2175,16 @@ _portable_use_device_a() {
     jq 'del(.access)' "$root/manifest.json" > "$root/manifest.next" &&
         mv "$root/manifest.next" "$root/manifest.json" || return 1
     local_before="$(_hash_file "$root/config.json") $(_hash_file "$root/manifest.json") $(_hash_file "$root/secrets.json") $(_hash_file "$root/ssh/known_hosts")"
-    for input in $'1\nn\n0\n' $'1\n\n0\n' $'2\n\n0\n' $'2\nn\n0\n' $'0\n' ''; do
-        run bash -c 'printf "%s" "$1" | "$0"' "$APP/remote-control-essence.sh" "$input"
+    for input in migrate replace status; do
+        case "$input" in
+            migrate) _rc source github-migrate-format ;;
+            replace) _rc source github-replace-with-local ;;
+            status) _rc status ;;
+        esac
         assert_failure
         case "$input" in
-            1*) assert_output --partial "Преобразование конфигурации GitHub" ;;
-            2*) assert_output --partial "Замена конфигурации GitHub" ;;
+            migrate) assert_output --partial "Преобразование конфигурации GitHub" ;;
+            replace) assert_output --partial "Замена конфигурации GitHub" ;;
         esac
         [[ "$(git --git-dir="$REMOTE" rev-parse main)" == "$PORTABLE_V1_COMMIT" ]] || return 1
         [[ "$(_hash_file "$root/config.json") $(_hash_file "$root/manifest.json") $(_hash_file "$root/secrets.json") $(_hash_file "$root/ssh/known_hosts")" == "$local_before" ]] || return 1
@@ -2157,10 +2196,13 @@ _portable_use_device_a() {
     git -C "$updater" push origin main >/dev/null 2>&1 || return 1
     local newer
     newer=$(git --git-dir="$REMOTE" rev-parse main)
-    run bash -c 'printf "1\n2\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc status
     assert_failure
-    assert_output --partial "Требуется Remote Control 9.9.9"
-    [[ "$output" != *"Преобразовать и опубликовать"* && "$output" != *"Заменить GitHub"* ]] || return 1
+    assert_output --partial "Remote Control 9.9.9"
+    _rc source github-migrate-format --yes
+    assert_failure
+    _rc source github-replace-with-local --yes
+    assert_failure
     [[ "$(git --git-dir="$REMOTE" rev-parse main)" == "$newer" ]] || return 1
     [[ ! -s "$PORTABLE_SSH_LOG" ]]
 }
@@ -2168,13 +2210,15 @@ _portable_use_device_a() {
 @test "format recovery on another device marks foreign passwords as missing" {
     _portable_prepare_two_devices || return 1
     _portable_publish_v1 || return 1
-    run bash -c 'printf "1\ny\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source github-migrate-format
+    [ "$status" -eq 2 ]
+    assert_output --partial "Потребуется повторный ввод пароля: portable-a, portable-b"
+    _rc source github-migrate-format --yes
     assert_success
     git --git-dir="$REMOTE" show main:manifest.json > "$BATS_TEST_TMPDIR/m.json" || return 1
     jq -e '.vault_version==2 and .portability.status=="needs_setup" and
         (.portability.issues|map(select(.reason=="missing_secret").node_id)|sort)==
         ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]' "$BATS_TEST_TMPDIR/m.json" || return 1
-    assert_output --partial "Потребуется повторный ввод пароля: portable-a, portable-b"
     [[ ! -s "$PORTABLE_SSH_LOG" ]]
 }
 
@@ -2183,10 +2227,12 @@ _portable_use_device_a() {
     _portable_publish_v1 || return 1
     _portable_use_device_a
     local local_config="$HOME/.config/remote-control-essence/config.json"
-    run bash -c 'printf "2\ny\n0\n" | "$0"' "$APP/remote-control-essence.sh"
-    assert_success
+    _rc source github-replace-with-local
+    [ "$status" -eq 2 ]
     assert_output --partial "будут храниться в GitHub без шифрования"
     assert_output --partial "навсегда останутся в истории Git."
+    _rc source github-replace-with-local --yes
+    assert_success
     git --git-dir="$REMOTE" show main:config.json > "$BATS_TEST_TMPDIR/c.json" || return 1
     cmp -s <(jq -S . "$BATS_TEST_TMPDIR/c.json") <(jq -S . "$local_config") || return 1
     git --git-dir="$REMOTE" show main:manifest.json | jq -e '.vault_version==2' >/dev/null || return 1
@@ -2194,19 +2240,20 @@ _portable_use_device_a() {
     [[ ! -s "$PORTABLE_SSH_LOG" ]]
 }
 
-@test "GitHub menu o replaces remote config with the device-only configuration" {
+@test "source github-replace-with-local replaces remote config with the device-only configuration" {
     _portable_prepare_two_devices || return 1
     local before local_config="$HOME/.config/remote-control-essence/config.json"
     before=$(git --git-dir="$REMOTE" rev-parse main)
-    run bash -c 'printf "i\nO\n\n0\n0\n" | "$0"' "$APP/remote-control-essence.sh"
-    assert_success
-    [[ "$(git --git-dir="$REMOTE" rev-parse main)" == "$before" ]] || return 1
-    run bash -c 'printf "i\no\ny\n0\n0\n" | "$0"' "$APP/remote-control-essence.sh"
-    assert_success
+    _rc source github-replace-with-local
+    [ "$status" -eq 2 ]
     assert_output --partial "Локальная конфигурация пуста."
+    [[ "$(git --git-dir="$REMOTE" rev-parse main)" == "$before" ]] || return 1
+    _rc source github-replace-with-local --yes
+    assert_success
     git --git-dir="$REMOTE" show main:config.json > "$BATS_TEST_TMPDIR/c.json" || return 1
     cmp -s <(jq -S . "$BATS_TEST_TMPDIR/c.json") <(jq -S . "$local_config") || return 1
     jq -e '.nodes==[]' "$HOME/.config/remote-control-essence/github-runtime/config.json" || return 1
+    [[ ! -e "$HOME/.config/remote-control-essence/runtime-vault.json" ]] || return 1
     [[ ! -s "$PORTABLE_SSH_LOG" ]]
 }
 
@@ -2215,11 +2262,13 @@ _portable_use_device_a() {
     _portable_publish_v1 || return 1
     export HOME="$BATS_TEST_TMPDIR/device-c-home" TEST_MACHINE_ID=33333333333333333333333333333333
     mkdir -p "$HOME"
-    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source init-local
     assert_success
-    run bash -c 'printf "i\n1\n1\ny\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _connect_github
+    [ "$status" -eq 2 ]
+    assert_output --partial "--existing migrate|local"
+    _connect_github --existing migrate
     assert_success
-    assert_output --partial "Преобразовать и загрузить конфигурацию из GitHub"
     git --git-dir="$REMOTE" show main:manifest.json | jq -e '.vault_version==2' >/dev/null || return 1
     git --git-dir="$REMOTE" merge-base --is-ancestor "$PORTABLE_V1_COMMIT" main || return 1
     jq -e '.type=="github"' "$HOME/.config/remote-control-essence/source.json" || return 1
@@ -2228,13 +2277,13 @@ _portable_use_device_a() {
 }
 
 @test "portable password actual entrypoint real age publishes partial state and imports on device B" {
-    command -v age >/dev/null || return 1
-    command -v age-keygen >/dev/null || return 1
+    _real_age_tools
     _portable_install_device_wrappers || return 1
-    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source init-local
     assert_success
     _portable_seed_local_passwords || return 1
-    _portable_entrypoint_tty $'i\n1\n1\nsynthetic-vault-pass\nsynthetic-vault-pass\n0\n'
+    _age_headless '{"new-vault-password":"synthetic-vault-pass"}' \
+        source github-connect --login test-owner --storage age --yes --secrets-stdin
     assert_success
     [[ "$output" != *synthetic-portable* && "$output" != *synthetic-vault-pass* ]] || return 1
     local files
@@ -2242,9 +2291,10 @@ _portable_use_device_a() {
     [[ "$files" == $'recipient.txt\nstate.json.age\nstorage.json\nunlock.age' ]] || return 1
     export HOME="$BATS_TEST_TMPDIR/age-device-b" TEST_MACHINE_ID=22222222222222222222222222222222
     mkdir -p "$HOME"
-    run bash -c 'printf "1\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source init-local
     assert_success
-    _portable_entrypoint_tty $'i\n1\nsynthetic-vault-pass\nn\n1\n0\n'
+    _age_headless '{"vault-password":"synthetic-vault-pass"}' \
+        source github-connect --login test-owner --existing remote --secrets-stdin
     assert_success
     local runtime="$HOME/.config/remote-control-essence/github-runtime"
     [[ "$(_portable_get_runtime_password "$runtime" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)" == synthetic-portable-a ]] || return 1
@@ -2276,8 +2326,9 @@ fi
 exec "$PORTABLE_REAL_MV" "$@"
 EOF
     chmod +x "$BIN/mv"
-    run bash -c 'printf "2\nY\nsynthetic-issue-failure\n0\n" | "$0"' "$APP/remote-control-essence.sh"
-    assert_success
+    run bash -c 'printf "%s\n" "$1" | "$0" node password --name portable-b --password-stdin' \
+        "$APP/remote-control-essence.sh" synthetic-issue-failure
+    [ "$status" -eq 1 ]
     [[ -e "$PORTABLE_SECRET_WRITTEN" && -e "$PORTABLE_ISSUE_FAULT" ]] || return 1
     [[ "$(_hash_file "$PORTABLE_CONFIG/secrets.json") $(_hash_file "$PORTABLE_CONFIG/manifest.json")" == "$before" ]] || return 1
     [[ "$output" != *synthetic-issue-failure* && ! -s "$PORTABLE_SSH_LOG" ]]
@@ -2290,7 +2341,8 @@ EOF
     jq '.portability.issues += [{node_id:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",reason:"missing_host_key"}]' "$PORTABLE_CONFIG/manifest.json" > "$BATS_TEST_TMPDIR/manifest.host-issue" &&
         mv "$BATS_TEST_TMPDIR/manifest.host-issue" "$PORTABLE_CONFIG/manifest.json" || return 1
     chmod 600 "$PORTABLE_CONFIG/manifest.json"
-    run bash -c 'printf "2\nY\nsynthetic-repaired-b\n0\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    run bash -c 'printf "%s\n" "$1" | "$0" node password --name portable-b --password-stdin' \
+        "$APP/remote-control-essence.sh" synthetic-repaired-b
     assert_success
     [[ "$(_portable_get_runtime_password "$PORTABLE_CONFIG" bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)" == synthetic-repaired-b ]] || return 1
     jq -e '.portability=={status:"needs_setup",issues:[{node_id:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",reason:"missing_host_key"}]}' "$PORTABLE_CONFIG/manifest.json" || return 1
@@ -2315,7 +2367,7 @@ fi
 exec "$BIN/openssl.normal" "$@"
 EOF
     chmod +x "$BIN/openssl"
-    run bash -c 'printf "0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc session open
     assert_failure
     [[ -e "$PORTABLE_ENCODE_FAULT" ]] || return 1
     [[ "$output" != *synthetic-portable* && "$output" != *partial-unpublishable* ]] || return 1
@@ -2325,7 +2377,7 @@ EOF
 }
 
 _portable_reopen_local() {
-    run bash -c 'printf "i\nE\n0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc source github-switch-local
     assert_success
     local secret_hash
     secret_hash=$(_hash_file "$PORTABLE_CONFIG/secrets.json") || return 1
@@ -2333,66 +2385,754 @@ _portable_reopen_local() {
     jq -S . "$PORTABLE_CONFIG/config.json" > "$BATS_TEST_TMPDIR/local-config-before.json"
     # Local startup checkpoints the imported manifest into its canonical key
     # order. Establish the local UI baseline after opening, not before startup.
-    run bash -c 'printf "0\n" | "$0"' "$APP/remote-control-essence.sh"
+    _rc session open
     assert_success
     [[ "$(_hash_file "$PORTABLE_CONFIG/secrets.json")" == "$secret_hash" ]] || return 1
     diff -u "$BATS_TEST_TMPDIR/local-manifest-before.json" <(jq -S . "$PORTABLE_CONFIG/manifest.json") || return 1
     diff -u "$BATS_TEST_TMPDIR/local-config-before.json" <(jq -S . "$PORTABLE_CONFIG/config.json") || return 1
 }
 
-_portable_entrypoint_tty() {
-    local commands="$1" driver="$BATS_TEST_TMPDIR/portable-tty.py"
-    cat > "$driver" <<'PY'
-import errno
-import os
-import pty
-import re
-import select
-import signal
-import sys
-import time
-
-read_fd, write_fd = os.pipe()
-pid, terminal = pty.fork()
-if pid == 0:
-    os.close(write_fd)
-    os.dup2(read_fd, 0)
-    os.close(read_fd)
-    os.execv(sys.argv[1], [sys.argv[1]])
-os.close(read_fd)
-os.write(write_fd, sys.argv[2].encode())
-os.close(write_fd)
-deadline = time.monotonic() + 90
-pending = b""
+# No controlling terminal: core age paths must never fall back to a prompt.
+_age_headless() {
+    local requests="$1"
+    shift
+    command -v python3 >/dev/null 2>&1 || skip "python3 нужен для headless integration"
+    run --separate-stderr python3 -c '
+import os, signal, subprocess, sys
+p = subprocess.Popen(sys.argv[1:], stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
 try:
-    while True:
-        if time.monotonic() > deadline:
-            os.killpg(pid, signal.SIGKILL)
-            raise RuntimeError("interactive age scenario timed out")
-        readable, _, _ = select.select([terminal], [], [], 0.2)
-        if not readable:
+    out, err = p.communicate(sys.stdin.buffer.read(), timeout=90)
+except subprocess.TimeoutExpired:
+    os.killpg(p.pid, signal.SIGKILL)
+    p.communicate()
+    raise
+sys.stdout.buffer.write(out)
+sys.stderr.buffer.write(err)
+sys.exit(p.returncode)
+' "$APP/remote-control-essence.sh" "$@" <<< "$requests"
+}
+
+_real_age_tools() {
+    local dir="${RC_TEST_AGE_DIR:-}" path version major minor patch
+    if [[ -z "$dir" ]]; then
+        path=$(command -v age) || skip "Нужен реальный age >=1.3.2 и batchpass"
+        dir=$(dirname "$path")
+    fi
+    [[ -x "$dir/age" && -x "$dir/age-keygen" && -x "$dir/age-plugin-batchpass" ]] ||
+        skip "Нужен реальный age >=1.3.2 и batchpass"
+    dir=$(cd "$dir" && pwd -P) || return 1
+    version=$("$dir/age" --version) || return 1
+    [[ "$version" =~ ^v?([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || return 1
+    major=${BASH_REMATCH[1]} minor=${BASH_REMATCH[2]} patch=${BASH_REMATCH[3]}
+    (( major > 1 || (major == 1 && (minor > 3 || (minor == 3 && patch >= 2))) )) ||
+        skip "Нужен реальный age >=1.3.2 и batchpass"
+    export AGE_BIN="$dir/age" AGE_KEYGEN_BIN="$dir/age-keygen"
+    export RC_TEST_REAL_AGE_DIR="$dir"
+}
+
+@test "CLI in plaintext GitHub mode pushes a mutation and honours the session lock" {
+    bats_require_minimum_version 1.5.0
+    _rc source init-local
+    assert_success
+    _connect_github --storage none
+    assert_success
+    local config_dir="$HOME/.config/remote-control-essence"
+
+    run --separate-stderr "$APP/remote-control-essence.sh" status --json < /dev/null
+    assert_success
+    jq -e '.ok and .data.source.type == "github" and (.sync | type == "string")' <<< "$output"
+
+    run --separate-stderr "$APP/remote-control-essence.sh" group add --name lab --json < /dev/null
+    assert_success
+    jq -e '.data.name == "LAB"' <<< "$output"
+    git --git-dir="$REMOTE" show main:config.json | jq -e 'any(.groups[]; .name == "LAB")'
+    [ ! -e "$config_dir/.rc-lock" ]
+
+    sleep 60 &
+    local holder=$!
+    mkdir "$config_dir/.rc-lock"
+    printf 'pid=%s\nkind=session\nlabel=github-session\n' "$holder" > "$config_dir/.rc-lock/owner"
+    local start=$SECONDS
+    run --separate-stderr "$APP/remote-control-essence.sh" status --json < /dev/null
+    kill "$holder" 2>/dev/null || true
+    [ "$status" -eq 1 ]
+    [ "$(jq -r '.error.code' <<< "$output")" = locked ]
+    (( SECONDS - start < 10 ))
+}
+
+@test "CLI unlocks the age vault only from RC_VAULT_PASSWORD" {
+    bats_require_minimum_version 1.5.0
+    git --git-dir="$REMOTE" update-ref -d refs/heads/main
+    _install_fake_age
+    _rc source init-local
+    assert_success
+    _rc_secrets '{"new-vault-password":"access-pass"}' \
+        source github-connect --login test-owner --storage age
+    assert_success
+
+    run --separate-stderr "$APP/remote-control-essence.sh" status --json < /dev/null
+    [ "$status" -eq 2 ]
+    [ "$(jq -r '.error.code' <<< "$output")" = vault_password_required ]
+
+    RC_VAULT_PASSWORD=wrong-pass run --separate-stderr \
+        "$APP/remote-control-essence.sh" status --json < /dev/null
+    [ "$status" -eq 1 ]
+    [ "$(jq -r '.error.code' <<< "$output")" = vault_password_invalid ]
+
+    RC_VAULT_PASSWORD=access-pass run --separate-stderr \
+        "$APP/remote-control-essence.sh" status --json < /dev/null
+    assert_success
+    jq -e '.ok and .data.source.type == "github"' <<< "$output"
+
+    # Через serve пароль приходит только полем secrets запроса session open.
+    run --separate-stderr bash -c 'printf "%s\n" "{\"id\":1,\"argv\":[\"status\"]}" \
+        "{\"id\":2,\"argv\":[\"session\",\"open\"]}" \
+        "{\"id\":3,\"argv\":[\"session\",\"open\"],\"secrets\":{\"vault-password\":\"access-pass\"}}" \
+        "{\"id\":4,\"argv\":[\"status\"]}" | RC_VAULT_PASSWORD=access-pass "$0" serve' \
+        "$APP/remote-control-essence.sh"
+    assert_success
+    [[ "$output$stderr" != *access-pass* ]]
+    printf '%s\n' "$output" | jq -se 'any(.[]; .id == 1 and .error.code == "session_closed")' >/dev/null
+    printf '%s\n' "$output" | jq -se 'any(.[]; .id == 2 and .error.code == "vault_password_required")' >/dev/null
+    printf '%s\n' "$output" | jq -se 'any(.[]; .id == 3 and .ok and .data.source == "github")' >/dev/null
+    printf '%s\n' "$output" | jq -se 'any(.[]; .id == 4 and .ok and .data.source.type == "github")' >/dev/null
+}
+
+# Файлы каталога конфигурации (без него самого), по одному на строку.
+_config_tree() {
+    local dir="$HOME/.config/remote-control-essence"
+    [[ -d "$dir" ]] || return 0
+    (cd "$dir" && find . -mindepth 1 | LC_ALL=C sort)
+}
+
+@test "refused first GitHub connect leaves no configuration and keeps first run" {
+    local config_dir="$HOME/.config/remote-control-essence"
+
+    GH_MODE=missing _connect_github --json
+    [ "$status" -eq 2 ]
+    [ "$(jq -r '.error.code' <<< "$output")" = repo_create_required ]
+    [[ ! -e "$config_dir" ]] || return 1
+    _rc session status --json
+    [ "$(jq -c '.data | [.configured,.open,.authorized]' <<< "$output")" = '[false,false,false]' ]
+
+    _connect_github --json
+    [ "$status" -eq 2 ]
+    [ "$(jq -r '.error.code' <<< "$output")" = storage_mode_required ]
+    [[ ! -e "$config_dir" ]] || return 1
+    _rc session status --json
+    [ "$(jq -r '.data.configured' <<< "$output")" = false ]
+
+    # Профиль входа, созданный до подключения, остаётся; удаляется только новое.
+    _rc source github-login --login test-owner
+    assert_success
+    local before
+    before=$(_config_tree)
+    [[ "$before" == *"./credentials/gh/test-owner/hosts.yml"* ]] || return 1
+    GH_MODE=missing _connect_github --json
+    [ "$(jq -r '.error.code' <<< "$output")" = repo_create_required ]
+    [ "$(_config_tree)" = "$before" ]
+    _rc session status --json
+    [ "$(jq -r '.data.configured' <<< "$output")" = false ]
+}
+
+@test "failed source init-local removes only the files it created" {
+    local config_dir="$HOME/.config/remote-control-essence"
+    mkdir -p "$config_dir"
+    printf 'not json\n' > "$config_dir/manifest.json"
+
+    _rc source init-local --json
+    [ "$status" -ne 0 ]
+    [ "$(_config_tree)" = "./manifest.json" ]
+    [ "$(cat "$config_dir/manifest.json")" = "not json" ]
+    _rc session status --json
+    [ "$(jq -r '.data.configured' <<< "$output")" = false ]
+}
+
+@test "first GitHub connect retries in one serve process after repo_create_required" {
+    export GH_MODE=reconnect GH_REPO_STATE_FILE="$BATS_TEST_TMPDIR/repo-created"
+    export GH_CREATE_COUNT_FILE="$BATS_TEST_TMPDIR/repo-create-count"
+    printf '0\n' > "$GH_CREATE_COUNT_FILE"
+
+    _serve_requests '["source","github-connect","--login","test-owner"]' \
+        '["session","status"]' \
+        '["source","github-connect","--login","test-owner","--create-repo","--storage","none","--yes"]' \
+        '["session","status"]'
+    assert_success
+    printf '%s\n' "$output" | jq -se 'any(.[]; .id == 1 and .error.code == "repo_create_required")' >/dev/null || return 1
+    printf '%s\n' "$output" | jq -se 'any(.[]; .id == 2 and .data.configured == false and .data.open == false)' >/dev/null || return 1
+    printf '%s\n' "$output" | jq -se 'any(.[]; .id == 3 and .ok and .data.storage == "none")' >/dev/null || return 1
+    printf '%s\n' "$output" | jq -se 'any(.[]; .id == 4 and .data.configured and .data.source == "github" and .data.open)' >/dev/null || return 1
+    [ "$(cat "$GH_CREATE_COUNT_FILE")" = 1 ]
+    jq -e '.type == "github"' "$HOME/.config/remote-control-essence/source.json"
+}
+
+# ─── security round 1: github (S-M9) ────────────────────────────────────────
+
+# _rc_json ARGV… — разовая команда с --json; конверт в output, журнал отдельно.
+_rc_json() {
+    bats_require_minimum_version 1.5.0
+    run --separate-stderr "$APP/remote-control-essence.sh" "$@" --json < /dev/null
+}
+
+@test "refused first connect plan never creates the missing repository" {
+    export GH_MODE=missing GH_CALLS_FILE="$BATS_TEST_TMPDIR/gh-calls"
+    export GH_CREATE_COUNT_FILE="$BATS_TEST_TMPDIR/gh-create-count"
+    printf '0\n' > "$GH_CREATE_COUNT_FILE"
+    local config_dir="$HOME/.config/remote-control-essence" token
+
+    _rc_json source github-connect --login test-owner --create-repo --storage none
+    [ "$(jq -r '.error.code' <<< "$output")" = confirmation_required ]
+    jq -e '.error.plan | index("Будет создан приватный репозиторий.") and
+        any(.[]; startswith("Пароли SSH и ключи будут храниться в GitHub без шифрования"))' <<< "$output"
+    [[ "$(cat "$GH_CREATE_COUNT_FILE")" == 0 ]] || return 1
+    [[ ! -e "$config_dir" ]] || return 1
+
+    token=$(jq -r '.error.plan_token' <<< "$output")
+    _rc_json source github-connect --login test-owner --create-repo --storage none --yes --plan-token "$token"
+    [ "$(jq -r '.ok' <<< "$output")" = true ]
+    [[ "$(cat "$GH_CREATE_COUNT_FILE")" == 1 ]] || return 1
+    jq -e '.type == "github"' "$config_dir/source.json"
+}
+
+@test "change-account plans privatization and foreign-file removal before any write" {
+    _prepare_alternate_remote
+    export GH_CALLS_FILE="$BATS_TEST_TMPDIR/gh-calls"
+    _connect_github --storage none
+    assert_success
+    local seed="$BATS_TEST_TMPDIR/alternate-seed" config_dir="$HOME/.config/remote-control-essence"
+    local a_head b_head source_hash token
+    printf 'foreign\n' > "$seed/README.md"
+    git -C "$seed" add README.md && git -C "$seed" commit -qm foreign && git -C "$seed" push -q origin main || return 1
+    a_head=$(git --git-dir="$REMOTE" rev-parse main)
+    b_head=$(git --git-dir="$ALTERNATE_REMOTE" rev-parse main)
+    source_hash=$(_hash_file "$config_dir/source.json")
+    export GH_PUBLIC_REPO=alternate-owner/essence-remote-control-config
+    export GH_PRIVATE_MARKER="$BATS_TEST_TMPDIR/private-marker"
+
+    # Решения по-прежнему раньше плана.
+    _rc_json source github-change-account --login alternate-owner
+    [ "$(jq -r '.error.code' <<< "$output")" = repo_private_required ]
+    _rc_json source github-change-account --login alternate-owner --make-private
+    [ "$(jq -r '.error.code' <<< "$output")" = target_replace_required ]
+    _rc_json source github-change-account --login alternate-owner --make-private --replace-target
+    [ "$(jq -r '.error.code' <<< "$output")" = storage_mode_required ]
+
+    _rc_json source github-change-account --login alternate-owner --make-private --replace-target --storage none
+    [ "$(jq -r '.error.code' <<< "$output")" = confirmation_required ]
+    jq -e '.error.plan |
+        index("Публичный репозиторий станет приватным.") and
+        index("Из alternate-owner/essence-remote-control-config будут удалены все файлы (1); они останутся только в истории Git.") and
+        any(.[]; startswith("Пароли SSH и ключи будут храниться в GitHub без шифрования"))' <<< "$output"
+    ! grep -q '^repo edit ' "$GH_CALLS_FILE" || return 1
+    [[ ! -e "$GH_PRIVATE_MARKER" ]] || return 1
+    [[ "$(git --git-dir="$ALTERNATE_REMOTE" rev-parse main)" == "$b_head" ]] || return 1
+    [[ "$(git --git-dir="$REMOTE" rev-parse main)" == "$a_head" ]] || return 1
+    [[ "$(_hash_file "$config_dir/source.json")" == "$source_hash" ]] || return 1
+    [[ ! -e "$config_dir/account-switch" ]] || return 1
+
+    token=$(jq -r '.error.plan_token' <<< "$output")
+    _rc_json source github-change-account --login alternate-owner --make-private --replace-target \
+        --storage none --yes --plan-token "$token"
+    [ "$(jq -r '.ok' <<< "$output")" = true ]
+    [[ -e "$GH_PRIVATE_MARKER" ]] || return 1
+    [[ "$(git --git-dir="$ALTERNATE_REMOTE" ls-tree -r --name-only main)" != *README.md* ]] || return 1
+    git --git-dir="$ALTERNATE_REMOTE" show main:storage.json | jq -e '.encryption == "none"' >/dev/null
+    [[ "$(git --git-dir="$REMOTE" rev-parse main)" == "$a_head" ]] || return 1
+    jq -e '.repo == "alternate-owner/essence-remote-control-config"' "$config_dir/source.json"
+}
+
+# ─── round 2: github (connect, recovery, self) ──────────────────────────────
+
+# In-process core (cmd_helper) on the local $REMOTE of setup(); the GitHub CLI is
+# a function: the repository is private unless R2_PUBLIC=1 (until `repo edit`),
+# `api user` fails with R2_API_FAIL=1.
+_r2_core() {
+    load '../helpers/cmd_helper'
+    load_core
+    load '../helpers/mock_ssh'
+    BUILTIN_TEMPLATES_DIR="$PROJECT_ROOT/remote-control/templates"
+    _github_ensure_deps() { return 0; }
+    _github_prepare_account() { return 0; }
+    _github_gh() {
+        shift
+        case "$1 $2" in
+            "api user")
+                [[ "${R2_API_FAIL:-0}" != 1 ]] || { printf 'connection timed out\n'; return 1; }
+                printf 'test-owner\n' ;;
+            "repo view")
+                if [[ "${R2_PUBLIC:-0}" == 1 && ! -e "$BATS_TEST_TMPDIR/r2-privatized" ]]; then
+                    printf '{"visibility":"PUBLIC"}\n'
+                else
+                    printf '{"visibility":"PRIVATE"}\n'
+                fi ;;
+            "repo edit") touch "$BATS_TEST_TMPDIR/r2-privatized" ;;
+            *) return 1 ;;
+        esac
+    }
+    load_fixture_config
+    load_fixture_template
+    open_local_session || return 1
+    # Nodes would add SSH steps to the plan; these tests cover the source only.
+    jq_w '.nodes = [] | .connections = [] | .clients |= map(select(.name != "my-pc"))'
+}
+
+# Local files the connect rollback must return (config, manifest, auth, source).
+_r2_local_files() {
+    local f
+    for f in config.json manifest.json .auth source.json ssh/known_hosts; do
+        printf '%s %s\n' "$f" "$([[ -f "$CONFIG_DIR/$f" ]] && cksum < "$CONFIG_DIR/$f" || echo absent)"
+    done
+}
+
+_r2_connect() {
+    run_cmd source github-connect --login test-owner --storage none --yes "$@"
+    [ "$status" -eq 0 ] || { printf 'connect: %s\n' "$CMD_ENVELOPE"; return 1; }
+}
+
+@test "R2-L10: connect _required answers remove the cache paths they created" {
+    _r2_core
+    local before; before=$(_r2_local_files)
+    run_cmd source github-connect --login test-owner
+    [ "$(cmd_jq -r .error.code)" = storage_mode_required ]
+    [ ! -e "$CONFIG_DIR/github-store.git" ] && [ ! -e "$CONFIG_DIR/github-sessions" ]
+    [ ! -e "$CONFIG_DIR/credentials" ]
+    [ -z "$(find "$CONFIG_DIR" -maxdepth 1 -name '.github-enable.*')" ]
+    [ "$(_r2_local_files)" = "$before" ]
+}
+
+@test "R2-L10: connect _required restores the refs of an existing cache store" {
+    _r2_core
+    local store="$CONFIG_DIR/github-store.git" tree commit refs
+    git init -q --bare "$store"
+    git --git-dir="$store" remote add origin "https://example.invalid/old.git"
+    tree=$(printf '' | git --git-dir="$store" mktree)
+    commit=$(printf 'local only\n' | git -c user.name=t -c user.email=t@e.invalid --git-dir="$store" commit-tree "$tree")
+    git --git-dir="$store" update-ref refs/heads/main "$commit"
+    refs=$(git --git-dir="$store" for-each-ref --format='%(objectname) %(refname)')
+    run_cmd source github-connect --login test-owner
+    [ "$(cmd_jq -r .error.code)" = storage_mode_required ]
+    [ "$(git --git-dir="$store" for-each-ref --format='%(objectname) %(refname)')" = "$refs" ]
+    [ "$(git --git-dir="$store" remote get-url origin)" = "https://example.invalid/old.git" ]
+}
+
+@test "R2-M11: connect failing after github_enable_local in a state_action step rolls back to local" {
+    _r2_core
+    local before; before=$(_r2_local_files)
+    eval "_r2_orig_checkpoint() $(declare -f github_config_checkpoint | tail -n +2)"
+    github_config_checkpoint() {
+        [[ $# -gt 0 ]] || { _github_record_error x "injected post checkpoint"; return 1; }
+        _r2_orig_checkpoint "$@"
+    }
+    run_cmd source github-connect --login test-owner --storage none --yes
+    [ "$status" -eq 1 ]
+    [ "$(cmd_jq -r .error.code)" = source_failed ]
+    [ "$CONFIG_SOURCE" = local ] && [ -z "$GITHUB_WORKTREE" ]
+    [ "$_RC_LOCK_DEPTH" = 0 ] && [ "$_RC_LOCK_SESSION" = 0 ] && [ ! -d "$CONFIG_DIR/.rc-lock" ]
+    [ "$RC_SESSION_OPEN" = 1 ] && [ "$RC_SESSION_AUTHORIZED" = 1 ]
+    [ "$(_r2_local_files)" = "$before" ]
+    [ ! -e "$CONFIG_DIR/github-runtime" ] && [ ! -e "$CONFIG_DIR/github-sessions" ]
+    run_cmd group list
+    [ "$status" -eq 0 ]
+}
+
+@test "R2-L13: connect to a public repository needs --make-private and privatizes after consent" {
+    _r2_core
+    R2_PUBLIC=1
+    run_cmd source github-connect --login test-owner --storage none
+    [ "$(cmd_jq -r .error.code)" = repo_private_required ]
+    [ "$(cmd_jq -r .error.repo)" = test-owner/essence-remote-control-config ]
+    run_cmd source github-connect --login test-owner --storage none --make-private
+    [ "$(cmd_jq -r .error.code)" = confirmation_required ]
+    cmd_jq -e '.error.plan | index("Публичный репозиторий станет приватным.")' >/dev/null
+    [ ! -e "$BATS_TEST_TMPDIR/r2-privatized" ]
+    run_cmd source github-connect --login test-owner --storage none --make-private --yes \
+        --plan-token "$(cmd_jq -r .error.plan_token)"
+    [ "$status" -eq 0 ]
+    [ -e "$BATS_TEST_TMPDIR/r2-privatized" ]
+}
+
+@test "R2-L13: connect --existing remote to a public repository privatizes only after consent" {
+    _r2_core
+    _r2_connect
+    run_cmd source github-switch-local
+    [ "$status" -eq 0 ]
+    R2_PUBLIC=1
+    run_cmd source github-connect --login test-owner --existing remote
+    [ "$(cmd_jq -r .error.code)" = repo_private_required ]
+    run_cmd source github-connect --login test-owner --existing remote --make-private
+    [ "$(cmd_jq -r .error.code)" = confirmation_required ]
+    cmd_jq -e '.error.plan | index("Публичный репозиторий станет приватным.")' >/dev/null
+    [ ! -e "$BATS_TEST_TMPDIR/r2-privatized" ]
+    run_cmd source github-connect --login test-owner --existing remote --make-private --yes \
+        --plan-token "$(cmd_jq -r .error.plan_token)"
+    [ "$status" -eq 0 ]
+    [ -e "$BATS_TEST_TMPDIR/r2-privatized" ]
+    [ "$CONFIG_SOURCE" = github ]
+}
+
+@test "R2-H8: replace-with-local rc 3 closes the session so stale state cannot overwrite the publication" {
+    _r2_core
+    _r2_connect
+    jq '.groups += [{"name":"LOCALONLY","template":"default.yaml"}]' "$CONFIG_DIR/config.json" \
+        > "$BATS_TEST_TMPDIR/r2-config" && cp "$BATS_TEST_TMPDIR/r2-config" "$CONFIG_DIR/config.json"
+    run_cmd source github-replace-with-local
+    local token; token=$(cmd_jq -r .error.plan_token)
+    eval "_r2_orig_materialize() $(declare -f _config_source_materialize_state | tail -n +2)"
+    _config_source_materialize_state() {
+        [[ -z "${R2_FAIL_MATERIALIZE:-}" ]] || { _github_record_error x "injected materialize"; return 1; }
+        _r2_orig_materialize "$@"
+    }
+    R2_FAIL_MATERIALIZE=1 run_cmd source github-replace-with-local --yes --plan-token "$token"
+    [ "$status" -eq 0 ]
+    [ "$(cmd_jq -c .data)" = '{"published":true,"refreshed":false}' ]
+    [ "$RC_SESSION_OPEN" = 0 ] && [ -z "$GITHUB_WORKTREE" ]
+    run_cmd group add --name AFTER
+    [ "$(cmd_jq -r .error.code)" = session_closed ]
+    git --git-dir="$REMOTE" show main:config.json | jq -e '.groups | map(.name) | index("LOCALONLY")'
+    run_cmd session open
+    [ "$status" -eq 0 ]
+    jq -e '.groups | map(.name) | index("LOCALONLY")' "$CONFIG_JSON"
+}
+
+@test "R2-L12: password-set failing after the .auth write restores the previous password" {
+    _r2_core
+    _r2_connect
+    eval "_r2_orig_checkpoint() $(declare -f github_config_checkpoint | tail -n +2)"
+    github_config_checkpoint() {
+        [[ $# -gt 0 ]] || { _github_record_error x "injected checkpoint"; return 1; }
+        _r2_orig_checkpoint "$@"
+    }
+    RC_REQUEST_SECRETS='{"password":"newpw"}'
+    run_cmd self password-set
+    [ "$status" -eq 1 ]
+    [ ! -e "$CONFIG_DIR/.auth" ]
+    jq -e '.access.script_password_hash == null' "$STATE_MANIFEST"
+    [ -z "$(find "$CONFIG_DIR" -maxdepth 1 -name '.auth.restore.*')" ]
+    github_config_checkpoint() { _r2_orig_checkpoint "$@"; }
+    RC_REQUEST_SECRETS='{"password":"newpw"}'
+    run_cmd self password-set
+    [ "$status" -eq 0 ]
+    local hash; hash=$(cat "$CONFIG_DIR/.auth")
+    github_config_checkpoint() {
+        [[ $# -gt 0 ]] || { _github_record_error x "injected checkpoint"; return 1; }
+        _r2_orig_checkpoint "$@"
+    }
+    RC_REQUEST_SECRETS='{"current-password":"newpw"}'
+    run_cmd self password-remove --yes
+    [ "$status" -eq 1 ]
+    [ "$(cat "$CONFIG_DIR/.auth")" = "$hash" ]
+}
+
+@test "R2-L15: uninstall --remove-data plan warns about changes not sent to GitHub" {
+    _r2_core
+    _r2_connect
+    _self_is_root() { return 0; }
+    run_cmd self uninstall --remove-data
+    ! cmd_jq -e '.error.plan | map(select(test("не отправленные в GitHub"))) | length > 0' >/dev/null
+    R2_API_FAIL=1 run_cmd group add --name LAB
+    [ "$GITHUB_SYNC_STATUS" = pending ]
+    run_cmd self uninstall --remove-data
+    [ "$(cmd_jq -r .error.code)" = confirmation_required ]
+    cmd_jq -e '.error.plan | index("Изменения, не отправленные в GitHub, будут потеряны: сначала выполните source github-push.")' >/dev/null
+}
+
+# Real core/serve with official age and batchpass. No crypto test doubles here.
+_real_age_spy() {
+    local tool dir="$BATS_TEST_TMPDIR/age-spy"
+    mkdir -p "$dir"
+    export RC_TEST_AGE_ARGV_LOG="$BATS_TEST_TMPDIR/age-argv"
+    export RC_TEST_AGE_ENV_LOG="$BATS_TEST_TMPDIR/age-environment"
+    for tool in age age-keygen age-plugin-batchpass; do
+        cat > "$dir/$tool" <<'EOF'
+#!/bin/bash
+printf '%s\0' "${0##*/}" "$@" >> "$RC_TEST_AGE_ARGV_LOG"
+env >> "$RC_TEST_AGE_ENV_LOG"
+if [[ "${0##*/}" == age && " $* " == *' -j batchpass '* && " $* " == *' -o '* ]]; then
+    [[ "${AGE_PASSPHRASE_FD:-}" == 9 && -z "${AGE_PASSPHRASE:-}" && -z "${AGEDEBUG:-}" ]] || exit 94
+    if IFS= read -r unexpected || [[ -n "$unexpected" ]]; then exit 95; fi
+fi
+exec "$RC_TEST_REAL_AGE_DIR/${0##*/}" "$@"
+EOF
+        chmod +x "$dir/$tool"
+    done
+    export AGE_BIN="$dir/age" AGE_KEYGEN_BIN="$dir/age-keygen"
+}
+
+_assert_real_age_secrets_hidden() {
+    local secret
+    for secret in "$@"; do
+        [[ "$output$stderr" != *"$secret"* ]] || return 1
+        ! grep -aFq -- "$secret" "$RC_TEST_AGE_ARGV_LOG" "$RC_TEST_AGE_ENV_LOG" || return 1
+    done
+}
+
+@test "real age headless core: init saved-key reopen fetch rewrap close and password reopen" {
+    _real_age_tools
+    _real_age_spy
+    _rc source init-local
+    assert_success
+    _age_headless '{"new-vault-password":"s-h3-old-sensitive"}' \
+        source github-connect --login test-owner --storage age --remember-key --yes --json --secrets-stdin
+    assert_success
+    local root="$HOME/.config/remote-control-essence" before_recipient
+    [ -f "$root/credentials/github-config.agekey" ]
+    [ "$(_file_mode "$root/credentials/github-config.agekey")" = 600 ]
+    before_recipient=$(git --git-dir="$REMOTE" show main:recipient.txt)
+    [ "$(git --git-dir="$REMOTE" ls-tree -r --name-only main)" = $'recipient.txt\nstate.json.age\nstorage.json\nunlock.age' ]
+
+    # A separate process proves the remembered native key, not a pending password.
+    _age_headless '{}' status --json
+    assert_success
+    jq -e '.ok and .data.source.type=="github"' <<< "$output"
+    # EOF closes each serve process and its session; there is no session-close verb.
+    _age_headless $'{"id":1,"argv":["session","open"]}\n{"id":2,"argv":["group","add","--name","AGE_REAL"]}\n{"id":3,"argv":["source","github-fetch"]}\n{"id":4,"argv":["source","github-rewrap-password"],"secrets":{"vault-password":"s-h3-old-sensitive","new-vault-password":"s-h3-new-sensitive"}}' serve
+    assert_success
+    jq -se '[.[] | select(has("ok"))] | length==4 and all(.ok)' <<< "$output" ||
+        { printf '%s\n' "$output"; return 1; }
+    _assert_real_age_secrets_hidden s-h3-old-sensitive s-h3-new-sensitive
+    _age_headless $'{"id":1,"argv":["session","open"]}\n{"id":2,"argv":["status"]}' serve
+    assert_success
+    jq -se '[.[] | select(has("ok"))] | length==2 and all(.ok)' <<< "$output"
+    jq -se 'any(.[]; .id==2 and .data.counts.groups==4)' <<< "$output"
+    _assert_real_age_secrets_hidden s-h3-old-sensitive s-h3-new-sensitive
+    [ "$(git --git-dir="$REMOTE" show main:recipient.txt)" = "$before_recipient" ]
+    [ ! -e "$root/.rc-lock" ]
+    rm "$root/credentials/github-config.agekey"
+
+    _age_headless '{"id":1,"argv":["session","open"],"secrets":{"vault-password":"s-h3-old-sensitive"}}' serve
+    assert_success
+    jq -se 'any(.[]; .id==1 and .error.code=="vault_password_invalid")' <<< "$output"
+    _age_headless $'{"id":1,"argv":["session","open"],"secrets":{"vault-password":"s-h3-new-sensitive"}}\n{"id":2,"argv":["source","github-fetch"]}\n{"id":3,"argv":["status"]}' serve
+    assert_success
+    jq -se '[.[] | select(has("ok"))] | length==3 and all(.ok)' <<< "$output" ||
+        { printf '%s\n' "$output"; return 1; }
+    _assert_real_age_secrets_hidden s-h3-old-sensitive s-h3-new-sensitive
+    _age_headless $'{"id":1,"argv":["session","open"],"secrets":{"vault-password":"s-h3-new-sensitive"}}\n{"id":2,"argv":["status"]}' serve
+    assert_success
+    jq -se '[.[] | select(has("ok"))] | length==2 and all(.ok)' <<< "$output"
+    jq -se 'any(.[]; .id==2 and .data.counts.groups==4)' <<< "$output"
+    _assert_real_age_secrets_hidden s-h3-old-sensitive s-h3-new-sensitive
+    [ ! -e "$root/credentials/github-config.agekey" ]
+    [ ! -e "$root/.rc-lock" ]
+    [ -z "$(find "$root" -name '.github-private.*' -o -name '.rewrap-*')" ]
+}
+
+# Only legacy artifact generation/decryption gets a tty: the application never does.
+_legacy_age_artifact() {
+    local secret="$1" mode="$2" input="$3" output_file="$4"
+    local legacy="${RC_TEST_OLD_AGE:-}"
+    [[ -n "$legacy" && -x "$legacy" ]] || skip "RC_TEST_OLD_AGE нужен для age 1.2.1 compatibility"
+    run --separate-stderr python3 -c '
+import os, pty, select, signal, sys, time
+password = sys.stdin.buffer.read().rstrip(b"\r\n")
+mode = sys.argv[2]
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv(sys.argv[1], [sys.argv[1], mode, "-o", sys.argv[4], sys.argv[3]])
+data = b""
+sent = 0
+limit = 2 if mode == "-p" else 1
+deadline = time.monotonic() + 30
+try:
+    while time.monotonic() < deadline:
+        if not select.select([fd], [], [], .1)[0]:
             continue
         try:
-            chunk = os.read(terminal, 65536)
-        except OSError as error:
-            if error.errno == errno.EIO:
-                break
-            raise
-        if not chunk:
+            part = os.read(fd, 65536)
+        except OSError:
             break
-        sys.stdout.buffer.write(chunk)
-        sys.stdout.buffer.flush()
-        pending = (pending + chunk)[-4096:]
-        # The app's stdin remains the scripted menu input. Only age's genuine
-        # controlling-terminal passphrase prompts are answered on this PTY.
-        if re.search(rb"(?:Enter|Confirm|Type) passphrase[^\r\n]*: *$", pending):
-            os.write(terminal, b"synthetic-vault-pass\n")
-            pending = b""
+        if not part:
+            break
+        data += part
+        if sent < limit and ((sent == 0 and b"Enter passphrase" in data) or
+                             (sent == 1 and b"Confirm passphrase" in data)):
+            os.write(fd, password + b"\r")
+            sent += 1
+    else:
+        os.killpg(pid, signal.SIGKILL)
+        raise RuntimeError("legacy age timed out")
 finally:
-    os.close(terminal)
+    os.close(fd)
 _, status = os.waitpid(pid, 0)
+assert password not in data, "legacy tty echoed its password"
 sys.exit(os.waitstatus_to_exitcode(status))
-PY
-    chmod 600 "$driver"
-    run python3 "$driver" "$APP/remote-control-essence.sh" "$commands"
+' "$legacy" "$mode" "$input" "$output_file" <<< "$secret"
+    assert_success
+}
+
+@test "real age headless core reads legacy age-p unlock and writes old-age-compatible rewrap" {
+    _real_age_tools
+    [[ -n "${RC_TEST_OLD_AGE:-}" && -x "$RC_TEST_OLD_AGE" ]] ||
+        skip "RC_TEST_OLD_AGE нужен для age 1.2.1 compatibility"
+    _real_age_spy
+    _rc source init-local
+    assert_success
+    _age_headless '{"new-vault-password":"s-h3-legacy-old"}' \
+        source github-connect --login test-owner --storage age --remember-key --yes --json --secrets-stdin
+    assert_success
+    local root="$HOME/.config/remote-control-essence" updater="$BATS_TEST_TMPDIR/legacy-updater"
+    cp "$root/credentials/github-config.agekey" "$BATS_TEST_TMPDIR/identity"
+    git --git-dir="$REMOTE" show main:unlock.age > "$BATS_TEST_TMPDIR/new.age"
+    _legacy_age_artifact s-h3-legacy-old -d "$BATS_TEST_TMPDIR/new.age" "$BATS_TEST_TMPDIR/old-reader.key"
+    cmp "$BATS_TEST_TMPDIR/identity" "$BATS_TEST_TMPDIR/old-reader.key"
+    _legacy_age_artifact s-h3-legacy-old -p "$BATS_TEST_TMPDIR/identity" "$BATS_TEST_TMPDIR/legacy.age"
+    git clone "$REMOTE" "$updater" >/dev/null
+    cp "$BATS_TEST_TMPDIR/legacy.age" "$updater/unlock.age"
+    git -C "$updater" -c user.name=test -c user.email=test@example.invalid commit -am legacy-unlock >/dev/null
+    git -C "$updater" push origin main >/dev/null
+    rm "$root/credentials/github-config.agekey"
+    _age_headless $'{"id":1,"argv":["session","open"],"secrets":{"vault-password":"s-h3-legacy-old"}}\n{"id":2,"argv":["status"]}\n{"id":3,"argv":["source","github-rewrap-password"],"secrets":{"vault-password":"s-h3-legacy-old","new-vault-password":"s-h3-legacy-new"}}' serve
+    assert_success
+    jq -se '[.[] | select(has("ok"))] | length==3 and all(.ok)' <<< "$output" ||
+        { printf '%s\n' "$output"; return 1; }
+    _assert_real_age_secrets_hidden s-h3-legacy-old s-h3-legacy-new
+    _age_headless $'{"id":1,"argv":["session","open"],"secrets":{"vault-password":"s-h3-legacy-new"}}\n{"id":2,"argv":["status"]}' serve
+    assert_success
+    jq -se '[.[] | select(has("ok"))] | length==2 and all(.ok)' <<< "$output" ||
+        { printf '%s\n' "$output"; return 1; }
+    _assert_real_age_secrets_hidden s-h3-legacy-old s-h3-legacy-new
+    git --git-dir="$REMOTE" show main:unlock.age > "$BATS_TEST_TMPDIR/rewrapped.age"
+    _legacy_age_artifact s-h3-legacy-new -d "$BATS_TEST_TMPDIR/rewrapped.age" "$BATS_TEST_TMPDIR/rewrapped.key"
+    cmp "$BATS_TEST_TMPDIR/identity" "$BATS_TEST_TMPDIR/rewrapped.key"
+}
+
+@test "real age dependency failure returns deps_missing without changing logical state" {
+    _real_age_tools
+    _forbid_age_package_installers
+    local bad="$BIN/unsupported-age" head root="$HOME/.config/remote-control-essence"
+    printf '#!/bin/bash\n[[ "$1" == --version ]] && { echo v1.2.1; exit 0; }; exit 99\n' > "$bad"
+    chmod +x "$bad"
+    export AGE_BIN="$bad"
+    head=$(git --git-dir="$REMOTE" rev-parse main)
+    _age_headless '{"new-vault-password":"s-h3-deps-secret"}' \
+        source github-connect --login test-owner --storage age --yes --json --secrets-stdin
+    [ "$status" -eq 1 ]
+    jq -e '.error.code=="deps_missing"' <<< "$output"
+    [ -z "$(_config_tree)" ]
+    [ "$(git --git-dir="$REMOTE" rev-parse main)" = "$head" ]
+    _age_headless '{}' session status --json
+    assert_success
+    jq -e '.data.configured==false' <<< "$output"
+    _rc source init-local
+    assert_success
+    local before_config before_manifest before_secrets
+    before_config=$(_hash_file "$root/config.json")
+    before_manifest=$(_hash_file "$root/manifest.json")
+    before_secrets=$(_hash_file "$root/secrets.json")
+    _age_headless '{"new-vault-password":"s-h3-deps-secret"}' \
+        source github-connect --login test-owner --storage age --yes --json --secrets-stdin
+    [ "$status" -eq 1 ]
+    jq -e '.error.code=="deps_missing"' <<< "$output"
+    [ "$(_hash_file "$root/config.json")" = "$before_config" ]
+    [ "$(_hash_file "$root/manifest.json")" = "$before_manifest" ]
+    [ "$(_hash_file "$root/secrets.json")" = "$before_secrets" ]
+    [ ! -e "$root/source.json" ]
+    [ ! -e "$RC_TEST_FORBIDDEN_INSTALLS" ]
+}
+
+@test "real age bootstrap cache survives fresh required rollback and retry without downloading twice" {
+    _real_age_tools
+    [[ -f "${RC_TEST_AGE_ARCHIVE:-}" ]] || skip "RC_TEST_AGE_ARCHIVE нужен для bootstrap integration"
+    unset AGE_BIN AGE_KEYGEN_BIN
+    export XDG_CACHE_HOME="$BATS_TEST_TMPDIR/cache"
+    export RC_TEST_AGE_DOWNLOADS="$BATS_TEST_TMPDIR/downloads"
+    local tool
+    for tool in age age-keygen; do
+        printf '#!/bin/bash\n[[ "$1" == --version ]] && { echo v1.2.1; exit 0; }; exit 99\n' > "$BIN/$tool"
+        chmod +x "$BIN/$tool"
+    done
+    cat > "$BIN/curl" <<'EOF'
+#!/bin/bash
+output="" url=""
+while (( $# )); do
+    case "$1" in
+        -o|--output) output="$2"; shift 2 ;;
+        https://github.com/FiloSottile/age/releases/download/*) url="$1"; shift ;;
+        *) shift ;;
+    esac
+done
+[[ -n "$output" && -n "$url" ]] || exit 1
+printf '%s\n' "$url" >> "$RC_TEST_AGE_DOWNLOADS"
+cp "$RC_TEST_AGE_ARCHIVE" "$output"
+EOF
+    local cached="$XDG_CACHE_HOME/remote-control-essence/tools/age-v1.3.2/age"
+    # Retry in the same serve process: it retains the resolved absolute AGE_BIN.
+    _age_headless $'{"id":1,"argv":["source","github-connect","--login","test-owner","--storage","age","--yes"]}\n{"id":2,"argv":["session","status"]}\n{"id":3,"argv":["source","github-connect","--login","test-owner","--storage","age","--yes"],"secrets":{"new-vault-password":"s-h3-cache-password"}}\n{"id":4,"argv":["session","open"],"secrets":{"vault-password":"s-h3-cache-password"}}' serve
+    assert_success
+    jq -se 'any(.[]; .id==1 and .error.code=="new_vault_password_required") and
+        any(.[]; .id==2 and .ok and .data.configured==false) and
+        any(.[]; .id==3 and .ok) and any(.[]; .id==4 and .ok)' <<< "$output" ||
+        { printf '%s\n' "$output"; return 1; }
+    [ -x "$cached" ]
+    [ "$(wc -l < "$RC_TEST_AGE_DOWNLOADS" | tr -d ' ')" = 1 ]
+    _age_headless '{"id":1,"argv":["session","open"],"secrets":{"vault-password":"s-h3-cache-password"}}' serve
+    assert_success
+    jq -se 'any(.[]; .id==1 and .ok)' <<< "$output"
+}
+
+@test "real age missing plugin fails closed without network package manager or local publication" {
+    _real_age_tools
+    _forbid_age_package_installers
+    local tools="$BATS_TEST_TMPDIR/missing-plugin" isolated="$BATS_TEST_TMPDIR/no-plugin-path"
+    local directory executable name head original_path="$PATH"
+    mkdir -p "$tools" "$isolated"
+    ln -s "$AGE_BIN" "$tools/age"
+    ln -s "$AGE_KEYGEN_BIN" "$tools/age-keygen"
+    # Retain test/system executables but remove every plugin search location.
+    while IFS= read -r directory; do
+        [[ -d "$directory" ]] || continue
+        for executable in "$directory"/*; do
+            [[ -f "$executable" && -x "$executable" ]] || continue
+            name=${executable##*/}
+            [[ "$name" != age-plugin-batchpass ]] || continue
+            [[ -e "$isolated/$name" ]] || ln -s "$executable" "$isolated/$name"
+        done
+    done < <(tr ':' '\n' <<< "$PATH")
+    export AGE_BIN="$tools/age" AGE_KEYGEN_BIN="$tools/age-keygen"
+    export PATH="$BIN:$isolated"
+    head=$(git --git-dir="$REMOTE" rev-parse main)
+    _age_headless '{"new-vault-password":"s-h3-missing-plugin"}' \
+        source github-connect --login test-owner --storage age --yes --json --secrets-stdin
+    export PATH="$original_path"
+    [ "$status" -eq 1 ]
+    jq -e '.error.code=="deps_missing"' <<< "$output"
+    [ -z "$(_config_tree)" ]
+    [ "$(git --git-dir="$REMOTE" rev-parse main)" = "$head" ]
+    [ ! -e "$RC_TEST_FORBIDDEN_INSTALLS" ]
+}
+
+_forbid_age_package_installers() {
+    local tool
+    export PM=unsupported RC_TEST_FORBIDDEN_INSTALLS="$BATS_TEST_TMPDIR/forbidden-install"
+    for tool in apt-get apt brew dnf yum pacman zypper apk pkg sudo; do
+        cat > "$BIN/$tool" <<'EOF'
+#!/bin/bash
+printf '%s\n' "${0##*/}" >> "$RC_TEST_FORBIDDEN_INSTALLS"
+exit 99
+EOF
+        chmod +x "$BIN/$tool"
+    done
+}
+
+@test "real age rejects malformed recipient even with a valid saved native key" {
+    _real_age_tools
+    _rc source init-local
+    assert_success
+    _age_headless '{"new-vault-password":"s-h3-recipient-password"}' \
+        source github-connect --login test-owner --storage age --remember-key --yes --json --secrets-stdin
+    assert_success
+    local root="$HOME/.config/remote-control-essence" updater="$BATS_TEST_TMPDIR/bad-recipient"
+    local key_hash config_hash
+    key_hash=$(_hash_file "$root/credentials/github-config.agekey")
+    config_hash=$(_hash_file "$root/config.json")
+    git clone "$REMOTE" "$updater" >/dev/null
+    printf 'not-a-recipient\n' > "$updater/recipient.txt"
+    git -C "$updater" -c user.name=test -c user.email=test@example.invalid commit -am malformed-recipient >/dev/null
+    git -C "$updater" push origin main >/dev/null
+    _age_headless '{}' status --json
+    [ "$status" -eq 1 ]
+    jq -e '.error.code=="github_format_invalid"' <<< "$output"
+    [ "$(_hash_file "$root/credentials/github-config.agekey")" = "$key_hash" ]
+    [ "$(_hash_file "$root/config.json")" = "$config_hash" ]
 }

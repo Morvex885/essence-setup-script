@@ -83,9 +83,11 @@ _successful_local_change() {
 
 _password_removal_late_failure() {
     _select_wrapper "$1"
+    source "$PROJECT_ROOT/remote-control/modules/cli.sh"
     source "$PROJECT_ROOT/remote-control/modules/self.sh"
-    # Sandbox authentication, following ui_remote_ops.bats; the menu, removal,
-    # wrapper and checkpoint remain the real implementations.
+    source "$PROJECT_ROOT/remote-control/modules/cmd_core.sh"
+    # Sandbox authentication, following cmd_system.bats; the removal command
+    # core, wrapper and checkpoint remain the real implementations.
     _verify_pass() { [[ "$1" == "saved:$2" ]]; }
     printf 'saved:secret\n' > "$SCRIPT_AUTH_FILE"
     state_checkpoint || return 1
@@ -93,19 +95,13 @@ _password_removal_late_failure() {
     _inject_manifest_promotion_failure
     success() { printf '%s\n' "$*" >> "$SUCCESS_EVENTS"; }
 
-    run set_script_password <<< $'2\nsecret\ny\nx\n0'
-    assert_success
+    RC_REQUEST_SECRETS='{"current-password":"secret"}'
+    RC_CONFIRM_YES=1
+    run cli_cmd_self_password_remove
+    assert_failure
     [[ ! -e "$SCRIPT_AUTH_FILE" && ! -e "$SUCCESS_EVENTS" ]] || return 1
     cmp "$STATE_MANIFEST" "$BATS_TEST_TMPDIR/manifest.before" || return 1
     [[ "$(cat "$MANIFEST_ATTEMPTS")" == rejected ]] || return 1
-    # The redraw reflects the already-applied removal and accepts another menu
-    # command instead of exiting or retrying the failed persistence operation.
-    assert_output --partial 'Пароль: не установлен'
-    assert_output --partial 'Неверный выбор.'
-    refute_output --partial 'Не удалось удалить пароль.'
-    refute_output --partial 'Пароль убран'
-    refute_output --partial 'старый пароль'
-    refute_output --partial 'пароль не изменён'
 }
 
 @test "state wrapper reports late manifest failure without rolling back applied JSON" {
@@ -132,11 +128,11 @@ _password_removal_late_failure() {
     _successful_local_change github
 }
 
-@test "password menu with state wrapper stays available after applied removal and late failure" {
+@test "password removal command with state wrapper stays available after applied removal and late failure" {
     _password_removal_late_failure state
 }
 
-@test "password menu with GitHub override stays available after applied removal and late failure" {
+@test "password removal command with GitHub override stays available after applied removal and late failure" {
     _password_removal_late_failure github
 }
 

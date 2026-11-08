@@ -5,6 +5,8 @@ setup() {
     setup_test_env
     source_common
     source_module 'github-config.sh'
+    # Bare-module fault fixtures model an already available batchpass dependency.
+    ensure_age_batchpass() { return 0; }
     export REMOTE="$BATS_TEST_TMPDIR/remote.git"
     export GITHUB_REMOTE="$REMOTE" GITHUB_STORE="$BATS_TEST_TMPDIR/store.git" GITHUB_SESSIONS_DIR="$BATS_TEST_TMPDIR/sessions"
     export GIT_CONFIG_GLOBAL="$BATS_TEST_TMPDIR/gitconfig" GIT_CONFIG_NOSYSTEM=1
@@ -744,7 +746,7 @@ SSH
                 [[ -n "$askpass" && -n "$password" &&
                    ! -e "$askpass" && ! -e "$password" ]] || exit 1
             done
-            state_action add_group add_group <<< "ROUTER" || exit 1
+            state_action add_group core_group_add ROUTER || exit 1
             jq -e "any(.groups[]; .name==\"ROUTER\")" "$CONFIG_JSON" >/dev/null || exit 1
             git --git-dir="$REMOTE" show main:config.json |
                 jq -e "any(.groups[]; .name==\"ROUTER\")" >/dev/null || exit 1
@@ -777,7 +779,7 @@ SSH
     [[ -z "$GITHUB_WORKTREE" ]] || return 1
     [[ ! -d "$old_worktree" ]] || return 1
     ! git --git-dir="$GITHUB_STORE" show-ref --verify --quiet \
-        "refs/heads/session/$old_session"
+        "refs/heads/session/$old_session" || return 1
 
     github_sync_init
     [[ -n "$GITHUB_SESSION_ID" ]] || return 1
@@ -972,6 +974,27 @@ SSH
     github_config_close
 }
 
+@test "missing batchpass dependency leaves the committed age bundle untouched" {
+    _seed_age_revision || return 1
+    local before_head before_paths rc=0
+    before_head=$(git -C "$GITHUB_WORKTREE" rev-parse HEAD) || return 1
+    before_paths=$(find "$CONFIG_DIR" -print | LC_ALL=C sort) || return 1
+    ensure_age_batchpass() { return 1; }
+    GITHUB_SECRET_VAULT_PASSWORD=old-password GITHUB_SECRET_NEW_VAULT_PASSWORD=new-password
+    github_config_rewrap_master || rc=$?
+    [[ "$rc" -ne 0 && "$RC_ERROR_CODE" == deps_missing ]] || return 1
+    [[ "$(git -C "$GITHUB_WORKTREE" rev-parse HEAD)" == "$before_head" &&
+       "$(git --git-dir="$GITHUB_STORE" rev-parse main)" == "$before_head" &&
+       "$(git --git-dir="$REMOTE" rev-parse main)" == "$before_head" ]] || return 1
+    [[ -z "$(git -C "$GITHUB_WORKTREE" status --porcelain)" ]] || return 1
+    [[ "$(cat "$GITHUB_WORKTREE/unlock.age")" == old-unlock &&
+       "$(cat "$GITHUB_WORKTREE/recipient.txt")" == age1oldrecipient &&
+       "$(cat "$GITHUB_WORKTREE/state.json.age")" == old-state ]] || return 1
+    [[ "$(_file_mode "$GITHUB_WORKTREE/unlock.age")" == 600 &&
+       "$(_file_mode "$GITHUB_WORKTREE/state.json.age")" == 600 ]] || return 1
+    [[ "$(find "$CONFIG_DIR" -print | LC_ALL=C sort)" == "$before_paths" ]]
+}
+
 @test "rewrap push failure keeps one committed bundle pending without mixed worktree state" {
     _seed_age_revision || return 1
     local age="$BATS_TEST_TMPDIR/age-rewrap-success" held="$BATS_TEST_TMPDIR/held.git"
@@ -979,25 +1002,23 @@ SSH
     old_head=$(git -C "$GITHUB_WORKTREE" rev-parse HEAD) || return 1
     cat > "$age" <<'EOF'
 #!/bin/bash
-out=""
-decrypt=false
-while (($#)); do
-    case "$1" in
-        -d) decrypt=true; shift ;;
-        -o) out="${2:-}"; shift 2 ;;
-        *) shift ;;
-    esac
-done
-if [[ "$decrypt" == true ]]; then
+[[ $# -eq 6 && "$2" == -j && "$3" == batchpass && "$4" == -o ]] || exit 1
+[[ "${AGE_PASSPHRASE_FD:-}" == 9 && /dev/fd/0 -ef /dev/null ]] || exit 1
+IFS= read -r pw <&9 || [[ -n "$pw" ]] || exit 1
+out="$5"
+if [[ "$1" == -d ]]; then
+    [[ "$pw" == old-password && "$(cat "$6")" == old-unlock ]] || exit 1
     printf 'AGE-SECRET-KEY-REWRAP\n' > "$out"
 else
+    [[ "$1" == -e && "$pw" == new-password && "$(cat "$6")" == AGE-SECRET-KEY-REWRAP ]] || exit 1
     printf 'new-unlock\n' > "$out"
 fi
 EOF
     chmod +x "$age" || return 1
     AGE_BIN="$age"
     mv "$REMOTE" "$held" || return 1
-    github_config_rewrap_master <<< $'old-password\nnew-password\nnew-password\n' || rc=$?
+    GITHUB_SECRET_VAULT_PASSWORD=old-password GITHUB_SECRET_NEW_VAULT_PASSWORD=new-password
+    github_config_rewrap_master || rc=$?
     mv "$held" "$REMOTE" || return 1
     [[ "$rc" -eq 0 ]] || return 1
     [[ "$GITHUB_SYNC_STATUS" == pending ]] || return 1
@@ -1015,18 +1036,15 @@ EOF
     local age="$BATS_TEST_TMPDIR/age-rewrap-account" new_head rc=0
     cat > "$age" <<'EOF'
 #!/bin/bash
-out=""
-decrypt=false
-while (($#)); do
-    case "$1" in
-        -d) decrypt=true; shift ;;
-        -o) out="${2:-}"; shift 2 ;;
-        *) shift ;;
-    esac
-done
-if [[ "$decrypt" == true ]]; then
+[[ $# -eq 6 && "$2" == -j && "$3" == batchpass && "$4" == -o ]] || exit 1
+[[ "${AGE_PASSPHRASE_FD:-}" == 9 && /dev/fd/0 -ef /dev/null ]] || exit 1
+IFS= read -r pw <&9 || [[ -n "$pw" ]] || exit 1
+out="$5"
+if [[ "$1" == -d ]]; then
+    [[ "$pw" == old-password && "$(cat "$6")" == old-unlock ]] || exit 1
     printf 'AGE-SECRET-KEY-REWRAP\n' > "$out"
 else
+    [[ "$1" == -e && "$pw" == new-password && "$(cat "$6")" == AGE-SECRET-KEY-REWRAP ]] || exit 1
     printf 'new-unlock\n' > "$out"
 fi
 EOF
@@ -1039,7 +1057,8 @@ EOF
         _github_record_error "проверка аккаунта GitHub" "gh offline"
         return 1
     }
-    github_config_rewrap_master <<< $'old-password\nnew-password\nnew-password\n' || rc=$?
+    GITHUB_SECRET_VAULT_PASSWORD=old-password GITHUB_SECRET_NEW_VAULT_PASSWORD=new-password
+    github_config_rewrap_master || rc=$?
     [[ "$rc" -eq 0 ]] || return 1
     [[ "$GITHUB_SYNC_STATUS" == pending ]] || return 1
     [[ "$(cat "$GITHUB_WORKTREE/unlock.age")" == new-unlock ]] || return 1
@@ -1063,21 +1082,24 @@ printf '# public key: age1newrecipient\nAGE-SECRET-KEY-ROTATED\n'
 EOF
     cat > "$age" <<'EOF'
 #!/bin/bash
-out=""
-while (($#)); do
-    if [[ "$1" == -o ]]; then out="${2:-}"; shift 2; else shift; fi
-done
+[[ $# -eq 6 && "$1" == -e && "$2" == -j && "$3" == batchpass && "$4" == -o ]] || exit 1
+[[ "${AGE_PASSPHRASE_FD:-}" == 9 && /dev/fd/0 -ef /dev/null ]] || exit 1
+IFS= read -r pw <&9 || [[ -n "$pw" ]] || exit 1
+[[ "$pw" == master-password && "$(cat "$6")" == *AGE-SECRET-KEY-ROTATED* ]] || exit 1
+out="$5"
 printf 'new-unlock\n' > "$out"
 EOF
     chmod +x "$age" "$keygen" || return 1
     AGE_BIN="$age"
     AGE_KEYGEN_BIN="$keygen"
-    confirm_yn() { return 0; }
+    source_module 'state.sh'
+    RC_CONFIRM_YES=1
     github_config_checkpoint() {
         printf 'new-state\n' > "$GITHUB_WORKTREE/state.json.age"
     }
     mv "$REMOTE" "$held" || return 1
-    github_config_rotate_vault_key <<< $'master-password\nmaster-password\n' || rc=$?
+    GITHUB_SECRET_NEW_VAULT_PASSWORD=master-password
+    github_config_rotate_vault_key || rc=$?
     mv "$held" "$REMOTE" || return 1
     [[ "$rc" -eq 0 ]] || return 1
     [[ "$GITHUB_SYNC_STATUS" == pending ]] || return 1
@@ -1169,14 +1191,14 @@ EOF
     github_sync_init || return 1
     github_config_close || return 1
     _prepare_fetch_runtime "$BATS_TEST_TMPDIR/live-runtime" || return 1
-    local marker="$BATS_TEST_TMPDIR/startup.called"
+    local startup_marker="$BATS_TEST_TMPDIR/startup.called"
     config_source_startup() {
-        printf 'called\n' > "$marker"
+        printf 'called\n' > "$startup_marker"
         return 0
     }
 
     github_sync_fetch || return 1
-    [[ "$(cat "$marker")" == called ]]
+    [[ "$(cat "$startup_marker")" == called ]]
 }
 
 @test "requested remote and branch mismatch cannot reuse or flush a live session" {
@@ -1429,23 +1451,23 @@ _fetch_runtime_fingerprint() {
 
 @test "portable password fetch rollback preserves raw ciphertext modes and absent auth" {
     _seed_live_revision 1
-    local runtime="$CONFIG_DIR/live-runtime" auth="$CONFIG_DIR/.auth"
-    _prepare_fetch_runtime "$runtime" || return 1
+    local t_runtime="$CONFIG_DIR/live-runtime" t_auth="$CONFIG_DIR/.auth"
+    _prepare_fetch_runtime "$t_runtime" || return 1
     local before old_worktree="$GITHUB_WORKTREE" old_session="$GITHUB_SESSION_ID"
-    before=$(_fetch_runtime_fingerprint "$runtime") || return 1
-    local branch presence rc
-    for branch in failed-startup no-session; do
+    before=$(_fetch_runtime_fingerprint "$t_runtime") || return 1
+    local t_branch presence rc
+    for t_branch in failed-startup no-session; do
         for presence in present absent; do
             if [[ "$presence" == present ]]; then
-                printf 'exact-auth\n\n' > "$auth"
-                chmod 600 "$auth"
+                printf 'exact-auth\n\n' > "$t_auth"
+                chmod 600 "$t_auth"
             else
-                rm -f "$auth"
+                rm -f "$t_auth"
             fi
             config_source_startup() {
-                printf 'new-ciphertext\n' > "$runtime/secrets.json"
-                printf 'new-manifest\n' > "$runtime/manifest.json"
-                printf 'new-auth\n' > "$auth"
+                printf 'new-ciphertext\n' > "$t_runtime/secrets.json"
+                printf 'new-manifest\n' > "$t_runtime/manifest.json"
+                printf 'new-auth\n' > "$t_auth"
                 STATE_DIR="$CONFIG_DIR/wrong-runtime"
                 CONFIG_JSON="$STATE_DIR/config.json"
                 SECRETS_JSON="$STATE_DIR/secrets.json"
@@ -1453,22 +1475,22 @@ _fetch_runtime_fingerprint() {
                 TEMPLATES_DIR="$STATE_DIR/templates"
                 SSH_IDENTITIES_DIR="$STATE_DIR/ssh/identities"
                 SSH_KNOWN_HOSTS="$STATE_DIR/ssh/known_hosts"
-                [[ "$branch" == no-session ]]
+                [[ "$t_branch" == no-session ]]
             }
             rc=0
             github_sync_fetch || rc=$?
-            if [[ "$branch" == failed-startup ]]; then [[ "$rc" -ne 0 ]] || return 1
+            if [[ "$t_branch" == failed-startup ]]; then [[ "$rc" -ne 0 ]] || return 1
             else [[ "$rc" -eq 0 ]] || return 1; fi
-            [[ "$(_fetch_runtime_fingerprint "$runtime")" == "$before" ]] || return 1
-            [[ "$STATE_DIR" == "$runtime" && "$CONFIG_JSON" == "$runtime/config.json" ]] || return 1
-            [[ "$SECRETS_JSON" == "$runtime/secrets.json" && "$STATE_MANIFEST" == "$runtime/manifest.json" ]] || return 1
-            [[ "$TEMPLATES_DIR" == "$runtime/templates" && "$SSH_IDENTITIES_DIR" == "$runtime/ssh/identities" ]] || return 1
-            [[ "$SSH_KNOWN_HOSTS" == "$runtime/ssh/known_hosts" ]] || return 1
+            [[ "$(_fetch_runtime_fingerprint "$t_runtime")" == "$before" ]] || return 1
+            [[ "$STATE_DIR" == "$t_runtime" && "$CONFIG_JSON" == "$t_runtime/config.json" ]] || return 1
+            [[ "$SECRETS_JSON" == "$t_runtime/secrets.json" && "$STATE_MANIFEST" == "$t_runtime/manifest.json" ]] || return 1
+            [[ "$TEMPLATES_DIR" == "$t_runtime/templates" && "$SSH_IDENTITIES_DIR" == "$t_runtime/ssh/identities" ]] || return 1
+            [[ "$SSH_KNOWN_HOSTS" == "$t_runtime/ssh/known_hosts" ]] || return 1
             [[ "$GITHUB_WORKTREE" == "$old_worktree" && "$GITHUB_SESSION_ID" == "$old_session" ]] || return 1
             if [[ "$presence" == present ]]; then
-                cmp -s "$auth" <(printf 'exact-auth\n\n') || return 1
-                [[ "$(_file_mode "$auth")" == 600 ]] || return 1
-            else [[ ! -e "$auth" ]] || return 1; fi
+                cmp -s "$t_auth" <(printf 'exact-auth\n\n') || return 1
+                [[ "$(_file_mode "$t_auth")" == 600 ]] || return 1
+            else [[ ! -e "$t_auth" ]] || return 1; fi
             [[ -z "$(find "$CONFIG_DIR" -maxdepth 1 -name '.fetch-runtime.*' -print)" ]] || return 1
         done
     done
@@ -1476,14 +1498,14 @@ _fetch_runtime_fingerprint() {
 
 @test "portable password failed fetch restore retains a lossless private backup" {
     _seed_live_revision 1
-    local runtime="$CONFIG_DIR/live-runtime" auth="$CONFIG_DIR/.auth"
-    _prepare_fetch_runtime "$runtime" || return 1
+    local t_runtime="$CONFIG_DIR/live-runtime" auth="$CONFIG_DIR/.auth"
+    _prepare_fetch_runtime "$t_runtime" || return 1
     printf 'original-auth\n' > "$auth"
     chmod 600 "$auth"
     local before backup rc=0
-    before=$(_fetch_runtime_fingerprint "$runtime") || return 1
+    before=$(_fetch_runtime_fingerprint "$t_runtime") || return 1
     config_source_startup() {
-        printf 'candidate-secrets\n' > "$runtime/secrets.json"
+        printf 'candidate-secrets\n' > "$t_runtime/secrets.json"
         return 79
     }
     _github_runtime_restore() { return 83; }
@@ -1495,4 +1517,339 @@ _fetch_runtime_fingerprint() {
     [[ "$(_fetch_runtime_fingerprint "$backup/runtime")" == "$before" ]] || return 1
     cmp -s "$backup/auth" "$auth" || return 1
     [[ "$GITHUB_LAST_ERROR $GITHUB_LAST_HINT" == *"$backup"* ]] || return 1
+}
+
+# ─── round 2: github fetch / change-account / session lock ───────────────────
+# Full core (rc_dispatch) over local bare repositories: test-owner →
+# $R2/remote.git, alt-owner → $R2/alt.git; gh is a function stub.
+_r2_stubs() {
+    BUILTIN_TEMPLATES_DIR="$PROJECT_ROOT/remote-control/templates"
+    ensure_age_batchpass() { return 0; }
+    _github_ensure_deps() { return 0; }
+    _github_prepare_account() { return 0; }
+    _github_gh() {
+        local login="$1" target="$R2/remote.git"
+        shift
+        [[ "${3:-}" != alt-owner/* ]] || target="$R2/alt.git"
+        case "$1 $2" in
+            "api user")
+                [[ "${R2_API_FAIL:-0}" != 1 ]] || { printf 'connection timed out\n'; return 1; }
+                printf '%s\n' "$login" ;;
+            "repo view")
+                [[ ! -e "$R2/offline" ]] || { printf 'error connecting to api.github.com\n'; return 1; }
+                [[ -d "$target" ]] || { printf 'repository not found\n'; return 1; }
+                printf '{"visibility":"PRIVATE"}\n' ;;
+            "repo create") git init -q --bare -b main "$target" ;;
+            "repo delete")
+                [[ "${R2_DELETE_FAIL:-0}" != 1 ]] || { printf 'delete failed\n'; return 1; }
+                rm -rf "$target" ;;
+            *) return 1 ;;
+        esac
+    }
+}
+
+_r2_core_setup() {
+    R2="$BATS_TEST_TMPDIR/r2"
+    mkdir -p "$R2"
+    unset GITHUB_REMOTE GITHUB_STORE GITHUB_SESSIONS_DIR GITHUB_OWNER GITHUB_REPO_NAME
+    load '../helpers/cmd_helper'
+    load_core
+    load '../helpers/mock_ssh'
+    git config --global user.name test
+    git config --global user.email test@example.invalid
+    git config --global "url.file://$R2/remote.git.insteadOf" \
+        "https://github.com/test-owner/essence-remote-control-config.git"
+    git config --global "url.file://$R2/alt.git.insteadOf" \
+        "https://github.com/alt-owner/essence-remote-control-config.git"
+    _r2_stubs
+    load_fixture_config
+    load_fixture_template
+    open_local_session
+    jq_w '.nodes = [] | .connections = [] | .clients |= map(select(.name != "my-pc"))'
+    local -a storage=(--storage none)
+    (( $# == 0 )) || storage=("$@")
+    run_cmd source github-connect --login test-owner --create-repo "${storage[@]}" --yes
+    [ "$status" -eq 0 ] || { echo "connect: $CMD_ENVELOPE"; return 1; }
+}
+
+# Process crash/restart: globals reset, modules sourced again, no session lock.
+_r2_new_process() {
+    local v m
+    for v in $(compgen -A variable GITHUB_); do unset "$v"; done
+    unset CONFIG_SOURCE STATE_DIR SECRETS_JSON STATE_MANIFEST SSH_IDENTITIES_DIR \
+        SSH_KNOWN_HOSTS SCRIPT_AUTH_FILE LOCAL_CONFIG_JSON
+    CONFIG_JSON="$CONFIG_DIR/config.json" TEMPLATES_DIR="$CONFIG_DIR/templates"
+    RC_SESSION_OPEN=0 RC_SESSION_AUTHORIZED=0 _RC_LOCK_DEPTH=0 _RC_LOCK_SESSION=0
+    rm -rf "$CONFIG_DIR/.rc-lock"
+    for m in state github-config source session; do
+        source "$PROJECT_ROOT/remote-control/modules/$m.sh"
+    done
+    _r2_stubs
+}
+
+_r2_head() { git --git-dir="$1" rev-parse main 2>/dev/null || echo none; }
+
+# alt-owner repository: same history as test-owner plus one commit with group ALT.
+_r2_seed_alt() {
+    cp -r "$R2/remote.git" "$R2/alt.git"
+    git clone -q "$R2/alt.git" "$R2/seed"
+    jq '.groups += [{"name":"ALT","template":"default.yaml"}]' "$R2/seed/config.json" > "$R2/seed/c.tmp"
+    mv "$R2/seed/c.tmp" "$R2/seed/config.json"
+    git -C "$R2/seed" commit -qam alt
+    git -C "$R2/seed" push -q origin main
+}
+
+@test "r2: failed github-fetch keeps the session target; later pushes reach GitHub" {
+    _r2_core_setup
+    local remote="$GITHUB_REMOTE" head
+    touch "$R2/offline"; mv "$R2/remote.git" "$R2/remote.away"
+    run_cmd source github-fetch
+    [ "$status" -ne 0 ]
+    [ "$GITHUB_REMOTE" = "$remote" ]
+    [ "$GITHUB_OWNER" = test-owner ]
+    rm -f "$R2/offline"; mv "$R2/remote.away" "$R2/remote.git"
+    head=$(_r2_head "$R2/remote.git")
+    run_cmd group add --name LAB
+    [ "$(cmd_jq -c '[.ok,.sync]')" = '[true,"clean"]' ]
+    [ "$(_r2_head "$R2/remote.git")" != "$head" ]
+}
+
+@test "r2: change-account _required keeps pending sync and leaves no new-account profile" {
+    _r2_core_setup
+    _r2_seed_alt
+    R2_API_FAIL=1 run_cmd group add --name LAB
+    [ "$GITHUB_SYNC_STATUS" = pending ]
+    local head; head=$(_r2_head "$R2/remote.git")
+    run_cmd source github-change-account --login alt-owner
+    [ "$(cmd_jq -r .error.code)" = existing_config_action_required ]
+    [ "$GITHUB_SYNC_STATUS" = pending ]
+    [ ! -e "$CONFIG_DIR/credentials/gh/alt-owner" ]
+    [ ! -e "$CONFIG_DIR/account-switch" ]
+    run_cmd source github-change-account --login alt-owner --existing local
+    [ "$(cmd_jq -r .error.code)" = confirmation_required ]
+    [ ! -e "$CONFIG_DIR/credentials/gh/alt-owner" ]
+    run_cmd source status
+    [ "$(cmd_jq -r .sync)" = pending ]
+    session_close >/dev/null 2>&1
+    [ "$(_r2_head "$R2/remote.git")" != "$head" ]
+}
+
+@test "r2: change-account --existing remote failing after finalize finishes the switch on next open" {
+    _r2_core_setup
+    _r2_seed_alt
+    local old_head; old_head=$(_r2_head "$R2/remote.git")
+    eval "_r2_orig_mat() $(declare -f _config_source_materialize_state | tail -n +2)"
+    _config_source_materialize_state() {
+        [[ -z "${R2_FAIL_MAT:-}" ]] || { _github_record_error x "injected materialize"; return 1; }
+        _r2_orig_mat "$@"
+    }
+    R2_FAIL_MAT=1 run_cmd source github-change-account --login alt-owner --existing remote
+    [ "$status" -ne 0 ]
+    [ "$(jq -r .phase "$CONFIG_DIR/account-switch/transaction.json")" = target_committed ]
+    # Suspended: nothing reaches either repository from this process.
+    run_cmd group add --name LEAK
+    [ "$(cmd_jq -r .ok)" = false ]
+    [ "$(_r2_head "$R2/remote.git")" = "$old_head" ]
+    _r2_new_process
+    run_cmd session open
+    [ "$status" -eq 0 ]
+    [ ! -e "$CONFIG_DIR/account-switch" ]
+    [ "$(jq -r .repo "$CONFIG_DIR/source.json")" = alt-owner/essence-remote-control-config ]
+    jq -e '.groups | map(.name) | index("ALT")' "$CONFIG_JSON" >/dev/null
+    run_cmd group add --name AFTER
+    [ "$(cmd_jq -c '[.ok,.sync]')" = '[true,"clean"]' ]
+    [ "$(_r2_head "$R2/remote.git")" = "$old_head" ]
+    git --git-dir="$R2/alt.git" show main:config.json | jq -e '.groups | map(.name) | index("AFTER")' >/dev/null
+}
+
+@test "r2: change-account push that never reached an empty repo rolls back on next open" {
+    _r2_core_setup
+    git init -q --bare -b main "$R2/alt.git"
+    _github_sync_push() { _github_record_error x "push timeout"; return 1; }
+    run_cmd source github-change-account --login alt-owner --storage none --yes
+    [ "$status" -ne 0 ]
+    [ "$(jq -r .phase "$CONFIG_DIR/account-switch/transaction.json")" = push_unknown ]
+    _r2_new_process
+    run_cmd session open
+    [ "$status" -eq 0 ]
+    [ ! -e "$CONFIG_DIR/account-switch" ]
+    [ "$(jq -r .repo "$CONFIG_DIR/source.json")" = test-owner/essence-remote-control-config ]
+}
+
+@test "r2: change-account push_unknown recovery records why it cannot check the push" {
+    _r2_core_setup
+    git init -q --bare -b main "$R2/alt.git"
+    _github_sync_push() { _github_record_error x "push timeout"; return 1; }
+    run_cmd source github-change-account --login alt-owner --storage none --yes
+    _r2_new_process
+    rm -rf "$R2/alt.git"
+    run_cmd session open
+    [ "$status" -ne 0 ]
+    [ -n "$GITHUB_LAST_ERROR" ]
+    [ "$(jq -r .phase "$CONFIG_DIR/account-switch/transaction.json")" = push_unknown ]
+}
+
+@test "r2: change-account --existing remote rolls back when the target worktree does not close" {
+    _r2_core_setup
+    _r2_seed_alt
+    local alt_head; alt_head=$(_r2_head "$R2/alt.git")
+    eval "_r2_orig_close() $(declare -f github_config_close | tail -n +2)"
+    github_config_close() {
+        if [[ -n "${R2_FAIL_CLOSE:-}" && "${GITHUB_WORKTREE:-}" == *account-switch/target-sessions* ]]; then
+            _github_record_error x "injected close"; return 1
+        fi
+        _r2_orig_close "$@"
+    }
+    R2_FAIL_CLOSE=1 run_cmd source github-change-account --login alt-owner --existing remote
+    [ "$(cmd_jq -r .error.code)" = source_failed ]
+    [[ "$(cmd_jq -r .error.message)" == *"injected close"* ]]
+    [ "$GITHUB_OWNER" = test-owner ]
+    [ "$GITHUB_STORE" = "$CONFIG_DIR/github-store.git" ]
+    [ ! -e "$CONFIG_DIR/account-switch" ]
+    run_cmd group add --name LEAK
+    [ "$(cmd_jq -c '[.ok,.sync]')" = '[true,"clean"]' ]
+    [ "$(_r2_head "$R2/alt.git")" = "$alt_head" ]
+    git --git-dir="$R2/remote.git" show main:config.json | jq -e '.groups | map(.name) | index("LEAK")' >/dev/null
+}
+
+@test "r2: repeated source startups keep the session lock depth at one" {
+    _r2_core_setup
+    [ "$_RC_LOCK_DEPTH" -eq 1 ]
+    run_cmd source github-fetch
+    run_cmd source github-fetch
+    [ "$status" -eq 0 ]
+    [ "$_RC_LOCK_DEPTH" -eq 1 ]
+    [ "$_RC_LOCK_SESSION" -eq 1 ]
+}
+
+@test "r2: github-switch-local releases the GitHub session lock" {
+    _r2_core_setup
+    run_cmd source github-switch-local
+    [ "$status" -eq 0 ]
+    [ "$CONFIG_SOURCE" = local ]
+    [ "$_RC_LOCK_DEPTH" -eq 0 ] && [ "$_RC_LOCK_SESSION" -eq 0 ]
+    [ ! -e "$CONFIG_DIR/.rc-lock" ]
+    run bash -c 'source "$1/remote-control/modules/state.sh" >/dev/null 2>&1
+        warn() { :; }; CONFIG_DIR="$2"; RC_LOCK_WAIT=0
+        rc_lock_acquire mutation other && echo acquired || echo "$RC_ERROR_CODE"' _ "$PROJECT_ROOT" "$CONFIG_DIR"
+    [ "$output" = acquired ]
+}
+
+@test "r2: github-delete-repo releases the session lock even when the remote delete fails" {
+    _r2_core_setup
+    R2_DELETE_FAIL=1 run_cmd source github-delete-repo --yes
+    [ "$(cmd_jq -r .error.code)" = remote_failed ]
+    [ "$CONFIG_SOURCE" = local ]
+    [ "$_RC_LOCK_DEPTH" -eq 0 ] && [ "$_RC_LOCK_SESSION" -eq 0 ]
+    [ ! -e "$CONFIG_DIR/.rc-lock" ]
+}
+
+# Fake age wraps unlock.age through batchpass fd 9, rejects native identity
+# decryption of password envelopes, and binds native state to its recipient.
+_r2_fake_age() {
+    local bin="$BATS_TEST_TMPDIR/r2-bin"
+    mkdir -p "$bin"
+    cat > "$bin/age-keygen" <<'AGE'
+#!/bin/bash
+if [[ "${1:-}" == -y ]]; then
+    k=$(grep -v '^#' "$2" | head -1); [[ "$k" == AGE-SECRET-KEY-* ]] || exit 1
+    printf 'age1%s\n' "$(printf '%s' "$k" | sha256sum | cut -c1-20)"
+else
+    k="AGE-SECRET-KEY-$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    printf '# public key: age1%s\n%s\n' "$(printf '%s' "$k" | sha256sum | cut -c1-20)" "$k"
+fi
+AGE
+    cat > "$bin/age" <<'AGE'
+#!/bin/bash
+out="" input="" mode="" identity="" recipient="" plugin=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -e|-d) [[ -z "$mode" ]] || exit 1; mode="$1"; shift ;;
+        -j) [[ "$2" == batchpass ]] || exit 1; plugin="$2"; shift 2 ;;
+        -i) identity="$2"; shift 2 ;;
+        -r) recipient="$2"; shift 2 ;;
+        -o) out="$2"; shift 2 ;;
+        -*) exit 1 ;;
+        *) [[ -z "$input" ]] || exit 1; input="$1"; shift ;;
+    esac
+done
+[[ -n "$out" && -s "$input" ]] || exit 1
+if [[ -n "$plugin" ]]; then
+    [[ -z "$identity$recipient" && "${AGE_PASSPHRASE_FD:-}" == 9 ]] || exit 1
+    [[ /dev/fd/0 -ef /dev/null ]] || exit 1
+    IFS= read -r pw <&9 || [[ -n "$pw" ]] || exit 1
+fi
+if [[ "$mode" != -d ]]; then
+    if [[ "$plugin" == batchpass && "$mode" == -e ]]; then
+        { printf 'FAKEPW:%s\n' "$pw"
+          printf 'IDSHA:%s\n' "$(grep -v '^#' "$input" | head -1 | sha256sum | cut -c1-20)"
+          cat "$input"; } > "$out"
+    else
+        [[ -n "$recipient" && -z "$plugin$identity" ]] || exit 1
+        { printf 'FAKERECIPIENT:%s\n' "$recipient"; cat "$input"; } > "$out"
+    fi
+    exit 0
+fi
+first=$(head -1 "$input")
+if [[ "$first" == FAKEPW:* ]]; then
+    [[ "$plugin" == batchpass && -z "$identity" && "FAKEPW:$pw" == "$first" ]] || exit 1
+    tail -n +3 "$input" > "$out"
+else
+    [[ -z "$plugin$recipient" && -s "$identity" ]] || exit 1
+    public=$("$AGE_KEYGEN_BIN" -y "$identity") || exit 1
+    [[ "$first" == "FAKERECIPIENT:$public" ]] || exit 1
+    tail -n +2 "$input" > "$out"
+fi
+AGE
+    chmod +x "$bin/age" "$bin/age-keygen"
+    export AGE_BIN="$bin/age" AGE_KEYGEN_BIN="$bin/age-keygen"
+}
+
+# Decrypted keys on disk (every ephemeral key lives in .github-private.*/output).
+_r2_key_files() { find "$CONFIG_DIR" -maxdepth 2 -path "$CONFIG_DIR/.github-private.*/output" -print; }
+
+@test "r2: github-fetch in an age session reuses the session key without the vault password" {
+    _r2_fake_age
+    RC_REQUEST_SECRETS='{"new-vault-password":"vpw"}'
+    _r2_core_setup --storage age
+    [ ! -e "$GITHUB_UNLOCK_FILE" ]
+    [ "$(_r2_key_files)" = "$GITHUB_IDENTITY" ]
+    RC_REQUEST_SECRETS='{}'
+    run_cmd source github-fetch
+    [ "$status" -eq 0 ] || { echo "$CMD_ENVELOPE"; return 1; }
+    # One key for the reopened session; the previous session's key is gone.
+    [ "$(_r2_key_files)" = "$GITHUB_IDENTITY" ]
+    run_cmd group add --name LAB
+    [ "$(cmd_jq -c '[.ok,.sync]')" = '[true,"clean"]' ]
+    session_close >/dev/null 2>&1
+    [ -z "$(_r2_key_files)" ]
+    [ ! -e "$GITHUB_UNLOCK_FILE" ]
+}
+
+@test "r2: github-fetch after a key rotation elsewhere answers vault_password_required and keeps the session key" {
+    _r2_fake_age
+    RC_REQUEST_SECRETS='{"new-vault-password":"vpw"}'
+    _r2_core_setup --storage age
+    local key="$GITHUB_IDENTITY" w="$R2/other-device"
+    git clone -q "$R2/remote.git" "$w"
+    "$AGE_KEYGEN_BIN" > "$R2/rotated.key"
+    printf '%s' vpw2 | AGE_PASSPHRASE_FD=9 "$AGE_BIN" -e -j batchpass \
+        -o "$w/unlock.age" "$R2/rotated.key" 9<&0 </dev/null || return 1
+    "$AGE_KEYGEN_BIN" -y "$R2/rotated.key" > "$w/recipient.txt"
+    "$AGE_BIN" -d -i "$key" -o "$R2/rotated-state.json" "$w/state.json.age" || return 1
+    "$AGE_BIN" -r "$(cat "$w/recipient.txt")" -o "$w/state.json.age" \
+        "$R2/rotated-state.json" || return 1
+    rm -f "$R2/rotated-state.json"
+    git -C "$w" commit -qam rotate && git -C "$w" push -q origin main
+    RC_REQUEST_SECRETS='{}'
+    run_cmd source github-fetch
+    [ "$(cmd_jq -r .error.code)" = vault_password_required ]
+    [ "$GITHUB_IDENTITY" = "$key" ] && [ -f "$key" ]
+    [ "$(_r2_key_files)" = "$key" ]
+    session_close >/dev/null 2>&1
+    [ -z "$(_r2_key_files)" ]
+    RC_REQUEST_SECRETS='{"vault-password":"vpw2"}'
+    run_cmd session open
+    [ "$status" -eq 0 ] || { echo "$CMD_ENVELOPE"; return 1; }
+    [ "$(_r2_key_files)" = "$GITHUB_IDENTITY" ]
 }

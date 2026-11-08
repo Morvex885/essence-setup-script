@@ -3,15 +3,12 @@
 setup() {
     load '../helpers/test_helper'
     setup_test_env
-    source_common
-    source_module state.sh
-    source_module nodes.sh
-    source "$TESTS_DIR/helpers/mock_ssh.bash"
+    load '../helpers/cmd_helper'
     # Keep the real option builder, askpass handling and ssh invocation. Only
     # the transport binary is replaced; no network or accepted system key exists.
-    source_module ssh.sh
-    source_module hardening.sh
+    load_core
     state_open_local
+    RC_SESSION_OPEN=1 RC_SESSION_AUTHORIZED=1
     export CONFIG_SOURCE=local NODE_NAME=local-password NODE_ID=0123456789abcdef0123456789abcdef
     export NODE_IDENTITY=system SERVER_IP=192.0.2.10 SERVER_PORT=22 SERVER_USER=root
     export SERVER_AUTH=password SERVER_PASS='hardening-password-canary'
@@ -43,6 +40,7 @@ while (( $# )); do
                 PasswordAuthentication=*) password_auth="${2#*=}" ;;
             esac
             shift 2 ;;
+        --) shift ;;
         root@*) shift; command="$1"; break ;;
         *) exit 90 ;;
     esac
@@ -71,9 +69,9 @@ else
 fi
 case "$SSH_RECOVERY_FAULT:$phase:$port" in
     apply:apply:* | verify:verify-new:* | fallback:verify-new:* | rollback:verify-new:*) exit 1 ;;
-    fallback:rollback:22 | rollback:rollback:*) exit 1 ;;
+    fallback:rollback:22 | rollback:rollback:* | select:select:*) exit 1 ;;
 esac
-[[ "$phase" != select ]] || printf 'free\n'
+[[ "$phase" != select ]] || printf '%s\n' "${SSH_PORT_STATE:-free}"
 [[ "$phase" != verify-key && "$phase" != verify-new && "$phase" != verify-old ]] || printf 'ok\n'
 exit 0
 EOF
@@ -86,6 +84,13 @@ EOF
 }
 
 teardown() { teardown_test_env; }
+
+# node harden через ядро; журнал — в $BATS_TEST_TMPDIR/output.
+harden() {
+    run_cmd node harden --name local-password --port 55555 --yes
+    printf '%s\n' "$output" > "$BATS_TEST_TMPDIR/output"
+    [ "$status" -eq 0 ]
+}
 
 assert_key_recovery_argv() {
     local file phase port arg previous identity batch identities password_auth
@@ -170,7 +175,7 @@ assert_retained_portable_identity() {
 }
 
 @test "local password hardening applies and verifies the generated key without system keys" {
-    ssh_hardening <<< $'55555\ny' > "$BATS_TEST_TMPDIR/output" 2>&1
+    harden
     assert_key_recovery_argv
     assert_phase 'verify-key 22'
     assert_phase 'disable 22'
@@ -184,7 +189,9 @@ assert_retained_portable_identity() {
 
 @test "failed port apply uses the verified identity to roll back and restore password" {
     export SSH_RECOVERY_FAULT=apply
-    if ssh_hardening <<< $'55555\ny' > "$BATS_TEST_TMPDIR/output" 2>&1; then return 1; fi
+    if harden; then return 1; fi
+    [ "$(cmd_jq '.error.code')" = hardening_failed ]
+    cmd_jq '.error | .stage == "port" and .rolled_back == true and .console_required == false' | grep -qx true
     assert_key_recovery_argv
     assert_phase 'apply 22'
     assert_phase 'rollback 22'
@@ -195,7 +202,8 @@ assert_retained_portable_identity() {
 
 @test "failed new-port verification recovers through the old port with the verified key" {
     export SSH_RECOVERY_FAULT=verify
-    if ssh_hardening <<< $'55555\ny' > "$BATS_TEST_TMPDIR/output" 2>&1; then return 1; fi
+    if harden; then return 1; fi
+    cmd_jq '.error | .stage == "verify" and .rolled_back == true' | grep -qx true
     assert_key_recovery_argv
     assert_phase 'verify-new 55555'
     assert_phase 'rollback 22'
@@ -206,7 +214,7 @@ assert_retained_portable_identity() {
 
 @test "rollback fallback on the new port also supplies the generated identity" {
     export SSH_RECOVERY_FAULT=fallback
-    if ssh_hardening <<< $'55555\ny' > "$BATS_TEST_TMPDIR/output" 2>&1; then return 1; fi
+    if harden; then return 1; fi
     assert_key_recovery_argv
     assert_phase 'rollback 22'
     assert_phase 'rollback 55555'
@@ -217,7 +225,8 @@ assert_retained_portable_identity() {
 
 @test "unconfirmed rollback never persists the new port or discards password credentials" {
     export SSH_RECOVERY_FAULT=rollback
-    if ssh_hardening <<< $'55555\ny' > "$BATS_TEST_TMPDIR/output" 2>&1; then return 1; fi
+    if harden; then return 1; fi
+    cmd_jq '.error | .rolled_back == false and .console_required == true' | grep -qx true
     assert_key_recovery_argv
     assert_phase 'rollback 22'
     assert_phase 'rollback 55555'
@@ -229,7 +238,8 @@ assert_retained_portable_identity() {
     cp "$SECRETS_JSON" "$BATS_TEST_TMPDIR/secrets.before"
     reject_hardening_state_promotion "$SECRETS_JSON"
 
-    if ssh_hardening <<< $'55555\ny' > "$BATS_TEST_TMPDIR/output" 2>&1; then return 1; fi
+    if harden; then return 1; fi
+    cmd_jq '.error.stage == "secret_delete"' | grep -qx true
 
     [[ "$(cat "$BATS_TEST_TMPDIR/rejected-promotions")" == "$SECRETS_JSON" ]]
     assert_phase 'verify-key 22'
@@ -246,7 +256,7 @@ assert_retained_portable_identity() {
     [[ "$SERVER_PORT" == 55555 && "$SERVER_AUTH" == key && -z "$SERVER_PASS" ]]
     cmp "$SECRETS_JSON" "$BATS_TEST_TMPDIR/secrets.before"
     [[ "$(node_secret_get "$NODE_ID")" == hardening-password-canary ]]
-    [[ "$(cat "$BATS_TEST_TMPDIR/output")" != *"Усиление защиты SSH завершено"* ]]
+    [ "$(cmd_jq '.ok')" = false ]
 }
 
 @test "late identity checkpoint failure retains the published key and stops before disabling password or changing port" {
@@ -254,7 +264,8 @@ assert_retained_portable_identity() {
     cp "$SECRETS_JSON" "$BATS_TEST_TMPDIR/secrets.before"
     reject_hardening_state_promotion "$STATE_MANIFEST"
 
-    if ssh_hardening <<< $'55555\ny' > "$BATS_TEST_TMPDIR/output" 2>&1; then return 1; fi
+    if harden; then return 1; fi
+    cmd_jq '.error.stage == "key"' | grep -qx true
 
     [[ "$(cat "$BATS_TEST_TMPDIR/rejected-promotions")" == "$STATE_MANIFEST" ]]
     assert_phase 'install 22'
@@ -270,7 +281,7 @@ assert_retained_portable_identity() {
     [[ "$(jq_r '.nodes[0].secret_id')" == "node:$NODE_ID:ssh-password" ]]
     cmp "$STATE_MANIFEST" "$BATS_TEST_TMPDIR/manifest.before"
     cmp "$SECRETS_JSON" "$BATS_TEST_TMPDIR/secrets.before"
-    [[ "$(cat "$BATS_TEST_TMPDIR/output")" != *"Усиление защиты SSH завершено"* ]]
+    [ "$(cmd_jq '.ok')" = false ]
 }
 
 _write_github_known_hosts() {
@@ -323,4 +334,69 @@ _write_github_known_hosts() {
     [[ -e "$BATS_TEST_TMPDIR/jq-w-called" ]] || return 1
     [[ -e "$BATS_TEST_TMPDIR/rolled-back" && "$SERVER_PORT" == 22 ]]
     cmp "$SSH_KNOWN_HOSTS" "$BATS_TEST_TMPDIR/known.before"
+}
+
+@test "node harden without --yes returns the plan with the port and changes nothing remote" {
+    local before
+    before=$(jq -S . "$CONFIG_JSON")
+    run_cmd node harden --name local-password --port 55555
+    [ "$status" -eq 2 ]
+    [ "$(cmd_jq '.error.code')" = confirmation_required ]
+    [ "$(cmd_jq '.error.port')" = 55555 ]
+    cmd_jq '.error.plan | any(. == "Порт: 22 → 55555")' | grep -qx true
+    [[ "$(cmd_jq '.error.plan_token')" =~ ^[0-9a-f]{16}$ ]]
+    assert_phase 'select 22'
+    assert_no_hardening_phase install
+    assert_no_hardening_phase disable
+    [ "$(jq -S . "$CONFIG_JSON")" = "$before" ]
+}
+
+@test "node harden without --port picks a free random port into the plan" {
+    run_cmd node harden --name local-password
+    [ "$status" -eq 2 ]
+    local port
+    port=$(cmd_jq '.error.port')
+    (( port >= 49152 && port <= 65535 ))
+}
+
+@test "node harden reports port_in_use, invalid ports and SSH failure before any change" {
+    SSH_PORT_STATE=occupied run_cmd node harden --name local-password --port 2222
+    [ "$(cmd_jq '.error.code')" = port_in_use ]
+    [ "$(cmd_jq '.error.port')" = 2222 ]
+    run_cmd node harden --name local-password --port 70000
+    [ "$(cmd_jq '.error.code')" = invalid ]
+    SSH_RECOVERY_FAULT=select run_cmd node harden --name local-password --port 2222
+    [ "$(cmd_jq '.error.code')" = remote_failed ]
+    run_cmd node harden --name missing
+    [ "$(cmd_jq '.error.code')" = not_found ]
+    assert_no_hardening_phase install
+    [[ "$(jq_r '.nodes[0].port')" == 22 ]]
+}
+
+@test "node harden with a stale plan token answers plan_changed and changes nothing" {
+    run_cmd node harden --name local-password --port 55555 --yes --plan-token 0000000000000000
+    [ "$status" -eq 2 ]
+    [ "$(cmd_jq '.error.code')" = plan_changed ]
+    assert_no_hardening_phase install
+    [[ "$(jq_r '.nodes[0].auth')" == password ]]
+}
+
+# ─── security round 1: nodes ───
+
+@test "security: every hardening ssh call ends options with -- before the destination" {
+    harden
+    local file arg previous count=0
+    for file in "$SSH_ARGV_DIR/"*.argv; do
+        previous=
+        while IFS= read -r -d '' arg; do
+            if [[ "$arg" == root@192.0.2.10 ]]; then
+                [[ "$previous" == -- ]] || { echo "без --: $file"; return 1; }
+                count=$((count + 1))
+            fi
+            previous="$arg"
+        done < "$file"
+    done
+    (( count > 0 ))
+    # Прямой ssh проверки ключа из hardening.sh тоже среди вызовов.
+    assert_phase "verify-key 22"
 }

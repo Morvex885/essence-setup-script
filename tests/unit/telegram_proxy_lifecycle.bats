@@ -229,7 +229,6 @@ teardown() { teardown_test_env; }
     transcript=$(cat "$events")
     [[ "$transcript" == $'cert\nwarn:'*'UFW TCP/80'*$'\nrollback' ]]
     [[ "$transcript" != *$'\nrollback\n'* ]]
-    [[ "$transcript" != *'Не удалось выпустить/установить сертификат'* ]]
     [[ "$transcript" != *unexpected_tls* ]]
 }
 
@@ -645,7 +644,7 @@ EOF
         REMOTE_SCRIPTS_VERSION=$(_remote_scripts_normalize_version "$(cat "$VERSION_PATH")")
     }
     ssh_run() { printf '%s\n' "$NODE_NAME" >> "$BATS_TEST_TMPDIR/failed-workers"; return 1; }
-    run _telegram_proxy_remote_run web restart false 1 2
+    run core_telegram_run web restart 1 2
     [ "$status" -eq 1 ]
     [ "$(wc -l < "$BATS_TEST_TMPDIR/failed-workers" | tr -d ' ')" -eq 2 ]
 }

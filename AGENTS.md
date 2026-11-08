@@ -7,6 +7,9 @@ Bash-проект для настройки прокси-сервера на я�
 - [common/](common/) — независимый слой. Никогда не делает `source` из `setup-essence/` или `remote-control/`.
 - [setup-essence/](setup-essence/) и [remote-control/](remote-control/) импортируют из `common/`, но **не друг из друга**.
 - YAML-билдеры протоколов живут **только** в [common/protocols/](common/protocols/) (`vless-tcp.sh`, `vless-xhttp.sh`, `vless-grpc.sh`, `hy2.sh`, `iptables-dnat.sh`, `uri.sh`). Не дублировать билдер в модуле.
+- [remote-control/modules/](remote-control/modules/) — **ядро команд без вопросов пользователю**: `cli.sh` (разбор, `rc_dispatch`, конверт, коды выхода, секреты, справка, рендерер), `session.sh`, `source.sh`, `serve.sh` (протокол JSON-строк) и команды в `cmd_core.sh` (`help`, `status`, `session`, `source`, `self`), `cmd_nodes.sh` (`node`, `conn`, `awg`, `telegram`), `cmd_clients.sh` (`client`, `group`, `template`, `generate`, `sub`). Новый `cmd_*.sh` не заводится. Правила — скилл [essence-commands](.agents/skills/essence-commands/SKILL.md).
+- [remote-control/tui/](remote-control/tui/) (`main.sh`, `client.sh`, `system.sh`, `nodes.sh`, `clients.sh`) — слой экранов отдельного процесса. Импортирует **только** `common/` и `tui/`, к ядру обращается **только** через `tui_call` (запросы к `serve`), модули ядра, `config.json` и функции `core_*` не использует (проверяет `tests/unit/tui.bats`). Правила — скилл [essence-menus](.agents/skills/essence-menus/SKILL.md).
+- **Новое действие = команда + экран.** Логика — в команде ядра с тестом `run_cmd`; экран только вызывает её и показывает результат. Каталог команд — [docs/remote-control.md](docs/remote-control.md#командная-строка-cli).
 - Парные `subscription.sh` в [setup-essence/modules/subscription.sh](setup-essence/modules/subscription.sh) и [remote-control/modules/subscription.sh](remote-control/modules/subscription.sh) — разные роли (серверный nginx vs локальное управление токенами). Прямой зависимости нет — менять одно не значит автоматически менять другое.
 
 ## Helpers — переиспользуй, не дублируй
@@ -26,7 +29,9 @@ Bash-проект для настройки прокси-сервера на я�
 
 **Порты** ([common/common.sh](common/common.sh)): `is_port_free port`, `gen_free_port min max`.
 
-**Обновления** ([common/common.sh](common/common.sh)): `check_update_start`, `latest_version`, `has_update`.
+**Обновления** ([common/common.sh](common/common.sh)): `check_update_start`, `latest_version`, `has_update`. Запросы к GitHub API с токеном — только через `_github_release_curl url` (токен уходит конфигом через stdin, не в argv).
+
+**Проверка SSH-параметров ноды** ([common/common.sh](common/common.sh)): `node_ssh_user_valid`, `node_ssh_host_valid` (шаблоны `NODE_SSH_USER_RE`, `NODE_SSH_HOST_RE`). Логин и адрес ноды проверяются ими везде — и при `node add`, и при загрузке сохранённой ноды; не писать свои регулярные выражения.
 
 **Зависимости** ([common/ensure-deps.sh](common/ensure-deps.sh)):
 - `ensure_dep bin...` — проверить и при необходимости поставить через текущий PM (apt/dnf/yum/pacman/zypper/apk/brew/termux).
@@ -34,8 +39,9 @@ Bash-проект для настройки прокси-сервера на я�
 
 **TLS** ([common/cert.sh](common/cert.sh)):
 - `ensure_acme_installed email` — установить acme.sh с Let's Encrypt.
-- `issue_cert domain webroot is_ip` — HTTP-01 через webroot (для IP — shortlived профиль).
-- `install_cert domain reload_cmd` — выложить серт в `/etc/nginx/ssl` и привязать reload.
+- `ensure_cert identity webroot is_ip [cert_dir …]` — единственный владелец выдачи, установки и продления: HTTP-01 через webroot (для IP — shortlived профиль), при ошибке откатывает файлы и регистрации.
+- `release_cert identity webroot [cert_dir …]` — снять сертификат и связанную настройку продления.
+- `acme_select_email` / `acme_email_valid email` — выбор и проверка ACME email.
 
 **Пользователи listener'а mihomo** ([common/listener-users.sh](common/listener-users.sh)):
 - `_sync_listener_users marker users_yaml` — заменить блок между маркерами в YAML конфига mihomo.
@@ -46,12 +52,26 @@ Bash-проект для настройки прокси-сервера на я�
 **SSH/SCP** (только в [remote-control/](remote-control/)) — [remote-control/modules/ssh.sh](remote-control/modules/ssh.sh):
 - `ssh_run [opts] -- cmd...` — SSH с поддержкой пароля через `SSH_ASKPASS`, timeout 30s, корректный `StrictHostKeyChecking`.
 - `scp_run args...` — SCP с теми же параметрами безопасности.
-- `ssh_connect` — проверка соединения с обновлением `known_hosts` и retry.
+- `ssh_probe` — одна проверка SSH загруженной ноды без вопросов и повторов: `missing_secret`, `needs_setup`, `host_key_changed` (с отпечатками) или `remote_failed`.
 - `upload_scripts` — загрузка `setup-essence.sh`, `modules/`, `common/` на сервер с `chmod +x`.
+
+**Ядро команд** (только в [remote-control/](remote-control/), [state.sh](remote-control/modules/state.sh), [cli.sh](remote-control/modules/cli.sh)):
+- `rc_fail CODE MSG [EXTRA]` — ошибка команды: код из списка (`docs/remote-control.md`), сообщение, JSON-поля EXTRA. Решение, которое раньше спрашивалось посреди операции, — код `…_required` с EXTRA, а не вопрос.
+- `rc_confirm_gate` — подтверждение опасного действия: по `CORE_PLAN_LINES` (и `CORE_PLAN_EXTRA`, `CORE_PLAN_DATA`) без `--yes` отвечает `confirmation_required` с `plan` и `plan_token`, при изменившемся плане — `plan_changed`.
+- `rc_secret NAME` — значение секрета запроса; секреты не попадают в argv внешних программ, журнал и `CLI_DATA`.
+- `state_action LABEL fn args…` / `rc_locked` — единственный способ изменять состояние под блокировкой и с checkpoint.
+- `rc_dispatch ARGV…` — единый диспетчер обоих транспортов (разовый CLI и `serve`).
+
+**TUI** ([remote-control/tui/client.sh](remote-control/tui/client.sh)):
+- `tui_call ARGV…` — запрос к `serve`; результат в `TUI_OK`, `TUI_CODE`, `TUI_DATA`, `TUI_ERROR` (читать `tui_q`/`tui_eq`).
+- `tui_run_confirmed TITLE QUESTION ARGV…` — план из ответа команды, один `confirm_yn … N`, повтор с `--yes --plan-token`.
+- `tui_secret NAME VALUE` / `tui_secrets_clear` — секреты только полем `secrets` запроса.
+- `tui_pick_node|client|group`, `tui_toggle_nodes`, `tui_handle_node_codes` — общие виджеты (вместо `node_pick`).
 
 **Ноды** — [remote-control/modules/nodes.sh](remote-control/modules/nodes.sh):
 - `node_load idx` — загружает ноду в переменные `NODE_NAME`, `SERVER_IP`, `SERVER_PORT`, `SERVER_USER`, `SERVER_AUTH`, `SERVER_PASS`, `NODE_TAG`.
 - `node_load_by_name name` — то же по имени.
+- `_node_name_valid` / `_node_tag_valid` — единственная проверка имени (латиница, цифры, `.`, `_`, `-`) и тега (до 32 символов, без управляющих и служебных символов) для `node add`, `node rename`, `node tag`.
 - `node_pass_encode` / `node_pass_decode` — AES-256-CBC + PBKDF2, ключ из `/etc/machine-id`. Пароли в `config.json` всегда шифрованные.
 
 ## Конвенции кода
@@ -59,6 +79,7 @@ Bash-проект для настройки прокси-сервера на я�
 - UI и пользовательские сообщения — **на русском**.
 - ANSI-цвета и префиксы — только из `common.sh` (`[*] [✓] [!] [✗]`). Новые префиксы не вводить.
 - `set -euo pipefail`: **есть** в установщиках (`install-essence.sh`, `install-remote-control.sh`); **нет** в основных entrypoints (`setup-essence.sh`, `remote-control-essence.sh`) — они полагаются на `error()` → `exit 1`. Сохранять этот паттерн, не добавлять `set -e` в существующие entrypoints.
+- Модули `remote-control/modules/` не задают вопросов (`read`, `confirm_yn`, `menu_select`, `toggle_select`, `box_*`, `review_frame`): решения — коды `_required`, подтверждения — `rc_confirm_gate`. Вопросы и меню — только в `remote-control/tui/` и `setup-essence/`.
 - Меню: каждая опция — отдельная `case`-ветка. Wildcard `*)` должен **выводить ошибку**, не молча принимать ввод.
 - Чувствительные tmp-файлы — под `umask 077`.
 - Хост-разработка на Windows, цель — Debian/Ubuntu. CRLF может попасть в строки от `jq`/`read` — поэтому `jq_r`, а не `jq -r`.
@@ -80,6 +101,7 @@ teardown() { teardown_test_env; }
 
 Помощники:
 - [tests/helpers/test_helper.bash](tests/helpers/test_helper.bash) — `setup_test_env`/`teardown_test_env`, `source_common`/`source_module`, `load_fixture_config`/`load_fixture_template`/`load_fixture_client_config`, `override_pass_key` (детерминизм шифрования).
+- [tests/helpers/cmd_helper.bash](tests/helpers/cmd_helper.bash) — тесты команд: `load_core` (модули в порядке entrypoint), `open_local_session`, `run_cmd ARGV…` (выполняет `rc_dispatch` в текущем shell; результат — `status`, `output`, `CMD_ENVELOPE`), `cmd_jq FILTER`. Секреты — переменная `RC_REQUEST_SECRETS` перед `run_cmd`.
 - [tests/helpers/mock_ssh.bash](tests/helpers/mock_ssh.bash) — моки `ssh_run`/`scp_run`/`upload_scripts`. Управление через `SSH_RUN_CALLS`, `SSH_RUN_MOCK_OUTPUT`, `SSH_RUN_MOCK_EXIT`, `reset_ssh_mocks`. **Реальные SSH в тестах запрещены.**
 - [tests/helpers/fuzz_helper.bash](tests/helpers/fuzz_helper.bash) — словари (`DICT_SHELL_INJECTION`, `DICT_PATH_TRAVERSAL`, `DICT_FORMAT_STRINGS`, `DICT_UTF8_EDGE`, `DICT_BOUNDARY`) и генераторы (`random_int`, `random_string`, `random_utf8`, `mutate_inject`, `fuzz_mutated_input`).
 
@@ -89,6 +111,7 @@ Fuzz проверяет **инварианты**: round-trip (`decode(encode(x))
 
 Правила:
 - Новая функция валидации / парсер / энкодер — должна получить unit-тест. Парсеры и энкодеры — ещё и fuzz.
+- Новая или изменённая команда ядра — тесты через `run_cmd` в `tests/unit/cmd_*.bats` (`cmd_system`, `cmd_nodes`, `cmd_node_harden`, `cmd_conn`, `cmd_clients`, `cmd_generate`, `cmd_subscriptions`): нет решения → код `_required` и состояние не изменено, без `--yes` → `confirmation_required`, успех → данные и состояние, сбой посередине → откат или `partial`. Протокол `serve`, разбор argv, конверт и рендерер — `cli_contract.bats`; экраны `tui/` — `tui.bats` с заглушкой `tui_call`.
 - Тест упал → чинить код, а не подгонять ожидания теста.
 
 ## Перед сдачей задачи

@@ -77,7 +77,7 @@ _state_secret_decode() (
     machine_id=$(cat /etc/machine-id 2>/dev/null || hostname)
     key=$(printf '%s' "rcm-${machine_id}" | openssl dgst -sha256 -r | cut -d' ' -f1) || return 1
     printf '%s' "$1" | base64 -d 2>/dev/null |
-        openssl enc -aes-256-cbc -d -pbkdf2 -k "$key" 2>/dev/null
+        openssl enc -aes-256-cbc -d -pbkdf2 -pass fd:3 3<<< "$key" 2>/dev/null
 )
 
 _state_secret_encode() (
@@ -89,7 +89,7 @@ _state_secret_encode() (
     local machine_id key
     machine_id=$(cat /etc/machine-id 2>/dev/null || hostname)
     key=$(printf '%s' "rcm-${machine_id}" | openssl dgst -sha256 -r | cut -d' ' -f1) || return 1
-    printf '%s' "$1" | openssl enc -aes-256-cbc -pbkdf2 -k "$key" 2>/dev/null |
+    printf '%s' "$1" | openssl enc -aes-256-cbc -pbkdf2 -pass fd:3 3<<< "$key" 2>/dev/null |
         base64 | tr -d '\n'
 )
 
@@ -222,7 +222,7 @@ _migrate_state_1_to_2() {
             }
             secret_id="node:${id}:ssh-password"
             local encoded_json
-            encoded_json=$(jq --arg k "$secret_id" --arg v "$pass" '.node_passwords[$k]=$v' "$secrets_tmp") || {
+            encoded_json=$(printf '%s' "$pass" | jq -Rs --arg k "$secret_id" --slurpfile s "$secrets_tmp" '. as $v | $s[0] | .node_passwords[$k]=$v') || {
                 rm -rf "$migration_dir"; return 1;
             }
             printf '%s\n' "$encoded_json" > "$secrets_tmp"
@@ -246,12 +246,12 @@ _migrate_state_1_to_2() {
         rm -rf "$migration_dir"; return 1;
     }
 
-    local minimum script_password_hash=""
+    local minimum script_auth_hash=""
     minimum=$(jq -r '.minimum_remote_control_version // empty' "$CONFIG_JSON")
     [[ -s "${SCRIPT_AUTH_FILE:-}" ]] &&
-        script_password_hash=$(tr -d '\r\n' < "$SCRIPT_AUTH_FILE")
-    jq -n --arg min "$minimum" --arg password_hash "$script_password_hash" \
-        '{schema_version:2,minimum_remote_control_version:(if $min=="" then null else $min end),portability:{status:"ready",issues:[]},access:{script_password_hash:(if $password_hash=="" then null else $password_hash end)},templates:{}}' \
+        script_auth_hash=$(tr -d '\r\n' < "$SCRIPT_AUTH_FILE")
+    jq -n --arg min "$minimum" --arg auth_hash "$script_auth_hash" \
+        '{schema_version:2,minimum_remote_control_version:(if $min=="" then null else $min end),portability:{status:"ready",issues:[]},access:{script_password_hash:(if $auth_hash=="" then null else $auth_hash end)},templates:{}}' \
         > "$manifest_tmp" || {
         rm -rf "$migration_dir"; return 1;
     }
@@ -343,16 +343,15 @@ state_validate() {
         return 1
     }
 
-    jq -e '
+    jq -e --arg ure "$NODE_SSH_USER_RE" --arg hre "$NODE_SSH_HOST_RE" '
         . as $root |
         ($root.nodes|type=="array") and ($root.groups|type=="array") and
         ($root.clients|type=="array") and ($root.connections|type=="array") and
         ($root.nodes | all(.[]; (
           (.id|type=="string" and test("^[0-9a-fA-F]{32}$")) and
           (.name|type=="string" and length>0) and
-          (.ip|type=="string" and length>0) and
           (.port|type=="number" and floor==. and . >= 1 and . <= 65535) and
-          (.user|type=="string" and length>0) and
+          '"$NODE_SSH_FIELDS_JQ"' and
           (.auth|type=="string" and test("^(key|password)$")) and
           ((.aliases // {})|type=="object")
         ))) and
@@ -443,8 +442,8 @@ state_validate() {
     done < <(jq -c '.nodes[]' "$CONFIG_JSON")
     fi
 
-    local declared issues_json detected_json password_issues
-    password_issues=$(_state_password_issues "$CONFIG_JSON" "$SECRETS_JSON") || return 1
+    local declared issues_json detected_json node_issues
+    node_issues=$(_state_password_issues "$CONFIG_JSON" "$SECRETS_JSON") || return 1
     declared=$(_state_declared_portability) || return 1
     jq -e '(.status=="ready" or .status=="needs_setup") and
         (.issues|type=="array") and
@@ -455,8 +454,8 @@ state_validate() {
         warn "portability содержит некорректные issue."
         return 1
     }
-    issues_json=$(jq -c --argjson passwords "$password_issues" \
-        '[.issues[] | select(.reason!="missing_secret")] + $passwords |
+    issues_json=$(jq -c --argjson secret_issues "$node_issues" \
+        '[.issues[] | select(.reason!="missing_secret")] + $secret_issues |
          unique | sort_by([.node_id,.reason])' <<< "$declared") || return 1
     detected_json='[]'
     if [[ "${#detected[@]}" -gt 0 ]]; then
@@ -685,7 +684,8 @@ node_secret_set() {
     encoded=$(_state_secret_encode "$plaintext") || return 1
     [[ -n "$encoded" ]] || return 1
     tmp="${SECRETS_JSON}.tmp.$$"
-    if ! jq --arg id "$secret_id" --arg value "$encoded" \
+    # Шифротекст — через stdin, не в argv jq (/proc/<pid>/cmdline).
+    if ! printf '%s' "$encoded" | jq --arg id "$secret_id" --rawfile value /dev/stdin \
         '.schema_version=(.schema_version // 1) | .node_passwords=(.node_passwords // {}) | .node_passwords[$id]=$value' \
         "$SECRETS_JSON" > "$tmp"; then
         rm -f "$tmp"
@@ -710,8 +710,8 @@ node_secret_delete() {
 state_checkpoint() {
     [[ -f "$CONFIG_JSON" ]] || return 1
     _state_ensure_dirs || return 1
-    local tmp existing minimum password_issues script_password_hash=""
-    password_issues=$(_state_password_issues "$CONFIG_JSON" "$SECRETS_JSON") || return 1
+    local tmp existing minimum node_issues script_auth_hash=""
+    node_issues=$(_state_password_issues "$CONFIG_JSON" "$SECRETS_JSON") || return 1
     umask 077
     tmp="${STATE_MANIFEST}.tmp.$$"
     existing='{}'
@@ -721,12 +721,12 @@ state_checkpoint() {
     minimum=$(jq -r '.minimum_remote_control_version // empty' <<< "$existing" 2>/dev/null || true)
     [[ -n "$minimum" ]] || minimum="${CURRENT_VERSION:-0.0.0}"
     [[ -s "${SCRIPT_AUTH_FILE:-}" ]] &&
-        script_password_hash=$(tr -d '\r\n' < "$SCRIPT_AUTH_FILE")
+        script_auth_hash=$(tr -d '\r\n' < "$SCRIPT_AUTH_FILE")
     if ! jq -n --argjson old "$existing" --arg min "$minimum" \
-        --arg password_hash "$script_password_hash" --argjson passwords "$password_issues" \
-        '([$old.portability.issues[]? | select(.reason!="missing_secret")] + $passwords |
+        --arg auth_hash "$script_auth_hash" --argjson secret_issues "$node_issues" \
+        '([$old.portability.issues[]? | select(.reason!="missing_secret")] + $secret_issues |
           unique | sort_by([.node_id,.reason])) as $issues |
-         {schema_version:2,minimum_remote_control_version:$min,portability:{status:(if ($issues|length)>0 then "needs_setup" else "ready" end),issues:$issues},access:{script_password_hash:(if $password_hash=="" then null else $password_hash end)},templates:($old.templates // {})}' > "$tmp"; then
+         {schema_version:2,minimum_remote_control_version:$min,portability:{status:(if ($issues|length)>0 then "needs_setup" else "ready" end),issues:$issues},access:{script_password_hash:(if $auth_hash=="" then null else $auth_hash end)},templates:($old.templates // {})}' > "$tmp"; then
         rm -f "$tmp"
         return 1
     fi
@@ -787,10 +787,227 @@ state_portability_remove_node() {
     state_portability_set_issues "$updated"
 }
 
-# state_action is intentionally transport-agnostic. github-config.sh may wrap
-# it with a stronger snapshot/flush implementation; local mode must remain a
-# direct call so existing menu functions retain their return values.
+# ─── Ошибки ядра ─────────────────────────────────────────────────────────────
+# Core-функции сообщают о сбое через rc_fail: код (машиночитаемый литерал),
+# сообщение (русский текст) и необязательный JSON-объект с подробностями.
+RC_ERROR_CODE=""
+RC_ERROR_MESSAGE=""
+RC_ERROR_EXTRA=""
+
+rc_error_reset() {
+    RC_ERROR_CODE=""
+    RC_ERROR_MESSAGE=""
+    RC_ERROR_EXTRA=""
+}
+
+# RC_QUIET_DECISIONS=1 (serve, CLI с --json): коды-решения (*_required,
+# plan_changed) не печатаются — их обрабатывает интерфейс. Переводы строк в
+# сообщении сводятся к одному пробелу: журнал serve построчный, и чужой текст
+# (имя, вывод сервера) не должен порождать отдельное событие.
+rc_fail() {
+    local message="${2:-}"
+    message="${message//$'\r'/$'\n'}"
+    while [[ "$message" == *$'\n\n'* ]]; do
+        message="${message//$'\n\n'/$'\n'}"
+    done
+    RC_ERROR_CODE="${1:-failed}"
+    RC_ERROR_MESSAGE="${message//$'\n'/ }"
+    RC_ERROR_EXTRA="${3:-}"
+    if [[ -n "$RC_ERROR_MESSAGE" ]]; then
+        if [[ "${RC_QUIET_DECISIONS:-0}" != 1 ]] ||
+           [[ "$RC_ERROR_CODE" != plan_changed && "$RC_ERROR_CODE" != *_required ]]; then
+            warn "$RC_ERROR_MESSAGE"
+        fi
+    fi
+    return 1
+}
+
+# ─── Подтверждение по плану ──────────────────────────────────────────────────
+# Вход: CORE_PLAN_LINES (строки плана), CORE_PLAN_EXTRA (строка, влияющая на
+# токен, но не на текст плана), CORE_PLAN_DATA (JSON-объект в EXTRA ошибки).
+# Токен — первые 16 hex SHA-256 от RC_CONFIRM_SCOPE, строк плана и
+# CORE_PLAN_EXTRA. Без --yes → confirmation_required; --yes с чужим токеном →
+# plan_changed; иначе rc 0 и команда выполняется.
+CORE_PLAN_LINES=()
+CORE_PLAN_EXTRA=""
+CORE_PLAN_DATA='{}'
+RC_CONFIRM_YES=0
+RC_CONFIRM_TOKEN=""
+RC_CONFIRM_SCOPE=""
+
+rc_plan_token() {
+    local digest
+    digest=$({
+        printf '%s\n' "$RC_CONFIRM_SCOPE"
+        (( ${#CORE_PLAN_LINES[@]} == 0 )) || printf '%s\n' "${CORE_PLAN_LINES[@]}"
+        printf '%s' "$CORE_PLAN_EXTRA"
+    } | openssl dgst -sha256) || return 1
+    digest="${digest##* }"
+    [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s' "${digest:0:16}"
+}
+
+rc_confirm_gate() {
+    local token plan extra data="${CORE_PLAN_DATA:-}"
+    if ! token=$(rc_plan_token); then
+        rc_fail failed "Не удалось вычислить токен плана."
+        return 1
+    fi
+    if (( ${#CORE_PLAN_LINES[@]} == 0 )); then
+        plan='[]'
+    else
+        plan=$(printf '%s\n' "${CORE_PLAN_LINES[@]}" | jq -R . | jq -sc .) || plan='[]'
+    fi
+    printf '%s' "$data" | jq -e 'type == "object"' >/dev/null 2>&1 || data='{}'
+    extra=$(jq -cn --argjson d "$data" --argjson p "$plan" --arg t "$token" \
+        '$d + {plan:$p, plan_token:$t}') || extra='{}'
+    if [[ "${RC_CONFIRM_YES:-0}" != 1 ]]; then
+        rc_fail confirmation_required "Требуется подтверждение: повторите команду с --yes." "$extra"
+        return 1
+    fi
+    if [[ -n "${RC_CONFIRM_TOKEN:-}" && "$RC_CONFIRM_TOKEN" != "$token" ]]; then
+        rc_fail plan_changed "План изменился: проверьте его и подтвердите заново." "$extra"
+        return 1
+    fi
+    return 0
+}
+
+# ─── Блокировка конфигурации ─────────────────────────────────────────────────
+# mkdir-лок (flock нет на macOS). session — на весь процесс (GitHub-режим),
+# mutation — на время одной записи. Повторный захват в том же процессе
+# реентерабелен, чтобы вложенные state_action не блокировали сами себя.
+_RC_LOCK_DEPTH=0
+_RC_LOCK_SESSION=0
+
+_rc_lock_dir() { printf '%s/.rc-lock' "$CONFIG_DIR"; }
+
+_rc_lock_write_owner() {
+    local dir="$1" kind="$2" label="$3" started
+    started=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+    (umask 077; printf 'pid=%s\nkind=%s\nlabel=%s\nstarted=%s\n' "$$" "$kind" "$label" "$started" \
+        > "$dir/owner.tmp" && mv -f "$dir/owner.tmp" "$dir/owner")
+}
+
+_rc_lock_owner_field() {
+    local file="$1" key="$2" line
+    [[ -f "$file" ]] || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" == "$key="* ]] && { printf '%s' "${line#*=}"; return 0; }
+    done < "$file"
+    return 1
+}
+
+rc_lock_acquire() {
+    local kind="${1:-mutation}" label="${2:-}" dir pid owner_kind owner_label deadline now stale wait_s
+    dir=$(_rc_lock_dir)
+    if (( _RC_LOCK_DEPTH > 0 )); then
+        if [[ "$kind" == session ]]; then
+            _rc_lock_write_owner "$dir" session "$label" || true
+            _RC_LOCK_SESSION=1
+        fi
+        _RC_LOCK_DEPTH=$((_RC_LOCK_DEPTH + 1))
+        return 0
+    fi
+    if [[ ! -d "$CONFIG_DIR" ]]; then
+        (umask 077; mkdir -p "$CONFIG_DIR") || return 1
+    fi
+    now=$(date +%s)
+    # Только целое число секунд: иначе значение окружения вычислялось бы как
+    # арифметика (5s, 1+ — аварийное завершение; подстановки — выполнение кода).
+    wait_s="${RC_LOCK_WAIT:-30}"
+    [[ "$wait_s" =~ ^[0-9]{1,6}$ ]] || wait_s=30
+    deadline=$((now + 10#$wait_s))
+    while :; do
+        if mkdir "$dir" 2>/dev/null; then
+            if ! _rc_lock_write_owner "$dir" "$kind" "$label"; then
+                rm -rf "$dir"
+                rc_fail locked "Не удалось записать владельца блокировки конфигурации."
+                return 1
+            fi
+            _RC_LOCK_DEPTH=1
+            [[ "$kind" == session ]] && _RC_LOCK_SESSION=1
+            return 0
+        fi
+        pid=$(_rc_lock_owner_field "$dir/owner" pid) || pid=""
+        stale=false
+        if [[ -z "$pid" ]]; then
+            # Владелец ещё не записан: свежий каталог — чужой захват в процессе.
+            [[ -n "$(find "$dir" -maxdepth 0 -mmin +1 2>/dev/null)" ]] && stale=true
+        elif [[ "$pid" == "$$" ]] || ! kill -0 "$pid" 2>/dev/null; then
+            # pid == $$ при нулевой глубине: лок остался от завершённого
+            # подпроцесса этого же процесса ($$ в подоболочке — PID родителя).
+            stale=true
+        fi
+        if [[ "$stale" == true ]]; then
+            rm -rf "$dir.stale.$$" 2>/dev/null
+            if mv "$dir" "$dir.stale.$$" 2>/dev/null; then
+                rm -rf "$dir.stale.$$"
+                continue
+            fi
+        fi
+        owner_kind=$(_rc_lock_owner_field "$dir/owner" kind) || owner_kind=""
+        owner_label=$(_rc_lock_owner_field "$dir/owner" label) || owner_label=""
+        now=$(date +%s)
+        if [[ "$owner_kind" == session ]] || (( now >= deadline )); then
+            rc_fail locked "Конфигурация занята другим процессом (PID ${pid:-?}: ${owner_label:-?}). Повторите после его завершения."
+            return 1
+        fi
+        sleep 0.2
+    done
+}
+
+_rc_lock_remove_own() {
+    local dir pid
+    dir=$(_rc_lock_dir)
+    [[ -d "$dir" ]] || return 0
+    pid=$(_rc_lock_owner_field "$dir/owner" pid) || return 0
+    [[ "$pid" == "$$" ]] && rm -rf "$dir"
+    return 0
+}
+
+rc_lock_release() {
+    (( _RC_LOCK_DEPTH > 0 )) || return 0
+    _RC_LOCK_DEPTH=$((_RC_LOCK_DEPTH - 1))
+    if (( _RC_LOCK_DEPTH == 0 && _RC_LOCK_SESSION == 0 )); then
+        _rc_lock_remove_own
+    fi
+    return 0
+}
+
+rc_lock_release_all() {
+    _rc_lock_remove_own
+    _RC_LOCK_DEPTH=0
+    _RC_LOCK_SESSION=0
+}
+
+rc_locked() {
+    local label="$1" rc=0
+    shift
+    rc_lock_acquire mutation "$label" || return 1
+    "$@" || rc=$?
+    rc_lock_release
+    return "$rc"
+}
+
+# state_action: лок на одну мутацию + транспорт-специфичное тело.
+# _state_action_run в local-режиме — прямой вызов с локальной точкой
+# восстановления; github-config.sh переопределяет его snapshot/flush-версией.
 state_action() {
+    rc_error_reset
+    rc_lock_acquire mutation "$1" || return 1
+    local rc=0
+    _state_action_run "$@" || rc=$?
+    rc_lock_release
+    return "$rc"
+}
+
+# Изменение записано в конфигурацию: успех или partial (конфиг уже изменён,
+# не удались только последующие шаги) — такое состояние тоже сохраняется.
+_state_action_persists() {
+    [[ "$1" -eq 0 || "${RC_ERROR_CODE:-}" == partial ]]
+}
+
+_state_action_run() {
     local label="$1" function="$2"
     shift 2
     [[ -n "$function" ]] || return 1
@@ -800,7 +1017,7 @@ state_action() {
     }
     "$function" "$@"
     local rc=$?
-    if [[ "$CONFIG_SOURCE" == "local" && $rc -eq 0 ]]; then
+    if [[ "$CONFIG_SOURCE" == "local" ]] && _state_action_persists "$rc"; then
         if ! state_checkpoint >/dev/null; then
             warn "Не удалось сохранить локальную точку восстановления. Проверьте результат операции перед повтором."
             return 1

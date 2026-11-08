@@ -1,117 +1,6 @@
 #!/bin/bash
 # ─── Генерация клиентских конфигов ─────────────────────────────────────────
 
-edit_template() {
-    local templates=() template_name
-    while IFS= read -r template_name; do
-        [[ -n "$template_name" ]] && templates+=("$template_name")
-    done < <(_list_templates)
-    while true; do
-        echo ""
-        box_top
-        box_center "Редактирование шаблона"
-        box_mid
-        if [[ ${#templates[@]} -eq 0 ]]; then
-            box_line " Нет шаблонов" " ${DIM}Нет шаблонов${NC}"
-            box_mid
-        else
-            for (( i=0; i<${#templates[@]}; i++ )); do
-                menu_item "$((i+1))" "${templates[$i]}" CYAN
-            done
-        fi
-        menu_item n "Создать новый шаблон" GREEN
-        menu_item 0 "Отмена" NC
-        box_bot
-        echo ""
-        local TPL_CHOICE
-        if ! IFS= read -rp "  Выберите шаблон: " TPL_CHOICE; then
-            return 1
-        fi
-        TPL_CHOICE="${TPL_CHOICE%$'\r'}"
-        local template="" source=""
-        mkdir -p "$TEMPLATES_DIR" || return 1
-        if [[ "$TPL_CHOICE" == n || "$TPL_CHOICE" == N ]]; then
-            IFS= read -rp "  Имя нового шаблона (без .yaml): " TPL_NAME || return 1
-            TPL_NAME="${TPL_NAME%$'\r'}"
-            if [[ -z "$TPL_NAME" || ! "$TPL_NAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
-                warn "Имя может содержать только буквы, цифры, точку, - и _"
-                return 1
-            fi
-            template="$TEMPLATES_DIR/${TPL_NAME}.yaml"
-            [[ -f "$template" ]] && { warn "Шаблон '${TPL_NAME}.yaml' уже существует."; return 1; }
-            source=$(_find_template "default.yaml")
-            if [[ -n "$source" ]]; then
-                cp "$source" "$template" || return 1
-            else
-                : > "$template" || return 1
-            fi
-        elif menu_index_valid "$TPL_CHOICE" "${#templates[@]}"; then
-            source=$(_find_template "${templates[$((TPL_CHOICE - 1))]}")
-            [[ -n "$source" ]] || { warn "Шаблон не найден."; return 1; }
-            template="$TEMPLATES_DIR/${templates[$((TPL_CHOICE - 1))]}"
-            [[ "$source" == "$template" ]] || cp "$source" "$template" || return 1
-        elif [[ "$TPL_CHOICE" == 0 ]]; then
-            return 1
-        else
-            warn "Неверный выбор."
-            continue
-        fi
-        if command -v nano > /dev/null 2>&1; then
-            nano "$template" || {
-                warn "Редактор завершился с ошибкой. Изменения шаблона не подтверждены."
-                return 1
-            }
-        elif command -v vi > /dev/null 2>&1; then
-            vi "$template" || {
-                warn "Редактор завершился с ошибкой. Изменения шаблона не подтверждены."
-                return 1
-            }
-        else
-            warn "Редактор не найден. Отредактируйте вручную:"
-            info "$template"
-        fi
-        return 0
-    done
-}
-
-generate_menu() {
-    while true; do
-        echo ""
-        box_top
-        box_center "Генерация конфигов"
-        box_mid
-        groups_list
-        if [[ ${#GRP_LIST[@]} -gt 0 ]]; then
-            local g tpl client_count
-            for g in "${GRP_LIST[@]}"; do
-                tpl=$(_template_name_for_group "$g")
-                client_count=$(jq_r --arg g "$g" '[.clients[] | select(.group==$g)] | length')
-                box_line " ${g}: ${tpl}, ${client_count} клиентов"
-            done
-        else
-            box_line " Нет групп" " ${DIM}Нет групп${NC}"
-        fi
-        box_mid
-        menu_item g "По группе" CYAN
-        menu_item a "Всем клиентам" CYAN
-        menu_item t "Редактировать шаблон" CYAN
-        menu_item 0 "Назад" NC
-        box_bot
-        echo ""
-        if ! IFS= read -rp "  Выберите действие: " GEN_CHOICE; then
-            return 0
-        fi
-        GEN_CHOICE="${GEN_CHOICE%$'\r'}"
-        case "$GEN_CHOICE" in
-            g|G) generate_by_group ;;
-            a|A) generate_all ;;
-            t|T) state_action "edit_template" edit_template ;;
-            0) return 0 ;;
-            *) warn "Неверный выбор." ;;
-        esac
-    done
-}
-
 GENERATE_CLIENT_OK=()
 GENERATE_CLIENT_SKIPPED=()
 GENERATE_CLIENT_FAILED=()
@@ -126,32 +15,22 @@ _generate_reset_results() {
     GENERATE_NODE_FAILED=()
 }
 
-_generate_summary() {
-    review_frame "Итог генерации" \
-        "Клиенты: готово — ${#GENERATE_CLIENT_OK[@]}; пропущено — ${#GENERATE_CLIENT_SKIPPED[@]}; ошибка — ${#GENERATE_CLIENT_FAILED[@]}" \
-        "Готово: ${GENERATE_CLIENT_OK[*]:-нет}" \
-        "Пропущено: ${GENERATE_CLIENT_SKIPPED[*]:-нет}" \
-        "Ошибка: ${GENERATE_CLIENT_FAILED[*]:-нет}" \
-        "Ноды: синхронизировано — ${#GENERATE_NODE_OK[@]}; ошибка — ${#GENERATE_NODE_FAILED[@]}" \
-        "Синхронизировано: ${GENERATE_NODE_OK[*]:-нет}" \
-        "Ошибка нод: ${GENERATE_NODE_FAILED[*]:-нет}" \
-        "Конфиги: $GENERATED_DIR/"
-    [[ -n "$(jq_r '.subscription_host.node // empty')" ]] && info "Для публикации откройте «Подписки»."
-    if [[ ${#GENERATE_CLIENT_FAILED[@]} -gt 0 || ${#GENERATE_NODE_FAILED[@]} -gt 0 ]]; then return 1; fi
-    [[ ${#GENERATE_CLIENT_SKIPPED[@]} -eq 0 ]] || warn "Часть клиентов пропущена."
-    return 0
-}
-
-generate_by_group() {
+# Генерация конфигов всех клиентов группы и синхронизация listeners на её нодах.
+core_generate_group() {
+    local group="$1"
     _generate_reset_results
     _reset_node_cache
-    select_group || return 1
-    _generate_group "$SELECTED_GROUP" || true
+    [[ -n "$group" ]] || { rc_fail usage "Не указана группа."; return 1; }
+    if [[ "$(jq_r --arg g "$group" 'any(.groups[]?; .name == $g)')" != true ]]; then
+        rc_fail not_found "Группа '$group' не найдена."
+        return 1
+    fi
+    _generate_group "$group" || true
 
     # Синхронизация per-client users на нодах группы
     local _group_nodes=()
-    local _gn_csv
-    _gn_csv=$(_group_nodes_csv "$SELECTED_GROUP")
+    local _gn_csv _cn _ex
+    _gn_csv=$(_group_nodes_csv "$group")
     IFS=',' read -ra _group_nodes <<< "$_gn_csv"
     # Добавляем кастомные ноды клиентов группы
     while IFS= read -r _cn; do
@@ -159,23 +38,53 @@ generate_by_group() {
         local _already=false
         for _ex in "${_group_nodes[@]}"; do [[ "$_ex" == "$_cn" ]] && _already=true; done
         $_already || _group_nodes+=("$_cn")
-    done < <(jq_r --arg g "$SELECTED_GROUP" '.clients[] | select(.group==$g and .inherit_nodes_from_group==false) | .nodes // [] | .[]')
+    done < <(jq_r --arg g "$group" '.clients[] | select(.group==$g and .inherit_nodes_from_group==false) | .nodes // [] | .[]')
     if [[ ${#_group_nodes[@]} -gt 0 ]]; then
         _sync_listeners_on_nodes "${_group_nodes[@]}" || true
     fi
 
-    _generate_summary
+    _generate_result
+}
+
+# Генерация конфига одного клиента и синхронизация listeners на его нодах.
+core_generate_client() {
+    local client="$1" group nodes_csv
+    local -a nodes=()
+    _generate_reset_results
+    _reset_node_cache
+    [[ -n "$client" ]] || { rc_fail usage "Не указан клиент."; return 1; }
+    group=$(jq_r --arg n "$client" 'first(.clients[] | select(.name==$n) | .group) // empty')
+    if [[ -z "$group" ]]; then
+        rc_fail not_found "Клиент '$client' не найден."
+        return 1
+    fi
+    _generate_group "$group" "$client" || true
+
+    nodes_csv=$(_collect_client_nodes "$client")
+    IFS=',' read -ra nodes <<< "$nodes_csv"
+    if [[ ${#nodes[@]} -gt 0 ]]; then
+        _sync_listeners_on_nodes "${nodes[@]}" || true
+    fi
+
+    _generate_result
+}
+
+# rc 1, если есть ошибки по клиентам или нодам.
+_generate_result() {
+    [[ ${#GENERATE_CLIENT_FAILED[@]} -eq 0 && ${#GENERATE_NODE_FAILED[@]} -eq 0 ]]
 }
 
 generate_all() {
+    local -a groups=()
+    local g
     _generate_reset_results
     _reset_node_cache
-    echo ""
-    groups_list
-    if [[ ${#GRP_LIST[@]} -eq 0 ]]; then
+    while IFS= read -r g; do
+        [[ -n "$g" ]] && groups+=("$g")
+    done < <(jq_r '.groups[].name')
+    if [[ ${#groups[@]} -eq 0 ]]; then
         warn "Нет групп."
-        _generate_summary
-        return $?
+        return 0
     fi
 
     # Собрать все уникальные ноды и клиентов по всем группам заранее,
@@ -183,7 +92,7 @@ generate_all() {
     local all_client_names=()
     local all_unique_nodes=()
 
-    for g in "${GRP_LIST[@]}"; do
+    for g in "${groups[@]}"; do
         local _gnodes_csv
         _gnodes_csv=$(_group_nodes_csv "$g")
         local -a _gnodes
@@ -223,14 +132,50 @@ generate_all() {
     _prefetch_node_configs "${all_unique_nodes[@]}"
 
     # Генерация (0 SSH — всё в кеше)
-    for g in "${GRP_LIST[@]}"; do
+    for g in "${groups[@]}"; do
         _generate_group "$g" || true
     done
 
     # Синхронизация per-client users на нодах
     _sync_listeners_on_nodes "${all_unique_nodes[@]}" || true
-    _generate_summary
+    _generate_result
 }
+
+# ─── Проверка данных из конфигурации ────────────────────────────────────────
+# generate.sh подключается и без clients.sh (тесты генерации), поэтому правила
+# путей и учётных данных живут здесь; clients.sh использует их во время работы.
+
+# Имя группы или клиента как компонент пути в $GENERATED_DIR — то же правило,
+# что _validate_client_name (clients.sh).
+_generated_name_valid() {
+    [[ "${1:-}" =~ ^[a-zA-Z0-9._-]+$ && ! "$1" =~ ^\.+$ ]]
+}
+
+# Учётные данные клиента проверяются при каждом чтении: конфигурация может
+# прийти из GitHub, а значения попадают в YAML клиента и listener'ов нод.
+# uuid — канонический вид uuidgen; пароль Hysteria2 генерируется как 32 hex,
+# допускаются и прежние значения из [A-Za-z0-9_-] (без метасимволов).
+_client_vless_uuid_valid() {
+    [[ "${1:-}" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]
+}
+
+_client_hy2_password_valid() {
+    [[ "${1:-}" =~ ^[A-Za-z0-9_-]{1,128}$ ]]
+}
+
+# 0, если PATH лежит строго внутри $GENERATED_DIR: без компонентов . и .., а
+# физический каталог-родитель (cd -P, симлинки раскрыты) — внутри физического
+# $GENERATED_DIR. Проверяется перед mv/rm -rf каталогов клиентов.
+_generated_path_safe() {
+    local path="${1:-}" rel root parent
+    [[ -n "${GENERATED_DIR:-}" && "$path" == "$GENERATED_DIR"/?* ]] || return 1
+    rel="${path#"$GENERATED_DIR"/}"
+    case "/$rel/" in */./*|*/../*|*//*) return 1 ;; esac
+    root=$(CDPATH='' cd -P -- "$GENERATED_DIR" 2>/dev/null && pwd) || return 1
+    parent=$(CDPATH='' cd -P -- "${path%/*}" 2>/dev/null && pwd) || return 1
+    [[ "$parent" == "$root" || "$parent" == "$root"/* ]]
+}
+
 # ─── Кеш конфигов нод ──────────────────────────────────────────────────────
 NODE_CONFIG_CACHE_KEYS=()
 NODE_CONFIG_CACHE_VALUES=()
@@ -425,8 +370,17 @@ _render_client_config() {
     [[ -z "$proxy_entries" || "$found_anchor" -eq 1 ]]
 }
 
+# _generate_group GROUP [ONLY_CLIENT] — с ONLY_CLIENT обрабатывается только этот клиент группы.
 _generate_group() {
-    local group="$1"
+    local group="$1" only_client="${2:-}"
+    if ! _generated_name_valid "$group"; then
+        warn "Недопустимое имя группы '$group' в конфигурации — конфиги группы не сгенерированы."
+        local invalid
+        while IFS= read -r invalid; do
+            [[ -n "$invalid" ]] && GENERATE_CLIENT_FAILED+=("$invalid")
+        done < <(jq_r --arg g "$group" --arg only "$only_client" '.clients[] | select(.group==$g and ($only == "" or .name == $only)) | .name')
+        return 1
+    fi
     local tpl_name
     tpl_name=$(_template_name_for_group "$group")
     local template
@@ -437,7 +391,7 @@ _generate_group() {
         local skipped
         while IFS= read -r skipped; do
             [[ -n "$skipped" ]] && GENERATE_CLIENT_SKIPPED+=("$skipped")
-        done < <(jq_r --arg g "$group" '.clients[] | select(.group==$g) | .name')
+        done < <(jq_r --arg g "$group" --arg only "$only_client" '.clients[] | select(.group==$g and ($only == "" or .name == $only)) | .name')
         return 0
     fi
 
@@ -449,11 +403,15 @@ _generate_group() {
     local group_clients=()
     while IFS= read -r client_line; do
         group_clients+=("$client_line")
-    done < <(jq_r --arg g "$group" \
-        '.clients[] | select(.group==$g) | "\(.name)|\(.group)|\(if .inherit_nodes_from_group == false then false else true end)|\(.nodes // [] | join(","))"')
+    done < <(jq_r --arg g "$group" --arg only "$only_client" \
+        '.clients[] | select(.group==$g and ($only == "" or .name == $only)) | "\(.name)|\(.group)|\(if .inherit_nodes_from_group == false then false else true end)|\(.nodes // [] | join(","))"')
 
     if [[ ${#group_clients[@]} -eq 0 ]]; then
-        warn "В группе $group нет клиентов — пропускаю."
+        if [[ -n "$only_client" ]]; then
+            warn "Клиент $only_client не найден в группе $group — пропускаю."
+        else
+            warn "В группе $group нет клиентов — пропускаю."
+        fi
         return 0
     fi
 
@@ -461,6 +419,7 @@ _generate_group() {
 
     # Фаза 1: собираем уникальные ноды и имена клиентов
     local all_nodes_csv="$group_nodes_csv"
+    [[ -n "$only_client" ]] && all_nodes_csv=""
     local client_names=()
     for client_line in "${group_clients[@]}"; do
         local cname="${client_line%%|*}"
@@ -471,6 +430,8 @@ _generate_group() {
         local client_own_nodes="${rest#*|}"
         if [[ "$client_inherit" != "true" && -n "$client_own_nodes" ]]; then
             all_nodes_csv="${all_nodes_csv},${client_own_nodes}"
+        elif [[ "$client_inherit" == "true" && -n "$only_client" ]]; then
+            all_nodes_csv="${all_nodes_csv},${group_nodes_csv}"
         fi
     done
 
@@ -514,8 +475,14 @@ _generate_group() {
             client_nodes="$client_own_nodes"
         fi
 
+        if ! _generated_name_valid "$client_name"; then
+            warn "Недопустимое имя клиента '$client_name' в конфигурации — config.yaml не сгенерирован"
+            GENERATE_CLIENT_FAILED+=("$client_name")
+            rc=1
+            continue
+        fi
         local client_dir="$GENERATED_DIR/$group/$client_name"
-        if ! mkdir -p "$client_dir"; then
+        if ! mkdir -p "$client_dir" || ! _generated_path_safe "$client_dir"; then
             warn "$client_name — config.yaml не сгенерирован"
             GENERATE_CLIENT_FAILED+=("$client_name")
             rc=1
@@ -592,6 +559,19 @@ _generate_group() {
     return "$rc"
 }
 
+# _yaml_set_field FIELD VALUE — stdin → stdout: в строках с «    FIELD: …» всё от
+# первого вхождения заменяется на «    FIELD: VALUE» (как sed s/…/…/, но значение
+# не интерпретируется и не попадает в argv).
+_yaml_set_field() {
+    local field="$1" value="$2" line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == *"    $field: "* ]]; then
+            line="${line%%"    $field: "*}    $field: $value"
+        fi
+        printf '%s\n' "$line"
+    done
+}
+
 _fetch_proxies_for_client() {
     local client_name="$1"
     local client_group="$2"
@@ -601,10 +581,16 @@ _fetch_proxies_for_client() {
     local -a node_names _cc allowed
     local nname _p conn_name
 
-    # Per-client credentials для подстановки в proxy-блоки
+    # Per-client credentials для подстановки в proxy-блоки (проверяются: значения
+    # из конфигурации попадают в YAML клиента)
     local _client_vless_uuid _client_hy2_pass
     _client_vless_uuid=$(jq_r --arg c "$client_name" '.clients[] | select(.name==$c) | .credentials.vless_uuid // ""')
     _client_hy2_pass=$(jq_r --arg c "$client_name" '.clients[] | select(.name==$c) | .credentials.hy2_password // ""')
+    if { [[ -n "$_client_vless_uuid" ]] && ! _client_vless_uuid_valid "$_client_vless_uuid"; } ||
+        { [[ -n "$_client_hy2_pass" ]] && ! _client_hy2_password_valid "$_client_hy2_pass"; }; then
+        warn "$client_name: недопустимые учётные данные в конфигурации" >&2
+        return 1
+    fi
 
     IFS=',' read -ra node_names <<< "$nodes_csv"
     for nname in "${node_names[@]}"; do
@@ -671,14 +657,14 @@ _fetch_proxies_for_client() {
                     case "$_proxy_type" in
                         vless)
                             [[ -n "$_client_vless_uuid" ]] && \
-                                block=$(echo "$block" | sed "s/    uuid: .*/    uuid: $_client_vless_uuid/")
+                                block=$(printf '%s\n' "$block" | _yaml_set_field uuid "$_client_vless_uuid")
                             if declare -F _normalize_vless_xhttp_proxy_yaml >/dev/null; then
                                 block=$(printf '%s\n' "$block" | _normalize_vless_xhttp_proxy_yaml)
                             fi
                             ;;
                         hysteria2)
                             [[ -n "$_client_hy2_pass" ]] && \
-                                block=$(echo "$block" | sed "s/    password: .*/    password: $_client_hy2_pass/")
+                                block=$(printf '%s\n' "$block" | _yaml_set_field password "$_client_hy2_pass")
                             ;;
                     esac
                 fi
@@ -707,7 +693,7 @@ _fetch_proxies_for_client() {
                     local search="  - name: \"$orig\""
                     local replace="  - name: \"$repl\""
                     proxy_block="${proxy_block//"$search"/"$replace"}"
-                done < <(echo "$aliases_json" | jq -r 'to_entries[] | "\(.key)\t\(.value)"')
+                done < <(printf '%s\n' "$aliases_json" | jq -r 'to_entries[] | "\(.key)\t\(.value)"' | tr -d '\r')
             fi
 
             # Tag prefix
@@ -727,72 +713,133 @@ _fetch_proxies_for_client() {
 
 # ─── Синхронизация users в listener'ах на нодах ──────────────────────────────
 
-# Собирает per-client users для указанной ноды и синхронизирует listener'ы
+# _node_users_load NODE → NODE_USERS_DATA: строки «имя|uuid|пароль» клиентов,
+# назначенных ноде (через группу или свои ноды). rc 1 — конфигурация не читается
+# или имя/учётные данные клиента недопустимы: на ноду ничего не отправляется.
+_node_users_load() {
+    local nname="$1" data name uuid pass
+    NODE_USERS_DATA=""
+    data=$(set -o pipefail
+        jq_r --arg n "$nname" '
+            . as $root |
+            .clients[] |
+            select(
+                (.inherit_nodes_from_group != false and
+                    (.group as $g | any(
+                        $root.connections[];
+                        .node == $n and any(.groups[]?; .name == $g)
+                    ))) or
+                (.inherit_nodes_from_group == false and
+                    (.nodes // [] | index($n)))
+            ) |
+            "\(.name)|\(.credentials.vless_uuid // "")|\(.credentials.hy2_password // "")"
+        ' 2>/dev/null
+    ) || return 1
+    while IFS='|' read -r name uuid pass; do
+        [[ -n "$name" ]] || continue
+        if ! _generated_name_valid "$name" ||
+            { [[ -n "$uuid" ]] && ! _client_vless_uuid_valid "$uuid"; } ||
+            { [[ -n "$pass" ]] && ! _client_hy2_password_valid "$pass"; }; then
+            warn "$nname: недопустимое имя или учётные данные клиента в конфигурации — пользователи на ноде не изменены."
+            return 1
+        fi
+    done <<< "$data"
+    NODE_USERS_DATA="$data"
+}
+
+# _listener_users_payload MARKER… — stdin для _listener_users_remote_cmd: на каждый
+# маркер строка «маркер число_строк» и YAML-блок пользователей из NODE_USERS_DATA.
+# uuid и пароли клиентов передаются только так — не в argv ssh и удалённого bash.
+_listener_users_payload() {
+    local marker block count name uuid pass
+    for marker in "$@"; do
+        block="" count=0
+        while IFS='|' read -r name uuid pass; do
+            [[ -n "$name" ]] || continue
+            case "$marker" in
+                hy2)
+                    [[ -n "$pass" ]] || continue
+                    block+="      ${name}: ${pass}"$'\n'
+                    count=$((count + 1))
+                    ;;
+                *)
+                    [[ -n "$uuid" ]] || continue
+                    block+="      - username: ${name}"$'\n'"        uuid: ${uuid}"$'\n'
+                    count=$((count + 2))
+                    if [[ "$marker" == vless-tcp ]]; then
+                        block+="        flow: xtls-rprx-vision"$'\n'
+                        count=$((count + 1))
+                    fi
+                    ;;
+            esac
+        done <<< "$NODE_USERS_DATA"
+        printf '%s %s\n%s' "$marker" "$count" "$block"
+    done
+}
+
+# _listener_users_remote_cmd strict|lenient — постоянная SSH-команда, читающая
+# пользователей listener'ов из stdin (_listener_users_payload).
+# strict: первый сбой останавливает до перезапуска mihomo (генерация);
+# lenient: маркеры, которых нет на ноде, пропускаются, сбои копятся (удаление).
+_listener_users_remote_cmd() {
+    local mode="$1" module tail
+    printf -v module %q "$REMOTE_DIR/common/listener-users.sh"
+    if [[ "$mode" == strict ]]; then
+        tail=$(cat <<'EOF'
+    _sync_listener_users "$_m" "$_u" || exit 1
+done
+systemctl restart mihomo
+EOF
+)
+    else
+        tail=$(cat <<'EOF'
+    if grep -q "^# --- $_m ---\$" /etc/mihomo/config.yaml 2>/dev/null; then
+        _sync_listener_users "$_m" "$_u" || _sync_rc=1
+    fi
+done
+if [ -f /etc/mihomo/config.yaml ]; then systemctl restart mihomo || _sync_rc=1; fi
+exit "$_sync_rc"
+EOF
+)
+    fi
+    printf 'source %s || exit 1\n' "$module"
+    cat <<'EOF'
+_sync_rc=0
+while IFS=' ' read -r _m _n; do
+    case "$_m" in vless-tcp|vless-xhttp|vless-grpc|hy2) ;; *) exit 1 ;; esac
+    case "$_n" in ''|*[!0-9]*) exit 1 ;; esac
+    _u=''
+    while [ "$_n" -gt 0 ]; do
+        IFS= read -r _l || exit 1
+        _u="$_u$_l
+"
+        _n=$((_n - 1))
+    done
+    _u=${_u%?}
+EOF
+    printf '%s\n' "$tail"
+}
+
+# Собирает per-client users для указанной ноды и синхронизирует listener'ы.
+# Пользователи (uuid/пароли) уходят в stdin SSH, команда постоянна.
 # Args: nname — имя ноды
 _sync_node_listeners() {
-    local nname="$1"
+    local nname="$1" remote_config payload
+    local -a markers=()
 
     if ! node_load_by_name "$nname"; then
         return 1
     fi
 
-    # Собираем всех клиентов, привязанных к этой ноде (через группы и кастомные ноды)
-    local users_data
-    users_data=$(set -o pipefail
-        jq_r --arg n "$nname" '
-            . as $root |
-            [.clients[] |
-                select(
-                    (.inherit_nodes_from_group != false and
-                        (.group as $g | any(
-                            $root.connections[];
-                            .node == $n and any(.groups[]?; .name == $g)
-                        ))) or
-                    (.inherit_nodes_from_group == false and
-                        (.nodes // [] | index($n)))
-                ) |
-                {name: .name, vless_uuid: .credentials.vless_uuid, hy2_password: .credentials.hy2_password}
-            ] | .[] | "\(.name) \(.vless_uuid) \(.hy2_password)"
-        ' 2>/dev/null
-    ) || return 1
+    # Клиенты, привязанные к этой ноде (через группы и кастомные ноды)
+    _node_users_load "$nname" || return 1
     # Определяем какие listener'ы есть на ноде (из кешированного конфига)
-    local remote_config
     remote_config=$(_get_node_config "$nname") || return 1
-
-    # Формируем YAML-блоки для каждого типа listener'а
-    local vless_tcp_users="" vless_xhttp_users="" vless_grpc_users="" hy2_users=""
-    local has_vless_tcp=false has_vless_xhttp=false has_vless_grpc=false has_hy2=false
-
-    echo "$remote_config" | grep -q '^--- VLESS TCP ---' && has_vless_tcp=true
-    echo "$remote_config" | grep -q '^--- VLESS xHTTP ---' && has_vless_xhttp=true
-    echo "$remote_config" | grep -q '^--- VLESS gRPC ---' && has_vless_grpc=true
-    echo "$remote_config" | grep -q '^--- Hysteria2 ---' && has_hy2=true
-
-    while IFS=' ' read -r _cname _cuuid _cpass; do
-        [[ -z "$_cname" ]] && continue
-        if $has_vless_tcp && [[ -n "$_cuuid" ]]; then
-            vless_tcp_users+="      - username: ${_cname}"$'\n'
-            vless_tcp_users+="        uuid: ${_cuuid}"$'\n'
-            vless_tcp_users+="        flow: xtls-rprx-vision"$'\n'
-        fi
-        if $has_vless_xhttp && [[ -n "$_cuuid" ]]; then
-            vless_xhttp_users+="      - username: ${_cname}"$'\n'
-            vless_xhttp_users+="        uuid: ${_cuuid}"$'\n'
-        fi
-        if $has_vless_grpc && [[ -n "$_cuuid" ]]; then
-            vless_grpc_users+="      - username: ${_cname}"$'\n'
-            vless_grpc_users+="        uuid: ${_cuuid}"$'\n'
-        fi
-        if $has_hy2 && [[ -n "$_cpass" ]]; then
-            hy2_users+="      ${_cname}: ${_cpass}"$'\n'
-        fi
-    done <<< "$users_data"
-
-    # Убираем trailing newline
-    vless_tcp_users="${vless_tcp_users%$'\n'}"
-    vless_xhttp_users="${vless_xhttp_users%$'\n'}"
-    vless_grpc_users="${vless_grpc_users%$'\n'}"
-    hy2_users="${hy2_users%$'\n'}"
+    echo "$remote_config" | grep -q '^--- VLESS TCP ---' && markers+=(vless-tcp)
+    echo "$remote_config" | grep -q '^--- VLESS xHTTP ---' && markers+=(vless-xhttp)
+    echo "$remote_config" | grep -q '^--- VLESS gRPC ---' && markers+=(vless-grpc)
+    echo "$remote_config" | grep -q '^--- Hysteria2 ---' && markers+=(hy2)
+    payload=$(_listener_users_payload "${markers[@]}")
 
     # Подготовка скриптов один раз за операцию
     if ! array_contains "$nname" "${SCRIPTS_READY[@]}"; then
@@ -803,24 +850,8 @@ _sync_node_listeners() {
         SCRIPTS_READY+=("$nname")
     fi
 
-    # Формируем SSH-команду: sync каждого listener'а + restart
-    local sync_cmd="source ${REMOTE_DIR}/common/listener-users.sh"
-    if $has_vless_tcp; then
-        sync_cmd+=" && _sync_listener_users 'vless-tcp' $(printf '%q' "$vless_tcp_users")"
-    fi
-    if $has_vless_xhttp; then
-        sync_cmd+=" && _sync_listener_users 'vless-xhttp' $(printf '%q' "$vless_xhttp_users")"
-    fi
-    if $has_vless_grpc; then
-        sync_cmd+=" && _sync_listener_users 'vless-grpc' $(printf '%q' "$vless_grpc_users")"
-    fi
-    if $has_hy2; then
-        sync_cmd+=" && _sync_listener_users 'hy2' $(printf '%q' "$hy2_users")"
-    fi
-    # Restart mihomo после sync
-    sync_cmd+=" && systemctl restart mihomo"
-
-    if ssh_run -- "$sync_cmd" 2>/dev/null; then
+    # Sync каждого listener'а, затем restart mihomo; первый сбой — без restart
+    if ssh_run -- "$(_listener_users_remote_cmd strict)" 2>/dev/null <<< "$payload"; then
         success "$nname — входные подключения обновлены"
         return 0
     fi

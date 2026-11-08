@@ -295,6 +295,7 @@ _pin_hosts() {
 }
 
 @test "AWG guard never discovers connects or mutates using previously loaded node" {
+    source_module 'ssh.sh'
     source_module 'awg_peers.sh'
     node_load 1
     node_secret_delete "$B"
@@ -303,15 +304,49 @@ _pin_hosts() {
     cp "$STATE_MANIFEST" "$STATE_DIR/manifest-before"
     local log="$STATE_DIR/operations" rc=0
     : > "$log"
-    ssh_connect() { printf 'connect:%s\n' "$NODE_NAME" >> "$log"; }
-    ssh_run() { printf 'ssh:%s\n' "$NODE_NAME" >> "$log"; printf '%s' NO_AWG; }
+    ssh_run() {
+        if [[ "${*: -1}" == "echo ok" ]]; then printf 'connect:%s\n' "$NODE_NAME" >> "$log"; printf 'ok\n'; return 0; fi
+        printf 'ssh:%s\n' "$NODE_NAME" >> "$log"; printf '%s' NO_AWG
+    }
     upload_scripts() { printf 'upload\n' >> "$log"; }
     _awg_expected_peers() { printf 'peers\n' >> "$log"; }
-    _awg_peers_node 2 || rc=$?
-    [[ "$rc" == 1 && ! -s "$log" && "$NODE_ID" == "$A" ]]
+    core_awg_status "$(jq -r '.nodes[1].name' "$CONFIG_JSON")" || rc=$?
+    [[ "$rc" == 1 && "$RC_ERROR_CODE" == missing_secret && ! -s "$log" && "$NODE_ID" == "$A" ]]
     cmp "$STATE_DIR/config-before" "$CONFIG_JSON"
     cmp "$STATE_DIR/secrets-before" "$SECRETS_JSON"
     cmp "$STATE_DIR/manifest-before" "$STATE_MANIFEST"
-    _awg_peers_node 1
+    core_awg_status "$(jq -r '.nodes[0].name' "$CONFIG_JSON")"
     [[ "$(cat "$log")" == $'connect:portable-a\nssh:portable-a' ]]
+}
+
+# ─── security round 1: nodes ───
+
+@test "security: passwords encrypted the old way still decrypt and the key stays out of argv" {
+    local key legacy machine_key fresh bin="$BATS_TEST_TMPDIR/argv-bin"
+    key=$(_pass_key)
+    # Прежний формат: openssl enc -aes-256-cbc -pbkdf2 -k KEY, base64.
+    legacy=$(printf '%s' 'legacy-Secret!' | openssl enc -aes-256-cbc -pbkdf2 -k "$key" 2>/dev/null | base64 | tr -d '\n')
+    [ "$(node_pass_decode "$legacy")" = 'legacy-Secret!' ]
+    # Ранний bootstrap без nodes.sh: ключ из machine-id, тот же формат.
+    machine_key=$(printf '%s' "rcm-$(cat /etc/machine-id 2>/dev/null || hostname)" |
+        openssl dgst -sha256 -r | cut -d' ' -f1)
+    legacy=$(printf '%s' 'bootstrap-Secret!' | openssl enc -aes-256-cbc -pbkdf2 -k "$machine_key" 2>/dev/null | base64 | tr -d '\n')
+    [ "$(unset -f node_pass_decode node_pass_encode; _state_secret_decode "$legacy")" = 'bootstrap-Secret!' ]
+    fresh=$(unset -f node_pass_decode node_pass_encode; _state_secret_encode 'bootstrap-new')
+    [ "$(printf '%s' "$fresh" | base64 -d | openssl enc -aes-256-cbc -d -pbkdf2 -k "$machine_key" 2>/dev/null)" = bootstrap-new ]
+
+    mkdir -p "$bin"
+    export ARGV_LOG="$BATS_TEST_TMPDIR/openssl.argv" REAL_OPENSSL
+    REAL_OPENSSL=$(command -v openssl)
+    cat > "$bin/openssl" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$@" >> "$ARGV_LOG"
+exec "$REAL_OPENSSL" "$@"
+EOF
+    chmod +x "$bin/openssl"
+    fresh=$(PATH="$bin:$PATH" node_pass_encode 'fresh-Secret!')
+    [ "$(PATH="$bin:$PATH" node_pass_decode "$fresh")" = 'fresh-Secret!' ]
+    [ "$(printf '%s' "$fresh" | base64 -d | "$REAL_OPENSSL" enc -aes-256-cbc -d -pbkdf2 -k "$key" 2>/dev/null)" = 'fresh-Secret!' ]
+    [[ -s "$ARGV_LOG" ]]
+    ! grep -qF -- "$key" "$ARGV_LOG" || return 1
 }
