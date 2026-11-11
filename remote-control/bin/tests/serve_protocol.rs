@@ -270,7 +270,8 @@ fn termination_signals_restore_the_raw_console() {
         assert_eq!(set.status.code(), Some(0), "{}", String::from_utf8_lossy(&set.stderr));
 
         let (mut master, mut slave) = (0, 0);
-        assert_eq!(unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null(), std::ptr::null()) }, 0);
+        // `*mut` coerces to the `*const` Linux signature and matches macOS's `*mut`.
+        assert_eq!(unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) }, 0);
         let lflag = |fd| {
             let mut termios: libc::termios = unsafe { std::mem::zeroed() };
             assert_eq!(unsafe { libc::tcgetattr(fd, &mut termios) }, 0);
