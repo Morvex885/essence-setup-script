@@ -43,13 +43,14 @@ const MAX_BINARY_BYTES: u64 = 1 << 30;
 // ─── Release target identity ────────────────────────────────────────────────
 
 /// Map a build triple (os, arch, env) to the release matrix target name.
-/// `None` means the platform is not part of the 8-target release matrix.
+/// `None` means the platform is not part of the release matrix.
 fn target_triple_for(os: &str, arch: &str, env: Option<&str>) -> Option<&'static str> {
     match (os, arch, env) {
         ("linux", "x86_64", _) => Some("x86_64-unknown-linux-gnu"),
         ("linux", "aarch64", Some("musl")) => Some("aarch64-unknown-linux-musl"),
         ("linux", "aarch64", _) => Some("aarch64-unknown-linux-gnu"),
         ("linux", "arm", _) => Some("armv7-unknown-linux-gnueabihf"),
+        ("android", "aarch64", _) => Some("aarch64-linux-android"),
         ("macos", "x86_64", _) => Some("x86_64-apple-darwin"),
         ("macos", "aarch64", _) => Some("aarch64-apple-darwin"),
         ("windows", "x86_64", _) => Some("x86_64-pc-windows-msvc"),
@@ -808,13 +809,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn target_matrix_maps_all_eight_targets() {
+    fn target_matrix_maps_all_release_targets() {
         let cases = [
             (("linux", "x86_64", None as Option<&str>), Some("x86_64-unknown-linux-gnu")),
             (("linux", "aarch64", Some("musl")), Some("aarch64-unknown-linux-musl")),
             (("linux", "aarch64", None), Some("aarch64-unknown-linux-gnu")),
             (("linux", "aarch64", Some("gnu")), Some("aarch64-unknown-linux-gnu")),
             (("linux", "arm", Some("gnueabihf")), Some("armv7-unknown-linux-gnueabihf")),
+            (("android", "aarch64", None), Some("aarch64-linux-android")),
             (("macos", "x86_64", None), Some("x86_64-apple-darwin")),
             (("macos", "aarch64", None), Some("aarch64-apple-darwin")),
             (("windows", "x86_64", Some("msvc")), Some("x86_64-pc-windows-msvc")),
@@ -830,7 +832,7 @@ mod tests {
         assert_eq!(target_triple_for("freebsd", "x86_64", None), None);
         assert_eq!(target_triple_for("linux", "riscv64", None), None);
         assert_eq!(target_triple_for("windows", "x86", None), None);
-        assert_eq!(target_triple_for("android", "aarch64", None), None);
+        assert_eq!(target_triple_for("android", "arm", None), None);
     }
 
     #[test]

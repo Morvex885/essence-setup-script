@@ -30,6 +30,9 @@ jobs:
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             cross: true
+          - target: aarch64-linux-android
+            os: ubuntu-latest
+            cross: true
           - target: x86_64-apple-darwin
             os: macos-latest
           - target: aarch64-apple-darwin
@@ -112,7 +115,7 @@ jobs:
         working-directory: dist
         run: |
           count=$(find . -maxdepth 1 -name 'essence-rc-*' | wc -l)
-          test "$count" -eq 8
+          test "$count" -eq 9
           sha256sum essence-rc-* > SHA256SUMS
           cat SHA256SUMS
 

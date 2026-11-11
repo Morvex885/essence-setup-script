@@ -33,6 +33,12 @@ is_termux() {
     [[ -n "${TERMUX_VERSION:-}" || "${PREFIX:-}" == *com.termux* ]]
 }
 
+# Android (Termux): нативная сборка на bionic — её getaddrinfo резолвит имена через
+# системный netd. Статический musl ищет DNS в отсутствующем /etc/resolv.conf.
+is_android() {
+    is_termux || [[ "$(uname -o 2>/dev/null || true)" == Android ]]
+}
+
 # ldd из musl завершается с ненулевым кодом даже на --version, поэтому
 # вывод захватывается целиком, а код возврата ldd игнорируется (pipefail).
 is_musl() {
@@ -48,9 +54,9 @@ detect_target() {
     arch=$(uname -m)
     case "$os" in
         Linux)
-            if is_termux; then
+            if is_android; then
                 case "$arch" in
-                    aarch64|arm64) echo "aarch64-unknown-linux-musl" ;;
+                    aarch64|arm64) echo "aarch64-linux-android" ;;
                     *) return 1 ;;
                 esac
                 return 0

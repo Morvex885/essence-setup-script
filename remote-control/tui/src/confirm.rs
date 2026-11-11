@@ -16,6 +16,8 @@ pub fn set_flag(argv: &mut Vec<String>, flag: &str, value: Option<&str>) {
         if let Some(value)=value { if index+1<argv.len() && !argv[index+1].starts_with("--") { argv[index+1]=value.into(); } else { argv.insert(index+1,value.into()); } }
     } else { argv.push(flag.into()); if let Some(value)=value { argv.push(value.into()); } }
 }
+/// Drop a boolean flag set earlier, so a changed answer is not left behind.
+pub fn clear_flag(argv: &mut Vec<String>, flag: &str) { argv.retain(|s| s != flag); }
 /// Refusal returns the last (unsuccessful) reply, without sending a mutation.
 /// `--force` is valid only inside this helper: the first call obtains its plan.
 /// Like v1 `tui_run_confirmed`, a plan that changes more than twice stops.

@@ -11,6 +11,7 @@
 use std::{env, fs, io::{self, Write}, path::{Path, PathBuf}, process::{Command, Stdio}};
 use ratatui::{style::Style, text::{Line, Span}};
 use serde_json::Value;
+use unicode_width::UnicodeWidthStr;
 use crate::{app::{Context, Navigation, Screen}, confirm::run_confirmed, serve::{argv, Reply, Secrets}, ui::{self, Item, View}};
 
 pub struct Clients;
@@ -377,7 +378,9 @@ fn qr_lines(command: &mut Command, url: &str) -> Vec<String> {
     }
 }
 /// v1 `tui_render_share_bundle` from `subscription show`: link, expiry,
-/// headers, curl and JSON lines, then the QR code when available.
+/// headers, curl and JSON lines, then the QR code when available. QR rows are
+/// never wrapped: a code wider than the frame is replaced by a note (the link
+/// is already shown above), never drawn as a broken grid.
 fn share_view(data: &Value, qr: &[String]) -> View {
     let url = text(&data["url"]);
     let mut view = View::new(format!("Подписка: {}", text(&data["client"])));
@@ -396,7 +399,11 @@ fn share_view(data: &Value, qr: &[String]) -> View {
     view.context.push(ui::text(serde_json::json!({ "url": url }).to_string(), ui::NC));
     if !qr.is_empty() {
         view.context.push(Line::default());
-        view.context.extend(qr.iter().map(|line| Line::raw(line.clone())));
+        if qr.iter().all(|line| line.width() <= ui::CONTENT_WIDTH) {
+            view.context.extend(qr.iter().map(|line| Line::raw(line.clone())));
+        } else {
+            view.context.push(ui::text("QR-код не помещается в рамку — используйте ссылку выше.", ui::YELLOW));
+        }
     }
     view
 }
@@ -657,18 +664,41 @@ fn edit_template(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
     if let Err(error) = result { ctx.ui.notice(ui::warn(format!("Изменения не сохранены: {error}"))); }
     Ok(())
 }
-/// Edit on the cooked terminal; unchanged content imports nothing.
+/// Edit on the cooked terminal; unchanged content imports nothing. A rejected
+/// import (core error) or a failed editor after edits keeps the working copy
+/// until the user reopens it or discards it explicitly.
 fn edit_file(ctx: &mut Context<'_>, name: &str, editor: &[String], path: &Path, original: &[u8]) -> io::Result<()> {
     let mut command = Command::new(&editor[0]);
     command.args(&editor[1..]).arg(path);
-    if !ctx.ui.suspended(&mut command)?.success() {
-        ctx.ui.notice(ui::warn("Редактор завершился с ошибкой. Изменения не сохранены."));
-        return Ok(());
+    loop {
+        let edited = ctx.ui.suspended(&mut command)?.success();
+        if fs::read(path)? == original {
+            ctx.ui.notice(if edited { ui::text("Изменений нет.", ui::DIM) } else { ui::warn("Редактор завершился с ошибкой. Изменения не сохранены.") });
+            return Ok(());
+        }
+        if edited {
+            let reply = confirmed(ctx, "Импорт изменений шаблона", "Сохранить изменения шаблона?",
+                &["template", "import", "--name", name, "--file", &path.to_string_lossy()])?;
+            // Success, or the plan was refused: the user's decision is final.
+            if reply.ok || matches!(reply.code(), "confirmation_required" | "plan_changed") { return Ok(()); }
+        } else {
+            ctx.ui.notice(ui::warn("Редактор завершился с ошибкой."));
+        }
+        if !reopen_editor(ctx, name)? { ctx.ui.notice(ui::text("Изменения шаблона отменены.", ui::DIM)); return Ok(()); }
     }
-    if fs::read(path)? == original { ctx.ui.notice(ui::text("Изменений нет.", ui::DIM)); return Ok(()); }
-    confirmed(ctx, "Импорт изменений шаблона", "Сохранить изменения шаблона?",
-        &["template", "import", "--name", name, "--file", &path.to_string_lossy()])?;
-    Ok(())
+}
+/// The edits are not saved: `r` reopens the kept working copy, `d`/EOF discard it.
+fn reopen_editor(ctx: &mut Context<'_>, name: &str) -> io::Result<bool> {
+    let mut view = View::menu(format!("Изменения шаблона не сохранены: {name}"),
+        vec![Item::new('r', "Открыть рабочую копию в редакторе", ui::YELLOW), Item::new('d', "Отменить изменения", ui::RED)]);
+    view.context.push(ui::text("Рабочая копия сохранена до решения.", ui::YELLOW));
+    loop {
+        match ctx.choose(&view)?.map(|s| s.to_ascii_lowercase()).as_deref() {
+            Some("r") => return Ok(true),
+            None | Some("d") => return Ok(false),
+            _ => ctx.invalid(),
+        }
+    }
 }
 
 // ─── Generation ──────────────────────────────────────────────────────────────
@@ -1031,6 +1061,31 @@ mod tests {
         }
         assert!(qr_lines(&mut Command::new("/nonexistent/qrencode"), "u").is_empty());
     }
+    /// `qrencode -t UTF8` rows: half blocks with space margins, one column each.
+    fn qr_grid(columns: usize) -> Vec<String> {
+        (0..columns / 2).map(|y| (0..columns).map(|x| match (x < 2 || x + 2 >= columns, (x * 7 + y * 3) % 4) {
+            (true, _) => ' ', (_, 0) => '█', (_, 1) => '▀', (_, 2) => '▄', _ => ' ',
+        }).collect()).collect()
+    }
+    /// A fitting QR keeps every row whole (one framed row each, grid
+    /// intact); a QR wider than the frame (long link) is replaced by a note
+    /// while the link itself stays visible.
+    #[test]
+    fn qr_rows_are_never_wrapped_and_a_too_wide_code_falls_back_to_the_link() {
+        let grid = qr_grid(ui::CONTENT_WIDTH);
+        let view = share_view(&bundle("https://h/sub/tok"), &grid);
+        let rows: Vec<String> = view.lines().iter().map(ToString::to_string).collect();
+        let start = rows.iter().position(|row| row == &format!("│{}│", grid[0])).expect("first QR row whole");
+        for (offset, line) in grid.iter().enumerate() { assert_eq!(rows[start + offset], format!("│{line}│")); }
+        let link = format!("https://essence.example/sub/{}", "t".repeat(300));
+        let view = share_view(&bundle(&link), &qr_grid(77));
+        let text = content(&view);
+        assert!(!text.contains('█') && !text.contains('▀'), "no broken grid");
+        assert!(text.contains("QR-код не помещается"));
+        let shown: String = view.lines().iter().map(ToString::to_string).filter(|r| r.starts_with('│')).map(|r| r.trim_matches('│').trim_end().to_owned()).collect();
+        assert!(shown.contains(&link), "the link stays readable");
+        assert!(view.lines().iter().all(|line| line.width() <= usize::from(ui::FRAME_WIDTH)));
+    }
     #[test]
     fn rotate_and_revoke_use_plans_and_rotation_shows_the_new_bundle() {
         let (_, ui) = drive(vec![
@@ -1235,7 +1290,7 @@ mod tests {
         assert_eq!(keys(&ui.views[0]), [("r".into(), ui::YELLOW), ("0".into(), ui::NC)]);
         assert_eq!(notices(&ui, "Неверный выбор."), 1);
     }
-    struct EditorUi { inner: ScriptedUi, replacement: Option<&'static [u8]>, succeeds: bool, suspended: usize }
+    struct EditorUi { inner: ScriptedUi, replacement: Option<&'static [u8]>, succeeds: bool, suspended: usize, seen: Vec<Vec<u8>> }
     impl UserInterface for EditorUi {
         fn input(&mut self, view: &View, hidden: bool) -> io::Result<Option<zeroize::Zeroizing<String>>> { self.inner.input(view, hidden) }
         fn show(&mut self, view: &View) -> io::Result<()> { self.inner.show(view) }
@@ -1244,6 +1299,7 @@ mod tests {
         fn suspended(&mut self, command: &mut Command) -> io::Result<std::process::ExitStatus> {
             self.suspended += 1;
             let file = PathBuf::from(command.get_args().last().unwrap());
+            self.seen.push(fs::read(&file)?);
             if let Some(content) = self.replacement { fs::write(file, content)?; }
             #[cfg(unix)] { use std::os::unix::process::ExitStatusExt; Ok(std::process::ExitStatus::from_raw(if self.succeeds { 0 } else { 256 })) }
             #[cfg(windows)] { use std::os::windows::process::ExitStatusExt; Ok(std::process::ExitStatus::from_raw(if self.succeeds { 0 } else { 1 })) }
@@ -1253,7 +1309,7 @@ mod tests {
     fn editor_no_change_and_failure_import_nothing_changes_are_plan_confirmed() {
         let changed = Some(b"changed".as_slice());
         for (replacement, succeeds, planned, consent, notice) in [
-            (None, true, false, "", "Изменений нет."), (changed, false, false, "", "Редактор завершился с ошибкой"),
+            (None, true, false, "", "Изменений нет."), (changed, false, false, "d", "Редактор завершился с ошибкой"),
             (changed, true, true, "y", ""), (changed, true, true, "n", ""), (changed, true, false, "", ""),
         ] {
             let file = tempfile::NamedTempFile::new().unwrap();
@@ -1269,12 +1325,37 @@ mod tests {
             }
             let registry = Registry { screens: vec![], github_wizard: None };
             let mut core = ScriptedClient::new(steps);
-            let mut ui = EditorUi { inner: ScriptedUi::new(&[consent]), replacement, succeeds, suspended: 0 };
+            let mut ui = EditorUi { inner: ScriptedUi::new(&[consent]), replacement, succeeds, suspended: 0, seen: vec![] };
             edit_file(&mut Context { client: &mut core, ui: &mut ui, registry: &registry }, "m.yaml", &["editor".into()], file.path(), b"original").unwrap();
             assert_eq!(ui.suspended, 1);
             core.assert_finished();
             if !notice.is_empty() { assert_eq!(notices(&ui.inner, notice), 1); }
             assert_eq!(ui.inner.views.iter().filter(|v| v.prompt.contains("(y/N)")).count(), usize::from(planned));
+        }
+    }
+    /// A rejected import keeps the working copy: `r` reopens it with the
+    /// edits intact, `d` discards it; nothing is lost silently.
+    #[test]
+    fn rejected_import_keeps_the_working_copy_until_retry_or_discard() {
+        for (inputs, retried) in [(&["x", "R"][..], true), (&["d"][..], false), (&[][..], false)] {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            fs::write(file.path(), b"original").unwrap();
+            let path = file.path().to_str().unwrap();
+            let import = ["template", "import", "--name", "m.yaml", "--file", path];
+            let mut steps = vec![step(&import, fail("invalid", json!({"message": "Шаблон не является UTF-8"})))];
+            if retried { steps.push(ok(&import, json!({"name":"m.yaml"}))); }
+            let registry = Registry { screens: vec![], github_wizard: None };
+            let mut core = ScriptedClient::new(steps);
+            let mut ui = EditorUi { inner: ScriptedUi::new(inputs), replacement: Some(b"changed"), succeeds: true, suspended: 0, seen: vec![] };
+            edit_file(&mut Context { client: &mut core, ui: &mut ui, registry: &registry }, "m.yaml", &["editor".into()], file.path(), b"original").unwrap();
+            core.assert_finished();
+            assert!(ui.inner.inputs.is_empty());
+            assert_eq!(ui.suspended, 1 + usize::from(retried));
+            if retried { assert_eq!(ui.seen[1], b"changed", "the editor reopens the edited copy"); }
+            assert_eq!(fs::read(file.path()).unwrap(), b"changed");
+            let decision = ui.inner.views.iter().find(|v| v.title.starts_with("Изменения шаблона не сохранены")).expect("decision offered");
+            assert_eq!(keys(decision), [("r".into(), ui::YELLOW), ("d".into(), ui::RED)]);
+            frames(&ui.inner);
         }
     }
     #[test]

@@ -1,8 +1,9 @@
-//! Shared, TestBackend-renderable frames. Interior width is 68 codepoints.
+//! Shared, TestBackend-renderable frames. Interior width is 68 terminal columns.
 //! Every row is wrapped here — frame body, journal and prompt — so no text
 //! depends on the terminal width or is cut at the frame edge.
 use std::time::Instant;
 use ratatui::{Frame, layout::Rect, style::{Color, Modifier, Style}, text::{Line, Span}, widgets::Paragraph};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 pub const CONTENT_WIDTH: usize = 68;
 pub const FRAME_WIDTH: u16 = 70;
 pub const CYAN: Color = Color::Cyan;
@@ -97,12 +98,14 @@ fn highlighted(mut line: Line<'static>) -> Line<'static> {
 }
 fn border(left: char, right: char) -> Line<'static> { Line::styled(format!("{left}{}{right}", "─".repeat(CONTENT_WIDTH)), Style::default().fg(CYAN)) }
 fn wrap(line: &Line<'_>) -> Vec<Line<'static>> { wrap_to(line, CONTENT_WIDTH, 0) }
-/// Word-aware wrap of one styled line into rows of at most `width`
-/// codepoints. Continuation rows start with `indent` spaces; `\n` starts a
-/// new row; control characters are dropped; a word longer than a row is
-/// split. The line's own style is kept on every piece.
+/// Word-aware wrap of one styled line into rows of at most `width` terminal
+/// columns (a wide character such as `界` takes two). Continuation rows start
+/// with `indent` spaces; `\n` starts a new row; control characters are
+/// dropped; a word longer than a row is split. The line's own style is kept on
+/// every piece.
 pub fn wrap_to(line: &Line<'_>, width: usize, indent: usize) -> Vec<Line<'static>> {
     let width = width.max(indent + 1);
+    let columns = |cells: &[(char, Style)]| cells.iter().map(|(c, _)| c.width().unwrap_or(0)).sum::<usize>();
     let mut rows: Vec<Vec<(char, Style)>> = vec![];
     let mut row: Vec<(char, Style)> = vec![];
     // Leading cells of `row` that are continuation indent, not text.
@@ -112,9 +115,12 @@ pub fn wrap_to(line: &Line<'_>, width: usize, indent: usize) -> Vec<Line<'static
         for ch in span.content.chars() {
             if ch == '\n' { rows.push(std::mem::take(&mut row)); start = 0; continue; }
             if ch.is_control() { continue; }
-            if row.len() >= width {
+            let cells = ch.width().unwrap_or(0);
+            if row.len() > start && columns(&row) + cells > width {
+                // The unfinished word moves to the next row only when it fits
+                // there; a word longer than a row is split in place.
                 let carried = match row.iter().rposition(|(c, _)| *c == ' ') {
-                    Some(space) if ch != ' ' && space > start => row.split_off(space + 1),
+                    Some(space) if ch != ' ' && space > start && indent + columns(&row[space + 1..]) + cells <= width => row.split_off(space + 1),
                     _ => vec![],
                 };
                 while row.len() > start && row.last().is_some_and(|(c, _)| *c == ' ') { row.pop(); }
@@ -146,7 +152,7 @@ fn journal_rows(line: &Line<'_>) -> Vec<Line<'static>> {
     wrap_to(line, usize::from(FRAME_WIDTH), indent)
 }
 fn framed(line: Line<'static>, centered: bool) -> Line<'static> {
-    let count: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+    let count: usize = line.spans.iter().map(|s| s.content.width()).sum();
     let padding = CONTENT_WIDTH.saturating_sub(count);
     let left = if centered { padding / 2 } else { 0 };
     let mut spans = vec![Span::styled("│", Style::default().fg(CYAN)), Span::raw(" ".repeat(left))];
@@ -355,5 +361,26 @@ pub fn render_busy(frame: &mut Frame<'_>, view: &View, input: &str, hidden: bool
         assert_eq!(rows[bottom + 1], "hint");
         assert_eq!(rows[bottom + 2], "[!] journal");
         assert!(view.lines().iter().all(|line| line.to_string() != "hint"));
+    }
+    /// Wide characters take two columns: rows wrap by columns and the right
+    /// border stays in the last frame column.
+    #[test] fn wide_characters_wrap_by_columns_and_keep_the_right_border() {
+        let words = "界面 ".repeat(30);
+        let mut view = View::new("标题 заголовок");
+        view.context.push(Line::raw(words.trim().to_owned()));
+        view.context.push(Line::raw("界".repeat(50)));
+        let mut terminal = Terminal::new(TestBackend::new(80, 40)).unwrap();
+        terminal.draw(|f| render(f, &view, "", false, &[])).unwrap();
+        let buffer = terminal.backend().buffer();
+        let framed: Vec<u16> = (0..40).filter(|y| buffer[(0, *y)].symbol() == "│").collect();
+        assert!(framed.len() >= 6, "title and wrapped rows");
+        assert!(framed.iter().all(|y| buffer[(FRAME_WIDTH - 1, *y)].symbol() == "│"), "right border in place");
+        assert!(view.lines().iter().all(|line| line.width() == usize::from(FRAME_WIDTH) || line.width() == 0));
+        let rows = wrap(&Line::raw(words.trim().to_owned()));
+        assert!(rows.iter().all(|row| row.width() <= CONTENT_WIDTH) && rows.len() == 3);
+        assert_eq!(rows.iter().map(ToString::to_string).collect::<Vec<_>>().join(" "), words.trim(), "split only between words");
+        let journal = wrap_to(&Line::raw(format!("[✗] {}", "界".repeat(60))), usize::from(FRAME_WIDTH), 4);
+        assert!(journal.iter().all(|row| row.width() <= usize::from(FRAME_WIDTH)));
+        assert!(journal[1..].iter().all(|row| row.to_string().starts_with("    界")));
     }
 }

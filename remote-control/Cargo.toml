@@ -32,6 +32,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
 tempfile = "3"
 thiserror = "2"
+unicode-width = "0.2.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "io-std", "net", "fs", "process", "signal", "sync", "time"] }
 zeroize = { version = "1", features = ["derive", "serde"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }

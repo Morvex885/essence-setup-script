@@ -594,13 +594,15 @@ fn connection_node(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
     }
 }
 /// Proxies (marked as currently assigned) first, then target groups (unmarked).
+/// A confirmed empty proxy set removes the assignment of the chosen groups
+/// (`conn set` without `--proxy`); `0`/EOF in either toggle changes nothing.
 fn assign_connections(ctx: &mut Context<'_>, name: &str, proxies: &[String], assigned: &[Vec<String>]) -> io::Result<()> {
     let Some(selected) = ctx.toggle("Подключения для групп", proxies, assigned.iter().map(|g| !g.is_empty()).collect(), EMPTY)? else { return Ok(()); };
-    if selected.is_empty() { ctx.ui.notice(ui::warn("Ничего не выбрано.")); return Ok(()); }
     let listed = ctx.call(&["group", "list"])?;
     if !listed.ok { outcome(ctx, &listed); return Ok(()); }
     let groups = names(&listed.data);
-    let Some(targets) = ctx.toggle("Группы для подключений", &groups, vec![], EMPTY)? else { return Ok(()); };
+    let title = if selected.is_empty() { "Группы: снять назначение подключений" } else { "Группы для подключений" };
+    let Some(targets) = ctx.toggle(title, &groups, vec![], EMPTY)? else { return Ok(()); };
     if targets.is_empty() { ctx.ui.notice(ui::warn("Ничего не выбрано.")); return Ok(()); }
     let mut words = argv(&["conn", "set", "--name", name]);
     for i in targets { words.extend(argv(&["--group", &groups[i]])); }
@@ -702,8 +704,14 @@ fn telegram_table(ctx: &mut Context<'_>, reply: &Reply) -> io::Result<bool> {
         };
         view.context.push(ui::text(format!("{}  {status}  {}", text(&row["node"]), text(&row["reason"])), color));
     }
-    ctx.ui.show(&view)?;
-    Ok(true)
+    // Kept on screen until Enter/0/EOF: the next menu frame would replace it.
+    view.prompt = "Enter — продолжить: ".into();
+    loop {
+        match ctx.choose(&view)?.as_deref() {
+            None | Some("" | "0") => return Ok(true),
+            _ => ctx.invalid(),
+        }
+    }
 }
 /// v1 `_tui_telegram_batch`: unchecked node toggles → one `--name` per node →
 /// the core's frozen plan → results table.
@@ -1196,7 +1204,17 @@ mod tests {
         run(vec![node_sync(json!(["p1", "p2"])), node_list(), node_list()], &["b", "2", "0", "0"], |ctx| connection_node(ctx, "n"));
         run(vec![node_sync(json!(["p1"])), node_list(), step(&["group", "list"], ok(json!([{"name": "g1"}]))), node_list()],
             &["b", "", "1", "0", "0"], |ctx| connection_node(ctx, "n"));
-        let (_, _, ui) = run(vec![node_sync(json!(["p1"])), node_list(), node_list()], &["b", "1", "", "0"], |ctx| connection_node(ctx, "n"));
+        // A confirmed empty selection removes the last assignment of the chosen
+        // groups (no `--proxy`); cancelling the group toggle changes nothing.
+        let groups = || step(&["group", "list"], ok(json!([{"name": "old"}, {"name": "g2"}])));
+        let (_, client, ui) = run(vec![node_sync(json!(["p1"])), node_list(), groups(),
+            step(&["conn", "set", "--name", "n", "--group", "old"], ok(json!({}))), node_list()],
+            &["b", "1", "", "1", "", "0"], |ctx| connection_node(ctx, "n"));
+        assert!(client.calls.iter().all(|call| !call.contains(&"--proxy".to_owned())));
+        assert!(ui.notices.is_empty());
+        run(vec![node_sync(json!(["p1"])), node_list(), groups(), node_list()], &["b", "1", "", "1", "0", "0"], |ctx| connection_node(ctx, "n"));
+        run(vec![node_sync(json!(["p1"])), node_list(), node_list()], &["b", "1", "0", "0"], |ctx| connection_node(ctx, "n"));
+        let (_, _, ui) = run(vec![node_sync(json!(["p1"])), node_list(), groups(), node_list()], &["b", "1", "", "", "0"], |ctx| connection_node(ctx, "n"));
         assert!(noticed(&ui, "Ничего не выбрано."));
     }
     #[test]
@@ -1285,7 +1303,7 @@ mod tests {
             for key in [key.to_owned(), key.to_ascii_uppercase()] {
                 let words = argv(&["telegram", verb, "--name", "n1", "--name", "n3"]);
                 let results = json!({"results": [{"node": "n1", "code": 0, "status": "ok", "reason": null}, {"node": "n3", "code": 0, "status": "ok", "reason": null}]});
-                let (_, ui) = screen(&mut Telegram, &[&key, "1", "3", "", "y", "0"], vec![
+                let (_, ui) = screen(&mut Telegram, &[&key, "1", "3", "", "y", "", "0"], vec![
                     three_nodes(), (words.clone(), plan("confirmation_required", "tg")), (with_yes(&words, "tg"), ok(results)),
                 ]);
                 assert!(ui.views[1].sections[0].iter().take(3).all(|i| i.label.starts_with("[ ]")));
@@ -1315,12 +1333,17 @@ mod tests {
             let results = json!({"results": [
                 {"node": "a", "code": 0, "status": "ok", "reason": null}, {"node": "b", "code": 3, "status": "not_installed", "reason": "не установлен"},
                 {"node": "c", "code": 4, "status": "partial", "reason": "x"}, {"node": "d", "code": 1, "status": "error", "reason": "offline"}]});
-            let (_, ui) = screen(&mut Telegram, &[key, "0"], vec![step(&["telegram", "status", "--all"], err("partial", results))]);
-            let table = ui.views.iter().find(|v| v.title == "Результат Telegram Proxy").unwrap();
+            let (_, ui) = screen(&mut Telegram, &[key, "x", "", "0"], vec![step(&["telegram", "status", "--all"], err("partial", results))]);
+            // The table waits for Enter: an unknown key keeps it on screen.
+            let tables: Vec<&View> = ui.views.iter().filter(|v| v.title == "Результат Telegram Proxy").collect();
+            assert_eq!(tables.len(), 2);
+            assert_eq!(ui.views.last().unwrap().title, "Telegram Proxy");
+            let table = tables[0];
             assert_eq!(colors(table), [Some(ui::GREEN), Some(ui::YELLOW), Some(ui::YELLOW), Some(ui::RED)]);
             let lines: Vec<String> = table.context.iter().map(|l| l.to_string()).collect();
             assert_eq!(lines, ["a  готово  ", "b  не установлено  не установлен", "c  частично  x", "d  ошибка  offline"]);
-            assert!(table.sections.is_empty() && ui.notices.is_empty());
+            assert!(table.sections.is_empty() && !table.prompt.is_empty());
+            assert_eq!(ui.notices.len(), 1, "only the invalid key");
         }
         let (_, ui) = screen(&mut Telegram, &["s", "0"], vec![step(&["telegram", "status", "--all"], Reply::failure("invalid"))]);
         assert_eq!(ui.notices.len(), 1);

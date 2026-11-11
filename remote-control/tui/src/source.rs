@@ -8,7 +8,7 @@ use ratatui::{style::Style, text::{Line, Span}};
 use serde_json::Value;
 use crate::{
     app::{Context, Navigation, Screen},
-    confirm::{decision_flag, run_confirmed, set_flag},
+    confirm::{clear_flag, decision_flag, run_confirmed, set_flag},
     serve::{argv, Reply, Secrets},
     system::{new_password, sync_state},
     ui::{self, Item, View},
@@ -269,8 +269,12 @@ pub fn github_wizard(context: &mut Context<'_>, mode: &str) -> io::Result<bool> 
                 match context.secret(title, "Пароль доступа к конфигурации GitHub")? {
                     Some(password) => {
                         secrets.insert_hidden("vault-password", password);
-                        if !change && context.confirm(View::new("Ключ расшифровки"), "Сохранить ключ расшифровки на этом устройстве?")? {
-                            set_flag(&mut words, "--remember-key", None);
+                        if !change {
+                            if context.confirm(View::new("Ключ расшифровки"), "Сохранить ключ расшифровки на этом устройстве?")? {
+                                set_flag(&mut words, "--remember-key", None);
+                            } else {
+                                clear_flag(&mut words, "--remember-key");
+                            }
                         }
                         true
                     },
@@ -432,6 +436,22 @@ mod tests {
         let chooser = ui.views.iter().find(|v| v.title == "Конфигурация в GitHub").unwrap();
         assert_eq!(chooser.sections[0][0].label, "Использовать конфигурацию из GitHub (ноды 2, клиенты 1)");
         assert_eq!(client.secret_names[4], ["vault-password"]);
+    }
+    /// A wrong password asks again; answering «no» the second time drops
+    /// `--remember-key` set by the first «yes».
+    #[test] fn remember_key_follows_the_last_answer_after_an_invalid_password() {
+        let base = words(&["source", "github-connect", "--login", "other-owner"]);
+        let remember = words(&["source", "github-connect", "--login", "other-owner", "--remember-key"]);
+        let mut client = ScriptedClient::new([accounts(), (base.clone(), error("vault_password_required", json!({}))),
+            (remember.clone(), error("vault_password_invalid", json!({}))), (base.clone(), ok())]);
+        let mut ui = ScriptedUi::new(&["3", "other-owner", "vp", "y", "vp2", "n"]);
+        assert!(wizard(&mut client, &mut ui, "connect"));
+        client.assert_finished();
+        let mut client = ScriptedClient::new([accounts(), (base.clone(), error("vault_password_required", json!({}))),
+            (base, error("vault_password_invalid", json!({}))), (remember, ok())]);
+        let mut ui = ScriptedUi::new(&["3", "other-owner", "vp", "n", "vp2", "y"]);
+        assert!(wizard(&mut client, &mut ui, "connect"));
+        client.assert_finished();
     }
     #[test] fn storage_choices_come_from_the_reply() {
         let base = words(&["source", "github-connect", "--login", "test-owner"]);
