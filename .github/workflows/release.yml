@@ -12,8 +12,90 @@ jobs:
   test:
     uses: ./.github/workflows/tests.yml
 
-  release:
+  build:
+    name: Build essence-rc (${{ matrix.target }})
     needs: test
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: true
+          - target: armv7-unknown-linux-gnueabihf
+            os: ubuntu-latest
+            cross: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+          - target: aarch64-linux-android
+            os: ubuntu-latest
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            msvc_arch: x64
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            msvc_arch: x64_arm64
+    runs-on: ${{ matrix.os }}
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+          targets: ${{ matrix.target }}
+      - name: Configure MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.msvc_arch }}
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --version 0.2.5 --locked
+      - name: Build release binary
+        if: ${{ !matrix.cross && runner.os != 'Windows' }}
+        run: cargo build --manifest-path remote-control/Cargo.toml -p essence-rc --release --locked --target "$TARGET"
+      - name: Build release binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: cargo build --manifest-path remote-control/Cargo.toml -p essence-rc --release --locked --target $env:TARGET
+      - name: Cross-build release binary
+        if: matrix.cross
+        # VERSION and the server assets live outside the Cargo workspace.
+        env:
+          # cross 0.2.5's Android image ships NDK r21 without libunwind, which
+          # current Rust requires; the pinned main image has a newer NDK.
+          CROSS_TARGET_AARCH64_LINUX_ANDROID_IMAGE: ghcr.io/cross-rs/aarch64-linux-android@sha256:b081e122d075268e8f528b914ae0b2d0c6dc4dc4921ab05da86cc44726f4e2a0
+        run: cross build --manifest-path remote-control/Cargo.toml -p essence-rc --release --locked --target "$TARGET"
+      - name: Package (tar.gz)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          tar -czf "dist/essence-rc-${TARGET}.tar.gz" -C "remote-control/target/${TARGET}/release" essence-rc
+      - name: Package (zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path "remote-control/target/$env:TARGET/release/essence-rc.exe" `
+            -DestinationPath "dist/essence-rc-$env:TARGET.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: essence-rc-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -23,25 +105,52 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build and verify release tarball
+      - name: Build and verify source tarball
         run: bash tests/ci/build_release_tarball.sh "$VERSION"
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: essence-rc-*
+          path: dist
+          merge-multiple: true
+
+      - name: Write SHA256SUMS
+        working-directory: dist
+        run: |
+          count=$(find . -maxdepth 1 -name 'essence-rc-*' | wc -l)
+          test "$count" -eq 9
+          sha256sum essence-rc-* > SHA256SUMS
+          cat SHA256SUMS
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           name: "Essence ${{ github.ref_name }}"
+          fail_on_unmatched_files: true
           files: |
+            dist/essence-rc-*
+            dist/SHA256SUMS
             essence-setup-${{ github.ref_name }}.tar.gz
             essence-setup-${{ github.ref_name }}.tar.gz.sha256
           generate_release_notes: true
           body: |
-            ## Установка
+            ## Remote Control (essence-rc)
+
+            Linux / macOS / Termux:
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/Morvex885/essence-setup-script/main/install-essence-rc.sh | bash
+            ```
+
+            Windows: скачайте `essence-rc-x86_64-pc-windows-msvc.zip`
+            (или `aarch64`), сверьте хеш с `SHA256SUMS` и положите
+            `essence-rc.exe` в каталог из PATH. Подробнее — в README.
+
+            ## Сервер (essence-setup)
 
             ```bash
             curl -fsSL https://raw.githubusercontent.com/Morvex885/essence-setup-script/main/setup-essence/install-essence.sh | sudo bash
             ```
 
-            ## Обновление
-            Запустите `essence-setup` и выберите пункт **Обновить**.
-            Или повторно выполните команду установки.
+            Обновление: `essence-setup` → пункт **Обновить**, или повторите команду установки.
