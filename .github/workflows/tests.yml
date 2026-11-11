@@ -21,7 +21,9 @@ jobs:
           submodules: recursive
 
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y jq openssl nginx curl age gh
+        # age is not installed: the runner image cannot download it from the
+        # Ubuntu archive, and the Bash tests use fakes when it is absent.
+        run: sudo apt-get update && sudo apt-get install -y jq openssl nginx curl gh
 
       - name: Install latest stable Mihomo
         run: |
