@@ -22,10 +22,14 @@ _sync_listener_users() {
         return 1
     fi
 
-    # Проверяем что маркеры client-users существуют в этом блоке
-    local block_content
-    block_content=$(sed -n "/^# --- ${marker} ---$/,/^# --- \/${marker} ---$/p" "$config")
-    if ! echo "$block_content" | grep -q '# client-users-start'; then
+    # Both markers must occur in order inside the selected listener block.
+    if ! awk -v marker="$marker" '
+        $0 == "# --- " marker " ---" { inside=1; next }
+        $0 == "# --- /" marker " ---" { closed=1; exit }
+        inside && /# client-users-start/ { start=1; next }
+        inside && start && /# client-users-end/ { end=1 }
+        END { if (!(inside && start && end && closed)) exit 1 }
+    ' "$config"; then
         return 1
     fi
 
@@ -62,20 +66,24 @@ _build_vless_users_yaml() {
     local add_flow=false
     [[ "$marker" == "vless-tcp" ]] && add_flow=true
 
-    while IFS=' ' read -r username uuid; do
+    while IFS=' ' read -r username uuid || [[ -n "$username" ]]; do
+        uuid="${uuid%$'\r'}"
         [[ -z "$username" || -z "$uuid" ]] && continue
         echo "      - username: $username"
         echo "        uuid: $uuid"
         $add_flow && echo "        flow: xtls-rprx-vision"
     done
+    return 0
 }
 
 # Формирует YAML-блок users для Hysteria2 listener'а
 # Stdin: строки формата "username password" (разделитель — пробел)
 # Stdout: готовый YAML-блок с правильным indent
 _build_hy2_users_yaml() {
-    while IFS=' ' read -r username password; do
+    while IFS=' ' read -r username password || [[ -n "$username" ]]; do
+        password="${password%$'\r'}"
         [[ -z "$username" || -z "$password" ]] && continue
         echo "      $username: $password"
     done
+    return 0
 }

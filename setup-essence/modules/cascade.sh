@@ -203,11 +203,14 @@ _install_dnat_cascade() {
     confirm_yn "Всё верно?" || { info "Отменено."; return; }
 
     # Применяем iptables правила
-    _apply_dnat_rules "$cname" "$REMOTE_SERVER" "$REMOTE_PORT" "$LOCAL_PORT"
+    _apply_dnat_rules "$cname" "$REMOTE_SERVER" "$REMOTE_PORT" "$LOCAL_PORT" || {
+        warn "Не удалось применить DNAT правила."
+        return 1
+    }
     success "iptables DNAT правила применены"
 
     # Сохраняем правила
-    _persist_dnat_rules
+    _persist_dnat_rules || { warn "Не удалось сохранить DNAT правила."; return 1; }
     success "Правила сохранены"
 
     # UFW

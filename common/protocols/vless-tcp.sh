@@ -33,6 +33,8 @@ EOF
 _build_vless_tcp_client_yaml() {
     local name="$1" server="$2" port="$3" uuid="$4"
     local sni="$5" public_key="$6" short_id="$7"
+    name="${name//\\/\\\\}"; name="${name//\"/\\\"}"
+    name="${name//$'\n'/\\n}"; name="${name//$'\r'/\\r}"
     cat <<EOF
 proxies:
   - name: "$name"
@@ -57,7 +59,8 @@ EOF
 _build_vless_tcp_uri() {
     local uuid="$1" server="$2" port="$3" sni="$4"
     local public_key="$5" short_id="$6" fragment="${7:-VLESS TCP}"
-    echo "vless://${uuid}@${server}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${public_key}&sid=${short_id}&type=tcp#${fragment}"
+    [[ "$server" == *:* && "$server" != \[* ]] && server="[$server]"
+    echo "vless://$(_uri_percent_encode "$uuid")@${server}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$(_uri_percent_encode "$sni")&fp=chrome&pbk=$(_uri_percent_encode "$public_key")&sid=$(_uri_percent_encode "$short_id")&type=tcp#$(_uri_percent_encode "$fragment")"
 }
 
 # Exit proxy YAML (cascade outbound / proxies section)
@@ -65,7 +68,7 @@ _build_vless_tcp_uri() {
 _build_vless_tcp_exit_yaml() {
     local name="$1" server="$2" port="$3" uuid="$4" sni="$5"
     local public_key="${6:-}" short_id="${7:-}"
-    local flow="${8:-xtls-rprx-vision}" fingerprint="${9:-chrome}"
+    local flow="${8-xtls-rprx-vision}" fingerprint="${9:-chrome}"
 
     echo "  - name: $name"
     echo "    type: vless"

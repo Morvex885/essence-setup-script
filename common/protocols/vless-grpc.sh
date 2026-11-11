@@ -33,6 +33,8 @@ EOF
 _build_vless_grpc_client_yaml() {
     local name="$1" server="$2" port="$3" uuid="$4"
     local sni="$5" service="$6" public_key="$7" short_id="$8"
+    name="${name//\\/\\\\}"; name="${name//\"/\\\"}"
+    name="${name//$'\n'/\\n}"; name="${name//$'\r'/\\r}"
     cat <<EOF
 proxies:
   - name: "$name"
@@ -58,7 +60,8 @@ EOF
 _build_vless_grpc_uri() {
     local uuid="$1" server="$2" port="$3" sni="$4"
     local service="$5" public_key="$6" short_id="$7" fragment="${8:-VLESS gRPC}"
-    echo "vless://${uuid}@${server}:${port}?encryption=none&security=reality&sni=${sni}&fp=chrome&pbk=${public_key}&sid=${short_id}&type=grpc&serviceName=${service}#${fragment}"
+    [[ "$server" == *:* && "$server" != \[* ]] && server="[$server]"
+    echo "vless://$(_uri_percent_encode "$uuid")@${server}:${port}?encryption=none&security=reality&sni=$(_uri_percent_encode "$sni")&fp=chrome&pbk=$(_uri_percent_encode "$public_key")&sid=$(_uri_percent_encode "$short_id")&type=grpc&serviceName=$(_uri_percent_encode "$service")#$(_uri_percent_encode "$fragment")"
 }
 
 # Exit proxy YAML (cascade outbound)

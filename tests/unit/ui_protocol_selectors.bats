@@ -235,3 +235,9 @@ _redirect_vless_config() {
     assert_output --partial 'servername: vpn.example'
     assert_output --partial 'path: "/"'
 }
+
+@test "_parse_proxy_uri accepts URI without trailing newline" {
+    run _parse_proxy_uri exit-node < <(printf 'hy2://pw@h.example:443?insecure=1')
+    assert_success
+    assert_output --partial 'server: h.example'
+}

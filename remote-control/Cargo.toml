@@ -1,0 +1,37 @@
+[workspace]
+members = ["core"]
+resolver = "3"
+
+[workspace.package]
+version = "2.0.0"
+edition = "2024"
+rust-version = "1.99"
+publish = false
+
+[workspace.dependencies]
+aes-gcm = { version = "0.10", features = ["zeroize"] }
+age = "0.11"
+argon2 = { version = "0.5", features = ["zeroize"] }
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+dirs = "5"
+hex = "0.4"
+include_dir = "0.7"
+libc = "0.2"
+proptest = "1"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+russh = { version = "0.65", default-features = false, features = ["ring", "rsa"] }
+russh-sftp = "3"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "io-std", "net", "fs", "process", "signal", "sync", "time"] }
+zeroize = { version = "1", features = ["derive", "serde"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+tar = "0.4"
+zip = { version = "6", default-features = false, features = ["deflate-flate2"] }
+semver = "1"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_SystemServices", "Win32_System_Threading"] }

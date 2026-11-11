@@ -29,6 +29,8 @@ _build_hy2_listener_yaml() {
 _build_hy2_client_yaml() {
     local name="$1" server="$2" port="$3" pass="$4"
     local sni="${5:-www.google.de}" skip_verify="${6:-true}" obfs_pass="${7:-}"
+    name="${name//\\/\\\\}"; name="${name//\"/\\\"}"
+    name="${name//$'\n'/\\n}"; name="${name//$'\r'/\\r}"
 
     echo "proxies:"
     echo "  - name: \"$name\""
@@ -49,10 +51,11 @@ _build_hy2_client_yaml() {
 _build_hy2_uri() {
     local pass="$1" server="$2" port="$3"
     local sni="${4:-www.google.de}" obfs_pass="${5:-}"
+    [[ "$server" == *:* && "$server" != \[* ]] && server="[$server]"
 
     local obfs_params=""
-    [[ -n "$obfs_pass" ]] && obfs_params="&obfs=salamander&obfs-password=${obfs_pass}"
-    echo "hysteria2://${pass}@${server}:${port}?insecure=1&sni=${sni}${obfs_params}"
+    [[ -n "$obfs_pass" ]] && obfs_params="&obfs=salamander&obfs-password=$(_uri_percent_encode "$obfs_pass")"
+    echo "hysteria2://$(_uri_percent_encode "$pass")@${server}:${port}?insecure=1&sni=$(_uri_percent_encode "$sni")${obfs_params}"
 }
 
 # Exit proxy YAML (cascade outbound / proxies section)

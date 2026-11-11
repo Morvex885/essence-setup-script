@@ -67,6 +67,8 @@ _build_vless_xhttp_tls_listener_yaml() {
 _build_vless_xhttp_client_yaml() {
     local name="$1" server="$2" port="$3" uuid="$4" sni="$5"
     local path="$6" public_key="${7:-}" short_id="${8:-}"
+    name="${name//\\/\\\\}"; name="${name//\"/\\\"}"
+    name="${name//$'\n'/\\n}"; name="${name//$'\r'/\\r}"
 
     echo "proxies:"
     echo "  - name: \"$name\""
@@ -94,6 +96,7 @@ _build_vless_xhttp_client_yaml() {
 _build_vless_xhttp_uri() {
     local uuid="$1" server="$2" port="$3" sni="$4" path="$5"
     local public_key="${6:-}" short_id="${7:-}" fragment="${8:-VLESS xHTTP}"
+    [[ "$server" == *:* && "$server" != \[* ]] && server="[$server]"
 
     local security_params encoded_sni encoded_path encoded_public_key encoded_short_id encoded_fragment
     encoded_sni=$(_uri_percent_encode "$sni") || return 1
@@ -140,16 +143,18 @@ _build_vless_xhttp_exit_yaml() {
 # Normalize an extracted proxy block used by remote-control. Non-xHTTP blocks
 # are returned byte-for-byte; xHTTP always receives the known-good fingerprint.
 _normalize_vless_xhttp_proxy_yaml() {
-    local block
+    local block cr=$'\r' eol=""
     block=$(cat)
-    if ! grep -q '^    network: xhttp$' <<< "$block"; then
+    if ! grep -q "^    network: xhttp${cr}\?\$" <<< "$block"; then
         printf '%s\n' "$block"
         return
     fi
+    # CRLF blocks keep their line endings.
+    [[ "$block" == *"$cr"* ]] && eol="$cr"
     if grep -q '^    client-fingerprint:' <<< "$block"; then
-        sed 's/^    client-fingerprint:.*/    client-fingerprint: firefox/' <<< "$block"
+        sed "s/^    client-fingerprint:[^${cr}]*/    client-fingerprint: firefox/" <<< "$block"
     else
-        printf '%s\n    client-fingerprint: firefox\n' "$block"
+        printf '%s\n    client-fingerprint: firefox%s\n' "$block" "$eol"
     fi
 }
 

@@ -1,0 +1,365 @@
+{
+  "cases": [
+    {
+      "args": [
+        ""
+      ],
+      "case": "hu_users_cr",
+      "function": "_build_hy2_users_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_users_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": "YWxpY2UgcDENCg==",
+      "stdout_b64": "ICAgICAgYWxpY2U6IHAxCg=="
+    },
+    {
+      "args": [
+        ""
+      ],
+      "case": "hu_users_empty",
+      "function": "_build_hy2_users_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_users_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": "",
+      "stdout_b64": ""
+    },
+    {
+      "args": [
+        ""
+      ],
+      "case": "hu_users_no_pass",
+      "function": "_build_hy2_users_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_users_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": "YWxpY2UK",
+      "stdout_b64": ""
+    },
+    {
+      "args": [
+        ""
+      ],
+      "case": "hu_users_no_trailing_newline",
+      "function": "_build_hy2_users_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_users_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": "YWxpY2UgcDEKYm9iIHAy",
+      "stdout_b64": "ICAgICAgYWxpY2U6IHAxCiAgICAgIGJvYjogcDIK"
+    },
+    {
+      "args": [
+        ""
+      ],
+      "case": "hu_users_skip",
+      "function": "_build_hy2_users_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_users_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": "CmFsaWNlIHAxCgogIApiYWQK",
+      "stdout_b64": "ICAgICAgYWxpY2U6IHAxCg=="
+    },
+    {
+      "args": [
+        ""
+      ],
+      "case": "hu_users_special_pass",
+      "function": "_build_hy2_users_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_users_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": "Ym9iIHAjc3MmJQo=",
+      "stdout_b64": "ICAgICAgYm9iOiBwI3NzJiUK"
+    },
+    {
+      "args": [
+        ""
+      ],
+      "case": "hu_users_tab",
+      "function": "_build_hy2_users_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_users_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": "YQliCg==",
+      "stdout_b64": ""
+    },
+    {
+      "args": [
+        ""
+      ],
+      "case": "hu_users_two",
+      "function": "_build_hy2_users_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_users_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": "YWxpY2UgcDEKYm9iIHAyCg==",
+      "stdout_b64": "ICAgICAgYWxpY2U6IHAxCiAgICAgIGJvYjogcDIK"
+    },
+    {
+      "args": [
+        "vless-tcp"
+      ],
+      "case": "vu_cr",
+      "function": "_build_vless_users_yaml",
+      "globals": {},
+      "invoke": "_build_vless_users_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": "YWxpY2UgdTENCmJvYiB1Mg0K",
+      "stdout_b64": "ICAgICAgLSB1c2VybmFtZTogYWxpY2UKICAgICAgICB1dWlkOiB1MQogICAgICAgIGZsb3c6IHh0bHMtcnByeC12aXNpb24KICAgICAgLSB1c2VybmFtZTogYm9iCiAgICAgICAgdXVpZDogdTIKICAgICAgICBmbG93OiB4dGxzLXJwcngtdmlzaW9uCg=="
+    },
+    {
+      "args": [
+        "vless-tcp"
+      ],
+      "case": "vu_cyr_name",
+      "function": "_build_vless_users_yaml",
+      "globals": {},
+      "invoke": "_build_vless_users_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": "0JjQstCw0L0gdS0xCg==",
+      "stdout_b64": "ICAgICAgLSB1c2VybmFtZTog0JjQstCw0L0KICAgICAgICB1dWlkOiB1LTEKICAgICAgICBmbG93OiB4dGxzLXJwcngtdmlzaW9uCg=="
+    },
+    {
+      "args": [
+        "vless-grpc"
+      ],
+      "case": "vu_grpc",
+      "function": "_build_vless_users_yaml",
+      "globals": {},
+      "invoke": "_build_vless_users_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": "YWxpY2UgMTExMTExMTEKYm9iIDIyMjIyMjIyCg==",
+      "stdout_b64": "ICAgICAgLSB1c2VybmFtZTogYWxpY2UKICAgICAgICB1dWlkOiAxMTExMTExMQogICAgICAtIHVzZXJuYW1lOiBib2IKICAgICAgICB1dWlkOiAyMjIyMjIyMgo="
+    },
+    {
+      "args": [
+        "vless-tcp"
+      ],
+      "case": "vu_multi_space",
+      "function": "_build_vless_users_yaml",
+      "globals": {},
+      "invoke": "_build_vless_users_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": "YWxpY2UgIHUxCg==",
+      "stdout_b64": "ICAgICAgLSB1c2VybmFtZTogYWxpY2UKICAgICAgICB1dWlkOiB1MQogICAgICAgIGZsb3c6IHh0bHMtcnByeC12aXNpb24K"
+    },
+    {
+      "args": [
+        "vless-tcp"
+      ],
+      "case": "vu_no_input",
+      "function": "_build_vless_users_yaml",
+      "globals": {},
+      "invoke": "_build_vless_users_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": "",
+      "stdout_b64": ""
+    },
+    {
+      "args": [
+        "vless-tcp"
+      ],
+      "case": "vu_no_trailing_newline",
+      "function": "_build_vless_users_yaml",
+      "globals": {},
+      "invoke": "_build_vless_users_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": "YWxpY2UgdTEKYm9iIHUy",
+      "stdout_b64": "ICAgICAgLSB1c2VybmFtZTogYWxpY2UKICAgICAgICB1dWlkOiB1MQogICAgICAgIGZsb3c6IHh0bHMtcnByeC12aXNpb24KICAgICAgLSB1c2VybmFtZTogYm9iCiAgICAgICAgdXVpZDogdTIKICAgICAgICBmbG93OiB4dGxzLXJwcngtdmlzaW9uCg=="
+    },
+    {
+      "args": [
+        "vless-tcp"
+      ],
+      "case": "vu_no_uuid",
+      "function": "_build_vless_users_yaml",
+      "globals": {},
+      "invoke": "_build_vless_users_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": "bG9uZWx5Cg==",
+      "stdout_b64": ""
+    },
+    {
+      "args": [
+        "vless-tcp"
+      ],
+      "case": "vu_skip_invalid",
+      "function": "_build_vless_users_yaml",
+      "globals": {},
+      "invoke": "_build_vless_users_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": "CmFsaWNlIHUxCgogIApiYWQK",
+      "stdout_b64": "ICAgICAgLSB1c2VybmFtZTogYWxpY2UKICAgICAgICB1dWlkOiB1MQogICAgICAgIGZsb3c6IHh0bHMtcnByeC12aXNpb24K"
+    },
+    {
+      "args": [
+        "vless-tcp"
+      ],
+      "case": "vu_tcp_two",
+      "function": "_build_vless_users_yaml",
+      "globals": {},
+      "invoke": "_build_vless_users_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": "YWxpY2UgMTExMTExMTEKYm9iIDIyMjIyMjIyCg==",
+      "stdout_b64": "ICAgICAgLSB1c2VybmFtZTogYWxpY2UKICAgICAgICB1dWlkOiAxMTExMTExMQogICAgICAgIGZsb3c6IHh0bHMtcnByeC12aXNpb24KICAgICAgLSB1c2VybmFtZTogYm9iCiAgICAgICAgdXVpZDogMjIyMjIyMjIKICAgICAgICBmbG93OiB4dGxzLXJwcngtdmlzaW9uCg=="
+    },
+    {
+      "args": [
+        "vless-xhttp"
+      ],
+      "case": "vu_xhttp",
+      "function": "_build_vless_users_yaml",
+      "globals": {},
+      "invoke": "_build_vless_users_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": "YWxpY2UgMTExMTExMTEK",
+      "stdout_b64": "ICAgICAgLSB1c2VybmFtZTogYWxpY2UKICAgICAgICB1dWlkOiAxMTExMTExMQo="
+    },
+    {
+      "args": [
+        "vless-tcp",
+        "      - username: alice\n        uuid: u1\n        flow: xtls-rprx-vision\n      - username: bob\n        uuid: u2\n        flow: xtls-rprx-vision"
+      ],
+      "case": "sy_config_missing",
+      "function": "_sync_listener_users",
+      "globals": {
+        "config_path": "/etc/mihomo/config.yaml",
+        "config_yaml": null,
+        "note": "stdout is the resulting config file (or empty if absent)"
+      },
+      "invoke": "w_sync",
+      "rc": 1,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": ""
+    },
+    {
+      "args": [
+        "vless-grpc",
+        "      - username: Иван\n        uuid: u-1"
+      ],
+      "case": "sy_cyr_user",
+      "function": "_sync_listener_users",
+      "globals": {
+        "config_path": "/etc/mihomo/config.yaml",
+        "config_yaml": "mihomo:\n  listeners:\n# --- vless-tcp ---\n  - name: vless-tcp\n    type: vless\n    port: 443\n    users:\n      # client-users-start\n      - username: old\n        uuid: old-uuid\n        flow: xtls-rprx-vision\n      # client-users-end\n    proxy: DIRECT\n# --- /vless-tcp ---\n# --- hy2 ---\n  - name: hy2\n    type: hysteria2\n    port: 8443\n    users:\n      # client-users-start\n      old: pw\n      # client-users-end\n    cascade-user-note: keep\n# cascade-user:alpha\n# --- /hy2 ---\n",
+        "note": "stdout is the resulting config file (or empty if absent)"
+      },
+      "invoke": "w_sync",
+      "rc": 1,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "bWlob21vOgogIGxpc3RlbmVyczoKIyAtLS0gdmxlc3MtdGNwIC0tLQogIC0gbmFtZTogdmxlc3MtdGNwCiAgICB0eXBlOiB2bGVzcwogICAgcG9ydDogNDQzCiAgICB1c2VyczoKICAgICAgIyBjbGllbnQtdXNlcnMtc3RhcnQKICAgICAgLSB1c2VybmFtZTogb2xkCiAgICAgICAgdXVpZDogb2xkLXV1aWQKICAgICAgICBmbG93OiB4dGxzLXJwcngtdmlzaW9uCiAgICAgICMgY2xpZW50LXVzZXJzLWVuZAogICAgcHJveHk6IERJUkVDVAojIC0tLSAvdmxlc3MtdGNwIC0tLQojIC0tLSBoeTIgLS0tCiAgLSBuYW1lOiBoeTIKICAgIHR5cGU6IGh5c3RlcmlhMgogICAgcG9ydDogODQ0MwogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgIG9sZDogcHcKICAgICAgIyBjbGllbnQtdXNlcnMtZW5kCiAgICBjYXNjYWRlLXVzZXItbm90ZToga2VlcAojIGNhc2NhZGUtdXNlcjphbHBoYQojIC0tLSAvaHkyIC0tLQo="
+    },
+    {
+      "args": [
+        "vless-tcp",
+        ""
+      ],
+      "case": "sy_delete_all",
+      "function": "_sync_listener_users",
+      "globals": {
+        "config_path": "/etc/mihomo/config.yaml",
+        "config_yaml": "mihomo:\n  listeners:\n# --- vless-tcp ---\n  - name: vless-tcp\n    type: vless\n    port: 443\n    users:\n      # client-users-start\n      - username: old\n        uuid: old-uuid\n        flow: xtls-rprx-vision\n      # client-users-end\n    proxy: DIRECT\n# --- /vless-tcp ---\n# --- hy2 ---\n  - name: hy2\n    type: hysteria2\n    port: 8443\n    users:\n      # client-users-start\n      old: pw\n      # client-users-end\n    cascade-user-note: keep\n# cascade-user:alpha\n# --- /hy2 ---\n",
+        "note": "stdout is the resulting config file (or empty if absent)"
+      },
+      "invoke": "w_sync",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "bWlob21vOgogIGxpc3RlbmVyczoKIyAtLS0gdmxlc3MtdGNwIC0tLQogIC0gbmFtZTogdmxlc3MtdGNwCiAgICB0eXBlOiB2bGVzcwogICAgcG9ydDogNDQzCiAgICB1c2VyczoKICAgICAgIyBjbGllbnQtdXNlcnMtc3RhcnQKICAgICAgIyBjbGllbnQtdXNlcnMtZW5kCiAgICBwcm94eTogRElSRUNUCiMgLS0tIC92bGVzcy10Y3AgLS0tCiMgLS0tIGh5MiAtLS0KICAtIG5hbWU6IGh5MgogICAgdHlwZTogaHlzdGVyaWEyCiAgICBwb3J0OiA4NDQzCiAgICB1c2VyczoKICAgICAgIyBjbGllbnQtdXNlcnMtc3RhcnQKICAgICAgb2xkOiBwdwogICAgICAjIGNsaWVudC11c2Vycy1lbmQKICAgIGNhc2NhZGUtdXNlci1ub3RlOiBrZWVwCiMgY2FzY2FkZS11c2VyOmFscGhhCiMgLS0tIC9oeTIgLS0tCg=="
+    },
+    {
+      "args": [
+        "hy2",
+        "      bob: pw2"
+      ],
+      "case": "sy_hy2_replace",
+      "function": "_sync_listener_users",
+      "globals": {
+        "config_path": "/etc/mihomo/config.yaml",
+        "config_yaml": "mihomo:\n  listeners:\n# --- vless-tcp ---\n  - name: vless-tcp\n    type: vless\n    port: 443\n    users:\n      # client-users-start\n      - username: old\n        uuid: old-uuid\n        flow: xtls-rprx-vision\n      # client-users-end\n    proxy: DIRECT\n# --- /vless-tcp ---\n# --- hy2 ---\n  - name: hy2\n    type: hysteria2\n    port: 8443\n    users:\n      # client-users-start\n      old: pw\n      # client-users-end\n    cascade-user-note: keep\n# cascade-user:alpha\n# --- /hy2 ---\n",
+        "note": "stdout is the resulting config file (or empty if absent)"
+      },
+      "invoke": "w_sync",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "bWlob21vOgogIGxpc3RlbmVyczoKIyAtLS0gdmxlc3MtdGNwIC0tLQogIC0gbmFtZTogdmxlc3MtdGNwCiAgICB0eXBlOiB2bGVzcwogICAgcG9ydDogNDQzCiAgICB1c2VyczoKICAgICAgIyBjbGllbnQtdXNlcnMtc3RhcnQKICAgICAgLSB1c2VybmFtZTogb2xkCiAgICAgICAgdXVpZDogb2xkLXV1aWQKICAgICAgICBmbG93OiB4dGxzLXJwcngtdmlzaW9uCiAgICAgICMgY2xpZW50LXVzZXJzLWVuZAogICAgcHJveHk6IERJUkVDVAojIC0tLSAvdmxlc3MtdGNwIC0tLQojIC0tLSBoeTIgLS0tCiAgLSBuYW1lOiBoeTIKICAgIHR5cGU6IGh5c3RlcmlhMgogICAgcG9ydDogODQ0MwogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgIGJvYjogcHcyCiAgICAgICMgY2xpZW50LXVzZXJzLWVuZAogICAgY2FzY2FkZS11c2VyLW5vdGU6IGtlZXAKIyBjYXNjYWRlLXVzZXI6YWxwaGEKIyAtLS0gL2h5MiAtLS0K"
+    },
+    {
+      "args": [
+        "vless-xhttp",
+        "      - username: alice\n        uuid: u1\n        flow: xtls-rprx-vision\n      - username: bob\n        uuid: u2\n        flow: xtls-rprx-vision"
+      ],
+      "case": "sy_marker_missing",
+      "function": "_sync_listener_users",
+      "globals": {
+        "config_path": "/etc/mihomo/config.yaml",
+        "config_yaml": "mihomo:\n  listeners:\n# --- vless-tcp ---\n  - name: vless-tcp\n    type: vless\n    port: 443\n    users:\n      # client-users-start\n      - username: old\n        uuid: old-uuid\n        flow: xtls-rprx-vision\n      # client-users-end\n    proxy: DIRECT\n# --- /vless-tcp ---\n# --- hy2 ---\n  - name: hy2\n    type: hysteria2\n    port: 8443\n    users:\n      # client-users-start\n      old: pw\n      # client-users-end\n    cascade-user-note: keep\n# cascade-user:alpha\n# --- /hy2 ---\n",
+        "note": "stdout is the resulting config file (or empty if absent)"
+      },
+      "invoke": "w_sync",
+      "rc": 1,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "bWlob21vOgogIGxpc3RlbmVyczoKIyAtLS0gdmxlc3MtdGNwIC0tLQogIC0gbmFtZTogdmxlc3MtdGNwCiAgICB0eXBlOiB2bGVzcwogICAgcG9ydDogNDQzCiAgICB1c2VyczoKICAgICAgIyBjbGllbnQtdXNlcnMtc3RhcnQKICAgICAgLSB1c2VybmFtZTogb2xkCiAgICAgICAgdXVpZDogb2xkLXV1aWQKICAgICAgICBmbG93OiB4dGxzLXJwcngtdmlzaW9uCiAgICAgICMgY2xpZW50LXVzZXJzLWVuZAogICAgcHJveHk6IERJUkVDVAojIC0tLSAvdmxlc3MtdGNwIC0tLQojIC0tLSBoeTIgLS0tCiAgLSBuYW1lOiBoeTIKICAgIHR5cGU6IGh5c3RlcmlhMgogICAgcG9ydDogODQ0MwogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgIG9sZDogcHcKICAgICAgIyBjbGllbnQtdXNlcnMtZW5kCiAgICBjYXNjYWRlLXVzZXItbm90ZToga2VlcAojIGNhc2NhZGUtdXNlcjphbHBoYQojIC0tLSAvaHkyIC0tLQo="
+    },
+    {
+      "args": [
+        "vless-tcp",
+        "      - username: alice\n        uuid: u1\n        flow: xtls-rprx-vision\n      - username: bob\n        uuid: u2\n        flow: xtls-rprx-vision"
+      ],
+      "case": "sy_no_client_block",
+      "function": "_sync_listener_users",
+      "globals": {
+        "config_path": "/etc/mihomo/config.yaml",
+        "config_yaml": "# --- vless-tcp ---\n  - name: x\n    port: 1\n# --- /vless-tcp ---\n",
+        "note": "stdout is the resulting config file (or empty if absent)"
+      },
+      "invoke": "w_sync",
+      "rc": 1,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "IyAtLS0gdmxlc3MtdGNwIC0tLQogIC0gbmFtZTogeAogICAgcG9ydDogMQojIC0tLSAvdmxlc3MtdGNwIC0tLQo="
+    },
+    {
+      "args": [
+        "vless-tcp",
+        "      - username: alice\n        uuid: u1\n        flow: xtls-rprx-vision\n      - username: bob\n        uuid: u2\n        flow: xtls-rprx-vision"
+      ],
+      "case": "sy_vless_tcp_replace",
+      "function": "_sync_listener_users",
+      "globals": {
+        "config_path": "/etc/mihomo/config.yaml",
+        "config_yaml": "mihomo:\n  listeners:\n# --- vless-tcp ---\n  - name: vless-tcp\n    type: vless\n    port: 443\n    users:\n      # client-users-start\n      - username: old\n        uuid: old-uuid\n        flow: xtls-rprx-vision\n      # client-users-end\n    proxy: DIRECT\n# --- /vless-tcp ---\n# --- hy2 ---\n  - name: hy2\n    type: hysteria2\n    port: 8443\n    users:\n      # client-users-start\n      old: pw\n      # client-users-end\n    cascade-user-note: keep\n# cascade-user:alpha\n# --- /hy2 ---\n",
+        "note": "stdout is the resulting config file (or empty if absent)"
+      },
+      "invoke": "w_sync",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "bWlob21vOgogIGxpc3RlbmVyczoKIyAtLS0gdmxlc3MtdGNwIC0tLQogIC0gbmFtZTogdmxlc3MtdGNwCiAgICB0eXBlOiB2bGVzcwogICAgcG9ydDogNDQzCiAgICB1c2VyczoKICAgICAgIyBjbGllbnQtdXNlcnMtc3RhcnQKICAgICAgLSB1c2VybmFtZTogYWxpY2UKICAgICAgICB1dWlkOiB1MQogICAgICAgIGZsb3c6IHh0bHMtcnByeC12aXNpb24KICAgICAgLSB1c2VybmFtZTogYm9iCiAgICAgICAgdXVpZDogdTIKICAgICAgICBmbG93OiB4dGxzLXJwcngtdmlzaW9uCiAgICAgICMgY2xpZW50LXVzZXJzLWVuZAogICAgcHJveHk6IERJUkVDVAojIC0tLSAvdmxlc3MtdGNwIC0tLQojIC0tLSBoeTIgLS0tCiAgLSBuYW1lOiBoeTIKICAgIHR5cGU6IGh5c3RlcmlhMgogICAgcG9ydDogODQ0MwogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgIG9sZDogcHcKICAgICAgIyBjbGllbnQtdXNlcnMtZW5kCiAgICBjYXNjYWRlLXVzZXItbm90ZToga2VlcAojIGNhc2NhZGUtdXNlcjphbHBoYQojIC0tLSAvaHkyIC0tLQo="
+    }
+  ],
+  "module": "listener-users"
+}
