@@ -26,6 +26,8 @@ impl Screen for Subscriptions { fn run(&mut self, ctx: &mut Context<'_>) -> io::
 
 // ─── Shared helpers ──────────────────────────────────────────────────────────
 
+/// Empty multi-select state of this module's toggles.
+const EMPTY: &str = "Нет вариантов для выбора";
 fn text(v: &Value) -> &str { v.as_str().unwrap_or("—") }
 fn scalar(v: &Value) -> String {
     match v { Value::String(s) => s.clone(), Value::Null => "—".into(), other => other.to_string() }
@@ -112,31 +114,6 @@ fn list_view(title: &str, labels: &[String], empty: &str, actions: Vec<Item>) ->
     else { view.sections.insert(0, labels.iter().enumerate().map(|(i, s)| Item::new(i + 1, s, ui::CYAN)).collect()); }
     view
 }
-/// v1 `toggle_select`: Enter commits the flags, 0/EOF drops partial changes.
-/// Callers preselect only what mirrors the current state, never deletions.
-fn toggle(ctx: &mut Context<'_>, title: &str, labels: &[String], mut flags: Vec<bool>) -> io::Result<Option<Vec<usize>>> {
-    if labels.is_empty() {
-        let mut view = View::menu(title, vec![Item::new(0, "Отмена", ui::NC)]);
-        view.context.push(ui::text("Нет вариантов для выбора", ui::DIM));
-        ctx.ui.show(&view)?;
-        return Ok(None);
-    }
-    flags.resize(labels.len(), false);
-    loop {
-        let mut items: Vec<Item> = labels.iter().enumerate()
-            .map(|(i, label)| Item::new(i + 1, format!("[{}] {label}", if flags[i] { 'x' } else { ' ' }), ui::CYAN)).collect();
-        items.push(Item::new(0, "Отмена", ui::NC));
-        let mut view = View::menu(title, items);
-        view.mode = ui::Mode::Toggle;
-        view.prompt = "Пробел/номер — переключить, Enter — сохранить, 0 — отмена: ".into();
-        match ctx.choose(&view)? {
-            None => return Ok(None),
-            Some(choice) if choice.is_empty() => return Ok(Some(flags.iter().enumerate().filter_map(|(i, on)| on.then_some(i)).collect())),
-            Some(choice) if choice == "0" => return Ok(None),
-            Some(choice) => match index(&choice, labels.len()) { Some(i) => flags[i] = !flags[i], None => ctx.invalid() },
-        }
-    }
-}
 /// A node command retried only after the shared node-code handler fixed it.
 fn node_request(ctx: &mut Context<'_>, node: &str, words: &[&str]) -> io::Result<Option<Value>> {
     loop {
@@ -199,7 +176,7 @@ fn clients(ctx: &mut Context<'_>) -> io::Result<()> {
     }
 }
 fn delete_clients(ctx: &mut Context<'_>, targets: &[String]) -> io::Result<()> {
-    let Some(selected) = toggle(ctx, "Удаление клиентов", targets, vec![false; targets.len()])? else { return Ok(()); };
+    let Some(selected) = ctx.toggle("Удаление клиентов", targets, vec![false; targets.len()], EMPTY)? else { return Ok(()); };
     if selected.is_empty() { ctx.ui.notice(ui::warn("Ничего не выбрано.")); return Ok(()); }
     let mut words = vec!["client", "delete"];
     for i in selected { words.extend(["--name", targets[i].as_str()]); }
@@ -294,7 +271,7 @@ fn client_nodes(ctx: &mut Context<'_>, name: &str, inherit: bool, current: &[Str
     let labels: Vec<String> = rows(&data).iter().map(node_label).collect();
     // The current (effective) nodes are the starting state, like v1.
     let flags = targets.iter().map(|n| current.contains(n)).collect();
-    let Some(selected) = toggle(ctx, &format!("Свои ноды клиента: {name}"), &labels, flags)? else { return Ok(()); };
+    let Some(selected) = ctx.toggle(&format!("Свои ноды клиента: {name}"), &labels, flags, EMPTY)? else { return Ok(()); };
     if selected.is_empty() { ctx.ui.notice(ui::warn("Ничего не выбрано.")); return Ok(()); }
     let mut words = vec!["client", "nodes", "--name", name];
     for i in selected { words.extend(["--node", targets[i].as_str()]); }
@@ -320,7 +297,7 @@ fn client_connections(ctx: &mut Context<'_>, name: &str, own: &[String]) -> io::
     let Some(found) = node_request(ctx, &node, &["conn", "list", "--name", &node, "--discover"])? else { return Ok(()); };
     let proxies = strings(&found[0]["discovered"]);
     let flags = proxies.iter().map(|p| current.contains(p)).collect();
-    let Some(selected) = toggle(ctx, &format!("Подключения клиента на {node}"), &proxies, flags)? else { return Ok(()); };
+    let Some(selected) = ctx.toggle(&format!("Подключения клиента на {node}"), &proxies, flags, EMPTY)? else { return Ok(()); };
     if selected.is_empty() { ctx.ui.notice(ui::warn("Ничего не выбрано.")); return Ok(()); }
     let mut words = vec!["client", "connections", "--name", name, "--node", &node];
     for i in selected { words.extend(["--proxy", proxies[i].as_str()]); }
@@ -1331,7 +1308,7 @@ mod tests {
     #[test]
     fn selectors_reject_expressions_and_empty_lists_read_nothing() {
         let (_, ui) = drive(vec![], &["01", "+1", "1+1", "", "1", "0"], |ctx| {
-            assert_eq!(toggle(ctx, "Toggle", &["one".into()], vec![false])?, Some(vec![]));
+            assert_eq!(ctx.toggle("Toggle", &["one".into()], vec![false], EMPTY)?, Some(vec![]));
             Ok(())
         });
         assert_eq!(notices(&ui, "Неверный выбор."), 3);
@@ -1339,7 +1316,7 @@ mod tests {
         assert_eq!(index(" 1", 1), None);
         let (_, ui) = drive(vec![ok(&["group", "list"], json!([]))], &["untouched"], |ctx| {
             assert!(pick(ctx, "group", "Empty")?.is_none());
-            assert!(toggle(ctx, "Empty toggle", &[], vec![])?.is_none());
+            assert!(ctx.toggle("Empty toggle", &[], vec![], EMPTY)?.is_none());
             Ok(())
         });
         assert_eq!(ui.inputs.len(), 1);

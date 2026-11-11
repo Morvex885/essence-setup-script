@@ -146,7 +146,7 @@ impl Screen for Source {
                     report(context, &reply);
                 },
                 "k" if encrypted => {
-                    let Some(path) = ask(context, "Импорт ключа восстановления", "Путь к файлу")? else { return Ok(Navigation::Back); };
+                    let Some(path) = ask(context, "Импорт ключа восстановления", "Путь к файлу")? else { continue; };
                     if !path.is_empty() {
                         let reply = context.call(&["source", "github-import-recovery-key", "--file", &path])?;
                         report(context, &reply);
@@ -345,6 +345,14 @@ mod tests {
         let mut client = ScriptedClient::new([(words(&["source", "status"]), error("source_failed", json!({})))]);
         assert!(matches!(source(&mut client, &mut ScriptedUi::new(&[])), Navigation::Back));
         client.assert_finished();
+    }
+    #[test] fn cancelled_recovery_key_path_keeps_the_source_screen() {
+        let mut client = ScriptedClient::new([status("age"), status("age")]);
+        let mut ui = ScriptedUi::new(&[]);
+        ui.inputs.extend([Some("k".into()), None, Some("0".into())]);
+        assert!(matches!(source(&mut client, &mut ui), Navigation::Back));
+        client.assert_finished();
+        assert!(ui.inputs.is_empty());
     }
     #[test] fn rewrap_and_rotate_send_passwords_only_as_secrets() {
         let rewrap = words(&["source", "github-rewrap-password"]);
