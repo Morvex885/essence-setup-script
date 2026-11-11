@@ -311,7 +311,11 @@ async fn route(invocation: &Invocation, secrets: &Secrets, session: &mut Session
         }
         ("self", "password-set") => {
             check_current_password(session, secrets)?;
-            let password = secrets.get("password").unwrap_or("");
+            // Absent: the front end prompts and repeats; explicitly empty: invalid.
+            let password = secrets.get("password").ok_or_else(|| {
+                RcError::new("missing_secret", "Не передан секрет password (--secrets-stdin или поле secrets).")
+                    .with_extra("secret", "password")
+            })?;
             if password.is_empty() {
                 return Err(RcError::new("invalid", "Пароль не может быть пустым."));
             }
@@ -436,6 +440,10 @@ mod tests {
         let init = run(&mut one_shot, &["source", "init-local"], "{}").await;
         assert!(init.ok, "{:?}", init.error.map(|e| e.message));
         assert!(root.path().join("config.json").exists() && root.path().join("manifest.json").exists());
+        let absent = run(&mut one_shot, &["self", "password-set"], "{}").await.error.unwrap();
+        assert_eq!((absent.code, absent.extra["secret"].clone()), ("missing_secret", json!("password")), "the front end prompts");
+        let empty = run(&mut one_shot, &["self", "password-set"], r#"{"password":""}"#).await.error.unwrap();
+        assert_eq!(empty.code, "invalid");
         let set = run(&mut one_shot, &["self", "password-set"], r#"{"password":"first"}"#).await;
         assert!(set.ok);
         assert_eq!(journal.borrow().last().unwrap(), &(Level::Success, "Пароль сохранён".to_owned()));
