@@ -594,8 +594,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::fake_transport::{AuthMethod, ConnectExpectation, FakeTransport, Operation, ScriptStep};
     use crate::github::commands::GithubSession;
-    use crate::github::store::WorkSession;
-    use crate::github::{BRANCH, REPO_NAME, Storage, SyncStatus, Target};
+    use crate::github::{BRANCH, REPO_NAME, Storage, SyncStatus, Target, store};
     use crate::model::{Portability, PortabilityIssue};
     use crate::nodes::testing;
     use crate::transport::ExecResult;
@@ -634,9 +633,9 @@ pub(crate) mod tests {
             "auth": "key", "identity": null, "secret_id": null})).unwrap()
     }
 
-    /// A GitHub session over `root` with keyless nodes pending SSH setup;
-    /// its worktree lives outside the data directory.
-    fn github(root: &Path, worktree: &Path, nodes: &[Node]) -> (Session, testing::Journal) {
+    /// A GitHub session over `root` with keyless nodes pending SSH setup; its
+    /// git store and worktree live in `work`, outside the data directory.
+    fn github(root: &Path, work: &Path, nodes: &[Node]) -> (Session, testing::Journal) {
         let (mut session, journal) = testing::session(root);
         let mut config = session.state.load_config().unwrap();
         config.nodes = nodes.to_vec();
@@ -646,11 +645,9 @@ pub(crate) mod tests {
             .map(|reason| PortabilityIssue { node_id: node.id.clone(), reason })).collect();
         manifest.portability = Portability::from_issues(issues);
         session.state.save_manifest(&manifest).unwrap();
-        std::fs::create_dir_all(worktree).unwrap();
+        let target = Target::new("alice", REPO_NAME, BRANCH);
         session.github = Some(GithubSession {
-            target: Target::new("alice", REPO_NAME, BRANCH),
-            work: Some(WorkSession { store: worktree.join("store"), sessions: worktree.join("sessions"), id: "t".into(),
-                worktree: worktree.to_path_buf(), branch: BRANCH.into(), origin: String::new() }),
+            work: Some(store::test_work_session(work, &target)), target,
             storage: Storage::Plain, keys: None, sync: SyncStatus::Clean, last_counts: Value::Null, last_version: None,
         });
         (session, journal)

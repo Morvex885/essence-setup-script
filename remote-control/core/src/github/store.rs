@@ -662,6 +662,24 @@ pub fn flush(paths: &StatePaths, target: &Target, work: &WorkSession, storage: S
     result
 }
 
+/// Test fixture under `dir`: a bare store on the initial empty state with
+/// `target`'s origin and an open session worktree. GitHub is never reached:
+/// a flush pins its commit, then the account check fails (pending).
+#[cfg(test)]
+pub(crate) fn test_work_session(dir: &Path, target: &Target) -> WorkSession {
+    let store = dir.join("store.git");
+    let mut init = exec::git();
+    init.args(["init", "-q", "--bare"]).arg(&store);
+    assert!(exec::run(init, None, exec::LOCAL_TIMEOUT).unwrap().success);
+    store_ok(&store, "test", &["remote", "add", "origin", &target.url()]).unwrap();
+    let tree = store_ok(&store, "test", &["mktree"]).unwrap().text();
+    let mut list = AUTHOR.to_vec();
+    list.extend(["commit-tree", &tree, "-m", "Initial empty state"]);
+    let initial = store_ok(&store, "test", &list).unwrap().text();
+    update_ref(&store, &format!("refs/heads/{}", target.branch), &initial).unwrap();
+    open_worktree(&store, &dir.join("sessions"), &target.branch).unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -720,20 +738,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = StatePaths::new(dir.path().join("data"));
         let target = Target::new("octo", "essence-remote-control-config", "main");
-        let store = dir.path().join("store.git");
-        let mut init = exec::git();
-        init.args(["init", "-q", "--bare"]).arg(&store);
-        assert!(exec::run(init, None, exec::LOCAL_TIMEOUT).unwrap().success);
-        store_ok(&store, "test", &["remote", "add", "origin", &target.url()]).unwrap();
-        let tree = store_ok(&store, "test", &["mktree"]).unwrap().text();
-        let mut list = AUTHOR.to_vec();
-        list.extend(["commit-tree", &tree, "-m", "Initial empty state"]);
-        let initial = store_ok(&store, "test", &list).unwrap().text();
-        let local_ref = "refs/heads/main";
-        update_ref(&store, local_ref, &initial).unwrap();
+        let work = test_work_session(dir.path(), &target);
+        let (store, local_ref) = (work.store.clone(), "refs/heads/main");
+        let initial = rev(&store, local_ref).unwrap().unwrap();
         assert!(!holds_snapshot(&store, local_ref).unwrap(), "the initial empty state is not a snapshot");
         assert!(!holds_snapshot(&store, "refs/heads/none").unwrap());
-        let work = open_worktree(&store, &dir.path().join("sessions"), "main").unwrap();
         fs::write(work.worktree.join("config.json"), "{}\n").unwrap();
 
         // Refused before the commit: nothing is pinned.

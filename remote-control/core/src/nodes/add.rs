@@ -528,18 +528,22 @@ mod tests {
 
     #[tokio::test]
     async fn github_defer_saves_a_pending_node_without_contact() {
-        use crate::github::{BRANCH, REPO_NAME, Storage, SyncStatus, Target, commands::GithubSession, store::WorkSession};
-        let (root, worktree) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        use crate::github::{BRANCH, REPO_NAME, Storage, SyncStatus, Target, commands::GithubSession, store};
+        let (root, work) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let (mut session, _journal) = testing::session(root.path());
+        let target = Target::new("alice", REPO_NAME, BRANCH);
         session.github = Some(GithubSession {
-            target: Target::new("alice", REPO_NAME, BRANCH),
-            work: Some(WorkSession { store: worktree.path().join("store"), sessions: worktree.path().join("sessions"), id: "t".into(),
-                worktree: worktree.path().to_path_buf(), branch: BRANCH.into(), origin: String::new() }),
+            work: Some(store::test_work_session(work.path(), &target)), target,
             storage: Storage::Plain, keys: None, sync: SyncStatus::Clean, last_counts: Value::Null, last_version: None,
         });
+        let git_store = session.github.as_ref().unwrap().work.as_ref().unwrap().store.clone();
+        let initial = store::rev(&git_store, "refs/heads/main").unwrap();
         let mut transport = FakeTransport::new([]);
         let data = add(&mut session, &testing::invocation(&argv(&["--auth", "key", "--defer-ssh-setup"])), &Secrets::default(), &mut transport)
             .await.unwrap();
+        // Saved locally: committed and pinned, waiting for push.
+        assert_eq!(session.github.as_ref().unwrap().sync, SyncStatus::Pending);
+        assert_ne!(store::rev(&git_store, "refs/heads/main").unwrap(), initial);
         assert!(transport.journal().is_empty());
         assert_eq!(data["needs_setup"], json!(true));
         let id = data["id"].as_str().unwrap();

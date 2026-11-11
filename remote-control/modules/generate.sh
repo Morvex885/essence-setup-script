@@ -750,6 +750,8 @@ _node_users_load() {
 # _listener_users_payload MARKER… — stdin для _listener_users_remote_cmd: на каждый
 # маркер строка «маркер число_строк» и YAML-блок пользователей из NODE_USERS_DATA.
 # uuid и пароли клиентов передаются только так — не в argv ssh и удалённого bash.
+# Формат блоков совпадает с _build_*_users_yaml (common/listener-users.sh):
+# пароль Hysteria2 — строка YAML в двойных кавычках.
 _listener_users_payload() {
     local marker block count name uuid pass
     for marker in "$@"; do
@@ -759,7 +761,9 @@ _listener_users_payload() {
             case "$marker" in
                 hy2)
                     [[ -n "$pass" ]] || continue
-                    block+="      ${name}: ${pass}"$'\n'
+                    pass="${pass//\\/\\\\}"; pass="${pass//\"/\\\"}"
+                    pass="${pass//$'\n'/\\n}"; pass="${pass//$'\r'/\\r}"
+                    block+="      ${name}: \"${pass}\""$'\n'
                     count=$((count + 1))
                     ;;
                 *)

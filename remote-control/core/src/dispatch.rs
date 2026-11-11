@@ -195,8 +195,9 @@ impl Session {
 
     /// The single mutation path (v1 `state_action`): mutation lock → change →
     /// checkpoint. For GitHub the runtime is serialized into the worktree and
-    /// flushed; a failure before the worktree is written restores the runtime
-    /// (and `auth.txt`), a failed flush keeps the result and leaves `pending`.
+    /// flushed; a failure before the commit is pinned restores the runtime
+    /// (and `auth.txt`) and the worktree, a failed push after it keeps the
+    /// result and leaves `pending`.
     pub fn mutate<T>(&mut self, label: &str, apply: impl FnOnce(&State) -> Result<T>) -> Result<T> {
         let locks = self.state.locks().clone();
         let _guard = locks.acquire(LockKind::Mutation, label)?;
@@ -224,9 +225,25 @@ impl Session {
             let _ = backup.restore();
             return Err(github::prefixed(error, "Не удалось сохранить изменение в GitHub", "source_failed"));
         }
-        if let Err(error) = github.flush(self.state.paths()) {
-            self.sink.log(Level::Warn, &format!("Не удалось отправить изменение в GitHub: {}", error.message));
-            self.sink.log(Level::Warn, "Изменения сохранены локально и ожидают отправки.");
+        let sync_before = github.sync;
+        match github.try_flush(self.state.paths()) {
+            Ok(()) => {}
+            Err(failure) if failure.pinned => {
+                self.sink.log(Level::Warn, &format!("Не удалось отправить изменение в GitHub: {}", failure.error.message));
+                self.sink.log(Level::Warn, "Изменения сохранены локально и ожидают отправки.");
+            }
+            Err(failure) => {
+                // Nothing was committed: the change is not saved anywhere, so
+                // the runtime, the worktree and the sync status return to
+                // their state before it.
+                let restored = backup.restore().and_then(|()| github::vault::serialize(&self.state))
+                    .and_then(|snapshot| github.checkpoint(&snapshot));
+                github.sync = sync_before;
+                if restored.is_err() {
+                    self.sink.log(Level::Warn, "Не удалось вернуть конфигурацию и рабочую копию GitHub к прежнему состоянию: проверьте конфигурацию перед следующим изменением.");
+                }
+                return Err(github::prefixed(failure.error, "Не удалось сохранить изменение в GitHub", "source_failed"));
+            }
         }
         result
     }
@@ -487,5 +504,37 @@ mod tests {
         let open = run(&mut one_shot, &["session", "open"], "{}").await;
         assert_eq!(open.error.unwrap().code, "not_configured");
         assert!(!root.path().join("absent").exists());
+    }
+
+    #[test]
+    fn a_flush_failing_before_the_pin_saves_nothing() {
+        use crate::github::{BRANCH, REPO_NAME, Storage, SyncStatus, Target, commands::GithubSession, stage_of, store};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("data");
+        let (mut session, journal) = session(&root, DispatchMode::OneShot);
+        let paths = StatePaths::new(&root);
+        session.state = State::with_locks(paths.runtime(), session.state.locks().clone());
+        crate::secure_fs::create_dir_all(&paths.github_runtime()).unwrap();
+        session.state.save_config(&crate::model::Config::default()).unwrap();
+        let work = store::test_work_session(&dir.path().join("work"), &Target::new("alice", REPO_NAME, BRANCH));
+        let (git_store, worktree) = (work.store.clone(), work.worktree.clone());
+        let initial = store::rev(&git_store, "refs/heads/main").unwrap();
+        // The session target no longer matches its worktree: flush stops before the commit.
+        session.github = Some(GithubSession { target: Target::new("mallory", REPO_NAME, BRANCH), work: Some(work),
+            storage: Storage::Plain, keys: None, sync: SyncStatus::Clean, last_counts: Value::Null, last_version: None });
+        let before = crate::nodes::testing::fingerprint(&paths.github_runtime());
+
+        let error = session.mutate("probe", |state| {
+            let mut config = state.load_config()?;
+            config.groups.push(crate::model::Group { name: "PROBE".into(), ..Default::default() });
+            state.save_config(&config)
+        }).unwrap_err();
+        assert_eq!((error.code, stage_of(&error)), ("source_failed", Some("проверка цели рабочей сессии GitHub")), "{}", error.message);
+        assert!(error.message.starts_with("Не удалось сохранить изменение в GitHub"), "{}", error.message);
+        assert_eq!(crate::nodes::testing::fingerprint(&paths.github_runtime()), before, "the runtime is restored");
+        assert!(!std::fs::read_to_string(worktree.join("config.json")).unwrap().contains("PROBE"), "the worktree is re-checkpointed");
+        assert_eq!(store::rev(&git_store, "refs/heads/main").unwrap(), initial, "nothing is pinned");
+        assert_eq!(session.github.as_ref().unwrap().sync, SyncStatus::Clean, "nothing waits for push");
+        assert!(journal.borrow().iter().all(|(level, _)| *level != Level::Warn), "no false «saved locally» warning");
     }
 }

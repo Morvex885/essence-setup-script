@@ -22,6 +22,7 @@ use crate::log::Level;
 use crate::model::{Client, Config, Node};
 use crate::nodes::scripts::{self, REMOTE_DIR};
 use crate::nodes::{self, COMMAND_TIMEOUT, LONG_TIMEOUT, required, sh_quote};
+use crate::protocols::listener_users;
 use crate::secure_fs;
 use crate::state::StatePaths;
 use crate::transport::{RemoteSession, RemoteTransport};
@@ -304,31 +305,17 @@ fn node_users<'a>(config: &'a Config, node: &str) -> Option<Vec<User<'a>>> {
 }
 
 /// stdin of the listener command: per marker `marker count` and the YAML
-/// lines of its users (v1 `_listener_users_payload`).
+/// lines of its users (v1 `_listener_users_payload`), built by the
+/// `listener-users.sh` builders so Hysteria2 passwords are quoted YAML strings.
 fn listener_payload(markers: &[&str], users: &[User<'_>]) -> String {
     let mut payload = String::new();
     for marker in markers {
-        let (mut block, mut count) = (String::new(), 0usize);
-        for user in users {
-            if *marker == "hy2" {
-                if user.password.is_empty() {
-                    continue;
-                }
-                block.push_str(&format!("      {}: {}\n", user.name, user.password));
-                count += 1;
-            } else {
-                if user.uuid.is_empty() {
-                    continue;
-                }
-                block.push_str(&format!("      - username: {}\n        uuid: {}\n", user.name, user.uuid));
-                count += 2;
-                if *marker == "vless-tcp" {
-                    block.push_str("        flow: xtls-rprx-vision\n");
-                    count += 1;
-                }
-            }
-        }
-        payload.push_str(&format!("{marker} {count}\n{block}"));
+        let block = if *marker == "hy2" {
+            listener_users::hy2_users_yaml(users.iter().map(|user| (user.name, user.password)))
+        } else {
+            listener_users::vless_users_yaml(marker, users.iter().map(|user| (user.name, user.uuid)))
+        };
+        payload.push_str(&format!("{marker} {}\n{block}", block.lines().count()));
     }
     payload
 }
@@ -1025,10 +1012,11 @@ mod tests {
 
     #[test]
     fn listener_payload_and_commands_keep_credentials_on_stdin() {
-        let users = [User { name: "r", uuid: ROUTER_UUID, password: "p1" }, User { name: "n", uuid: "", password: "" }];
+        let users = [User { name: "r", uuid: ROUTER_UUID, password: "p1" }, User { name: "n", uuid: "", password: "" },
+            User { name: "d", uuid: "", password: "-" }];
         assert_eq!(listener_payload(&["vless-tcp", "vless-grpc", "hy2"], &users), format!(
             "vless-tcp 3\n      - username: r\n        uuid: {ROUTER_UUID}\n        flow: xtls-rprx-vision\n\
-             vless-grpc 2\n      - username: r\n        uuid: {ROUTER_UUID}\nhy2 1\n      r: p1\n"));
+             vless-grpc 2\n      - username: r\n        uuid: {ROUTER_UUID}\nhy2 2\n      r: \"p1\"\n      d: \"-\"\n"));
         assert_eq!(listener_payload(&["hy2"], &[]), "hy2 0\n");
         let strict = listener_command(ListenerMode::Strict);
         assert!(strict.starts_with("source '/root/essence-setup/common/listener-users.sh' || exit 1\n_sync_rc=0\n"));

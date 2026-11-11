@@ -305,8 +305,8 @@ _invoke_listener_sync_without_pipefail() {
     [[ "$(_listener_block vless-tcp)" == *"flow: xtls-rprx-vision"* ]]
     [[ "$(_listener_block vless-xhttp)" == *"username: my-router"* ]]
     [[ "$(_listener_block vless-xhttp)" != *"flow: xtls-rprx-vision"* ]]
-    [[ "$(_listener_block hy2)" == *"my-router: router-hy2-pass-0001"* ]]
-    [[ "$(_listener_block hy2)" == *"my-pc: pc-hy2-pass-0002"* ]]
+    [[ "$(_listener_block hy2)" == *'my-router: "router-hy2-pass-0001"'* ]]
+    [[ "$(_listener_block hy2)" == *'my-pc: "pc-hy2-pass-0002"'* ]]
     [[ "$(_listener_block vless-tcp)" != *"old-tcp"* ]]
 
     jq_w '.clients=[]'
@@ -323,6 +323,13 @@ _invoke_listener_sync_without_pipefail() {
     [[ "$(_listener_block hy2)" == *"cascade-user: hy2-cascade"* ]]
     [[ "$(wc -l < "$LISTENER_RESTART_LOG")" -eq 1 ]]
     [[ -z "$(_listener_users_body vless-tcp "$LISTENER_RESTART_SNAPSHOT")" ]]
+}
+
+@test "_listener_users_payload: Hysteria2 passwords are quoted YAML strings" {
+    local payload
+    NODE_USERS_DATA=$'alice|u-1|-\nbob||a"b\\c'
+    payload=$(_listener_users_payload hy2 vless-grpc)
+    [[ "$payload" == $'hy2 2\n      alice: "-"\n      bob: "a\\"b\\\\c"\nvless-grpc 2\n      - username: alice\n        uuid: u-1' ]]
 }
 
 @test "_sync_node_listeners: malformed or missing JSON fails before remote changes" {

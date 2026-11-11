@@ -490,7 +490,7 @@ prepare_empty_assigned_group() {
     [[ "$(cat "$ssh_argv_file")" != *11111111-2222-3333-4444-555555555555* ]]
     [[ "$(cat "$ssh_argv_file")" != *pc-hy2-pass-0002* ]]
     grep -qF 'uuid: 11111111-2222-3333-4444-555555555555' "$ssh_input_file"
-    grep -qF 'my-pc: pc-hy2-pass-0002' "$ssh_input_file"
+    grep -qF 'my-pc: "pc-hy2-pass-0002"' "$ssh_input_file"
     [[ "$(cat "$ssh_input_file")" != *my-router* ]]
 }
 
