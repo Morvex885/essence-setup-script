@@ -397,7 +397,7 @@ mod platform {
     use std::{mem, os::windows::{ffi::OsStrExt, io::{AsRawHandle, FromRawHandle}}};
     use windows_sys::Win32::{Foundation::INVALID_HANDLE_VALUE, Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
         FILE_SHARE_WRITE, GetFileInformationByHandle, OPEN_EXISTING,
     }};
 
@@ -406,7 +406,9 @@ mod platform {
         if wide[..wide.len() - 1].contains(&0) { return Err(io::Error::new(io::ErrorKind::InvalidInput, "NUL in lock path")); }
         // No FILE_SHARE_DELETE: until the election is installed and verified,
         // neither this directory nor its path may be renamed or deleted.
-        let handle = unsafe { CreateFileW(wide.as_ptr(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, std::ptr::null(), OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, std::ptr::null_mut()) };
+        // Share modes bind only handles with data or delete access, so the
+        // pin needs FILE_LIST_DIRECTORY; attribute-only access pins nothing.
+        let handle = unsafe { CreateFileW(wide.as_ptr(), FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, std::ptr::null(), OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, std::ptr::null_mut()) };
         if handle == INVALID_HANDLE_VALUE { return Err(io::Error::last_os_error()); }
         let file = unsafe { File::from_raw_handle(handle) };
         let info = information(&file)?;

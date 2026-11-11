@@ -284,6 +284,9 @@ fn rust_port_matches_bash_goldens() {
     let mut failures = Vec::new();
     let mut total = 0;
     for module in MODULES {
+        // DNAT cases run the generated script under a POSIX bash; on Windows
+        // `bash` is the WSL launcher. The scripts only ever run on Linux nodes.
+        if cfg!(windows) && module == "iptables-dnat" { continue; }
         for case in load(module) {
             total += 1;
             let outcome = replay(&case);

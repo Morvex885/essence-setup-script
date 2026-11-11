@@ -5,9 +5,9 @@
 //! points. Only the directory explicitly passed to `create_dir_all` is made
 //! private on reuse. New directories are private from creation. Atomic writes
 //! sync the new file before replacement and the containing directory on Unix.
-//! Windows has no
-//! supported equivalent of Unix directory fsync; MoveFileExW's WRITE_THROUGH is
-//! used, but cannot promise the same power-loss durability for directory entries.
+//! Windows has no supported equivalent of Unix directory fsync, so the
+//! replacing rename cannot promise the same power-loss durability for
+//! directory entries.
 
 use std::fs::File;
 use std::io::{self, Write};
@@ -305,7 +305,7 @@ mod platform {
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::path::{Component, Path, PathBuf};
     use std::ptr::{null, null_mut};
-    use windows_sys::Win32::Foundation::{ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE, LocalFree};
+    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE, LocalFree};
     use windows_sys::Win32::Security::Authorization::{ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo};
     use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, EqualSid, GetSecurityDescriptorDacl, GetTokenInformation, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SECURITY_ATTRIBUTES, TOKEN_INFORMATION_CLASS, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER, TokenOwner, TokenUser};
     use windows_sys::Win32::Storage::FileSystem::*;
@@ -474,30 +474,6 @@ mod platform {
         bool_result(unsafe { CreateDirectoryW(path.as_ptr(), &attributes) })
     }
 
-    /// Rename with POSIX semantics (Windows 10 1607+, NTFS): the destination
-    /// is replaced even while readers hold it open, which the classic rename
-    /// refuses with ERROR_ACCESS_DENIED. Filesystems without it report
-    /// ERROR_INVALID_PARAMETER/ERROR_NOT_SUPPORTED; the caller falls back.
-    /// `destination` is the NUL-terminated UTF-16 full path.
-    fn posix_rename(source: &Path, destination: &[u16]) -> io::Result<()> {
-        const FILE_RENAME_FLAG_REPLACE_IF_EXISTS: u32 = 0x1;
-        const FILE_RENAME_FLAG_POSIX_SEMANTICS: u32 = 0x2;
-        let file = open(source, false, DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)?;
-        let name = &destination[..destination.len() - 1];
-        let name_offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
-        let size = name_offset + size_of_val(name);
-        // u64 storage satisfies FILE_RENAME_INFO's pointer alignment.
-        let mut buffer = vec![0u64; size.div_ceil(size_of::<u64>())];
-        unsafe {
-            let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
-            (*info).Anonymous.Flags = FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
-            (*info).RootDirectory = null_mut();
-            (*info).FileNameLength = size_of_val(name) as u32;
-            std::ptr::copy_nonoverlapping(name.as_ptr(), buffer.as_mut_ptr().cast::<u8>().add(name_offset).cast::<u16>(), name.len());
-            bool_result(SetFileInformationByHandle(file.as_raw_handle(), FileRenameInfoEx, buffer.as_ptr().cast(), size as u32))
-        }
-    }
-
     fn walk(path: &Path, create: bool) -> io::Result<Parent> {
         // absolute handles drive-relative paths without changing global cwd.
         let absolute = std::path::absolute(path)?;
@@ -605,18 +581,12 @@ mod platform {
         }
 
         pub(super) fn replace(&self, source: &OsStr, destination: &OsStr) -> io::Result<()> {
-            let source_path = self.child(source)?;
-            let destination = wide(&self.child(destination)?)?;
-            match posix_rename(&source_path, &destination) {
-                Err(error) if matches!(error.raw_os_error().map(|code| code as u32),
-                    Some(ERROR_INVALID_PARAMETER | ERROR_NOT_SUPPORTED | ERROR_INVALID_FUNCTION)) => (),
-                result => return result,
-            }
-            let source = wide(&source_path)?;
-            // Same-parent MoveFileEx, without COPY_ALLOWED, is an atomic rename.
-            // Unlike ReplaceFileW it keeps the new file's private DACL rather
-            // than inheriting the replaced file's possibly permissive DACL.
-            bool_result(unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) })
+            // Same-parent rename. std uses POSIX semantics (FileRenameInfoEx,
+            // Windows 10 1607+), so readers holding the destination open do
+            // not block the replacement; MoveFileExW is its fallback. Unlike
+            // ReplaceFileW it keeps the new file's private DACL rather than
+            // inheriting the replaced file's possibly permissive DACL.
+            std::fs::rename(self.child(source)?, self.child(destination)?)
         }
 
         pub(super) fn remove(&self, name: &OsStr) {
@@ -636,25 +606,27 @@ mod platform {
         let file = open(path, directory, READ_CONTROL | FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).unwrap();
         check_owner(&file).unwrap();
         unsafe {
-            let mut owner = null_mut();
             let mut dacl = null_mut();
             let mut descriptor = null_mut();
-            assert_eq!(GetSecurityInfo(file.as_raw_handle(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-                &mut owner, null_mut(), &mut dacl, null_mut(), &mut descriptor), 0);
+            assert_eq!(GetSecurityInfo(file.as_raw_handle(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                null_mut(), null_mut(), &mut dacl, null_mut(), &mut descriptor), 0);
             let _allocation = LocalAllocation(descriptor);
             assert!(!dacl.is_null(), "NULL DACL grants access to everyone");
             let mut control = 0;
             let mut revision = 0;
             assert_ne!(GetSecurityDescriptorControl(descriptor, &mut control, &mut revision), 0);
             assert_ne!(control & SE_DACL_PROTECTED, 0, "DACL must not inherit broad ancestor grants");
-            assert_eq!((*dacl).AceCount, 1, "only the owner may receive an allow ACE");
+            assert_eq!((*dacl).AceCount, 1, "only the current user may receive an allow ACE");
             let mut ace = null_mut();
             assert_ne!(GetAce(dacl, 0, &mut ace), 0);
             let ace = &*ace.cast::<ACCESS_ALLOWED_ACE>();
             assert_eq!(ace.Header.AceType as u32, ACCESS_ALLOWED_ACE_TYPE);
             assert_eq!(ace.Mask & FILE_ALL_ACCESS, FILE_ALL_ACCESS);
             let ace_sid = std::ptr::addr_of!(ace.SidStart).cast_mut().cast();
-            assert_ne!(EqualSid(owner, ace_sid), 0, "allow ACE must name the actual owner SID");
+            // The owner (checked above) may be the elevated token's default
+            // owner, BUILTIN\Administrators; the grant always names the user.
+            let user = token_user().unwrap();
+            assert_ne!(EqualSid((*(user.as_ptr().cast::<TOKEN_USER>())).User.Sid, ace_sid), 0, "allow ACE must name the current user SID");
         }
     }
 }
