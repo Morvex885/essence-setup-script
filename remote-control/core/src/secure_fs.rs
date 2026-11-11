@@ -307,7 +307,7 @@ mod platform {
     use std::ptr::{null, null_mut};
     use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE, LocalFree};
     use windows_sys::Win32::Security::Authorization::{ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo};
-    use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, EqualSid, GetSecurityDescriptorDacl, GetTokenInformation, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser};
+    use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, EqualSid, GetSecurityDescriptorDacl, GetTokenInformation, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SECURITY_ATTRIBUTES, TOKEN_INFORMATION_CLASS, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER, TokenOwner, TokenUser};
     use windows_sys::Win32::Storage::FileSystem::*;
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     use windows_sys::Win32::System::SystemServices::FILE_PERSISTENT_ACLS;
@@ -364,23 +364,25 @@ mod platform {
         if value == 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
     }
 
-    // Keep the token buffer alive: TOKEN_USER's SID points into this buffer.
-    fn token_user() -> io::Result<Vec<usize>> {
+    // Keep the token buffer alive: the SID inside TOKEN_USER/TOKEN_OWNER points into this buffer.
+    fn token_information(class: TOKEN_INFORMATION_CLASS) -> io::Result<Vec<usize>> {
         unsafe {
             let mut token = null_mut();
             bool_result(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token))?;
             let token = OwnedHandle::from_raw_handle(token);
             let mut length = 0;
-            GetTokenInformation(token.as_raw_handle(), TokenUser, null_mut(), 0, &mut length);
+            GetTokenInformation(token.as_raw_handle(), class, null_mut(), 0, &mut length);
             if length == 0 {
                 return Err(io::Error::last_os_error());
             }
-            // usize gives the TOKEN_USER structure and embedded SID alignment.
+            // usize gives the token structure and embedded SID alignment.
             let mut buffer = vec![0usize; (length as usize).div_ceil(size_of::<usize>())];
-            bool_result(GetTokenInformation(token.as_raw_handle(), TokenUser, buffer.as_mut_ptr().cast(), length, &mut length))?;
+            bool_result(GetTokenInformation(token.as_raw_handle(), class, buffer.as_mut_ptr().cast(), length, &mut length))?;
             Ok(buffer)
         }
     }
+
+    fn token_user() -> io::Result<Vec<usize>> { token_information(TokenUser) }
 
     pub(super) struct Security(LocalAllocation);
 
@@ -427,17 +429,23 @@ mod platform {
         }
     }
 
+    /// The owner is the current user or the token's default owner: an
+    /// elevated administrator's objects are owned by BUILTIN\Administrators
+    /// (the default owner of an elevated token), which is still a principal
+    /// of this process, not a foreign one.
     fn check_owner(file: &File) -> io::Result<()> {
         unsafe {
             let user = token_user()?;
             let sid = (*(user.as_ptr().cast::<TOKEN_USER>())).User.Sid;
+            let default_owner = token_information(TokenOwner)?;
+            let default_sid = (*(default_owner.as_ptr().cast::<TOKEN_OWNER>())).Owner;
             let mut owner = null_mut();
             let mut descriptor = null_mut();
             let result = GetSecurityInfo(file.as_raw_handle(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
                 &mut owner, null_mut(), null_mut(), null_mut(), &mut descriptor);
             if result != 0 { return Err(io::Error::from_raw_os_error(result as i32)); }
             let _allocation = LocalAllocation(descriptor);
-            if owner.is_null() || EqualSid(owner, sid) == 0 { return Err(unsafe_path()); }
+            if owner.is_null() || (EqualSid(owner, sid) == 0 && EqualSid(owner, default_sid) == 0) { return Err(unsafe_path()); }
             Ok(())
         }
     }
