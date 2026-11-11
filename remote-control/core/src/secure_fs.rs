@@ -305,7 +305,7 @@ mod platform {
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::path::{Component, Path, PathBuf};
     use std::ptr::{null, null_mut};
-    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE, LocalFree};
+    use windows_sys::Win32::Foundation::{ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE, LocalFree};
     use windows_sys::Win32::Security::Authorization::{ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo};
     use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, EqualSid, GetSecurityDescriptorDacl, GetTokenInformation, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SECURITY_ATTRIBUTES, TOKEN_INFORMATION_CLASS, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER, TokenOwner, TokenUser};
     use windows_sys::Win32::Storage::FileSystem::*;
@@ -474,6 +474,30 @@ mod platform {
         bool_result(unsafe { CreateDirectoryW(path.as_ptr(), &attributes) })
     }
 
+    /// Rename with POSIX semantics (Windows 10 1607+, NTFS): the destination
+    /// is replaced even while readers hold it open, which the classic rename
+    /// refuses with ERROR_ACCESS_DENIED. Filesystems without it report
+    /// ERROR_INVALID_PARAMETER/ERROR_NOT_SUPPORTED; the caller falls back.
+    /// `destination` is the NUL-terminated UTF-16 full path.
+    fn posix_rename(source: &Path, destination: &[u16]) -> io::Result<()> {
+        const FILE_RENAME_FLAG_REPLACE_IF_EXISTS: u32 = 0x1;
+        const FILE_RENAME_FLAG_POSIX_SEMANTICS: u32 = 0x2;
+        let file = open(source, false, DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)?;
+        let name = &destination[..destination.len() - 1];
+        let name_offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+        let size = name_offset + size_of_val(name);
+        // u64 storage satisfies FILE_RENAME_INFO's pointer alignment.
+        let mut buffer = vec![0u64; size.div_ceil(size_of::<u64>())];
+        unsafe {
+            let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+            (*info).Anonymous.Flags = FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
+            (*info).RootDirectory = null_mut();
+            (*info).FileNameLength = size_of_val(name) as u32;
+            std::ptr::copy_nonoverlapping(name.as_ptr(), buffer.as_mut_ptr().cast::<u8>().add(name_offset).cast::<u16>(), name.len());
+            bool_result(SetFileInformationByHandle(file.as_raw_handle(), FileRenameInfoEx, buffer.as_ptr().cast(), size as u32))
+        }
+    }
+
     fn walk(path: &Path, create: bool) -> io::Result<Parent> {
         // absolute handles drive-relative paths without changing global cwd.
         let absolute = std::path::absolute(path)?;
@@ -581,8 +605,14 @@ mod platform {
         }
 
         pub(super) fn replace(&self, source: &OsStr, destination: &OsStr) -> io::Result<()> {
-            let source = wide(&self.child(source)?)?;
+            let source_path = self.child(source)?;
             let destination = wide(&self.child(destination)?)?;
+            match posix_rename(&source_path, &destination) {
+                Err(error) if matches!(error.raw_os_error().map(|code| code as u32),
+                    Some(ERROR_INVALID_PARAMETER | ERROR_NOT_SUPPORTED | ERROR_INVALID_FUNCTION)) => (),
+                result => return result,
+            }
+            let source = wide(&source_path)?;
             // Same-parent MoveFileEx, without COPY_ALLOWED, is an atomic rename.
             // Unlike ReplaceFileW it keeps the new file's private DACL rather
             // than inheriting the replaced file's possibly permissive DACL.
