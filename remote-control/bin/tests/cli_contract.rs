@@ -1309,18 +1309,20 @@ fn uninstall_with_yes_removes_only_disposable_copy() {
     // С --remove-data данные уходят вместе с копией.
     let env2 = TestEnv::new();
     let bin2 = env2.disposable_bin();
-    fs::create_dir_all(env2.data()).unwrap();
-    fs::write(env2.data().join("marker"), b"state").unwrap();
+    // Only a recognizable essence-rc data layout is removed recursively.
+    let marker = env2.data().join("generated").join("marker");
+    fs::create_dir_all(marker.parent().unwrap()).unwrap();
+    fs::write(&marker, b"state").unwrap();
     let result = run_json(&bin2, &env2, &["self", "uninstall", "--remove-data", "--yes"], None);
     let value = envelope(&result);
     if value["ok"] == json!(true) {
         assert!(!bin2.exists(), "исполняемая копия удалена");
-        assert!(!env2.data().join("marker").exists(), "данные удалены с --remove-data");
+        assert!(!marker.exists(), "данные удалены с --remove-data");
         assert_eq!(value["data"]["data_kept"], json!(false), "data_kept=false: {value}");
     } else {
         assert_eq!(result.code, Some(2));
         assert!(bin2.exists());
-        assert!(env2.data().join("marker").exists());
+        assert!(marker.exists());
     }
     assert!(Path::new(BIN).exists(), "cargo-бинарник никогда не удаляется тестами");
 }
