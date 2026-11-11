@@ -41,39 +41,10 @@ source_common() {
     error() { echo -e "  ${RED}[✗]${NC} $*" >&2; return 1; }
 }
 
-# Remote-control modules depend on state.sh for schema-v2 paths and secrets.
-source_module() {
-    local module="$1"
-    if [[ "$module" != "state.sh" ]]; then
-        source "$PROJECT_ROOT/remote-control/modules/state.sh"
-    fi
-    source "$PROJECT_ROOT/remote-control/modules/$module"
-}
-
-# ─── Deterministic overrides ──────────────────────────────────────────────────
-
-# Override _pass_key to return a deterministic key for encryption tests
-override_pass_key() {
-    _pass_key() {
-        echo "aaaa1111bbbb2222cccc3333dddd4444eeee5555ffff6666aabb7788ccdd99ee"
-    }
-}
-
 # ─── Fixture loading ──────────────────────────────────────────────────────────
 
 FIXTURES_DIR="$TESTS_DIR/fixtures"
 
 load_fixture_config() {
     cp "$FIXTURES_DIR/sample_config.json" "$CONFIG_JSON"
-    if declare -F node_secret_set >/dev/null 2>&1; then
-        node_secret_set "22222222222222222222222222222222" "testpass123"
-    fi
-}
-
-load_fixture_template() {
-    cp "$FIXTURES_DIR/sample_template.yaml" "$TEMPLATES_DIR/default.yaml"
-}
-
-load_fixture_client_config() {
-    cat "$FIXTURES_DIR/sample_client_config.txt"
 }

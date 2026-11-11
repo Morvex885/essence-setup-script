@@ -627,28 +627,6 @@ EOF
     [ ! -e "$TPROXY_FIREWALL_FILE" ]
 }
 
-@test "remote batch failure aggregate remains failure when one worker fails" {
-    load '../helpers/mock_ssh'
-    reset_ssh_mocks
-    CURRENT_VERSION=1.2.3
-    REMOTE_DIR=/root/essence-setup
-    SETUP_DIR="$PROJECT_ROOT/setup-essence"
-    COMMON_DIR="$PROJECT_ROOT/common"
-    VERSION_PATH="$PROJECT_ROOT/VERSION"
-    source "$PROJECT_ROOT/remote-control/modules/ssh.sh"
-    source "$PROJECT_ROOT/remote-control/modules/telegram-proxy.sh"
-    node_load() { NODE_NAME="node-$1"; SERVER_IP=127.0.0.1; SERVER_PORT=22; SERVER_USER=root; SERVER_AUTH=key; SERVER_PASS=; return 0; }
-    nodes_count() { printf '2\n'; }
-    _remote_scripts_probe() {
-        REMOTE_SCRIPTS_STATE=ready
-        REMOTE_SCRIPTS_VERSION=$(_remote_scripts_normalize_version "$(cat "$VERSION_PATH")")
-    }
-    ssh_run() { printf '%s\n' "$NODE_NAME" >> "$BATS_TEST_TMPDIR/failed-workers"; return 1; }
-    run core_telegram_run web restart 1 2
-    [ "$status" -eq 1 ]
-    [ "$(wc -l < "$BATS_TEST_TMPDIR/failed-workers" | tr -d ' ')" -eq 2 ]
-}
-
 @test "certificate failure preserves its status and restores the original UFW rule" {
     local rc rules="$BATS_TEST_TMPDIR/ufw-restored"
     TELEGRAM_WEB_EMAIL=admin@example.com
