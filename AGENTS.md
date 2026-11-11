@@ -109,7 +109,7 @@ Fixtures: [tests/fixtures/sample_config.json](tests/fixtures/sample_config.json)
 
 - Версия — [VERSION](VERSION) (бамп перед тегом); её читают `rc-core`, serve-hello и `self version`.
 - CI: [.github/workflows/tests.yml](.github/workflows/tests.yml) — серверные BATS + `cargo test --workspace --locked` на трёх ОС.
-- Релиз: [.github/workflows/release.yml](.github/workflows/release.yml) — тест → сборка 8 целей → `essence-rc-<target>.tar.gz|.zip` + `SHA256SUMS`; серверный комплект собирает `tests/ci/build_release_tarball.sh` (в архив не входят `remote-control/`).
+- Релиз: [.github/workflows/release.yml](.github/workflows/release.yml) — тест → сборка 9 целей (включая `aarch64-linux-android` для Termux) → `essence-rc-<target>.tar.gz|.zip` + `SHA256SUMS`; серверный комплект собирает `tests/ci/build_release_tarball.sh` (в архив не входят `remote-control/`).
 
 ## Что не коммитить
 
