@@ -62,7 +62,7 @@ Bash-скрипты для настройки прокси-сервера и Rus
 - **Обновления** — проверка версии и обновление бинарника командой `self update` (SHA-256 из `SHA256SUMS`) или из раздела «Настройки»
 - **Пароль запуска** — Argon2id; для GitHub входит в логическое состояние и следует выбранному режиму шифрования
 - **Каталог данных** — `~/.local/share/essence-remote-control` (Linux/Termux), `~/Library/Application Support/essence-remote-control` (macOS), `%APPDATA%\essence-remote-control` (Windows); переопределяется `ESSENCE_RC_DATA_DIR`
-- **Командная строка** — `essence-rc <сущность> <действие> [--json]` без вопросов: источник, ноды, группы, шаблоны, клиенты, подключения, генерация, подписки, AmneziaWG, Telegram и сам remote-control; опасные действия показывают план и требуют `--yes --plan-token`; решения (`*_required`) возвращаются кодами с данными, секреты — через `--secrets-stdin` (`essence-rc help`)
+- **Командная строка** — `essence-rc <сущность> <действие> [--json]` без вопросов: источник, ноды, группы, шаблоны, клиенты, подключения, генерация, подписки, AmneziaWG, Telegram и сам remote-control; опасные действия показывают план и выполняются только с `--yes` (необязательный `--plan-token` из плана гарантирует, что план не изменился); решения (`*_required`) возвращаются кодами с данными, секреты — через `--secrets-stdin` (`essence-rc help`)
 
 Remote Control поддерживает переносимый источник состояния GitHub. При первом
 выборе используется фиксированный приватный репозиторий
@@ -102,7 +102,8 @@ Intel/Apple Silicon, Termux aarch64), скачивает `essence-rc-<target>.ta
 
 1. Скачайте из [последнего релиза](https://github.com/Morvex885/essence-setup-script/releases/latest)
    `essence-rc-x86_64-pc-windows-msvc.zip` (или `essence-rc-aarch64-pc-windows-msvc.zip`) и `SHA256SUMS`.
-2. Сверьте хеш в PowerShell — он должен совпасть со строкой архива в `SHA256SUMS`:
+2. Сверьте хеш в PowerShell — он должен совпасть со строкой архива в `SHA256SUMS`
+   (для ARM64 подставьте в обе команды `essence-rc-aarch64-pc-windows-msvc.zip`):
    ```powershell
    (Get-FileHash .\essence-rc-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash.ToLower()
    Select-String essence-rc-x86_64-pc-windows-msvc.zip .\SHA256SUMS
