@@ -1,0 +1,162 @@
+{
+  "cases": [
+    {
+      "args": [
+        "vless-cascade",
+        "203.0.113.5",
+        "443",
+        "8443"
+      ],
+      "case": "dn_apply_basic",
+      "function": "_apply_dnat_rules",
+      "globals": {},
+      "invoke": "w_apply_dnat",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "c3lzY3RsIFstd10gW25ldC5pcHY0LmlwX2ZvcndhcmQ9MV0KZ3JlcCBbLXF4Rl0gW25ldC5pcHY0LmlwX2ZvcndhcmQ9MV0gWy9ldGMvc3lzY3RsLmNvbmZdCmdyZXAgWy1xXSBbXiMqW1s6c3BhY2U6XV0qbmV0Wy5daXB2NFsuXWlwX2ZvcndhcmQ9XSBbL2V0Yy9zeXNjdGwuY29uZl0Kc2VkIFstaV0gW3MvXiMqW1s6c3BhY2U6XV0qbmV0Wy5daXB2NFsuXWlwX2ZvcndhcmQ9LiovbmV0LmlwdjQuaXBfZm9yd2FyZD0xL10gWy9ldGMvc3lzY3RsLmNvbmZdCmlwdGFibGVzIFstdF0gW25hdF0gWy1BXSBbUFJFUk9VVElOR10gWy1wXSBbdGNwXSBbLS1kcG9ydF0gWzg0NDNdIFstal0gW0ROQVRdIFstLXRvLWRlc3RpbmF0aW9uXSBbMjAzLjAuMTEzLjU6NDQzXSBbLW1dIFtjb21tZW50XSBbLS1jb21tZW50XSBbY2FzY2FkZS1kbmF0OnZsZXNzLWNhc2NhZGVdCmlwdGFibGVzIFstdF0gW25hdF0gWy1BXSBbUFJFUk9VVElOR10gWy1wXSBbdWRwXSBbLS1kcG9ydF0gWzg0NDNdIFstal0gW0ROQVRdIFstLXRvLWRlc3RpbmF0aW9uXSBbMjAzLjAuMTEzLjU6NDQzXSBbLW1dIFtjb21tZW50XSBbLS1jb21tZW50XSBbY2FzY2FkZS1kbmF0OnZsZXNzLWNhc2NhZGVdCmlwdGFibGVzIFstdF0gW25hdF0gWy1BXSBbUE9TVFJPVVRJTkddIFstcF0gW3RjcF0gWy1kXSBbMjAzLjAuMTEzLjVdIFstLWRwb3J0XSBbNDQzXSBbLWpdIFtNQVNRVUVSQURFXSBbLW1dIFtjb21tZW50XSBbLS1jb21tZW50XSBbY2FzY2FkZS1kbmF0OnZsZXNzLWNhc2NhZGVdCmlwdGFibGVzIFstdF0gW25hdF0gWy1BXSBbUE9TVFJPVVRJTkddIFstcF0gW3VkcF0gWy1kXSBbMjAzLjAuMTEzLjVdIFstLWRwb3J0XSBbNDQzXSBbLWpdIFtNQVNRVUVSQURFXSBbLW1dIFtjb21tZW50XSBbLS1jb21tZW50XSBbY2FzY2FkZS1kbmF0OnZsZXNzLWNhc2NhZGVdCg=="
+    },
+    {
+      "args": [
+        "x",
+        "203.0.113.5",
+        "443",
+        ""
+      ],
+      "case": "dn_apply_empty_local",
+      "function": "_apply_dnat_rules",
+      "globals": {},
+      "invoke": "w_apply_dnat",
+      "rc": 1,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": ""
+    },
+    {
+      "args": [
+        "v6",
+        "2001:db8::5",
+        "443",
+        "8443"
+      ],
+      "case": "dn_apply_ipv6_remote",
+      "function": "_apply_dnat_rules",
+      "globals": {},
+      "invoke": "w_apply_dnat",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "c3lzY3RsIFstd10gW25ldC5pcHY2LmNvbmYuYWxsLmZvcndhcmRpbmc9MV0KZ3JlcCBbLXF4Rl0gW25ldC5pcHY2LmNvbmYuYWxsLmZvcndhcmRpbmc9MV0gWy9ldGMvc3lzY3RsLmNvbmZdCmdyZXAgWy1xXSBbXiMqW1s6c3BhY2U6XV0qbmV0Wy5daXB2NlsuXWNvbmZbLl1hbGxbLl1mb3J3YXJkaW5nPV0gWy9ldGMvc3lzY3RsLmNvbmZdCnNlZCBbLWldIFtzL14jKltbOnNwYWNlOl1dKm5ldFsuXWlwdjZbLl1jb25mWy5dYWxsWy5dZm9yd2FyZGluZz0uKi9uZXQuaXB2Ni5jb25mLmFsbC5mb3J3YXJkaW5nPTEvXSBbL2V0Yy9zeXNjdGwuY29uZl0KaXA2dGFibGVzIFstdF0gW25hdF0gWy1BXSBbUFJFUk9VVElOR10gWy1wXSBbdGNwXSBbLS1kcG9ydF0gWzg0NDNdIFstal0gW0ROQVRdIFstLXRvLWRlc3RpbmF0aW9uXSBbWzIwMDE6ZGI4Ojo1XTo0NDNdIFstbV0gW2NvbW1lbnRdIFstLWNvbW1lbnRdIFtjYXNjYWRlLWRuYXQ6djZdCmlwNnRhYmxlcyBbLXRdIFtuYXRdIFstQV0gW1BSRVJPVVRJTkddIFstcF0gW3VkcF0gWy0tZHBvcnRdIFs4NDQzXSBbLWpdIFtETkFUXSBbLS10by1kZXN0aW5hdGlvbl0gW1syMDAxOmRiODo6NV06NDQzXSBbLW1dIFtjb21tZW50XSBbLS1jb21tZW50XSBbY2FzY2FkZS1kbmF0OnY2XQppcDZ0YWJsZXMgWy10XSBbbmF0XSBbLUFdIFtQT1NUUk9VVElOR10gWy1wXSBbdGNwXSBbLWRdIFsyMDAxOmRiODo6NV0gWy0tZHBvcnRdIFs0NDNdIFstal0gW01BU1FVRVJBREVdIFstbV0gW2NvbW1lbnRdIFstLWNvbW1lbnRdIFtjYXNjYWRlLWRuYXQ6djZdCmlwNnRhYmxlcyBbLXRdIFtuYXRdIFstQV0gW1BPU1RST1VUSU5HXSBbLXBdIFt1ZHBdIFstZF0gWzIwMDE6ZGI4Ojo1XSBbLS1kcG9ydF0gWzQ0M10gWy1qXSBbTUFTUVVFUkFERV0gWy1tXSBbY29tbWVudF0gWy0tY29tbWVudF0gW2Nhc2NhZGUtZG5hdDp2Nl0K"
+    },
+    {
+      "args": [
+        "my node",
+        "203.0.113.5",
+        "443",
+        "8443"
+      ],
+      "case": "dn_apply_name_space",
+      "function": "_apply_dnat_rules",
+      "globals": {},
+      "invoke": "w_apply_dnat",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "c3lzY3RsIFstd10gW25ldC5pcHY0LmlwX2ZvcndhcmQ9MV0KZ3JlcCBbLXF4Rl0gW25ldC5pcHY0LmlwX2ZvcndhcmQ9MV0gWy9ldGMvc3lzY3RsLmNvbmZdCmdyZXAgWy1xXSBbXiMqW1s6c3BhY2U6XV0qbmV0Wy5daXB2NFsuXWlwX2ZvcndhcmQ9XSBbL2V0Yy9zeXNjdGwuY29uZl0Kc2VkIFstaV0gW3MvXiMqW1s6c3BhY2U6XV0qbmV0Wy5daXB2NFsuXWlwX2ZvcndhcmQ9LiovbmV0LmlwdjQuaXBfZm9yd2FyZD0xL10gWy9ldGMvc3lzY3RsLmNvbmZdCmlwdGFibGVzIFstdF0gW25hdF0gWy1BXSBbUFJFUk9VVElOR10gWy1wXSBbdGNwXSBbLS1kcG9ydF0gWzg0NDNdIFstal0gW0ROQVRdIFstLXRvLWRlc3RpbmF0aW9uXSBbMjAzLjAuMTEzLjU6NDQzXSBbLW1dIFtjb21tZW50XSBbLS1jb21tZW50XSBbY2FzY2FkZS1kbmF0Om15IG5vZGVdCmlwdGFibGVzIFstdF0gW25hdF0gWy1BXSBbUFJFUk9VVElOR10gWy1wXSBbdWRwXSBbLS1kcG9ydF0gWzg0NDNdIFstal0gW0ROQVRdIFstLXRvLWRlc3RpbmF0aW9uXSBbMjAzLjAuMTEzLjU6NDQzXSBbLW1dIFtjb21tZW50XSBbLS1jb21tZW50XSBbY2FzY2FkZS1kbmF0Om15IG5vZGVdCmlwdGFibGVzIFstdF0gW25hdF0gWy1BXSBbUE9TVFJPVVRJTkddIFstcF0gW3RjcF0gWy1kXSBbMjAzLjAuMTEzLjVdIFstLWRwb3J0XSBbNDQzXSBbLWpdIFtNQVNRVUVSQURFXSBbLW1dIFtjb21tZW50XSBbLS1jb21tZW50XSBbY2FzY2FkZS1kbmF0Om15IG5vZGVdCmlwdGFibGVzIFstdF0gW25hdF0gWy1BXSBbUE9TVFJPVVRJTkddIFstcF0gW3VkcF0gWy1kXSBbMjAzLjAuMTEzLjVdIFstLWRwb3J0XSBbNDQzXSBbLWpdIFtNQVNRVUVSQURFXSBbLW1dIFtjb21tZW50XSBbLS1jb21tZW50XSBbY2FzY2FkZS1kbmF0Om15IG5vZGVdCg=="
+    },
+    {
+      "args": [
+        "edge",
+        "203.0.113.5",
+        "65535",
+        "1"
+      ],
+      "case": "dn_apply_ports_edge",
+      "function": "_apply_dnat_rules",
+      "globals": {},
+      "invoke": "w_apply_dnat",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "c3lzY3RsIFstd10gW25ldC5pcHY0LmlwX2ZvcndhcmQ9MV0KZ3JlcCBbLXF4Rl0gW25ldC5pcHY0LmlwX2ZvcndhcmQ9MV0gWy9ldGMvc3lzY3RsLmNvbmZdCmdyZXAgWy1xXSBbXiMqW1s6c3BhY2U6XV0qbmV0Wy5daXB2NFsuXWlwX2ZvcndhcmQ9XSBbL2V0Yy9zeXNjdGwuY29uZl0Kc2VkIFstaV0gW3MvXiMqW1s6c3BhY2U6XV0qbmV0Wy5daXB2NFsuXWlwX2ZvcndhcmQ9LiovbmV0LmlwdjQuaXBfZm9yd2FyZD0xL10gWy9ldGMvc3lzY3RsLmNvbmZdCmlwdGFibGVzIFstdF0gW25hdF0gWy1BXSBbUFJFUk9VVElOR10gWy1wXSBbdGNwXSBbLS1kcG9ydF0gWzFdIFstal0gW0ROQVRdIFstLXRvLWRlc3RpbmF0aW9uXSBbMjAzLjAuMTEzLjU6NjU1MzVdIFstbV0gW2NvbW1lbnRdIFstLWNvbW1lbnRdIFtjYXNjYWRlLWRuYXQ6ZWRnZV0KaXB0YWJsZXMgWy10XSBbbmF0XSBbLUFdIFtQUkVST1VUSU5HXSBbLXBdIFt1ZHBdIFstLWRwb3J0XSBbMV0gWy1qXSBbRE5BVF0gWy0tdG8tZGVzdGluYXRpb25dIFsyMDMuMC4xMTMuNTo2NTUzNV0gWy1tXSBbY29tbWVudF0gWy0tY29tbWVudF0gW2Nhc2NhZGUtZG5hdDplZGdlXQppcHRhYmxlcyBbLXRdIFtuYXRdIFstQV0gW1BPU1RST1VUSU5HXSBbLXBdIFt0Y3BdIFstZF0gWzIwMy4wLjExMy41XSBbLS1kcG9ydF0gWzY1NTM1XSBbLWpdIFtNQVNRVUVSQURFXSBbLW1dIFtjb21tZW50XSBbLS1jb21tZW50XSBbY2FzY2FkZS1kbmF0OmVkZ2VdCmlwdGFibGVzIFstdF0gW25hdF0gWy1BXSBbUE9TVFJPVVRJTkddIFstcF0gW3VkcF0gWy1kXSBbMjAzLjAuMTEzLjVdIFstLWRwb3J0XSBbNjU1MzVdIFstal0gW01BU1FVRVJBREVdIFstbV0gW2NvbW1lbnRdIFstLWNvbW1lbnRdIFtjYXNjYWRlLWRuYXQ6ZWRnZV0K"
+    },
+    {
+      "args": [
+        ""
+      ],
+      "case": "dn_persist_netfilter_present",
+      "function": "_persist_dnat_rules",
+      "globals": {},
+      "invoke": "w_persist_dnat",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "bmV0ZmlsdGVyLXBlcnNpc3RlbnQgW3NhdmVdCg=="
+    },
+    {
+      "args": [
+        "vless-cascade",
+        "203.0.113.5",
+        "443",
+        "8443"
+      ],
+      "case": "dn_remove_basic",
+      "function": "_remove_dnat_rules",
+      "globals": {},
+      "invoke": "w_remove_dnat",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "aXB0YWJsZXMgWy10XSBbbmF0XSBbLURdIFtQUkVST1VUSU5HXSBbLXBdIFt0Y3BdIFstLWRwb3J0XSBbODQ0M10gWy1qXSBbRE5BVF0gWy0tdG8tZGVzdGluYXRpb25dIFsyMDMuMC4xMTMuNTo0NDNdIFstbV0gW2NvbW1lbnRdIFstLWNvbW1lbnRdIFtjYXNjYWRlLWRuYXQ6dmxlc3MtY2FzY2FkZV0KaXB0YWJsZXMgWy10XSBbbmF0XSBbLURdIFtQUkVST1VUSU5HXSBbLXBdIFt1ZHBdIFstLWRwb3J0XSBbODQ0M10gWy1qXSBbRE5BVF0gWy0tdG8tZGVzdGluYXRpb25dIFsyMDMuMC4xMTMuNTo0NDNdIFstbV0gW2NvbW1lbnRdIFstLWNvbW1lbnRdIFtjYXNjYWRlLWRuYXQ6dmxlc3MtY2FzY2FkZV0KaXB0YWJsZXMgWy10XSBbbmF0XSBbLURdIFtQT1NUUk9VVElOR10gWy1wXSBbdGNwXSBbLWRdIFsyMDMuMC4xMTMuNV0gWy0tZHBvcnRdIFs0NDNdIFstal0gW01BU1FVRVJBREVdIFstbV0gW2NvbW1lbnRdIFstLWNvbW1lbnRdIFtjYXNjYWRlLWRuYXQ6dmxlc3MtY2FzY2FkZV0KaXB0YWJsZXMgWy10XSBbbmF0XSBbLURdIFtQT1NUUk9VVElOR10gWy1wXSBbdWRwXSBbLWRdIFsyMDMuMC4xMTMuNV0gWy0tZHBvcnRdIFs0NDNdIFstal0gW01BU1FVRVJBREVdIFstbV0gW2NvbW1lbnRdIFstLWNvbW1lbnRdIFtjYXNjYWRlLWRuYXQ6dmxlc3MtY2FzY2FkZV0K"
+    },
+    {
+      "args": [
+        "x",
+        "203.0.113.5",
+        "443",
+        ""
+      ],
+      "case": "dn_remove_empty_local",
+      "function": "_remove_dnat_rules",
+      "globals": {},
+      "invoke": "w_remove_dnat",
+      "rc": 1,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": ""
+    },
+    {
+      "args": [
+        "v6",
+        "2001:db8::5",
+        "443",
+        "8443"
+      ],
+      "case": "dn_remove_ipv6_remote",
+      "function": "_remove_dnat_rules",
+      "globals": {},
+      "invoke": "w_remove_dnat",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "aXA2dGFibGVzIFstdF0gW25hdF0gWy1EXSBbUFJFUk9VVElOR10gWy1wXSBbdGNwXSBbLS1kcG9ydF0gWzg0NDNdIFstal0gW0ROQVRdIFstLXRvLWRlc3RpbmF0aW9uXSBbWzIwMDE6ZGI4Ojo1XTo0NDNdIFstbV0gW2NvbW1lbnRdIFstLWNvbW1lbnRdIFtjYXNjYWRlLWRuYXQ6djZdCmlwNnRhYmxlcyBbLXRdIFtuYXRdIFstRF0gW1BSRVJPVVRJTkddIFstcF0gW3VkcF0gWy0tZHBvcnRdIFs4NDQzXSBbLWpdIFtETkFUXSBbLS10by1kZXN0aW5hdGlvbl0gW1syMDAxOmRiODo6NV06NDQzXSBbLW1dIFtjb21tZW50XSBbLS1jb21tZW50XSBbY2FzY2FkZS1kbmF0OnY2XQppcDZ0YWJsZXMgWy10XSBbbmF0XSBbLURdIFtQT1NUUk9VVElOR10gWy1wXSBbdGNwXSBbLWRdIFsyMDAxOmRiODo6NV0gWy0tZHBvcnRdIFs0NDNdIFstal0gW01BU1FVRVJBREVdIFstbV0gW2NvbW1lbnRdIFstLWNvbW1lbnRdIFtjYXNjYWRlLWRuYXQ6djZdCmlwNnRhYmxlcyBbLXRdIFtuYXRdIFstRF0gW1BPU1RST1VUSU5HXSBbLXBdIFt1ZHBdIFstZF0gWzIwMDE6ZGI4Ojo1XSBbLS1kcG9ydF0gWzQ0M10gWy1qXSBbTUFTUVVFUkFERV0gWy1tXSBbY29tbWVudF0gWy0tY29tbWVudF0gW2Nhc2NhZGUtZG5hdDp2Nl0K"
+    },
+    {
+      "args": [
+        "my node",
+        "203.0.113.5",
+        "443",
+        "8443"
+      ],
+      "case": "dn_remove_name_space",
+      "function": "_remove_dnat_rules",
+      "globals": {},
+      "invoke": "w_remove_dnat",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "aXB0YWJsZXMgWy10XSBbbmF0XSBbLURdIFtQUkVST1VUSU5HXSBbLXBdIFt0Y3BdIFstLWRwb3J0XSBbODQ0M10gWy1qXSBbRE5BVF0gWy0tdG8tZGVzdGluYXRpb25dIFsyMDMuMC4xMTMuNTo0NDNdIFstbV0gW2NvbW1lbnRdIFstLWNvbW1lbnRdIFtjYXNjYWRlLWRuYXQ6bXkgbm9kZV0KaXB0YWJsZXMgWy10XSBbbmF0XSBbLURdIFtQUkVST1VUSU5HXSBbLXBdIFt1ZHBdIFstLWRwb3J0XSBbODQ0M10gWy1qXSBbRE5BVF0gWy0tdG8tZGVzdGluYXRpb25dIFsyMDMuMC4xMTMuNTo0NDNdIFstbV0gW2NvbW1lbnRdIFstLWNvbW1lbnRdIFtjYXNjYWRlLWRuYXQ6bXkgbm9kZV0KaXB0YWJsZXMgWy10XSBbbmF0XSBbLURdIFtQT1NUUk9VVElOR10gWy1wXSBbdGNwXSBbLWRdIFsyMDMuMC4xMTMuNV0gWy0tZHBvcnRdIFs0NDNdIFstal0gW01BU1FVRVJBREVdIFstbV0gW2NvbW1lbnRdIFstLWNvbW1lbnRdIFtjYXNjYWRlLWRuYXQ6bXkgbm9kZV0KaXB0YWJsZXMgWy10XSBbbmF0XSBbLURdIFtQT1NUUk9VVElOR10gWy1wXSBbdWRwXSBbLWRdIFsyMDMuMC4xMTMuNV0gWy0tZHBvcnRdIFs0NDNdIFstal0gW01BU1FVRVJBREVdIFstbV0gW2NvbW1lbnRdIFstLWNvbW1lbnRdIFtjYXNjYWRlLWRuYXQ6bXkgbm9kZV0K"
+    }
+  ],
+  "module": "iptables-dnat"
+}

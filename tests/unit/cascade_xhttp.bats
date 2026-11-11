@@ -71,3 +71,40 @@ EOF
     grep -qF 'uuid: bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb' <<< "$yaml"
     grep -qF 'client-fingerprint: firefox' <<< "$yaml"
 }
+
+@test "DNAT uses IPv6 firewall and brackets destination; empty port is rejected" {
+    source "$PROJECT_ROOT/common/protocols/iptables-dnat.sh"
+    local log="$BATS_TEST_TMPDIR/dnat.log"
+    ip6tables() { printf 'ip6tables %s\n' "$*" >> "$log"; }
+    iptables() { printf 'iptables %s\n' "$*" >> "$log"; }
+    sysctl() { printf 'sysctl %s\n' "$*" >> "$log"; }
+    grep() { return 0; }
+    _apply_dnat_rules node 2001:db8::1 443 8443
+    _remove_dnat_rules node 2001:db8::1 443 8443
+    [ "$(command grep -c 'ip6tables .*--to-destination \[2001:db8::1\]:443' "$log")" -eq 4 ]
+    ! command grep -q '^iptables ' "$log"
+    : > "$log"
+    run _apply_dnat_rules node 2001:db8::1 443 ''
+    [ "$status" -ne 0 ]
+    [ ! -s "$log" ]
+}
+
+@test "DNAT persists forwarding when sysctl config lacks the key" {
+    local config="$BATS_TEST_TMPDIR/sysctl.conf" patched="$BATS_TEST_TMPDIR/dnat.sh"
+    printf '# unrelated\n' > "$config"
+    sed "s|/etc/sysctl.conf|$config|g" "$PROJECT_ROOT/common/protocols/iptables-dnat.sh" > "$patched"
+    source "$patched"
+    sysctl() { :; }
+    ip6tables() { :; }
+    _apply_dnat_rules node 2001:db8::1 443 8443
+    grep -qxF 'net.ipv6.conf.all.forwarding=1' "$config"
+}
+
+@test "_dnat_client_uri replaces only the authority, IPv6 in brackets both ways" {
+    run _dnat_client_uri 'vless://uuid@[2001:db8::1]:443?type=tcp&sni=a#DE' 203.0.113.9 8443
+    assert_output 'vless://uuid@203.0.113.9:8443?type=tcp&sni=a#DE'
+    run _dnat_client_uri 'hy2://p%40ss@exit.example:443/?sni=x#n@1' 2001:db8::9 2096
+    assert_output 'hy2://p%40ss@[2001:db8::9]:2096/?sni=x#n@1'
+    run _dnat_client_uri 'hysteria2://exit.example:443' 198.51.100.1 1
+    assert_output 'hysteria2://198.51.100.1:1'
+}

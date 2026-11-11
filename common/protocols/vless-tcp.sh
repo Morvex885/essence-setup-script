@@ -6,6 +6,13 @@
 _build_vless_tcp_listener_yaml() {
     local name="$1" listen="$2" port="$3" username="$4" uuid="$5"
     local dest="$6" private_key="$7" short_id="$8" sni="$9" proxy="${10}"
+    # YAML address: "[v6]" loses its brackets, a trailing ":" ("::") needs quotes.
+    [[ "$listen" == \[*\] ]] && { listen="${listen#\[}"; listen="${listen%\]}"; }
+    [[ "$listen" == *: ]] && listen="\"$listen\""
+    dest="${dest//\\/\\\\}"; dest="${dest//\"/\\\"}"
+    dest="${dest//$'\n'/\\n}"; dest="${dest//$'\r'/\\r}"
+    sni="${sni//\\/\\\\}"; sni="${sni//\"/\\\"}"
+    sni="${sni//$'\n'/\\n}"; sni="${sni//$'\r'/\\r}"
     cat <<EOF
   - name: $name
     type: vless
@@ -18,12 +25,12 @@ _build_vless_tcp_listener_yaml() {
         flow: xtls-rprx-vision
       # client-users-end
     reality-config:
-      dest: $dest
+      dest: "$dest"
       private-key: "$private_key"
       short-id:
         - "$short_id"
       server-names:
-        - $sni
+        - "$sni"
     proxy: $proxy
 EOF
 }
@@ -33,6 +40,12 @@ EOF
 _build_vless_tcp_client_yaml() {
     local name="$1" server="$2" port="$3" uuid="$4"
     local sni="$5" public_key="$6" short_id="$7"
+    name="${name//\\/\\\\}"; name="${name//\"/\\\"}"
+    name="${name//$'\n'/\\n}"; name="${name//$'\r'/\\r}"
+    sni="${sni//\\/\\\\}"; sni="${sni//\"/\\\"}"
+    sni="${sni//$'\n'/\\n}"; sni="${sni//$'\r'/\\r}"
+    [[ "$server" == \[*\] ]] && { server="${server#\[}"; server="${server%\]}"; }
+    [[ "$server" == *: ]] && server="\"$server\""
     cat <<EOF
 proxies:
   - name: "$name"
@@ -44,7 +57,7 @@ proxies:
     udp: true
     flow: xtls-rprx-vision
     tls: true
-    servername: $sni
+    servername: "$sni"
     reality-opts:
       public-key: "$public_key"
       short-id: "$short_id"
@@ -57,7 +70,8 @@ EOF
 _build_vless_tcp_uri() {
     local uuid="$1" server="$2" port="$3" sni="$4"
     local public_key="$5" short_id="$6" fragment="${7:-VLESS TCP}"
-    echo "vless://${uuid}@${server}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${public_key}&sid=${short_id}&type=tcp#${fragment}"
+    [[ "$server" == *:* && "$server" != \[* ]] && server="[$server]"
+    echo "vless://$(_uri_percent_encode "$uuid")@${server}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$(_uri_percent_encode "$sni")&fp=chrome&pbk=$(_uri_percent_encode "$public_key")&sid=$(_uri_percent_encode "$short_id")&type=tcp#$(_uri_percent_encode "$fragment")"
 }
 
 # Exit proxy YAML (cascade outbound / proxies section)
@@ -65,7 +79,11 @@ _build_vless_tcp_uri() {
 _build_vless_tcp_exit_yaml() {
     local name="$1" server="$2" port="$3" uuid="$4" sni="$5"
     local public_key="${6:-}" short_id="${7:-}"
-    local flow="${8:-xtls-rprx-vision}" fingerprint="${9:-chrome}"
+    local flow="${8-xtls-rprx-vision}" fingerprint="${9:-chrome}"
+    sni="${sni//\\/\\\\}"; sni="${sni//\"/\\\"}"
+    sni="${sni//$'\n'/\\n}"; sni="${sni//$'\r'/\\r}"
+    [[ "$server" == \[*\] ]] && { server="${server#\[}"; server="${server%\]}"; }
+    [[ "$server" == *: ]] && server="\"$server\""
 
     echo "  - name: $name"
     echo "    type: vless"
@@ -76,7 +94,7 @@ _build_vless_tcp_exit_yaml() {
     echo "    udp: true"
     [[ -n "$flow" ]] && echo "    flow: $flow"
     echo "    tls: true"
-    echo "    servername: $sni"
+    echo "    servername: \"$sni\""
     if [[ -n "$public_key" ]]; then
         echo "    reality-opts:"
         echo "      public-key: $public_key"

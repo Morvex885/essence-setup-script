@@ -6,6 +6,15 @@
 _build_vless_xhttp_listener_yaml() {
     local name="$1" listen="$2" port="$3" username="$4" uuid="$5"
     local path="$6" dest="$7" private_key="$8" short_id="$9" sni="${10}" proxy="${11}"
+    # YAML address: "[v6]" loses its brackets, a trailing ":" ("::") needs quotes.
+    [[ "$listen" == \[*\] ]] && { listen="${listen#\[}"; listen="${listen%\]}"; }
+    [[ "$listen" == *: ]] && listen="\"$listen\""
+    path="${path//\\/\\\\}"; path="${path//\"/\\\"}"
+    path="${path//$'\n'/\\n}"; path="${path//$'\r'/\\r}"
+    dest="${dest//\\/\\\\}"; dest="${dest//\"/\\\"}"
+    dest="${dest//$'\n'/\\n}"; dest="${dest//$'\r'/\\r}"
+    sni="${sni//\\/\\\\}"; sni="${sni//\"/\\\"}"
+    sni="${sni//$'\n'/\\n}"; sni="${sni//$'\r'/\\r}"
     cat <<EOF
   - name: $name
     type: vless
@@ -20,12 +29,12 @@ _build_vless_xhttp_listener_yaml() {
       path: "$path"
       mode: auto
     reality-config:
-      dest: $dest
+      dest: "$dest"
       private-key: "$private_key"
       short-id:
         - "$short_id"
       server-names:
-        - $sni
+        - "$sni"
     proxy: $proxy
 EOF
 }
@@ -35,6 +44,10 @@ EOF
 _build_vless_xhttp_nginx_listener_yaml() {
     local name="$1" listen="$2" port="$3" username="$4" uuid="$5"
     local path="$6" proxy="$7"
+    [[ "$listen" == \[*\] ]] && { listen="${listen#\[}"; listen="${listen%\]}"; }
+    [[ "$listen" == *: ]] && listen="\"$listen\""
+    path="${path//\\/\\\\}"; path="${path//\"/\\\"}"
+    path="${path//$'\n'/\\n}"; path="${path//$'\r'/\\r}"
     cat <<EOF
   - name: $name
     type: vless
@@ -67,6 +80,14 @@ _build_vless_xhttp_tls_listener_yaml() {
 _build_vless_xhttp_client_yaml() {
     local name="$1" server="$2" port="$3" uuid="$4" sni="$5"
     local path="$6" public_key="${7:-}" short_id="${8:-}"
+    name="${name//\\/\\\\}"; name="${name//\"/\\\"}"
+    name="${name//$'\n'/\\n}"; name="${name//$'\r'/\\r}"
+    path="${path//\\/\\\\}"; path="${path//\"/\\\"}"
+    path="${path//$'\n'/\\n}"; path="${path//$'\r'/\\r}"
+    sni="${sni//\\/\\\\}"; sni="${sni//\"/\\\"}"
+    sni="${sni//$'\n'/\\n}"; sni="${sni//$'\r'/\\r}"
+    [[ "$server" == \[*\] ]] && { server="${server#\[}"; server="${server%\]}"; }
+    [[ "$server" == *: ]] && server="\"$server\""
 
     echo "proxies:"
     echo "  - name: \"$name\""
@@ -77,7 +98,7 @@ _build_vless_xhttp_client_yaml() {
     echo "    network: xhttp"
     echo "    udp: true"
     echo "    tls: true"
-    echo "    servername: $sni"
+    echo "    servername: \"$sni\""
     echo "    xhttp-opts:"
     echo "      path: \"$path\""
     echo "      mode: auto"
@@ -94,6 +115,7 @@ _build_vless_xhttp_client_yaml() {
 _build_vless_xhttp_uri() {
     local uuid="$1" server="$2" port="$3" sni="$4" path="$5"
     local public_key="${6:-}" short_id="${7:-}" fragment="${8:-VLESS xHTTP}"
+    [[ "$server" == *:* && "$server" != \[* ]] && server="[$server]"
 
     local security_params encoded_sni encoded_path encoded_public_key encoded_short_id encoded_fragment
     encoded_sni=$(_uri_percent_encode "$sni") || return 1
@@ -116,6 +138,12 @@ _build_vless_xhttp_exit_yaml() {
     local name="$1" server="$2" port="$3" uuid="$4" sni="$5"
     local path="$6" mode="${7:-auto}"
     local public_key="${8:-}" short_id="${9:-}"
+    path="${path//\\/\\\\}"; path="${path//\"/\\\"}"
+    path="${path//$'\n'/\\n}"; path="${path//$'\r'/\\r}"
+    sni="${sni//\\/\\\\}"; sni="${sni//\"/\\\"}"
+    sni="${sni//$'\n'/\\n}"; sni="${sni//$'\r'/\\r}"
+    [[ "$server" == \[*\] ]] && { server="${server#\[}"; server="${server%\]}"; }
+    [[ "$server" == *: ]] && server="\"$server\""
 
     echo "  - name: $name"
     echo "    type: vless"
@@ -128,7 +156,7 @@ _build_vless_xhttp_exit_yaml() {
     echo "      path: \"$path\""
     echo "      mode: $mode"
     echo "    tls: true"
-    echo "    servername: $sni"
+    echo "    servername: \"$sni\""
     if [[ -n "$public_key" ]]; then
         echo "    reality-opts:"
         echo "      public-key: $public_key"
@@ -140,16 +168,18 @@ _build_vless_xhttp_exit_yaml() {
 # Normalize an extracted proxy block used by remote-control. Non-xHTTP blocks
 # are returned byte-for-byte; xHTTP always receives the known-good fingerprint.
 _normalize_vless_xhttp_proxy_yaml() {
-    local block
+    local block cr=$'\r' eol=""
     block=$(cat)
-    if ! grep -q '^    network: xhttp$' <<< "$block"; then
+    if ! grep -q "^    network: xhttp${cr}\?\$" <<< "$block"; then
         printf '%s\n' "$block"
         return
     fi
+    # CRLF blocks keep their line endings.
+    [[ "$block" == *"$cr"* ]] && eol="$cr"
     if grep -q '^    client-fingerprint:' <<< "$block"; then
-        sed 's/^    client-fingerprint:.*/    client-fingerprint: firefox/' <<< "$block"
+        sed "s/^    client-fingerprint:[^${cr}]*/    client-fingerprint: firefox/" <<< "$block"
     else
-        printf '%s\n    client-fingerprint: firefox\n' "$block"
+        printf '%s\n    client-fingerprint: firefox%s\n' "$block" "$eol"
     fi
 }
 

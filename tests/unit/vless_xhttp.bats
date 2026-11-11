@@ -73,3 +73,75 @@ teardown() {
     assert_failure
     assert_output --partial 'Некорректное percent-кодирование'
 }
+
+@test "bracketed IPv6 URI parses to unbracketed server and correct port" {
+    source "$PROJECT_ROOT/common/protocols/vless-tcp.sh"
+    source "$PROJECT_ROOT/common/protocols/hy2.sh"
+    _parse_server_port_from_uri 'vless://u@[2001:db8::1]:8443?type=tcp#n'
+    [[ "$URI_SERVER" == "2001:db8::1" && "$URI_PORT" == "8443" ]]
+    local yaml
+    yaml=$(_parse_vless_uri_to_exit p 'vless://u@[2001:db8::1]:443?type=tcp' 2>/dev/null)
+    grep -qxF '    server: 2001:db8::1' <<< "$yaml"
+    grep -qxF '    port: 443' <<< "$yaml"
+    yaml=$(_parse_hy2_uri_to_exit p 'hy2://pw@[2001:db8::1]:443' 2>/dev/null)
+    grep -qxF '    server: 2001:db8::1' <<< "$yaml"
+    [[ $(_build_hy2_uri pw 2001:db8::1 443) == 'hysteria2://pw@[2001:db8::1]:443?'* ]]
+    [[ $(_build_vless_tcp_uri u 2001:db8::1 443 s k i) == 'vless://u@[2001:db8::1]:443?'* ]]
+}
+
+@test "trailing CR from CRLF input does not leak into the last URI field" {
+    source "$PROJECT_ROOT/common/protocols/hy2.sh"
+    _parse_server_port_from_uri $'hy2://p@h:443\r'
+    [[ "$URI_PORT" == "443" ]]
+    local yaml
+    yaml=$(_parse_vless_uri_to_exit p $'vless://u@h:443?type=xhttp&mode=packet-up\r' 2>/dev/null)
+    grep -qxF '    xhttp-opts:' <<< "$yaml"
+    grep -qF 'mode: packet-up' <<< "$yaml"
+    [[ "$yaml" != *$'\r'* ]]
+    yaml=$(_parse_hy2_uri_to_exit p $'hy2://pw@h:443?insecure=1\r' 2>/dev/null)
+    grep -qxF '    skip-cert-verify: true' <<< "$yaml"
+}
+
+@test "xHTTP normalizer handles CRLF blocks" {
+    local out
+    out=$(printf '  - name: n\r\n    network: xhttp\r\n    client-fingerprint: chrome\r\n' | _normalize_vless_xhttp_proxy_yaml)
+    [[ "$out" == *$'    client-fingerprint: firefox\r'* ]]
+    [[ "$out" != *chrome* ]]
+    out=$(printf '  - name: n\r\n    network: xhttp\r\n' | _normalize_vless_xhttp_proxy_yaml)
+    [[ "$out" == *$'    client-fingerprint: firefox\r' ]]
+}
+
+@test "URI builders encode reserved fields and hysteria password round trips" {
+    source "$PROJECT_ROOT/common/protocols/vless-tcp.sh"
+    source "$PROJECT_ROOT/common/protocols/vless-grpc.sh"
+    source "$PROJECT_ROOT/common/protocols/hy2.sh"
+    local uri yaml
+    uri=$(_build_hy2_uri 'p@# &%' host 443 's&n' 'ob#fs')
+    [[ "$uri" == *'p%40%23%20%26%25@host'* && "$uri" == *'ob%23fs'* ]]
+    yaml=$(_parse_hy2_uri_to_exit p "$uri" 2>/dev/null)
+    [[ "$yaml" == *'password: "p@# &%"'* ]]
+    uri=$(_build_vless_grpc_uri uuid host 443 's&n' 'svc?x' 'p+k' id 'my node')
+    [[ "$uri" == *'sni=s%26n'* && "$uri" == *'serviceName=svc%3Fx'* && "$uri" == *'#my%20node' ]]
+    uri=$(_build_vless_tcp_uri uuid host 443 s k id 'my node')
+    [[ "$uri" == *'#my%20node' ]]
+}
+
+@test "explicitly empty TCP flow is omitted" {
+    source "$PROJECT_ROOT/common/protocols/vless-tcp.sh"
+    local yaml
+    yaml=$(_build_vless_tcp_exit_yaml p host 443 uuid s '' '' '')
+    [[ "$yaml" != *'    flow:'* ]]
+}
+
+@test "client YAML quotes escape double quotes and backslashes" {
+    source "$PROJECT_ROOT/common/protocols/vless-tcp.sh"
+    source "$PROJECT_ROOT/common/protocols/vless-grpc.sh"
+    source "$PROJECT_ROOT/common/protocols/hy2.sh"
+    local yaml
+    yaml=$(_build_hy2_client_yaml 'a"b\c' host 443 pass)
+    [[ "$yaml" == *'name: "a\"b\\c"'* ]]
+    yaml=$(_build_vless_tcp_client_yaml 'a"b\c' host 443 u s k id)
+    [[ "$yaml" == *'name: "a\"b\\c"'* ]]
+    yaml=$(_build_vless_grpc_client_yaml 'a"b\c' host 443 u s svc k id)
+    [[ "$yaml" == *'name: "a\"b\\c"'* ]]
+}

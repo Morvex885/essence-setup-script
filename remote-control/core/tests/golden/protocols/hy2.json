@@ -1,0 +1,764 @@
+{
+  "cases": [
+    {
+      "args": [
+        "v6",
+        "[2001:db8::1]",
+        "443",
+        "pw"
+      ],
+      "case": "hc_bracketed_server",
+      "function": "_build_hy2_client_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_client_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "cHJveGllczoKICAtIG5hbWU6ICJ2NiIKICAgIHR5cGU6IGh5c3RlcmlhMgogICAgc2VydmVyOiAyMDAxOmRiODo6MQogICAgcG9ydDogNDQzCiAgICBwYXNzd29yZDogInB3IgogICAgc25pOiAid3d3Lmdvb2dsZS5kZSIKICAgIHNraXAtY2VydC12ZXJpZnk6IHRydWUK"
+    },
+    {
+      "args": [
+        "hy2-exit",
+        "exit.example.com",
+        "443",
+        "pw"
+      ],
+      "case": "hc_defaults",
+      "function": "_build_hy2_client_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_client_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "cHJveGllczoKICAtIG5hbWU6ICJoeTItZXhpdCIKICAgIHR5cGU6IGh5c3RlcmlhMgogICAgc2VydmVyOiBleGl0LmV4YW1wbGUuY29tCiAgICBwb3J0OiA0NDMKICAgIHBhc3N3b3JkOiAicHciCiAgICBzbmk6ICJ3d3cuZ29vZ2xlLmRlIgogICAgc2tpcC1jZXJ0LXZlcmlmeTogdHJ1ZQo="
+    },
+    {
+      "args": [
+        "x",
+        "h",
+        "443",
+        "pw",
+        "www.google.de",
+        "true",
+        ""
+      ],
+      "case": "hc_empty_obfs",
+      "function": "_build_hy2_client_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_client_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "cHJveGllczoKICAtIG5hbWU6ICJ4IgogICAgdHlwZTogaHlzdGVyaWEyCiAgICBzZXJ2ZXI6IGgKICAgIHBvcnQ6IDQ0MwogICAgcGFzc3dvcmQ6ICJwdyIKICAgIHNuaTogInd3dy5nb29nbGUuZGUiCiAgICBza2lwLWNlcnQtdmVyaWZ5OiB0cnVlCg=="
+    },
+    {
+      "args": [
+        "x",
+        "h.example",
+        "443",
+        "pw",
+        "",
+        "true"
+      ],
+      "case": "hc_empty_sni_default",
+      "function": "_build_hy2_client_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_client_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "cHJveGllczoKICAtIG5hbWU6ICJ4IgogICAgdHlwZTogaHlzdGVyaWEyCiAgICBzZXJ2ZXI6IGguZXhhbXBsZQogICAgcG9ydDogNDQzCiAgICBwYXNzd29yZDogInB3IgogICAgc25pOiAid3d3Lmdvb2dsZS5kZSIKICAgIHNraXAtY2VydC12ZXJpZnk6IHRydWUK"
+    },
+    {
+      "args": [
+        "hy2-exit",
+        "exit.example.com",
+        "443",
+        "pw",
+        "cdn.example.org",
+        "false",
+        "salt"
+      ],
+      "case": "hc_full",
+      "function": "_build_hy2_client_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_client_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "cHJveGllczoKICAtIG5hbWU6ICJoeTItZXhpdCIKICAgIHR5cGU6IGh5c3RlcmlhMgogICAgc2VydmVyOiBleGl0LmV4YW1wbGUuY29tCiAgICBwb3J0OiA0NDMKICAgIHBhc3N3b3JkOiAicHciCiAgICBzbmk6ICJjZG4uZXhhbXBsZS5vcmciCiAgICBza2lwLWNlcnQtdmVyaWZ5OiBmYWxzZQogICAgb2Jmczogc2FsYW1hbmRlcgogICAgb2Jmcy1wYXNzd29yZDogInNhbHQiCg=="
+    },
+    {
+      "args": [
+        "v6",
+        "2001:db8::1",
+        "443",
+        "pw"
+      ],
+      "case": "hc_ipv6_server",
+      "function": "_build_hy2_client_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_client_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "cHJveGllczoKICAtIG5hbWU6ICJ2NiIKICAgIHR5cGU6IGh5c3RlcmlhMgogICAgc2VydmVyOiAyMDAxOmRiODo6MQogICAgcG9ydDogNDQzCiAgICBwYXNzd29yZDogInB3IgogICAgc25pOiAid3d3Lmdvb2dsZS5kZSIKICAgIHNraXAtY2VydC12ZXJpZnk6IHRydWUK"
+    },
+    {
+      "args": [
+        "Выход 🚀 \"q\"",
+        "h.example",
+        "8443",
+        "pw"
+      ],
+      "case": "hc_name_special",
+      "function": "_build_hy2_client_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_client_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "cHJveGllczoKICAtIG5hbWU6ICLQktGL0YXQvtC0IPCfmoAgXCJxXCIiCiAgICB0eXBlOiBoeXN0ZXJpYTIKICAgIHNlcnZlcjogaC5leGFtcGxlCiAgICBwb3J0OiA4NDQzCiAgICBwYXNzd29yZDogInB3IgogICAgc25pOiAid3d3Lmdvb2dsZS5kZSIKICAgIHNraXAtY2VydC12ZXJpZnk6IHRydWUK"
+    },
+    {
+      "args": [
+        "x",
+        "h",
+        "443",
+        "*a #b",
+        "www.google.de",
+        "true",
+        "- o \"q\""
+      ],
+      "case": "hc_pass_leading_indicator",
+      "function": "_build_hy2_client_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_client_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "cHJveGllczoKICAtIG5hbWU6ICJ4IgogICAgdHlwZTogaHlzdGVyaWEyCiAgICBzZXJ2ZXI6IGgKICAgIHBvcnQ6IDQ0MwogICAgcGFzc3dvcmQ6ICIqYSAjYiIKICAgIHNuaTogInd3dy5nb29nbGUuZGUiCiAgICBza2lwLWNlcnQtdmVyaWZ5OiB0cnVlCiAgICBvYmZzOiBzYWxhbWFuZGVyCiAgICBvYmZzLXBhc3N3b3JkOiAiLSBvIFwicVwiIgo="
+    },
+    {
+      "args": [
+        "x",
+        "h",
+        "1",
+        "p#q?r&s=t%u"
+      ],
+      "case": "hc_pass_special",
+      "function": "_build_hy2_client_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_client_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "cHJveGllczoKICAtIG5hbWU6ICJ4IgogICAgdHlwZTogaHlzdGVyaWEyCiAgICBzZXJ2ZXI6IGgKICAgIHBvcnQ6IDEKICAgIHBhc3N3b3JkOiAicCNxP3Imcz10JXUiCiAgICBzbmk6ICJ3d3cuZ29vZ2xlLmRlIgogICAgc2tpcC1jZXJ0LXZlcmlmeTogdHJ1ZQo="
+    },
+    {
+      "args": [
+        "x",
+        "h",
+        "65535",
+        "pw"
+      ],
+      "case": "hc_port_max",
+      "function": "_build_hy2_client_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_client_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "cHJveGllczoKICAtIG5hbWU6ICJ4IgogICAgdHlwZTogaHlzdGVyaWEyCiAgICBzZXJ2ZXI6IGgKICAgIHBvcnQ6IDY1NTM1CiAgICBwYXNzd29yZDogInB3IgogICAgc25pOiAid3d3Lmdvb2dsZS5kZSIKICAgIHNraXAtY2VydC12ZXJpZnk6IHRydWUK"
+    },
+    {
+      "args": [
+        "v6",
+        "2001:db8::",
+        "443",
+        "pw"
+      ],
+      "case": "hc_server_trailing_colon",
+      "function": "_build_hy2_client_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_client_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "cHJveGllczoKICAtIG5hbWU6ICJ2NiIKICAgIHR5cGU6IGh5c3RlcmlhMgogICAgc2VydmVyOiAiMjAwMTpkYjg6OiIKICAgIHBvcnQ6IDQ0MwogICAgcGFzc3dvcmQ6ICJwdyIKICAgIHNuaTogInd3dy5nb29nbGUuZGUiCiAgICBza2lwLWNlcnQtdmVyaWZ5OiB0cnVlCg=="
+    },
+    {
+      "args": [
+        "hy2-exit",
+        "exit.example.com",
+        "443",
+        "pw",
+        "a.b",
+        "true"
+      ],
+      "case": "hc_skip_true",
+      "function": "_build_hy2_client_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_client_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "cHJveGllczoKICAtIG5hbWU6ICJoeTItZXhpdCIKICAgIHR5cGU6IGh5c3RlcmlhMgogICAgc2VydmVyOiBleGl0LmV4YW1wbGUuY29tCiAgICBwb3J0OiA0NDMKICAgIHBhc3N3b3JkOiAicHciCiAgICBzbmk6ICJhLmIiCiAgICBza2lwLWNlcnQtdmVyaWZ5OiB0cnVlCg=="
+    },
+    {
+      "args": [
+        "v6",
+        "[2001:db8::1]",
+        "443",
+        "pw"
+      ],
+      "case": "hx_bracketed_server",
+      "function": "_build_hy2_exit_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_exit_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHY2CiAgICB0eXBlOiBoeXN0ZXJpYTIKICAgIHNlcnZlcjogMjAwMTpkYjg6OjEKICAgIHBvcnQ6IDQ0MwogICAgcGFzc3dvcmQ6ICJwdyIKICAgIHNuaTogInd3dy5nb29nbGUuZGUiCiAgICBza2lwLWNlcnQtdmVyaWZ5OiB0cnVlCg=="
+    },
+    {
+      "args": [
+        "hy2-exit",
+        "exit.example.com",
+        "443",
+        "pw"
+      ],
+      "case": "hx_defaults",
+      "function": "_build_hy2_exit_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_exit_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IGh5Mi1leGl0CiAgICB0eXBlOiBoeXN0ZXJpYTIKICAgIHNlcnZlcjogZXhpdC5leGFtcGxlLmNvbQogICAgcG9ydDogNDQzCiAgICBwYXNzd29yZDogInB3IgogICAgc25pOiAid3d3Lmdvb2dsZS5kZSIKICAgIHNraXAtY2VydC12ZXJpZnk6IHRydWUK"
+    },
+    {
+      "args": [
+        "x",
+        "h",
+        "443",
+        "pw",
+        "",
+        "true"
+      ],
+      "case": "hx_empty_sni_default",
+      "function": "_build_hy2_exit_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_exit_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IGh5c3RlcmlhMgogICAgc2VydmVyOiBoCiAgICBwb3J0OiA0NDMKICAgIHBhc3N3b3JkOiAicHciCiAgICBzbmk6ICJ3d3cuZ29vZ2xlLmRlIgogICAgc2tpcC1jZXJ0LXZlcmlmeTogdHJ1ZQo="
+    },
+    {
+      "args": [
+        "hy2-exit",
+        "exit.example.com",
+        "443",
+        "pw",
+        "cdn.example.org",
+        "false",
+        "salt"
+      ],
+      "case": "hx_full",
+      "function": "_build_hy2_exit_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_exit_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IGh5Mi1leGl0CiAgICB0eXBlOiBoeXN0ZXJpYTIKICAgIHNlcnZlcjogZXhpdC5leGFtcGxlLmNvbQogICAgcG9ydDogNDQzCiAgICBwYXNzd29yZDogInB3IgogICAgc25pOiAiY2RuLmV4YW1wbGUub3JnIgogICAgc2tpcC1jZXJ0LXZlcmlmeTogZmFsc2UKICAgIG9iZnM6IHNhbGFtYW5kZXIKICAgIG9iZnMtcGFzc3dvcmQ6ICJzYWx0Igo="
+    },
+    {
+      "args": [
+        "v6",
+        "2001:db8::1",
+        "443",
+        "pw"
+      ],
+      "case": "hx_ipv6",
+      "function": "_build_hy2_exit_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_exit_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHY2CiAgICB0eXBlOiBoeXN0ZXJpYTIKICAgIHNlcnZlcjogMjAwMTpkYjg6OjEKICAgIHBvcnQ6IDQ0MwogICAgcGFzc3dvcmQ6ICJwdyIKICAgIHNuaTogInd3dy5nb29nbGUuZGUiCiAgICBza2lwLWNlcnQtdmVyaWZ5OiB0cnVlCg=="
+    },
+    {
+      "args": [
+        "Выход",
+        "h",
+        "443",
+        "pw"
+      ],
+      "case": "hx_name_cyr",
+      "function": "_build_hy2_exit_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_exit_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6INCS0YvRhdC+0LQKICAgIHR5cGU6IGh5c3RlcmlhMgogICAgc2VydmVyOiBoCiAgICBwb3J0OiA0NDMKICAgIHBhc3N3b3JkOiAicHciCiAgICBzbmk6ICJ3d3cuZ29vZ2xlLmRlIgogICAgc2tpcC1jZXJ0LXZlcmlmeTogdHJ1ZQo="
+    },
+    {
+      "args": [
+        "hy2-exit",
+        "h",
+        "443",
+        "pw",
+        "www.google.de",
+        "true",
+        "obfs"
+      ],
+      "case": "hx_obfs",
+      "function": "_build_hy2_exit_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_exit_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IGh5Mi1leGl0CiAgICB0eXBlOiBoeXN0ZXJpYTIKICAgIHNlcnZlcjogaAogICAgcG9ydDogNDQzCiAgICBwYXNzd29yZDogInB3IgogICAgc25pOiAid3d3Lmdvb2dsZS5kZSIKICAgIHNraXAtY2VydC12ZXJpZnk6IHRydWUKICAgIG9iZnM6IHNhbGFtYW5kZXIKICAgIG9iZnMtcGFzc3dvcmQ6ICJvYmZzIgo="
+    },
+    {
+      "args": [
+        "x",
+        "h",
+        "443",
+        "a\"b\\c",
+        "www.google.de",
+        "true",
+        "o\r\n"
+      ],
+      "case": "hx_pass_quote_backslash",
+      "function": "_build_hy2_exit_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_exit_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IGh5c3RlcmlhMgogICAgc2VydmVyOiBoCiAgICBwb3J0OiA0NDMKICAgIHBhc3N3b3JkOiAiYVwiYlxcYyIKICAgIHNuaTogInd3dy5nb29nbGUuZGUiCiAgICBza2lwLWNlcnQtdmVyaWZ5OiB0cnVlCiAgICBvYmZzOiBzYWxhbWFuZGVyCiAgICBvYmZzLXBhc3N3b3JkOiAib1xyXG4iCg=="
+    },
+    {
+      "args": [
+        "x",
+        "h",
+        "443",
+        "p#q?r&s=t%u"
+      ],
+      "case": "hx_pass_special",
+      "function": "_build_hy2_exit_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_exit_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IGh5c3RlcmlhMgogICAgc2VydmVyOiBoCiAgICBwb3J0OiA0NDMKICAgIHBhc3N3b3JkOiAicCNxP3Imcz10JXUiCiAgICBzbmk6ICJ3d3cuZ29vZ2xlLmRlIgogICAgc2tpcC1jZXJ0LXZlcmlmeTogdHJ1ZQo="
+    },
+    {
+      "args": [
+        "x",
+        "h",
+        "1",
+        "pw"
+      ],
+      "case": "hx_port_min",
+      "function": "_build_hy2_exit_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_exit_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IGh5c3RlcmlhMgogICAgc2VydmVyOiBoCiAgICBwb3J0OiAxCiAgICBwYXNzd29yZDogInB3IgogICAgc25pOiAid3d3Lmdvb2dsZS5kZSIKICAgIHNraXAtY2VydC12ZXJpZnk6IHRydWUK"
+    },
+    {
+      "args": [
+        "hy2-exit",
+        "h",
+        "443",
+        "pw",
+        "a.b",
+        "false"
+      ],
+      "case": "hx_skip_false",
+      "function": "_build_hy2_exit_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_exit_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IGh5Mi1leGl0CiAgICB0eXBlOiBoeXN0ZXJpYTIKICAgIHNlcnZlcjogaAogICAgcG9ydDogNDQzCiAgICBwYXNzd29yZDogInB3IgogICAgc25pOiAiYS5iIgogICAgc2tpcC1jZXJ0LXZlcmlmeTogZmFsc2UK"
+    },
+    {
+      "args": [
+        "hy2-main",
+        "443",
+        "alice",
+        "secret",
+        "DIRECT"
+      ],
+      "case": "hl_basic",
+      "function": "_build_hy2_listener_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IGh5Mi1tYWluCiAgICB0eXBlOiBoeXN0ZXJpYTIKICAgIGxpc3RlbjogMC4wLjAuMAogICAgcG9ydDogNDQzCiAgICB1c2VyczoKICAgICAgIyBjbGllbnQtdXNlcnMtc3RhcnQKICAgICAgYWxpY2U6ICJzZWNyZXQiCiAgICAgICMgY2xpZW50LXVzZXJzLWVuZAogICAgY2VydGlmaWNhdGU6IC9ldGMvbWlob21vL2NlcnRzL2h5Mi9zZXJ2ZXIuY3J0CiAgICBwcml2YXRlLWtleTogL2V0Yy9taWhvbW8vY2VydHMvaHkyL3NlcnZlci5rZXkKICAgIHByb3h5OiBESVJFQ1QK"
+    },
+    {
+      "args": [
+        "hy2",
+        "443",
+        "u",
+        "p\r",
+        "DIRECT"
+      ],
+      "case": "hl_cr_pass",
+      "function": "_build_hy2_listener_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IGh5MgogICAgdHlwZTogaHlzdGVyaWEyCiAgICBsaXN0ZW46IDAuMC4wLjAKICAgIHBvcnQ6IDQ0MwogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgIHU6ICJwXHIiCiAgICAgICMgY2xpZW50LXVzZXJzLWVuZAogICAgY2VydGlmaWNhdGU6IC9ldGMvbWlob21vL2NlcnRzL2h5Mi9zZXJ2ZXIuY3J0CiAgICBwcml2YXRlLWtleTogL2V0Yy9taWhvbW8vY2VydHMvaHkyL3NlcnZlci5rZXkKICAgIHByb3h5OiBESVJFQ1QK"
+    },
+    {
+      "args": [
+        "Выход-1",
+        "443",
+        "u",
+        "p",
+        "DIRECT"
+      ],
+      "case": "hl_cyr_name",
+      "function": "_build_hy2_listener_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6INCS0YvRhdC+0LQtMQogICAgdHlwZTogaHlzdGVyaWEyCiAgICBsaXN0ZW46IDAuMC4wLjAKICAgIHBvcnQ6IDQ0MwogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgIHU6ICJwIgogICAgICAjIGNsaWVudC11c2Vycy1lbmQKICAgIGNlcnRpZmljYXRlOiAvZXRjL21paG9tby9jZXJ0cy9oeTIvc2VydmVyLmNydAogICAgcHJpdmF0ZS1rZXk6IC9ldGMvbWlob21vL2NlcnRzL2h5Mi9zZXJ2ZXIua2V5CiAgICBwcm94eTogRElSRUNUCg=="
+    },
+    {
+      "args": [
+        "hy2",
+        "443",
+        "u",
+        "p"
+      ],
+      "case": "hl_missing_proxy",
+      "function": "_build_hy2_listener_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IGh5MgogICAgdHlwZTogaHlzdGVyaWEyCiAgICBsaXN0ZW46IDAuMC4wLjAKICAgIHBvcnQ6IDQ0MwogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgIHU6ICJwIgogICAgICAjIGNsaWVudC11c2Vycy1lbmQKICAgIGNlcnRpZmljYXRlOiAvZXRjL21paG9tby9jZXJ0cy9oeTIvc2VydmVyLmNydAogICAgcHJpdmF0ZS1rZXk6IC9ldGMvbWlob21vL2NlcnRzL2h5Mi9zZXJ2ZXIua2V5CiAgICBwcm94eTogCg=="
+    },
+    {
+      "args": [
+        "hy2",
+        "443",
+        "",
+        "p",
+        "DIRECT"
+      ],
+      "case": "hl_missing_user",
+      "function": "_build_hy2_listener_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IGh5MgogICAgdHlwZTogaHlzdGVyaWEyCiAgICBsaXN0ZW46IDAuMC4wLjAKICAgIHBvcnQ6IDQ0MwogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgIDogInAiCiAgICAgICMgY2xpZW50LXVzZXJzLWVuZAogICAgY2VydGlmaWNhdGU6IC9ldGMvbWlob21vL2NlcnRzL2h5Mi9zZXJ2ZXIuY3J0CiAgICBwcml2YXRlLWtleTogL2V0Yy9taWhvbW8vY2VydHMvaHkyL3NlcnZlci5rZXkKICAgIHByb3h5OiBESVJFQ1QK"
+    },
+    {
+      "args": [
+        "hy2",
+        "443",
+        "u",
+        "a\nb",
+        "DIRECT"
+      ],
+      "case": "hl_newline_pass",
+      "function": "_build_hy2_listener_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IGh5MgogICAgdHlwZTogaHlzdGVyaWEyCiAgICBsaXN0ZW46IDAuMC4wLjAKICAgIHBvcnQ6IDQ0MwogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgIHU6ICJhXG5iIgogICAgICAjIGNsaWVudC11c2Vycy1lbmQKICAgIGNlcnRpZmljYXRlOiAvZXRjL21paG9tby9jZXJ0cy9oeTIvc2VydmVyLmNydAogICAgcHJpdmF0ZS1rZXk6IC9ldGMvbWlob21vL2NlcnRzL2h5Mi9zZXJ2ZXIua2V5CiAgICBwcm94eTogRElSRUNUCg=="
+    },
+    {
+      "args": [
+        "hy2-main",
+        "443",
+        "alice",
+        "secret",
+        "DIRECT",
+        "obfs-pw"
+      ],
+      "case": "hl_obfs",
+      "function": "_build_hy2_listener_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IGh5Mi1tYWluCiAgICB0eXBlOiBoeXN0ZXJpYTIKICAgIGxpc3RlbjogMC4wLjAuMAogICAgcG9ydDogNDQzCiAgICB1c2VyczoKICAgICAgIyBjbGllbnQtdXNlcnMtc3RhcnQKICAgICAgYWxpY2U6ICJzZWNyZXQiCiAgICAgICMgY2xpZW50LXVzZXJzLWVuZAogICAgb2Jmczogc2FsYW1hbmRlcgogICAgb2Jmcy1wYXNzd29yZDogIm9iZnMtcHciCiAgICBjZXJ0aWZpY2F0ZTogL2V0Yy9taWhvbW8vY2VydHMvaHkyL3NlcnZlci5jcnQKICAgIHByaXZhdGUta2V5OiAvZXRjL21paG9tby9jZXJ0cy9oeTIvc2VydmVyLmtleQogICAgcHJveHk6IERJUkVDVAo="
+    },
+    {
+      "args": [
+        "hy2",
+        "443",
+        "u",
+        "p",
+        "DIRECT",
+        "o&b=fs"
+      ],
+      "case": "hl_obfs_amp",
+      "function": "_build_hy2_listener_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IGh5MgogICAgdHlwZTogaHlzdGVyaWEyCiAgICBsaXN0ZW46IDAuMC4wLjAKICAgIHBvcnQ6IDQ0MwogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgIHU6ICJwIgogICAgICAjIGNsaWVudC11c2Vycy1lbmQKICAgIG9iZnM6IHNhbGFtYW5kZXIKICAgIG9iZnMtcGFzc3dvcmQ6ICJvJmI9ZnMiCiAgICBjZXJ0aWZpY2F0ZTogL2V0Yy9taWhvbW8vY2VydHMvaHkyL3NlcnZlci5jcnQKICAgIHByaXZhdGUta2V5OiAvZXRjL21paG9tby9jZXJ0cy9oeTIvc2VydmVyLmtleQogICAgcHJveHk6IERJUkVDVAo="
+    },
+    {
+      "args": [
+        "hy2-main",
+        "443",
+        "alice",
+        "secret",
+        "DIRECT",
+        ""
+      ],
+      "case": "hl_obfs_explicit_empty",
+      "function": "_build_hy2_listener_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IGh5Mi1tYWluCiAgICB0eXBlOiBoeXN0ZXJpYTIKICAgIGxpc3RlbjogMC4wLjAuMAogICAgcG9ydDogNDQzCiAgICB1c2VyczoKICAgICAgIyBjbGllbnQtdXNlcnMtc3RhcnQKICAgICAgYWxpY2U6ICJzZWNyZXQiCiAgICAgICMgY2xpZW50LXVzZXJzLWVuZAogICAgY2VydGlmaWNhdGU6IC9ldGMvbWlob21vL2NlcnRzL2h5Mi9zZXJ2ZXIuY3J0CiAgICBwcml2YXRlLWtleTogL2V0Yy9taWhvbW8vY2VydHMvaHkyL3NlcnZlci5rZXkKICAgIHByb3h5OiBESVJFQ1QK"
+    },
+    {
+      "args": [
+        "hy2-x",
+        "8443",
+        "bob",
+        "pw",
+        "proxy-a"
+      ],
+      "case": "hl_port_custom",
+      "function": "_build_hy2_listener_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IGh5Mi14CiAgICB0eXBlOiBoeXN0ZXJpYTIKICAgIGxpc3RlbjogMC4wLjAuMAogICAgcG9ydDogODQ0MwogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgIGJvYjogInB3IgogICAgICAjIGNsaWVudC11c2Vycy1lbmQKICAgIGNlcnRpZmljYXRlOiAvZXRjL21paG9tby9jZXJ0cy9oeTIvc2VydmVyLmNydAogICAgcHJpdmF0ZS1rZXk6IC9ldGMvbWlob21vL2NlcnRzL2h5Mi9zZXJ2ZXIua2V5CiAgICBwcm94eTogcHJveHktYQo="
+    },
+    {
+      "args": [
+        "hy2",
+        "443",
+        "u",
+        "a\"b\\c",
+        "DIRECT",
+        "o\"\\#"
+      ],
+      "case": "hl_quote_backslash_pass",
+      "function": "_build_hy2_listener_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IGh5MgogICAgdHlwZTogaHlzdGVyaWEyCiAgICBsaXN0ZW46IDAuMC4wLjAKICAgIHBvcnQ6IDQ0MwogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgIHU6ICJhXCJiXFxjIgogICAgICAjIGNsaWVudC11c2Vycy1lbmQKICAgIG9iZnM6IHNhbGFtYW5kZXIKICAgIG9iZnMtcGFzc3dvcmQ6ICJvXCJcXCMiCiAgICBjZXJ0aWZpY2F0ZTogL2V0Yy9taWhvbW8vY2VydHMvaHkyL3NlcnZlci5jcnQKICAgIHByaXZhdGUta2V5OiAvZXRjL21paG9tby9jZXJ0cy9oeTIvc2VydmVyLmtleQogICAgcHJveHk6IERJUkVDVAo="
+    },
+    {
+      "args": [
+        "hy2",
+        "443",
+        "u",
+        "p a$s#?&=%Ж😀",
+        "DIRECT"
+      ],
+      "case": "hl_special_pass",
+      "function": "_build_hy2_listener_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IGh5MgogICAgdHlwZTogaHlzdGVyaWEyCiAgICBsaXN0ZW46IDAuMC4wLjAKICAgIHBvcnQ6IDQ0MwogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgIHU6ICJwIGEkcyM/Jj0l0Jbwn5iAIgogICAgICAjIGNsaWVudC11c2Vycy1lbmQKICAgIGNlcnRpZmljYXRlOiAvZXRjL21paG9tby9jZXJ0cy9oeTIvc2VydmVyLmNydAogICAgcHJpdmF0ZS1rZXk6IC9ldGMvbWlob21vL2NlcnRzL2h5Mi9zZXJ2ZXIua2V5CiAgICBwcm94eTogRElSRUNUCg=="
+    },
+    {
+      "args": [
+        "hy2",
+        "443",
+        "john doe",
+        "pw",
+        "DIRECT"
+      ],
+      "case": "hl_user_space",
+      "function": "_build_hy2_listener_yaml",
+      "globals": {},
+      "invoke": "_build_hy2_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IGh5MgogICAgdHlwZTogaHlzdGVyaWEyCiAgICBsaXN0ZW46IDAuMC4wLjAKICAgIHBvcnQ6IDQ0MwogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgIGpvaG4gZG9lOiAicHciCiAgICAgICMgY2xpZW50LXVzZXJzLWVuZAogICAgY2VydGlmaWNhdGU6IC9ldGMvbWlob21vL2NlcnRzL2h5Mi9zZXJ2ZXIuY3J0CiAgICBwcml2YXRlLWtleTogL2V0Yy9taWhvbW8vY2VydHMvaHkyL3NlcnZlci5rZXkKICAgIHByb3h5OiBESVJFQ1QK"
+    },
+    {
+      "args": [
+        "пароль",
+        "h",
+        "443"
+      ],
+      "case": "hu_cyr_pass",
+      "function": "_build_hy2_uri",
+      "globals": {},
+      "invoke": "_build_hy2_uri",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "aHlzdGVyaWEyOi8vJUQwJUJGJUQwJUIwJUQxJTgwJUQwJUJFJUQwJUJCJUQxJThDQGg6NDQzP2luc2VjdXJlPTEmc25pPXd3dy5nb29nbGUuZGUK"
+    },
+    {
+      "args": [
+        "pw",
+        "h.example",
+        "443"
+      ],
+      "case": "hu_defaults",
+      "function": "_build_hy2_uri",
+      "globals": {},
+      "invoke": "_build_hy2_uri",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "aHlzdGVyaWEyOi8vcHdAaC5leGFtcGxlOjQ0Mz9pbnNlY3VyZT0xJnNuaT13d3cuZ29vZ2xlLmRlCg=="
+    },
+    {
+      "args": [
+        "pw",
+        "h",
+        "443",
+        ""
+      ],
+      "case": "hu_empty_sni",
+      "function": "_build_hy2_uri",
+      "globals": {},
+      "invoke": "_build_hy2_uri",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "aHlzdGVyaWEyOi8vcHdAaDo0NDM/aW5zZWN1cmU9MSZzbmk9d3d3Lmdvb2dsZS5kZQo="
+    },
+    {
+      "args": [
+        "pw",
+        "[2001:db8::1]",
+        "443"
+      ],
+      "case": "hu_ipv6",
+      "function": "_build_hy2_uri",
+      "globals": {},
+      "invoke": "_build_hy2_uri",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "aHlzdGVyaWEyOi8vcHdAWzIwMDE6ZGI4OjoxXTo0NDM/aW5zZWN1cmU9MSZzbmk9d3d3Lmdvb2dsZS5kZQo="
+    },
+    {
+      "args": [
+        "pw",
+        "h",
+        "443",
+        "www.google.de",
+        "obfs pw"
+      ],
+      "case": "hu_obfs",
+      "function": "_build_hy2_uri",
+      "globals": {},
+      "invoke": "_build_hy2_uri",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "aHlzdGVyaWEyOi8vcHdAaDo0NDM/aW5zZWN1cmU9MSZzbmk9d3d3Lmdvb2dsZS5kZSZvYmZzPXNhbGFtYW5kZXImb2Jmcy1wYXNzd29yZD1vYmZzJTIwcHcK"
+    },
+    {
+      "args": [
+        "pw",
+        "h",
+        "443",
+        "",
+        "a&b"
+      ],
+      "case": "hu_obfs_amp",
+      "function": "_build_hy2_uri",
+      "globals": {},
+      "invoke": "_build_hy2_uri",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "aHlzdGVyaWEyOi8vcHdAaDo0NDM/aW5zZWN1cmU9MSZzbmk9d3d3Lmdvb2dsZS5kZSZvYmZzPXNhbGFtYW5kZXImb2Jmcy1wYXNzd29yZD1hJTI2Ygo="
+    },
+    {
+      "args": [
+        "pw",
+        "h",
+        "1"
+      ],
+      "case": "hu_port_1",
+      "function": "_build_hy2_uri",
+      "globals": {},
+      "invoke": "_build_hy2_uri",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "aHlzdGVyaWEyOi8vcHdAaDoxP2luc2VjdXJlPTEmc25pPXd3dy5nb29nbGUuZGUK"
+    },
+    {
+      "args": [
+        "pw",
+        "h",
+        "443",
+        "sni.example"
+      ],
+      "case": "hu_sni",
+      "function": "_build_hy2_uri",
+      "globals": {},
+      "invoke": "_build_hy2_uri",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "aHlzdGVyaWEyOi8vcHdAaDo0NDM/aW5zZWN1cmU9MSZzbmk9c25pLmV4YW1wbGUK"
+    },
+    {
+      "args": [
+        "p ass#1?&=%",
+        "h",
+        "443"
+      ],
+      "case": "hu_special_pass",
+      "function": "_build_hy2_uri",
+      "globals": {},
+      "invoke": "_build_hy2_uri",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "aHlzdGVyaWEyOi8vcCUyMGFzcyUyMzElM0YlMjYlM0QlMjVAaDo0NDM/aW5zZWN1cmU9MSZzbmk9d3d3Lmdvb2dsZS5kZQo="
+    }
+  ],
+  "module": "hy2"
+}

@@ -43,6 +43,35 @@ _uri_percent_decode() {
     printf '%s' "$output"
 }
 
+# Split a scheme-less URI "userinfo@host:port?params#fragment".
+# Strips one trailing CR (CRLF input) and the fragment. Bracketed IPv6
+# "[addr]:port" yields the unbracketed addr (YAML/iptables form).
+# Sets: _URI_USERINFO, _URI_SERVER, _URI_PORT, _URI_PARAMS
+_uri_split() {
+    local uri="$1" hostport rest
+    uri="${uri%$'\r'}"
+    uri="${uri%%#*}"
+    _URI_PARAMS=""
+    if [[ "$uri" == *\?* ]]; then
+        _URI_PARAMS="${uri#*\?}"
+        uri="${uri%%\?*}"
+    fi
+    _URI_USERINFO=""
+    [[ "$uri" == *@* ]] && _URI_USERINFO="${uri%@*}"
+    hostport="${uri##*@}"
+    _URI_PORT=""
+    if [[ "$hostport" == \[*\]* ]]; then
+        _URI_SERVER="${hostport#\[}"
+        _URI_SERVER="${_URI_SERVER%%\]*}"
+        rest="${hostport#*\]}"
+        [[ "$rest" == :* ]] && _URI_PORT="${rest#:}"
+    else
+        _URI_SERVER="${hostport%%:*}"
+        [[ "$hostport" == *:* ]] && _URI_PORT="${hostport##*:}"
+    fi
+    return 0
+}
+
 # Extract server and port from any supported URI (vless://, hy2://, hysteria2://)
 # Sets: URI_SERVER, URI_PORT
 _parse_server_port_from_uri() {
@@ -50,11 +79,9 @@ _parse_server_port_from_uri() {
     uri="${uri#vless://}"
     uri="${uri#hysteria2://}"
     uri="${uri#hy2://}"
-    uri="${uri%%#*}"
-    local hostport="${uri#*@}"
-    hostport="${hostport%%\?*}"
-    URI_SERVER="${hostport%%:*}"
-    URI_PORT="${hostport##*:}"
+    _uri_split "$uri"
+    URI_SERVER="$_URI_SERVER"
+    URI_PORT="$_URI_PORT"
 }
 
 # Dispatcher: read URI from user, detect protocol, return exit YAML
@@ -63,7 +90,8 @@ _parse_server_port_from_uri() {
 _parse_proxy_uri() {
     local proxy_name="$1"
     echo "" >&2
-    IFS= read -rp "  Вставьте URI: " URI || return 1
+    # A last line without trailing newline is still accepted.
+    IFS= read -rp "  Вставьте URI: " URI || [[ -n "$URI" ]] || return 1
     URI="${URI%$'\r'}"
 
     if [[ "$URI" == vless://* ]]; then
@@ -82,23 +110,22 @@ _parse_vless_uri_to_exit() {
     local proxy_name="$1" uri="$2"
 
     # vless://UUID@SERVER:PORT?params#fragment
-    uri="${uri#vless://}"
-    uri="${uri%%#*}"
-    local userinfo="${uri%%@*}"
-    local hostport="${uri#*@}"
-    local params="${hostport#*\?}"
-    hostport="${hostport%%\?*}"
+    _uri_split "${uri#vless://}"
 
-    local C_UUID="$userinfo"
-    local C_SERVER="${hostport%%:*}"
-    local C_PORT="${hostport##*:}"
+    local C_UUID="$_URI_USERINFO"
+    local C_SERVER="$_URI_SERVER"
+    local C_PORT="$_URI_PORT"
+    C_UUID=$(_uri_percent_decode "$C_UUID") || { warn "Некорректное percent-кодирование в VLESS URI"; return 1; }
 
     local C_SNI="" C_PUBKEY="" C_SHORT_ID="" C_FLOW="" C_FP="chrome"
     local C_TYPE="tcp" C_PATH="" C_MODE="auto" C_SERVICE=""
 
-    local IFS='&'
-    for param in $params; do
-        local key="${param%%=*}" val="${param#*=}"
+    local param key val
+    local -a params=()
+    [[ -n "$_URI_PARAMS" ]] && IFS='&' read -ra params <<< "$_URI_PARAMS"
+    for param in "${params[@]}"; do
+        [[ -z "$param" ]] && continue
+        key="${param%%=*}" val="${param#*=}"
         if ! val=$(_uri_percent_decode "$val"); then
             warn "Некорректное percent-кодирование в VLESS URI"
             return 1
@@ -115,12 +142,12 @@ _parse_vless_uri_to_exit() {
             serviceName) C_SERVICE="$val" ;;
         esac
     done
-    unset IFS
 
     [[ -z "$C_SNI" ]] && C_SNI="$C_SERVER"
 
     echo "" >&2
-    info "VLESS $C_TYPE: $C_SERVER:$C_PORT (SNI: $C_SNI)" >&2
+    # info/warn print via `echo -e`: double backslashes so URI text is shown verbatim.
+    info "VLESS ${C_TYPE//\\/\\\\}: ${C_SERVER//\\/\\\\}:${C_PORT//\\/\\\\} (SNI: ${C_SNI//\\/\\\\})" >&2
 
     case "$C_TYPE" in
         tcp)
@@ -139,8 +166,8 @@ _parse_vless_uri_to_exit() {
                 "$C_UUID" "$C_SNI" "$C_SERVICE" "$C_PUBKEY" "$C_SHORT_ID" "$C_FP"
             ;;
         *)
-            warn "Неизвестный транспорт VLESS: $C_TYPE. Поддерживаются: tcp, xhttp, grpc"
-            return
+            warn "Неизвестный транспорт VLESS: ${C_TYPE//\\/\\\\}. Поддерживаются: tcp, xhttp, grpc"
+            return 1
             ;;
     esac
 }
@@ -151,22 +178,21 @@ _parse_hy2_uri_to_exit() {
 
     uri="${uri#hysteria2://}"
     uri="${uri#hy2://}"
-    uri="${uri%%#*}"
+    _uri_split "$uri"
 
-    local userinfo="${uri%%@*}"
-    local hostport="${uri#*@}"
-    local params="${hostport#*\?}"
-    hostport="${hostport%%\?*}"
-
-    local C_PASS="$userinfo"
-    local C_SERVER="${hostport%%:*}"
-    local C_PORT="${hostport##*:}"
+    local C_PASS="$_URI_USERINFO"
+    local C_SERVER="$_URI_SERVER"
+    local C_PORT="$_URI_PORT"
+    C_PASS=$(_uri_percent_decode "$C_PASS") || { warn "Некорректное percent-кодирование в Hysteria2 URI"; return 1; }
 
     local C_SNI="" C_INSECURE="" C_OBFS_PASS=""
 
-    local IFS='&'
-    for param in $params; do
-        local key="${param%%=*}" val="${param#*=}"
+    local param key val
+    local -a params=()
+    [[ -n "$_URI_PARAMS" ]] && IFS='&' read -ra params <<< "$_URI_PARAMS"
+    for param in "${params[@]}"; do
+        [[ -z "$param" ]] && continue
+        key="${param%%=*}" val="${param#*=}"
         if ! val=$(_uri_percent_decode "$val"); then
             warn "Некорректное percent-кодирование в Hysteria2 URI"
             return 1
@@ -177,7 +203,6 @@ _parse_hy2_uri_to_exit() {
             obfs-password) C_OBFS_PASS="$val" ;;
         esac
     done
-    unset IFS
 
     [[ -z "$C_SNI" ]] && C_SNI="www.google.de"
 
@@ -185,7 +210,7 @@ _parse_hy2_uri_to_exit() {
     [[ "$C_INSECURE" == "1" ]] && skip_verify="true"
 
     echo "" >&2
-    info "Hysteria2: $C_SERVER:$C_PORT" >&2
+    info "Hysteria2: ${C_SERVER//\\/\\\\}:${C_PORT//\\/\\\\}" >&2
     [[ -n "$C_OBFS_PASS" ]] && info "Obfs: salamander" >&2
 
     _build_hy2_exit_yaml "$proxy_name" "$C_SERVER" "$C_PORT" "$C_PASS" "$C_SNI" "$skip_verify" "$C_OBFS_PASS"

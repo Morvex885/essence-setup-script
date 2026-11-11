@@ -1,0 +1,1404 @@
+{
+  "cases": [
+    {
+      "args": [
+        "p",
+        "hy2://pw@h:443?sni=%G0"
+      ],
+      "case": "hp_bad_pct",
+      "function": "_parse_hy2_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_hy2_uri_to_exit",
+      "rc": 1,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAbWzE7MzNtWyFdG1swbSDQndC10LrQvtGA0YDQtdC60YLQvdC+0LUgcGVyY2VudC3QutC+0LTQuNGA0L7QstCw0L3QuNC1INCyIEh5c3RlcmlhMiBVUkkK"
+    },
+    {
+      "args": [
+        "p",
+        "hy2://pw@h:443?insecure=1\r"
+      ],
+      "case": "hp_cr_tail",
+      "function": "_parse_hy2_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_hy2_uri_to_exit",
+      "rc": 0,
+      "stderr_b64": "CiAgG1swOzM2bVsqXRtbMG0gSHlzdGVyaWEyOiBoOjQ0Mwo=",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHAKICAgIHR5cGU6IGh5c3RlcmlhMgogICAgc2VydmVyOiBoCiAgICBwb3J0OiA0NDMKICAgIHBhc3N3b3JkOiAicHciCiAgICBzbmk6ICJ3d3cuZ29vZ2xlLmRlIgogICAgc2tpcC1jZXJ0LXZlcmlmeTogdHJ1ZQo="
+    },
+    {
+      "args": [
+        "p",
+        "hy2://pw@h:443?sni=%D0%9F%D1%80%D0%B8%D0%BC%D0%B5%D1%80.%D1%80%D1%84&insecure=1"
+      ],
+      "case": "hp_cyr_sni",
+      "function": "_parse_hy2_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_hy2_uri_to_exit",
+      "rc": 0,
+      "stderr_b64": "CiAgG1swOzM2bVsqXRtbMG0gSHlzdGVyaWEyOiBoOjQ0Mwo=",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHAKICAgIHR5cGU6IGh5c3RlcmlhMgogICAgc2VydmVyOiBoCiAgICBwb3J0OiA0NDMKICAgIHBhc3N3b3JkOiAicHciCiAgICBzbmk6ICLQn9GA0LjQvNC10YAu0YDRhCIKICAgIHNraXAtY2VydC12ZXJpZnk6IHRydWUK"
+    },
+    {
+      "args": [
+        "hy2-exit",
+        "hy2://pw@h:443"
+      ],
+      "case": "hp_default_sni",
+      "function": "_parse_hy2_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_hy2_uri_to_exit",
+      "rc": 0,
+      "stderr_b64": "CiAgG1swOzM2bVsqXRtbMG0gSHlzdGVyaWEyOiBoOjQ0Mwo=",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IGh5Mi1leGl0CiAgICB0eXBlOiBoeXN0ZXJpYTIKICAgIHNlcnZlcjogaAogICAgcG9ydDogNDQzCiAgICBwYXNzd29yZDogInB3IgogICAgc25pOiAid3d3Lmdvb2dsZS5kZSIKICAgIHNraXAtY2VydC12ZXJpZnk6IGZhbHNlCg=="
+    },
+    {
+      "args": [
+        "p",
+        "hy2://🔑@h:443"
+      ],
+      "case": "hp_emoji_pass",
+      "function": "_parse_hy2_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_hy2_uri_to_exit",
+      "rc": 0,
+      "stderr_b64": "CiAgG1swOzM2bVsqXRtbMG0gSHlzdGVyaWEyOiBoOjQ0Mwo=",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHAKICAgIHR5cGU6IGh5c3RlcmlhMgogICAgc2VydmVyOiBoCiAgICBwb3J0OiA0NDMKICAgIHBhc3N3b3JkOiAi8J+UkSIKICAgIHNuaTogInd3dy5nb29nbGUuZGUiCiAgICBza2lwLWNlcnQtdmVyaWZ5OiBmYWxzZQo="
+    },
+    {
+      "args": [
+        "p",
+        "hy2://"
+      ],
+      "case": "hp_empty_after_scheme",
+      "function": "_parse_hy2_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_hy2_uri_to_exit",
+      "rc": 0,
+      "stderr_b64": "CiAgG1swOzM2bVsqXRtbMG0gSHlzdGVyaWEyOiA6Cg==",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHAKICAgIHR5cGU6IGh5c3RlcmlhMgogICAgc2VydmVyOiAKICAgIHBvcnQ6IAogICAgcGFzc3dvcmQ6ICIiCiAgICBzbmk6ICJ3d3cuZ29vZ2xlLmRlIgogICAgc2tpcC1jZXJ0LXZlcmlmeTogZmFsc2UK"
+    },
+    {
+      "args": [
+        "p",
+        "hy2://pw@h:443#my-node"
+      ],
+      "case": "hp_fragment_ignored",
+      "function": "_parse_hy2_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_hy2_uri_to_exit",
+      "rc": 0,
+      "stderr_b64": "CiAgG1swOzM2bVsqXRtbMG0gSHlzdGVyaWEyOiBoOjQ0Mwo=",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHAKICAgIHR5cGU6IGh5c3RlcmlhMgogICAgc2VydmVyOiBoCiAgICBwb3J0OiA0NDMKICAgIHBhc3N3b3JkOiAicHciCiAgICBzbmk6ICJ3d3cuZ29vZ2xlLmRlIgogICAgc2tpcC1jZXJ0LXZlcmlmeTogZmFsc2UK"
+    },
+    {
+      "args": [
+        "hy2-exit",
+        "hysteria2://PASS-1@exit.example.com:443?insecure=1&sni=cdn.example.org&obfs=salamander&obfs-password=OBFS%23PW"
+      ],
+      "case": "hp_full",
+      "function": "_parse_hy2_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_hy2_uri_to_exit",
+      "rc": 0,
+      "stderr_b64": "CiAgG1swOzM2bVsqXRtbMG0gSHlzdGVyaWEyOiBleGl0LmV4YW1wbGUuY29tOjQ0MwogIBtbMDszNm1bKl0bWzBtIE9iZnM6IHNhbGFtYW5kZXIK",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IGh5Mi1leGl0CiAgICB0eXBlOiBoeXN0ZXJpYTIKICAgIHNlcnZlcjogZXhpdC5leGFtcGxlLmNvbQogICAgcG9ydDogNDQzCiAgICBwYXNzd29yZDogIlBBU1MtMSIKICAgIHNuaTogImNkbi5leGFtcGxlLm9yZyIKICAgIHNraXAtY2VydC12ZXJpZnk6IHRydWUKICAgIG9iZnM6IHNhbGFtYW5kZXIKICAgIG9iZnMtcGFzc3dvcmQ6ICJPQkZTI1BXIgo="
+    },
+    {
+      "args": [
+        "p",
+        "hysteria2://a%20b@h:443"
+      ],
+      "case": "hp_hysteria2_pct_pass",
+      "function": "_parse_hy2_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_hy2_uri_to_exit",
+      "rc": 0,
+      "stderr_b64": "CiAgG1swOzM2bVsqXRtbMG0gSHlzdGVyaWEyOiBoOjQ0Mwo=",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHAKICAgIHR5cGU6IGh5c3RlcmlhMgogICAgc2VydmVyOiBoCiAgICBwb3J0OiA0NDMKICAgIHBhc3N3b3JkOiAiYSBiIgogICAgc25pOiAid3d3Lmdvb2dsZS5kZSIKICAgIHNraXAtY2VydC12ZXJpZnk6IGZhbHNlCg=="
+    },
+    {
+      "args": [
+        "p",
+        "hy2://pw@h:443?insecure=0&sni=s"
+      ],
+      "case": "hp_insecure_0",
+      "function": "_parse_hy2_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_hy2_uri_to_exit",
+      "rc": 0,
+      "stderr_b64": "CiAgG1swOzM2bVsqXRtbMG0gSHlzdGVyaWEyOiBoOjQ0Mwo=",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHAKICAgIHR5cGU6IGh5c3RlcmlhMgogICAgc2VydmVyOiBoCiAgICBwb3J0OiA0NDMKICAgIHBhc3N3b3JkOiAicHciCiAgICBzbmk6ICJzIgogICAgc2tpcC1jZXJ0LXZlcmlmeTogZmFsc2UK"
+    },
+    {
+      "args": [
+        "p",
+        "hy2://pw@h:443?insecure=true"
+      ],
+      "case": "hp_insecure_true",
+      "function": "_parse_hy2_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_hy2_uri_to_exit",
+      "rc": 0,
+      "stderr_b64": "CiAgG1swOzM2bVsqXRtbMG0gSHlzdGVyaWEyOiBoOjQ0Mwo=",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHAKICAgIHR5cGU6IGh5c3RlcmlhMgogICAgc2VydmVyOiBoCiAgICBwb3J0OiA0NDMKICAgIHBhc3N3b3JkOiAicHciCiAgICBzbmk6ICJ3d3cuZ29vZ2xlLmRlIgogICAgc2tpcC1jZXJ0LXZlcmlmeTogZmFsc2UK"
+    },
+    {
+      "args": [
+        "p",
+        "hy2://pw@[2001:db8::1]:443?insecure=1"
+      ],
+      "case": "hp_ipv6_bracketed",
+      "function": "_parse_hy2_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_hy2_uri_to_exit",
+      "rc": 0,
+      "stderr_b64": "CiAgG1swOzM2bVsqXRtbMG0gSHlzdGVyaWEyOiAyMDAxOmRiODo6MTo0NDMK",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHAKICAgIHR5cGU6IGh5c3RlcmlhMgogICAgc2VydmVyOiAyMDAxOmRiODo6MQogICAgcG9ydDogNDQzCiAgICBwYXNzd29yZDogInB3IgogICAgc25pOiAid3d3Lmdvb2dsZS5kZSIKICAgIHNraXAtY2VydC12ZXJpZnk6IHRydWUK"
+    },
+    {
+      "args": [
+        "p",
+        "hy2://pw@h"
+      ],
+      "case": "hp_no_port",
+      "function": "_parse_hy2_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_hy2_uri_to_exit",
+      "rc": 0,
+      "stderr_b64": "CiAgG1swOzM2bVsqXRtbMG0gSHlzdGVyaWEyOiBoOgo=",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHAKICAgIHR5cGU6IGh5c3RlcmlhMgogICAgc2VydmVyOiBoCiAgICBwb3J0OiAKICAgIHBhc3N3b3JkOiAicHciCiAgICBzbmk6ICJ3d3cuZ29vZ2xlLmRlIgogICAgc2tpcC1jZXJ0LXZlcmlmeTogZmFsc2UK"
+    },
+    {
+      "args": [
+        "p",
+        "hy2://pw@h:443?obfs-password="
+      ],
+      "case": "hp_obfs_empty",
+      "function": "_parse_hy2_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_hy2_uri_to_exit",
+      "rc": 0,
+      "stderr_b64": "CiAgG1swOzM2bVsqXRtbMG0gSHlzdGVyaWEyOiBoOjQ0Mwo=",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHAKICAgIHR5cGU6IGh5c3RlcmlhMgogICAgc2VydmVyOiBoCiAgICBwb3J0OiA0NDMKICAgIHBhc3N3b3JkOiAicHciCiAgICBzbmk6ICJ3d3cuZ29vZ2xlLmRlIgogICAgc2tpcC1jZXJ0LXZlcmlmeTogZmFsc2UK"
+    },
+    {
+      "args": [
+        "p",
+        "hy2://pw@h:443?obfs-password=a%23b%26c"
+      ],
+      "case": "hp_obfs_pct",
+      "function": "_parse_hy2_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_hy2_uri_to_exit",
+      "rc": 0,
+      "stderr_b64": "CiAgG1swOzM2bVsqXRtbMG0gSHlzdGVyaWEyOiBoOjQ0MwogIBtbMDszNm1bKl0bWzBtIE9iZnM6IHNhbGFtYW5kZXIK",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHAKICAgIHR5cGU6IGh5c3RlcmlhMgogICAgc2VydmVyOiBoCiAgICBwb3J0OiA0NDMKICAgIHBhc3N3b3JkOiAicHciCiAgICBzbmk6ICJ3d3cuZ29vZ2xlLmRlIgogICAgc2tpcC1jZXJ0LXZlcmlmeTogZmFsc2UKICAgIG9iZnM6IHNhbGFtYW5kZXIKICAgIG9iZnMtcGFzc3dvcmQ6ICJhI2ImYyIK"
+    },
+    {
+      "args": [
+        "p",
+        "hy2://%2A%20a%20%23b%22%5C@h:443?obfs-password=-%20o%20%23x"
+      ],
+      "case": "hp_pass_yaml_special",
+      "function": "_parse_hy2_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_hy2_uri_to_exit",
+      "rc": 0,
+      "stderr_b64": "CiAgG1swOzM2bVsqXRtbMG0gSHlzdGVyaWEyOiBoOjQ0MwogIBtbMDszNm1bKl0bWzBtIE9iZnM6IHNhbGFtYW5kZXIK",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHAKICAgIHR5cGU6IGh5c3RlcmlhMgogICAgc2VydmVyOiBoCiAgICBwb3J0OiA0NDMKICAgIHBhc3N3b3JkOiAiKiBhICNiXCJcXCIKICAgIHNuaTogInd3dy5nb29nbGUuZGUiCiAgICBza2lwLWNlcnQtdmVyaWZ5OiBmYWxzZQogICAgb2Jmczogc2FsYW1hbmRlcgogICAgb2Jmcy1wYXNzd29yZDogIi0gbyAjeCIK"
+    },
+    {
+      "args": [
+        "p",
+        "hy2://pw@h:65535"
+      ],
+      "case": "hp_port_65535",
+      "function": "_parse_hy2_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_hy2_uri_to_exit",
+      "rc": 0,
+      "stderr_b64": "CiAgG1swOzM2bVsqXRtbMG0gSHlzdGVyaWEyOiBoOjY1NTM1Cg==",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHAKICAgIHR5cGU6IGh5c3RlcmlhMgogICAgc2VydmVyOiBoCiAgICBwb3J0OiA2NTUzNQogICAgcGFzc3dvcmQ6ICJwdyIKICAgIHNuaTogInd3dy5nb29nbGUuZGUiCiAgICBza2lwLWNlcnQtdmVyaWZ5OiBmYWxzZQo="
+    },
+    {
+      "args": [
+        "p",
+        "hy2://user:pass@h:443"
+      ],
+      "case": "hp_userinfo_colon",
+      "function": "_parse_hy2_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_hy2_uri_to_exit",
+      "rc": 0,
+      "stderr_b64": "CiAgG1swOzM2bVsqXRtbMG0gSHlzdGVyaWEyOiBoOjQ0Mwo=",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHAKICAgIHR5cGU6IGh5c3RlcmlhMgogICAgc2VydmVyOiBoCiAgICBwb3J0OiA0NDMKICAgIHBhc3N3b3JkOiAidXNlcjpwYXNzIgogICAgc25pOiAid3d3Lmdvb2dsZS5kZSIKICAgIHNraXAtY2VydC12ZXJpZnk6IGZhbHNlCg=="
+    },
+    {
+      "args": [
+        "p"
+      ],
+      "case": "pp_bad_pct",
+      "function": "_parse_proxy_uri",
+      "globals": {},
+      "invoke": "_parse_proxy_uri",
+      "rc": 1,
+      "stderr_b64": "Cg==",
+      "stdin_b64": "dmxlc3M6Ly91QGg6NDQzP3NuaT0lRzEK",
+      "stdout_b64": "ICAbWzE7MzNtWyFdG1swbSDQndC10LrQvtGA0YDQtdC60YLQvdC+0LUgcGVyY2VudC3QutC+0LTQuNGA0L7QstCw0L3QuNC1INCyIFZMRVNTIFVSSQo="
+    },
+    {
+      "args": [
+        "p"
+      ],
+      "case": "pp_empty_line",
+      "function": "_parse_proxy_uri",
+      "globals": {},
+      "invoke": "_parse_proxy_uri",
+      "rc": 1,
+      "stderr_b64": "CiAgG1sxOzMzbVshXRtbMG0g0J3QtdC40LfQstC10YHRgtC90YvQuSDQv9GA0L7RgtC+0LrQvtC7LiDQn9C+0LTQtNC10YDQttC40LLQsNGO0YLRgdGPOiB2bGVzczovLywgaHlzdGVyaWEyOi8vLCBoeTI6Ly8K",
+      "stdin_b64": "Cg==",
+      "stdout_b64": ""
+    },
+    {
+      "args": [
+        "p"
+      ],
+      "case": "pp_grpc",
+      "function": "_parse_proxy_uri",
+      "globals": {},
+      "invoke": "_parse_proxy_uri",
+      "rc": 0,
+      "stderr_b64": "CgogIBtbMDszNm1bKl0bWzBtIFZMRVNTIGdycGM6IGg6NDQzIChTTkk6IGgpCg==",
+      "stdin_b64": "dmxlc3M6Ly91QGg6NDQzP3R5cGU9Z3JwYyZzZXJ2aWNlTmFtZT1zCg==",
+      "stdout_b64": "ICAtIG5hbWU6IHAKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IGgKICAgIHBvcnQ6IDQ0MwogICAgdXVpZDogdQogICAgbmV0d29yazogZ3JwYwogICAgdWRwOiB0cnVlCiAgICBncnBjLW9wdHM6CiAgICAgIGdycGMtc2VydmljZS1uYW1lOiAicyIKICAgIHRsczogdHJ1ZQogICAgc2VydmVybmFtZTogImgiCiAgICBjbGllbnQtZmluZ2VycHJpbnQ6IGNocm9tZQo="
+    },
+    {
+      "args": [
+        "hy2-b"
+      ],
+      "case": "pp_hy2",
+      "function": "_parse_proxy_uri",
+      "globals": {},
+      "invoke": "_parse_proxy_uri",
+      "rc": 0,
+      "stderr_b64": "CgogIBtbMDszNm1bKl0bWzBtIEh5c3RlcmlhMjogaDo4NDQzCg==",
+      "stdin_b64": "aHlzdGVyaWEyOi8vcHdAaDo4NDQzP2luc2VjdXJlPTEmc25pPXgjbgo=",
+      "stdout_b64": "ICAtIG5hbWU6IGh5Mi1iCiAgICB0eXBlOiBoeXN0ZXJpYTIKICAgIHNlcnZlcjogaAogICAgcG9ydDogODQ0MwogICAgcGFzc3dvcmQ6ICJwdyIKICAgIHNuaTogIngiCiAgICBza2lwLWNlcnQtdmVyaWZ5OiB0cnVlCg=="
+    },
+    {
+      "args": [
+        "hy2-c"
+      ],
+      "case": "pp_hy2_crlf",
+      "function": "_parse_proxy_uri",
+      "globals": {},
+      "invoke": "_parse_proxy_uri",
+      "rc": 0,
+      "stderr_b64": "CgogIBtbMDszNm1bKl0bWzBtIEh5c3RlcmlhMjogaDo0NDMK",
+      "stdin_b64": "aHkyOi8vcHdAaDo0NDM/aW5zZWN1cmU9MQ0K",
+      "stdout_b64": "ICAtIG5hbWU6IGh5Mi1jCiAgICB0eXBlOiBoeXN0ZXJpYTIKICAgIHNlcnZlcjogaAogICAgcG9ydDogNDQzCiAgICBwYXNzd29yZDogInB3IgogICAgc25pOiAid3d3Lmdvb2dsZS5kZSIKICAgIHNraXAtY2VydC12ZXJpZnk6IHRydWUK"
+    },
+    {
+      "args": [
+        "p"
+      ],
+      "case": "pp_no_newline",
+      "function": "_parse_proxy_uri",
+      "globals": {},
+      "invoke": "_parse_proxy_uri",
+      "rc": 0,
+      "stderr_b64": "CgogIBtbMDszNm1bKl0bWzBtIFZMRVNTIHRjcDogaDo0NDMgKFNOSTogaCkK",
+      "stdin_b64": "dmxlc3M6Ly91QGg6NDQz",
+      "stdout_b64": "ICAtIG5hbWU6IHAKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IGgKICAgIHBvcnQ6IDQ0MwogICAgdXVpZDogdQogICAgbmV0d29yazogdGNwCiAgICB1ZHA6IHRydWUKICAgIGZsb3c6IHh0bHMtcnByeC12aXNpb24KICAgIHRsczogdHJ1ZQogICAgc2VydmVybmFtZTogImgiCiAgICBjbGllbnQtZmluZ2VycHJpbnQ6IGNocm9tZQo="
+    },
+    {
+      "args": [
+        "p"
+      ],
+      "case": "pp_unknown_scheme",
+      "function": "_parse_proxy_uri",
+      "globals": {},
+      "invoke": "_parse_proxy_uri",
+      "rc": 1,
+      "stderr_b64": "CiAgG1sxOzMzbVshXRtbMG0g0J3QtdC40LfQstC10YHRgtC90YvQuSDQv9GA0L7RgtC+0LrQvtC7LiDQn9C+0LTQtNC10YDQttC40LLQsNGO0YLRgdGPOiB2bGVzczovLywgaHlzdGVyaWEyOi8vLCBoeTI6Ly8K",
+      "stdin_b64": "aHR0cHM6Ly9leGFtcGxlLmNvbQo=",
+      "stdout_b64": ""
+    },
+    {
+      "args": [
+        "p"
+      ],
+      "case": "pp_unknown_transport",
+      "function": "_parse_proxy_uri",
+      "globals": {},
+      "invoke": "_parse_proxy_uri",
+      "rc": 1,
+      "stderr_b64": "CgogIBtbMDszNm1bKl0bWzBtIFZMRVNTIHF1aWM6IGg6NDQzIChTTkk6IGgpCg==",
+      "stdin_b64": "dmxlc3M6Ly91QGg6NDQzP3R5cGU9cXVpYwo=",
+      "stdout_b64": "ICAbWzE7MzNtWyFdG1swbSDQndC10LjQt9Cy0LXRgdGC0L3Ri9C5INGC0YDQsNC90YHQv9C+0YDRgiBWTEVTUzogcXVpYy4g0J/QvtC00LTQtdGA0LbQuNCy0LDRjtGC0YHRjzogdGNwLCB4aHR0cCwgZ3JwYwo="
+    },
+    {
+      "args": [
+        "proxy-a"
+      ],
+      "case": "pp_vless",
+      "function": "_parse_proxy_uri",
+      "globals": {},
+      "invoke": "_parse_proxy_uri",
+      "rc": 0,
+      "stderr_b64": "CgogIBtbMDszNm1bKl0bWzBtIFZMRVNTIHRjcDogaC5leGFtcGxlOjQ0MyAoU05JOiBoLmV4YW1wbGUpCg==",
+      "stdin_b64": "dmxlc3M6Ly91QGguZXhhbXBsZTo0NDM/dHlwZT10Y3AmcGJrPVBLJnNpZD1hYiZmbG93PXh0bHMtcnByeC12aXNpb24jbgo=",
+      "stdout_b64": "ICAtIG5hbWU6IHByb3h5LWEKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IGguZXhhbXBsZQogICAgcG9ydDogNDQzCiAgICB1dWlkOiB1CiAgICBuZXR3b3JrOiB0Y3AKICAgIHVkcDogdHJ1ZQogICAgZmxvdzogeHRscy1ycHJ4LXZpc2lvbgogICAgdGxzOiB0cnVlCiAgICBzZXJ2ZXJuYW1lOiAiaC5leGFtcGxlIgogICAgcmVhbGl0eS1vcHRzOgogICAgICBwdWJsaWMta2V5OiBQSwogICAgICBzaG9ydC1pZDogYWIKICAgIGNsaWVudC1maW5nZXJwcmludDogY2hyb21lCg=="
+    },
+    {
+      "args": [
+        "x"
+      ],
+      "case": "pp_vless_xhttp",
+      "function": "_parse_proxy_uri",
+      "globals": {},
+      "invoke": "_parse_proxy_uri",
+      "rc": 0,
+      "stderr_b64": "CgogIBtbMDszNm1bKl0bWzBtIFZMRVNTIHhodHRwOiBoOjQ0MyAoU05JOiBoKQo=",
+      "stdin_b64": "dmxlc3M6Ly91QGg6NDQzP3R5cGU9eGh0dHAmcGF0aD0lMkYmbW9kZT1wYWNrZXQtdXAK",
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IGgKICAgIHBvcnQ6IDQ0MwogICAgdXVpZDogdQogICAgbmV0d29yazogeGh0dHAKICAgIHVkcDogdHJ1ZQogICAgeGh0dHAtb3B0czoKICAgICAgcGF0aDogIi8iCiAgICAgIG1vZGU6IHBhY2tldC11cAogICAgdGxzOiB0cnVlCiAgICBzZXJ2ZXJuYW1lOiAiaCIKICAgIGNsaWVudC1maW5nZXJwcmludDogZmlyZWZveAo="
+    },
+    {
+      "args": [
+        "hy2://p@h:5#x@y"
+      ],
+      "case": "ps_at_in_fragment",
+      "function": "_parse_server_port_from_uri",
+      "globals": {},
+      "invoke": "w_server_port",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "c2VydmVyPWgKcG9ydD01Cg=="
+    },
+    {
+      "args": [
+        "vless://u@h.example:443?sni=a:b"
+      ],
+      "case": "ps_colon_in_query",
+      "function": "_parse_server_port_from_uri",
+      "globals": {},
+      "invoke": "w_server_port",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "c2VydmVyPWguZXhhbXBsZQpwb3J0PTQ0Mwo="
+    },
+    {
+      "args": [
+        "hy2://p@h:443\r"
+      ],
+      "case": "ps_crlf",
+      "function": "_parse_server_port_from_uri",
+      "globals": {},
+      "invoke": "w_server_port",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "c2VydmVyPWgKcG9ydD00NDMK"
+    },
+    {
+      "args": [
+        ""
+      ],
+      "case": "ps_empty",
+      "function": "_parse_server_port_from_uri",
+      "globals": {},
+      "invoke": "w_server_port",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "c2VydmVyPQpwb3J0PQo="
+    },
+    {
+      "args": [
+        "vless://u@a.b:444#name:with:colons"
+      ],
+      "case": "ps_fragment_colons",
+      "function": "_parse_server_port_from_uri",
+      "globals": {},
+      "invoke": "w_server_port",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "c2VydmVyPWEuYgpwb3J0PTQ0NAo="
+    },
+    {
+      "args": [
+        "hy2://pw@1.2.3.4:8443"
+      ],
+      "case": "ps_hy2",
+      "function": "_parse_server_port_from_uri",
+      "globals": {},
+      "invoke": "w_server_port",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "c2VydmVyPTEuMi4zLjQKcG9ydD04NDQzCg=="
+    },
+    {
+      "args": [
+        "hysteria2://pw@h.example:9443?insecure=1#n"
+      ],
+      "case": "ps_hysteria2",
+      "function": "_parse_server_port_from_uri",
+      "globals": {},
+      "invoke": "w_server_port",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "c2VydmVyPWguZXhhbXBsZQpwb3J0PTk0NDMK"
+    },
+    {
+      "args": [
+        "vless://u@[2001:db8::1]:443?x=1"
+      ],
+      "case": "ps_ipv6_bracketed",
+      "function": "_parse_server_port_from_uri",
+      "globals": {},
+      "invoke": "w_server_port",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "c2VydmVyPTIwMDE6ZGI4OjoxCnBvcnQ9NDQzCg=="
+    },
+    {
+      "args": [
+        "vless://u@x@h:1"
+      ],
+      "case": "ps_multi_at",
+      "function": "_parse_server_port_from_uri",
+      "globals": {},
+      "invoke": "w_server_port",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "c2VydmVyPWgKcG9ydD0xCg=="
+    },
+    {
+      "args": [
+        "vless://u@host?x=1"
+      ],
+      "case": "ps_no_port",
+      "function": "_parse_server_port_from_uri",
+      "globals": {},
+      "invoke": "w_server_port",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "c2VydmVyPWhvc3QKcG9ydD0K"
+    },
+    {
+      "args": [
+        "hy2://pw@host.example:1"
+      ],
+      "case": "ps_no_query",
+      "function": "_parse_server_port_from_uri",
+      "globals": {},
+      "invoke": "w_server_port",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "c2VydmVyPWhvc3QuZXhhbXBsZQpwb3J0PTEK"
+    },
+    {
+      "args": [
+        "example.com:443"
+      ],
+      "case": "ps_no_scheme",
+      "function": "_parse_server_port_from_uri",
+      "globals": {},
+      "invoke": "w_server_port",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "c2VydmVyPWV4YW1wbGUuY29tCnBvcnQ9NDQzCg=="
+    },
+    {
+      "args": [
+        "vless://uuid-1@example.com:443?x=1#f"
+      ],
+      "case": "ps_vless_basic",
+      "function": "_parse_server_port_from_uri",
+      "globals": {},
+      "invoke": "w_server_port",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "c2VydmVyPWV4YW1wbGUuY29tCnBvcnQ9NDQzCg=="
+    },
+    {
+      "args": [
+        "vless://u@h:0"
+      ],
+      "case": "ps_zero_port",
+      "function": "_parse_server_port_from_uri",
+      "globals": {},
+      "invoke": "w_server_port",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "c2VydmVyPWgKcG9ydD0wCg=="
+    },
+    {
+      "args": [
+        "p",
+        "vless://u@h:443?type=xhttp&path=%2"
+      ],
+      "case": "vl_bad_pct_path_tail",
+      "function": "_parse_vless_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_vless_uri_to_exit",
+      "rc": 1,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAbWzE7MzNtWyFdG1swbSDQndC10LrQvtGA0YDQtdC60YLQvdC+0LUgcGVyY2VudC3QutC+0LTQuNGA0L7QstCw0L3QuNC1INCyIFZMRVNTIFVSSQo="
+    },
+    {
+      "args": [
+        "p",
+        "vless://u@h:443?sni=%ZZ"
+      ],
+      "case": "vl_bad_pct_sni",
+      "function": "_parse_vless_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_vless_uri_to_exit",
+      "rc": 1,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAbWzE7MzNtWyFdG1swbSDQndC10LrQvtGA0YDQtdC60YLQvdC+0LUgcGVyY2VudC3QutC+0LTQuNGA0L7QstCw0L3QuNC1INCyIFZMRVNTIFVSSQo="
+    },
+    {
+      "args": [
+        "p",
+        "vless://u@h:443?type=tcp&fp=chrome\r"
+      ],
+      "case": "vl_cr_tail",
+      "function": "_parse_vless_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_vless_uri_to_exit",
+      "rc": 0,
+      "stderr_b64": "CiAgG1swOzM2bVsqXRtbMG0gVkxFU1MgdGNwOiBoOjQ0MyAoU05JOiBoKQo=",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHAKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IGgKICAgIHBvcnQ6IDQ0MwogICAgdXVpZDogdQogICAgbmV0d29yazogdGNwCiAgICB1ZHA6IHRydWUKICAgIGZsb3c6IHh0bHMtcnByeC12aXNpb24KICAgIHRsczogdHJ1ZQogICAgc2VydmVybmFtZTogImgiCiAgICBjbGllbnQtZmluZ2VycHJpbnQ6IGNocm9tZQo="
+    },
+    {
+      "args": [
+        "p",
+        "vless://u@h:443?type=grpc&serviceName=🚀"
+      ],
+      "case": "vl_emoji_service_raw",
+      "function": "_parse_vless_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_vless_uri_to_exit",
+      "rc": 0,
+      "stderr_b64": "CiAgG1swOzM2bVsqXRtbMG0gVkxFU1MgZ3JwYzogaDo0NDMgKFNOSTogaCkK",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHAKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IGgKICAgIHBvcnQ6IDQ0MwogICAgdXVpZDogdQogICAgbmV0d29yazogZ3JwYwogICAgdWRwOiB0cnVlCiAgICBncnBjLW9wdHM6CiAgICAgIGdycGMtc2VydmljZS1uYW1lOiAi8J+agCIKICAgIHRsczogdHJ1ZQogICAgc2VydmVybmFtZTogImgiCiAgICBjbGllbnQtZmluZ2VycHJpbnQ6IGNocm9tZQo="
+    },
+    {
+      "args": [
+        "p",
+        "vless://u@h:443?type=tcp&sni="
+      ],
+      "case": "vl_empty_sni",
+      "function": "_parse_vless_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_vless_uri_to_exit",
+      "rc": 0,
+      "stderr_b64": "CiAgG1swOzM2bVsqXRtbMG0gVkxFU1MgdGNwOiBoOjQ0MyAoU05JOiBoKQo=",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHAKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IGgKICAgIHBvcnQ6IDQ0MwogICAgdXVpZDogdQogICAgbmV0d29yazogdGNwCiAgICB1ZHA6IHRydWUKICAgIGZsb3c6IHh0bHMtcnByeC12aXNpb24KICAgIHRsczogdHJ1ZQogICAgc2VydmVybmFtZTogImgiCiAgICBjbGllbnQtZmluZ2VycHJpbnQ6IGNocm9tZQo="
+    },
+    {
+      "args": [
+        "p",
+        "vless://@h:443?type=tcp"
+      ],
+      "case": "vl_empty_uuid",
+      "function": "_parse_vless_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_vless_uri_to_exit",
+      "rc": 0,
+      "stderr_b64": "CiAgG1swOzM2bVsqXRtbMG0gVkxFU1MgdGNwOiBoOjQ0MyAoU05JOiBoKQo=",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHAKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IGgKICAgIHBvcnQ6IDQ0MwogICAgdXVpZDogCiAgICBuZXR3b3JrOiB0Y3AKICAgIHVkcDogdHJ1ZQogICAgZmxvdzogeHRscy1ycHJ4LXZpc2lvbgogICAgdGxzOiB0cnVlCiAgICBzZXJ2ZXJuYW1lOiAiaCIKICAgIGNsaWVudC1maW5nZXJwcmludDogY2hyb21lCg=="
+    },
+    {
+      "args": [
+        "p",
+        "vless://u@h:443?type=grpc&pbk=k"
+      ],
+      "case": "vl_grpc_default_service",
+      "function": "_parse_vless_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_vless_uri_to_exit",
+      "rc": 0,
+      "stderr_b64": "CiAgG1swOzM2bVsqXRtbMG0gVkxFU1MgZ3JwYzogaDo0NDMgKFNOSTogaCkK",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHAKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IGgKICAgIHBvcnQ6IDQ0MwogICAgdXVpZDogdQogICAgbmV0d29yazogZ3JwYwogICAgdWRwOiB0cnVlCiAgICBncnBjLW9wdHM6CiAgICAgIGdycGMtc2VydmljZS1uYW1lOiAiZ3JwYyIKICAgIHRsczogdHJ1ZQogICAgc2VydmVybmFtZTogImgiCiAgICByZWFsaXR5LW9wdHM6CiAgICAgIHB1YmxpYy1rZXk6IGsKICAgICAgc2hvcnQtaWQ6IAogICAgY2xpZW50LWZpbmdlcnByaW50OiBjaHJvbWUK"
+    },
+    {
+      "args": [
+        "p",
+        "vless://u@h:443?type=grpc&serviceName=a%22b%5Cc"
+      ],
+      "case": "vl_grpc_service_quote",
+      "function": "_parse_vless_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_vless_uri_to_exit",
+      "rc": 0,
+      "stderr_b64": "CiAgG1swOzM2bVsqXRtbMG0gVkxFU1MgZ3JwYzogaDo0NDMgKFNOSTogaCkK",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHAKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IGgKICAgIHBvcnQ6IDQ0MwogICAgdXVpZDogdQogICAgbmV0d29yazogZ3JwYwogICAgdWRwOiB0cnVlCiAgICBncnBjLW9wdHM6CiAgICAgIGdycGMtc2VydmljZS1uYW1lOiAiYVwiYlxcYyIKICAgIHRsczogdHJ1ZQogICAgc2VydmVybmFtZTogImgiCiAgICBjbGllbnQtZmluZ2VycHJpbnQ6IGNocm9tZQo="
+    },
+    {
+      "args": [
+        "p",
+        "vless://u@h:443?type=grpc&serviceName=my%20svc&security=reality&pbk=k&sid=s"
+      ],
+      "case": "vl_grpc_space",
+      "function": "_parse_vless_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_vless_uri_to_exit",
+      "rc": 0,
+      "stderr_b64": "CiAgG1swOzM2bVsqXRtbMG0gVkxFU1MgZ3JwYzogaDo0NDMgKFNOSTogaCkK",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHAKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IGgKICAgIHBvcnQ6IDQ0MwogICAgdXVpZDogdQogICAgbmV0d29yazogZ3JwYwogICAgdWRwOiB0cnVlCiAgICBncnBjLW9wdHM6CiAgICAgIGdycGMtc2VydmljZS1uYW1lOiAibXkgc3ZjIgogICAgdGxzOiB0cnVlCiAgICBzZXJ2ZXJuYW1lOiAiaCIKICAgIHJlYWxpdHktb3B0czoKICAgICAgcHVibGljLWtleTogawogICAgICBzaG9ydC1pZDogcwogICAgY2xpZW50LWZpbmdlcnByaW50OiBjaHJvbWUK"
+    },
+    {
+      "args": [
+        "p",
+        "vless://u@h:443?sni=a#b"
+      ],
+      "case": "vl_hash_in_query",
+      "function": "_parse_vless_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_vless_uri_to_exit",
+      "rc": 0,
+      "stderr_b64": "CiAgG1swOzM2bVsqXRtbMG0gVkxFU1MgdGNwOiBoOjQ0MyAoU05JOiBhKQo=",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHAKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IGgKICAgIHBvcnQ6IDQ0MwogICAgdXVpZDogdQogICAgbmV0d29yazogdGNwCiAgICB1ZHA6IHRydWUKICAgIGZsb3c6IHh0bHMtcnByeC12aXNpb24KICAgIHRsczogdHJ1ZQogICAgc2VydmVybmFtZTogImEiCiAgICBjbGllbnQtZmluZ2VycHJpbnQ6IGNocm9tZQo="
+    },
+    {
+      "args": [
+        "p",
+        "vless://u@[::]:443?type=tcp"
+      ],
+      "case": "vl_ipv6_any_default_sni",
+      "function": "_parse_vless_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_vless_uri_to_exit",
+      "rc": 0,
+      "stderr_b64": "CiAgG1swOzM2bVsqXRtbMG0gVkxFU1MgdGNwOiA6Ojo0NDMgKFNOSTogOjopCg==",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHAKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6ICI6OiIKICAgIHBvcnQ6IDQ0MwogICAgdXVpZDogdQogICAgbmV0d29yazogdGNwCiAgICB1ZHA6IHRydWUKICAgIGZsb3c6IHh0bHMtcnByeC12aXNpb24KICAgIHRsczogdHJ1ZQogICAgc2VydmVybmFtZTogIjo6IgogICAgY2xpZW50LWZpbmdlcnByaW50OiBjaHJvbWUK"
+    },
+    {
+      "args": [
+        "p",
+        "vless://u@[2001:db8::1]:443?type=tcp"
+      ],
+      "case": "vl_ipv6_bracketed",
+      "function": "_parse_vless_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_vless_uri_to_exit",
+      "rc": 0,
+      "stderr_b64": "CiAgG1swOzM2bVsqXRtbMG0gVkxFU1MgdGNwOiAyMDAxOmRiODo6MTo0NDMgKFNOSTogMjAwMTpkYjg6OjEpCg==",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHAKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IDIwMDE6ZGI4OjoxCiAgICBwb3J0OiA0NDMKICAgIHV1aWQ6IHUKICAgIG5ldHdvcms6IHRjcAogICAgdWRwOiB0cnVlCiAgICBmbG93OiB4dGxzLXJwcngtdmlzaW9uCiAgICB0bHM6IHRydWUKICAgIHNlcnZlcm5hbWU6ICIyMDAxOmRiODo6MSIKICAgIGNsaWVudC1maW5nZXJwcmludDogY2hyb21lCg=="
+    },
+    {
+      "args": [
+        "p",
+        "vless://u@h:443?flag&type=tcp"
+      ],
+      "case": "vl_key_without_value",
+      "function": "_parse_vless_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_vless_uri_to_exit",
+      "rc": 0,
+      "stderr_b64": "CiAgG1swOzM2bVsqXRtbMG0gVkxFU1MgdGNwOiBoOjQ0MyAoU05JOiBoKQo=",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHAKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IGgKICAgIHBvcnQ6IDQ0MwogICAgdXVpZDogdQogICAgbmV0d29yazogdGNwCiAgICB1ZHA6IHRydWUKICAgIGZsb3c6IHh0bHMtcnByeC12aXNpb24KICAgIHRsczogdHJ1ZQogICAgc2VydmVybmFtZTogImgiCiAgICBjbGllbnQtZmluZ2VycHJpbnQ6IGNocm9tZQo="
+    },
+    {
+      "args": [
+        "p",
+        "vless://u@h.example:443"
+      ],
+      "case": "vl_no_query",
+      "function": "_parse_vless_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_vless_uri_to_exit",
+      "rc": 0,
+      "stderr_b64": "CiAgG1swOzM2bVsqXRtbMG0gVkxFU1MgdGNwOiBoLmV4YW1wbGU6NDQzIChTTkk6IGguZXhhbXBsZSkK",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHAKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IGguZXhhbXBsZQogICAgcG9ydDogNDQzCiAgICB1dWlkOiB1CiAgICBuZXR3b3JrOiB0Y3AKICAgIHVkcDogdHJ1ZQogICAgZmxvdzogeHRscy1ycHJ4LXZpc2lvbgogICAgdGxzOiB0cnVlCiAgICBzZXJ2ZXJuYW1lOiAiaC5leGFtcGxlIgogICAgY2xpZW50LWZpbmdlcnByaW50OiBjaHJvbWUK"
+    },
+    {
+      "args": [
+        "p",
+        "vless://u@h:8443?type=tcp#a:b"
+      ],
+      "case": "vl_port_8443_colon_frag",
+      "function": "_parse_vless_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_vless_uri_to_exit",
+      "rc": 0,
+      "stderr_b64": "CiAgG1swOzM2bVsqXRtbMG0gVkxFU1MgdGNwOiBoOjg0NDMgKFNOSTogaCkK",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHAKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IGgKICAgIHBvcnQ6IDg0NDMKICAgIHV1aWQ6IHUKICAgIG5ldHdvcms6IHRjcAogICAgdWRwOiB0cnVlCiAgICBmbG93OiB4dGxzLXJwcngtdmlzaW9uCiAgICB0bHM6IHRydWUKICAgIHNlcnZlcm5hbWU6ICJoIgogICAgY2xpZW50LWZpbmdlcnByaW50OiBjaHJvbWUK"
+    },
+    {
+      "args": [
+        "p",
+        "vless://u@h:443?type=tcp&&sni=s&"
+      ],
+      "case": "vl_repeated_amp",
+      "function": "_parse_vless_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_vless_uri_to_exit",
+      "rc": 0,
+      "stderr_b64": "CiAgG1swOzM2bVsqXRtbMG0gVkxFU1MgdGNwOiBoOjQ0MyAoU05JOiBzKQo=",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHAKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IGgKICAgIHBvcnQ6IDQ0MwogICAgdXVpZDogdQogICAgbmV0d29yazogdGNwCiAgICB1ZHA6IHRydWUKICAgIGZsb3c6IHh0bHMtcnByeC12aXNpb24KICAgIHRsczogdHJ1ZQogICAgc2VydmVybmFtZTogInMiCiAgICBjbGllbnQtZmluZ2VycHJpbnQ6IGNocm9tZQo="
+    },
+    {
+      "args": [
+        "p",
+        "vless://u@h:443?type=grpc&sni=a%22b%5Cc%20%23x"
+      ],
+      "case": "vl_sni_quote",
+      "function": "_parse_vless_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_vless_uri_to_exit",
+      "rc": 0,
+      "stderr_b64": "CiAgG1swOzM2bVsqXRtbMG0gVkxFU1MgZ3JwYzogaDo0NDMgKFNOSTogYSJiXGMgI3gpCg==",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHAKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IGgKICAgIHBvcnQ6IDQ0MwogICAgdXVpZDogdQogICAgbmV0d29yazogZ3JwYwogICAgdWRwOiB0cnVlCiAgICBncnBjLW9wdHM6CiAgICAgIGdycGMtc2VydmljZS1uYW1lOiAiZ3JwYyIKICAgIHRsczogdHJ1ZQogICAgc2VydmVybmFtZTogImFcImJcXGMgI3giCiAgICBjbGllbnQtZmluZ2VycHJpbnQ6IGNocm9tZQo="
+    },
+    {
+      "args": [
+        "p",
+        "vless://u@h:443?sni=%D0%9F%D1%80%D0%B8%D0%BC%D0%B5%D1%80&type=tcp"
+      ],
+      "case": "vl_tcp_cyr_sni",
+      "function": "_parse_vless_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_vless_uri_to_exit",
+      "rc": 0,
+      "stderr_b64": "CiAgG1swOzM2bVsqXRtbMG0gVkxFU1MgdGNwOiBoOjQ0MyAoU05JOiDQn9GA0LjQvNC10YApCg==",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHAKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IGgKICAgIHBvcnQ6IDQ0MwogICAgdXVpZDogdQogICAgbmV0d29yazogdGNwCiAgICB1ZHA6IHRydWUKICAgIGZsb3c6IHh0bHMtcnByeC12aXNpb24KICAgIHRsczogdHJ1ZQogICAgc2VydmVybmFtZTogItCf0YDQuNC80LXRgCIKICAgIGNsaWVudC1maW5nZXJwcmludDogY2hyb21lCg=="
+    },
+    {
+      "args": [
+        "p",
+        "vless://u@h:443?security=reality&sni=s&pbk=k&sid=s&type=tcp"
+      ],
+      "case": "vl_tcp_default_flow",
+      "function": "_parse_vless_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_vless_uri_to_exit",
+      "rc": 0,
+      "stderr_b64": "CiAgG1swOzM2bVsqXRtbMG0gVkxFU1MgdGNwOiBoOjQ0MyAoU05JOiBzKQo=",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHAKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IGgKICAgIHBvcnQ6IDQ0MwogICAgdXVpZDogdQogICAgbmV0d29yazogdGNwCiAgICB1ZHA6IHRydWUKICAgIGZsb3c6IHh0bHMtcnByeC12aXNpb24KICAgIHRsczogdHJ1ZQogICAgc2VydmVybmFtZTogInMiCiAgICByZWFsaXR5LW9wdHM6CiAgICAgIHB1YmxpYy1rZXk6IGsKICAgICAgc2hvcnQtaWQ6IHMKICAgIGNsaWVudC1maW5nZXJwcmludDogY2hyb21lCg=="
+    },
+    {
+      "args": [
+        "proxy",
+        "vless://11111111-2222-3333-4444-555555555555@exit.example.com:443?encryption=none&flow=xtls-rprx-direct&security=reality&sni=www.microsoft.com&fp=safari&pbk=PUBKEY&sid=abcd&type=tcp#frag"
+      ],
+      "case": "vl_tcp_reality_full",
+      "function": "_parse_vless_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_vless_uri_to_exit",
+      "rc": 0,
+      "stderr_b64": "CiAgG1swOzM2bVsqXRtbMG0gVkxFU1MgdGNwOiBleGl0LmV4YW1wbGUuY29tOjQ0MyAoU05JOiB3d3cubWljcm9zb2Z0LmNvbSkK",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHByb3h5CiAgICB0eXBlOiB2bGVzcwogICAgc2VydmVyOiBleGl0LmV4YW1wbGUuY29tCiAgICBwb3J0OiA0NDMKICAgIHV1aWQ6IDExMTExMTExLTIyMjItMzMzMy00NDQ0LTU1NTU1NTU1NTU1NQogICAgbmV0d29yazogdGNwCiAgICB1ZHA6IHRydWUKICAgIGZsb3c6IHh0bHMtcnByeC1kaXJlY3QKICAgIHRsczogdHJ1ZQogICAgc2VydmVybmFtZTogInd3dy5taWNyb3NvZnQuY29tIgogICAgcmVhbGl0eS1vcHRzOgogICAgICBwdWJsaWMta2V5OiBQVUJLRVkKICAgICAgc2hvcnQtaWQ6IGFiY2QKICAgIGNsaWVudC1maW5nZXJwcmludDogc2FmYXJpCg=="
+    },
+    {
+      "args": [
+        "p",
+        "vless://u@h:443?type=quic"
+      ],
+      "case": "vl_unknown_transport",
+      "function": "_parse_vless_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_vless_uri_to_exit",
+      "rc": 1,
+      "stderr_b64": "CiAgG1swOzM2bVsqXRtbMG0gVkxFU1MgcXVpYzogaDo0NDMgKFNOSTogaCkK",
+      "stdin_b64": null,
+      "stdout_b64": "ICAbWzE7MzNtWyFdG1swbSDQndC10LjQt9Cy0LXRgdGC0L3Ri9C5INGC0YDQsNC90YHQv9C+0YDRgiBWTEVTUzogcXVpYy4g0J/QvtC00LTQtdGA0LbQuNCy0LDRjtGC0YHRjzogdGNwLCB4aHR0cCwgZ3JwYwo="
+    },
+    {
+      "args": [
+        "p",
+        "vless://u%ZZ@h:443?type=tcp"
+      ],
+      "case": "vl_uuid_bad_pct",
+      "function": "_parse_vless_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_vless_uri_to_exit",
+      "rc": 1,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAbWzE7MzNtWyFdG1swbSDQndC10LrQvtGA0YDQtdC60YLQvdC+0LUgcGVyY2VudC3QutC+0LTQuNGA0L7QstCw0L3QuNC1INCyIFZMRVNTIFVSSQo="
+    },
+    {
+      "args": [
+        "p",
+        "vless://u%00@h:443?type=tcp"
+      ],
+      "case": "vl_uuid_nul",
+      "function": "_parse_vless_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_vless_uri_to_exit",
+      "rc": 1,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAbWzE7MzNtWyFdG1swbSDQndC10LrQvtGA0YDQtdC60YLQvdC+0LUgcGVyY2VudC3QutC+0LTQuNGA0L7QstCw0L3QuNC1INCyIFZMRVNTIFVSSQo="
+    },
+    {
+      "args": [
+        "p",
+        "vless://11111111%2D2222%2D3333%2D4444%2D555555555555@h:443?type=tcp"
+      ],
+      "case": "vl_uuid_pct_encoded",
+      "function": "_parse_vless_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_vless_uri_to_exit",
+      "rc": 0,
+      "stderr_b64": "CiAgG1swOzM2bVsqXRtbMG0gVkxFU1MgdGNwOiBoOjQ0MyAoU05JOiBoKQo=",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHAKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IGgKICAgIHBvcnQ6IDQ0MwogICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICBuZXR3b3JrOiB0Y3AKICAgIHVkcDogdHJ1ZQogICAgZmxvdzogeHRscy1ycHJ4LXZpc2lvbgogICAgdGxzOiB0cnVlCiAgICBzZXJ2ZXJuYW1lOiAiaCIKICAgIGNsaWVudC1maW5nZXJwcmludDogY2hyb21lCg=="
+    },
+    {
+      "args": [
+        "p",
+        "vless://u%2@h:443?type=tcp"
+      ],
+      "case": "vl_uuid_truncated_pct",
+      "function": "_parse_vless_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_vless_uri_to_exit",
+      "rc": 1,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAbWzE7MzNtWyFdG1swbSDQndC10LrQvtGA0YDQtdC60YLQvdC+0LUgcGVyY2VudC3QutC+0LTQuNGA0L7QstCw0L3QuNC1INCyIFZMRVNTIFVSSQo="
+    },
+    {
+      "args": [
+        "p",
+        "vless://u@h:443?type=xhttp&security=tls"
+      ],
+      "case": "vl_xhttp_mode_default",
+      "function": "_parse_vless_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_vless_uri_to_exit",
+      "rc": 0,
+      "stderr_b64": "CiAgG1swOzM2bVsqXRtbMG0gVkxFU1MgeGh0dHA6IGg6NDQzIChTTkk6IGgpCg==",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHAKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IGgKICAgIHBvcnQ6IDQ0MwogICAgdXVpZDogdQogICAgbmV0d29yazogeGh0dHAKICAgIHVkcDogdHJ1ZQogICAgeGh0dHAtb3B0czoKICAgICAgcGF0aDogIi8iCiAgICAgIG1vZGU6IGF1dG8KICAgIHRsczogdHJ1ZQogICAgc2VydmVybmFtZTogImgiCiAgICBjbGllbnQtZmluZ2VycHJpbnQ6IGZpcmVmb3gK"
+    },
+    {
+      "args": [
+        "p",
+        "vless://u@h:443?type=xhttp&path=%2Fa%22b%5Cc"
+      ],
+      "case": "vl_xhttp_path_quote",
+      "function": "_parse_vless_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_vless_uri_to_exit",
+      "rc": 0,
+      "stderr_b64": "CiAgG1swOzM2bVsqXRtbMG0gVkxFU1MgeGh0dHA6IGg6NDQzIChTTkk6IGgpCg==",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHAKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IGgKICAgIHBvcnQ6IDQ0MwogICAgdXVpZDogdQogICAgbmV0d29yazogeGh0dHAKICAgIHVkcDogdHJ1ZQogICAgeGh0dHAtb3B0czoKICAgICAgcGF0aDogIi9hXCJiXFxjIgogICAgICBtb2RlOiBhdXRvCiAgICB0bHM6IHRydWUKICAgIHNlcnZlcm5hbWU6ICJoIgogICAgY2xpZW50LWZpbmdlcnByaW50OiBmaXJlZm94Cg=="
+    },
+    {
+      "args": [
+        "p",
+        "vless://u@h:443?type=xhttp&path=%2Fapi%2Fv1%3Fx%3D1&mode=packet-up&security=reality&sni=s&pbk=k&sid=s&fp=chrome"
+      ],
+      "case": "vl_xhttp_reality_path",
+      "function": "_parse_vless_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_vless_uri_to_exit",
+      "rc": 0,
+      "stderr_b64": "CiAgG1swOzM2bVsqXRtbMG0gVkxFU1MgeGh0dHA6IGg6NDQzIChTTkk6IHMpCg==",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHAKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IGgKICAgIHBvcnQ6IDQ0MwogICAgdXVpZDogdQogICAgbmV0d29yazogeGh0dHAKICAgIHVkcDogdHJ1ZQogICAgeGh0dHAtb3B0czoKICAgICAgcGF0aDogIi9hcGkvdjE/eD0xIgogICAgICBtb2RlOiBwYWNrZXQtdXAKICAgIHRsczogdHJ1ZQogICAgc2VydmVybmFtZTogInMiCiAgICByZWFsaXR5LW9wdHM6CiAgICAgIHB1YmxpYy1rZXk6IGsKICAgICAgc2hvcnQtaWQ6IHMKICAgIGNsaWVudC1maW5nZXJwcmludDogZmlyZWZveAo="
+    },
+    {
+      "args": [
+        "p",
+        "vless://u@h:443?type=xhttp&security=tls&sni=s"
+      ],
+      "case": "vl_xhttp_tls_default",
+      "function": "_parse_vless_uri_to_exit",
+      "globals": {},
+      "invoke": "_parse_vless_uri_to_exit",
+      "rc": 0,
+      "stderr_b64": "CiAgG1swOzM2bVsqXRtbMG0gVkxFU1MgeGh0dHA6IGg6NDQzIChTTkk6IHMpCg==",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHAKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IGgKICAgIHBvcnQ6IDQ0MwogICAgdXVpZDogdQogICAgbmV0d29yazogeGh0dHAKICAgIHVkcDogdHJ1ZQogICAgeGh0dHAtb3B0czoKICAgICAgcGF0aDogIi8iCiAgICAgIG1vZGU6IGF1dG8KICAgIHRsczogdHJ1ZQogICAgc2VydmVybmFtZTogInMiCiAgICBjbGllbnQtZmluZ2VycHJpbnQ6IGZpcmVmb3gK"
+    },
+    {
+      "args": [
+        "%ZZ"
+      ],
+      "case": "pd_bad_hex",
+      "function": "_uri_percent_decode",
+      "globals": {},
+      "invoke": "_uri_percent_decode",
+      "rc": 1,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": ""
+    },
+    {
+      "args": [
+        "a%0D%0Ab"
+      ],
+      "case": "pd_crlf",
+      "function": "_uri_percent_decode",
+      "globals": {},
+      "invoke": "_uri_percent_decode",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "YQ0KYg=="
+    },
+    {
+      "args": [
+        "%%41"
+      ],
+      "case": "pd_double_percent",
+      "function": "_uri_percent_decode",
+      "globals": {},
+      "invoke": "_uri_percent_decode",
+      "rc": 1,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": ""
+    },
+    {
+      "args": [
+        "%F0%9F%98%80"
+      ],
+      "case": "pd_emoji",
+      "function": "_uri_percent_decode",
+      "globals": {},
+      "invoke": "_uri_percent_decode",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "8J+YgA=="
+    },
+    {
+      "args": [
+        ""
+      ],
+      "case": "pd_empty",
+      "function": "_uri_percent_decode",
+      "globals": {},
+      "invoke": "_uri_percent_decode",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": ""
+    },
+    {
+      "args": [
+        "%FF%FE"
+      ],
+      "case": "pd_invalid_utf8",
+      "function": "_uri_percent_decode",
+      "globals": {},
+      "invoke": "_uri_percent_decode",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "//4="
+    },
+    {
+      "args": [
+        "100%"
+      ],
+      "case": "pd_lone_percent",
+      "function": "_uri_percent_decode",
+      "globals": {},
+      "invoke": "_uri_percent_decode",
+      "rc": 1,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": ""
+    },
+    {
+      "args": [
+        "%d0%9f"
+      ],
+      "case": "pd_lower",
+      "function": "_uri_percent_decode",
+      "globals": {},
+      "invoke": "_uri_percent_decode",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "0J8="
+    },
+    {
+      "args": [
+        "%4G"
+      ],
+      "case": "pd_nonhex_second",
+      "function": "_uri_percent_decode",
+      "globals": {},
+      "invoke": "_uri_percent_decode",
+      "rc": 1,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": ""
+    },
+    {
+      "args": [
+        "a%00b"
+      ],
+      "case": "pd_nul",
+      "function": "_uri_percent_decode",
+      "globals": {},
+      "invoke": "_uri_percent_decode",
+      "rc": 1,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": ""
+    },
+    {
+      "args": [
+        "plain-text_1"
+      ],
+      "case": "pd_plain",
+      "function": "_uri_percent_decode",
+      "globals": {},
+      "invoke": "_uri_percent_decode",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "cGxhaW4tdGV4dF8x"
+    },
+    {
+      "args": [
+        "a+b"
+      ],
+      "case": "pd_plus_kept",
+      "function": "_uri_percent_decode",
+      "globals": {},
+      "invoke": "_uri_percent_decode",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "YSti"
+    },
+    {
+      "args": [
+        "%23%3F%26%3D%25"
+      ],
+      "case": "pd_reserved",
+      "function": "_uri_percent_decode",
+      "globals": {},
+      "invoke": "_uri_percent_decode",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "Iz8mPSU="
+    },
+    {
+      "args": [
+        "a%2"
+      ],
+      "case": "pd_short",
+      "function": "_uri_percent_decode",
+      "globals": {},
+      "invoke": "_uri_percent_decode",
+      "rc": 1,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": ""
+    },
+    {
+      "args": [
+        "%2F%3Fq%3D1"
+      ],
+      "case": "pd_slash_query",
+      "function": "_uri_percent_decode",
+      "globals": {},
+      "invoke": "_uri_percent_decode",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "Lz9xPTE="
+    },
+    {
+      "args": [
+        "a%20b"
+      ],
+      "case": "pd_space",
+      "function": "_uri_percent_decode",
+      "globals": {},
+      "invoke": "_uri_percent_decode",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "YSBi"
+    },
+    {
+      "args": [
+        "x%4"
+      ],
+      "case": "pd_trailing_one",
+      "function": "_uri_percent_decode",
+      "globals": {},
+      "invoke": "_uri_percent_decode",
+      "rc": 1,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": ""
+    },
+    {
+      "args": [
+        "%D0%9F%D1%80%D0%B8"
+      ],
+      "case": "pd_utf8",
+      "function": "_uri_percent_decode",
+      "globals": {},
+      "invoke": "_uri_percent_decode",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "0J/RgNC4"
+    },
+    {
+      "args": [
+        "abcXYZ019-._~"
+      ],
+      "case": "pe_alnum",
+      "function": "_uri_percent_encode",
+      "globals": {},
+      "invoke": "_uri_percent_encode",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "YWJjWFlaMDE5LS5ffg=="
+    },
+    {
+      "args": [
+        "a\\b"
+      ],
+      "case": "pe_backslash",
+      "function": "_uri_percent_encode",
+      "globals": {},
+      "invoke": "_uri_percent_encode",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "YSU1Q2I="
+    },
+    {
+      "args": [
+        "[2001:db8::1]"
+      ],
+      "case": "pe_brackets",
+      "function": "_uri_percent_encode",
+      "globals": {},
+      "invoke": "_uri_percent_encode",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "JTVCMjAwMSUzQWRiOCUzQSUzQTElNUQ="
+    },
+    {
+      "args": [
+        "Привет"
+      ],
+      "case": "pe_cyrillic",
+      "function": "_uri_percent_encode",
+      "globals": {},
+      "invoke": "_uri_percent_encode",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "JUQwJTlGJUQxJTgwJUQwJUI4JUQwJUIyJUQwJUI1JUQxJTgy"
+    },
+    {
+      "args": [
+        "😀"
+      ],
+      "case": "pe_emoji",
+      "function": "_uri_percent_encode",
+      "globals": {},
+      "invoke": "_uri_percent_encode",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "JUYwJTlGJTk4JTgw"
+    },
+    {
+      "args": [
+        ""
+      ],
+      "case": "pe_empty",
+      "function": "_uri_percent_encode",
+      "globals": {},
+      "invoke": "_uri_percent_encode",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": ""
+    },
+    {
+      "args": [
+        "sni.пример.рф"
+      ],
+      "case": "pe_idn",
+      "function": "_uri_percent_encode",
+      "globals": {},
+      "invoke": "_uri_percent_encode",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "c25pLiVEMCVCRiVEMSU4MCVEMCVCOCVEMCVCQyVEMCVCNSVEMSU4MC4lRDElODAlRDElODQ="
+    },
+    {
+      "args": [
+        "Сервер 🚀 #1"
+      ],
+      "case": "pe_mixed",
+      "function": "_uri_percent_encode",
+      "globals": {},
+      "invoke": "_uri_percent_encode",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "JUQwJUExJUQwJUI1JUQxJTgwJUQwJUIyJUQwJUI1JUQxJTgwJTIwJUYwJTlGJTlBJTgwJTIwJTIzMQ=="
+    },
+    {
+      "args": [
+        "a\nb"
+      ],
+      "case": "pe_newline",
+      "function": "_uri_percent_encode",
+      "globals": {},
+      "invoke": "_uri_percent_encode",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "YSUwQWI="
+    },
+    {
+      "args": [
+        "%"
+      ],
+      "case": "pe_percent_only",
+      "function": "_uri_percent_encode",
+      "globals": {},
+      "invoke": "_uri_percent_encode",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "JTI1"
+    },
+    {
+      "args": [
+        "it's \"q\""
+      ],
+      "case": "pe_quotes",
+      "function": "_uri_percent_encode",
+      "globals": {},
+      "invoke": "_uri_percent_encode",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "aXQlMjdzJTIwJTIycSUyMg=="
+    },
+    {
+      "args": [
+        "a#b?c&d=e%f"
+      ],
+      "case": "pe_reserved",
+      "function": "_uri_percent_encode",
+      "globals": {},
+      "invoke": "_uri_percent_encode",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "YSUyM2IlM0ZjJTI2ZCUzRGUlMjVm"
+    },
+    {
+      "args": [
+        "a/b+c:d;e,f"
+      ],
+      "case": "pe_slash_plus",
+      "function": "_uri_percent_encode",
+      "globals": {},
+      "invoke": "_uri_percent_encode",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "YSUyRmIlMkJjJTNBZCUzQmUlMkNm"
+    },
+    {
+      "args": [
+        "a b"
+      ],
+      "case": "pe_space",
+      "function": "_uri_percent_encode",
+      "globals": {},
+      "invoke": "_uri_percent_encode",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "YSUyMGI="
+    },
+    {
+      "args": [
+        "a\tb\r"
+      ],
+      "case": "pe_tab_cr",
+      "function": "_uri_percent_encode",
+      "globals": {},
+      "invoke": "_uri_percent_encode",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "YSUwOWIlMEQ="
+    }
+  ],
+  "module": "uri"
+}

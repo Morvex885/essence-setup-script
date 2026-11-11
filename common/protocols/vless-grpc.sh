@@ -6,6 +6,15 @@
 _build_vless_grpc_listener_yaml() {
     local name="$1" listen="$2" port="$3" username="$4" uuid="$5"
     local service="$6" dest="$7" private_key="$8" short_id="$9" sni="${10}" proxy="${11}"
+    # YAML address: "[v6]" loses its brackets, a trailing ":" ("::") needs quotes.
+    [[ "$listen" == \[*\] ]] && { listen="${listen#\[}"; listen="${listen%\]}"; }
+    [[ "$listen" == *: ]] && listen="\"$listen\""
+    service="${service//\\/\\\\}"; service="${service//\"/\\\"}"
+    service="${service//$'\n'/\\n}"; service="${service//$'\r'/\\r}"
+    dest="${dest//\\/\\\\}"; dest="${dest//\"/\\\"}"
+    dest="${dest//$'\n'/\\n}"; dest="${dest//$'\r'/\\r}"
+    sni="${sni//\\/\\\\}"; sni="${sni//\"/\\\"}"
+    sni="${sni//$'\n'/\\n}"; sni="${sni//$'\r'/\\r}"
     cat <<EOF
   - name: $name
     type: vless
@@ -18,12 +27,12 @@ _build_vless_grpc_listener_yaml() {
       # client-users-end
     grpc-service-name: "$service"
     reality-config:
-      dest: $dest
+      dest: "$dest"
       private-key: "$private_key"
       short-id:
         - "$short_id"
       server-names:
-        - $sni
+        - "$sni"
     proxy: $proxy
 EOF
 }
@@ -33,6 +42,14 @@ EOF
 _build_vless_grpc_client_yaml() {
     local name="$1" server="$2" port="$3" uuid="$4"
     local sni="$5" service="$6" public_key="$7" short_id="$8"
+    name="${name//\\/\\\\}"; name="${name//\"/\\\"}"
+    name="${name//$'\n'/\\n}"; name="${name//$'\r'/\\r}"
+    service="${service//\\/\\\\}"; service="${service//\"/\\\"}"
+    service="${service//$'\n'/\\n}"; service="${service//$'\r'/\\r}"
+    sni="${sni//\\/\\\\}"; sni="${sni//\"/\\\"}"
+    sni="${sni//$'\n'/\\n}"; sni="${sni//$'\r'/\\r}"
+    [[ "$server" == \[*\] ]] && { server="${server#\[}"; server="${server%\]}"; }
+    [[ "$server" == *: ]] && server="\"$server\""
     cat <<EOF
 proxies:
   - name: "$name"
@@ -43,7 +60,7 @@ proxies:
     network: grpc
     udp: true
     tls: true
-    servername: $sni
+    servername: "$sni"
     grpc-opts:
       grpc-service-name: "$service"
     reality-opts:
@@ -58,7 +75,8 @@ EOF
 _build_vless_grpc_uri() {
     local uuid="$1" server="$2" port="$3" sni="$4"
     local service="$5" public_key="$6" short_id="$7" fragment="${8:-VLESS gRPC}"
-    echo "vless://${uuid}@${server}:${port}?encryption=none&security=reality&sni=${sni}&fp=chrome&pbk=${public_key}&sid=${short_id}&type=grpc&serviceName=${service}#${fragment}"
+    [[ "$server" == *:* && "$server" != \[* ]] && server="[$server]"
+    echo "vless://$(_uri_percent_encode "$uuid")@${server}:${port}?encryption=none&security=reality&sni=$(_uri_percent_encode "$sni")&fp=chrome&pbk=$(_uri_percent_encode "$public_key")&sid=$(_uri_percent_encode "$short_id")&type=grpc&serviceName=$(_uri_percent_encode "$service")#$(_uri_percent_encode "$fragment")"
 }
 
 # Exit proxy YAML (cascade outbound)
@@ -66,6 +84,12 @@ _build_vless_grpc_uri() {
 _build_vless_grpc_exit_yaml() {
     local name="$1" server="$2" port="$3" uuid="$4" sni="$5"
     local service="$6" public_key="${7:-}" short_id="${8:-}" fingerprint="${9:-chrome}"
+    service="${service//\\/\\\\}"; service="${service//\"/\\\"}"
+    service="${service//$'\n'/\\n}"; service="${service//$'\r'/\\r}"
+    sni="${sni//\\/\\\\}"; sni="${sni//\"/\\\"}"
+    sni="${sni//$'\n'/\\n}"; sni="${sni//$'\r'/\\r}"
+    [[ "$server" == \[*\] ]] && { server="${server#\[}"; server="${server%\]}"; }
+    [[ "$server" == *: ]] && server="\"$server\""
 
     echo "  - name: $name"
     echo "    type: vless"
@@ -77,7 +101,7 @@ _build_vless_grpc_exit_yaml() {
     echo "    grpc-opts:"
     echo "      grpc-service-name: \"$service\""
     echo "    tls: true"
-    echo "    servername: $sni"
+    echo "    servername: \"$sni\""
     if [[ -n "$public_key" ]]; then
         echo "    reality-opts:"
         echo "      public-key: $public_key"

@@ -1,0 +1,1155 @@
+{
+  "cases": [
+    {
+      "args": [
+        "x",
+        "h",
+        "443",
+        "11111111-2222-3333-4444-555555555555",
+        "пример.рф",
+        "/",
+        "PUBKEY",
+        "abcd"
+      ],
+      "case": "xc_cyr_sni",
+      "function": "_build_vless_xhttp_client_yaml",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_client_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "cHJveGllczoKICAtIG5hbWU6ICJ4IgogICAgdHlwZTogdmxlc3MKICAgIHNlcnZlcjogaAogICAgcG9ydDogNDQzCiAgICB1dWlkOiAxMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTUKICAgIG5ldHdvcms6IHhodHRwCiAgICB1ZHA6IHRydWUKICAgIHRsczogdHJ1ZQogICAgc2VydmVybmFtZTogItC/0YDQuNC80LXRgC7RgNGEIgogICAgeGh0dHAtb3B0czoKICAgICAgcGF0aDogIi8iCiAgICAgIG1vZGU6IGF1dG8KICAgIHJlYWxpdHktb3B0czoKICAgICAgcHVibGljLWtleTogIlBVQktFWSIKICAgICAgc2hvcnQtaWQ6ICJhYmNkIgogICAgY2xpZW50LWZpbmdlcnByaW50OiBmaXJlZm94Cg=="
+    },
+    {
+      "args": [
+        "x",
+        "h",
+        "443",
+        "11111111-2222-3333-4444-555555555555",
+        "sni.example",
+        ""
+      ],
+      "case": "xc_empty_path",
+      "function": "_build_vless_xhttp_client_yaml",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_client_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "cHJveGllczoKICAtIG5hbWU6ICJ4IgogICAgdHlwZTogdmxlc3MKICAgIHNlcnZlcjogaAogICAgcG9ydDogNDQzCiAgICB1dWlkOiAxMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTUKICAgIG5ldHdvcms6IHhodHRwCiAgICB1ZHA6IHRydWUKICAgIHRsczogdHJ1ZQogICAgc2VydmVybmFtZTogInNuaS5leGFtcGxlIgogICAgeGh0dHAtb3B0czoKICAgICAgcGF0aDogIiIKICAgICAgbW9kZTogYXV0bwogICAgY2xpZW50LWZpbmdlcnByaW50OiBmaXJlZm94Cg=="
+    },
+    {
+      "args": [
+        "x",
+        "h",
+        "443",
+        "11111111-2222-3333-4444-555555555555",
+        "sni.example",
+        "/",
+        "PUBKEY",
+        ""
+      ],
+      "case": "xc_empty_sid_reality",
+      "function": "_build_vless_xhttp_client_yaml",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_client_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "cHJveGllczoKICAtIG5hbWU6ICJ4IgogICAgdHlwZTogdmxlc3MKICAgIHNlcnZlcjogaAogICAgcG9ydDogNDQzCiAgICB1dWlkOiAxMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTUKICAgIG5ldHdvcms6IHhodHRwCiAgICB1ZHA6IHRydWUKICAgIHRsczogdHJ1ZQogICAgc2VydmVybmFtZTogInNuaS5leGFtcGxlIgogICAgeGh0dHAtb3B0czoKICAgICAgcGF0aDogIi8iCiAgICAgIG1vZGU6IGF1dG8KICAgIHJlYWxpdHktb3B0czoKICAgICAgcHVibGljLWtleTogIlBVQktFWSIKICAgICAgc2hvcnQtaWQ6ICIiCiAgICBjbGllbnQtZmluZ2VycHJpbnQ6IGZpcmVmb3gK"
+    },
+    {
+      "args": [
+        "x",
+        "[2001:db8::1]",
+        "443",
+        "11111111-2222-3333-4444-555555555555",
+        "sni.example",
+        "/",
+        "PUBKEY",
+        "abcd"
+      ],
+      "case": "xc_ipv6",
+      "function": "_build_vless_xhttp_client_yaml",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_client_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "cHJveGllczoKICAtIG5hbWU6ICJ4IgogICAgdHlwZTogdmxlc3MKICAgIHNlcnZlcjogMjAwMTpkYjg6OjEKICAgIHBvcnQ6IDQ0MwogICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICBuZXR3b3JrOiB4aHR0cAogICAgdWRwOiB0cnVlCiAgICB0bHM6IHRydWUKICAgIHNlcnZlcm5hbWU6ICJzbmkuZXhhbXBsZSIKICAgIHhodHRwLW9wdHM6CiAgICAgIHBhdGg6ICIvIgogICAgICBtb2RlOiBhdXRvCiAgICByZWFsaXR5LW9wdHM6CiAgICAgIHB1YmxpYy1rZXk6ICJQVUJLRVkiCiAgICAgIHNob3J0LWlkOiAiYWJjZCIKICAgIGNsaWVudC1maW5nZXJwcmludDogZmlyZWZveAo="
+    },
+    {
+      "args": [
+        "x",
+        "h",
+        "443",
+        "11111111-2222-3333-4444-555555555555",
+        "sni.example",
+        "/a\"b\\c",
+        "PUBKEY",
+        "abcd"
+      ],
+      "case": "xc_path_quote",
+      "function": "_build_vless_xhttp_client_yaml",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_client_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "cHJveGllczoKICAtIG5hbWU6ICJ4IgogICAgdHlwZTogdmxlc3MKICAgIHNlcnZlcjogaAogICAgcG9ydDogNDQzCiAgICB1dWlkOiAxMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTUKICAgIG5ldHdvcms6IHhodHRwCiAgICB1ZHA6IHRydWUKICAgIHRsczogdHJ1ZQogICAgc2VydmVybmFtZTogInNuaS5leGFtcGxlIgogICAgeGh0dHAtb3B0czoKICAgICAgcGF0aDogIi9hXCJiXFxjIgogICAgICBtb2RlOiBhdXRvCiAgICByZWFsaXR5LW9wdHM6CiAgICAgIHB1YmxpYy1rZXk6ICJQVUJLRVkiCiAgICAgIHNob3J0LWlkOiAiYWJjZCIKICAgIGNsaWVudC1maW5nZXJwcmludDogZmlyZWZveAo="
+    },
+    {
+      "args": [
+        "x",
+        "h",
+        "443",
+        "11111111-2222-3333-4444-555555555555",
+        "sni.example",
+        "/a b?c=d&e",
+        "PUBKEY",
+        "abcd"
+      ],
+      "case": "xc_path_special",
+      "function": "_build_vless_xhttp_client_yaml",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_client_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "cHJveGllczoKICAtIG5hbWU6ICJ4IgogICAgdHlwZTogdmxlc3MKICAgIHNlcnZlcjogaAogICAgcG9ydDogNDQzCiAgICB1dWlkOiAxMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTUKICAgIG5ldHdvcms6IHhodHRwCiAgICB1ZHA6IHRydWUKICAgIHRsczogdHJ1ZQogICAgc2VydmVybmFtZTogInNuaS5leGFtcGxlIgogICAgeGh0dHAtb3B0czoKICAgICAgcGF0aDogIi9hIGI/Yz1kJmUiCiAgICAgIG1vZGU6IGF1dG8KICAgIHJlYWxpdHktb3B0czoKICAgICAgcHVibGljLWtleTogIlBVQktFWSIKICAgICAgc2hvcnQtaWQ6ICJhYmNkIgogICAgY2xpZW50LWZpbmdlcnByaW50OiBmaXJlZm94Cg=="
+    },
+    {
+      "args": [
+        "x",
+        "h",
+        "8443",
+        "11111111-2222-3333-4444-555555555555",
+        "sni.example",
+        "/",
+        "PUBKEY",
+        "abcd"
+      ],
+      "case": "xc_port_8443",
+      "function": "_build_vless_xhttp_client_yaml",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_client_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "cHJveGllczoKICAtIG5hbWU6ICJ4IgogICAgdHlwZTogdmxlc3MKICAgIHNlcnZlcjogaAogICAgcG9ydDogODQ0MwogICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICBuZXR3b3JrOiB4aHR0cAogICAgdWRwOiB0cnVlCiAgICB0bHM6IHRydWUKICAgIHNlcnZlcm5hbWU6ICJzbmkuZXhhbXBsZSIKICAgIHhodHRwLW9wdHM6CiAgICAgIHBhdGg6ICIvIgogICAgICBtb2RlOiBhdXRvCiAgICByZWFsaXR5LW9wdHM6CiAgICAgIHB1YmxpYy1rZXk6ICJQVUJLRVkiCiAgICAgIHNob3J0LWlkOiAiYWJjZCIKICAgIGNsaWVudC1maW5nZXJwcmludDogZmlyZWZveAo="
+    },
+    {
+      "args": [
+        "xh-exit",
+        "exit.example.com",
+        "443",
+        "11111111-2222-3333-4444-555555555555",
+        "sni.example",
+        "/",
+        "PUBKEY",
+        "abcd"
+      ],
+      "case": "xc_reality",
+      "function": "_build_vless_xhttp_client_yaml",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_client_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "cHJveGllczoKICAtIG5hbWU6ICJ4aC1leGl0IgogICAgdHlwZTogdmxlc3MKICAgIHNlcnZlcjogZXhpdC5leGFtcGxlLmNvbQogICAgcG9ydDogNDQzCiAgICB1dWlkOiAxMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTUKICAgIG5ldHdvcms6IHhodHRwCiAgICB1ZHA6IHRydWUKICAgIHRsczogdHJ1ZQogICAgc2VydmVybmFtZTogInNuaS5leGFtcGxlIgogICAgeGh0dHAtb3B0czoKICAgICAgcGF0aDogIi8iCiAgICAgIG1vZGU6IGF1dG8KICAgIHJlYWxpdHktb3B0czoKICAgICAgcHVibGljLWtleTogIlBVQktFWSIKICAgICAgc2hvcnQtaWQ6ICJhYmNkIgogICAgY2xpZW50LWZpbmdlcnByaW50OiBmaXJlZm94Cg=="
+    },
+    {
+      "args": [
+        "xh-exit",
+        "exit.example.com",
+        "443",
+        "11111111-2222-3333-4444-555555555555",
+        "sni.example",
+        "/"
+      ],
+      "case": "xc_tls",
+      "function": "_build_vless_xhttp_client_yaml",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_client_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "cHJveGllczoKICAtIG5hbWU6ICJ4aC1leGl0IgogICAgdHlwZTogdmxlc3MKICAgIHNlcnZlcjogZXhpdC5leGFtcGxlLmNvbQogICAgcG9ydDogNDQzCiAgICB1dWlkOiAxMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTUKICAgIG5ldHdvcms6IHhodHRwCiAgICB1ZHA6IHRydWUKICAgIHRsczogdHJ1ZQogICAgc2VydmVybmFtZTogInNuaS5leGFtcGxlIgogICAgeGh0dHAtb3B0czoKICAgICAgcGF0aDogIi8iCiAgICAgIG1vZGU6IGF1dG8KICAgIGNsaWVudC1maW5nZXJwcmludDogZmlyZWZveAo="
+    },
+    {
+      "args": [
+        "x",
+        "[2001:db8::1]",
+        "443",
+        "11111111-2222-3333-4444-555555555555",
+        "sni.example",
+        "/a\"b\\c"
+      ],
+      "case": "xe_bracketed_server_quote",
+      "function": "_build_vless_xhttp_exit_yaml",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_exit_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IDIwMDE6ZGI4OjoxCiAgICBwb3J0OiA0NDMKICAgIHV1aWQ6IDExMTExMTExLTIyMjItMzMzMy00NDQ0LTU1NTU1NTU1NTU1NQogICAgbmV0d29yazogeGh0dHAKICAgIHVkcDogdHJ1ZQogICAgeGh0dHAtb3B0czoKICAgICAgcGF0aDogIi9hXCJiXFxjIgogICAgICBtb2RlOiBhdXRvCiAgICB0bHM6IHRydWUKICAgIHNlcnZlcm5hbWU6ICJzbmkuZXhhbXBsZSIKICAgIGNsaWVudC1maW5nZXJwcmludDogZmlyZWZveAo="
+    },
+    {
+      "args": [
+        "x",
+        "h",
+        "443",
+        "11111111-2222-3333-4444-555555555555",
+        "sni.example",
+        "/"
+      ],
+      "case": "xe_defaults",
+      "function": "_build_vless_xhttp_exit_yaml",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_exit_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IGgKICAgIHBvcnQ6IDQ0MwogICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICBuZXR3b3JrOiB4aHR0cAogICAgdWRwOiB0cnVlCiAgICB4aHR0cC1vcHRzOgogICAgICBwYXRoOiAiLyIKICAgICAgbW9kZTogYXV0bwogICAgdGxzOiB0cnVlCiAgICBzZXJ2ZXJuYW1lOiAic25pLmV4YW1wbGUiCiAgICBjbGllbnQtZmluZ2VycHJpbnQ6IGZpcmVmb3gK"
+    },
+    {
+      "args": [
+        "x",
+        "h",
+        "443",
+        "11111111-2222-3333-4444-555555555555",
+        "sni.example",
+        "/",
+        ""
+      ],
+      "case": "xe_empty_mode",
+      "function": "_build_vless_xhttp_exit_yaml",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_exit_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IGgKICAgIHBvcnQ6IDQ0MwogICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICBuZXR3b3JrOiB4aHR0cAogICAgdWRwOiB0cnVlCiAgICB4aHR0cC1vcHRzOgogICAgICBwYXRoOiAiLyIKICAgICAgbW9kZTogYXV0bwogICAgdGxzOiB0cnVlCiAgICBzZXJ2ZXJuYW1lOiAic25pLmV4YW1wbGUiCiAgICBjbGllbnQtZmluZ2VycHJpbnQ6IGZpcmVmb3gK"
+    },
+    {
+      "args": [
+        "x",
+        "h",
+        "443",
+        "11111111-2222-3333-4444-555555555555",
+        "sni.example",
+        "/",
+        "auto",
+        "PUBKEY",
+        "abcd",
+        "chrome"
+      ],
+      "case": "xe_fp_chrome_ignored",
+      "function": "_build_vless_xhttp_exit_yaml",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_exit_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IGgKICAgIHBvcnQ6IDQ0MwogICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICBuZXR3b3JrOiB4aHR0cAogICAgdWRwOiB0cnVlCiAgICB4aHR0cC1vcHRzOgogICAgICBwYXRoOiAiLyIKICAgICAgbW9kZTogYXV0bwogICAgdGxzOiB0cnVlCiAgICBzZXJ2ZXJuYW1lOiAic25pLmV4YW1wbGUiCiAgICByZWFsaXR5LW9wdHM6CiAgICAgIHB1YmxpYy1rZXk6IFBVQktFWQogICAgICBzaG9ydC1pZDogYWJjZAogICAgY2xpZW50LWZpbmdlcnByaW50OiBmaXJlZm94Cg=="
+    },
+    {
+      "args": [
+        "x",
+        "2001:db8::1",
+        "443",
+        "11111111-2222-3333-4444-555555555555",
+        "sni.example",
+        "/"
+      ],
+      "case": "xe_ipv6",
+      "function": "_build_vless_xhttp_exit_yaml",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_exit_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IDIwMDE6ZGI4OjoxCiAgICBwb3J0OiA0NDMKICAgIHV1aWQ6IDExMTExMTExLTIyMjItMzMzMy00NDQ0LTU1NTU1NTU1NTU1NQogICAgbmV0d29yazogeGh0dHAKICAgIHVkcDogdHJ1ZQogICAgeGh0dHAtb3B0czoKICAgICAgcGF0aDogIi8iCiAgICAgIG1vZGU6IGF1dG8KICAgIHRsczogdHJ1ZQogICAgc2VydmVybmFtZTogInNuaS5leGFtcGxlIgogICAgY2xpZW50LWZpbmdlcnByaW50OiBmaXJlZm94Cg=="
+    },
+    {
+      "args": [
+        "x",
+        "h",
+        "443",
+        "11111111-2222-3333-4444-555555555555",
+        "sni.example",
+        "/",
+        "packet-up"
+      ],
+      "case": "xe_packet_up",
+      "function": "_build_vless_xhttp_exit_yaml",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_exit_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IGgKICAgIHBvcnQ6IDQ0MwogICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICBuZXR3b3JrOiB4aHR0cAogICAgdWRwOiB0cnVlCiAgICB4aHR0cC1vcHRzOgogICAgICBwYXRoOiAiLyIKICAgICAgbW9kZTogcGFja2V0LXVwCiAgICB0bHM6IHRydWUKICAgIHNlcnZlcm5hbWU6ICJzbmkuZXhhbXBsZSIKICAgIGNsaWVudC1maW5nZXJwcmludDogZmlyZWZveAo="
+    },
+    {
+      "args": [
+        "x",
+        "h",
+        "443",
+        "11111111-2222-3333-4444-555555555555",
+        "sni.example",
+        "/a b?c=d",
+        "auto"
+      ],
+      "case": "xe_path_special",
+      "function": "_build_vless_xhttp_exit_yaml",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_exit_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IGgKICAgIHBvcnQ6IDQ0MwogICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICBuZXR3b3JrOiB4aHR0cAogICAgdWRwOiB0cnVlCiAgICB4aHR0cC1vcHRzOgogICAgICBwYXRoOiAiL2EgYj9jPWQiCiAgICAgIG1vZGU6IGF1dG8KICAgIHRsczogdHJ1ZQogICAgc2VydmVybmFtZTogInNuaS5leGFtcGxlIgogICAgY2xpZW50LWZpbmdlcnByaW50OiBmaXJlZm94Cg=="
+    },
+    {
+      "args": [
+        "x",
+        "h",
+        "8443",
+        "11111111-2222-3333-4444-555555555555",
+        "sni.example",
+        "/"
+      ],
+      "case": "xe_port_8443",
+      "function": "_build_vless_xhttp_exit_yaml",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_exit_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IGgKICAgIHBvcnQ6IDg0NDMKICAgIHV1aWQ6IDExMTExMTExLTIyMjItMzMzMy00NDQ0LTU1NTU1NTU1NTU1NQogICAgbmV0d29yazogeGh0dHAKICAgIHVkcDogdHJ1ZQogICAgeGh0dHAtb3B0czoKICAgICAgcGF0aDogIi8iCiAgICAgIG1vZGU6IGF1dG8KICAgIHRsczogdHJ1ZQogICAgc2VydmVybmFtZTogInNuaS5leGFtcGxlIgogICAgY2xpZW50LWZpbmdlcnByaW50OiBmaXJlZm94Cg=="
+    },
+    {
+      "args": [
+        "x",
+        "h",
+        "443",
+        "11111111-2222-3333-4444-555555555555",
+        "sni.example",
+        "/",
+        "auto",
+        "PUBKEY",
+        "abcd"
+      ],
+      "case": "xe_reality",
+      "function": "_build_vless_xhttp_exit_yaml",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_exit_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IGgKICAgIHBvcnQ6IDQ0MwogICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICBuZXR3b3JrOiB4aHR0cAogICAgdWRwOiB0cnVlCiAgICB4aHR0cC1vcHRzOgogICAgICBwYXRoOiAiLyIKICAgICAgbW9kZTogYXV0bwogICAgdGxzOiB0cnVlCiAgICBzZXJ2ZXJuYW1lOiAic25pLmV4YW1wbGUiCiAgICByZWFsaXR5LW9wdHM6CiAgICAgIHB1YmxpYy1rZXk6IFBVQktFWQogICAgICBzaG9ydC1pZDogYWJjZAogICAgY2xpZW50LWZpbmdlcnByaW50OiBmaXJlZm94Cg=="
+    },
+    {
+      "args": [
+        "vless-xhttp",
+        "0.0.0.0",
+        "443",
+        "alice",
+        "11111111-2222-3333-4444-555555555555",
+        "/",
+        "www.microsoft.com:443",
+        "PRIVKEY",
+        "abcd",
+        "sni.example",
+        "DIRECT"
+      ],
+      "case": "xl_basic",
+      "function": "_build_vless_xhttp_listener_yaml",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHZsZXNzLXhodHRwCiAgICB0eXBlOiB2bGVzcwogICAgbGlzdGVuOiAwLjAuMC4wCiAgICBwb3J0OiA0NDMKICAgIHVzZXJzOgogICAgICAjIGNsaWVudC11c2Vycy1zdGFydAogICAgICAtIHVzZXJuYW1lOiBhbGljZQogICAgICAgIHV1aWQ6IDExMTExMTExLTIyMjItMzMzMy00NDQ0LTU1NTU1NTU1NTU1NQogICAgICAjIGNsaWVudC11c2Vycy1lbmQKICAgIHhodHRwLWNvbmZpZzoKICAgICAgcGF0aDogIi8iCiAgICAgIG1vZGU6IGF1dG8KICAgIHJlYWxpdHktY29uZmlnOgogICAgICBkZXN0OiAid3d3Lm1pY3Jvc29mdC5jb206NDQzIgogICAgICBwcml2YXRlLWtleTogIlBSSVZLRVkiCiAgICAgIHNob3J0LWlkOgogICAgICAgIC0gImFiY2QiCiAgICAgIHNlcnZlci1uYW1lczoKICAgICAgICAtICJzbmkuZXhhbXBsZSIKICAgIHByb3h5OiBESVJFQ1QK"
+    },
+    {
+      "args": [
+        "x",
+        "0.0.0.0",
+        "443",
+        "alice",
+        "11111111-2222-3333-4444-555555555555",
+        "/api/v1?x=1",
+        "d:443",
+        "pk",
+        "sid",
+        "sni.example",
+        "DIRECT"
+      ],
+      "case": "xl_custom_path",
+      "function": "_build_vless_xhttp_listener_yaml",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBsaXN0ZW46IDAuMC4wLjAKICAgIHBvcnQ6IDQ0MwogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgIC0gdXNlcm5hbWU6IGFsaWNlCiAgICAgICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICAgICMgY2xpZW50LXVzZXJzLWVuZAogICAgeGh0dHAtY29uZmlnOgogICAgICBwYXRoOiAiL2FwaS92MT94PTEiCiAgICAgIG1vZGU6IGF1dG8KICAgIHJlYWxpdHktY29uZmlnOgogICAgICBkZXN0OiAiZDo0NDMiCiAgICAgIHByaXZhdGUta2V5OiAicGsiCiAgICAgIHNob3J0LWlkOgogICAgICAgIC0gInNpZCIKICAgICAgc2VydmVyLW5hbWVzOgogICAgICAgIC0gInNuaS5leGFtcGxlIgogICAgcHJveHk6IERJUkVDVAo="
+    },
+    {
+      "args": [
+        "x",
+        "0.0.0.0",
+        "443",
+        "Иван",
+        "11111111-2222-3333-4444-555555555555",
+        "/",
+        "d:443",
+        "pk",
+        "sid",
+        "sni.example",
+        "DIRECT"
+      ],
+      "case": "xl_cyr_user",
+      "function": "_build_vless_xhttp_listener_yaml",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBsaXN0ZW46IDAuMC4wLjAKICAgIHBvcnQ6IDQ0MwogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgIC0gdXNlcm5hbWU6INCY0LLQsNC9CiAgICAgICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICAgICMgY2xpZW50LXVzZXJzLWVuZAogICAgeGh0dHAtY29uZmlnOgogICAgICBwYXRoOiAiLyIKICAgICAgbW9kZTogYXV0bwogICAgcmVhbGl0eS1jb25maWc6CiAgICAgIGRlc3Q6ICJkOjQ0MyIKICAgICAgcHJpdmF0ZS1rZXk6ICJwayIKICAgICAgc2hvcnQtaWQ6CiAgICAgICAgLSAic2lkIgogICAgICBzZXJ2ZXItbmFtZXM6CiAgICAgICAgLSAic25pLmV4YW1wbGUiCiAgICBwcm94eTogRElSRUNUCg=="
+    },
+    {
+      "args": [
+        "x",
+        "0.0.0.0",
+        "443",
+        "alice",
+        "11111111-2222-3333-4444-555555555555",
+        "",
+        "d:443",
+        "pk",
+        "sid",
+        "sni.example",
+        "DIRECT"
+      ],
+      "case": "xl_empty_path",
+      "function": "_build_vless_xhttp_listener_yaml",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBsaXN0ZW46IDAuMC4wLjAKICAgIHBvcnQ6IDQ0MwogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgIC0gdXNlcm5hbWU6IGFsaWNlCiAgICAgICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICAgICMgY2xpZW50LXVzZXJzLWVuZAogICAgeGh0dHAtY29uZmlnOgogICAgICBwYXRoOiAiIgogICAgICBtb2RlOiBhdXRvCiAgICByZWFsaXR5LWNvbmZpZzoKICAgICAgZGVzdDogImQ6NDQzIgogICAgICBwcml2YXRlLWtleTogInBrIgogICAgICBzaG9ydC1pZDoKICAgICAgICAtICJzaWQiCiAgICAgIHNlcnZlci1uYW1lczoKICAgICAgICAtICJzbmkuZXhhbXBsZSIKICAgIHByb3h5OiBESVJFQ1QK"
+    },
+    {
+      "args": [
+        "x",
+        "::",
+        "443",
+        "alice",
+        "11111111-2222-3333-4444-555555555555",
+        "/",
+        "d:443",
+        "pk",
+        "sid",
+        "sni.example",
+        "DIRECT"
+      ],
+      "case": "xl_ipv6_listen",
+      "function": "_build_vless_xhttp_listener_yaml",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBsaXN0ZW46ICI6OiIKICAgIHBvcnQ6IDQ0MwogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgIC0gdXNlcm5hbWU6IGFsaWNlCiAgICAgICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICAgICMgY2xpZW50LXVzZXJzLWVuZAogICAgeGh0dHAtY29uZmlnOgogICAgICBwYXRoOiAiLyIKICAgICAgbW9kZTogYXV0bwogICAgcmVhbGl0eS1jb25maWc6CiAgICAgIGRlc3Q6ICJkOjQ0MyIKICAgICAgcHJpdmF0ZS1rZXk6ICJwayIKICAgICAgc2hvcnQtaWQ6CiAgICAgICAgLSAic2lkIgogICAgICBzZXJ2ZXItbmFtZXM6CiAgICAgICAgLSAic25pLmV4YW1wbGUiCiAgICBwcm94eTogRElSRUNUCg=="
+    },
+    {
+      "args": [
+        "x",
+        "0.0.0.0",
+        "443",
+        "alice",
+        "11111111-2222-3333-4444-555555555555",
+        "/",
+        "d:443",
+        "pk",
+        "sid",
+        "sni.example"
+      ],
+      "case": "xl_missing_proxy",
+      "function": "_build_vless_xhttp_listener_yaml",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBsaXN0ZW46IDAuMC4wLjAKICAgIHBvcnQ6IDQ0MwogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgIC0gdXNlcm5hbWU6IGFsaWNlCiAgICAgICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICAgICMgY2xpZW50LXVzZXJzLWVuZAogICAgeGh0dHAtY29uZmlnOgogICAgICBwYXRoOiAiLyIKICAgICAgbW9kZTogYXV0bwogICAgcmVhbGl0eS1jb25maWc6CiAgICAgIGRlc3Q6ICJkOjQ0MyIKICAgICAgcHJpdmF0ZS1rZXk6ICJwayIKICAgICAgc2hvcnQtaWQ6CiAgICAgICAgLSAic2lkIgogICAgICBzZXJ2ZXItbmFtZXM6CiAgICAgICAgLSAic25pLmV4YW1wbGUiCiAgICBwcm94eTogCg=="
+    },
+    {
+      "args": [
+        "x",
+        "[::]",
+        "443",
+        "alice",
+        "11111111-2222-3333-4444-555555555555",
+        "/a\"b\\c",
+        "[2001:db8::2]:443",
+        "pk",
+        "sid",
+        "sni.example",
+        "DIRECT"
+      ],
+      "case": "xl_path_quote",
+      "function": "_build_vless_xhttp_listener_yaml",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBsaXN0ZW46ICI6OiIKICAgIHBvcnQ6IDQ0MwogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgIC0gdXNlcm5hbWU6IGFsaWNlCiAgICAgICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICAgICMgY2xpZW50LXVzZXJzLWVuZAogICAgeGh0dHAtY29uZmlnOgogICAgICBwYXRoOiAiL2FcImJcXGMiCiAgICAgIG1vZGU6IGF1dG8KICAgIHJlYWxpdHktY29uZmlnOgogICAgICBkZXN0OiAiWzIwMDE6ZGI4OjoyXTo0NDMiCiAgICAgIHByaXZhdGUta2V5OiAicGsiCiAgICAgIHNob3J0LWlkOgogICAgICAgIC0gInNpZCIKICAgICAgc2VydmVyLW5hbWVzOgogICAgICAgIC0gInNuaS5leGFtcGxlIgogICAgcHJveHk6IERJUkVDVAo="
+    },
+    {
+      "args": [
+        "x",
+        "0.0.0.0",
+        "443",
+        "alice",
+        "11111111-2222-3333-4444-555555555555",
+        "/",
+        "d:443",
+        "pk\r",
+        "sid",
+        "sni.example",
+        "DIRECT"
+      ],
+      "case": "xl_pk_cr",
+      "function": "_build_vless_xhttp_listener_yaml",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBsaXN0ZW46IDAuMC4wLjAKICAgIHBvcnQ6IDQ0MwogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgIC0gdXNlcm5hbWU6IGFsaWNlCiAgICAgICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICAgICMgY2xpZW50LXVzZXJzLWVuZAogICAgeGh0dHAtY29uZmlnOgogICAgICBwYXRoOiAiLyIKICAgICAgbW9kZTogYXV0bwogICAgcmVhbGl0eS1jb25maWc6CiAgICAgIGRlc3Q6ICJkOjQ0MyIKICAgICAgcHJpdmF0ZS1rZXk6ICJwaw0iCiAgICAgIHNob3J0LWlkOgogICAgICAgIC0gInNpZCIKICAgICAgc2VydmVyLW5hbWVzOgogICAgICAgIC0gInNuaS5leGFtcGxlIgogICAgcHJveHk6IERJUkVDVAo="
+    },
+    {
+      "args": [
+        "x",
+        "0.0.0.0",
+        "8443",
+        "alice",
+        "11111111-2222-3333-4444-555555555555",
+        "/",
+        "d:443",
+        "pk",
+        "sid",
+        "sni.example",
+        "DIRECT"
+      ],
+      "case": "xl_port_8443",
+      "function": "_build_vless_xhttp_listener_yaml",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBsaXN0ZW46IDAuMC4wLjAKICAgIHBvcnQ6IDg0NDMKICAgIHVzZXJzOgogICAgICAjIGNsaWVudC11c2Vycy1zdGFydAogICAgICAtIHVzZXJuYW1lOiBhbGljZQogICAgICAgIHV1aWQ6IDExMTExMTExLTIyMjItMzMzMy00NDQ0LTU1NTU1NTU1NTU1NQogICAgICAjIGNsaWVudC11c2Vycy1lbmQKICAgIHhodHRwLWNvbmZpZzoKICAgICAgcGF0aDogIi8iCiAgICAgIG1vZGU6IGF1dG8KICAgIHJlYWxpdHktY29uZmlnOgogICAgICBkZXN0OiAiZDo0NDMiCiAgICAgIHByaXZhdGUta2V5OiAicGsiCiAgICAgIHNob3J0LWlkOgogICAgICAgIC0gInNpZCIKICAgICAgc2VydmVyLW5hbWVzOgogICAgICAgIC0gInNuaS5leGFtcGxlIgogICAgcHJveHk6IERJUkVDVAo="
+    },
+    {
+      "args": [
+        "x",
+        "127.0.0.1",
+        "8080",
+        "alice",
+        "11111111-2222-3333-4444-555555555555",
+        "/",
+        "DIRECT"
+      ],
+      "case": "xn_basic",
+      "function": "_build_vless_xhttp_nginx_listener_yaml",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_nginx_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBsaXN0ZW46IDEyNy4wLjAuMQogICAgcG9ydDogODA4MAogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgIC0gdXNlcm5hbWU6IGFsaWNlCiAgICAgICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICAgICMgY2xpZW50LXVzZXJzLWVuZAogICAgeGh0dHAtY29uZmlnOgogICAgICBwYXRoOiAiLyIKICAgICAgbW9kZTogYXV0bwogICAgYWxsb3ctaW5zZWN1cmU6IHRydWUKICAgIHByb3h5OiBESVJFQ1QK"
+    },
+    {
+      "args": [
+        "x",
+        "127.0.0.1",
+        "8080",
+        "Иван",
+        "11111111-2222-3333-4444-555555555555",
+        "/",
+        "DIRECT"
+      ],
+      "case": "xn_cyr_user",
+      "function": "_build_vless_xhttp_nginx_listener_yaml",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_nginx_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBsaXN0ZW46IDEyNy4wLjAuMQogICAgcG9ydDogODA4MAogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgIC0gdXNlcm5hbWU6INCY0LLQsNC9CiAgICAgICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICAgICMgY2xpZW50LXVzZXJzLWVuZAogICAgeGh0dHAtY29uZmlnOgogICAgICBwYXRoOiAiLyIKICAgICAgbW9kZTogYXV0bwogICAgYWxsb3ctaW5zZWN1cmU6IHRydWUKICAgIHByb3h5OiBESVJFQ1QK"
+    },
+    {
+      "args": [
+        "x",
+        "127.0.0.1",
+        "8080",
+        "",
+        "11111111-2222-3333-4444-555555555555",
+        "/",
+        "DIRECT"
+      ],
+      "case": "xn_empty_user",
+      "function": "_build_vless_xhttp_nginx_listener_yaml",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_nginx_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBsaXN0ZW46IDEyNy4wLjAuMQogICAgcG9ydDogODA4MAogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgIC0gdXNlcm5hbWU6IAogICAgICAgIHV1aWQ6IDExMTExMTExLTIyMjItMzMzMy00NDQ0LTU1NTU1NTU1NTU1NQogICAgICAjIGNsaWVudC11c2Vycy1lbmQKICAgIHhodHRwLWNvbmZpZzoKICAgICAgcGF0aDogIi8iCiAgICAgIG1vZGU6IGF1dG8KICAgIGFsbG93LWluc2VjdXJlOiB0cnVlCiAgICBwcm94eTogRElSRUNUCg=="
+    },
+    {
+      "args": [
+        "x",
+        "::1",
+        "8080",
+        "alice",
+        "11111111-2222-3333-4444-555555555555",
+        "/",
+        "DIRECT"
+      ],
+      "case": "xn_ipv6",
+      "function": "_build_vless_xhttp_nginx_listener_yaml",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_nginx_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBsaXN0ZW46IDo6MQogICAgcG9ydDogODA4MAogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgIC0gdXNlcm5hbWU6IGFsaWNlCiAgICAgICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICAgICMgY2xpZW50LXVzZXJzLWVuZAogICAgeGh0dHAtY29uZmlnOgogICAgICBwYXRoOiAiLyIKICAgICAgbW9kZTogYXV0bwogICAgYWxsb3ctaW5zZWN1cmU6IHRydWUKICAgIHByb3h5OiBESVJFQ1QK"
+    },
+    {
+      "args": [
+        "x",
+        "[::1]",
+        "8080",
+        "alice",
+        "11111111-2222-3333-4444-555555555555",
+        "/a\"b\\c",
+        "DIRECT"
+      ],
+      "case": "xn_listen_bracketed_quote",
+      "function": "_build_vless_xhttp_nginx_listener_yaml",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_nginx_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBsaXN0ZW46IDo6MQogICAgcG9ydDogODA4MAogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgIC0gdXNlcm5hbWU6IGFsaWNlCiAgICAgICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICAgICMgY2xpZW50LXVzZXJzLWVuZAogICAgeGh0dHAtY29uZmlnOgogICAgICBwYXRoOiAiL2FcImJcXGMiCiAgICAgIG1vZGU6IGF1dG8KICAgIGFsbG93LWluc2VjdXJlOiB0cnVlCiAgICBwcm94eTogRElSRUNUCg=="
+    },
+    {
+      "args": [
+        "x",
+        "127.0.0.1",
+        "8080",
+        "alice",
+        "11111111-2222-3333-4444-555555555555",
+        "/"
+      ],
+      "case": "xn_missing_proxy",
+      "function": "_build_vless_xhttp_nginx_listener_yaml",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_nginx_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBsaXN0ZW46IDEyNy4wLjAuMQogICAgcG9ydDogODA4MAogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgIC0gdXNlcm5hbWU6IGFsaWNlCiAgICAgICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICAgICMgY2xpZW50LXVzZXJzLWVuZAogICAgeGh0dHAtY29uZmlnOgogICAgICBwYXRoOiAiLyIKICAgICAgbW9kZTogYXV0bwogICAgYWxsb3ctaW5zZWN1cmU6IHRydWUKICAgIHByb3h5OiAK"
+    },
+    {
+      "args": [
+        "x",
+        "127.0.0.1",
+        "8080",
+        "alice",
+        "11111111-2222-3333-4444-555555555555",
+        "/a b?c=d&e",
+        "DIRECT"
+      ],
+      "case": "xn_path_special",
+      "function": "_build_vless_xhttp_nginx_listener_yaml",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_nginx_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBsaXN0ZW46IDEyNy4wLjAuMQogICAgcG9ydDogODA4MAogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgIC0gdXNlcm5hbWU6IGFsaWNlCiAgICAgICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICAgICMgY2xpZW50LXVzZXJzLWVuZAogICAgeGh0dHAtY29uZmlnOgogICAgICBwYXRoOiAiL2EgYj9jPWQmZSIKICAgICAgbW9kZTogYXV0bwogICAgYWxsb3ctaW5zZWN1cmU6IHRydWUKICAgIHByb3h5OiBESVJFQ1QK"
+    },
+    {
+      "args": [
+        "x",
+        "127.0.0.1",
+        "2053",
+        "alice",
+        "11111111-2222-3333-4444-555555555555",
+        "/",
+        "DIRECT"
+      ],
+      "case": "xn_port_2053",
+      "function": "_build_vless_xhttp_nginx_listener_yaml",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_nginx_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBsaXN0ZW46IDEyNy4wLjAuMQogICAgcG9ydDogMjA1MwogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgIC0gdXNlcm5hbWU6IGFsaWNlCiAgICAgICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICAgICMgY2xpZW50LXVzZXJzLWVuZAogICAgeGh0dHAtY29uZmlnOgogICAgICBwYXRoOiAiLyIKICAgICAgbW9kZTogYXV0bwogICAgYWxsb3ctaW5zZWN1cmU6IHRydWUKICAgIHByb3h5OiBESVJFQ1QK"
+    },
+    {
+      "args": [
+        "x",
+        "0.0.0.0",
+        "443",
+        "alice",
+        "11111111-2222-3333-4444-555555555555",
+        "/",
+        "DIRECT"
+      ],
+      "case": "xt_7args",
+      "function": "_build_vless_xhttp_tls_listener_yaml",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_tls_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBsaXN0ZW46IDAuMC4wLjAKICAgIHBvcnQ6IDQ0MwogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgIC0gdXNlcm5hbWU6IGFsaWNlCiAgICAgICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICAgICMgY2xpZW50LXVzZXJzLWVuZAogICAgeGh0dHAtY29uZmlnOgogICAgICBwYXRoOiAiLyIKICAgICAgbW9kZTogYXV0bwogICAgYWxsb3ctaW5zZWN1cmU6IHRydWUKICAgIHByb3h5OiAK"
+    },
+    {
+      "args": [
+        "x",
+        "::",
+        "443",
+        "alice",
+        "11111111-2222-3333-4444-555555555555",
+        "/",
+        "c",
+        "k",
+        "DIRECT"
+      ],
+      "case": "xt_ipv6",
+      "function": "_build_vless_xhttp_tls_listener_yaml",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_tls_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBsaXN0ZW46ICI6OiIKICAgIHBvcnQ6IDQ0MwogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgIC0gdXNlcm5hbWU6IGFsaWNlCiAgICAgICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICAgICMgY2xpZW50LXVzZXJzLWVuZAogICAgeGh0dHAtY29uZmlnOgogICAgICBwYXRoOiAiLyIKICAgICAgbW9kZTogYXV0bwogICAgYWxsb3ctaW5zZWN1cmU6IHRydWUKICAgIHByb3h5OiBESVJFQ1QK"
+    },
+    {
+      "args": [
+        "x",
+        "0.0.0.0",
+        "443",
+        "alice",
+        "11111111-2222-3333-4444-555555555555",
+        "/",
+        "/etc/cert.pem",
+        "/etc/key.pem"
+      ],
+      "case": "xt_legacy_8args",
+      "function": "_build_vless_xhttp_tls_listener_yaml",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_tls_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBsaXN0ZW46IDAuMC4wLjAKICAgIHBvcnQ6IDQ0MwogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgIC0gdXNlcm5hbWU6IGFsaWNlCiAgICAgICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICAgICMgY2xpZW50LXVzZXJzLWVuZAogICAgeGh0dHAtY29uZmlnOgogICAgICBwYXRoOiAiLyIKICAgICAgbW9kZTogYXV0bwogICAgYWxsb3ctaW5zZWN1cmU6IHRydWUKICAgIHByb3h5OiAK"
+    },
+    {
+      "args": [
+        "x",
+        "0.0.0.0",
+        "443",
+        "alice",
+        "11111111-2222-3333-4444-555555555555",
+        "/",
+        "/etc/cert.pem",
+        "/etc/key.pem",
+        "DIRECT"
+      ],
+      "case": "xt_legacy_9args",
+      "function": "_build_vless_xhttp_tls_listener_yaml",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_tls_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBsaXN0ZW46IDAuMC4wLjAKICAgIHBvcnQ6IDQ0MwogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgIC0gdXNlcm5hbWU6IGFsaWNlCiAgICAgICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICAgICMgY2xpZW50LXVzZXJzLWVuZAogICAgeGh0dHAtY29uZmlnOgogICAgICBwYXRoOiAiLyIKICAgICAgbW9kZTogYXV0bwogICAgYWxsb3ctaW5zZWN1cmU6IHRydWUKICAgIHByb3h5OiBESVJFQ1QK"
+    },
+    {
+      "args": [
+        "x",
+        "0.0.0.0",
+        "443",
+        "alice",
+        "11111111-2222-3333-4444-555555555555",
+        "/p q",
+        "c",
+        "k",
+        "DIRECT"
+      ],
+      "case": "xt_path_special",
+      "function": "_build_vless_xhttp_tls_listener_yaml",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_tls_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBsaXN0ZW46IDAuMC4wLjAKICAgIHBvcnQ6IDQ0MwogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgIC0gdXNlcm5hbWU6IGFsaWNlCiAgICAgICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICAgICMgY2xpZW50LXVzZXJzLWVuZAogICAgeGh0dHAtY29uZmlnOgogICAgICBwYXRoOiAiL3AgcSIKICAgICAgbW9kZTogYXV0bwogICAgYWxsb3ctaW5zZWN1cmU6IHRydWUKICAgIHByb3h5OiBESVJFQ1QK"
+    },
+    {
+      "args": [
+        "x",
+        "0.0.0.0",
+        "8443",
+        "alice",
+        "11111111-2222-3333-4444-555555555555",
+        "/",
+        "c",
+        "k",
+        "DIRECT"
+      ],
+      "case": "xt_port_8443",
+      "function": "_build_vless_xhttp_tls_listener_yaml",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_tls_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBsaXN0ZW46IDAuMC4wLjAKICAgIHBvcnQ6IDg0NDMKICAgIHVzZXJzOgogICAgICAjIGNsaWVudC11c2Vycy1zdGFydAogICAgICAtIHVzZXJuYW1lOiBhbGljZQogICAgICAgIHV1aWQ6IDExMTExMTExLTIyMjItMzMzMy00NDQ0LTU1NTU1NTU1NTU1NQogICAgICAjIGNsaWVudC11c2Vycy1lbmQKICAgIHhodHRwLWNvbmZpZzoKICAgICAgcGF0aDogIi8iCiAgICAgIG1vZGU6IGF1dG8KICAgIGFsbG93LWluc2VjdXJlOiB0cnVlCiAgICBwcm94eTogRElSRUNUCg=="
+    },
+    {
+      "args": [
+        "11111111-2222-3333-4444-555555555555",
+        "h",
+        "443",
+        "пример.рф",
+        "/",
+        "PUBKEY",
+        "abcd"
+      ],
+      "case": "xu_cyr_sni",
+      "function": "_build_vless_xhttp_uri",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_uri",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "dmxlc3M6Ly8xMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTVAaDo0NDM/ZW5jcnlwdGlvbj1ub25lJnNlY3VyaXR5PXJlYWxpdHkmc25pPSVEMCVCRiVEMSU4MCVEMCVCOCVEMCVCQyVEMCVCNSVEMSU4MC4lRDElODAlRDElODQmZnA9ZmlyZWZveCZwYms9UFVCS0VZJnNpZD1hYmNkJnR5cGU9eGh0dHAmcGF0aD0lMkYmbW9kZT1hdXRvI1ZMRVNTJTIweEhUVFAK"
+    },
+    {
+      "args": [
+        "11111111-2222-3333-4444-555555555555",
+        "h",
+        "443",
+        "sni.example",
+        ""
+      ],
+      "case": "xu_empty_path",
+      "function": "_build_vless_xhttp_uri",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_uri",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "dmxlc3M6Ly8xMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTVAaDo0NDM/ZW5jcnlwdGlvbj1ub25lJnNlY3VyaXR5PXRscyZzbmk9c25pLmV4YW1wbGUmZnA9ZmlyZWZveCZ0eXBlPXhodHRwJnBhdGg9Jm1vZGU9YXV0byNWTEVTUyUyMHhIVFRQCg=="
+    },
+    {
+      "args": [
+        "11111111-2222-3333-4444-555555555555",
+        "h",
+        "443",
+        "",
+        "/"
+      ],
+      "case": "xu_empty_sni",
+      "function": "_build_vless_xhttp_uri",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_uri",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "dmxlc3M6Ly8xMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTVAaDo0NDM/ZW5jcnlwdGlvbj1ub25lJnNlY3VyaXR5PXRscyZzbmk9JmZwPWZpcmVmb3gmdHlwZT14aHR0cCZwYXRoPSUyRiZtb2RlPWF1dG8jVkxFU1MlMjB4SFRUUAo="
+    },
+    {
+      "args": [
+        "11111111-2222-3333-4444-555555555555",
+        "[2001:db8::1]",
+        "443",
+        "sni.example",
+        "/",
+        "PUBKEY",
+        "abcd"
+      ],
+      "case": "xu_ipv6",
+      "function": "_build_vless_xhttp_uri",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_uri",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "dmxlc3M6Ly8xMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTVAWzIwMDE6ZGI4OjoxXTo0NDM/ZW5jcnlwdGlvbj1ub25lJnNlY3VyaXR5PXJlYWxpdHkmc25pPXNuaS5leGFtcGxlJmZwPWZpcmVmb3gmcGJrPVBVQktFWSZzaWQ9YWJjZCZ0eXBlPXhodHRwJnBhdGg9JTJGJm1vZGU9YXV0byNWTEVTUyUyMHhIVFRQCg=="
+    },
+    {
+      "args": [
+        "11111111-2222-3333-4444-555555555555",
+        "h",
+        "443",
+        "sni.example",
+        "/p?a=1&b=2%3D",
+        "PUBKEY",
+        "abcd"
+      ],
+      "case": "xu_path_special",
+      "function": "_build_vless_xhttp_uri",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_uri",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "dmxlc3M6Ly8xMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTVAaDo0NDM/ZW5jcnlwdGlvbj1ub25lJnNlY3VyaXR5PXJlYWxpdHkmc25pPXNuaS5leGFtcGxlJmZwPWZpcmVmb3gmcGJrPVBVQktFWSZzaWQ9YWJjZCZ0eXBlPXhodHRwJnBhdGg9JTJGcCUzRmElM0QxJTI2YiUzRDIlMjUzRCZtb2RlPWF1dG8jVkxFU1MlMjB4SFRUUAo="
+    },
+    {
+      "args": [
+        "11111111-2222-3333-4444-555555555555",
+        "h",
+        "443",
+        "sni.example",
+        "/",
+        "PUBKEY",
+        ""
+      ],
+      "case": "xu_pbk_no_sid",
+      "function": "_build_vless_xhttp_uri",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_uri",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "dmxlc3M6Ly8xMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTVAaDo0NDM/ZW5jcnlwdGlvbj1ub25lJnNlY3VyaXR5PXJlYWxpdHkmc25pPXNuaS5leGFtcGxlJmZwPWZpcmVmb3gmcGJrPVBVQktFWSZzaWQ9JnR5cGU9eGh0dHAmcGF0aD0lMkYmbW9kZT1hdXRvI1ZMRVNTJTIweEhUVFAK"
+    },
+    {
+      "args": [
+        "11111111-2222-3333-4444-555555555555",
+        "h",
+        "8443",
+        "sni.example",
+        "/",
+        "PUBKEY",
+        "abcd"
+      ],
+      "case": "xu_port_8443",
+      "function": "_build_vless_xhttp_uri",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_uri",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "dmxlc3M6Ly8xMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTVAaDo4NDQzP2VuY3J5cHRpb249bm9uZSZzZWN1cml0eT1yZWFsaXR5JnNuaT1zbmkuZXhhbXBsZSZmcD1maXJlZm94JnBiaz1QVUJLRVkmc2lkPWFiY2QmdHlwZT14aHR0cCZwYXRoPSUyRiZtb2RlPWF1dG8jVkxFU1MlMjB4SFRUUAo="
+    },
+    {
+      "args": [
+        "11111111-2222-3333-4444-555555555555",
+        "h",
+        "443",
+        "sni.example",
+        "/",
+        "PUBKEY",
+        "abcd"
+      ],
+      "case": "xu_reality_default_frag",
+      "function": "_build_vless_xhttp_uri",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_uri",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "dmxlc3M6Ly8xMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTVAaDo0NDM/ZW5jcnlwdGlvbj1ub25lJnNlY3VyaXR5PXJlYWxpdHkmc25pPXNuaS5leGFtcGxlJmZwPWZpcmVmb3gmcGJrPVBVQktFWSZzaWQ9YWJjZCZ0eXBlPXhodHRwJnBhdGg9JTJGJm1vZGU9YXV0byNWTEVTUyUyMHhIVFRQCg=="
+    },
+    {
+      "args": [
+        "11111111-2222-3333-4444-555555555555",
+        "h",
+        "443",
+        "sni.example",
+        "/",
+        "PUBKEY",
+        "abcd",
+        "Нода 🚀"
+      ],
+      "case": "xu_reality_frag",
+      "function": "_build_vless_xhttp_uri",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_uri",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "dmxlc3M6Ly8xMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTVAaDo0NDM/ZW5jcnlwdGlvbj1ub25lJnNlY3VyaXR5PXJlYWxpdHkmc25pPXNuaS5leGFtcGxlJmZwPWZpcmVmb3gmcGJrPVBVQktFWSZzaWQ9YWJjZCZ0eXBlPXhodHRwJnBhdGg9JTJGJm1vZGU9YXV0byMlRDAlOUQlRDAlQkUlRDAlQjQlRDAlQjAlMjAlRjAlOUYlOUElODAK"
+    },
+    {
+      "args": [
+        "11111111-2222-3333-4444-555555555555",
+        "h",
+        "443",
+        "sni.example",
+        "/"
+      ],
+      "case": "xu_tls_default",
+      "function": "_build_vless_xhttp_uri",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_uri",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "dmxlc3M6Ly8xMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTVAaDo0NDM/ZW5jcnlwdGlvbj1ub25lJnNlY3VyaXR5PXRscyZzbmk9c25pLmV4YW1wbGUmZnA9ZmlyZWZveCZ0eXBlPXhodHRwJnBhdGg9JTJGJm1vZGU9YXV0byNWTEVTUyUyMHhIVFRQCg=="
+    },
+    {
+      "args": [
+        "11111111-2222-3333-4444-555555555555",
+        "h",
+        "443",
+        "sni.example",
+        "/",
+        "",
+        "",
+        "x y"
+      ],
+      "case": "xu_tls_frag_space",
+      "function": "_build_vless_xhttp_uri",
+      "globals": {},
+      "invoke": "_build_vless_xhttp_uri",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "dmxlc3M6Ly8xMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTVAaDo0NDM/ZW5jcnlwdGlvbj1ub25lJnNlY3VyaXR5PXRscyZzbmk9c25pLmV4YW1wbGUmZnA9ZmlyZWZveCZ0eXBlPXhodHRwJnBhdGg9JTJGJm1vZGU9YXV0byN4JTIweQo="
+    },
+    {
+      "args": [
+        ""
+      ],
+      "case": "nx_chrome_replaced",
+      "function": "_normalize_vless_xhttp_proxy_yaml",
+      "globals": {},
+      "invoke": "_normalize_vless_xhttp_proxy_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": "ICAtIG5hbWU6IG4KICAgIHR5cGU6IHZsZXNzCiAgICBuZXR3b3JrOiB4aHR0cAogICAgY2xpZW50LWZpbmdlcnByaW50OiBjaHJvbWUK",
+      "stdout_b64": "ICAtIG5hbWU6IG4KICAgIHR5cGU6IHZsZXNzCiAgICBuZXR3b3JrOiB4aHR0cAogICAgY2xpZW50LWZpbmdlcnByaW50OiBmaXJlZm94Cg=="
+    },
+    {
+      "args": [
+        ""
+      ],
+      "case": "nx_crlf_passthrough",
+      "function": "_normalize_vless_xhttp_proxy_yaml",
+      "globals": {},
+      "invoke": "_normalize_vless_xhttp_proxy_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": "ICAtIG5hbWU6IG4NCiAgICBuZXR3b3JrOiB4aHR0cA0KICAgIGNsaWVudC1maW5nZXJwcmludDogY2hyb21lDQo=",
+      "stdout_b64": "ICAtIG5hbWU6IG4NCiAgICBuZXR3b3JrOiB4aHR0cA0KICAgIGNsaWVudC1maW5nZXJwcmludDogZmlyZWZveA0K"
+    },
+    {
+      "args": [
+        ""
+      ],
+      "case": "nx_empty",
+      "function": "_normalize_vless_xhttp_proxy_yaml",
+      "globals": {},
+      "invoke": "_normalize_vless_xhttp_proxy_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "Cg=="
+    },
+    {
+      "args": [
+        ""
+      ],
+      "case": "nx_fp_spaces",
+      "function": "_normalize_vless_xhttp_proxy_yaml",
+      "globals": {},
+      "invoke": "_normalize_vless_xhttp_proxy_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": "ICAtIG5hbWU6IG4KICAgIG5ldHdvcms6IHhodHRwCiAgICBjbGllbnQtZmluZ2VycHJpbnQ6ICAgY2hyb21lICAK",
+      "stdout_b64": "ICAtIG5hbWU6IG4KICAgIG5ldHdvcms6IHhodHRwCiAgICBjbGllbnQtZmluZ2VycHJpbnQ6IGZpcmVmb3gK"
+    },
+    {
+      "args": [
+        ""
+      ],
+      "case": "nx_grpc_passthrough",
+      "function": "_normalize_vless_xhttp_proxy_yaml",
+      "globals": {},
+      "invoke": "_normalize_vless_xhttp_proxy_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": "ICAtIG5hbWU6IGcKICAgIG5ldHdvcms6IGdycGMKICAgIGNsaWVudC1maW5nZXJwcmludDogY2hyb21lCg==",
+      "stdout_b64": "ICAtIG5hbWU6IGcKICAgIG5ldHdvcms6IGdycGMKICAgIGNsaWVudC1maW5nZXJwcmludDogY2hyb21lCg=="
+    },
+    {
+      "args": [
+        ""
+      ],
+      "case": "nx_no_fp_appended",
+      "function": "_normalize_vless_xhttp_proxy_yaml",
+      "globals": {},
+      "invoke": "_normalize_vless_xhttp_proxy_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": "ICAtIG5hbWU6IG4KICAgIG5ldHdvcms6IHhodHRwCiAgICB0bHM6IHRydWUK",
+      "stdout_b64": "ICAtIG5hbWU6IG4KICAgIG5ldHdvcms6IHhodHRwCiAgICB0bHM6IHRydWUKICAgIGNsaWVudC1maW5nZXJwcmludDogZmlyZWZveAo="
+    },
+    {
+      "args": [
+        ""
+      ],
+      "case": "nx_no_trailing_newline",
+      "function": "_normalize_vless_xhttp_proxy_yaml",
+      "globals": {},
+      "invoke": "_normalize_vless_xhttp_proxy_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": "ICAtIG5hbWU6IG4KICAgIG5ldHdvcms6IHhodHRw",
+      "stdout_b64": "ICAtIG5hbWU6IG4KICAgIG5ldHdvcms6IHhodHRwCiAgICBjbGllbnQtZmluZ2VycHJpbnQ6IGZpcmVmb3gK"
+    },
+    {
+      "args": [
+        ""
+      ],
+      "case": "nx_tcp_passthrough",
+      "function": "_normalize_vless_xhttp_proxy_yaml",
+      "globals": {},
+      "invoke": "_normalize_vless_xhttp_proxy_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": "ICAtIG5hbWU6IHQKICAgIG5ldHdvcms6IHRjcAogICAgY2xpZW50LWZpbmdlcnByaW50OiBjaHJvbWUK",
+      "stdout_b64": "ICAtIG5hbWU6IHQKICAgIG5ldHdvcms6IHRjcAogICAgY2xpZW50LWZpbmdlcnByaW50OiBjaHJvbWUK"
+    },
+    {
+      "args": [
+        ""
+      ],
+      "case": "nx_wrong_indent",
+      "function": "_normalize_vless_xhttp_proxy_yaml",
+      "globals": {},
+      "invoke": "_normalize_vless_xhttp_proxy_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": "ICAtIG5hbWU6IG4KICBuZXR3b3JrOiB4aHR0cAo=",
+      "stdout_b64": "ICAtIG5hbWU6IG4KICBuZXR3b3JrOiB4aHR0cAo="
+    }
+  ],
+  "module": "vless-xhttp"
+}

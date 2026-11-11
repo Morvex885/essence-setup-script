@@ -1,0 +1,716 @@
+{
+  "cases": [
+    {
+      "args": [
+        "grpc-exit",
+        "exit.example.com",
+        "443",
+        "11111111-2222-3333-4444-555555555555",
+        "sni.example",
+        "grpc",
+        "PUBKEY",
+        "abcd"
+      ],
+      "case": "gc_basic",
+      "function": "_build_vless_grpc_client_yaml",
+      "globals": {},
+      "invoke": "_build_vless_grpc_client_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "cHJveGllczoKICAtIG5hbWU6ICJncnBjLWV4aXQiCiAgICB0eXBlOiB2bGVzcwogICAgc2VydmVyOiBleGl0LmV4YW1wbGUuY29tCiAgICBwb3J0OiA0NDMKICAgIHV1aWQ6IDExMTExMTExLTIyMjItMzMzMy00NDQ0LTU1NTU1NTU1NTU1NQogICAgbmV0d29yazogZ3JwYwogICAgdWRwOiB0cnVlCiAgICB0bHM6IHRydWUKICAgIHNlcnZlcm5hbWU6ICJzbmkuZXhhbXBsZSIKICAgIGdycGMtb3B0czoKICAgICAgZ3JwYy1zZXJ2aWNlLW5hbWU6ICJncnBjIgogICAgcmVhbGl0eS1vcHRzOgogICAgICBwdWJsaWMta2V5OiAiUFVCS0VZIgogICAgICBzaG9ydC1pZDogImFiY2QiCiAgICBjbGllbnQtZmluZ2VycHJpbnQ6IGNocm9tZQo="
+    },
+    {
+      "args": [
+        "Выход 1",
+        "h",
+        "443",
+        "11111111-2222-3333-4444-555555555555",
+        "sni.example",
+        "grpc",
+        "PUBKEY",
+        "abcd"
+      ],
+      "case": "gc_cyr_name",
+      "function": "_build_vless_grpc_client_yaml",
+      "globals": {},
+      "invoke": "_build_vless_grpc_client_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "cHJveGllczoKICAtIG5hbWU6ICLQktGL0YXQvtC0IDEiCiAgICB0eXBlOiB2bGVzcwogICAgc2VydmVyOiBoCiAgICBwb3J0OiA0NDMKICAgIHV1aWQ6IDExMTExMTExLTIyMjItMzMzMy00NDQ0LTU1NTU1NTU1NTU1NQogICAgbmV0d29yazogZ3JwYwogICAgdWRwOiB0cnVlCiAgICB0bHM6IHRydWUKICAgIHNlcnZlcm5hbWU6ICJzbmkuZXhhbXBsZSIKICAgIGdycGMtb3B0czoKICAgICAgZ3JwYy1zZXJ2aWNlLW5hbWU6ICJncnBjIgogICAgcmVhbGl0eS1vcHRzOgogICAgICBwdWJsaWMta2V5OiAiUFVCS0VZIgogICAgICBzaG9ydC1pZDogImFiY2QiCiAgICBjbGllbnQtZmluZ2VycHJpbnQ6IGNocm9tZQo="
+    },
+    {
+      "args": [
+        "x",
+        "h",
+        "443",
+        "11111111-2222-3333-4444-555555555555",
+        "sni.example",
+        "",
+        "PUBKEY",
+        "abcd"
+      ],
+      "case": "gc_empty_service",
+      "function": "_build_vless_grpc_client_yaml",
+      "globals": {},
+      "invoke": "_build_vless_grpc_client_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "cHJveGllczoKICAtIG5hbWU6ICJ4IgogICAgdHlwZTogdmxlc3MKICAgIHNlcnZlcjogaAogICAgcG9ydDogNDQzCiAgICB1dWlkOiAxMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTUKICAgIG5ldHdvcms6IGdycGMKICAgIHVkcDogdHJ1ZQogICAgdGxzOiB0cnVlCiAgICBzZXJ2ZXJuYW1lOiAic25pLmV4YW1wbGUiCiAgICBncnBjLW9wdHM6CiAgICAgIGdycGMtc2VydmljZS1uYW1lOiAiIgogICAgcmVhbGl0eS1vcHRzOgogICAgICBwdWJsaWMta2V5OiAiUFVCS0VZIgogICAgICBzaG9ydC1pZDogImFiY2QiCiAgICBjbGllbnQtZmluZ2VycHJpbnQ6IGNocm9tZQo="
+    },
+    {
+      "args": [
+        "v6",
+        "[2001:db8::1]",
+        "443",
+        "11111111-2222-3333-4444-555555555555",
+        "sni.example",
+        "grpc",
+        "PUBKEY",
+        "abcd"
+      ],
+      "case": "gc_ipv6",
+      "function": "_build_vless_grpc_client_yaml",
+      "globals": {},
+      "invoke": "_build_vless_grpc_client_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "cHJveGllczoKICAtIG5hbWU6ICJ2NiIKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IDIwMDE6ZGI4OjoxCiAgICBwb3J0OiA0NDMKICAgIHV1aWQ6IDExMTExMTExLTIyMjItMzMzMy00NDQ0LTU1NTU1NTU1NTU1NQogICAgbmV0d29yazogZ3JwYwogICAgdWRwOiB0cnVlCiAgICB0bHM6IHRydWUKICAgIHNlcnZlcm5hbWU6ICJzbmkuZXhhbXBsZSIKICAgIGdycGMtb3B0czoKICAgICAgZ3JwYy1zZXJ2aWNlLW5hbWU6ICJncnBjIgogICAgcmVhbGl0eS1vcHRzOgogICAgICBwdWJsaWMta2V5OiAiUFVCS0VZIgogICAgICBzaG9ydC1pZDogImFiY2QiCiAgICBjbGllbnQtZmluZ2VycHJpbnQ6IGNocm9tZQo="
+    },
+    {
+      "args": [
+        "x",
+        "h",
+        "443",
+        "11111111-2222-3333-4444-555555555555",
+        "sni.example",
+        "grpc",
+        "PUBKEY"
+      ],
+      "case": "gc_missing_sid",
+      "function": "_build_vless_grpc_client_yaml",
+      "globals": {},
+      "invoke": "_build_vless_grpc_client_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "cHJveGllczoKICAtIG5hbWU6ICJ4IgogICAgdHlwZTogdmxlc3MKICAgIHNlcnZlcjogaAogICAgcG9ydDogNDQzCiAgICB1dWlkOiAxMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTUKICAgIG5ldHdvcms6IGdycGMKICAgIHVkcDogdHJ1ZQogICAgdGxzOiB0cnVlCiAgICBzZXJ2ZXJuYW1lOiAic25pLmV4YW1wbGUiCiAgICBncnBjLW9wdHM6CiAgICAgIGdycGMtc2VydmljZS1uYW1lOiAiZ3JwYyIKICAgIHJlYWxpdHktb3B0czoKICAgICAgcHVibGljLWtleTogIlBVQktFWSIKICAgICAgc2hvcnQtaWQ6ICIiCiAgICBjbGllbnQtZmluZ2VycHJpbnQ6IGNocm9tZQo="
+    },
+    {
+      "args": [
+        "x",
+        "h",
+        "443",
+        "11111111-2222-3333-4444-555555555555",
+        "sni.example",
+        "grpc",
+        "",
+        ""
+      ],
+      "case": "gc_no_reality",
+      "function": "_build_vless_grpc_client_yaml",
+      "globals": {},
+      "invoke": "_build_vless_grpc_client_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "cHJveGllczoKICAtIG5hbWU6ICJ4IgogICAgdHlwZTogdmxlc3MKICAgIHNlcnZlcjogaAogICAgcG9ydDogNDQzCiAgICB1dWlkOiAxMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTUKICAgIG5ldHdvcms6IGdycGMKICAgIHVkcDogdHJ1ZQogICAgdGxzOiB0cnVlCiAgICBzZXJ2ZXJuYW1lOiAic25pLmV4YW1wbGUiCiAgICBncnBjLW9wdHM6CiAgICAgIGdycGMtc2VydmljZS1uYW1lOiAiZ3JwYyIKICAgIHJlYWxpdHktb3B0czoKICAgICAgcHVibGljLWtleTogIiIKICAgICAgc2hvcnQtaWQ6ICIiCiAgICBjbGllbnQtZmluZ2VycHJpbnQ6IGNocm9tZQo="
+    },
+    {
+      "args": [
+        "x",
+        "h",
+        "8443",
+        "11111111-2222-3333-4444-555555555555",
+        "sni.example",
+        "grpc",
+        "PUBKEY",
+        "abcd"
+      ],
+      "case": "gc_port_8443",
+      "function": "_build_vless_grpc_client_yaml",
+      "globals": {},
+      "invoke": "_build_vless_grpc_client_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "cHJveGllczoKICAtIG5hbWU6ICJ4IgogICAgdHlwZTogdmxlc3MKICAgIHNlcnZlcjogaAogICAgcG9ydDogODQ0MwogICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICBuZXR3b3JrOiBncnBjCiAgICB1ZHA6IHRydWUKICAgIHRsczogdHJ1ZQogICAgc2VydmVybmFtZTogInNuaS5leGFtcGxlIgogICAgZ3JwYy1vcHRzOgogICAgICBncnBjLXNlcnZpY2UtbmFtZTogImdycGMiCiAgICByZWFsaXR5LW9wdHM6CiAgICAgIHB1YmxpYy1rZXk6ICJQVUJLRVkiCiAgICAgIHNob3J0LWlkOiAiYWJjZCIKICAgIGNsaWVudC1maW5nZXJwcmludDogY2hyb21lCg=="
+    },
+    {
+      "args": [
+        "x",
+        "h",
+        "443",
+        "11111111-2222-3333-4444-555555555555",
+        "sni.example",
+        "a\\b\"c",
+        "PUBKEY",
+        "abcd"
+      ],
+      "case": "gc_service_backslash",
+      "function": "_build_vless_grpc_client_yaml",
+      "globals": {},
+      "invoke": "_build_vless_grpc_client_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "cHJveGllczoKICAtIG5hbWU6ICJ4IgogICAgdHlwZTogdmxlc3MKICAgIHNlcnZlcjogaAogICAgcG9ydDogNDQzCiAgICB1dWlkOiAxMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTUKICAgIG5ldHdvcms6IGdycGMKICAgIHVkcDogdHJ1ZQogICAgdGxzOiB0cnVlCiAgICBzZXJ2ZXJuYW1lOiAic25pLmV4YW1wbGUiCiAgICBncnBjLW9wdHM6CiAgICAgIGdycGMtc2VydmljZS1uYW1lOiAiYVxcYlwiYyIKICAgIHJlYWxpdHktb3B0czoKICAgICAgcHVibGljLWtleTogIlBVQktFWSIKICAgICAgc2hvcnQtaWQ6ICJhYmNkIgogICAgY2xpZW50LWZpbmdlcnByaW50OiBjaHJvbWUK"
+    },
+    {
+      "args": [
+        "x",
+        "h",
+        "443",
+        "11111111-2222-3333-4444-555555555555",
+        "sni.example",
+        "a\"b",
+        "PUBKEY",
+        "abcd"
+      ],
+      "case": "gc_service_quote",
+      "function": "_build_vless_grpc_client_yaml",
+      "globals": {},
+      "invoke": "_build_vless_grpc_client_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "cHJveGllczoKICAtIG5hbWU6ICJ4IgogICAgdHlwZTogdmxlc3MKICAgIHNlcnZlcjogaAogICAgcG9ydDogNDQzCiAgICB1dWlkOiAxMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTUKICAgIG5ldHdvcms6IGdycGMKICAgIHVkcDogdHJ1ZQogICAgdGxzOiB0cnVlCiAgICBzZXJ2ZXJuYW1lOiAic25pLmV4YW1wbGUiCiAgICBncnBjLW9wdHM6CiAgICAgIGdycGMtc2VydmljZS1uYW1lOiAiYVwiYiIKICAgIHJlYWxpdHktb3B0czoKICAgICAgcHVibGljLWtleTogIlBVQktFWSIKICAgICAgc2hvcnQtaWQ6ICJhYmNkIgogICAgY2xpZW50LWZpbmdlcnByaW50OiBjaHJvbWUK"
+    },
+    {
+      "args": [
+        "x",
+        "[2001:db8::1]",
+        "443",
+        "11111111-2222-3333-4444-555555555555",
+        "sni.example",
+        "a\"b\\c"
+      ],
+      "case": "ge_bracketed_server_quote",
+      "function": "_build_vless_grpc_exit_yaml",
+      "globals": {},
+      "invoke": "_build_vless_grpc_exit_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IDIwMDE6ZGI4OjoxCiAgICBwb3J0OiA0NDMKICAgIHV1aWQ6IDExMTExMTExLTIyMjItMzMzMy00NDQ0LTU1NTU1NTU1NTU1NQogICAgbmV0d29yazogZ3JwYwogICAgdWRwOiB0cnVlCiAgICBncnBjLW9wdHM6CiAgICAgIGdycGMtc2VydmljZS1uYW1lOiAiYVwiYlxcYyIKICAgIHRsczogdHJ1ZQogICAgc2VydmVybmFtZTogInNuaS5leGFtcGxlIgogICAgY2xpZW50LWZpbmdlcnByaW50OiBjaHJvbWUK"
+    },
+    {
+      "args": [
+        "x",
+        "h",
+        "443",
+        "11111111-2222-3333-4444-555555555555",
+        "sni.example",
+        "grpc"
+      ],
+      "case": "ge_defaults",
+      "function": "_build_vless_grpc_exit_yaml",
+      "globals": {},
+      "invoke": "_build_vless_grpc_exit_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IGgKICAgIHBvcnQ6IDQ0MwogICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICBuZXR3b3JrOiBncnBjCiAgICB1ZHA6IHRydWUKICAgIGdycGMtb3B0czoKICAgICAgZ3JwYy1zZXJ2aWNlLW5hbWU6ICJncnBjIgogICAgdGxzOiB0cnVlCiAgICBzZXJ2ZXJuYW1lOiAic25pLmV4YW1wbGUiCiAgICBjbGllbnQtZmluZ2VycHJpbnQ6IGNocm9tZQo="
+    },
+    {
+      "args": [
+        "x",
+        "h",
+        "443",
+        "11111111-2222-3333-4444-555555555555",
+        "sni.example",
+        ""
+      ],
+      "case": "ge_empty_service",
+      "function": "_build_vless_grpc_exit_yaml",
+      "globals": {},
+      "invoke": "_build_vless_grpc_exit_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IGgKICAgIHBvcnQ6IDQ0MwogICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICBuZXR3b3JrOiBncnBjCiAgICB1ZHA6IHRydWUKICAgIGdycGMtb3B0czoKICAgICAgZ3JwYy1zZXJ2aWNlLW5hbWU6ICIiCiAgICB0bHM6IHRydWUKICAgIHNlcnZlcm5hbWU6ICJzbmkuZXhhbXBsZSIKICAgIGNsaWVudC1maW5nZXJwcmludDogY2hyb21lCg=="
+    },
+    {
+      "args": [
+        "x",
+        "h",
+        "443",
+        "11111111-2222-3333-4444-555555555555",
+        "sni.example",
+        "grpc",
+        "PUBKEY",
+        "abcd",
+        "firefox"
+      ],
+      "case": "ge_fp_firefox",
+      "function": "_build_vless_grpc_exit_yaml",
+      "globals": {},
+      "invoke": "_build_vless_grpc_exit_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IGgKICAgIHBvcnQ6IDQ0MwogICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICBuZXR3b3JrOiBncnBjCiAgICB1ZHA6IHRydWUKICAgIGdycGMtb3B0czoKICAgICAgZ3JwYy1zZXJ2aWNlLW5hbWU6ICJncnBjIgogICAgdGxzOiB0cnVlCiAgICBzZXJ2ZXJuYW1lOiAic25pLmV4YW1wbGUiCiAgICByZWFsaXR5LW9wdHM6CiAgICAgIHB1YmxpYy1rZXk6IFBVQktFWQogICAgICBzaG9ydC1pZDogYWJjZAogICAgY2xpZW50LWZpbmdlcnByaW50OiBmaXJlZm94Cg=="
+    },
+    {
+      "args": [
+        "x",
+        "2001:db8::1",
+        "443",
+        "11111111-2222-3333-4444-555555555555",
+        "sni.example",
+        "grpc"
+      ],
+      "case": "ge_ipv6",
+      "function": "_build_vless_grpc_exit_yaml",
+      "globals": {},
+      "invoke": "_build_vless_grpc_exit_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IDIwMDE6ZGI4OjoxCiAgICBwb3J0OiA0NDMKICAgIHV1aWQ6IDExMTExMTExLTIyMjItMzMzMy00NDQ0LTU1NTU1NTU1NTU1NQogICAgbmV0d29yazogZ3JwYwogICAgdWRwOiB0cnVlCiAgICBncnBjLW9wdHM6CiAgICAgIGdycGMtc2VydmljZS1uYW1lOiAiZ3JwYyIKICAgIHRsczogdHJ1ZQogICAgc2VydmVybmFtZTogInNuaS5leGFtcGxlIgogICAgY2xpZW50LWZpbmdlcnByaW50OiBjaHJvbWUK"
+    },
+    {
+      "args": [
+        "x",
+        "h",
+        "443",
+        "11111111-2222-3333-4444-555555555555",
+        "sni.example",
+        "grpc",
+        "",
+        "abcd"
+      ],
+      "case": "ge_pbk_empty_sid_set",
+      "function": "_build_vless_grpc_exit_yaml",
+      "globals": {},
+      "invoke": "_build_vless_grpc_exit_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IGgKICAgIHBvcnQ6IDQ0MwogICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICBuZXR3b3JrOiBncnBjCiAgICB1ZHA6IHRydWUKICAgIGdycGMtb3B0czoKICAgICAgZ3JwYy1zZXJ2aWNlLW5hbWU6ICJncnBjIgogICAgdGxzOiB0cnVlCiAgICBzZXJ2ZXJuYW1lOiAic25pLmV4YW1wbGUiCiAgICBjbGllbnQtZmluZ2VycHJpbnQ6IGNocm9tZQo="
+    },
+    {
+      "args": [
+        "x",
+        "h",
+        "1",
+        "11111111-2222-3333-4444-555555555555",
+        "sni.example",
+        "grpc"
+      ],
+      "case": "ge_port_1",
+      "function": "_build_vless_grpc_exit_yaml",
+      "globals": {},
+      "invoke": "_build_vless_grpc_exit_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IGgKICAgIHBvcnQ6IDEKICAgIHV1aWQ6IDExMTExMTExLTIyMjItMzMzMy00NDQ0LTU1NTU1NTU1NTU1NQogICAgbmV0d29yazogZ3JwYwogICAgdWRwOiB0cnVlCiAgICBncnBjLW9wdHM6CiAgICAgIGdycGMtc2VydmljZS1uYW1lOiAiZ3JwYyIKICAgIHRsczogdHJ1ZQogICAgc2VydmVybmFtZTogInNuaS5leGFtcGxlIgogICAgY2xpZW50LWZpbmdlcnByaW50OiBjaHJvbWUK"
+    },
+    {
+      "args": [
+        "x",
+        "h",
+        "443",
+        "11111111-2222-3333-4444-555555555555",
+        "sni.example",
+        "grpc",
+        "PUBKEY",
+        "abcd"
+      ],
+      "case": "ge_reality",
+      "function": "_build_vless_grpc_exit_yaml",
+      "globals": {},
+      "invoke": "_build_vless_grpc_exit_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IGgKICAgIHBvcnQ6IDQ0MwogICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICBuZXR3b3JrOiBncnBjCiAgICB1ZHA6IHRydWUKICAgIGdycGMtb3B0czoKICAgICAgZ3JwYy1zZXJ2aWNlLW5hbWU6ICJncnBjIgogICAgdGxzOiB0cnVlCiAgICBzZXJ2ZXJuYW1lOiAic25pLmV4YW1wbGUiCiAgICByZWFsaXR5LW9wdHM6CiAgICAgIHB1YmxpYy1rZXk6IFBVQktFWQogICAgICBzaG9ydC1pZDogYWJjZAogICAgY2xpZW50LWZpbmdlcnByaW50OiBjaHJvbWUK"
+    },
+    {
+      "args": [
+        "x",
+        "h",
+        "443",
+        "11111111-2222-3333-4444-555555555555",
+        "sni.example",
+        "a \"b\" c",
+        "PUBKEY",
+        "abcd"
+      ],
+      "case": "ge_special_service",
+      "function": "_build_vless_grpc_exit_yaml",
+      "globals": {},
+      "invoke": "_build_vless_grpc_exit_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBzZXJ2ZXI6IGgKICAgIHBvcnQ6IDQ0MwogICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICBuZXR3b3JrOiBncnBjCiAgICB1ZHA6IHRydWUKICAgIGdycGMtb3B0czoKICAgICAgZ3JwYy1zZXJ2aWNlLW5hbWU6ICJhIFwiYlwiIGMiCiAgICB0bHM6IHRydWUKICAgIHNlcnZlcm5hbWU6ICJzbmkuZXhhbXBsZSIKICAgIHJlYWxpdHktb3B0czoKICAgICAgcHVibGljLWtleTogUFVCS0VZCiAgICAgIHNob3J0LWlkOiBhYmNkCiAgICBjbGllbnQtZmluZ2VycHJpbnQ6IGNocm9tZQo="
+    },
+    {
+      "args": [
+        "vless-grpc",
+        "0.0.0.0",
+        "443",
+        "alice",
+        "11111111-2222-3333-4444-555555555555",
+        "grpc",
+        "www.microsoft.com:443",
+        "PRIVKEY",
+        "abcd",
+        "sni.example",
+        "DIRECT"
+      ],
+      "case": "gl_basic",
+      "function": "_build_vless_grpc_listener_yaml",
+      "globals": {},
+      "invoke": "_build_vless_grpc_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHZsZXNzLWdycGMKICAgIHR5cGU6IHZsZXNzCiAgICBsaXN0ZW46IDAuMC4wLjAKICAgIHBvcnQ6IDQ0MwogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgIC0gdXNlcm5hbWU6IGFsaWNlCiAgICAgICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICAgICMgY2xpZW50LXVzZXJzLWVuZAogICAgZ3JwYy1zZXJ2aWNlLW5hbWU6ICJncnBjIgogICAgcmVhbGl0eS1jb25maWc6CiAgICAgIGRlc3Q6ICJ3d3cubWljcm9zb2Z0LmNvbTo0NDMiCiAgICAgIHByaXZhdGUta2V5OiAiUFJJVktFWSIKICAgICAgc2hvcnQtaWQ6CiAgICAgICAgLSAiYWJjZCIKICAgICAgc2VydmVyLW5hbWVzOgogICAgICAgIC0gInNuaS5leGFtcGxlIgogICAgcHJveHk6IERJUkVDVAo="
+    },
+    {
+      "args": [
+        "x",
+        "0.0.0.0",
+        "443",
+        "Иван",
+        "11111111-2222-3333-4444-555555555555",
+        "grpc",
+        "d:443",
+        "pk",
+        "sid",
+        "sni.example",
+        "DIRECT"
+      ],
+      "case": "gl_cyr_user",
+      "function": "_build_vless_grpc_listener_yaml",
+      "globals": {},
+      "invoke": "_build_vless_grpc_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBsaXN0ZW46IDAuMC4wLjAKICAgIHBvcnQ6IDQ0MwogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgIC0gdXNlcm5hbWU6INCY0LLQsNC9CiAgICAgICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICAgICMgY2xpZW50LXVzZXJzLWVuZAogICAgZ3JwYy1zZXJ2aWNlLW5hbWU6ICJncnBjIgogICAgcmVhbGl0eS1jb25maWc6CiAgICAgIGRlc3Q6ICJkOjQ0MyIKICAgICAgcHJpdmF0ZS1rZXk6ICJwayIKICAgICAgc2hvcnQtaWQ6CiAgICAgICAgLSAic2lkIgogICAgICBzZXJ2ZXItbmFtZXM6CiAgICAgICAgLSAic25pLmV4YW1wbGUiCiAgICBwcm94eTogRElSRUNUCg=="
+    },
+    {
+      "args": [
+        "x",
+        "0.0.0.0",
+        "443",
+        "alice",
+        "11111111-2222-3333-4444-555555555555",
+        "grpc",
+        "d:443",
+        "pk",
+        "",
+        "sni.example",
+        "DIRECT"
+      ],
+      "case": "gl_empty_sid",
+      "function": "_build_vless_grpc_listener_yaml",
+      "globals": {},
+      "invoke": "_build_vless_grpc_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBsaXN0ZW46IDAuMC4wLjAKICAgIHBvcnQ6IDQ0MwogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgIC0gdXNlcm5hbWU6IGFsaWNlCiAgICAgICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICAgICMgY2xpZW50LXVzZXJzLWVuZAogICAgZ3JwYy1zZXJ2aWNlLW5hbWU6ICJncnBjIgogICAgcmVhbGl0eS1jb25maWc6CiAgICAgIGRlc3Q6ICJkOjQ0MyIKICAgICAgcHJpdmF0ZS1rZXk6ICJwayIKICAgICAgc2hvcnQtaWQ6CiAgICAgICAgLSAiIgogICAgICBzZXJ2ZXItbmFtZXM6CiAgICAgICAgLSAic25pLmV4YW1wbGUiCiAgICBwcm94eTogRElSRUNUCg=="
+    },
+    {
+      "args": [
+        "x",
+        "::",
+        "443",
+        "alice",
+        "11111111-2222-3333-4444-555555555555",
+        "grpc",
+        "d:443",
+        "pk",
+        "sid",
+        "sni.example",
+        "DIRECT"
+      ],
+      "case": "gl_ipv6",
+      "function": "_build_vless_grpc_listener_yaml",
+      "globals": {},
+      "invoke": "_build_vless_grpc_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBsaXN0ZW46ICI6OiIKICAgIHBvcnQ6IDQ0MwogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgIC0gdXNlcm5hbWU6IGFsaWNlCiAgICAgICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICAgICMgY2xpZW50LXVzZXJzLWVuZAogICAgZ3JwYy1zZXJ2aWNlLW5hbWU6ICJncnBjIgogICAgcmVhbGl0eS1jb25maWc6CiAgICAgIGRlc3Q6ICJkOjQ0MyIKICAgICAgcHJpdmF0ZS1rZXk6ICJwayIKICAgICAgc2hvcnQtaWQ6CiAgICAgICAgLSAic2lkIgogICAgICBzZXJ2ZXItbmFtZXM6CiAgICAgICAgLSAic25pLmV4YW1wbGUiCiAgICBwcm94eTogRElSRUNUCg=="
+    },
+    {
+      "args": [
+        "x",
+        "0.0.0.0",
+        "443",
+        "alice",
+        "11111111-2222-3333-4444-555555555555",
+        "grpc",
+        "d:443",
+        "pk",
+        "sid",
+        "sni.example"
+      ],
+      "case": "gl_missing_proxy",
+      "function": "_build_vless_grpc_listener_yaml",
+      "globals": {},
+      "invoke": "_build_vless_grpc_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBsaXN0ZW46IDAuMC4wLjAKICAgIHBvcnQ6IDQ0MwogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgIC0gdXNlcm5hbWU6IGFsaWNlCiAgICAgICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICAgICMgY2xpZW50LXVzZXJzLWVuZAogICAgZ3JwYy1zZXJ2aWNlLW5hbWU6ICJncnBjIgogICAgcmVhbGl0eS1jb25maWc6CiAgICAgIGRlc3Q6ICJkOjQ0MyIKICAgICAgcHJpdmF0ZS1rZXk6ICJwayIKICAgICAgc2hvcnQtaWQ6CiAgICAgICAgLSAic2lkIgogICAgICBzZXJ2ZXItbmFtZXM6CiAgICAgICAgLSAic25pLmV4YW1wbGUiCiAgICBwcm94eTogCg=="
+    },
+    {
+      "args": [
+        "x",
+        "0.0.0.0",
+        "443",
+        "alice",
+        "11111111-2222-3333-4444-555555555555",
+        "grpc",
+        "d:443",
+        "pk\r",
+        "sid",
+        "sni.example",
+        "DIRECT"
+      ],
+      "case": "gl_pk_cr",
+      "function": "_build_vless_grpc_listener_yaml",
+      "globals": {},
+      "invoke": "_build_vless_grpc_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBsaXN0ZW46IDAuMC4wLjAKICAgIHBvcnQ6IDQ0MwogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgIC0gdXNlcm5hbWU6IGFsaWNlCiAgICAgICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICAgICMgY2xpZW50LXVzZXJzLWVuZAogICAgZ3JwYy1zZXJ2aWNlLW5hbWU6ICJncnBjIgogICAgcmVhbGl0eS1jb25maWc6CiAgICAgIGRlc3Q6ICJkOjQ0MyIKICAgICAgcHJpdmF0ZS1rZXk6ICJwaw0iCiAgICAgIHNob3J0LWlkOgogICAgICAgIC0gInNpZCIKICAgICAgc2VydmVyLW5hbWVzOgogICAgICAgIC0gInNuaS5leGFtcGxlIgogICAgcHJveHk6IERJUkVDVAo="
+    },
+    {
+      "args": [
+        "x",
+        "0.0.0.0",
+        "2083",
+        "alice",
+        "11111111-2222-3333-4444-555555555555",
+        "grpc",
+        "d:443",
+        "pk",
+        "sid",
+        "sni.example",
+        "DIRECT"
+      ],
+      "case": "gl_port_2083",
+      "function": "_build_vless_grpc_listener_yaml",
+      "globals": {},
+      "invoke": "_build_vless_grpc_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBsaXN0ZW46IDAuMC4wLjAKICAgIHBvcnQ6IDIwODMKICAgIHVzZXJzOgogICAgICAjIGNsaWVudC11c2Vycy1zdGFydAogICAgICAtIHVzZXJuYW1lOiBhbGljZQogICAgICAgIHV1aWQ6IDExMTExMTExLTIyMjItMzMzMy00NDQ0LTU1NTU1NTU1NTU1NQogICAgICAjIGNsaWVudC11c2Vycy1lbmQKICAgIGdycGMtc2VydmljZS1uYW1lOiAiZ3JwYyIKICAgIHJlYWxpdHktY29uZmlnOgogICAgICBkZXN0OiAiZDo0NDMiCiAgICAgIHByaXZhdGUta2V5OiAicGsiCiAgICAgIHNob3J0LWlkOgogICAgICAgIC0gInNpZCIKICAgICAgc2VydmVyLW5hbWVzOgogICAgICAgIC0gInNuaS5leGFtcGxlIgogICAgcHJveHk6IERJUkVDVAo="
+    },
+    {
+      "args": [
+        "x",
+        "[::]",
+        "443",
+        "alice",
+        "11111111-2222-3333-4444-555555555555",
+        "a\"b\\c",
+        "d:443",
+        "pk",
+        "sid",
+        "sni.example",
+        "DIRECT"
+      ],
+      "case": "gl_service_quote",
+      "function": "_build_vless_grpc_listener_yaml",
+      "globals": {},
+      "invoke": "_build_vless_grpc_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBsaXN0ZW46ICI6OiIKICAgIHBvcnQ6IDQ0MwogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgIC0gdXNlcm5hbWU6IGFsaWNlCiAgICAgICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICAgICMgY2xpZW50LXVzZXJzLWVuZAogICAgZ3JwYy1zZXJ2aWNlLW5hbWU6ICJhXCJiXFxjIgogICAgcmVhbGl0eS1jb25maWc6CiAgICAgIGRlc3Q6ICJkOjQ0MyIKICAgICAgcHJpdmF0ZS1rZXk6ICJwayIKICAgICAgc2hvcnQtaWQ6CiAgICAgICAgLSAic2lkIgogICAgICBzZXJ2ZXItbmFtZXM6CiAgICAgICAgLSAic25pLmV4YW1wbGUiCiAgICBwcm94eTogRElSRUNUCg=="
+    },
+    {
+      "args": [
+        "x",
+        "0.0.0.0",
+        "443",
+        "alice",
+        "11111111-2222-3333-4444-555555555555",
+        "my svc/1",
+        "d:443",
+        "pk",
+        "sid",
+        "sni.example",
+        "DIRECT"
+      ],
+      "case": "gl_service_special",
+      "function": "_build_vless_grpc_listener_yaml",
+      "globals": {},
+      "invoke": "_build_vless_grpc_listener_yaml",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "ICAtIG5hbWU6IHgKICAgIHR5cGU6IHZsZXNzCiAgICBsaXN0ZW46IDAuMC4wLjAKICAgIHBvcnQ6IDQ0MwogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgIC0gdXNlcm5hbWU6IGFsaWNlCiAgICAgICAgdXVpZDogMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1CiAgICAgICMgY2xpZW50LXVzZXJzLWVuZAogICAgZ3JwYy1zZXJ2aWNlLW5hbWU6ICJteSBzdmMvMSIKICAgIHJlYWxpdHktY29uZmlnOgogICAgICBkZXN0OiAiZDo0NDMiCiAgICAgIHByaXZhdGUta2V5OiAicGsiCiAgICAgIHNob3J0LWlkOgogICAgICAgIC0gInNpZCIKICAgICAgc2VydmVyLW5hbWVzOgogICAgICAgIC0gInNuaS5leGFtcGxlIgogICAgcHJveHk6IERJUkVDVAo="
+    },
+    {
+      "args": [
+        "11111111-2222-3333-4444-555555555555",
+        "h",
+        "443",
+        "sni.example",
+        "grpc",
+        "PUBKEY",
+        "abcd"
+      ],
+      "case": "gu_default",
+      "function": "_build_vless_grpc_uri",
+      "globals": {},
+      "invoke": "_build_vless_grpc_uri",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "dmxlc3M6Ly8xMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTVAaDo0NDM/ZW5jcnlwdGlvbj1ub25lJnNlY3VyaXR5PXJlYWxpdHkmc25pPXNuaS5leGFtcGxlJmZwPWNocm9tZSZwYms9UFVCS0VZJnNpZD1hYmNkJnR5cGU9Z3JwYyZzZXJ2aWNlTmFtZT1ncnBjI1ZMRVNTJTIwZ1JQQwo="
+    },
+    {
+      "args": [
+        "11111111-2222-3333-4444-555555555555",
+        "h",
+        "443",
+        "sni.example",
+        "grpc",
+        "PUBKEY",
+        "abcd",
+        "🚀 нода"
+      ],
+      "case": "gu_emoji_fragment",
+      "function": "_build_vless_grpc_uri",
+      "globals": {},
+      "invoke": "_build_vless_grpc_uri",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "dmxlc3M6Ly8xMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTVAaDo0NDM/ZW5jcnlwdGlvbj1ub25lJnNlY3VyaXR5PXJlYWxpdHkmc25pPXNuaS5leGFtcGxlJmZwPWNocm9tZSZwYms9UFVCS0VZJnNpZD1hYmNkJnR5cGU9Z3JwYyZzZXJ2aWNlTmFtZT1ncnBjIyVGMCU5RiU5QSU4MCUyMCVEMCVCRCVEMCVCRSVEMCVCNCVEMCVCMAo="
+    },
+    {
+      "args": [
+        "11111111-2222-3333-4444-555555555555",
+        "h",
+        "443",
+        "sni.example",
+        "grpc",
+        "PUBKEY",
+        "abcd",
+        ""
+      ],
+      "case": "gu_empty_fragment",
+      "function": "_build_vless_grpc_uri",
+      "globals": {},
+      "invoke": "_build_vless_grpc_uri",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "dmxlc3M6Ly8xMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTVAaDo0NDM/ZW5jcnlwdGlvbj1ub25lJnNlY3VyaXR5PXJlYWxpdHkmc25pPXNuaS5leGFtcGxlJmZwPWNocm9tZSZwYms9UFVCS0VZJnNpZD1hYmNkJnR5cGU9Z3JwYyZzZXJ2aWNlTmFtZT1ncnBjI1ZMRVNTJTIwZ1JQQwo="
+    },
+    {
+      "args": [
+        "11111111-2222-3333-4444-555555555555",
+        "h",
+        "443",
+        "sni.example",
+        "grpc",
+        "PUBKEY",
+        "abcd",
+        "Node 1"
+      ],
+      "case": "gu_fragment",
+      "function": "_build_vless_grpc_uri",
+      "globals": {},
+      "invoke": "_build_vless_grpc_uri",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "dmxlc3M6Ly8xMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTVAaDo0NDM/ZW5jcnlwdGlvbj1ub25lJnNlY3VyaXR5PXJlYWxpdHkmc25pPXNuaS5leGFtcGxlJmZwPWNocm9tZSZwYms9UFVCS0VZJnNpZD1hYmNkJnR5cGU9Z3JwYyZzZXJ2aWNlTmFtZT1ncnBjI05vZGUlMjAxCg=="
+    },
+    {
+      "args": [
+        "11111111-2222-3333-4444-555555555555",
+        "[2001:db8::1]",
+        "443",
+        "sni.example",
+        "grpc",
+        "PUBKEY",
+        "abcd"
+      ],
+      "case": "gu_ipv6",
+      "function": "_build_vless_grpc_uri",
+      "globals": {},
+      "invoke": "_build_vless_grpc_uri",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "dmxlc3M6Ly8xMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTVAWzIwMDE6ZGI4OjoxXTo0NDM/ZW5jcnlwdGlvbj1ub25lJnNlY3VyaXR5PXJlYWxpdHkmc25pPXNuaS5leGFtcGxlJmZwPWNocm9tZSZwYms9UFVCS0VZJnNpZD1hYmNkJnR5cGU9Z3JwYyZzZXJ2aWNlTmFtZT1ncnBjI1ZMRVNTJTIwZ1JQQwo="
+    },
+    {
+      "args": [
+        "11111111-2222-3333-4444-555555555555",
+        "h",
+        "8443",
+        "sni.example",
+        "grpc",
+        "PUBKEY",
+        "abcd"
+      ],
+      "case": "gu_port_8443",
+      "function": "_build_vless_grpc_uri",
+      "globals": {},
+      "invoke": "_build_vless_grpc_uri",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "dmxlc3M6Ly8xMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTVAaDo4NDQzP2VuY3J5cHRpb249bm9uZSZzZWN1cml0eT1yZWFsaXR5JnNuaT1zbmkuZXhhbXBsZSZmcD1jaHJvbWUmcGJrPVBVQktFWSZzaWQ9YWJjZCZ0eXBlPWdycGMmc2VydmljZU5hbWU9Z3JwYyNWTEVTUyUyMGdSUEMK"
+    },
+    {
+      "args": [
+        "11111111-2222-3333-4444-555555555555",
+        "h",
+        "443",
+        "sni.example",
+        "my svc",
+        "PUBKEY",
+        "abcd"
+      ],
+      "case": "gu_service_space",
+      "function": "_build_vless_grpc_uri",
+      "globals": {},
+      "invoke": "_build_vless_grpc_uri",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "dmxlc3M6Ly8xMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTVAaDo0NDM/ZW5jcnlwdGlvbj1ub25lJnNlY3VyaXR5PXJlYWxpdHkmc25pPXNuaS5leGFtcGxlJmZwPWNocm9tZSZwYms9UFVCS0VZJnNpZD1hYmNkJnR5cGU9Z3JwYyZzZXJ2aWNlTmFtZT1teSUyMHN2YyNWTEVTUyUyMGdSUEMK"
+    },
+    {
+      "args": [
+        "11111111-2222-3333-4444-555555555555",
+        "h",
+        "443",
+        "a&b",
+        "grpc",
+        "PUBKEY",
+        "abcd"
+      ],
+      "case": "gu_special_sni",
+      "function": "_build_vless_grpc_uri",
+      "globals": {},
+      "invoke": "_build_vless_grpc_uri",
+      "rc": 0,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "dmxlc3M6Ly8xMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTVAaDo0NDM/ZW5jcnlwdGlvbj1ub25lJnNlY3VyaXR5PXJlYWxpdHkmc25pPWElMjZiJmZwPWNocm9tZSZwYms9UFVCS0VZJnNpZD1hYmNkJnR5cGU9Z3JwYyZzZXJ2aWNlTmFtZT1ncnBjI1ZMRVNTJTIwZ1JQQwo="
+    }
+  ],
+  "module": "vless-grpc"
+}

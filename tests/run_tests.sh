@@ -37,6 +37,8 @@ case "$MODE" in
         "${BASH:-bash}" "$BATS" "$SCRIPT_DIR/unit/" --recursive
         echo ""
         "${BASH:-bash}" "$BATS" "$SCRIPT_DIR/fuzz/" --recursive
+        echo ""
+        (cd "$SCRIPT_DIR/../remote-control" && cargo test --workspace --locked)
         ;;
     --ci)
         "${BASH:-bash}" "$BATS" "$SCRIPT_DIR/unit/" --recursive --tap
