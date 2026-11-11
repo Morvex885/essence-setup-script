@@ -602,8 +602,22 @@ fn stage_allowlist(work: &WorkSession, storage: Storage) -> Result<()> {
 }
 
 /// Stage and commit; pin the commit on the local branch before any network
-/// I/O so a later process can recover it. `None`: nothing to publish.
+/// I/O so a later process can recover it. `None`: nothing to publish. A
+/// failure before the pin returns the session HEAD and index to where they
+/// were, so an unpinned commit never reaches a later flush or push; the
+/// worktree files stay for the caller to restore.
 pub fn commit(work: &WorkSession, storage: Storage, pending: bool) -> Result<Option<String>> {
+    let previous = work.head()?;
+    commit_and_pin(work, storage, pending).map_err(|mut error| {
+        let reset = exec::tree_git(&work.worktree, &args(&["reset", "-q", "--mixed", &previous]));
+        if !reset.is_ok_and(|out| out.success) {
+            error.message.push_str(" Рабочая копия GitHub не возвращена к прежнему commit.");
+        }
+        error
+    })
+}
+
+fn commit_and_pin(work: &WorkSession, storage: Storage, pending: bool) -> Result<Option<String>> {
     let had_files = !work.tracked()?.is_empty();
     stage_allowlist(work, storage)?;
     let clean = exec::tree_git(&work.worktree, &args(&["diff", "--cached", "--quiet"]))?.success;
@@ -760,5 +774,35 @@ mod tests {
         assert_ne!(head, initial);
         assert_eq!(rev(&store, local_ref).unwrap(), Some(head));
         assert!(holds_snapshot(&store, local_ref).unwrap() && sync == SyncStatus::Pending);
+    }
+
+    #[test]
+    fn a_failed_pin_rolls_the_session_commit_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = StatePaths::new(dir.path().join("data"));
+        let target = Target::new("octo", "essence-remote-control-config", "main");
+        let work = test_work_session(dir.path(), &target);
+        let (local_ref, previous) = ("refs/heads/main", work.head().unwrap());
+        fs::write(work.worktree.join("config.json"), "{\"rejected\":true}\n").unwrap();
+        // A stale ref lock makes the pin fail right after the commit.
+        let lock = work.store.join("refs/heads/main.lock");
+        fs::write(&lock, "").unwrap();
+
+        let mut sync = SyncStatus::Clean;
+        let failure = flush(&paths, &target, &work, Storage::Plain, &mut sync).err().expect("the pin is blocked");
+        assert!(!failure.pinned);
+        assert_eq!(super::super::stage_of(&failure.error), Some("сохранение локальной точки восстановления"), "{}", failure.error.message);
+        assert_eq!(work.head().unwrap(), previous, "the unpinned commit is dropped from the session branch");
+        assert_eq!(rev(&work.store, local_ref).unwrap().as_deref(), Some(previous.as_str()));
+        assert!(exec::tree_git(&work.worktree, &args(&["diff", "--cached", "--quiet"])).unwrap().success, "nothing stays staged");
+        assert!(work.worktree.join("config.json").exists(), "the files are left for the caller to restore");
+
+        // The caller restores the files; the next flush commits only that, on top of the old HEAD.
+        fs::remove_file(&lock).unwrap();
+        fs::write(work.worktree.join("config.json"), "{}\n").unwrap();
+        assert!(flush(&paths, &target, &work, Storage::Plain, &mut sync).err().expect("no GitHub account").pinned);
+        let head = work.head().unwrap();
+        assert_eq!(rev(&work.store, local_ref).unwrap().as_deref(), Some(head.as_str()));
+        assert_eq!(rev(&work.store, &format!("{head}^")).unwrap(), Some(previous));
     }
 }

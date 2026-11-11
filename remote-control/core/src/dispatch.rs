@@ -537,4 +537,42 @@ mod tests {
         assert_eq!(session.github.as_ref().unwrap().sync, SyncStatus::Clean, "nothing waits for push");
         assert!(journal.borrow().iter().all(|(level, _)| *level != Level::Warn), "no false «saved locally» warning");
     }
+
+    #[test]
+    fn a_failed_pin_keeps_the_rejected_change_out_of_history() {
+        use crate::github::{BRANCH, REPO_NAME, Storage, SyncStatus, Target, commands::GithubSession, exec, stage_of, store};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("data");
+        let (mut session, _journal) = session(&root, DispatchMode::OneShot);
+        let paths = StatePaths::new(&root);
+        session.state = State::with_locks(paths.runtime(), session.state.locks().clone());
+        crate::secure_fs::create_dir_all(&paths.github_runtime()).unwrap();
+        session.state.save_config(&crate::model::Config::default()).unwrap();
+        let target = Target::new("alice", REPO_NAME, BRANCH);
+        let work = store::test_work_session(&dir.path().join("work"), &target);
+        let (git_store, previous) = (work.store.clone(), work.head().unwrap());
+        session.github = Some(GithubSession { target, work: Some(work),
+            storage: Storage::Plain, keys: None, sync: SyncStatus::Clean, last_counts: Value::Null, last_version: None });
+        let add_group = |name: &'static str| move |state: &State| {
+            let mut config = state.load_config()?;
+            config.groups.push(crate::model::Group { name: name.into(), ..Default::default() });
+            state.save_config(&config)
+        };
+
+        // A stale ref lock makes the pin fail right after the commit.
+        let lock = git_store.join("refs/heads/main.lock");
+        std::fs::write(&lock, "").unwrap();
+        let error = session.mutate("probe", add_group("PROBE")).unwrap_err();
+        assert_eq!((error.code, stage_of(&error)), ("source_failed", Some("сохранение локальной точки восстановления")), "{}", error.message);
+        std::fs::remove_file(&lock).unwrap();
+
+        // The next change is committed once, on top of the old HEAD, without the rejected one.
+        session.mutate("next", add_group("NEXT")).unwrap();
+        let log = exec::store_git(&git_store, &["log".as_ref(), "-p".as_ref(), "--format=%H %P".as_ref(), "refs/heads/main".as_ref()]).unwrap();
+        let log = String::from_utf8_lossy(&log.stdout).into_owned();
+        assert!(log.contains("NEXT") && !log.contains("PROBE"), "{log}");
+        let head = store::rev(&git_store, "refs/heads/main").unwrap().unwrap();
+        assert_eq!(store::rev(&git_store, &format!("{head}^")).unwrap(), Some(previous));
+        assert_eq!(session.github.as_ref().unwrap().sync, SyncStatus::Pending, "pinned, the push is pending");
+    }
 }
