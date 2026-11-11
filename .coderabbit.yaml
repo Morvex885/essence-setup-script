@@ -12,7 +12,7 @@ reviews:
   path_instructions:
     - path: "{.github/workflows/**,tests/ci/build_release_tarball.sh}"
       instructions: |
-        - Релизный архив собирает и проверяет tests/ci/build_release_tarball.sh (release.yml и tests.yml для PR в main): архив обязан содержать все tracked-файлы из common/, setup-essence/, remote-control/ и VERSION — их требуют проверки `_need` в setup-essence/install-essence.sh и remote-control/install-remote-control.sh.
+        - Релизный архив серверного комплекта собирает и проверяет tests/ci/build_release_tarball.sh (release.yml и tests.yml для PR в main): архив обязан содержать все tracked-файлы из common/, setup-essence/ и VERSION (их требуют проверки `_need` в setup-essence/install-essence.sh) и не содержать remote-control/ (Cargo workspace клиента: исходники Rust, встроенные шаблоны). Клиент выходит бинарниками `essence-rc-<target>.tar.gz|.zip` + `SHA256SUMS` (job `build` в release.yml), их ставит install-essence-rc.sh.
         - Job id `test` в tests.yml — обязательная проверка в rulesets protect-main и protect-develop; переименование блокирует мерж.
         - Минимальные permissions GITHUB_TOKEN; `contents: write` только у job публикации релиза.
         - Не подставлять `${{ }}`-выражения прямо в `run:`; передавать через `env:`.

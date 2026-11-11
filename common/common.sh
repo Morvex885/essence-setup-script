@@ -301,7 +301,7 @@ menu_item() {
     local label="$2"
     local color="${3:-CYAN}"
     local color_value="${!color}"
-    box_line " ${key}) ${label}" " ${color_value}${key}) ${label}${NC}"
+    box_line " ${key}) ${label}" " ${color_value}${key})${NC} ${label}"
 }
 
 menu_index_valid() {

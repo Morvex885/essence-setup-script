@@ -1,7 +1,9 @@
 #!/bin/bash
-# Собирает релизный архив essence-setup-<version>.tar.gz (+ .sha256) в <outdir>
-# и проверяет, что в нём есть каждый tracked-файл из common/, setup-essence/,
-# remote-control/, VERSION и remote-control.cmd — их требуют установщики и launcher.
+# Собирает релизный архив серверного комплекта essence-setup-<version>.tar.gz
+# (+ .sha256) в <outdir> и проверяет, что в нём есть каждый tracked-файл из
+# common/, setup-essence/ и VERSION — их требует setup-essence/install-essence.sh.
+# Клиент Remote Control выходит отдельными бинарниками essence-rc-<target>,
+# поэтому remote-control/ (Cargo workspace клиента) в архив не входит.
 # Использование: build_release_tarball.sh <version> [outdir]
 set -euo pipefail
 
@@ -17,20 +19,15 @@ cd "$PROJECT_ROOT"
 
 # Список заранее: при ошибке git ls-files set -e остановит скрипт,
 # а пустой список не даст проверке пройти вхолостую.
-files=$(git ls-files common setup-essence remote-control VERSION remote-control.cmd)
+files=$(git ls-files common setup-essence VERSION)
 [[ -n "$files" ]] || { echo "::error::git ls-files вернул пустой список" >&2; exit 1; }
 
 rm -rf "$OUT_DIR/dist"
-mkdir -p "$DIST/setup-essence/modules" "$DIST/remote-control/modules" \
-         "$DIST/remote-control/templates" "$DIST/remote-control/tui" "$DIST/common"
+mkdir -p "$DIST/setup-essence/modules" "$DIST/common"
 cp setup-essence/setup-essence.sh setup-essence/install-essence.sh "$DIST/setup-essence/"
 cp setup-essence/modules/*.sh "$DIST/setup-essence/modules/"
-cp remote-control/remote-control-essence.sh remote-control/install-remote-control.sh "$DIST/remote-control/"
-cp remote-control/modules/*.sh "$DIST/remote-control/modules/"
-cp remote-control/tui/*.sh "$DIST/remote-control/tui/"
-cp remote-control/templates/*.yaml "$DIST/remote-control/templates/"
 cp -r common/. "$DIST/common/"
-cp VERSION remote-control.cmd "$DIST/"
+cp VERSION "$DIST/"
 
 # Архив с корнем essence-setup/ → при распаковке --strip-components=1
 tar -czf "$OUT_DIR/$TARBALL" -C "$OUT_DIR/dist" essence-setup
@@ -44,4 +41,8 @@ while IFS= read -r f; do
         missing=1
     fi
 done <<<"$files"
+if grep -qE '^essence-setup/remote-control/' <<<"$listing"; then
+    echo "::error::В архив $TARBALL попал remote-control/ (исходники клиента)" >&2
+    missing=1
+fi
 exit "$missing"

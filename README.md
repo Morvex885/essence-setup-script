@@ -8,7 +8,7 @@
 
 # Essence
 
-Набор bash-скриптов для настройки прокси-сервера и управления клиентскими конфигами на базе ядра [mihomo (Clash.Meta)](https://github.com/MetaCubeX/mihomo).
+Bash-скрипты для настройки прокси-сервера и Rust-клиент `essence-rc` для управления серверами и клиентскими конфигами на базе ядра [mihomo (Clash.Meta)](https://github.com/MetaCubeX/mihomo).
 
 Поддерживаемые протоколы: **VLESS Reality** (TCP, xHTTP, gRPC), **Hysteria2**, **AmneziaWG**, **WARP**, **Каскады нод**.
 
@@ -19,7 +19,7 @@
 | Компонент | Описание | Документация |
 |-----------|----------|-------------|
 | **Essence Setup** | Серверный скрипт. Устанавливается на VPS, настраивает протоколы | [docs/essence.md](docs/essence.md) |
-| **Remote Control** | Локальный скрипт. Управляет серверами по SSH, генерирует клиентские конфиги | [docs/remote-control.md](docs/remote-control.md) |
+| **Remote Control** | Локальный бинарник `essence-rc` (Linux, macOS, Windows, Termux). Управляет серверами по SSH, генерирует клиентские конфиги | [docs/remote-control.md](docs/remote-control.md), [remote-control/README.md](remote-control/README.md) |
 
 ## Возможности
 
@@ -48,8 +48,8 @@
 
 ### Локальная часть (Remote Control)
 
-- **Единое ядро команд** — вся логика в командах `сущность действие --флаги` → JSON `{ok,data|error}`; терминальное меню (`remote-control/tui/`) — только слой экранов поверх ядра, а `remote-control-essence serve` отдаёт то же ядро по протоколу JSON-строк для веб-панели и приложений ([архитектура](docs/remote-control.md#архитектура-ядро-команд))
-- **Управление нодами** — добавление VPS с AES-256-CBC шифрованием паролей, переименование с каскадным апдейтом ссылок, теги, удаление с опциональной очисткой сервера
+- **Единое ядро команд** — вся логика в командах `сущность действие --флаги` → JSON `{ok,data|error}`; терминальное меню (`essence-rc` без аргументов) — только слой экранов поверх ядра, а `essence-rc serve` отдаёт то же ядро по протоколу JSON-строк для веб-панели и приложений ([remote-control/README.md](remote-control/README.md))
+- **Управление нодами** — добавление VPS с паролями под AES-256-GCM (ключ устройства), переименование с каскадным апдейтом ссылок, теги, удаление с опциональной очисткой сервера
 - **Усиление защиты SSH** — генерация переносимого ed25519-ключа, копирование на сервер, отключение пароля, смена SSH-порта (49152-65535) и обновление firewall с проверкой результата
 - **Клиенты** — создание с auto-generated `vless_uuid` + `hy2_password`, наследование нод от группы или кастомный список, смена группы с миграцией, переименование с миграцией директории
 - **Группы** — шаблон на группу, маркеры `# --- GROUP ---` в YAML для per-group блоков, поддержка мульти-группы (`GROUP1/GROUP2`)
@@ -58,11 +58,11 @@
 - **Генерация конфигов** — по группе или всем, per-client credentials injection, кеш proxy-конфигов с нод, проверка дубликатов, синхронизация входных подключений. Итог показывает готовых, пропущенных и ошибочных клиентов; публикация подписок — отдельное действие
 - **Подписки** — публикация, отзыв и смена токенов, пакетное обновление, миграция между нодами, проверка HTTP 200 и очистка осиротевших файлов
 - **HTTP-заголовки подписок** — наследование `default → group → client` с показом итогового значения и источника, безопасное quoting для nginx
-- **Шаблоны** — создание на основе `default.yaml` или другого шаблона, редактор (`$VISUAL`/`$EDITOR`, nano, vi) в меню, экспорт и импорт файлом, несколько шаблонов на проект
-- **Обновления** — фоновая проверка версии при запуске, обновление командой `self update` или из раздела «Настройки»
-- **Пароль запуска** — SHA-512 с солью; для GitHub входит в логическое состояние и следует выбранному режиму шифрования
-- **Dev / Installed режимы** — автоопределение (dev, если на уровень выше каталога скрипта есть `.git` или `VERSION` (запуск из репозитория), installed иначе), данные в `.remote-data/` или `~/.config/remote-control-essence/`
-- **Командная строка** — `remote-control-essence <сущность> <действие> [--json]` без вопросов: источник, ноды, группы, шаблоны, клиенты, подключения, генерация, подписки, AmneziaWG, Telegram и сам remote-control; опасные действия показывают план и требуют `--yes --plan-token`; решения (`*_required`) возвращаются кодами с данными, секреты — через `--secrets-stdin` ([docs/remote-control.md](docs/remote-control.md#командная-строка-cli))
+- **Шаблоны** — создание на основе `default.yaml` или другого шаблона, редактор (`$VISUAL`/`$EDITOR`, nano, vi; в Windows — notepad) в меню, экспорт и импорт файлом, несколько шаблонов на проект
+- **Обновления** — проверка версии и обновление бинарника командой `self update` (SHA-256 из `SHA256SUMS`) или из раздела «Настройки»
+- **Пароль запуска** — Argon2id; для GitHub входит в логическое состояние и следует выбранному режиму шифрования
+- **Каталог данных** — `~/.local/share/essence-remote-control` (Linux/Termux), `~/Library/Application Support/essence-remote-control` (macOS), `%APPDATA%\essence-remote-control` (Windows); переопределяется `ESSENCE_RC_DATA_DIR`
+- **Командная строка** — `essence-rc <сущность> <действие> [--json]` без вопросов: источник, ноды, группы, шаблоны, клиенты, подключения, генерация, подписки, AmneziaWG, Telegram и сам remote-control; опасные действия показывают план и требуют `--yes --plan-token`; решения (`*_required`) возвращаются кодами с данными, секреты — через `--secrets-stdin` (`essence-rc help`)
 
 Remote Control поддерживает переносимый источник состояния GitHub. При первом
 выборе используется фиксированный приватный репозиторий
@@ -80,30 +80,43 @@ Remote Control поддерживает переносимый источник 
 без изменения пароля на VPS или автоматического SSH.
 
 
-Все shell entrypoints требуют Bash 3.2 или новее.
+Серверные shell entrypoints требуют Bash 3.2 или новее.
 
 ## Быстрый старт
 
-Запустите Remote Control — он сам загрузит серверные скрипты на VPS при первом подключении к ноде.
+Запустите Remote Control (`essence-rc`) — он сам загрузит серверные скрипты на VPS при первом подключении к ноде.
 
-**Linux / macOS — установка:**
+**Linux / macOS / Android (Termux) — установка:**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Morvex885/essence-setup-script/main/remote-control/install-remote-control.sh | sudo bash
-remote-control-essence
+curl -fsSL https://raw.githubusercontent.com/Morvex885/essence-setup-script/main/install-essence-rc.sh | bash
+essence-rc
 ```
 
-**Windows:**
+Установщик определяет ОС и архитектуру (Linux x86_64/aarch64/armv7, macOS
+Intel/Apple Silicon, Termux aarch64), скачивает `essence-rc-<target>.tar.gz` из
+последнего релиза, сверяет SHA256 с `SHA256SUMS` и ставит бинарник в
+`/usr/local/bin/essence-rc` (при необходимости через `sudo`); в Termux — в
+`$PREFIX/bin` без root. Конкретная версия: `ESSENCE_RC_VERSION=v2.0.0`.
 
-Скачайте [последний релиз](https://github.com/Morvex885/essence-setup-script/releases/latest) или клонируйте репозиторий, затем запустите:
-```cmd
-remote-control.cmd
-```
+**Windows (x64 / ARM64):**
+
+1. Скачайте из [последнего релиза](https://github.com/Morvex885/essence-setup-script/releases/latest)
+   `essence-rc-x86_64-pc-windows-msvc.zip` (или `essence-rc-aarch64-pc-windows-msvc.zip`) и `SHA256SUMS`.
+2. Сверьте хеш в PowerShell — он должен совпасть со строкой архива в `SHA256SUMS`:
+   ```powershell
+   (Get-FileHash .\essence-rc-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash.ToLower()
+   Select-String essence-rc-x86_64-pc-windows-msvc.zip .\SHA256SUMS
+   ```
+3. Распакуйте `essence-rc.exe` в каталог из `PATH` (например, `%USERPROFILE%\bin`) и запустите:
+   ```cmd
+   essence-rc
+   ```
 
 **Из исходников (для разработки):**
 ```bash
 git clone https://github.com/Morvex885/essence-setup-script.git
-cd essence-setup-script
-bash remote-control/remote-control-essence.sh
+cd essence-setup-script/remote-control
+cargo run -p essence-rc --release
 ```
 
 > **Ручная установка на VPS (альтернативный способ):**
@@ -157,7 +170,7 @@ https://<domain>:<port>/sub/<token>
 
 **Сервер:** Debian / Ubuntu, root-доступ, домен с A-записью (для VLESS Self-Steal и Subscription hosting)
 
-**Локально:** `ssh`, `jq`, `openssl`. На Windows — WSL. Отсутствующие зависимости скрипт пробует поставить сам через `common/ensure-deps.sh`.
+**Локально:** только `essence-rc` (SSH встроен). Для источника GitHub — `git` и `gh`; для QR-кода подписки — `qrencode` (необязательно).
 
 ## Структура проекта
 
@@ -188,41 +201,16 @@ essence-setup/
 |       +-- fake-site.sh           # Decoy-сайты
 |       +-- subscription.sh        # HTTPS subscription hosting
 |       +-- uninstall.sh           # Полное удаление
-+-- remote-control/                # Локальный скрипт
-|   +-- remote-control-essence.sh  # Bootstrap: меню без аргументов, CLI с аргументами
-|   +-- install-remote-control.sh  # Установщик
-|   +-- tui/                       # Слой экранов (общается с ядром только через serve)
-|   |   +-- main.sh                # Запуск процесса TUI
-|   |   +-- client.sh              # Клиент serve и общие виджеты
-|   |   +-- system.sh              # Вход, сводка, источник, настройки
-|   |   +-- nodes.sh               # Ноды, подключения, AmneziaWG, Telegram
-|   |   +-- clients.sh             # Клиенты, группы, шаблоны, генерация, подписки
-|   +-- modules/                   # Ядро команд без вопросов
-|   |   +-- nodes.sh               # Хранилище нод, шифрование паролей
-|   |   +-- ssh.sh                 # SSH/SCP обёртки
-|   |   +-- hardening.sh           # SSH hardening (ключ + порт)
-|   |   +-- clients.sh             # Клиенты + per-client credentials
-|   |   +-- groups.sh              # Группы + шаблоны
-|   |   +-- connections.sh         # Подключения нод для групп + дискавер
-|   |   +-- awg_peers.sh           # AWG peers lifecycle
-|   |   +-- templates.sh           # Обработка шаблонов (группы-маркеры)
-|   |   +-- generate.sh            # Генерация конфигов + listener sync
-|   |   +-- subscription.sh        # Публикация/ротация/отзыв подписок
-|   |   +-- self.sh                # Обновление, пароль, удаление
-|   |   +-- state.sh               # Состояние: блокировка, контрольные точки, миграции формата
-|   |   +-- github-config.sh       # Хранилище GitHub: age-снимок, синхронизация
-|   |   +-- telegram-proxy.sh      # Telegram Proxy на нодах: preflight, пакетные действия
-|   |   +-- cli.sh                 # rc_dispatch, конверт, коды выхода, секреты, справка, рендерер
-|   |   +-- session.sh             # Открытие и закрытие сессии
-|   |   +-- source.sh              # Источник конфигурации (локальный, GitHub)
-|   |   +-- serve.sh               # Протокол serve (JSON-строки)
-|   |   +-- cmd_core.sh            # Команды help, status, session, source, self
-|   |   +-- cmd_nodes.sh           # Команды node, conn, awg, telegram
-|   |   +-- cmd_clients.sh         # Команды client, group, template, generate, sub
-|   +-- templates/
-|       +-- default.yaml           # Шаблон конфига по умолчанию
-+-- tests/                         # BATS-тесты (unit + fuzz)
++-- remote-control/                # Remote Control на Rust (Cargo workspace)
+|   +-- core/                      # rc-core: модель, состояние, команды, SSH, GitHub, билдеры
+|   |   +-- src/cli.rs             # Каталог команд (грамматика v2) и справка
+|   |   +-- src/dispatch.rs        # Единый диспетчер CLI и serve, Session::mutate
+|   |   +-- templates/default.yaml # Встроенный шаблон конфига
+|   +-- tui/                       # essence-rc-tui: терминальное меню (только через serve)
+|   +-- bin/                       # essence-rc: CLI, serve v2, запуск меню
+|   +-- README.md                  # Архитектура и проверки шагов переписывания
++-- install-essence-rc.sh          # Установщик essence-rc
++-- tests/                         # BATS-тесты серверной части (unit + fuzz)
 +-- docs/                          # Документация
-+-- remote-control.cmd             # Лаунчер для Windows (WSL)
 +-- VERSION                        # Текущая версия
 ```
