@@ -1,5 +1,5 @@
 [workspace]
-members = ["core"]
+members = ["core", "bin", "tui"]
 resolver = "3"
 
 [workspace.package]
@@ -14,12 +14,16 @@ age = "0.11"
 argon2 = { version = "0.5", features = ["zeroize"] }
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
+crossterm = "0.29"
 dirs = "5"
 hex = "0.4"
 include_dir = "0.7"
 libc = "0.2"
 proptest = "1"
 rand = "0.8"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm", "crossterm_0_29"] }
+rc-core = { path = "core" }
+essence-rc-tui = { path = "tui" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 russh = { version = "0.65", default-features = false, features = ["ring", "rsa"] }
 russh-sftp = "3"
