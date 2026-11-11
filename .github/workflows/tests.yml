@@ -72,7 +72,7 @@ jobs:
         with:
           toolchain: 1.99.1
       - name: Test workspace
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --no-fail-fast
 
   rust-ssh-e2e:
     name: Rust OpenSSH integration
