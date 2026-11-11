@@ -277,7 +277,12 @@ _install_dnat_cascade() {
     # Сохраняем правила
     if ! _persist_dnat_rules; then
         warn "Не удалось сохранить DNAT правила."
-        _rollback_dnat_install "$cname" "$dnat_preexisting" "$REMOTE_SERVER" "$REMOTE_PORT" "$LOCAL_PORT"
+        # Сохранение могло записать часть правил: после отката сохранённое
+        # состояние приводится к фактическому, иначе удалённое вернётся при перезагрузке.
+        if _rollback_dnat_install "$cname" "$dnat_preexisting" "$REMOTE_SERVER" "$REMOTE_PORT" "$LOCAL_PORT" &&
+            ! _persist_dnat_rules; then
+            warn "Не удалось сохранить правила после отката: при перезагрузке могут вернуться удалённые DNAT правила. Выполните: netfilter-persistent save"
+        fi
         return 1
     fi
     success "Правила сохранены"

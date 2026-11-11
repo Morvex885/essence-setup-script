@@ -11,6 +11,8 @@ _build_vless_tcp_listener_yaml() {
     [[ "$listen" == *: ]] && listen="\"$listen\""
     dest="${dest//\\/\\\\}"; dest="${dest//\"/\\\"}"
     dest="${dest//$'\n'/\\n}"; dest="${dest//$'\r'/\\r}"
+    sni="${sni//\\/\\\\}"; sni="${sni//\"/\\\"}"
+    sni="${sni//$'\n'/\\n}"; sni="${sni//$'\r'/\\r}"
     cat <<EOF
   - name: $name
     type: vless
@@ -28,7 +30,7 @@ _build_vless_tcp_listener_yaml() {
       short-id:
         - "$short_id"
       server-names:
-        - $sni
+        - "$sni"
     proxy: $proxy
 EOF
 }
@@ -40,6 +42,8 @@ _build_vless_tcp_client_yaml() {
     local sni="$5" public_key="$6" short_id="$7"
     name="${name//\\/\\\\}"; name="${name//\"/\\\"}"
     name="${name//$'\n'/\\n}"; name="${name//$'\r'/\\r}"
+    sni="${sni//\\/\\\\}"; sni="${sni//\"/\\\"}"
+    sni="${sni//$'\n'/\\n}"; sni="${sni//$'\r'/\\r}"
     [[ "$server" == \[*\] ]] && { server="${server#\[}"; server="${server%\]}"; }
     [[ "$server" == *: ]] && server="\"$server\""
     cat <<EOF
@@ -53,7 +57,7 @@ proxies:
     udp: true
     flow: xtls-rprx-vision
     tls: true
-    servername: $sni
+    servername: "$sni"
     reality-opts:
       public-key: "$public_key"
       short-id: "$short_id"
@@ -76,6 +80,8 @@ _build_vless_tcp_exit_yaml() {
     local name="$1" server="$2" port="$3" uuid="$4" sni="$5"
     local public_key="${6:-}" short_id="${7:-}"
     local flow="${8-xtls-rprx-vision}" fingerprint="${9:-chrome}"
+    sni="${sni//\\/\\\\}"; sni="${sni//\"/\\\"}"
+    sni="${sni//$'\n'/\\n}"; sni="${sni//$'\r'/\\r}"
     [[ "$server" == \[*\] ]] && { server="${server#\[}"; server="${server%\]}"; }
     [[ "$server" == *: ]] && server="\"$server\""
 
@@ -88,7 +94,7 @@ _build_vless_tcp_exit_yaml() {
     echo "    udp: true"
     [[ -n "$flow" ]] && echo "    flow: $flow"
     echo "    tls: true"
-    echo "    servername: $sni"
+    echo "    servername: \"$sni\""
     if [[ -n "$public_key" ]]; then
         echo "    reality-opts:"
         echo "      public-key: $public_key"

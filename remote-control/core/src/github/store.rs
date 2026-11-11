@@ -17,7 +17,7 @@ use crate::state::StatePaths;
 
 const AUTHOR: [&str; 4] = ["-c", "user.name=Essence Remote Control", "-c", "user.email=remote-control@localhost"];
 const ACCOUNT_STAGE: &str = "проверка аккаунта GitHub";
-pub const PUSH_STAGE: &str = "отправка конфигурации в GitHub";
+const PUSH_STAGE: &str = "отправка конфигурации в GitHub";
 
 /// Journal callback of the running command.
 pub type Log<'a> = &'a mut dyn FnMut(Level, &str);
@@ -404,6 +404,15 @@ pub struct Prepared {
     pub pending: PendingRepo,
 }
 
+/// The branch holds committed configuration files, not just the initial empty state.
+fn holds_snapshot(store: &Path, name: &str) -> Result<bool> {
+    if !has_ref(store, name)? {
+        return Ok(false);
+    }
+    let out = store_ok(store, "чтение локальной версии конфигурации", &["ls-tree", "--name-only", name])?;
+    Ok(!out.text().is_empty())
+}
+
 fn pending_status(store: &Path, branch: &str) -> Result<SyncStatus> {
     let local = rev(store, &format!("refs/heads/{branch}"))?;
     let tracking = rev(store, &format!("refs/remotes/origin/{branch}"))?;
@@ -524,7 +533,12 @@ pub fn sync_init(paths: &StatePaths, target: &Target, store: &Path, sessions: &P
         } else if !has_ref(store, &local_ref)? && empty != Some(true) {
             return Err(fail("загрузка репозитория GitHub", fetched.diagnostic()));
         }
-        sync = if empty == Some(true) { SyncStatus::Clean } else { pending_status(store, &target.branch)? };
+        sync = match empty {
+            // No branch on GitHub yet: a pinned local snapshot still waits for push.
+            Some(true) if holds_snapshot(store, &local_ref)? => SyncStatus::Pending,
+            Some(true) => SyncStatus::Clean,
+            _ => pending_status(store, &target.branch)?,
+        };
     }
     if !has_ref(store, &local_ref)? {
         let stage = "создание локальной ветки конфигурации";
@@ -623,24 +637,29 @@ pub fn push(paths: &StatePaths, target: &Target, work: &WorkSession, head: &str)
     Ok(())
 }
 
+/// A failed flush. `pinned`: the commit already sits on the local branch, so
+/// the change survives as pending and must never be rolled back.
+pub struct FlushFailure {
+    pub error: RcError,
+    pub pinned: bool,
+}
+
 /// v1 `github_sync_flush`. Any failure leaves `sync` pending; diverged remote
 /// history is rejected by push, never merged.
-pub fn flush(paths: &StatePaths, target: &Target, work: &WorkSession, storage: Storage, sync: &mut SyncStatus) -> Result<()> {
+pub fn flush(paths: &StatePaths, target: &Target, work: &WorkSession, storage: Storage, sync: &mut SyncStatus)
+    -> std::result::Result<(), FlushFailure>
+{
+    let unpinned = |error: RcError| FlushFailure { error, pinned: false };
     let result = (|| {
-        target_guard(work, target)?;
-        let Some(head) = commit(work, storage, *sync == SyncStatus::Pending)? else {
+        target_guard(work, target).map_err(unpinned)?;
+        let Some(head) = commit(work, storage, *sync == SyncStatus::Pending).map_err(unpinned)? else {
             return Ok(());
         };
-        push(paths, target, work, &head)
+        // Every later failure (account check, gh/git not starting, push) is after the pin.
+        push(paths, target, work, &head).map_err(|error| FlushFailure { error, pinned: true })
     })();
     *sync = if result.is_ok() { SyncStatus::Clean } else { SyncStatus::Pending };
     result
-}
-
-/// A push or account failure happens after the commit is pinned locally: the
-/// mutation is kept as pending instead of being rolled back.
-pub fn failed_after_pin(error: &RcError) -> bool {
-    matches!(super::stage_of(error), Some(PUSH_STAGE | ACCOUNT_STAGE))
 }
 
 #[cfg(test)]
@@ -694,5 +713,43 @@ mod tests {
         assert_eq!(rev(&store, "refs/remotes/origin/main").unwrap().as_deref(), Some(rewritten.as_str()));
         assert_eq!(rev(&store, "refs/heads/main").unwrap().as_deref(), Some(second.as_str()));
         assert!(!is_ancestor(&store, &second, &rewritten).unwrap());
+    }
+
+    #[test]
+    fn flush_reports_whether_its_commit_was_pinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = StatePaths::new(dir.path().join("data"));
+        let target = Target::new("octo", "essence-remote-control-config", "main");
+        let store = dir.path().join("store.git");
+        let mut init = exec::git();
+        init.args(["init", "-q", "--bare"]).arg(&store);
+        assert!(exec::run(init, None, exec::LOCAL_TIMEOUT).unwrap().success);
+        store_ok(&store, "test", &["remote", "add", "origin", &target.url()]).unwrap();
+        let tree = store_ok(&store, "test", &["mktree"]).unwrap().text();
+        let mut list = AUTHOR.to_vec();
+        list.extend(["commit-tree", &tree, "-m", "Initial empty state"]);
+        let initial = store_ok(&store, "test", &list).unwrap().text();
+        let local_ref = "refs/heads/main";
+        update_ref(&store, local_ref, &initial).unwrap();
+        assert!(!holds_snapshot(&store, local_ref).unwrap(), "the initial empty state is not a snapshot");
+        assert!(!holds_snapshot(&store, "refs/heads/none").unwrap());
+        let work = open_worktree(&store, &dir.path().join("sessions"), "main").unwrap();
+        fs::write(work.worktree.join("config.json"), "{}\n").unwrap();
+
+        // Refused before the commit: nothing is pinned.
+        let mut sync = SyncStatus::Clean;
+        let other = Target::new("other", "essence-remote-control-config", "main");
+        let failure = flush(&paths, &other, &work, Storage::Plain, &mut sync).err().expect("foreign target");
+        assert!(!failure.pinned && sync == SyncStatus::Pending);
+        assert_eq!(rev(&store, local_ref).unwrap().as_deref(), Some(initial.as_str()));
+
+        // The account check fails (gh absent or the empty profile is not
+        // logged in), whatever its stage: the commit is already pinned.
+        let failure = flush(&paths, &target, &work, Storage::Plain, &mut sync).err().expect("no GitHub account");
+        assert!(failure.pinned, "{}", failure.error.message);
+        let head = work.head().unwrap();
+        assert_ne!(head, initial);
+        assert_eq!(rev(&store, local_ref).unwrap(), Some(head));
+        assert!(holds_snapshot(&store, local_ref).unwrap() && sync == SyncStatus::Pending);
     }
 }

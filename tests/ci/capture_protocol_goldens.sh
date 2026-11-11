@@ -229,6 +229,8 @@ c uri _parse_vless_uri_to_exit vl_uuid_truncated_pct '<none>' 'p' 'vless://u%2@h
 c uri _parse_vless_uri_to_exit vl_uuid_nul '<none>' 'p' 'vless://u%00@h:443?type=tcp'
 c uri _parse_vless_uri_to_exit vl_grpc_service_quote '<none>' 'p' 'vless://u@h:443?type=grpc&serviceName=a%22b%5Cc'
 c uri _parse_vless_uri_to_exit vl_xhttp_path_quote '<none>' 'p' 'vless://u@h:443?type=xhttp&path=%2Fa%22b%5Cc'
+c uri _parse_vless_uri_to_exit vl_ipv6_any_default_sni '<none>' 'p' 'vless://u@[::]:443?type=tcp'
+c uri _parse_vless_uri_to_exit vl_sni_quote '<none>' 'p' 'vless://u@h:443?type=grpc&sni=a%22b%5Cc%20%23x'
 
 # ── _parse_hy2_uri_to_exit ──────────────────────────────────────────────────
 
@@ -328,6 +330,7 @@ c vless-tcp _build_vless_tcp_listener_yaml tl_cr_pk '<none>' 'x' '0.0.0.0' 443 a
 c vless-tcp _build_vless_tcp_listener_yaml tl_port_2053 '<none>' 'x' '0.0.0.0' 2053 alice "$UUID" 'd:443' pk sid sni.example DIRECT
 c vless-tcp _build_vless_tcp_listener_yaml tl_listen_bracketed '<none>' 'x' '[::]' 443 alice "$UUID" 'd:443' pk sid sni.example DIRECT
 c vless-tcp _build_vless_tcp_listener_yaml tl_dest_quote '<none>' 'x' '0.0.0.0' 443 alice "$UUID" 'a"b\c:443' pk sid sni.example DIRECT
+c vless-tcp _build_vless_tcp_listener_yaml tl_sni_special '<none>' 'x' '0.0.0.0' 443 alice "$UUID" 'd:443' pk sid '::' DIRECT
 
 c vless-tcp _build_vless_tcp_client_yaml tc_basic '<none>' 'vless-exit' 'exit.example.com' 443 "$UUID" 'www.microsoft.com' PUBKEY abcd
 c vless-tcp _build_vless_tcp_client_yaml tc_ipv6 '<none>' 'v6' '[2001:db8::1]' 443 "$UUID" sni.example PUBKEY abcd
@@ -508,6 +511,7 @@ c listener-users _build_hy2_users_yaml hu_users_empty ''
 c listener-users _build_hy2_users_yaml hu_users_no_pass $'alice\n'
 c listener-users _build_hy2_users_yaml hu_users_tab $'a\tb\n'
 c listener-users _build_hy2_users_yaml hu_users_no_trailing_newline $'alice p1\nbob p2'
+c listener-users _build_hy2_users_yaml hu_users_quote_backslash $'eve a #"b\\c\nmax -x: y\n'
 
 sync_case sy_vless_tcp_replace vless-tcp "$USERS_TCP" "$SYNC_BASE"
 sync_case sy_delete_all vless-tcp '' "$SYNC_BASE"

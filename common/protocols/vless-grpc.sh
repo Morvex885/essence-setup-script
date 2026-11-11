@@ -13,6 +13,8 @@ _build_vless_grpc_listener_yaml() {
     service="${service//$'\n'/\\n}"; service="${service//$'\r'/\\r}"
     dest="${dest//\\/\\\\}"; dest="${dest//\"/\\\"}"
     dest="${dest//$'\n'/\\n}"; dest="${dest//$'\r'/\\r}"
+    sni="${sni//\\/\\\\}"; sni="${sni//\"/\\\"}"
+    sni="${sni//$'\n'/\\n}"; sni="${sni//$'\r'/\\r}"
     cat <<EOF
   - name: $name
     type: vless
@@ -30,7 +32,7 @@ _build_vless_grpc_listener_yaml() {
       short-id:
         - "$short_id"
       server-names:
-        - $sni
+        - "$sni"
     proxy: $proxy
 EOF
 }
@@ -44,6 +46,8 @@ _build_vless_grpc_client_yaml() {
     name="${name//$'\n'/\\n}"; name="${name//$'\r'/\\r}"
     service="${service//\\/\\\\}"; service="${service//\"/\\\"}"
     service="${service//$'\n'/\\n}"; service="${service//$'\r'/\\r}"
+    sni="${sni//\\/\\\\}"; sni="${sni//\"/\\\"}"
+    sni="${sni//$'\n'/\\n}"; sni="${sni//$'\r'/\\r}"
     [[ "$server" == \[*\] ]] && { server="${server#\[}"; server="${server%\]}"; }
     [[ "$server" == *: ]] && server="\"$server\""
     cat <<EOF
@@ -56,7 +60,7 @@ proxies:
     network: grpc
     udp: true
     tls: true
-    servername: $sni
+    servername: "$sni"
     grpc-opts:
       grpc-service-name: "$service"
     reality-opts:
@@ -82,6 +86,8 @@ _build_vless_grpc_exit_yaml() {
     local service="$6" public_key="${7:-}" short_id="${8:-}" fingerprint="${9:-chrome}"
     service="${service//\\/\\\\}"; service="${service//\"/\\\"}"
     service="${service//$'\n'/\\n}"; service="${service//$'\r'/\\r}"
+    sni="${sni//\\/\\\\}"; sni="${sni//\"/\\\"}"
+    sni="${sni//$'\n'/\\n}"; sni="${sni//$'\r'/\\r}"
     [[ "$server" == \[*\] ]] && { server="${server#\[}"; server="${server%\]}"; }
     [[ "$server" == *: ]] && server="\"$server\""
 
@@ -95,7 +101,7 @@ _build_vless_grpc_exit_yaml() {
     echo "    grpc-opts:"
     echo "      grpc-service-name: \"$service\""
     echo "    tls: true"
-    echo "    servername: $sni"
+    echo "    servername: \"$sni\""
     if [[ -n "$public_key" ]]; then
         echo "    reality-opts:"
         echo "      public-key: $public_key"

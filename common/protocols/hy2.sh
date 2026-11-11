@@ -42,6 +42,8 @@ _build_hy2_client_yaml() {
     pass="${pass//$'\n'/\\n}"; pass="${pass//$'\r'/\\r}"
     obfs_pass="${obfs_pass//\\/\\\\}"; obfs_pass="${obfs_pass//\"/\\\"}"
     obfs_pass="${obfs_pass//$'\n'/\\n}"; obfs_pass="${obfs_pass//$'\r'/\\r}"
+    sni="${sni//\\/\\\\}"; sni="${sni//\"/\\\"}"
+    sni="${sni//$'\n'/\\n}"; sni="${sni//$'\r'/\\r}"
     # YAML address: "[v6]" loses its brackets, a trailing ":" ("::") needs quotes.
     [[ "$server" == \[*\] ]] && { server="${server#\[}"; server="${server%\]}"; }
     [[ "$server" == *: ]] && server="\"$server\""
@@ -52,7 +54,7 @@ _build_hy2_client_yaml() {
     echo "    server: $server"
     echo "    port: $port"
     echo "    password: \"$pass\""
-    echo "    sni: $sni"
+    echo "    sni: \"$sni\""
     echo "    skip-cert-verify: $skip_verify"
     if [[ -n "$obfs_pass" ]]; then
         echo "    obfs: salamander"
@@ -81,6 +83,8 @@ _build_hy2_exit_yaml() {
     pass="${pass//$'\n'/\\n}"; pass="${pass//$'\r'/\\r}"
     obfs_pass="${obfs_pass//\\/\\\\}"; obfs_pass="${obfs_pass//\"/\\\"}"
     obfs_pass="${obfs_pass//$'\n'/\\n}"; obfs_pass="${obfs_pass//$'\r'/\\r}"
+    sni="${sni//\\/\\\\}"; sni="${sni//\"/\\\"}"
+    sni="${sni//$'\n'/\\n}"; sni="${sni//$'\r'/\\r}"
     [[ "$server" == \[*\] ]] && { server="${server#\[}"; server="${server%\]}"; }
     [[ "$server" == *: ]] && server="\"$server\""
 
@@ -89,7 +93,7 @@ _build_hy2_exit_yaml() {
     echo "    server: $server"
     echo "    port: $port"
     echo "    password: \"$pass\""
-    echo "    sni: $sni"
+    echo "    sni: \"$sni\""
     echo "    skip-cert-verify: $skip_verify"
     if [[ -n "$obfs_pass" ]]; then
         echo "    obfs: salamander"

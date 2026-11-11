@@ -73,11 +73,7 @@ fn yaml_names(line: &str) -> Vec<String> {
         let value = line[start..].trim_start();
         let offset = line.len() - value.len();
         let (name, length) = match value.chars().next() {
-            Some(quote @ ('"' | '\'')) => {
-                let body = &value[1..];
-                let end = body.find(quote).unwrap_or(body.len());
-                (body[..end].to_owned(), (end + 2).min(value.len()))
-            }
+            Some(quote @ ('"' | '\'')) => quoted_scalar(&value[1..], quote),
             _ => {
                 let end = if flow { value.find([',', '}']).unwrap_or(value.len()) } else { value.len() };
                 let scalar = &value[..end];
@@ -91,6 +87,34 @@ fn yaml_names(line: &str) -> Vec<String> {
         }
     }
     names
+}
+
+/// Decoded body of a quoted scalar (after the opening quote) and the bytes
+/// consumed including both quotes. Double quotes decode the escapes the
+/// builders emit (`\\`, `\"`, `\n`, `\r`; others stay verbatim); single quotes
+/// decode `''`. An unterminated scalar runs to the end of the line.
+fn quoted_scalar(body: &str, quote: char) -> (String, usize) {
+    let mut name = String::new();
+    let mut chars = body.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        match ch {
+            '\\' if quote == '"' => match chars.next() {
+                Some((_, '\\')) => name.push('\\'),
+                Some((_, '"')) => name.push('"'),
+                Some((_, 'n')) => name.push('\n'),
+                Some((_, 'r')) => name.push('\r'),
+                Some((_, other)) => { name.push('\\'); name.push(other); }
+                None => name.push('\\'),
+            },
+            '\'' if quote == '\'' && chars.peek().is_some_and(|&(_, next)| next == '\'') => {
+                chars.next();
+                name.push('\'');
+            }
+            _ if ch == quote => return (name, index + 2),
+            _ => name.push(ch),
+        }
+    }
+    (name, body.len() + 1)
 }
 
 fn node_groups(config: &Config, node: &str) -> Value {
@@ -358,6 +382,8 @@ mod tests {
         assert_eq!(parse_discovered(config), ["AWG", "Hysteria2", "VLESS TCP", "hy2-flow", "vless-cascade [DE->RU]"]);
         assert!(parse_discovered("").is_empty());
         assert!(parse_discovered("  type: hysteria2\n").is_empty());
+        let escaped = "  - name: \"vless \\\"q\\\" a\\\\b\\nc\"\n  - {name: 'hy2 it''s', type: hysteria2}\n  - name: \"vless-open\n";
+        assert_eq!(parse_discovered(escaped), ["hy2 it's", "vless \"q\" a\\b\nc", "vless-open"]);
     }
 
     #[test]

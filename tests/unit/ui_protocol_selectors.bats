@@ -232,7 +232,7 @@ _redirect_vless_config() {
     assert_output --partial 'server: vpn.example'
     assert_output --partial 'port: 443'
     assert_output --partial 'uuid: auth-uuid'
-    assert_output --partial 'servername: vpn.example'
+    assert_output --partial 'servername: "vpn.example"'
     assert_output --partial 'path: "/"'
 }
 

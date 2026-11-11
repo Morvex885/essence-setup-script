@@ -325,12 +325,43 @@ fn data_layout_reason(data: &Path) -> Option<&'static str> {
     None
 }
 
+/// Why another user could swap the data root (or one of its ancestors) between
+/// the checks and `remove_dir_all`. The canonical path has no symlinks, and
+/// `remove_dir_all` never follows them below it; only renames in a writable
+/// ancestor remain, so every ancestor must be owned by the effective user or
+/// root and not writable by group/others (sticky directories such as `/tmp`
+/// forbid renaming foreign entries). The data root itself must not be shared.
+#[cfg(unix)]
+fn data_swappable_reason(canonical: &Path) -> Option<&'static str> {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid has no preconditions.
+    let euid = unsafe { libc::geteuid() };
+    for dir in canonical.ancestors() {
+        let Ok(metadata) = fs::symlink_metadata(dir) else { return Some("не удаётся проверить права каталога") };
+        let owned = metadata.uid() == euid || metadata.uid() == 0;
+        let shared = metadata.mode() & 0o022 != 0 && (dir == canonical || metadata.mode() & 0o1000 == 0);
+        if !owned || shared {
+            return Some("каталог или его родитель может изменить другой пользователь");
+        }
+    }
+    None
+}
+
+/// Windows has no `sudo`; profile directories are owner-only by default.
+#[cfg(not(unix))]
+fn data_swappable_reason(_canonical: &Path) -> Option<&'static str> {
+    None
+}
+
 /// The canonical data root may be removed recursively.
 fn ensure_data_removable(canonical: &Path, exe: &Path) -> Result<()> {
     let home = dirs::home_dir()
         .ok_or_else(|| RcError::new("failed", "Не удалось определить домашний каталог."))?;
     let home = fs::canonicalize(&home).unwrap_or(home);
-    match data_unsafe_reason(canonical, &home, exe).or_else(|| data_layout_reason(canonical)) {
+    let reason = data_unsafe_reason(canonical, &home, exe)
+        .or_else(|| data_swappable_reason(canonical))
+        .or_else(|| data_layout_reason(canonical));
+    match reason {
         Some(reason) => Err(unsafe_data_path(canonical, reason)),
         None => Ok(()),
     }
@@ -931,6 +962,28 @@ mod tests {
         );
         assert_eq!(data_unsafe_reason(Path::new("/home/user/.local/share/essence-remote-control"), home, exe), None);
         assert_eq!(data_unsafe_reason(Path::new("/tmp/data"), home, exe), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_data_roots_and_parents_are_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::tempdir().unwrap();
+        let data = parent.path().join("data");
+        fs::create_dir(&data).unwrap();
+        let canonical = fs::canonicalize(&data).unwrap();
+        fs::set_permissions(&canonical, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        // Depends on the ancestors of the temporary directory only.
+        let baseline = data_swappable_reason(&canonical);
+        let shared = Some("каталог или его родитель может изменить другой пользователь");
+        fs::set_permissions(&canonical, fs::Permissions::from_mode(0o777)).unwrap();
+        assert_eq!(data_swappable_reason(&canonical), shared, "shared data root");
+        fs::set_permissions(&canonical, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        assert_eq!(data_swappable_reason(&canonical), shared, "renames possible in the parent");
+        fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o1777)).unwrap();
+        assert_eq!(data_swappable_reason(&canonical), baseline, "a sticky parent forbids foreign renames");
     }
 
     #[test]

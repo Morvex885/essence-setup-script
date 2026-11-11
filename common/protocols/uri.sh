@@ -146,7 +146,8 @@ _parse_vless_uri_to_exit() {
     [[ -z "$C_SNI" ]] && C_SNI="$C_SERVER"
 
     echo "" >&2
-    info "VLESS $C_TYPE: $C_SERVER:$C_PORT (SNI: $C_SNI)" >&2
+    # info/warn print via `echo -e`: double backslashes so URI text is shown verbatim.
+    info "VLESS ${C_TYPE//\\/\\\\}: ${C_SERVER//\\/\\\\}:${C_PORT//\\/\\\\} (SNI: ${C_SNI//\\/\\\\})" >&2
 
     case "$C_TYPE" in
         tcp)
@@ -165,7 +166,7 @@ _parse_vless_uri_to_exit() {
                 "$C_UUID" "$C_SNI" "$C_SERVICE" "$C_PUBKEY" "$C_SHORT_ID" "$C_FP"
             ;;
         *)
-            warn "Неизвестный транспорт VLESS: $C_TYPE. Поддерживаются: tcp, xhttp, grpc"
+            warn "Неизвестный транспорт VLESS: ${C_TYPE//\\/\\\\}. Поддерживаются: tcp, xhttp, grpc"
             return 1
             ;;
     esac
@@ -209,7 +210,7 @@ _parse_hy2_uri_to_exit() {
     [[ "$C_INSECURE" == "1" ]] && skip_verify="true"
 
     echo "" >&2
-    info "Hysteria2: $C_SERVER:$C_PORT" >&2
+    info "Hysteria2: ${C_SERVER//\\/\\\\}:${C_PORT//\\/\\\\}" >&2
     [[ -n "$C_OBFS_PASS" ]] && info "Obfs: salamander" >&2
 
     _build_hy2_exit_yaml "$proxy_name" "$C_SERVER" "$C_PORT" "$C_PASS" "$C_SNI" "$skip_verify" "$C_OBFS_PASS"

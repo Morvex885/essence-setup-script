@@ -19,20 +19,31 @@ pub fn listener_yaml(listener: &VlessListener) -> String {
     )
 }
 
-/// `reality-config` + `proxy` tail shared by the Reality listeners. `dest` is
-/// quoted: an IPv6 `[addr]:port` would otherwise start a YAML flow sequence.
+/// `reality-config` + `proxy` tail shared by the Reality listeners. `dest` and
+/// the SNI are quoted: an IPv6 `[addr]:port` would otherwise start a YAML flow
+/// sequence, and an SNI such as `::` is not a valid plain scalar.
 pub(super) fn reality_config(listener: &VlessListener) -> String {
     format!(
-        "    reality-config:\n      dest: \"{}\"\n      private-key: \"{}\"\n      short-id:\n        - \"{}\"\n      server-names:\n        - {}\n    proxy: {}\n",
-        yaml_escape(listener.dest), listener.private_key, listener.short_id, listener.sni, listener.proxy
+        "    reality-config:\n      dest: \"{}\"\n      private-key: \"{}\"\n      short-id:\n        - \"{}\"\n      server-names:\n        - \"{}\"\n    proxy: {}\n",
+        yaml_escape(listener.dest),
+        listener.private_key,
+        listener.short_id,
+        yaml_escape(listener.sni),
+        listener.proxy
     )
 }
 
 /// Client config: a `proxies:` document with one quoted-name proxy.
 pub fn client_yaml(vless: &Vless) -> String {
     format!(
-        "proxies:\n  - name: \"{}\"\n    type: vless\n    server: {}\n    port: {}\n    uuid: {}\n    network: tcp\n    udp: true\n    flow: {FLOW}\n    tls: true\n    servername: {}\n    reality-opts:\n      public-key: \"{}\"\n      short-id: \"{}\"\n    client-fingerprint: chrome\n",
-        yaml_escape(vless.name), yaml_host(vless.server), vless.port, vless.uuid, vless.sni, vless.public_key, vless.short_id
+        "proxies:\n  - name: \"{}\"\n    type: vless\n    server: {}\n    port: {}\n    uuid: {}\n    network: tcp\n    udp: true\n    flow: {FLOW}\n    tls: true\n    servername: \"{}\"\n    reality-opts:\n      public-key: \"{}\"\n      short-id: \"{}\"\n    client-fingerprint: chrome\n",
+        yaml_escape(vless.name),
+        yaml_host(vless.server),
+        vless.port,
+        vless.uuid,
+        yaml_escape(vless.sni),
+        vless.public_key,
+        vless.short_id
     )
 }
 
@@ -61,7 +72,7 @@ pub fn exit_yaml(vless: &Vless, flow: &str, fingerprint: &str) -> String {
         line(&mut out, &format!("    flow: {flow}"));
     }
     line(&mut out, "    tls: true");
-    line(&mut out, &format!("    servername: {}", vless.sni));
+    line(&mut out, &format!("    servername: \"{}\"", yaml_escape(vless.sni)));
     push_reality_opts(&mut out, vless);
     line(&mut out, &format!("    client-fingerprint: {}", or(fingerprint, "chrome")));
     out
@@ -86,7 +97,10 @@ mod tests {
         let yaml = exit_yaml(&vless, "", "");
         assert!(!yaml.contains("    flow:"));
         assert!(exit_yaml(&vless, FLOW, "").contains("    flow: xtls-rprx-vision\n"));
-        assert!(yaml.ends_with("    servername: s\n    client-fingerprint: chrome\n"));
+        assert!(yaml.ends_with("    servername: \"s\"\n    client-fingerprint: chrome\n"));
+        let sni = Vless { sni: "::", ..vless };
+        assert!(exit_yaml(&sni, "", "").contains("    servername: \"::\"\n"));
+        assert!(client_yaml(&Vless { sni: "a\"b", ..vless }).contains("    servername: \"a\\\"b\"\n"));
         assert!(uri(&Vless { name: "", ..vless }).ends_with("&type=tcp#VLESS%20TCP\n"));
     }
 }

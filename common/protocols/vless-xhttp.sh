@@ -13,6 +13,8 @@ _build_vless_xhttp_listener_yaml() {
     path="${path//$'\n'/\\n}"; path="${path//$'\r'/\\r}"
     dest="${dest//\\/\\\\}"; dest="${dest//\"/\\\"}"
     dest="${dest//$'\n'/\\n}"; dest="${dest//$'\r'/\\r}"
+    sni="${sni//\\/\\\\}"; sni="${sni//\"/\\\"}"
+    sni="${sni//$'\n'/\\n}"; sni="${sni//$'\r'/\\r}"
     cat <<EOF
   - name: $name
     type: vless
@@ -32,7 +34,7 @@ _build_vless_xhttp_listener_yaml() {
       short-id:
         - "$short_id"
       server-names:
-        - $sni
+        - "$sni"
     proxy: $proxy
 EOF
 }
@@ -82,6 +84,8 @@ _build_vless_xhttp_client_yaml() {
     name="${name//$'\n'/\\n}"; name="${name//$'\r'/\\r}"
     path="${path//\\/\\\\}"; path="${path//\"/\\\"}"
     path="${path//$'\n'/\\n}"; path="${path//$'\r'/\\r}"
+    sni="${sni//\\/\\\\}"; sni="${sni//\"/\\\"}"
+    sni="${sni//$'\n'/\\n}"; sni="${sni//$'\r'/\\r}"
     [[ "$server" == \[*\] ]] && { server="${server#\[}"; server="${server%\]}"; }
     [[ "$server" == *: ]] && server="\"$server\""
 
@@ -94,7 +98,7 @@ _build_vless_xhttp_client_yaml() {
     echo "    network: xhttp"
     echo "    udp: true"
     echo "    tls: true"
-    echo "    servername: $sni"
+    echo "    servername: \"$sni\""
     echo "    xhttp-opts:"
     echo "      path: \"$path\""
     echo "      mode: auto"
@@ -136,6 +140,8 @@ _build_vless_xhttp_exit_yaml() {
     local public_key="${8:-}" short_id="${9:-}"
     path="${path//\\/\\\\}"; path="${path//\"/\\\"}"
     path="${path//$'\n'/\\n}"; path="${path//$'\r'/\\r}"
+    sni="${sni//\\/\\\\}"; sni="${sni//\"/\\\"}"
+    sni="${sni//$'\n'/\\n}"; sni="${sni//$'\r'/\\r}"
     [[ "$server" == \[*\] ]] && { server="${server#\[}"; server="${server%\]}"; }
     [[ "$server" == *: ]] && server="\"$server\""
 
@@ -150,7 +156,7 @@ _build_vless_xhttp_exit_yaml() {
     echo "      path: \"$path\""
     echo "      mode: $mode"
     echo "    tls: true"
-    echo "    servername: $sni"
+    echo "    servername: \"$sni\""
     if [[ -n "$public_key" ]]; then
         echo "    reality-opts:"
         echo "      public-key: $public_key"

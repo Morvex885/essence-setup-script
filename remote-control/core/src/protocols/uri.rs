@@ -13,8 +13,9 @@ pub enum UriError {
     VlessPercent,
     #[error("Некорректное percent-кодирование в Hysteria2 URI")]
     Hy2Percent,
-    #[error("Неизвестный транспорт VLESS: {0}. Поддерживаются: tcp, xhttp, grpc")]
-    UnknownTransport(String),
+    /// `note` is the informational line v1 printed before failing.
+    #[error("Неизвестный транспорт VLESS: {transport}. Поддерживаются: tcp, xhttp, grpc")]
+    UnknownTransport { transport: String, note: String },
     #[error("Неизвестный протокол. Поддерживаются: vless://, hysteria2://, hy2://")]
     UnknownScheme,
 }
@@ -168,13 +169,13 @@ pub fn parse_vless_uri(name: &str, uri: &str) -> Result<ExitProxy, UriError> {
         public_key: &public_key,
         short_id: &short_id,
     };
+    let note = format!("VLESS {transport}: {}:{} (SNI: {sni})", parts.server, parts.port);
     let yaml = match transport.as_str() {
         "tcp" => vless_tcp::exit_yaml(&vless, super::or(&flow, vless_tcp::FLOW), &fingerprint),
         "xhttp" => vless_xhttp::exit_yaml(&vless, super::or(&path, "/"), &mode),
         "grpc" => vless_grpc::exit_yaml(&vless, super::or(&service, "grpc"), &fingerprint),
-        _ => return Err(UriError::UnknownTransport(transport)),
+        _ => return Err(UriError::UnknownTransport { transport, note }),
     };
-    let note = format!("VLESS {transport}: {}:{} (SNI: {sni})", parts.server, parts.port);
     Ok(ExitProxy { yaml, notes: vec![note] })
 }
 
@@ -257,7 +258,10 @@ mod tests {
 
     #[test]
     fn unknown_transport_and_scheme_fail() {
-        assert_eq!(parse_proxy_uri("p", "vless://u@h:1?type=quic\n"), Err(UriError::UnknownTransport("quic".into())));
+        assert_eq!(
+            parse_proxy_uri("p", "vless://u@h:1?type=quic\n"),
+            Err(UriError::UnknownTransport { transport: "quic".into(), note: "VLESS quic: h:1 (SNI: h)".into() })
+        );
         assert_eq!(parse_proxy_uri("p", "https://x\n"), Err(UriError::UnknownScheme));
         assert_eq!(parse_proxy_uri("p", ""), Err(UriError::UnknownScheme));
     }

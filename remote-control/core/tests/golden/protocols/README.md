@@ -73,8 +73,9 @@ variation that were removed or pinned:
   (uuid, password, sni, pbk, sid, serviceName, obfs-password, fragment).
 - Client YAML `name:` escapes `\`, `"`, CR and LF inside the double quotes.
   The same escaping applies to the double-quoted xHTTP `path`, gRPC
-  `grpc-service-name`, Reality `dest` and Hysteria2 `password` /
-  `obfs-password` (listener user password included).
+  `grpc-service-name`, Reality `dest`, SNI (`servername`, `server-names`,
+  Hysteria2 `sni`) and Hysteria2 `password` / `obfs-password` (listener and
+  `_build_hy2_users_yaml` user passwords included).
 - YAML `server:` / `listen:` addresses drop the brackets of `[v6]`; an address
   ending with `:` (`::`, `2001:db8::`) is double-quoted.
 - `_parse_vless_uri_to_exit` percent-decodes the UUID; a malformed escape or

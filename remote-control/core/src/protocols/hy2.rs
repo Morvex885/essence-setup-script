@@ -53,11 +53,11 @@ pub fn listener_yaml(listener: &Hy2Listener) -> String {
 
 fn proxy_body(out: &mut String, hy2: &Hy2) {
     out.push_str(&format!(
-        "    type: hysteria2\n    server: {}\n    port: {}\n    password: \"{}\"\n    sni: {}\n    skip-cert-verify: {}\n",
+        "    type: hysteria2\n    server: {}\n    port: {}\n    password: \"{}\"\n    sni: \"{}\"\n    skip-cert-verify: {}\n",
         yaml_host(hy2.server),
         hy2.port,
         yaml_escape(hy2.password),
-        or(hy2.sni, DEFAULT_SNI),
+        yaml_escape(or(hy2.sni, DEFAULT_SNI)),
         hy2.skip_cert_verify
     ));
     push_obfs(out, hy2.obfs_password);

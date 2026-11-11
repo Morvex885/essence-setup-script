@@ -31,11 +31,11 @@ pub fn vless_users_yaml<'a>(marker: &str, users: impl IntoIterator<Item = (&'a s
 }
 
 /// Users block of the Hysteria2 listener; pairs with an empty name or
-/// password are skipped.
+/// password are skipped. Passwords are double-quoted YAML strings.
 pub fn hy2_users_yaml<'a>(users: impl IntoIterator<Item = (&'a str, &'a str)>) -> String {
     let mut out = String::new();
     for (name, password) in users.into_iter().filter(|(n, p)| !n.is_empty() && !p.is_empty()) {
-        out.push_str(&format!("      {name}: {password}\n"));
+        out.push_str(&format!("      {name}: \"{}\"\n", super::yaml_escape(password)));
     }
     out
 }
@@ -115,7 +115,7 @@ mod tests {
     fn users_keep_last_line_and_strip_cr() {
         let pairs = parse_user_lines("alice  u1\r\n\n  \nbad\nbob u2");
         assert_eq!(vless_users_yaml("vless-grpc", pairs.iter().copied()), "      - username: alice\n        uuid: u1\n      - username: bob\n        uuid: u2\n");
-        assert_eq!(hy2_users_yaml(parse_user_lines("a\tb\nc p#&\n")), "      c: p#&\n");
+        assert_eq!(hy2_users_yaml(parse_user_lines("a\tb\nc p#&\nd x\"y\\z\r\n")), "      c: \"p#&\"\n      d: \"x\\\"y\\\\z\"\n");
     }
 
     #[test]

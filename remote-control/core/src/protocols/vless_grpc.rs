@@ -23,12 +23,12 @@ pub fn listener_yaml(listener: &VlessListener, service: &str) -> String {
 /// Client config: a `proxies:` document with one quoted-name proxy.
 pub fn client_yaml(vless: &Vless, service: &str) -> String {
     format!(
-        "proxies:\n  - name: \"{}\"\n    type: vless\n    server: {}\n    port: {}\n    uuid: {}\n    network: grpc\n    udp: true\n    tls: true\n    servername: {}\n    grpc-opts:\n      grpc-service-name: \"{}\"\n    reality-opts:\n      public-key: \"{}\"\n      short-id: \"{}\"\n    client-fingerprint: chrome\n",
+        "proxies:\n  - name: \"{}\"\n    type: vless\n    server: {}\n    port: {}\n    uuid: {}\n    network: grpc\n    udp: true\n    tls: true\n    servername: \"{}\"\n    grpc-opts:\n      grpc-service-name: \"{}\"\n    reality-opts:\n      public-key: \"{}\"\n      short-id: \"{}\"\n    client-fingerprint: chrome\n",
         yaml_escape(vless.name),
         yaml_host(vless.server),
         vless.port,
         vless.uuid,
-        vless.sni,
+        yaml_escape(vless.sni),
         yaml_escape(service),
         vless.public_key,
         vless.short_id
@@ -53,13 +53,13 @@ pub fn uri(vless: &Vless, service: &str) -> String {
 /// Cascade exit proxy item; empty `fingerprint` → `chrome`.
 pub fn exit_yaml(vless: &Vless, service: &str, fingerprint: &str) -> String {
     let mut out = format!(
-        "  - name: {}\n    type: vless\n    server: {}\n    port: {}\n    uuid: {}\n    network: grpc\n    udp: true\n    grpc-opts:\n      grpc-service-name: \"{}\"\n    tls: true\n    servername: {}\n",
+        "  - name: {}\n    type: vless\n    server: {}\n    port: {}\n    uuid: {}\n    network: grpc\n    udp: true\n    grpc-opts:\n      grpc-service-name: \"{}\"\n    tls: true\n    servername: \"{}\"\n",
         vless.name,
         yaml_host(vless.server),
         vless.port,
         vless.uuid,
         yaml_escape(service),
-        vless.sni
+        yaml_escape(vless.sni)
     );
     push_reality_opts(&mut out, vless);
     line(&mut out, &format!("    client-fingerprint: {}", or(fingerprint, "chrome")));

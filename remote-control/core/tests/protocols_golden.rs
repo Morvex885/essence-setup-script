@@ -1,6 +1,6 @@
 //! Replays the Bash protocol goldens (`tests/golden/protocols/*.json`, see
 //! the README there) against the Rust port in `rc_core::protocols`: stdout
-//! bytes and rc must match, and stderr for the URI parsers' notes.
+//! bytes and rc must match, and stderr for the URI parsers' notes and warnings.
 
 use std::path::Path;
 use std::process::Command;
@@ -84,16 +84,24 @@ fn warn(text: &str) -> String {
     format!("  \x1b[1;33m[!]\x1b[0m {text}\n")
 }
 
-/// Parsers print an empty line and their notes on stderr; errors other than
-/// an unknown scheme are warned on stdout.
+/// Parsers print an empty line and their notes on stderr. An unknown scheme
+/// is warned on stderr; other errors are warned on stdout, an unknown
+/// transport after its note, percent-coding errors before anything else.
 fn parsed(result: Result<ExitProxy, UriError>, stderr_prefix: &str) -> Outcome {
     match result {
         Ok(exit) => {
             let notes: String = exit.notes.iter().map(|note| info(note)).collect();
             Outcome { stdout: exit.yaml.into_bytes(), rc: 0, stderr: Some(format!("{stderr_prefix}\n{notes}").into_bytes()) }
         }
-        Err(UriError::UnknownScheme) => Outcome { stdout: Vec::new(), rc: 1, stderr: None },
-        Err(error) => Outcome { stdout: warn(&error.to_string()).into_bytes(), rc: 1, stderr: None },
+        Err(error) => {
+            let message = warn(&error.to_string());
+            let (stdout, stderr) = match &error {
+                UriError::UnknownScheme => (String::new(), format!("{stderr_prefix}{message}")),
+                UriError::UnknownTransport { note, .. } => (message, format!("{stderr_prefix}\n{}", info(note))),
+                _ => (message, stderr_prefix.to_owned()),
+            };
+            Outcome { stdout: stdout.into_bytes(), rc: 1, stderr: Some(stderr.into_bytes()) }
+        }
     }
 }
 

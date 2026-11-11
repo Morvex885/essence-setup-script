@@ -53,7 +53,13 @@ impl GithubSession {
     }
 
     pub fn flush(&mut self, paths: &StatePaths) -> Result<()> {
-        let work = self.work()?.clone();
+        self.try_flush(paths).map_err(|failure| failure.error)
+    }
+
+    /// `flush` that tells a failure after the commit was pinned locally
+    /// (the change stays pending) from an earlier one (nothing was saved).
+    pub fn try_flush(&mut self, paths: &StatePaths) -> std::result::Result<(), store::FlushFailure> {
+        let work = self.work().map_err(|error| store::FlushFailure { error, pinned: false })?.clone();
         store::flush(paths, &self.target, &work, self.storage, &mut self.sync)
     }
 
@@ -407,14 +413,19 @@ pub(super) fn storage_decision(storage: Option<Storage>, log: &mut dyn FnMut(Lev
     Ok(storage)
 }
 
-/// Write, commit and push; a failed flush keeps the work pending (v1 rc 0 path).
+/// Write, commit and push. A failure after the commit is pinned keeps the work
+/// pending (v1 rc 0 path); an earlier one saved nothing and is returned.
 fn publish(paths: &StatePaths, github: &mut GithubSession, snapshot: &Snapshot, log: &mut dyn FnMut(Level, &str)) -> Result<()> {
     github.checkpoint(snapshot)?;
-    if let Err(error) = github.flush(paths) {
-        log(Level::Warn, &format!("Не удалось отправить конфигурацию в GitHub: {}", error.message));
-        log(Level::Warn, "Изменения сохранены локально и ожидают отправки.");
+    match github.try_flush(paths) {
+        Ok(()) => Ok(()),
+        Err(failure) if failure.pinned => {
+            log(Level::Warn, &format!("Не удалось отправить конфигурацию в GitHub: {}", failure.error.message));
+            log(Level::Warn, "Изменения сохранены локально и ожидают отправки.");
+            Ok(())
+        }
+        Err(failure) => Err(failure.error),
     }
-    Ok(())
 }
 
 // ─── source init-local / status / accounts / login ───────────────────────────
@@ -841,11 +852,12 @@ pub fn push(session: &mut Session) -> Result<Value> {
 /// kept as pending, anything earlier restores the files and the worktree.
 fn flush_or_restore(session: &mut Session, head: &str, saved: Vec<(PathBuf, Option<zeroize::Zeroizing<Vec<u8>>>)>, note: &str) -> Result<()> {
     let paths = root(session);
-    let Err(error) = github(session).flush(&paths) else { return Ok(()) };
-    if store::failed_after_pin(&error) {
-        session.log(Level::Warn, &format!("{note}: {}", error.message));
+    let Err(failure) = github(session).try_flush(&paths) else { return Ok(()) };
+    if failure.pinned {
+        session.log(Level::Warn, &format!("{note}: {}", failure.error.message));
         return Ok(());
     }
+    let error = failure.error;
     let work = github(session).work()?.clone();
     work.reset_hard(head)?;
     for (path, bytes) in saved {

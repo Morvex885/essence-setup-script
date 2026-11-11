@@ -18,7 +18,9 @@ teardown() {
     [[ "$out" == *'uuid: u1'$'\n'* && "$out" != *$'\r'* ]]
     grep -qxF '        uuid: u2' <<< "$out"
     out=$(printf 'alice p1\r\nbob p2' | _build_hy2_users_yaml)
-    [[ "$out" == $'      alice: p1\n      bob: p2' ]]
+    [[ "$out" == $'      alice: "p1"\n      bob: "p2"' ]]
+    out=$(printf 'eve a #"b\\c\n' | _build_hy2_users_yaml)
+    [[ "$out" == '      eve: "a #\"b\\c"' ]]
 }
 
 @test "listener sync refuses missing end marker without changing config" {

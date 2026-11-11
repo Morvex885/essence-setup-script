@@ -44,12 +44,12 @@ pub fn nginx_listener_yaml(listener: &NginxListener) -> String {
 /// Client config: Reality when `public_key` is set, otherwise TLS.
 pub fn client_yaml(vless: &Vless, path: &str) -> String {
     let mut out = format!(
-        "proxies:\n  - name: \"{}\"\n    type: vless\n    server: {}\n    port: {}\n    uuid: {}\n    network: xhttp\n    udp: true\n    tls: true\n    servername: {}\n    xhttp-opts:\n      path: \"{}\"\n      mode: auto\n",
+        "proxies:\n  - name: \"{}\"\n    type: vless\n    server: {}\n    port: {}\n    uuid: {}\n    network: xhttp\n    udp: true\n    tls: true\n    servername: \"{}\"\n    xhttp-opts:\n      path: \"{}\"\n      mode: auto\n",
         yaml_escape(vless.name),
         yaml_host(vless.server),
         vless.port,
         vless.uuid,
-        vless.sni,
+        yaml_escape(vless.sni),
         yaml_escape(path)
     );
     if !vless.public_key.is_empty() {
@@ -88,14 +88,14 @@ pub fn uri(vless: &Vless, path: &str) -> String {
 /// `firefox` (the only one known to work with xHTTP).
 pub fn exit_yaml(vless: &Vless, path: &str, mode: &str) -> String {
     let mut out = format!(
-        "  - name: {}\n    type: vless\n    server: {}\n    port: {}\n    uuid: {}\n    network: xhttp\n    udp: true\n    xhttp-opts:\n      path: \"{}\"\n      mode: {}\n    tls: true\n    servername: {}\n",
+        "  - name: {}\n    type: vless\n    server: {}\n    port: {}\n    uuid: {}\n    network: xhttp\n    udp: true\n    xhttp-opts:\n      path: \"{}\"\n      mode: {}\n    tls: true\n    servername: \"{}\"\n",
         vless.name,
         yaml_host(vless.server),
         vless.port,
         vless.uuid,
         yaml_escape(path),
         or(mode, "auto"),
-        vless.sni
+        yaml_escape(vless.sni)
     );
     push_reality_opts(&mut out, vless);
     line(&mut out, "    client-fingerprint: firefox");

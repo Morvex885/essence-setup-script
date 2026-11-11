@@ -80,12 +80,15 @@ _build_vless_users_yaml() {
 
 # Формирует YAML-блок users для Hysteria2 listener'а
 # Stdin: строки формата "username password" (разделитель — пробел)
-# Stdout: готовый YAML-блок с правильным indent
+# Stdout: готовый YAML-блок с правильным indent; пароль — строка YAML
+# в двойных кавычках (экранируются \, ", CR и LF)
 _build_hy2_users_yaml() {
     while IFS=' ' read -r username password || [[ -n "$username" ]]; do
         password="${password%$'\r'}"
         [[ -z "$username" || -z "$password" ]] && continue
-        echo "      $username: $password"
+        password="${password//\\/\\\\}"; password="${password//\"/\\\"}"
+        password="${password//$'\n'/\\n}"; password="${password//$'\r'/\\r}"
+        echo "      $username: \"$password\""
     done
     return 0
 }
