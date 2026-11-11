@@ -577,6 +577,7 @@ pub async fn connect<T: RemoteTransport>(session: &mut Session, invocation: &Inv
         Ok(undo) => undo,
         Err(error) => {
             release(session);
+            if !root_existed { let _ = fs::remove_dir(paths.root()); }
             return Err(prefixed(error, "Не удалось подключить GitHub", "source_failed"));
         }
     };
@@ -592,6 +593,10 @@ pub async fn connect<T: RemoteTransport>(session: &mut Session, invocation: &Inv
         Err(error) => {
             undo.rollback(&paths);
             release(session);
+            // A root this connect created is left empty by the rollback once
+            // the lock is released; remove_dir refuses a root another process
+            // has started to use in the meantime.
+            if !root_existed { let _ = fs::remove_dir(paths.root()); }
             Err(prefixed(error, "Не удалось подключить GitHub", "source_failed"))
         }
     }
