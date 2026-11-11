@@ -1,9 +1,10 @@
 //! Shared, TestBackend-renderable frames. Interior width is 68 terminal columns.
 //! Every row is wrapped here — frame body, journal and prompt — so no text
 //! depends on the terminal width or is cut at the frame edge.
-use std::time::Instant;
+use std::{borrow::Cow, time::Instant};
 use ratatui::{Frame, layout::Rect, style::{Color, Modifier, Style}, text::{Line, Span}, widgets::Paragraph};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 pub const CONTENT_WIDTH: usize = 68;
 pub const FRAME_WIDTH: u16 = 70;
 pub const CYAN: Color = Color::Cyan;
@@ -99,47 +100,54 @@ fn highlighted(mut line: Line<'static>) -> Line<'static> {
 fn border(left: char, right: char) -> Line<'static> { Line::styled(format!("{left}{}{right}", "─".repeat(CONTENT_WIDTH)), Style::default().fg(CYAN)) }
 fn wrap(line: &Line<'_>) -> Vec<Line<'static>> { wrap_to(line, CONTENT_WIDTH, 0) }
 /// Word-aware wrap of one styled line into rows of at most `width` terminal
-/// columns (a wide character such as `界` takes two). Continuation rows start
-/// with `indent` spaces; `\n` starts a new row; control characters are
-/// dropped; a word longer than a row is split. The line's own style is kept on
-/// every piece.
+/// columns. Units are grapheme clusters measured with `str::width` like
+/// `framed`: a wide character such as `界` or `♥\u{FE0F}` takes two columns and
+/// a zero-width mark never leaves its base. Continuation rows start with
+/// `indent` spaces; `\n` starts a new row; control characters are dropped; a
+/// word longer than a row is split. The line's own style is kept on every piece.
 pub fn wrap_to(line: &Line<'_>, width: usize, indent: usize) -> Vec<Line<'static>> {
+    type Cell<'a> = (Cow<'a, str>, Style);
     let width = width.max(indent + 1);
-    let columns = |cells: &[(char, Style)]| cells.iter().map(|(c, _)| c.width().unwrap_or(0)).sum::<usize>();
-    let mut rows: Vec<Vec<(char, Style)>> = vec![];
-    let mut row: Vec<(char, Style)> = vec![];
+    let columns = |cells: &[Cell<'_>]| cells.iter().map(|(g, _)| g.width()).sum::<usize>();
+    let space = |cell: &Cell<'_>| cell.0 == " ";
+    let mut rows: Vec<Vec<Cell<'_>>> = vec![];
+    let mut row: Vec<Cell<'_>> = vec![];
     // Leading cells of `row` that are continuation indent, not text.
     let mut start = 0;
     for span in &line.spans {
         let style = line.style.patch(span.style);
-        for ch in span.content.chars() {
-            if ch == '\n' { rows.push(std::mem::take(&mut row)); start = 0; continue; }
-            if ch.is_control() { continue; }
-            let cells = ch.width().unwrap_or(0);
+        for grapheme in span.content.graphemes(true) {
+            if grapheme.contains('\n') { rows.push(std::mem::take(&mut row)); start = 0; continue; }
+            let grapheme: Cow<'_, str> = if grapheme.chars().any(char::is_control) {
+                Cow::Owned(grapheme.chars().filter(|c| !c.is_control()).collect())
+            } else { Cow::Borrowed(grapheme) };
+            if grapheme.is_empty() { continue; }
+            let blank = grapheme == " ";
+            let cells = grapheme.width();
             if row.len() > start && columns(&row) + cells > width {
                 // The unfinished word moves to the next row only when it fits
                 // there; a word longer than a row is split in place.
-                let carried = match row.iter().rposition(|(c, _)| *c == ' ') {
-                    Some(space) if ch != ' ' && space > start && indent + columns(&row[space + 1..]) + cells <= width => row.split_off(space + 1),
+                let carried = match row.iter().rposition(space) {
+                    Some(at) if !blank && at > start && indent + columns(&row[at + 1..]) + cells <= width => row.split_off(at + 1),
                     _ => vec![],
                 };
-                while row.len() > start && row.last().is_some_and(|(c, _)| *c == ' ') { row.pop(); }
-                rows.push(std::mem::replace(&mut row, vec![(' ', Style::default()); indent]));
+                while row.len() > start && row.last().is_some_and(space) { row.pop(); }
+                rows.push(std::mem::replace(&mut row, vec![(Cow::Borrowed(" "), Style::default()); indent]));
                 start = indent;
                 row.extend(carried);
-                if ch == ' ' { continue; }
+                if blank { continue; }
             }
-            if ch == ' ' && row.len() == start && start > 0 { continue; }
-            row.push((ch, style));
+            if blank && row.len() == start && start > 0 { continue; }
+            row.push((grapheme, style));
         }
     }
     rows.push(row);
     rows.into_iter().map(|cells| {
         let mut spans: Vec<Span<'static>> = vec![];
-        for (ch, style) in cells {
+        for (grapheme, style) in cells {
             match spans.last_mut() {
-                Some(span) if span.style == style => span.content.to_mut().push(ch),
-                _ => spans.push(Span::styled(ch.to_string(), style)),
+                Some(span) if span.style == style => span.content.to_mut().push_str(&grapheme),
+                _ => spans.push(Span::styled(grapheme.into_owned(), style)),
             }
         }
         Line::from(spans)
@@ -382,5 +390,25 @@ pub fn render_busy(frame: &mut Frame<'_>, view: &View, input: &str, hidden: bool
         let journal = wrap_to(&Line::raw(format!("[✗] {}", "界".repeat(60))), usize::from(FRAME_WIDTH), 4);
         assert!(journal.iter().all(|row| row.width() <= usize::from(FRAME_WIDTH)));
         assert!(journal[1..].iter().all(|row| row.to_string().starts_with("    界")));
+    }
+    /// `♥\u{FE0F}` is one two-column cluster: the selector stays with its
+    /// heart and every frame row fits the frame width.
+    #[test] fn emoji_presentation_sequences_stay_whole_and_fit_the_frame() {
+        let heart = "♥\u{FE0F}";
+        let mut view = View::new(heart.repeat(40));
+        view.context.push(Line::raw(heart.repeat(50)));
+        view.context.push(Line::raw(format!("{heart} ").repeat(30)));
+        view.sections.push(vec![Item::new(1, heart.repeat(45), CYAN)]);
+        let lines = view.lines();
+        assert!(lines.iter().all(|line| line.width() <= usize::from(FRAME_WIDTH)), "{:#?}", lines.iter().map(Line::width).collect::<Vec<_>>());
+        assert!(lines.iter().skip(1).all(|line| line.width() == usize::from(FRAME_WIDTH)));
+        for row in wrap(&Line::raw(heart.repeat(50))) {
+            let text = row.to_string();
+            assert!(!text.starts_with('\u{FE0F}') && text.chars().filter(|c| *c == '♥').count() == text.chars().filter(|c| *c == '\u{FE0F}').count());
+        }
+        let mut terminal = Terminal::new(TestBackend::new(80, 40)).unwrap();
+        terminal.draw(|f| render(f, &view, "", false, &[])).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!((0..40).filter(|y| buffer[(0, *y)].symbol() == "│").all(|y| buffer[(FRAME_WIDTH - 1, y)].symbol() == "│"));
     }
 }

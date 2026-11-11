@@ -596,8 +596,13 @@ fn connection_node(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
 /// Proxies (marked as currently assigned) first, then target groups (unmarked).
 /// A confirmed empty proxy set removes the assignment of the chosen groups
 /// (`conn set` without `--proxy`); `0`/EOF in either toggle changes nothing.
+/// Without discovered proxies (node not synced) only removal is possible:
+/// the proxy toggle is skipped.
 fn assign_connections(ctx: &mut Context<'_>, name: &str, proxies: &[String], assigned: &[Vec<String>]) -> io::Result<()> {
-    let Some(selected) = ctx.toggle("Подключения для групп", proxies, assigned.iter().map(|g| !g.is_empty()).collect(), EMPTY)? else { return Ok(()); };
+    let selected = if proxies.is_empty() { vec![] } else {
+        let Some(selected) = ctx.toggle("Подключения для групп", proxies, assigned.iter().map(|g| !g.is_empty()).collect(), EMPTY)? else { return Ok(()); };
+        selected
+    };
     let listed = ctx.call(&["group", "list"])?;
     if !listed.ok { outcome(ctx, &listed); return Ok(()); }
     let groups = names(&listed.data);
@@ -1216,6 +1221,17 @@ mod tests {
         run(vec![node_sync(json!(["p1"])), node_list(), node_list()], &["b", "1", "0", "0"], |ctx| connection_node(ctx, "n"));
         let (_, _, ui) = run(vec![node_sync(json!(["p1"])), node_list(), groups(), node_list()], &["b", "1", "", "", "0"], |ctx| connection_node(ctx, "n"));
         assert!(noticed(&ui, "Ничего не выбрано."));
+        // Unreachable node: nothing discovered, the proxy toggle is skipped and
+        // the chosen group's assignment can still be removed.
+        let unreachable = step(&["conn", "sync", "--name", "n"], err("partial", json!({"nodes": [{"name": "n", "status": "unreachable", "error": "remote_failed"}]})));
+        let (_, client, ui) = run(vec![unreachable, node_list(), groups(),
+            step(&["conn", "set", "--name", "n", "--group", "old"], ok(json!({}))), node_list()],
+            &["b", "1", "", "0"], |ctx| connection_node(ctx, "n"));
+        assert!(client.calls.iter().all(|call| !call.contains(&"--proxy".to_owned())));
+        assert!(ui.views.iter().all(|v| v.title != "Подключения для групп"));
+        // Cancelling the group toggle still changes nothing.
+        let unreachable = step(&["conn", "sync", "--name", "n"], err("partial", json!({"nodes": [{"name": "n", "status": "unreachable", "error": "remote_failed"}]})));
+        run(vec![unreachable, node_list(), groups(), node_list()], &["b", "0", "0"], |ctx| connection_node(ctx, "n"));
     }
     #[test]
     fn connection_node_sync_and_alias_hotkeys_both_cases() {
