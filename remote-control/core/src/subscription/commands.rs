@@ -53,14 +53,15 @@ fn batch_warning(failure: UploadFailure) -> &'static str {
 /// `partial` carrying the command data (the subscription is already saved).
 async fn verify(data: Value) -> Result<Value> {
     let Some(url) = data["url"].as_str() else { return Ok(data) };
-    match remote::http_status(url).await {
-        Some(200) => Ok(data),
-        code => {
-            let code = code.map_or_else(|| "нет ответа".to_owned(), |code| code.to_string());
-            Err(with_data(RcError::new("partial", format!(
-                "Подписка сохранена, но проверка HTTP: {code} (ожидалось 200). Проверьте журнал ошибок nginx на сервере.")), &data))
-        }
-    }
+    let code = match remote::http_status(url).await {
+        remote::HttpCheck::Status(200) => return Ok(data),
+        remote::HttpCheck::Untrusted => return Err(with_data(RcError::new("partial",
+            "Подписка сохранена, но сертификат сервера подписок не подтверждён. Проверьте сертификат домена подписки."), &data)),
+        remote::HttpCheck::Status(code) => code.to_string(),
+        remote::HttpCheck::NoResponse => "нет ответа".to_owned(),
+    };
+    Err(with_data(RcError::new("partial", format!(
+        "Подписка сохранена, но проверка HTTP: {code} (ожидалось 200). Проверьте журнал ошибок nginx на сервере.")), &data))
 }
 
 // ─── host / list / show ──────────────────────────────────────────────────────

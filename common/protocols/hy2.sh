@@ -1,11 +1,18 @@
 #!/bin/bash
 # ─── Hysteria2 protocol builders ────────────────────────────────────────────
 
+# Passwords are emitted as double-quoted YAML scalars: a plain scalar breaks
+# on " #", a leading indicator or a line break.
+
 # Listener YAML for config.yaml (server-side)
 # Args: name port user pass proxy [obfs_pass]
 _build_hy2_listener_yaml() {
     local name="$1" port="$2" user="$3" pass="$4" proxy="$5"
     local obfs_pass="${6:-}"
+    pass="${pass//\\/\\\\}"; pass="${pass//\"/\\\"}"
+    pass="${pass//$'\n'/\\n}"; pass="${pass//$'\r'/\\r}"
+    obfs_pass="${obfs_pass//\\/\\\\}"; obfs_pass="${obfs_pass//\"/\\\"}"
+    obfs_pass="${obfs_pass//$'\n'/\\n}"; obfs_pass="${obfs_pass//$'\r'/\\r}"
 
     echo "  - name: $name"
     echo "    type: hysteria2"
@@ -13,11 +20,11 @@ _build_hy2_listener_yaml() {
     echo "    port: $port"
     echo "    users:"
     echo "      # client-users-start"
-    echo "      $user: $pass"
+    echo "      $user: \"$pass\""
     echo "      # client-users-end"
     if [[ -n "$obfs_pass" ]]; then
         echo "    obfs: salamander"
-        echo "    obfs-password: $obfs_pass"
+        echo "    obfs-password: \"$obfs_pass\""
     fi
     echo "    certificate: /etc/mihomo/certs/hy2/server.crt"
     echo "    private-key: /etc/mihomo/certs/hy2/server.key"
@@ -31,18 +38,25 @@ _build_hy2_client_yaml() {
     local sni="${5:-www.google.de}" skip_verify="${6:-true}" obfs_pass="${7:-}"
     name="${name//\\/\\\\}"; name="${name//\"/\\\"}"
     name="${name//$'\n'/\\n}"; name="${name//$'\r'/\\r}"
+    pass="${pass//\\/\\\\}"; pass="${pass//\"/\\\"}"
+    pass="${pass//$'\n'/\\n}"; pass="${pass//$'\r'/\\r}"
+    obfs_pass="${obfs_pass//\\/\\\\}"; obfs_pass="${obfs_pass//\"/\\\"}"
+    obfs_pass="${obfs_pass//$'\n'/\\n}"; obfs_pass="${obfs_pass//$'\r'/\\r}"
+    # YAML address: "[v6]" loses its brackets, a trailing ":" ("::") needs quotes.
+    [[ "$server" == \[*\] ]] && { server="${server#\[}"; server="${server%\]}"; }
+    [[ "$server" == *: ]] && server="\"$server\""
 
     echo "proxies:"
     echo "  - name: \"$name\""
     echo "    type: hysteria2"
     echo "    server: $server"
     echo "    port: $port"
-    echo "    password: $pass"
+    echo "    password: \"$pass\""
     echo "    sni: $sni"
     echo "    skip-cert-verify: $skip_verify"
     if [[ -n "$obfs_pass" ]]; then
         echo "    obfs: salamander"
-        echo "    obfs-password: $obfs_pass"
+        echo "    obfs-password: \"$obfs_pass\""
     fi
 }
 
@@ -63,17 +77,23 @@ _build_hy2_uri() {
 _build_hy2_exit_yaml() {
     local name="$1" server="$2" port="$3" pass="$4"
     local sni="${5:-www.google.de}" skip_verify="${6:-true}" obfs_pass="${7:-}"
+    pass="${pass//\\/\\\\}"; pass="${pass//\"/\\\"}"
+    pass="${pass//$'\n'/\\n}"; pass="${pass//$'\r'/\\r}"
+    obfs_pass="${obfs_pass//\\/\\\\}"; obfs_pass="${obfs_pass//\"/\\\"}"
+    obfs_pass="${obfs_pass//$'\n'/\\n}"; obfs_pass="${obfs_pass//$'\r'/\\r}"
+    [[ "$server" == \[*\] ]] && { server="${server#\[}"; server="${server%\]}"; }
+    [[ "$server" == *: ]] && server="\"$server\""
 
     echo "  - name: $name"
     echo "    type: hysteria2"
     echo "    server: $server"
     echo "    port: $port"
-    echo "    password: $pass"
+    echo "    password: \"$pass\""
     echo "    sni: $sni"
     echo "    skip-cert-verify: $skip_verify"
     if [[ -n "$obfs_pass" ]]; then
         echo "    obfs: salamander"
-        echo "    obfs-password: $obfs_pass"
+        echo "    obfs-password: \"$obfs_pass\""
     fi
 }
 

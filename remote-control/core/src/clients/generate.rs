@@ -192,10 +192,15 @@ impl Report {
         ]
     }
 
+    /// No client and no node failed (skips are not failures).
+    pub fn complete(&self) -> bool {
+        self.failed.is_empty() && self.nodes_failed.is_empty()
+    }
+
     /// Success data, or `partial` carrying the same fields when any client
     /// or node failed (skips are not failures).
     fn finish(&self, dir: &Path) -> Result<Value> {
-        if self.failed.is_empty() && self.nodes_failed.is_empty() {
+        if self.complete() {
             return Ok(Value::Object(self.fields(dir).into_iter().map(|(k, v)| (k.to_owned(), v)).collect()));
         }
         Err(self.fields(dir).into_iter()
@@ -811,8 +816,8 @@ pub async fn generate<T: RemoteTransport>(session: &mut Session, invocation: &In
 /// Regenerate `group` after a client changed groups (v1 set-group flow):
 /// configs of `nodes` and the group's nodes are read, the group's peers are
 /// ensured, its configs rendered and the users of `nodes` synchronized.
-/// Any client or node failure is `partial` with the report fields.
-pub async fn regenerate_group<T: RemoteTransport>(session: &mut Session, group: &str, nodes: &[String], connect: &dyn Fn() -> T) -> Result<()> {
+/// Client and node failures are in the report; `Err` only when nothing ran.
+pub async fn regenerate_group<T: RemoteTransport>(session: &mut Session, group: &str, nodes: &[String], connect: &dyn Fn() -> T) -> Result<Report> {
     let config = session.state.load_config()?;
     let _guard = session.state.locks().acquire(LockKind::Mutation, "generate")?;
     let mut sync = Vec::new();
@@ -820,8 +825,7 @@ pub async fn regenerate_group<T: RemoteTransport>(session: &mut Session, group: 
     let mut fetch = sync.clone();
     push_unique(&mut fetch, group_scope_nodes(&config, group));
     let scope = Scope { targets: vec![(group.to_owned(), None)], awg_clients: group_members(&config, group), fetch, sync };
-    let dir = generated_dir(session.state.paths());
-    run(session, &config, scope, connect).await.finish(&dir).map(drop)
+    Ok(run(session, &config, scope, connect).await)
 }
 
 /// Remove deleted clients from the listeners of `nodes` (v1 client delete):

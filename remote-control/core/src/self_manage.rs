@@ -296,6 +296,46 @@ fn data_unsafe_reason(data: &Path, home: &Path, exe: &Path) -> Option<&'static s
     None
 }
 
+/// Top-level entries of an essence-rc data root (`StatePaths`, the lock).
+const DATA_ENTRIES: [&str; 17] = [
+    "config.json", "secrets.json", "manifest.json", "ssh", "templates", "auth.txt", "secret.key", "source.json",
+    "generated", "github-store", "github-sessions", "github-runtime", "credentials", "account-switch",
+    "import-backups", ".rc-lock", ".DS_Store",
+];
+/// Leftovers of interrupted writes, stages and lock reclaims in the root.
+const DATA_TRANSIENT_PREFIXES: [&str; 4] = [".rc-", ".local-switch-", ".github-runtime.", ".identity."];
+
+/// Why the directory is not recognizably an essence-rc data root. Every entry
+/// must belong to the known layout, so a mistaken `ESSENCE_RC_DATA_DIR`
+/// (`/var/lib`, a project directory) is never removed recursively; existing
+/// data roots need no dedicated marker file. An empty directory loses nothing.
+fn data_layout_reason(data: &Path) -> Option<&'static str> {
+    let unreadable = Some("не удаётся прочитать содержимое каталога");
+    let Ok(entries) = fs::read_dir(data) else { return unreadable };
+    for entry in entries {
+        let Ok(entry) = entry else { return unreadable };
+        let name = entry.file_name();
+        let known = name.to_str().is_some_and(|name| {
+            DATA_ENTRIES.contains(&name) || DATA_TRANSIENT_PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+        });
+        if !known {
+            return Some("каталог содержит файлы, не относящиеся к данным essence-rc");
+        }
+    }
+    None
+}
+
+/// The canonical data root may be removed recursively.
+fn ensure_data_removable(canonical: &Path, exe: &Path) -> Result<()> {
+    let home = dirs::home_dir()
+        .ok_or_else(|| RcError::new("failed", "Не удалось определить домашний каталог."))?;
+    let home = fs::canonicalize(&home).unwrap_or(home);
+    match data_unsafe_reason(canonical, &home, exe).or_else(|| data_layout_reason(canonical)) {
+        Some(reason) => Err(unsafe_data_path(canonical, reason)),
+        None => Ok(()),
+    }
+}
+
 fn unsafe_data_path(path: &Path, reason: &str) -> RcError {
     RcError::new("unsafe_path", "Небезопасный путь локальных данных. Удаление отменено.")
         .with_extra("path", path.display().to_string())
@@ -632,12 +672,7 @@ pub fn prepare_uninstall(state: &State, remove_data: bool) -> Result<UninstallPl
     let mut data = None;
     if remove_data {
         let canonical = canonical_data_root(&root)?;
-        let home = dirs::home_dir()
-            .ok_or_else(|| RcError::new("failed", "Не удалось определить домашний каталог."))?;
-        let home = fs::canonicalize(&home).unwrap_or(home);
-        if let Some(reason) = data_unsafe_reason(&canonical, &home, &exe) {
-            return Err(unsafe_data_path(&canonical, reason));
-        }
+        ensure_data_removable(&canonical, &exe)?;
         data = Some(canonical);
     }
     let data_line = data.as_ref().unwrap_or(&root);
@@ -671,12 +706,7 @@ impl UninstallPlan {
         let mut removed = vec![intent.exe.display().to_string()];
         if let Some(data) = &intent.data {
             let canonical = canonical_data_root(data)?;
-            let home = dirs::home_dir()
-                .ok_or_else(|| RcError::new("failed", "Не удалось определить домашний каталог."))?;
-            let home = fs::canonicalize(&home).unwrap_or(home);
-            if let Some(reason) = data_unsafe_reason(&canonical, &home, &intent.exe) {
-                return Err(unsafe_data_path(&canonical, reason));
-            }
+            ensure_data_removable(&canonical, &intent.exe)?;
             if let Err(_error) = fs::remove_dir_all(&canonical) {
                 if fs::metadata(&canonical).is_ok() {
                     return Err(RcError::new("failed", "Удаление essence-rc не завершено.")
@@ -901,5 +931,24 @@ mod tests {
         );
         assert_eq!(data_unsafe_reason(Path::new("/home/user/.local/share/essence-remote-control"), home, exe), None);
         assert_eq!(data_unsafe_reason(Path::new("/tmp/data"), home, exe), None);
+    }
+
+    #[test]
+    fn data_layout_accepts_only_essence_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(data_layout_reason(dir.path()), None, "empty");
+        for name in ["config.json", "manifest.json", "secret.key", ".rc-write-0123", ".rc-lock.stale.1.ab"] {
+            fs::write(dir.path().join(name), "x").unwrap();
+        }
+        for name in ["ssh", "generated", "github-runtime", ".rc-lock", ".identity.abc"] {
+            fs::create_dir(dir.path().join(name)).unwrap();
+        }
+        assert_eq!(data_layout_reason(dir.path()), None);
+        for foreign in ["notes.txt", ".bashrc", "lib"] {
+            fs::write(dir.path().join(foreign), "x").unwrap();
+            assert_eq!(data_layout_reason(dir.path()), Some("каталог содержит файлы, не относящиеся к данным essence-rc"), "{foreign}");
+            fs::remove_file(dir.path().join(foreign)).unwrap();
+        }
+        assert_eq!(data_layout_reason(&dir.path().join("missing")), Some("не удаётся прочитать содержимое каталога"));
     }
 }

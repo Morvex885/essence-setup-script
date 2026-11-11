@@ -6,6 +6,11 @@
 _build_vless_tcp_listener_yaml() {
     local name="$1" listen="$2" port="$3" username="$4" uuid="$5"
     local dest="$6" private_key="$7" short_id="$8" sni="$9" proxy="${10}"
+    # YAML address: "[v6]" loses its brackets, a trailing ":" ("::") needs quotes.
+    [[ "$listen" == \[*\] ]] && { listen="${listen#\[}"; listen="${listen%\]}"; }
+    [[ "$listen" == *: ]] && listen="\"$listen\""
+    dest="${dest//\\/\\\\}"; dest="${dest//\"/\\\"}"
+    dest="${dest//$'\n'/\\n}"; dest="${dest//$'\r'/\\r}"
     cat <<EOF
   - name: $name
     type: vless
@@ -18,7 +23,7 @@ _build_vless_tcp_listener_yaml() {
         flow: xtls-rprx-vision
       # client-users-end
     reality-config:
-      dest: $dest
+      dest: "$dest"
       private-key: "$private_key"
       short-id:
         - "$short_id"
@@ -35,6 +40,8 @@ _build_vless_tcp_client_yaml() {
     local sni="$5" public_key="$6" short_id="$7"
     name="${name//\\/\\\\}"; name="${name//\"/\\\"}"
     name="${name//$'\n'/\\n}"; name="${name//$'\r'/\\r}"
+    [[ "$server" == \[*\] ]] && { server="${server#\[}"; server="${server%\]}"; }
+    [[ "$server" == *: ]] && server="\"$server\""
     cat <<EOF
 proxies:
   - name: "$name"
@@ -69,6 +76,8 @@ _build_vless_tcp_exit_yaml() {
     local name="$1" server="$2" port="$3" uuid="$4" sni="$5"
     local public_key="${6:-}" short_id="${7:-}"
     local flow="${8-xtls-rprx-vision}" fingerprint="${9:-chrome}"
+    [[ "$server" == \[*\] ]] && { server="${server#\[}"; server="${server%\]}"; }
+    [[ "$server" == *: ]] && server="\"$server\""
 
     echo "  - name: $name"
     echo "    type: vless"

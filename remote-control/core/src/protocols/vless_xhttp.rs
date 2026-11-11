@@ -4,7 +4,7 @@
 use super::uri::percent_encode;
 use super::vless_grpc::listener_head;
 use super::vless_tcp::{push_reality_opts, reality_config};
-use super::{line, or, uri_host, yaml_name, Vless, VlessListener};
+use super::{line, or, uri_host, yaml_escape, yaml_host, Vless, VlessListener};
 
 /// A plain listener behind nginx TLS termination.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -20,7 +20,7 @@ pub struct NginxListener<'a> {
 
 fn xhttp_config(out: &mut String, path: &str) {
     line(out, "    xhttp-config:");
-    line(out, &format!("      path: \"{path}\""));
+    line(out, &format!("      path: \"{}\"", yaml_escape(path)));
     line(out, "      mode: auto");
 }
 
@@ -44,8 +44,13 @@ pub fn nginx_listener_yaml(listener: &NginxListener) -> String {
 /// Client config: Reality when `public_key` is set, otherwise TLS.
 pub fn client_yaml(vless: &Vless, path: &str) -> String {
     let mut out = format!(
-        "proxies:\n  - name: \"{}\"\n    type: vless\n    server: {}\n    port: {}\n    uuid: {}\n    network: xhttp\n    udp: true\n    tls: true\n    servername: {}\n    xhttp-opts:\n      path: \"{path}\"\n      mode: auto\n",
-        yaml_name(vless.name), vless.server, vless.port, vless.uuid, vless.sni
+        "proxies:\n  - name: \"{}\"\n    type: vless\n    server: {}\n    port: {}\n    uuid: {}\n    network: xhttp\n    udp: true\n    tls: true\n    servername: {}\n    xhttp-opts:\n      path: \"{}\"\n      mode: auto\n",
+        yaml_escape(vless.name),
+        yaml_host(vless.server),
+        vless.port,
+        vless.uuid,
+        vless.sni,
+        yaml_escape(path)
     );
     if !vless.public_key.is_empty() {
         line(&mut out, "    reality-opts:");
@@ -83,11 +88,12 @@ pub fn uri(vless: &Vless, path: &str) -> String {
 /// `firefox` (the only one known to work with xHTTP).
 pub fn exit_yaml(vless: &Vless, path: &str, mode: &str) -> String {
     let mut out = format!(
-        "  - name: {}\n    type: vless\n    server: {}\n    port: {}\n    uuid: {}\n    network: xhttp\n    udp: true\n    xhttp-opts:\n      path: \"{path}\"\n      mode: {}\n    tls: true\n    servername: {}\n",
+        "  - name: {}\n    type: vless\n    server: {}\n    port: {}\n    uuid: {}\n    network: xhttp\n    udp: true\n    xhttp-opts:\n      path: \"{}\"\n      mode: {}\n    tls: true\n    servername: {}\n",
         vless.name,
-        vless.server,
+        yaml_host(vless.server),
         vless.port,
         vless.uuid,
+        yaml_escape(path),
         or(mode, "auto"),
         vless.sni
     );
@@ -154,5 +160,17 @@ mod tests {
             uri(&vless, "/p q"),
             "vless://u@h:1?encryption=none&security=tls&sni=a%26b&fp=firefox&type=xhttp&path=%2Fp%20q&mode=auto#VLESS%20xHTTP\n"
         );
+    }
+
+    #[test]
+    fn yaml_escapes_path_and_unbrackets_addresses() {
+        let vless = Vless { server: "[2001:db8::1]", ..Vless::default() };
+        for yaml in [client_yaml(&vless, "/a\"b\\c"), exit_yaml(&vless, "/a\"b\\c", "")] {
+            assert!(yaml.contains("    server: 2001:db8::1\n"), "{yaml}");
+            assert!(yaml.contains("      path: \"/a\\\"b\\\\c\"\n"), "{yaml}");
+        }
+        let listener = NginxListener { listen: "[::]", path: "/p\"", ..NginxListener::default() };
+        let yaml = nginx_listener_yaml(&listener);
+        assert!(yaml.contains("    listen: \"::\"\n") && yaml.contains("      path: \"/p\\\"\"\n"), "{yaml}");
     }
 }

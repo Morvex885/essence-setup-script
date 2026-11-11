@@ -6,6 +6,13 @@
 _build_vless_xhttp_listener_yaml() {
     local name="$1" listen="$2" port="$3" username="$4" uuid="$5"
     local path="$6" dest="$7" private_key="$8" short_id="$9" sni="${10}" proxy="${11}"
+    # YAML address: "[v6]" loses its brackets, a trailing ":" ("::") needs quotes.
+    [[ "$listen" == \[*\] ]] && { listen="${listen#\[}"; listen="${listen%\]}"; }
+    [[ "$listen" == *: ]] && listen="\"$listen\""
+    path="${path//\\/\\\\}"; path="${path//\"/\\\"}"
+    path="${path//$'\n'/\\n}"; path="${path//$'\r'/\\r}"
+    dest="${dest//\\/\\\\}"; dest="${dest//\"/\\\"}"
+    dest="${dest//$'\n'/\\n}"; dest="${dest//$'\r'/\\r}"
     cat <<EOF
   - name: $name
     type: vless
@@ -20,7 +27,7 @@ _build_vless_xhttp_listener_yaml() {
       path: "$path"
       mode: auto
     reality-config:
-      dest: $dest
+      dest: "$dest"
       private-key: "$private_key"
       short-id:
         - "$short_id"
@@ -35,6 +42,10 @@ EOF
 _build_vless_xhttp_nginx_listener_yaml() {
     local name="$1" listen="$2" port="$3" username="$4" uuid="$5"
     local path="$6" proxy="$7"
+    [[ "$listen" == \[*\] ]] && { listen="${listen#\[}"; listen="${listen%\]}"; }
+    [[ "$listen" == *: ]] && listen="\"$listen\""
+    path="${path//\\/\\\\}"; path="${path//\"/\\\"}"
+    path="${path//$'\n'/\\n}"; path="${path//$'\r'/\\r}"
     cat <<EOF
   - name: $name
     type: vless
@@ -69,6 +80,10 @@ _build_vless_xhttp_client_yaml() {
     local path="$6" public_key="${7:-}" short_id="${8:-}"
     name="${name//\\/\\\\}"; name="${name//\"/\\\"}"
     name="${name//$'\n'/\\n}"; name="${name//$'\r'/\\r}"
+    path="${path//\\/\\\\}"; path="${path//\"/\\\"}"
+    path="${path//$'\n'/\\n}"; path="${path//$'\r'/\\r}"
+    [[ "$server" == \[*\] ]] && { server="${server#\[}"; server="${server%\]}"; }
+    [[ "$server" == *: ]] && server="\"$server\""
 
     echo "proxies:"
     echo "  - name: \"$name\""
@@ -119,6 +134,10 @@ _build_vless_xhttp_exit_yaml() {
     local name="$1" server="$2" port="$3" uuid="$4" sni="$5"
     local path="$6" mode="${7:-auto}"
     local public_key="${8:-}" short_id="${9:-}"
+    path="${path//\\/\\\\}"; path="${path//\"/\\\"}"
+    path="${path//$'\n'/\\n}"; path="${path//$'\r'/\\r}"
+    [[ "$server" == \[*\] ]] && { server="${server#\[}"; server="${server%\]}"; }
+    [[ "$server" == *: ]] && server="\"$server\""
 
     echo "  - name: $name"
     echo "    type: vless"

@@ -1,7 +1,7 @@
 //! VLESS TCP + Reality builders (`common/protocols/vless-tcp.sh`).
 
 use super::uri::percent_encode;
-use super::{line, or, uri_host, yaml_name, Vless, VlessListener};
+use super::{line, or, uri_host, yaml_escape, yaml_host, Vless, VlessListener};
 
 /// Flow used by every TCP Reality client.
 pub const FLOW: &str = "xtls-rprx-vision";
@@ -11,7 +11,7 @@ pub fn listener_yaml(listener: &VlessListener) -> String {
     format!(
         "  - name: {}\n    type: vless\n    listen: {}\n    port: {}\n    users:\n      # client-users-start\n      - username: {}\n        uuid: {}\n        flow: {FLOW}\n      # client-users-end\n{}",
         listener.name,
-        listener.listen,
+        yaml_host(listener.listen),
         listener.port,
         listener.username,
         listener.uuid,
@@ -19,11 +19,12 @@ pub fn listener_yaml(listener: &VlessListener) -> String {
     )
 }
 
-/// `reality-config` + `proxy` tail shared by the Reality listeners.
+/// `reality-config` + `proxy` tail shared by the Reality listeners. `dest` is
+/// quoted: an IPv6 `[addr]:port` would otherwise start a YAML flow sequence.
 pub(super) fn reality_config(listener: &VlessListener) -> String {
     format!(
-        "    reality-config:\n      dest: {}\n      private-key: \"{}\"\n      short-id:\n        - \"{}\"\n      server-names:\n        - {}\n    proxy: {}\n",
-        listener.dest, listener.private_key, listener.short_id, listener.sni, listener.proxy
+        "    reality-config:\n      dest: \"{}\"\n      private-key: \"{}\"\n      short-id:\n        - \"{}\"\n      server-names:\n        - {}\n    proxy: {}\n",
+        yaml_escape(listener.dest), listener.private_key, listener.short_id, listener.sni, listener.proxy
     )
 }
 
@@ -31,7 +32,7 @@ pub(super) fn reality_config(listener: &VlessListener) -> String {
 pub fn client_yaml(vless: &Vless) -> String {
     format!(
         "proxies:\n  - name: \"{}\"\n    type: vless\n    server: {}\n    port: {}\n    uuid: {}\n    network: tcp\n    udp: true\n    flow: {FLOW}\n    tls: true\n    servername: {}\n    reality-opts:\n      public-key: \"{}\"\n      short-id: \"{}\"\n    client-fingerprint: chrome\n",
-        yaml_name(vless.name), vless.server, vless.port, vless.uuid, vless.sni, vless.public_key, vless.short_id
+        yaml_escape(vless.name), yaml_host(vless.server), vless.port, vless.uuid, vless.sni, vless.public_key, vless.short_id
     )
 }
 
@@ -54,7 +55,7 @@ pub fn uri(vless: &Vless) -> String {
 pub fn exit_yaml(vless: &Vless, flow: &str, fingerprint: &str) -> String {
     let mut out = format!(
         "  - name: {}\n    type: vless\n    server: {}\n    port: {}\n    uuid: {}\n    network: tcp\n    udp: true\n",
-        vless.name, vless.server, vless.port, vless.uuid
+        vless.name, yaml_host(vless.server), vless.port, vless.uuid
     );
     if !flow.is_empty() {
         line(&mut out, &format!("    flow: {flow}"));

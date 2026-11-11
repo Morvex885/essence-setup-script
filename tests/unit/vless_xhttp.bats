@@ -119,7 +119,7 @@ teardown() {
     uri=$(_build_hy2_uri 'p@# &%' host 443 's&n' 'ob#fs')
     [[ "$uri" == *'p%40%23%20%26%25@host'* && "$uri" == *'ob%23fs'* ]]
     yaml=$(_parse_hy2_uri_to_exit p "$uri" 2>/dev/null)
-    [[ "$yaml" == *'password: p@# &%'* ]]
+    [[ "$yaml" == *'password: "p@# &%"'* ]]
     uri=$(_build_vless_grpc_uri uuid host 443 's&n' 'svc?x' 'p+k' id 'my node')
     [[ "$uri" == *'sni=s%26n'* && "$uri" == *'serviceName=svc%3Fx'* && "$uri" == *'#my%20node' ]]
     uri=$(_build_vless_tcp_uri uuid host 443 s k id 'my node')

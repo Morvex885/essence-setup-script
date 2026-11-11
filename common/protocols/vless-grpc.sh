@@ -6,6 +6,13 @@
 _build_vless_grpc_listener_yaml() {
     local name="$1" listen="$2" port="$3" username="$4" uuid="$5"
     local service="$6" dest="$7" private_key="$8" short_id="$9" sni="${10}" proxy="${11}"
+    # YAML address: "[v6]" loses its brackets, a trailing ":" ("::") needs quotes.
+    [[ "$listen" == \[*\] ]] && { listen="${listen#\[}"; listen="${listen%\]}"; }
+    [[ "$listen" == *: ]] && listen="\"$listen\""
+    service="${service//\\/\\\\}"; service="${service//\"/\\\"}"
+    service="${service//$'\n'/\\n}"; service="${service//$'\r'/\\r}"
+    dest="${dest//\\/\\\\}"; dest="${dest//\"/\\\"}"
+    dest="${dest//$'\n'/\\n}"; dest="${dest//$'\r'/\\r}"
     cat <<EOF
   - name: $name
     type: vless
@@ -18,7 +25,7 @@ _build_vless_grpc_listener_yaml() {
       # client-users-end
     grpc-service-name: "$service"
     reality-config:
-      dest: $dest
+      dest: "$dest"
       private-key: "$private_key"
       short-id:
         - "$short_id"
@@ -35,6 +42,10 @@ _build_vless_grpc_client_yaml() {
     local sni="$5" service="$6" public_key="$7" short_id="$8"
     name="${name//\\/\\\\}"; name="${name//\"/\\\"}"
     name="${name//$'\n'/\\n}"; name="${name//$'\r'/\\r}"
+    service="${service//\\/\\\\}"; service="${service//\"/\\\"}"
+    service="${service//$'\n'/\\n}"; service="${service//$'\r'/\\r}"
+    [[ "$server" == \[*\] ]] && { server="${server#\[}"; server="${server%\]}"; }
+    [[ "$server" == *: ]] && server="\"$server\""
     cat <<EOF
 proxies:
   - name: "$name"
@@ -69,6 +80,10 @@ _build_vless_grpc_uri() {
 _build_vless_grpc_exit_yaml() {
     local name="$1" server="$2" port="$3" uuid="$4" sni="$5"
     local service="$6" public_key="${7:-}" short_id="${8:-}" fingerprint="${9:-chrome}"
+    service="${service//\\/\\\\}"; service="${service//\"/\\\"}"
+    service="${service//$'\n'/\\n}"; service="${service//$'\r'/\\r}"
+    [[ "$server" == \[*\] ]] && { server="${server#\[}"; server="${server%\]}"; }
+    [[ "$server" == *: ]] && server="\"$server\""
 
     echo "  - name: $name"
     echo "    type: vless"

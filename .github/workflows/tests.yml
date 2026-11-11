@@ -11,7 +11,6 @@ permissions:
 
 jobs:
   test:
-    name: Server Bash tests
     runs-on: ubuntu-latest
     concurrency:
       group: tests-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
@@ -133,9 +132,14 @@ jobs:
         run: cargo install cross --version 0.2.5 --locked
       - name: Build workspace
         if: ${{ !matrix.cross }}
-        run: cargo build --workspace --locked --target ${{ matrix.target }}
+        # Runs under bash and pwsh (Windows); Cargo reads the target from the environment.
+        env:
+          CARGO_BUILD_TARGET: ${{ matrix.target }}
+        run: cargo build --workspace --locked
       - name: Cross-build workspace
         if: matrix.cross
         # VERSION and the server assets live outside the Cargo workspace.
         working-directory: .
-        run: cross build --manifest-path remote-control/Cargo.toml --workspace --locked --target ${{ matrix.target }}
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cross build --manifest-path remote-control/Cargo.toml --workspace --locked --target "$TARGET"

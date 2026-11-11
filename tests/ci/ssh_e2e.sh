@@ -27,9 +27,15 @@ container=$(docker run -d -p 127.0.0.1::2222 -v "$tmp:/fixture:ro" "$image")
 address=$(docker port "$container" 2222/tcp)
 port=${address##*:}
 [[ $address == 127.0.0.1:* && $port =~ ^[0-9]+$ && $port -gt 1023 ]] || { echo "Invalid loopback mapping: $address" >&2; exit 1; }
+# Docker's port proxy accepts TCP before sshd listens, so only an SSH banner proves readiness.
+ssh_banner_ready() (
+    exec 3<>"/dev/tcp/127.0.0.1/$port" || exit 1
+    IFS= read -r -t 1 banner <&3 || exit 1
+    [[ $banner == SSH-* ]]
+)
 ready=false
 for _ in {1..100}; do
-    if (echo >"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then ready=true; break; fi
+    if ssh_banner_ready 2>/dev/null; then ready=true; break; fi
     if [[ $(docker inspect -f '{{.State.Running}}' "$container") != true ]]; then break; fi
     sleep 0.1
 done

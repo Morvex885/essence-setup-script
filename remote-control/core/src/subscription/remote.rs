@@ -447,13 +447,39 @@ pub(super) async fn prune<S: RemoteSession>(remote: &S, sub_dir: &str, tokens: &
     (removed.unwrap_or(0), status == Some(0) && removed.is_some() && failed == Some(0))
 }
 
-/// HTTP status of the published link (v1 `curl -sk --max-time 5`); `None`
-/// without a response. Certificates are not verified, redirects not followed.
-pub(super) async fn http_status(url: &str) -> Option<u16> {
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+/// Answer of the published link to the post-publication request.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum HttpCheck {
+    Status(u16),
+    /// TLS handshake refused the server certificate.
+    Untrusted,
+    NoResponse,
+}
+
+/// HTTP status of the published link (v1 `curl --max-time 5`). The certificate
+/// is verified: subscription hosts serve an ACME certificate for their domain
+/// and mihomo clients verify it too. Redirects are not followed.
+pub(super) async fn http_status(url: &str) -> HttpCheck {
+    let Ok(client) = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(5))
-        .build().ok()?;
-    client.get(url).send().await.ok().map(|response| response.status().as_u16())
+        .build() else { return HttpCheck::NoResponse };
+    match client.get(url).send().await {
+        Ok(response) => HttpCheck::Status(response.status().as_u16()),
+        Err(error) if certificate_rejected(std::error::Error::source(&error)) => HttpCheck::Untrusted,
+        Err(_) => HttpCheck::NoResponse,
+    }
+}
+
+/// rustls reports verification failures (`invalid peer certificate: …`,
+/// `peer sent no certificates`) inside the connect error chain. The chain
+/// starts below the top-level error, whose text contains the URL.
+pub(super) fn certificate_rejected(mut source: Option<&(dyn std::error::Error + 'static)>) -> bool {
+    while let Some(error) = source {
+        if error.to_string().contains("certificate") {
+            return true;
+        }
+        source = error.source();
+    }
+    false
 }

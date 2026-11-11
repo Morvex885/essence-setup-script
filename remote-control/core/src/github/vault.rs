@@ -659,9 +659,19 @@ pub fn decrypt_with(identity: &age::x25519::Identity, ciphertext: &[u8]) -> Opti
     Some(plaintext)
 }
 
+/// scrypt `log_n` of a new `unlock.age`: age's default (v1 wrote it through
+/// `age -j batchpass`), fixed rather than calibrated to the creating machine,
+/// so every device opens the file within [`SCRYPT_MAX_WORK_FACTOR`].
+const SCRYPT_WORK_FACTOR: u8 = 18;
+/// The highest `log_n` accepted from a repository (the reference age cap).
+const SCRYPT_MAX_WORK_FACTOR: u8 = 22;
+
 /// `unlock.age`: the identity file encrypted with an scrypt passphrase.
 pub fn wrap_identity(keys: &Keys, password: &str) -> Result<Vec<u8>> {
-    let encryptor = age::Encryptor::with_user_passphrase(SecretString::from(password.to_owned()));
+    let mut recipient = age::scrypt::Recipient::new(SecretString::from(password.to_owned()));
+    recipient.set_work_factor(SCRYPT_WORK_FACTOR);
+    let encryptor = age::Encryptor::with_recipients(std::iter::once(&recipient as &dyn age::Recipient))
+        .map_err(|_| age_failed("шифрование ключа конфигурации GitHub", "Не удалось подготовить шифрование age."))?;
     let mut output = Vec::new();
     let mut writer = encryptor.wrap_output(&mut output)?;
     writer.write_all(keys.identity_file().as_bytes())?;
@@ -669,17 +679,21 @@ pub fn wrap_identity(keys: &Keys, password: &str) -> Result<Vec<u8>> {
     Ok(output)
 }
 
-/// `None`: wrong passphrase. A malformed envelope or key is a format error.
+/// `None`: wrong passphrase. A malformed envelope or key is a format error;
+/// an over-limit work factor is neither, so it never reads as foreign data.
 pub fn unwrap_identity(unlock: &[u8], password: &str) -> Result<Option<Keys>> {
     let decryptor = age::Decryptor::new(unlock).map_err(|_| invalid_format())?;
     if !decryptor.is_scrypt() {
         return Err(invalid_format());
     }
     let mut identity = age::scrypt::Identity::new(SecretString::from(password.to_owned()));
-    identity.set_max_work_factor(22);
+    identity.set_max_work_factor(SCRYPT_MAX_WORK_FACTOR);
     let mut reader = match decryptor.decrypt(std::iter::once(&identity as &dyn age::Identity)) {
         Ok(reader) => reader,
         Err(age::DecryptError::DecryptionFailed | age::DecryptError::NoMatchingKeys | age::DecryptError::KeyDecryptionFailed) => return Ok(None),
+        Err(age::DecryptError::ExcessiveWork { required, .. }) => return Err(RcError::new("vault_work_excessive", format!(
+            "Файл unlock.age защищён слишком сложным параметром scrypt (2^{required}, допустимо не больше 2^{SCRYPT_MAX_WORK_FACTOR}): расшифровка остановлена."))
+            .with_extra("required", required).with_extra("max", SCRYPT_MAX_WORK_FACTOR)),
         Err(_) => return Err(invalid_format()),
     };
     let mut text = Zeroizing::new(Vec::new());
@@ -969,6 +983,19 @@ mod tests {
         assert_eq!(&decrypt_with(&ours.identity, &file).unwrap()[..], b"snapshot");
         let wrapped = wrap_identity(&ours, "vault-pass").unwrap();
         assert!(String::from_utf8_lossy(&wrapped).starts_with("age-encryption.org/v1\n-> scrypt "));
+        // A fixed work factor within the unwrap limit; an over-limit one is
+        // its own error, never a format error (which would offer replacement).
+        let start = wrapped.iter().position(|b| *b == b'\n').unwrap() + 1;
+        let end = start + wrapped[start..].iter().position(|b| *b == b'\n').unwrap();
+        let stanza = std::str::from_utf8(&wrapped[start..end]).unwrap();
+        let factor = stanza.rsplit(' ').next().unwrap();
+        assert_eq!(factor, SCRYPT_WORK_FACTOR.to_string(), "{stanza}");
+        assert!(SCRYPT_WORK_FACTOR <= SCRYPT_MAX_WORK_FACTOR);
+        let mut heavy = wrapped[..end - factor.len()].to_vec();
+        heavy.extend_from_slice((SCRYPT_MAX_WORK_FACTOR + 1).to_string().as_bytes());
+        heavy.extend_from_slice(&wrapped[end..]);
+        let error = unwrap_identity(&heavy, "vault-pass").err().expect("over-limit work factor");
+        assert_eq!((error.code, &error.extra["required"]), ("vault_work_excessive", &json!(SCRYPT_MAX_WORK_FACTOR + 1)));
         assert!(unwrap_identity(&wrapped, "wrong").unwrap().is_none());
         let opened = unwrap_identity(&wrapped, "vault-pass").unwrap().unwrap();
         assert_eq!(opened.recipient, ours.recipient);

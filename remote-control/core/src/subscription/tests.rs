@@ -199,7 +199,7 @@ fn snippet_headers_ttl_and_time_follow_v1() {
     assert_eq!(ttl_expiry("12h", 100), Some(100 + 12 * 3600));
     assert_eq!(ttl_expiry("30d", 0), Some(30 * 86_400));
     assert_eq!(ttl_expiry("2w", 0), Some(2 * 604_800));
-    for bad in ["", "h", "1m", "0d", "01d", "1234567d", "-1d", "1.5d", "d1"] {
+    for bad in ["", "h", "1m", "0d", "01d", "1234567d", "-1d", "1.5d", "d1", "30д", "д"] {
         assert_eq!(ttl_expiry(bad, 0), None, "{bad}");
     }
     assert_eq!(iso(0), "1970-01-01T00:00:00Z");
@@ -445,6 +445,16 @@ async fn failed_http_check_after_saving_is_partial_with_the_link() {
         "Подписка сохранена, но проверка HTTP: 502 (ожидалось 200). Проверьте журнал ошибок nginx на сервере."));
     assert_eq!(error.extra["url"], json!(format!("{base}/sub/{token}")));
     assert_eq!(error.extra["expires_at"], Value::Null);
+}
+
+#[test]
+fn certificate_failures_are_told_apart_from_missing_answers() {
+    use std::io::{Error, ErrorKind};
+    let untrusted = Error::new(ErrorKind::InvalidData, "invalid peer certificate: UnknownIssuer");
+    assert!(remote::certificate_rejected(Some(&untrusted)));
+    assert!(remote::certificate_rejected(Some(&Error::other("peer sent no certificates"))));
+    assert!(!remote::certificate_rejected(Some(&Error::new(ErrorKind::ConnectionRefused, "connection refused"))));
+    assert!(!remote::certificate_rejected(None));
 }
 
 // ─── rotate / revoke ─────────────────────────────────────────────────────────

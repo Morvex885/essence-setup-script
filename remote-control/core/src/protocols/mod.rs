@@ -63,8 +63,10 @@ fn uri_host(server: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-/// Escapes the contents of a double-quoted client YAML name, matching Bash.
-fn yaml_name(name: &str) -> std::borrow::Cow<'_, str> {
+/// Escapes the contents of a double-quoted YAML scalar (client names, xHTTP
+/// paths, gRPC service names, Hysteria2 passwords, Reality dest), matching
+/// Bash: backslash, double quote, LF and CR.
+fn yaml_escape(name: &str) -> std::borrow::Cow<'_, str> {
     if !name.contains(['\\', '"', '\n', '\r']) {
         return name.into();
     }
@@ -79,6 +81,20 @@ fn yaml_name(name: &str) -> std::borrow::Cow<'_, str> {
         }
     }
     escaped.into()
+}
+
+/// Address for a YAML `server:`/`listen:` value. A bracketed IPv6 `[addr]`
+/// loses its brackets (a plain scalar starting with `[` is a flow sequence);
+/// an address ending with `:` (`::`, `2001:db8::`) is double-quoted, since a
+/// `:` before the line break is a mapping indicator. Other addresses such as
+/// `::1` or `2001:db8::1` stay plain strings, as Bash consumers read them.
+fn yaml_host(server: &str) -> std::borrow::Cow<'_, str> {
+    let host = server.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')).unwrap_or(server);
+    if host.ends_with(':') {
+        format!("\"{host}\"").into()
+    } else {
+        host.into()
+    }
 }
 
 /// Appends `line` and a newline (Bash `echo "$line"`).
@@ -98,6 +114,11 @@ mod tests {
         assert_eq!(uri_host("[2001:db8::1]"), "[2001:db8::1]");
         assert_eq!(or("", "d"), "d");
         assert_eq!(or("v", "d"), "v");
+        assert_eq!(yaml_host("[2001:db8::1]"), "2001:db8::1");
+        assert_eq!(yaml_host("::1"), "::1");
+        assert_eq!(yaml_host("::"), "\"::\"");
+        assert_eq!(yaml_host("[::]"), "\"::\"");
+        assert_eq!(yaml_host("[::1"), "[::1");
     }
 
     #[test]

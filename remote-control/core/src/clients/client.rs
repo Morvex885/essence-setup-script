@@ -435,22 +435,34 @@ pub async fn set_group<T: RemoteTransport>(session: &mut Session, invocation: &I
     session.log(Level::Success, &format!("{name}: группа — {group}"));
 
     let mut failed = false;
-    if let Err(error) = generate::regenerate_group(session, &group, &plan.affected, connect).await {
-        session.log(Level::Warn, &error.message);
-        failed = true;
-    }
+    let generated = match generate::regenerate_group(session, &group, &plan.affected, connect).await {
+        Ok(report) => {
+            if !report.complete() {
+                session.log(Level::Warn, "Генерация завершена с ошибками.");
+                failed = true;
+            }
+            report.ok.contains(&name)
+        }
+        Err(error) => {
+            session.log(Level::Warn, &error.message);
+            failed = true;
+            false
+        }
+    };
     for node in &plan.awg_drop {
         if let Err(error) = crate::awg::remove_peers(session, node, std::slice::from_ref(&name), connect).await {
             session.log(Level::Warn, &error.message);
             failed = true;
         }
     }
-    // The old directory goes only once the new config exists: a skipped
+    // The old directory goes only once this regeneration wrote the client's
+    // new config (even when other clients or nodes failed): a stale
+    // config.yaml in the new directory is no proof, a failed or skipped
     // generation keeps the previous config as a fallback.
-    let config = session.state.load_config()?;
-    let new_dir = client_dir(session.state.paths(), find_client(&config, &name)?)?;
     let old_dir = &plan.old_dir;
-    if new_dir.join("config.yaml").is_file() {
+    if generated {
+        let config = session.state.load_config()?;
+        let new_dir = client_dir(session.state.paths(), find_client(&config, &name)?)?;
         if *old_dir != new_dir && entry_exists(old_dir)? {
             if !generated_path_safe(session.state.paths(), old_dir) {
                 session.log(Level::Warn, &format!("{name}: старая папка вне каталога сгенерированных конфигов — не удалена: {}", old_dir.display()));
@@ -883,6 +895,22 @@ mod tests {
         }
         assert!(plan.iter().all(|l| !l.contains(&"a".repeat(64))));
         assert_eq!(fingerprint(root.path()), before);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn set_group_keeps_the_old_directory_when_the_client_was_not_regenerated() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut session, _, generated) = setup(root.path(), config());
+        let stale = generated.join("PC/my-router/config.yaml");
+        fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        fs::write(&stale, "stale\n").unwrap();
+        // Unreachable nodes: the generation fails, the stale file is no proof.
+        let error = run(&mut session, &["client", "set-group", "--name", "my-router", "--group", "PC", "--yes"],
+            &|| FakeTransport::default()).await.unwrap_err();
+        assert_eq!(error.code, "partial");
+        assert_eq!(find_client(&session.state.load_config().unwrap(), "my-router").unwrap().group, "PC");
+        assert_eq!(fs::read_to_string(generated.join("ROUTER/my-router/config.yaml")).unwrap(), "keep router\n");
+        assert_eq!(fs::read_to_string(&stale).unwrap(), "stale\n");
     }
 
     #[tokio::test(flavor = "current_thread")]

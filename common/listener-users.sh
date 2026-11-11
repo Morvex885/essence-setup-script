@@ -22,13 +22,15 @@ _sync_listener_users() {
         return 1
     fi
 
-    # Both markers must occur in order inside the selected listener block.
+    # Exactly one users start marker followed by exactly one end marker inside
+    # the listener block: a second, unclosed start would swallow the closing
+    # listener marker and the rest of the config.
     if ! awk -v marker="$marker" '
         $0 == "# --- " marker " ---" { inside=1; next }
         $0 == "# --- /" marker " ---" { closed=1; exit }
-        inside && /# client-users-start/ { start=1; next }
-        inside && start && /# client-users-end/ { end=1 }
-        END { if (!(inside && start && end && closed)) exit 1 }
+        inside && /# client-users-start/ { starts++; next }
+        inside && /# client-users-end/ { if (!starts) bad=1; ends++ }
+        END { if (!(inside && closed && !bad && starts == 1 && ends == 1)) exit 1 }
     ' "$config"; then
         return 1
     fi

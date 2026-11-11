@@ -72,10 +72,18 @@ variation that were removed or pinned:
 - VLESS TCP/gRPC and Hysteria2 URI builders percent-encode user fields
   (uuid, password, sni, pbk, sid, serviceName, obfs-password, fragment).
 - Client YAML `name:` escapes `\`, `"`, CR and LF inside the double quotes.
+  The same escaping applies to the double-quoted xHTTP `path`, gRPC
+  `grpc-service-name`, Reality `dest` and Hysteria2 `password` /
+  `obfs-password` (listener user password included).
+- YAML `server:` / `listen:` addresses drop the brackets of `[v6]`; an address
+  ending with `:` (`::`, `2001:db8::`) is double-quoted.
+- `_parse_vless_uri_to_exit` percent-decodes the UUID; a malformed escape or
+  `%00` in it fails like in query params.
 - `_build_vless_tcp_exit_yaml` with an explicitly empty flow omits `flow:`
   (only an unset flow defaults to `xtls-rprx-vision`).
-- `_sync_listener_users` fails without touching the file when
-  `# client-users-end` or the block end marker is missing.
+- `_sync_listener_users` fails without touching the file when the listener
+  block is not closed or does not hold exactly one `# client-users-start`
+  followed by exactly one `# client-users-end`.
 
 ## Not captured
 

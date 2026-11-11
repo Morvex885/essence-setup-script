@@ -1,7 +1,7 @@
 //! Hysteria2 builders (`common/protocols/hy2.sh`).
 
 use super::uri::percent_encode;
-use super::{line, or, uri_host, yaml_name};
+use super::{line, or, uri_host, yaml_escape, yaml_host};
 
 /// SNI used when none is given.
 pub const DEFAULT_SNI: &str = "www.google.de";
@@ -33,15 +33,16 @@ pub struct Hy2Listener<'a> {
 fn push_obfs(out: &mut String, obfs_password: &str) {
     if !obfs_password.is_empty() {
         line(out, "    obfs: salamander");
-        line(out, &format!("    obfs-password: {obfs_password}"));
+        line(out, &format!("    obfs-password: \"{}\"", yaml_escape(obfs_password)));
     }
 }
 
-/// Listener block for the server's `config.yaml`.
+/// Listener block for the server's `config.yaml`. Passwords are quoted: a
+/// plain scalar breaks on ` #`, a leading indicator or a line break.
 pub fn listener_yaml(listener: &Hy2Listener) -> String {
     let mut out = format!(
-        "  - name: {}\n    type: hysteria2\n    listen: 0.0.0.0\n    port: {}\n    users:\n      # client-users-start\n      {}: {}\n      # client-users-end\n",
-        listener.name, listener.port, listener.user, listener.password
+        "  - name: {}\n    type: hysteria2\n    listen: 0.0.0.0\n    port: {}\n    users:\n      # client-users-start\n      {}: \"{}\"\n      # client-users-end\n",
+        listener.name, listener.port, listener.user, yaml_escape(listener.password)
     );
     push_obfs(&mut out, listener.obfs_password);
     line(&mut out, "    certificate: /etc/mihomo/certs/hy2/server.crt");
@@ -52,10 +53,10 @@ pub fn listener_yaml(listener: &Hy2Listener) -> String {
 
 fn proxy_body(out: &mut String, hy2: &Hy2) {
     out.push_str(&format!(
-        "    type: hysteria2\n    server: {}\n    port: {}\n    password: {}\n    sni: {}\n    skip-cert-verify: {}\n",
-        hy2.server,
+        "    type: hysteria2\n    server: {}\n    port: {}\n    password: \"{}\"\n    sni: {}\n    skip-cert-verify: {}\n",
+        yaml_host(hy2.server),
         hy2.port,
-        hy2.password,
+        yaml_escape(hy2.password),
         or(hy2.sni, DEFAULT_SNI),
         hy2.skip_cert_verify
     ));
@@ -64,7 +65,7 @@ fn proxy_body(out: &mut String, hy2: &Hy2) {
 
 /// Client config: a `proxies:` document with one quoted-name proxy.
 pub fn client_yaml(hy2: &Hy2) -> String {
-    let mut out = format!("proxies:\n  - name: \"{}\"\n", yaml_name(hy2.name));
+    let mut out = format!("proxies:\n  - name: \"{}\"\n", yaml_escape(hy2.name));
     proxy_body(&mut out, hy2);
     out
 }
@@ -112,5 +113,25 @@ mod tests {
             "hysteria2://pw@[2001:db8::1]:443?insecure=1&sni=www.google.de&obfs=salamander&obfs-password=o\n"
         );
         assert!(exit_yaml(&hy2).contains("    skip-cert-verify: false\n    obfs: salamander\n"));
+    }
+
+    #[test]
+    fn yaml_quotes_passwords_and_unbrackets_server() {
+        let hy2 = Hy2 {
+            name: "n",
+            server: "[2001:db8::1]",
+            port: "443",
+            password: "p #\"\\\n",
+            sni: "",
+            skip_cert_verify: true,
+            obfs_password: "- o #",
+        };
+        for yaml in [client_yaml(&hy2), exit_yaml(&hy2)] {
+            assert!(yaml.contains("    server: 2001:db8::1\n"), "{yaml}");
+            assert!(yaml.contains("    password: \"p #\\\"\\\\\\n\"\n"), "{yaml}");
+            assert!(yaml.contains("    obfs-password: \"- o #\"\n"), "{yaml}");
+        }
+        let listener = Hy2Listener { user: "u", password: "a #b", obfs_password: "o", ..Hy2Listener::default() };
+        assert!(listener_yaml(&listener).contains("      u: \"a #b\"\n      # client-users-end\n    obfs: salamander\n    obfs-password: \"o\"\n"));
     }
 }

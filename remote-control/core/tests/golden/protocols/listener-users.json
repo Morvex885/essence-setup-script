@@ -347,6 +347,60 @@
         "vless-tcp",
         "      - username: alice\n        uuid: u1\n        flow: xtls-rprx-vision\n      - username: bob\n        uuid: u2\n        flow: xtls-rprx-vision"
       ],
+      "case": "sy_repeated_unclosed_users",
+      "function": "_sync_listener_users",
+      "globals": {
+        "config_path": "/etc/mihomo/config.yaml",
+        "config_yaml": "# --- vless-tcp ---\n  - name: x\n    users:\n      # client-users-start\n      # client-users-end\n      # client-users-start\n    proxy: DIRECT\n# --- /vless-tcp ---\ntail: keep\n",
+        "note": "stdout is the resulting config file (or empty if absent)"
+      },
+      "invoke": "w_sync",
+      "rc": 1,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "IyAtLS0gdmxlc3MtdGNwIC0tLQogIC0gbmFtZTogeAogICAgdXNlcnM6CiAgICAgICMgY2xpZW50LXVzZXJzLXN0YXJ0CiAgICAgICMgY2xpZW50LXVzZXJzLWVuZAogICAgICAjIGNsaWVudC11c2Vycy1zdGFydAogICAgcHJveHk6IERJUkVDVAojIC0tLSAvdmxlc3MtdGNwIC0tLQp0YWlsOiBrZWVwCg=="
+    },
+    {
+      "args": [
+        "vless-tcp",
+        "      - username: alice\n        uuid: u1\n        flow: xtls-rprx-vision\n      - username: bob\n        uuid: u2\n        flow: xtls-rprx-vision"
+      ],
+      "case": "sy_stray_end_before_users",
+      "function": "_sync_listener_users",
+      "globals": {
+        "config_path": "/etc/mihomo/config.yaml",
+        "config_yaml": "# --- vless-tcp ---\n      # client-users-end\n      # client-users-start\n      # client-users-end\n# --- /vless-tcp ---\n",
+        "note": "stdout is the resulting config file (or empty if absent)"
+      },
+      "invoke": "w_sync",
+      "rc": 1,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "IyAtLS0gdmxlc3MtdGNwIC0tLQogICAgICAjIGNsaWVudC11c2Vycy1lbmQKICAgICAgIyBjbGllbnQtdXNlcnMtc3RhcnQKICAgICAgIyBjbGllbnQtdXNlcnMtZW5kCiMgLS0tIC92bGVzcy10Y3AgLS0tCg=="
+    },
+    {
+      "args": [
+        "vless-tcp",
+        "      - username: alice\n        uuid: u1\n        flow: xtls-rprx-vision\n      - username: bob\n        uuid: u2\n        flow: xtls-rprx-vision"
+      ],
+      "case": "sy_two_users_blocks",
+      "function": "_sync_listener_users",
+      "globals": {
+        "config_path": "/etc/mihomo/config.yaml",
+        "config_yaml": "# --- vless-tcp ---\n      # client-users-start\n      # client-users-end\n      # client-users-start\n      # client-users-end\n# --- /vless-tcp ---\n",
+        "note": "stdout is the resulting config file (or empty if absent)"
+      },
+      "invoke": "w_sync",
+      "rc": 1,
+      "stderr_b64": "",
+      "stdin_b64": null,
+      "stdout_b64": "IyAtLS0gdmxlc3MtdGNwIC0tLQogICAgICAjIGNsaWVudC11c2Vycy1zdGFydAogICAgICAjIGNsaWVudC11c2Vycy1lbmQKICAgICAgIyBjbGllbnQtdXNlcnMtc3RhcnQKICAgICAgIyBjbGllbnQtdXNlcnMtZW5kCiMgLS0tIC92bGVzcy10Y3AgLS0tCg=="
+    },
+    {
+      "args": [
+        "vless-tcp",
+        "      - username: alice\n        uuid: u1\n        flow: xtls-rprx-vision\n      - username: bob\n        uuid: u2\n        flow: xtls-rprx-vision"
+      ],
       "case": "sy_vless_tcp_replace",
       "function": "_sync_listener_users",
       "globals": {

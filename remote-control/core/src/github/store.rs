@@ -274,9 +274,14 @@ pub fn ls_remote_has_branch(paths: &StatePaths, target: &Target, store: &Path) -
     Ok(ls_remote(paths, target, store)?.map(|empty| !empty))
 }
 
+/// Force-updates only the remote-tracking ref: a rewritten remote history must
+/// still be fetched; the local branch is reconciled by explicit ancestry checks.
+fn tracking_refspec(branch: &str) -> String {
+    format!("+refs/heads/{branch}:refs/remotes/origin/{branch}")
+}
+
 pub fn fetch(paths: &StatePaths, target: &Target, store: &Path) -> Result<Output> {
-    let branch = &target.branch;
-    remote(paths, target, store, &["fetch", "--no-tags", "origin", &format!("{branch}:refs/remotes/origin/{branch}")])
+    remote(paths, target, store, &["fetch", "--no-tags", "origin", &tracking_refspec(&target.branch)])
 }
 
 // ─── Session worktrees ───────────────────────────────────────────────────────
@@ -648,5 +653,46 @@ mod tests {
         assert!(auth_failure_confirmed("You are not logged into any GitHub hosts"));
         assert!(!auth_failure_confirmed("dial tcp: connection timed out after 4010ms"));
         assert!(!auth_failure_confirmed("error connecting to api.github.com"));
+    }
+
+    #[test]
+    fn fetch_follows_rewritten_remote_history_without_touching_the_local_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (origin, store) = (dir.path().join("origin.git"), dir.path().join("store.git"));
+        for repo in [&origin, &store] {
+            let mut init = exec::git();
+            init.arg("init").arg("--bare").arg(repo);
+            assert!(exec::run(init, None, exec::LOCAL_TIMEOUT).unwrap().success);
+        }
+        let commit = |message: &str, parent: Option<&str>| {
+            let tree = store_ok(&origin, "test", &["mktree"]).unwrap().text();
+            let mut list = AUTHOR.to_vec();
+            list.extend(["--git-dir", origin.to_str().unwrap(), "commit-tree", &tree, "-m", message]);
+            if let Some(parent) = parent {
+                list.extend(["-p", parent]);
+            }
+            let mut command = exec::git();
+            command.args(&list);
+            let out = exec::run(command, None, exec::LOCAL_TIMEOUT).unwrap();
+            assert!(out.success, "{}", out.diagnostic());
+            out.text()
+        };
+        let fetch = || {
+            let refspec = tracking_refspec("main");
+            store_run(&store, &["fetch", "--no-tags", origin.to_str().unwrap(), &refspec]).unwrap()
+        };
+        let first = commit("first", None);
+        let second = commit("second", Some(&first));
+        update_ref(&origin, "refs/heads/main", &second).unwrap();
+        assert!(fetch().success);
+        update_ref(&store, "refs/heads/main", &second).unwrap();
+        // Force-push of an unrelated history: a non-fast-forward for the tracking ref.
+        let rewritten = commit("rewritten", None);
+        update_ref(&origin, "refs/heads/main", &rewritten).unwrap();
+        let out = fetch();
+        assert!(out.success, "{}", out.diagnostic());
+        assert_eq!(rev(&store, "refs/remotes/origin/main").unwrap().as_deref(), Some(rewritten.as_str()));
+        assert_eq!(rev(&store, "refs/heads/main").unwrap().as_deref(), Some(second.as_str()));
+        assert!(!is_ancestor(&store, &second, &rewritten).unwrap());
     }
 }

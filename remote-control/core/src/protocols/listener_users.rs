@@ -45,15 +45,18 @@ const USERS_END: &str = "# client-users-end";
 
 /// Replaces the client users of the `# --- <marker> ---` listener block in
 /// `config` with `users_yaml` (empty → no client users). `None` when the block
-/// is not closed or the users start/end markers are missing or out of order.
-/// Cascade users outside the markers are kept.
+/// is not closed or does not hold exactly one users start marker followed by
+/// exactly one end marker: a second, unclosed start would otherwise swallow
+/// the closing listener marker and everything after it. Cascade users outside
+/// the markers are kept.
 pub fn sync(config: &str, marker: &str, users_yaml: &str) -> Option<String> {
     let start = format!("# --- {marker} ---");
     let end = format!("# --- /{marker} ---");
     let lines: Vec<&str> = config.strip_suffix('\n').unwrap_or(config).split('\n').collect();
     let lines = if config.is_empty() { Vec::new() } else { lines };
 
-    let (mut in_range, mut has_start, mut has_end, mut closed) = (false, false, false, false);
+    let (mut in_range, mut closed, mut ordered) = (false, false, true);
+    let (mut starts, mut ends) = (0usize, 0usize);
     for l in &lines {
         if *l == start {
             in_range = true;
@@ -61,12 +64,13 @@ pub fn sync(config: &str, marker: &str, users_yaml: &str) -> Option<String> {
             closed = true;
             break;
         } else if in_range && l.contains(USERS_START) {
-            has_start = true;
-        } else if in_range && has_start && l.contains(USERS_END) {
-            has_end = true;
+            starts += 1;
+        } else if in_range && l.contains(USERS_END) {
+            ordered &= starts > 0;
+            ends += 1;
         }
     }
-    if !(in_range && has_start && has_end && closed) {
+    if !(in_range && closed && ordered && starts == 1 && ends == 1) {
         return None;
     }
 
@@ -131,6 +135,10 @@ mod tests {
             "# --- hy2 ---\n      # client-users-start\n# --- /hy2 ---\n",
             "# --- hy2 ---\n      # client-users-end\n      # client-users-start\n# --- /hy2 ---\n",
             "# --- hy2 ---\n      # client-users-start\n      # client-users-end\n",
+            "# --- hy2 ---\n      # client-users-start\n      # client-users-end\n      # client-users-start\n# --- /hy2 ---\ntail: keep\n",
+            "# --- hy2 ---\n      # client-users-start\n      # client-users-end\n      # client-users-start\n      # client-users-end\n# --- /hy2 ---\n",
+            "# --- hy2 ---\n      # client-users-end\n      # client-users-start\n      # client-users-end\n# --- /hy2 ---\n",
+            "# --- hy2 ---\n      # client-users-start\n      # client-users-end\n      # client-users-end\n# --- /hy2 ---\n",
         ] {
             assert_eq!(sync(config, "hy2", "      new: pw"), None);
         }

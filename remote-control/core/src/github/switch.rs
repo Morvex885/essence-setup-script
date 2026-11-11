@@ -303,10 +303,22 @@ fn change_account_inner(session: &mut Session, invocation: &Invocation, secrets:
     };
     write_marker(paths, &marker)?;
     let result = switch_prepared(session, invocation, secrets, paths, &target, &old, old_state, &mut marker);
-    if result.is_err() && read_marker(paths).ok().flatten().is_some_and(|m| m.phase == Phase::Prepared) {
-        let _ = rollback(paths);
+    if result.is_err() {
+        abandon(session, paths);
     }
     result
+}
+
+/// A failed switch still in `prepared` is undone under the session lock. If
+/// the current GitHub session was already closed (`--existing remote`), the
+/// session suspends instead of staying open over a runtime that never syncs.
+fn abandon(session: &mut Session, paths: &StatePaths) {
+    if read_marker(paths).ok().flatten().is_some_and(|m| m.phase == Phase::Prepared) {
+        let _ = rollback(paths);
+        if session.github.is_none() {
+            suspend(session, &Phase::Prepared);
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -356,7 +368,7 @@ fn decide(session: &mut Session, invocation: &Invocation, secrets: &Secrets, pat
     if !tracked.is_empty() {
         match next.read_vault(paths, secrets, false, false, &mut log) {
             Ok(snapshot) => target_state = Some(snapshot),
-            Err(error) if matches!(error.code, "vault_password_required" | "vault_password_invalid") => return Err(error),
+            Err(error) if matches!(error.code, "vault_password_required" | "vault_password_invalid" | "vault_work_excessive") => return Err(error),
             Err(error) if error.code == "github_format_outdated" => {
                 return Err(fail("проверка формата конфигурации GitHub", format!(
                     "Репозиторий {} содержит конфигурацию устаревшего формата. Смена аккаунта прервана.", next.target.repo()))
@@ -389,24 +401,8 @@ fn decide(session: &mut Session, invocation: &Invocation, secrets: &Secrets, pat
             "Репозиторий {} содержит посторонние файлы: заменить их можно флагом --replace-target.", next.target.repo()))
             .with_extra("repo", next.target.repo()).with_extra("tracked_files", tracked.len()).with_extra("reason", reason));
     }
-    let storage = match invocation.value("storage").map(Storage::parse) {
-        Some(Some(storage)) => storage,
-        Some(None) => return Err(RcError::new("usage", "Флаг --storage принимает age или none.")),
-        None => return Err(RcError::new("storage_mode_required", "Выберите способ хранения конфигурации GitHub: --storage age|none.")
-            .with_extra("choices", ["age", "none"])),
-    };
-    let password = if storage == Storage::Age {
-        let password = secrets.get("new-vault-password").filter(|p| !p.is_empty()).ok_or_else(|| {
-            RcError::new("new_vault_password_required", "Требуется новый пароль доступа к конфигурации GitHub (секрет new-vault-password).")
-                .with_extra("secret", "new-vault-password")
-        })?;
-        if password.ends_with(['\r', '\n']) {
-            return Err(RcError::new("invalid", "Пароль доступа не должен заканчиваться переводом строки."));
-        }
-        Some(password.to_owned())
-    } else {
-        None
-    };
+    let storage = super::commands::storage_decision(super::commands::decisions(invocation)?.storage, &mut log)?;
+    let password = if storage == Storage::Age { Some(super::commands::new_vault_password(secrets)?.to_owned()) } else { None };
     let push = true;
     let desired = old_state.unwrap_or_else(vault::empty_snapshot);
     Ok(Choice { desired, push, storage, keys: None, password, replace: replace.is_some(), target_valid: false })
@@ -502,7 +498,8 @@ fn commit_target(session: &mut Session, invocation: &Invocation, paths: &StatePa
 
 /// The push outcome is unknown or the switch is committed but unfinished:
 /// the journal stays; both sessions close and nothing syncs until the next
-/// session open verifies and finishes or rolls back the switch.
+/// session open verifies and finishes or rolls back the switch. A rolled-back
+/// `prepared` switch only closes the session whose GitHub half is gone.
 fn suspend(session: &mut Session, phase: &Phase) {
     if let Some(mut current) = session.github.take() {
         let _ = current.close();
@@ -511,12 +508,15 @@ fn suspend(session: &mut Session, phase: &Phase) {
     session.state = State::with_locks(paths, session.state.locks().clone());
     session.open = false;
     let _ = session.state.locks().release_all();
-    if *phase == Phase::PushUnknown {
-        session.log(Level::Warn, "Результат отправки в новый репозиторий не подтверждён. Синхронизация и изменения приостановлены.");
-    } else {
-        session.log(Level::Warn, "Смена аккаунта GitHub не завершена. Синхронизация и изменения приостановлены.");
-    }
-    session.log(Level::Info, "Откройте сессию заново (session open): смена аккаунта будет проверена и завершена или отменена.");
+    const VERIFY: &str = "Откройте сессию заново (session open): смена аккаунта будет проверена и завершена или отменена.";
+    let (warning, next) = match phase {
+        Phase::Prepared => ("Смена аккаунта GitHub отменена, но текущая сессия GitHub уже закрыта. Синхронизация и изменения приостановлены.",
+            "Откройте сессию заново (session open)."),
+        Phase::PushUnknown => ("Результат отправки в новый репозиторий не подтверждён. Синхронизация и изменения приостановлены.", VERIFY),
+        Phase::TargetCommitted | Phase::LocalCommitted => ("Смена аккаунта GitHub не завершена. Синхронизация и изменения приостановлены.", VERIFY),
+    };
+    session.log(Level::Warn, warning);
+    session.log(Level::Info, next);
 }
 
 #[cfg(test)]
@@ -580,5 +580,33 @@ mod tests {
         let error = recover(&paths, &locks, &mut |_, _| {}).unwrap_err();
         assert!(error.message.contains("повреждена"), "{}", error.message);
         assert!(journal(&paths, "transaction.json").exists(), "a corrupt journal is never discarded");
+    }
+
+    #[test]
+    fn a_failed_prepared_switch_suspends_only_a_closed_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut session, journal) = crate::nodes::testing::session(dir.path());
+        let paths = session.state.paths().local();
+        drop(session.state.locks().acquire(crate::locking::LockKind::Session, "github-session").unwrap());
+        session.state = State::with_locks(paths.runtime(), session.state.locks().clone());
+        let old = Target::new("old-owner", super::super::REPO_NAME, super::super::BRANCH);
+        session.github = Some(GithubSession { target: old, work: None, storage: Storage::Plain, keys: None,
+            sync: SyncStatus::Clean, last_counts: Value::Null, last_version: None });
+
+        // The current session is intact: the switch is undone, the session stays open.
+        write_marker(&paths, &marker(Phase::Prepared)).unwrap();
+        abandon(&mut session, &paths);
+        assert!(!paths.account_switch().exists());
+        assert!(session.open && session.github.is_some() && dir.path().join(".rc-lock").exists());
+
+        // `--existing remote` closed the current session before the failure.
+        session.github = None;
+        write_marker(&paths, &marker(Phase::Prepared)).unwrap();
+        abandon(&mut session, &paths);
+        assert!(!paths.account_switch().exists(), "rolled back before the lock is released");
+        assert!(!session.open && session.github.is_none());
+        assert_eq!(session.state.paths().state_dir(), paths.root(), "no longer bound to github-runtime");
+        assert!(!dir.path().join(".rc-lock").exists());
+        assert!(journal.borrow().iter().any(|(level, text)| matches!(level, Level::Warn) && text.contains("уже закрыта")));
     }
 }

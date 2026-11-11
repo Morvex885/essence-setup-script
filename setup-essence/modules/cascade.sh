@@ -117,6 +117,48 @@ _show_current_listeners() {
     fi
 }
 
+# _dnat_rules_tagged CNAME — в таблице nat (IPv4 или IPv6) уже есть правила с
+# комментарием cascade-dnat:CNAME.
+_dnat_rules_tagged() {
+    local cname="$1"
+    { iptables-save -t nat 2>/dev/null; ip6tables-save -t nat 2>/dev/null; } |
+        grep -qF -e "--comment cascade-dnat:${cname} " -e "--comment \"cascade-dnat:${cname}\" "
+}
+
+# _rollback_dnat_install CNAME PREEXISTING REMOTE REMOTE_PORT LOCAL_PORT — убирает
+# правила, добавленные неудачной установкой (отсутствующие пропускаются).
+_rollback_dnat_install() {
+    local cname="$1" preexisting="$2"
+    shift 2
+    if [[ "$preexisting" == true ]]; then
+        warn "Правила cascade-dnat:${cname} существовали до установки — откат пропущен. Проверьте: iptables -t nat -S"
+        return 1
+    fi
+    _remove_dnat_rules "$cname" "$@"
+    info "Добавленные DNAT правила отменены."
+}
+
+# _dnat_client_uri URI HOST PORT — URI выходной ноды с адресом каскада: authority
+# собирается заново (IPv6 в квадратных скобках), userinfo, путь, query и фрагмент
+# сохраняются.
+_dnat_client_uri() {
+    local uri="$1" host="$2" port="$3" scheme="" body main suffix userinfo="" hostpath path=""
+    [[ "$host" == *:* ]] && host="[${host}]"
+    body="$uri"
+    if [[ "$uri" == *://* ]]; then
+        scheme="${uri%%://*}://"
+        body="${uri#*://}"
+    fi
+    main="${body%%[?#]*}"
+    suffix="${body#"$main"}"
+    [[ "$main" == *@* ]] && userinfo="${main%@*}@"
+    hostpath="${main##*@}"
+    if [[ "$hostpath" == */* ]]; then
+        path="/${hostpath#*/}"
+    fi
+    printf '%s%s%s:%s%s%s\n' "$scheme" "$userinfo" "$host" "$port" "$path" "$suffix"
+}
+
 _install_dnat_cascade() {
     local cname="$1"
 
@@ -202,15 +244,42 @@ _install_dnat_cascade() {
     echo ""
     confirm_yn "Всё верно?" || { info "Отменено."; return; }
 
+    # Адрес каскада для клиентов — до изменения правил. Для IPv6 exit-ноды
+    # правила ставятся только в ip6tables: клиенты должны приходить по IPv6.
+    local SERVER_ADDR remote_host="${REMOTE_SERVER#[}"
+    remote_host="${remote_host%]}"
+    SERVER_ADDR=$(grep '^Server:' /etc/mihomo/client-config.txt 2>/dev/null | head -1 | awk '{print $2}')
+    if [[ "$remote_host" == *:* ]]; then
+        [[ "$SERVER_ADDR" == *:* ]] || SERVER_ADDR=$(curl -6 -s --max-time 5 ifconfig.me)
+        if [[ "$SERVER_ADDR" != *:* ]]; then
+            warn "Exit-нода задана IPv6-адресом, но публичный IPv6 этого сервера не определён. Правила не изменены."
+            return 1
+        fi
+    else
+        [[ -z "$SERVER_ADDR" ]] && SERVER_ADDR=$(curl -4 -s --max-time 5 ifconfig.me)
+    fi
+    local client_host="$SERVER_ADDR"
+    [[ "$client_host" == *:* ]] && client_host="[${client_host}]"
+
+    # Правила с меткой этого каскада до установки: откат по точной спецификации
+    # (iptables -D удаляет первое совпадение) мог бы задеть их, поэтому он пропускается.
+    local dnat_preexisting=false
+    _dnat_rules_tagged "$cname" && dnat_preexisting=true
+
     # Применяем iptables правила
-    _apply_dnat_rules "$cname" "$REMOTE_SERVER" "$REMOTE_PORT" "$LOCAL_PORT" || {
+    if ! _apply_dnat_rules "$cname" "$REMOTE_SERVER" "$REMOTE_PORT" "$LOCAL_PORT"; then
         warn "Не удалось применить DNAT правила."
+        _rollback_dnat_install "$cname" "$dnat_preexisting" "$REMOTE_SERVER" "$REMOTE_PORT" "$LOCAL_PORT"
         return 1
-    }
+    fi
     success "iptables DNAT правила применены"
 
     # Сохраняем правила
-    _persist_dnat_rules || { warn "Не удалось сохранить DNAT правила."; return 1; }
+    if ! _persist_dnat_rules; then
+        warn "Не удалось сохранить DNAT правила."
+        _rollback_dnat_install "$cname" "$dnat_preexisting" "$REMOTE_SERVER" "$REMOTE_PORT" "$LOCAL_PORT"
+        return 1
+    fi
     success "Правила сохранены"
 
     # UFW
@@ -240,14 +309,9 @@ EOF
     rm /tmp/cascade_dnat_marker.yaml
 
     # Клиентский конфиг
-    local SERVER_ADDR
-    SERVER_ADDR=$(grep '^Server:' /etc/mihomo/client-config.txt 2>/dev/null | head -1 | awk '{print $2}')
-    [[ -z "$SERVER_ADDR" ]] && SERVER_ADDR=$(curl -4 -s --max-time 5 ifconfig.me)
-
     local client_uri=""
     if [[ -n "$EXIT_URI" ]]; then
-        # Заменяем server:port в URI на адрес текущего сервера
-        client_uri=$(echo "$EXIT_URI" | sed -E "s/@[^:@]+:[0-9]+/@${SERVER_ADDR}:${LOCAL_PORT}/")
+        client_uri=$(_dnat_client_uri "$EXIT_URI" "$SERVER_ADDR" "$LOCAL_PORT")
     fi
 
     cat >> /etc/mihomo/client-config.txt << EOF
@@ -257,7 +321,7 @@ Type: iptables-dnat
 Local port: $LOCAL_PORT
 Remote: $REMOTE_SERVER:$REMOTE_PORT
 $(  [[ -n "$client_uri" ]] && printf "URI: %s\n" "$client_uri" )
-Используйте конфиг exit-ноды, заменив адрес сервера на ${SERVER_ADDR}:${LOCAL_PORT}
+Используйте конфиг exit-ноды, заменив адрес сервера на ${client_host}:${LOCAL_PORT}
 --- /Cascade: ${cname} ---
 EOF
 

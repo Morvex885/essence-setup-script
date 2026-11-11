@@ -211,7 +211,11 @@ fn now() -> i64 {
 }
 
 /// `12h` / `30d` / `2w` → expiry epoch from `now` (count up to six digits).
+/// Non-ASCII input (`30д`) is invalid; it would split inside a character.
 fn ttl_expiry(ttl: &str, now: i64) -> Option<i64> {
+    if !ttl.is_ascii() {
+        return None;
+    }
     let (count, unit) = ttl.split_at(ttl.len().checked_sub(1)?);
     let mult = match unit { "h" => 3600, "d" => 86_400, "w" => 604_800, _ => return None };
     if count.is_empty() || count.len() > 6 || count.starts_with('0') || !count.bytes().all(|b| b.is_ascii_digit()) {

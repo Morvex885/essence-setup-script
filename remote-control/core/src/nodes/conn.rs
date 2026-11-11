@@ -186,11 +186,14 @@ pub fn set(session: &mut Session, invocation: &Invocation) -> Result<Value> {
 
 /// Keep only discovered proxies of `node`: in its group assignments (empty
 /// groups and entries dropped) and in client-owned selections (entries kept,
-/// so a client never silently falls back to its group). Returns the removed names.
+/// so a client never silently falls back to its group). Per-peer `awg-<peer>`
+/// assignments survive while the node reports AmneziaWG (`AWG`): discovery
+/// does not list individual peers. Returns the removed names.
 fn purge(config: &mut Config, node: &str, discovered: &[String]) -> BTreeSet<String> {
+    let awg = discovered.iter().any(|name| name == "AWG");
     let mut removed = BTreeSet::new();
     let mut keep = |proxy: &String| {
-        let valid = discovered.contains(proxy);
+        let valid = discovered.contains(proxy) || (awg && proxy.starts_with("awg-"));
         if !valid {
             removed.insert(proxy.clone());
         }
@@ -355,6 +358,25 @@ mod tests {
         assert_eq!(parse_discovered(config), ["AWG", "Hysteria2", "VLESS TCP", "hy2-flow", "vless-cascade [DE->RU]"]);
         assert!(parse_discovered("").is_empty());
         assert!(parse_discovered("  type: hysteria2\n").is_empty());
+    }
+
+    #[test]
+    fn purge_keeps_peer_assignments_only_with_amneziawg() {
+        let config = Config {
+            connections: vec![Connection { node: "de".into(), groups: vec![group("PC", &["awg-alpha", "AWG", "vless"])] }],
+            clients: vec![Client { name: "c1".into(), connections: Some(vec![ClientConnection {
+                node: "de".into(), proxies: vec!["awg-beta".into(), "gone".into()] }]), ..Client::default() }],
+            ..Config::default()
+        };
+        let mut with_awg = config.clone();
+        let removed = purge(&mut with_awg, "de", &["AWG".into(), "vless".into()]);
+        assert_eq!(removed.into_iter().collect::<Vec<_>>(), ["gone"]);
+        assert_eq!(with_awg.connections[0].groups, vec![group("PC", &["awg-alpha", "AWG", "vless"])]);
+        assert_eq!(with_awg.clients[0].connections.as_ref().unwrap()[0].proxies, ["awg-beta"]);
+        let mut without = config;
+        let removed = purge(&mut without, "de", &["vless".into()]);
+        assert_eq!(removed.into_iter().collect::<Vec<_>>(), ["AWG", "awg-alpha", "awg-beta", "gone"]);
+        assert_eq!(without.connections[0].groups, vec![group("PC", &["vless"])]);
     }
 
     #[tokio::test(flavor = "current_thread")]

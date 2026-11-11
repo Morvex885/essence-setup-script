@@ -31,3 +31,19 @@ teardown() {
     [ "$status" -ne 0 ]
     cmp "$config.before" "$config"
 }
+
+@test "listener sync refuses a second users block instead of deleting the listener tail" {
+    local config="$BATS_TEST_TMPDIR/config.yaml" patched="$BATS_TEST_TMPDIR/listener-users.sh" body
+    sed "s|/etc/mihomo/config.yaml|$config|g" "$PROJECT_ROOT/common/listener-users.sh" > "$patched"
+    source "$patched"
+    for body in \
+        '  # client-users-start\n  # client-users-end\n  # client-users-start\n' \
+        '  # client-users-start\n  # client-users-end\n  # client-users-start\n  # client-users-end\n' \
+        '  # client-users-end\n  # client-users-start\n  # client-users-end\n'; do
+        printf "# --- vless-tcp ---\n${body}# --- /vless-tcp ---\nother: keep\n" > "$config"
+        cp "$config" "$config.before"
+        run _sync_listener_users vless-tcp '      new: value'
+        [ "$status" -ne 0 ]
+        cmp "$config.before" "$config"
+    done
+}

@@ -113,9 +113,16 @@ pub fn server_port(uri: &str) -> ServerPort {
     ServerPort { server: parts.server.to_owned(), port: parts.port.to_owned() }
 }
 
+/// A percent-decoded URI component that must be UTF-8 without control
+/// characters: it ends up in a single-line YAML value.
+fn decode_value(raw: &str, error: &UriError) -> Result<String, UriError> {
+    percent_decode(raw)
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .filter(|value| !value.chars().any(char::is_control))
+        .ok_or_else(|| error.clone())
+}
+
 /// Decoded `key=value` query params (a param without `=` is its own value).
-/// Decoded values must be UTF-8 without control characters: they end up in
-/// single-line YAML values.
 fn params(query: &str, error: UriError) -> Result<Vec<(&str, String)>, UriError> {
     query
         .split('&')
@@ -123,11 +130,7 @@ fn params(query: &str, error: UriError) -> Result<Vec<(&str, String)>, UriError>
         .map(|param| {
             let key = param.split('=').next().unwrap_or_default();
             let value = param.split_once('=').map_or(param, |(_, value)| value);
-            percent_decode(value)
-                .and_then(|bytes| String::from_utf8(bytes).ok())
-                .filter(|value| !value.chars().any(char::is_control))
-                .map(|value| (key, value))
-                .ok_or_else(|| error.clone())
+            decode_value(value, &error).map(|value| (key, value))
         })
         .collect()
 }
@@ -136,6 +139,7 @@ fn params(query: &str, error: UriError) -> Result<Vec<(&str, String)>, UriError>
 /// (`tcp` by default, `xhttp`, `grpc`).
 pub fn parse_vless_uri(name: &str, uri: &str) -> Result<ExitProxy, UriError> {
     let parts = split(uri.strip_prefix("vless://").unwrap_or(uri));
+    let uuid = decode_value(parts.userinfo, &UriError::VlessPercent)?;
     let (mut sni, mut public_key, mut short_id, mut flow) = (String::new(), String::new(), String::new(), String::new());
     let (mut fingerprint, mut transport) = ("chrome".to_owned(), "tcp".to_owned());
     let (mut path, mut mode, mut service) = (String::new(), "auto".to_owned(), String::new());
@@ -159,7 +163,7 @@ pub fn parse_vless_uri(name: &str, uri: &str) -> Result<ExitProxy, UriError> {
         name,
         server: parts.server,
         port: parts.port,
-        uuid: parts.userinfo,
+        uuid: &uuid,
         sni,
         public_key: &public_key,
         short_id: &short_id,
@@ -265,7 +269,16 @@ mod tests {
             sni: "", skip_cert_verify: true, obfs_password: "",
         };
         let parsed = parse_hy2_uri("p", hy2::uri(&endpoint).trim_end()).unwrap();
-        assert!(parsed.yaml.contains("    password: p @#&%🔑\n"));
+        assert!(parsed.yaml.contains("    password: \"p @#&%🔑\"\n"));
         assert_eq!(parse_hy2_uri("p", "hy2://a%ZZ@h:443"), Err(UriError::Hy2Percent));
+    }
+
+    #[test]
+    fn vless_uuid_is_percent_decoded_and_malformed_userinfo_fails() {
+        let parsed = parse_vless_uri("p", "vless://11111111%2D2222@h:443?type=tcp").unwrap();
+        assert!(parsed.yaml.contains("    uuid: 11111111-2222\n"), "{}", parsed.yaml);
+        for uri in ["vless://u%ZZ@h:443", "vless://u%2@h:443", "vless://u%00@h:443", "vless://u%0A@h:443"] {
+            assert_eq!(parse_vless_uri("p", uri), Err(UriError::VlessPercent), "{uri}");
+        }
     }
 }

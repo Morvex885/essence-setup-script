@@ -223,6 +223,12 @@ c uri _parse_vless_uri_to_exit vl_key_without_value '<none>' 'p' 'vless://u@h:44
 c uri _parse_vless_uri_to_exit vl_emoji_service_raw '<none>' 'p' 'vless://u@h:443?type=grpc&serviceName=🚀'
 c uri _parse_vless_uri_to_exit vl_repeated_amp '<none>' 'p' 'vless://u@h:443?type=tcp&&sni=s&'
 c uri _parse_vless_uri_to_exit vl_empty_sni '<none>' 'p' 'vless://u@h:443?type=tcp&sni='
+c uri _parse_vless_uri_to_exit vl_uuid_pct_encoded '<none>' 'p' 'vless://11111111%2D2222%2D3333%2D4444%2D555555555555@h:443?type=tcp'
+c uri _parse_vless_uri_to_exit vl_uuid_bad_pct '<none>' 'p' 'vless://u%ZZ@h:443?type=tcp'
+c uri _parse_vless_uri_to_exit vl_uuid_truncated_pct '<none>' 'p' 'vless://u%2@h:443?type=tcp'
+c uri _parse_vless_uri_to_exit vl_uuid_nul '<none>' 'p' 'vless://u%00@h:443?type=tcp'
+c uri _parse_vless_uri_to_exit vl_grpc_service_quote '<none>' 'p' 'vless://u@h:443?type=grpc&serviceName=a%22b%5Cc'
+c uri _parse_vless_uri_to_exit vl_xhttp_path_quote '<none>' 'p' 'vless://u@h:443?type=xhttp&path=%2Fa%22b%5Cc'
 
 # ── _parse_hy2_uri_to_exit ──────────────────────────────────────────────────
 
@@ -243,6 +249,7 @@ c uri _parse_hy2_uri_to_exit hp_fragment_ignored '<none>' 'p' 'hy2://pw@h:443#my
 c uri _parse_hy2_uri_to_exit hp_emoji_pass '<none>' 'p' 'hy2://🔑@h:443'
 c uri _parse_hy2_uri_to_exit hp_no_port '<none>' 'p' 'hy2://pw@h'
 c uri _parse_hy2_uri_to_exit hp_hysteria2_pct_pass '<none>' 'p' 'hysteria2://a%20b@h:443'
+c uri _parse_hy2_uri_to_exit hp_pass_yaml_special '<none>' 'p' 'hy2://%2A%20a%20%23b%22%5C@h:443?obfs-password=-%20o%20%23x'
 
 # ── _parse_proxy_uri (reads one line from stdin) ───────────────────────────
 
@@ -270,6 +277,8 @@ c hy2 _build_hy2_listener_yaml hl_missing_user '<none>' 'hy2' 443 '' p DIRECT
 c hy2 _build_hy2_listener_yaml hl_cr_pass '<none>' 'hy2' 443 u $'p\r' DIRECT
 c hy2 _build_hy2_listener_yaml hl_obfs_amp '<none>' 'hy2' 443 u p DIRECT 'o&b=fs'
 c hy2 _build_hy2_listener_yaml hl_cyr_name '<none>' 'Выход-1' 443 u p DIRECT
+c hy2 _build_hy2_listener_yaml hl_quote_backslash_pass '<none>' 'hy2' 443 u 'a"b\c' DIRECT 'o"\#'
+c hy2 _build_hy2_listener_yaml hl_newline_pass '<none>' 'hy2' 443 u $'a\nb' DIRECT
 
 c hy2 _build_hy2_client_yaml hc_defaults '<none>' 'hy2-exit' 'exit.example.com' 443 pw
 c hy2 _build_hy2_client_yaml hc_full '<none>' 'hy2-exit' 'exit.example.com' 443 pw 'cdn.example.org' false 'salt'
@@ -280,6 +289,9 @@ c hy2 _build_hy2_client_yaml hc_empty_sni_default '<none>' 'x' 'h.example' 443 p
 c hy2 _build_hy2_client_yaml hc_pass_special '<none>' 'x' 'h' 1 'p#q?r&s=t%u'
 c hy2 _build_hy2_client_yaml hc_port_max '<none>' 'x' 'h' 65535 pw
 c hy2 _build_hy2_client_yaml hc_empty_obfs '<none>' 'x' 'h' 443 pw www.google.de true ''
+c hy2 _build_hy2_client_yaml hc_bracketed_server '<none>' 'v6' '[2001:db8::1]' 443 pw
+c hy2 _build_hy2_client_yaml hc_server_trailing_colon '<none>' 'v6' '2001:db8::' 443 pw
+c hy2 _build_hy2_client_yaml hc_pass_leading_indicator '<none>' 'x' h 443 '*a #b' www.google.de true '- o "q"'
 
 c hy2 _build_hy2_uri hu_defaults '<none>' pw 'h.example' 443
 c hy2 _build_hy2_uri hu_sni '<none>' pw h 443 'sni.example'
@@ -300,6 +312,8 @@ c hy2 _build_hy2_exit_yaml hx_empty_sni_default '<none>' 'x' 'h' 443 pw '' true
 c hy2 _build_hy2_exit_yaml hx_name_cyr '<none>' 'Выход' 'h' 443 pw
 c hy2 _build_hy2_exit_yaml hx_pass_special '<none>' 'x' 'h' 443 'p#q?r&s=t%u'
 c hy2 _build_hy2_exit_yaml hx_port_min '<none>' 'x' 'h' 1 pw
+c hy2 _build_hy2_exit_yaml hx_bracketed_server '<none>' 'v6' '[2001:db8::1]' 443 pw
+c hy2 _build_hy2_exit_yaml hx_pass_quote_backslash '<none>' 'x' h 443 'a"b\c' www.google.de true $'o\r\n'
 
 # ── vless-tcp builders ──────────────────────────────────────────────────────
 
@@ -312,6 +326,8 @@ c vless-tcp _build_vless_tcp_listener_yaml tl_dest_ipv6 '<none>' 'x' '0.0.0.0' 4
 c vless-tcp _build_vless_tcp_listener_yaml tl_cyr_sni '<none>' 'x' '0.0.0.0' 443 alice "$UUID" 'd:443' pk sid 'пример.рф' DIRECT
 c vless-tcp _build_vless_tcp_listener_yaml tl_cr_pk '<none>' 'x' '0.0.0.0' 443 alice "$UUID" 'd:443' $'pk\r' sid sni.example DIRECT
 c vless-tcp _build_vless_tcp_listener_yaml tl_port_2053 '<none>' 'x' '0.0.0.0' 2053 alice "$UUID" 'd:443' pk sid sni.example DIRECT
+c vless-tcp _build_vless_tcp_listener_yaml tl_listen_bracketed '<none>' 'x' '[::]' 443 alice "$UUID" 'd:443' pk sid sni.example DIRECT
+c vless-tcp _build_vless_tcp_listener_yaml tl_dest_quote '<none>' 'x' '0.0.0.0' 443 alice "$UUID" 'a"b\c:443' pk sid sni.example DIRECT
 
 c vless-tcp _build_vless_tcp_client_yaml tc_basic '<none>' 'vless-exit' 'exit.example.com' 443 "$UUID" 'www.microsoft.com' PUBKEY abcd
 c vless-tcp _build_vless_tcp_client_yaml tc_ipv6 '<none>' 'v6' '[2001:db8::1]' 443 "$UUID" sni.example PUBKEY abcd
@@ -341,6 +357,7 @@ c vless-tcp _build_vless_tcp_exit_yaml te_ipv6 '<none>' 'x' '2001:db8::1' 443 "$
 c vless-tcp _build_vless_tcp_exit_yaml te_special_pbk '<none>' 'x' h 443 "$UUID" sni.example 'pk+/=' 'a b'
 c vless-tcp _build_vless_tcp_exit_yaml te_port_8443_flow_other '<none>' 'x' h 8443 "$UUID" sni.example '' '' xtls-rprx-direct
 c vless-tcp _build_vless_tcp_exit_yaml te_empty_fp_default '<none>' 'x' h 443 "$UUID" sni.example PUBKEY abcd xtls-rprx-vision ''
+c vless-tcp _build_vless_tcp_exit_yaml te_bracketed_server '<none>' 'x' '[2001:db8::1]' 443 "$UUID" sni.example PUBKEY abcd
 
 # ── vless-grpc builders ─────────────────────────────────────────────────────
 
@@ -352,6 +369,7 @@ c vless-grpc _build_vless_grpc_listener_yaml gl_missing_proxy '<none>' 'x' '0.0.
 c vless-grpc _build_vless_grpc_listener_yaml gl_cyr_user '<none>' 'x' '0.0.0.0' 443 'Иван' "$UUID" 'grpc' 'd:443' pk sid sni.example DIRECT
 c vless-grpc _build_vless_grpc_listener_yaml gl_pk_cr '<none>' 'x' '0.0.0.0' 443 alice "$UUID" 'grpc' 'd:443' $'pk\r' sid sni.example DIRECT
 c vless-grpc _build_vless_grpc_listener_yaml gl_port_2083 '<none>' 'x' '0.0.0.0' 2083 alice "$UUID" 'grpc' 'd:443' pk sid sni.example DIRECT
+c vless-grpc _build_vless_grpc_listener_yaml gl_service_quote '<none>' 'x' '[::]' 443 alice "$UUID" 'a"b\c' 'd:443' pk sid sni.example DIRECT
 
 c vless-grpc _build_vless_grpc_client_yaml gc_basic '<none>' 'grpc-exit' 'exit.example.com' 443 "$UUID" sni.example grpc PUBKEY abcd
 c vless-grpc _build_vless_grpc_client_yaml gc_ipv6 '<none>' 'v6' '[2001:db8::1]' 443 "$UUID" sni.example grpc PUBKEY abcd
@@ -361,6 +379,7 @@ c vless-grpc _build_vless_grpc_client_yaml gc_no_reality '<none>' 'x' h 443 "$UU
 c vless-grpc _build_vless_grpc_client_yaml gc_cyr_name '<none>' 'Выход 1' h 443 "$UUID" sni.example grpc PUBKEY abcd
 c vless-grpc _build_vless_grpc_client_yaml gc_port_8443 '<none>' 'x' h 8443 "$UUID" sni.example grpc PUBKEY abcd
 c vless-grpc _build_vless_grpc_client_yaml gc_missing_sid '<none>' 'x' h 443 "$UUID" sni.example grpc PUBKEY
+c vless-grpc _build_vless_grpc_client_yaml gc_service_backslash '<none>' 'x' h 443 "$UUID" sni.example 'a\b"c' PUBKEY abcd
 
 c vless-grpc _build_vless_grpc_uri gu_default '<none>' "$UUID" h 443 sni.example grpc PUBKEY abcd
 c vless-grpc _build_vless_grpc_uri gu_fragment '<none>' "$UUID" h 443 sni.example grpc PUBKEY abcd 'Node 1'
@@ -379,6 +398,7 @@ c vless-grpc _build_vless_grpc_exit_yaml ge_ipv6 '<none>' 'x' '2001:db8::1' 443 
 c vless-grpc _build_vless_grpc_exit_yaml ge_special_service '<none>' 'x' h 443 "$UUID" sni.example 'a "b" c' PUBKEY abcd
 c vless-grpc _build_vless_grpc_exit_yaml ge_empty_service '<none>' 'x' h 443 "$UUID" sni.example ''
 c vless-grpc _build_vless_grpc_exit_yaml ge_port_1 '<none>' 'x' h 1 "$UUID" sni.example grpc
+c vless-grpc _build_vless_grpc_exit_yaml ge_bracketed_server_quote '<none>' 'x' '[2001:db8::1]' 443 "$UUID" sni.example 'a"b\c'
 
 # ── vless-xhttp builders ────────────────────────────────────────────────────
 
@@ -390,6 +410,7 @@ c vless-xhttp _build_vless_xhttp_listener_yaml xl_missing_proxy '<none>' 'x' '0.
 c vless-xhttp _build_vless_xhttp_listener_yaml xl_empty_path '<none>' 'x' '0.0.0.0' 443 alice "$UUID" '' 'd:443' pk sid sni.example DIRECT
 c vless-xhttp _build_vless_xhttp_listener_yaml xl_port_8443 '<none>' 'x' '0.0.0.0' 8443 alice "$UUID" / 'd:443' pk sid sni.example DIRECT
 c vless-xhttp _build_vless_xhttp_listener_yaml xl_pk_cr '<none>' 'x' '0.0.0.0' 443 alice "$UUID" / 'd:443' $'pk\r' sid sni.example DIRECT
+c vless-xhttp _build_vless_xhttp_listener_yaml xl_path_quote '<none>' 'x' '[::]' 443 alice "$UUID" '/a"b\c' '[2001:db8::2]:443' pk sid sni.example DIRECT
 
 c vless-xhttp _build_vless_xhttp_nginx_listener_yaml xn_basic '<none>' 'x' '127.0.0.1' 8080 alice "$UUID" / DIRECT
 c vless-xhttp _build_vless_xhttp_nginx_listener_yaml xn_ipv6 '<none>' 'x' '::1' 8080 alice "$UUID" / DIRECT
@@ -398,6 +419,7 @@ c vless-xhttp _build_vless_xhttp_nginx_listener_yaml xn_missing_proxy '<none>' '
 c vless-xhttp _build_vless_xhttp_nginx_listener_yaml xn_port_2053 '<none>' 'x' '127.0.0.1' 2053 alice "$UUID" / DIRECT
 c vless-xhttp _build_vless_xhttp_nginx_listener_yaml xn_cyr_user '<none>' 'x' '127.0.0.1' 8080 'Иван' "$UUID" / DIRECT
 c vless-xhttp _build_vless_xhttp_nginx_listener_yaml xn_empty_user '<none>' 'x' '127.0.0.1' 8080 '' "$UUID" / DIRECT
+c vless-xhttp _build_vless_xhttp_nginx_listener_yaml xn_listen_bracketed_quote '<none>' 'x' '[::1]' 8080 alice "$UUID" '/a"b\c' DIRECT
 
 c vless-xhttp _build_vless_xhttp_tls_listener_yaml xt_legacy_9args '<none>' 'x' '0.0.0.0' 443 alice "$UUID" / /etc/cert.pem /etc/key.pem DIRECT
 c vless-xhttp _build_vless_xhttp_tls_listener_yaml xt_legacy_8args '<none>' 'x' '0.0.0.0' 443 alice "$UUID" / /etc/cert.pem /etc/key.pem
@@ -414,6 +436,7 @@ c vless-xhttp _build_vless_xhttp_client_yaml xc_empty_sid_reality '<none>' 'x' h
 c vless-xhttp _build_vless_xhttp_client_yaml xc_port_8443 '<none>' 'x' h 8443 "$UUID" sni.example / PUBKEY abcd
 c vless-xhttp _build_vless_xhttp_client_yaml xc_cyr_sni '<none>' 'x' h 443 "$UUID" 'пример.рф' / PUBKEY abcd
 c vless-xhttp _build_vless_xhttp_client_yaml xc_empty_path '<none>' 'x' h 443 "$UUID" sni.example ''
+c vless-xhttp _build_vless_xhttp_client_yaml xc_path_quote '<none>' 'x' h 443 "$UUID" sni.example '/a"b\c' PUBKEY abcd
 
 c vless-xhttp _build_vless_xhttp_uri xu_tls_default '<none>' "$UUID" h 443 sni.example /
 c vless-xhttp _build_vless_xhttp_uri xu_reality_default_frag '<none>' "$UUID" h 443 sni.example / PUBKEY abcd
@@ -435,6 +458,7 @@ c vless-xhttp _build_vless_xhttp_exit_yaml xe_ipv6 '<none>' 'x' '2001:db8::1' 44
 c vless-xhttp _build_vless_xhttp_exit_yaml xe_path_special '<none>' 'x' h 443 "$UUID" sni.example '/a b?c=d' auto
 c vless-xhttp _build_vless_xhttp_exit_yaml xe_empty_mode '<none>' 'x' h 443 "$UUID" sni.example / ''
 c vless-xhttp _build_vless_xhttp_exit_yaml xe_port_8443 '<none>' 'x' h 8443 "$UUID" sni.example /
+c vless-xhttp _build_vless_xhttp_exit_yaml xe_bracketed_server_quote '<none>' 'x' '[2001:db8::1]' 443 "$UUID" sni.example '/a"b\c'
 
 c vless-xhttp _normalize_vless_xhttp_proxy_yaml nx_chrome_replaced '  - name: n
     type: vless
@@ -492,6 +516,9 @@ sync_case sy_marker_missing vless-xhttp "$USERS_TCP" "$SYNC_BASE"
 sync_case sy_no_client_block vless-tcp "$USERS_TCP" "$SYNC_NO_CLIENT"
 sync_case sy_config_missing vless-tcp "$USERS_TCP" '<none>'
 sync_case sy_cyr_user vless-grpc "$USERS_CYR" "$SYNC_BASE"
+sync_case sy_repeated_unclosed_users vless-tcp "$USERS_TCP" $'# --- vless-tcp ---\n  - name: x\n    users:\n      # client-users-start\n      # client-users-end\n      # client-users-start\n    proxy: DIRECT\n# --- /vless-tcp ---\ntail: keep\n'
+sync_case sy_two_users_blocks vless-tcp "$USERS_TCP" $'# --- vless-tcp ---\n      # client-users-start\n      # client-users-end\n      # client-users-start\n      # client-users-end\n# --- /vless-tcp ---\n'
+sync_case sy_stray_end_before_users vless-tcp "$USERS_TCP" $'# --- vless-tcp ---\n      # client-users-end\n      # client-users-start\n      # client-users-end\n# --- /vless-tcp ---\n'
 
 # ── emit one JSON per module ────────────────────────────────────────────────
 

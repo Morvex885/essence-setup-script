@@ -3,6 +3,7 @@
 //! secrets; a missing decision is a `*_required` error before any change, and
 //! every remote or destructive change happens after `Plan::confirm`.
 
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -137,7 +138,7 @@ fn password_line_valid(password: &str) -> Result<()> {
     Ok(())
 }
 
-fn new_vault_password(secrets: &Secrets) -> Result<&str> {
+pub(super) fn new_vault_password(secrets: &Secrets) -> Result<&str> {
     let password = secrets.get("new-vault-password").filter(|p| !p.is_empty()).ok_or_else(|| {
         RcError::new("new_vault_password_required", "Требуется новый пароль доступа к конфигурации GitHub (секрет new-vault-password).")
             .with_extra("secret", "new-vault-password")
@@ -274,7 +275,7 @@ fn sync_data(session: &Session) -> Value {
 pub(super) struct Decisions {
     create_repo: bool,
     make_private: bool,
-    storage: Option<Storage>,
+    pub(super) storage: Option<Storage>,
     existing: Option<String>,
     provision: Option<bool>,
     remember: bool,
@@ -397,7 +398,7 @@ fn decide_existing(choice: Option<&str>, allow_local: bool, outdated: bool, remo
     }
 }
 
-fn storage_decision(storage: Option<Storage>, log: &mut dyn FnMut(Level, &str)) -> Result<Storage> {
+pub(super) fn storage_decision(storage: Option<Storage>, log: &mut dyn FnMut(Level, &str)) -> Result<Storage> {
     let storage = storage.ok_or_else(|| RcError::new("storage_mode_required", "Выберите способ хранения конфигурации GitHub: --storage age|none.")
         .with_extra("choices", ["age", "none"]))?;
     if storage == Storage::Plain {
@@ -461,8 +462,12 @@ pub fn login(session: &mut Session, invocation: &Invocation) -> Result<Value> {
 // ─── source github-connect ───────────────────────────────────────────────────
 
 /// Paths a failed connect must not leave behind (v1 `_github_enable_snapshot`).
+/// Taken and rolled back under the session lock, so another process can
+/// neither change the snapshotted files nor lose its own to the rollback.
 struct ConnectUndo {
-    root_existed: bool,
+    /// Entries of a root this connect created (the lock only): a failure
+    /// removes everything else but keeps the root and its `.rc-lock`.
+    fresh_root: Option<Vec<OsString>>,
     created: Vec<PathBuf>,
     source: Option<zeroize::Zeroizing<Vec<u8>>>,
     auth: Option<zeroize::Zeroizing<Vec<u8>>>,
@@ -473,8 +478,11 @@ fn exists(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
 }
 
+const LOCK_DIR: &str = ".rc-lock";
+
 impl ConnectUndo {
-    fn take(paths: &StatePaths, login: &str) -> Result<Self> {
+    /// `root_existed` is observed before the lock, whose acquisition creates the root.
+    fn take(paths: &StatePaths, login: &str, root_existed: bool) -> Result<Self> {
         let mut created: Vec<PathBuf> = [paths.github_store(), paths.github_sessions(), paths.github_runtime()]
             .into_iter().filter(|path| !exists(path)).collect();
         let profile_levels = [paths.credentials(), paths.credentials().join("gh"), paths.gh_profile(login)];
@@ -486,15 +494,21 @@ impl ConnectUndo {
         }
         let store_refs = if store::store_exists(&paths.github_store()) {
             let out = super::exec::store_git(&paths.github_store(), &["for-each-ref".as_ref(), "--format=%(objectname) %(refname)".as_ref()])?;
+            // An unread ref list would make the rollback delete every existing ref.
+            if !out.success {
+                return Err(fail("проверка локальной копии репозитория", out.diagnostic()));
+            }
             let refs = out.text().lines().filter_map(|line| line.split_once(' ')).map(|(o, r)| (o.to_owned(), r.to_owned())).collect();
             Some((refs, store::origin(&paths.github_store())?))
         } else {
             None
         };
-        Ok(Self {
-            root_existed: exists(paths.root()), created,
-            source: read_optional(paths.source())?, auth: read_optional(paths.auth())?, store_refs,
-        })
+        let fresh_root = if root_existed {
+            None
+        } else {
+            Some(fs::read_dir(paths.root())?.map(|entry| entry.map(|entry| entry.file_name())).collect::<std::io::Result<Vec<_>>>()?)
+        };
+        Ok(Self { fresh_root, created, source: read_optional(paths.source())?, auth: read_optional(paths.auth())?, store_refs })
     }
 
     fn rollback(&self, paths: &StatePaths) {
@@ -523,6 +537,15 @@ impl ConnectUndo {
                 let _ = git(&["update-ref", name, oid]);
             }
         }
+        if let Some(kept) = &self.fresh_root {
+            for entry in fs::read_dir(paths.root()).into_iter().flatten().flatten() {
+                let name = entry.file_name();
+                if name == LOCK_DIR || kept.contains(&name) {
+                    continue;
+                }
+                let _ = if entry.file_type().is_ok_and(|kind| kind.is_dir()) { fs::remove_dir_all(entry.path()) } else { fs::remove_file(entry.path()) };
+            }
+        }
     }
 }
 
@@ -544,12 +567,19 @@ pub async fn connect<T: RemoteTransport>(session: &mut Session, invocation: &Inv
     }
     let choices = decisions(invocation)?;
     let paths = root(session);
-    let undo = ConnectUndo::take(&paths, &login)?;
+    let root_existed = exists(paths.root());
     locks(session).acquire(LockKind::Session, "github-session")?;
     if !configured && session.configured()? {
         release(session);
         return Err(RcError::new("conflict", "Конфигурация уже создана другим процессом."));
     }
+    let undo = match ConnectUndo::take(&paths, &login, root_existed) {
+        Ok(undo) => undo,
+        Err(error) => {
+            release(session);
+            return Err(prefixed(error, "Не удалось подключить GitHub", "source_failed"));
+        }
+    };
     match connect_locked(session, &paths, &login, &choices, invocation, secrets, transport).await {
         Ok(data) => {
             if !configured {
@@ -560,11 +590,8 @@ pub async fn connect<T: RemoteTransport>(session: &mut Session, invocation: &Inv
             Ok(data)
         }
         Err(error) => {
-            release(session);
             undo.rollback(&paths);
-            if !undo.root_existed {
-                let _ = fs::remove_dir_all(paths.root());
-            }
+            release(session);
             Err(prefixed(error, "Не удалось подключить GitHub", "source_failed"))
         }
     }
@@ -1183,4 +1210,37 @@ pub fn migrate_format(session: &mut Session, invocation: &Invocation, secrets: &
     let data = recovery_publish(session, &snapshot).map_err(|e| prefixed(e, "Не удалось преобразовать конфигурацию GitHub", "source_failed"))?;
     session.log(Level::Success, &format!("Конфигурация GitHub преобразована в формат v{}.", vault::FORMAT));
     Ok(data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unreadable_store_refs_abort_the_connect_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = StatePaths::new(dir.path());
+        // `objects/` makes it look like a store, but git cannot list its refs.
+        fs::create_dir_all(paths.github_store().join("objects")).unwrap();
+        let error = ConnectUndo::take(&paths, "octo", true).err().expect("an empty ref list must never be snapshotted");
+        assert_eq!((error.code, super::super::stage_of(&error)), ("source_failed", Some("проверка локальной копии репозитория")));
+    }
+
+    #[test]
+    fn failed_connect_cleans_a_fresh_root_but_keeps_it_and_its_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = StatePaths::new(dir.path().join("data"));
+        let locks = LockManager::new(paths.root());
+        drop(locks.acquire(LockKind::Session, "github-session").unwrap());
+        let undo = ConnectUndo::take(&paths, "octo", false).unwrap();
+        for created in [paths.github_store(), paths.github_runtime(), paths.gh_profile("octo")] {
+            fs::create_dir_all(created).unwrap();
+        }
+        fs::write(paths.source(), "{}").unwrap();
+        fs::write(paths.secret_key(), "key").unwrap();
+        undo.rollback(&paths);
+        let left: Vec<OsString> = fs::read_dir(paths.root()).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+        assert_eq!(left, [OsString::from(LOCK_DIR)], "the held lock survives the rollback");
+        locks.release_all().unwrap();
+    }
 }
