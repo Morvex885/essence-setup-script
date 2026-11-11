@@ -78,8 +78,9 @@ fn compact(text: &str) -> String { text.chars().filter(|c| !c.is_whitespace()).c
 
 fn openpty() -> (File, File) {
     let (mut master, mut slave) = (-1, -1);
-    let size = libc::winsize { ws_row: 45, ws_col: 90, ws_xpixel: 0, ws_ypixel: 0 };
-    assert_eq!(unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null(), &size) }, 0);
+    let mut size = libc::winsize { ws_row: 45, ws_col: 90, ws_xpixel: 0, ws_ypixel: 0 };
+    // `*mut` coerces to the `*const` Linux signature and matches macOS's `*mut`.
+    assert_eq!(unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null_mut(), &mut size) }, 0);
     (unsafe { File::from_raw_fd(master) }, unsafe { File::from_raw_fd(slave) })
 }
 
