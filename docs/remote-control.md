@@ -339,7 +339,8 @@ local_committed`. Сбой после принятия смены не отка�
   `timeout`), `onboarding_failed`, `port_in_use`, `hardening_failed`,
   `nothing_pending`, `not_installed`.
 - Вход и пароли: `auth_required`, `auth_failed`, `vault_password_required`,
-  `vault_password_invalid`, `new_vault_password_required`.
+  `vault_password_invalid`, `vault_work_excessive` (параметр scrypt файла
+  `unlock.age` выше допустимого 2^22), `new_vault_password_required`.
 - Источник GitHub: `github_auth_required`, `repo_create_required`,
   `repo_private_required`, `storage_mode_required`,
   `existing_config_action_required`, `cache_skip_required`,
