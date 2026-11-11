@@ -160,7 +160,8 @@ mod tests {
         assert_eq!(dnat.remove_script(), None);
     }
 
-    #[cfg(unix)]
+    // GNU sed (`sed -i` without a suffix): the script targets Linux servers.
+    #[cfg(target_os = "linux")]
     #[test]
     fn forwarding_persistence_replaces_or_appends_without_touching_other_keys() {
         use std::{fs, process::Command};

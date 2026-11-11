@@ -707,7 +707,7 @@ mod tests {
         assert_eq!(run(&mut session, &["client", "list", "--group", "NOPE"], &no_ssh).await.unwrap_err().code, "not_found");
         let shown = run(&mut session, &["client", "show", "--name", "my-router"], &no_ssh).await.unwrap();
         assert_eq!(shown["credentials"], json!({"vless_uuid": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "hy2_password": "router-hy2-pass-0001"}));
-        assert_eq!(shown["config"], json!({"path": generated.join("ROUTER/my-router/config.yaml").display().to_string(), "exists": true}));
+        assert_eq!(shown["config"], json!({"path": generated.join("ROUTER").join("my-router").join("config.yaml").display().to_string(), "exists": true}));
         assert_eq!(shown["connections"], json!([{"node": "ru-vps", "mode": "group", "proxies": ["vless-reality"]}]));
         assert_eq!(shown["subscription"]["url"], format!("https://sub.example/sub/{}", "a".repeat(64)));
         assert!(shown["subscription"]["headers"].is_array());
@@ -851,7 +851,7 @@ mod tests {
         assert_eq!(error.extra["plan"], json!([
             "Клиент: my-router", "Группа: ROUTER → PC", "Ноды клиента: ru-vps → de-vps", "Затронутые ноды:",
             " ru-vps  5.6.7.8:2222", " de-vps  1.2.3.4:22", "Старый каталог конфигов (удаляется после генерации нового):",
-            format!(" {}", generated.join("ROUTER/my-router").display()),
+            format!(" {}", generated.join("ROUTER").join("my-router").display()),
             "Служба mihomo на затронутых нодах может быть перезапущена.",
         ]));
         for (argv, code) in [
@@ -894,8 +894,8 @@ mod tests {
         assert_eq!((error.code, error.exit), ("confirmation_required", 2));
         assert_eq!(error.extra["plan"], json!([
             "Клиенты: my-router, my-pc", "Каталоги конфигов:",
-            format!(" my-router: {}", generated.join("ROUTER/my-router").display()),
-            format!(" my-pc: {}", generated.join("PC/my-pc").display()),
+            format!(" my-router: {}", generated.join("ROUTER").join("my-router").display()),
+            format!(" my-pc: {}", generated.join("PC").join("my-pc").display()),
             "Затронутые ноды:", " ru-vps  5.6.7.8:2222", " de-vps  1.2.3.4:22",
             "Клиенты AmneziaWG (my-router, my-pc) удаляются на нодах:", " ru-vps",
             "Подписки: my-router", "Хост подписок: de-vps",
