@@ -33,8 +33,12 @@ struct TestDir(PathBuf);
 
 impl TestDir {
     fn new() -> Self {
+        // Clock resolution is coarse on macOS (µs): the counter keeps
+        // directories created in the same tick distinct.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let path = std::env::temp_dir().join(format!("essence-state-test-{}-{nonce}", std::process::id()));
+        let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("essence-state-test-{}-{nonce}-{sequence}", std::process::id()));
         fs::create_dir(&path).unwrap();
         Self(path)
     }

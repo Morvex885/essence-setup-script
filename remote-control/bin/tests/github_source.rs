@@ -255,7 +255,8 @@ impl Env {
             let Ok(entries) = fs::read_dir(&dir) else { continue };
             for entry in entries.flatten() {
                 let path = entry.path();
-                let rel = path.strip_prefix(&self.data).unwrap().to_string_lossy().into_owned();
+                // Keys use `/` on every OS, matching the paths the assertions name.
+                let rel = path.strip_prefix(&self.data).unwrap().to_string_lossy().replace('\\', "/");
                 if path.is_dir() {
                     map.insert(format!("{rel}/"), Vec::new());
                     pending.push(path);
