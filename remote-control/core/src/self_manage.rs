@@ -331,15 +331,19 @@ fn data_layout_reason(data: &Path) -> Option<&'static str> {
 /// ancestor remain, so every ancestor must be owned by the effective user or
 /// root and not writable by group/others (sticky directories such as `/tmp`
 /// forbid renaming foreign entries). The data root itself must not be shared.
+/// Group write of the effective group is not sharing: with `umask 002` and
+/// user-private groups (Debian/Ubuntu default) every own directory has it.
 #[cfg(unix)]
 fn data_swappable_reason(canonical: &Path) -> Option<&'static str> {
     use std::os::unix::fs::MetadataExt;
-    // SAFETY: geteuid has no preconditions.
-    let euid = unsafe { libc::geteuid() };
+    // SAFETY: geteuid/getegid have no preconditions.
+    let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
     for dir in canonical.ancestors() {
         let Ok(metadata) = fs::symlink_metadata(dir) else { return Some("не удаётся проверить права каталога") };
         let owned = metadata.uid() == euid || metadata.uid() == 0;
-        let shared = metadata.mode() & 0o022 != 0 && (dir == canonical || metadata.mode() & 0o1000 == 0);
+        let mode = metadata.mode();
+        let writable = mode & 0o002 != 0 || (mode & 0o020 != 0 && metadata.gid() != egid);
+        let shared = writable && (dir == canonical || mode & 0o1000 == 0);
         if !owned || shared {
             return Some("каталог или его родитель может изменить другой пользователь");
         }
@@ -979,6 +983,8 @@ mod tests {
         let shared = Some("каталог или его родитель может изменить другой пользователь");
         fs::set_permissions(&canonical, fs::Permissions::from_mode(0o777)).unwrap();
         assert_eq!(data_swappable_reason(&canonical), shared, "shared data root");
+        fs::set_permissions(&canonical, fs::Permissions::from_mode(0o770)).unwrap();
+        assert_eq!(data_swappable_reason(&canonical), baseline, "write by the own (user-private) group, umask 002");
         fs::set_permissions(&canonical, fs::Permissions::from_mode(0o700)).unwrap();
         fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o777)).unwrap();
         assert_eq!(data_swappable_reason(&canonical), shared, "renames possible in the parent");
