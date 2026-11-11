@@ -272,6 +272,7 @@ fn termination_signals_restore_the_raw_console() {
         let (mut master, mut slave) = (0, 0);
         // `*mut` coerces to the `*const` Linux signature and matches macOS's `*mut`.
         assert_eq!(unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) }, 0);
+        let slave_path = unsafe { std::ffi::CStr::from_ptr(libc::ptsname(master)) }.to_owned();
         let lflag = |fd| {
             let mut termios: libc::termios = unsafe { std::mem::zeroed() };
             assert_eq!(unsafe { libc::tcgetattr(fd, &mut termios) }, 0);
@@ -310,7 +311,12 @@ fn termination_signals_restore_the_raw_console() {
         unsafe { libc::kill(child.id() as i32, signal) };
         let status = child.wait().unwrap();
         assert_eq!(status.code(), Some(128 + signal), "{name}: conventional exit code");
-        let restored = lflag(slave);
+        // macOS revokes the session leader's terminal when it exits, so the
+        // held slave fd is dead; a fresh open sees the same pty's termios.
+        let fresh = unsafe { libc::open(slave_path.as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
+        assert!(fresh >= 0, "{name}: reopen the pty slave");
+        let restored = lflag(fresh);
+        unsafe { libc::close(fresh) };
         assert!(restored & libc::ICANON != 0 && restored & libc::ECHO != 0, "{name}: terminal left in raw mode");
         unsafe { libc::close(slave) };
         let _ = drain.join();
