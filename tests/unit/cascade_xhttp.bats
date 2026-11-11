@@ -99,3 +99,12 @@ EOF
     _apply_dnat_rules node 2001:db8::1 443 8443
     grep -qxF 'net.ipv6.conf.all.forwarding=1' "$config"
 }
+
+@test "_dnat_client_uri replaces only the authority, IPv6 in brackets both ways" {
+    run _dnat_client_uri 'vless://uuid@[2001:db8::1]:443?type=tcp&sni=a#DE' 203.0.113.9 8443
+    assert_output 'vless://uuid@203.0.113.9:8443?type=tcp&sni=a#DE'
+    run _dnat_client_uri 'hy2://p%40ss@exit.example:443/?sni=x#n@1' 2001:db8::9 2096
+    assert_output 'hy2://p%40ss@[2001:db8::9]:2096/?sni=x#n@1'
+    run _dnat_client_uri 'hysteria2://exit.example:443' 198.51.100.1 1
+    assert_output 'hysteria2://198.51.100.1:1'
+}
