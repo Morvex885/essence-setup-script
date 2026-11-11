@@ -10,7 +10,7 @@
 //! exits without unwinding.
 
 use std::io::{self, IsTerminal, Write};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -40,51 +40,76 @@ pub fn console_available() -> bool {
 }
 
 fn raw_mode_works() -> bool {
-    if crossterm::terminal::enable_raw_mode().is_err() {
-        return false;
-    }
-    let _ = crossterm::terminal::disable_raw_mode();
-    true
+    RawModeGuard::enable().is_ok()
 }
 
-/// Raw mode currently enabled by a guard (read by the panic hook).
-static RAW_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Raw mode currently enabled by a guard (read by the panic hook and the
+/// terminating-signal handlers). The lock spans the mode switch itself, so a
+/// concurrent restore either runs before raw mode starts or sees it active —
+/// never in between.
+static RAW_ACTIVE: Mutex<bool> = Mutex::new(false);
+
+fn raw_state() -> MutexGuard<'static, bool> {
+    RAW_ACTIVE.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// Restores cooked mode on every exit path, including early returns.
 struct RawModeGuard;
 
 impl RawModeGuard {
     fn enable() -> std::io::Result<Self> {
+        let mut active = raw_state();
         crossterm::terminal::enable_raw_mode()?;
-        RAW_ACTIVE.store(true, Ordering::SeqCst);
+        *active = true;
         Ok(Self)
     }
 }
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
-        let _ = crossterm::terminal::disable_raw_mode();
-        RAW_ACTIVE.store(false, Ordering::SeqCst);
+        let mut active = raw_state();
+        if std::mem::take(&mut *active) {
+            let _ = crossterm::terminal::disable_raw_mode();
+        }
     }
 }
 
-/// Panic hook: the process exits without unwinding, so guards never run.
+/// How long a restore waits for another thread's mode switch to finish.
+const RESTORE_ATTEMPTS: u32 = 200;
+
+/// Panic hook and terminating signals: the process exits right after without
+/// unwinding, so guards never run. The lock is kept until exit so no thread
+/// re-enters raw mode in between. A panic inside a mode switch on this very
+/// thread holds the lock; the bounded wait keeps that case from hanging.
 pub fn restore_console() {
-    if RAW_ACTIVE.swap(false, Ordering::SeqCst) {
-        let _ = crossterm::terminal::disable_raw_mode();
+    for _ in 0..RESTORE_ATTEMPTS {
+        let mut active = match RAW_ACTIVE.try_lock() {
+            Ok(active) => active,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+        };
+        if std::mem::take(&mut *active) {
+            let _ = crossterm::terminal::disable_raw_mode();
+        }
+        std::mem::forget(active);
+        return;
     }
 }
 
 /// Read one hidden line from the console. `Ok(None)` means the entry was
 /// cancelled (Ctrl+C / Ctrl+D) or the console disappeared; the value may be
-/// empty and always stays zeroized. Nothing is echoed.
+/// empty and always stays zeroized. Nothing is echoed: raw mode starts before
+/// the prompt, so keys typed early are never echoed either.
 pub fn read_hidden_line(prompt: &str) -> std::io::Result<Option<Zeroizing<String>>> {
+    let _raw = RawModeGuard::enable()?;
     {
         let mut stderr = std::io::stderr().lock();
         write!(stderr, "{prompt}")?;
         stderr.flush()?;
     }
-    let _raw = RawModeGuard::enable()?;
     let mut value = Zeroizing::new(String::new());
     loop {
         match crossterm::event::read()? {

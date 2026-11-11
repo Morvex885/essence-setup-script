@@ -33,8 +33,12 @@ is_termux() {
     [[ -n "${TERMUX_VERSION:-}" || "${PREFIX:-}" == *com.termux* ]]
 }
 
+# ldd из musl завершается с ненулевым кодом даже на --version, поэтому
+# вывод захватывается целиком, а код возврата ldd игнорируется (pipefail).
 is_musl() {
-    ldd --version 2>&1 | grep -qi musl
+    local out
+    out=$(ldd --version 2>&1) || true
+    [[ "$out" == *[Mm][Uu][Ss][Ll]* ]]
 }
 
 # Печатает Rust target triple или возвращает 1, если платформа не поддерживается.

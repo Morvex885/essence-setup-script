@@ -124,12 +124,7 @@ impl Context<'_> {
     /// A selector never reads input when empty, never accepts leading zeroes,
     /// and returns no partial result on cancellation.
     pub fn select(&mut self, title: &str, labels: &[String]) -> io::Result<Option<usize>> {
-        if labels.is_empty() {
-            let mut view = View::menu(title, vec![Item::new(0, "Отмена", ui::NC)]);
-            view.context.push(ui::text("Нет объектов для выбора", ui::DIM));
-            self.ui.show(&view)?;
-            return Ok(None);
-        }
+        if labels.is_empty() { self.empty_list(title, "Нет объектов для выбора")?; return Ok(None); }
         let mut items: Vec<_> = labels.iter().enumerate().map(|(i,l)| Item::new(i+1,l,ui::CYAN)).collect();
         items.push(Item::new(0,"Отмена",ui::NC));
         let mut view = View::menu(title, items);
@@ -137,12 +132,39 @@ impl Context<'_> {
         loop {
             let Some(choice) = self.choose(&view)? else { return Ok(None); };
             if choice == "0" { return Ok(None); }
-            if !choice.starts_with('0') && choice.bytes().all(|b| b.is_ascii_digit()) {
-                if let Ok(n) = choice.parse::<usize>() { if n>0 && n<=labels.len() { return Ok(Some(n-1)); } }
-            }
+            if let Some(i) = list_index(&choice, labels.len()) { return Ok(Some(i)); }
             self.invalid();
         }
     }
+    /// v1 `toggle_select`: Enter commits the flags (indexes of checked labels),
+    /// `0`/EOF drop partial changes; an empty list shows `empty` and reads
+    /// nothing. Callers preselect only what mirrors the current state.
+    pub fn toggle(&mut self, title: &str, labels: &[String], mut flags: Vec<bool>, empty: &str) -> io::Result<Option<Vec<usize>>> {
+        if labels.is_empty() { self.empty_list(title, empty)?; return Ok(None); }
+        flags.resize(labels.len(), false);
+        loop {
+            let mut items: Vec<_> = labels.iter().enumerate()
+                .map(|(i, label)| Item::new(i + 1, format!("[{}] {label}", if flags[i] { 'x' } else { ' ' }), ui::CYAN)).collect();
+            items.push(Item::new(0, "Отмена", ui::NC));
+            let mut view = View::menu(title, items);
+            view.mode = ui::Mode::Toggle;
+            view.prompt = "Пробел/номер — переключить, Enter — сохранить, 0 — отмена: ".into();
+            let Some(choice) = self.choose(&view)? else { return Ok(None); };
+            if choice == "0" { return Ok(None); }
+            if choice.is_empty() { return Ok(Some(flags.iter().enumerate().filter_map(|(i, on)| on.then_some(i)).collect())); }
+            match list_index(&choice, labels.len()) { Some(i) => flags[i] = !flags[i], None => self.invalid() }
+        }
+    }
+    fn empty_list(&mut self, title: &str, message: &str) -> io::Result<()> {
+        let mut view = View::menu(title, vec![Item::new(0, "Отмена", ui::NC)]);
+        view.context.push(ui::text(message, ui::DIM));
+        self.ui.show(&view)
+    }
+}
+/// 1-based list number → index; `0`, leading zeroes, signs and expressions are invalid.
+fn list_index(choice: &str, count: usize) -> Option<usize> {
+    if choice.starts_with('0') || !choice.bytes().all(|b| b.is_ascii_digit()) { return None; }
+    choice.parse::<usize>().ok().filter(|n| *n > 0 && *n <= count).map(|n| n - 1)
 }
 /// The status line of a request in flight, by command: network and SSH calls
 /// name what is being waited for; anything else is a generic «Выполняется…».

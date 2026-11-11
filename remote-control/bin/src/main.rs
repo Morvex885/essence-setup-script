@@ -273,12 +273,9 @@ fn read_stdin_secrets() -> Result<Secrets> {
 /// без него — русский человекочитаемый вывод (сообщение ошибки на stderr).
 fn finish(envelope: Envelope, json: bool, invocation: Option<&Invocation>) -> ExitCode {
     if emit(&envelope, json, invocation).is_err() {
-        // stdout закрыт (EPIPE): json-ответ хотя бы на stderr.
-        if json {
-            if let Ok(line) = serde_json::to_string(&envelope) {
-                let _ = writeln!(io::stderr().lock(), "{line}");
-            }
-        }
+        // stdout закрыт (EPIPE): только фиксированное сообщение — конверт
+        // может содержать токены и ссылки, в stderr он не дублируется.
+        let _ = writeln!(io::stderr().lock(), "  [✗] Не удалось вывести ответ: stdout недоступен.");
         return ExitCode::FAILURE;
     }
     ExitCode::from(envelope.exit_code())

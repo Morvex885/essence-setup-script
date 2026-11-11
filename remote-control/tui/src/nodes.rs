@@ -17,6 +17,8 @@ struct NodeCard(String);
 
 /// Conditions of a node the shared handler resolves (`handle_node_codes`).
 const NODE_CODES: [&str; 4] = ["missing_secret", "host_key_changed", "host_key_unknown", "needs_setup"];
+/// Empty multi-select state (the same wording as `Context::select`).
+const EMPTY: &str = "Нет объектов для выбора";
 
 fn rows(value: &Value) -> &[Value] { value.as_array().map(Vec::as_slice).unwrap_or(&[]) }
 fn text(value: &Value) -> String { value.as_str().map(str::to_owned).unwrap_or_else(|| if value.is_null() { String::new() } else { value.to_string() }) }
@@ -244,13 +246,14 @@ impl Screen for NodeCard {
                 }
                 "h" | "H" => harden(ctx, &name)?,
                 "r" | "R" => {
-                    let Some(new) = ask(ctx, "Переименование ноды", "Новое имя ноды")? else { return Ok(Navigation::Back); };
+                    // Esc/Ctrl+D cancel only the rename; Ctrl+C leaves the card.
+                    let Some(new) = ask(ctx, "Переименование ноды", "Новое имя ноды")? else { if ctx.ui.interrupted() { return Ok(Navigation::Back); } continue; };
                     if new.is_empty() { continue; }
                     let renamed = ctx.call(&["node", "rename", "--name", &name, "--new-name", &new])?;
                     if renamed.ok { self.0 = renamed.data["name"].as_str().unwrap_or(&new).to_owned(); } else { outcome(ctx, &renamed); }
                 }
                 "e" | "E" => {
-                    let Some(tag) = ask(ctx, "Тег ноды", "Тег")? else { return Ok(Navigation::Back); };
+                    let Some(tag) = ask(ctx, "Тег ноды", "Тег")? else { if ctx.ui.interrupted() { return Ok(Navigation::Back); } continue; };
                     let changed = ctx.call(&["node", "tag", "--name", &name, "--tag", &tag])?;
                     outcome(ctx, &changed);
                 }
@@ -467,24 +470,6 @@ fn aliases(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
 
 // ─── Подключения ─────────────────────────────────────────────────────────────
 
-/// v1 `toggle_select`: Enter confirms, `0`/EOF cancel without partial flags.
-/// Preselection only mirrors current assignments; other toggles start unchecked.
-fn toggles(ctx: &mut Context<'_>, title: &str, labels: &[String], mut flags: Vec<bool>) -> io::Result<Option<Vec<usize>>> {
-    if labels.is_empty() { ctx.select(title, labels)?; return Ok(None); }
-    flags.resize(labels.len(), false);
-    loop {
-        let mut items: Vec<_> = labels.iter().enumerate()
-            .map(|(i, label)| Item::new(i + 1, format!("[{}] {label}", if flags[i] { 'x' } else { ' ' }), ui::CYAN)).collect();
-        items.push(Item::new(0, "Отмена", ui::NC));
-        let mut view = View::menu(title, items);
-        view.mode = ui::Mode::Toggle;
-        view.prompt = "Пробел/номер — переключить, Enter — сохранить, 0 — отмена: ".into();
-        let Some(choice) = ctx.choose(&view)? else { return Ok(None); };
-        if choice == "0" { return Ok(None); }
-        if choice.is_empty() { return Ok(Some(flags.iter().enumerate().filter_map(|(i, on)| on.then_some(i)).collect())); }
-        match index(&choice, labels.len()) { Some(i) => flags[i] = !flags[i], None => ctx.invalid() }
-    }
-}
 fn synced_node<'a>(sync: &'a Value, name: &str) -> Option<&'a Value> { rows(&sync["nodes"]).iter().find(|v| v["name"] == name) }
 /// `conn sync` row states other than `synced`.
 fn sync_problem(status: &Value) -> Option<&'static str> {
@@ -610,12 +595,12 @@ fn connection_node(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
 }
 /// Proxies (marked as currently assigned) first, then target groups (unmarked).
 fn assign_connections(ctx: &mut Context<'_>, name: &str, proxies: &[String], assigned: &[Vec<String>]) -> io::Result<()> {
-    let Some(selected) = toggles(ctx, "Подключения для групп", proxies, assigned.iter().map(|g| !g.is_empty()).collect())? else { return Ok(()); };
+    let Some(selected) = ctx.toggle("Подключения для групп", proxies, assigned.iter().map(|g| !g.is_empty()).collect(), EMPTY)? else { return Ok(()); };
     if selected.is_empty() { ctx.ui.notice(ui::warn("Ничего не выбрано.")); return Ok(()); }
     let listed = ctx.call(&["group", "list"])?;
     if !listed.ok { outcome(ctx, &listed); return Ok(()); }
     let groups = names(&listed.data);
-    let Some(targets) = toggles(ctx, "Группы для подключений", &groups, vec![])? else { return Ok(()); };
+    let Some(targets) = ctx.toggle("Группы для подключений", &groups, vec![], EMPTY)? else { return Ok(()); };
     if targets.is_empty() { ctx.ui.notice(ui::warn("Ничего не выбрано.")); return Ok(()); }
     let mut words = argv(&["conn", "set", "--name", name]);
     for i in targets { words.extend(argv(&["--group", &groups[i]])); }
@@ -727,7 +712,7 @@ fn telegram_batch(ctx: &mut Context<'_>, title: &str, mut words: Vec<String>) ->
     if !listed.ok { outcome(ctx, &listed); return Ok(()); }
     let nodes = names(&listed.data);
     let labels: Vec<String> = rows(&listed.data).iter().map(node_label).collect();
-    let Some(selected) = toggles(ctx, title, &labels, vec![])? else { return Ok(()); };
+    let Some(selected) = ctx.toggle(title, &labels, vec![], EMPTY)? else { return Ok(()); };
     if selected.is_empty() { ctx.ui.notice(ui::warn("Ничего не выбрано.")); return Ok(()); }
     for i in selected { words.extend(argv(&["--name", &nodes[i]])); }
     let reply = confirm::run_confirmed(ctx, title, "Выполнить?", &words, &Secrets::default())?;
@@ -1404,9 +1389,37 @@ mod tests {
         let (_, ui) = screen(&mut NodeCard("n".into()), &[], vec![step(&["node", "show", "--name", "n"], Reply::failure("not_found"))]);
         assert!(ui.notices.is_empty() && ui.views.is_empty());
         screen(&mut AmneziaWg, &["0"], vec![step(&["node", "list"], ok(json!([])))]);
-        let (selected, _, ui) = run(vec![], &[], |ctx| toggles(ctx, "empty", &[], vec![]));
+        let (selected, _, ui) = run(vec![], &[], |ctx| ctx.toggle("empty", &[], vec![], EMPTY));
         assert_eq!(selected, None);
         assert_eq!(ui.views.len(), 1);
+    }
+    /// A UI after Ctrl+C: reads end with `None` and `interrupted()` is set.
+    struct Interrupted(ScriptedUi);
+    impl UserInterface for Interrupted {
+        fn input(&mut self, view: &View, hidden: bool) -> io::Result<Option<zeroize::Zeroizing<String>>> { self.0.input(view, hidden) }
+        fn show(&mut self, view: &View) -> io::Result<()> { self.0.show(view) }
+        fn log(&mut self, log: &Log) { self.0.log(log) }
+        fn notice(&mut self, line: ratatui::text::Line<'static>) { self.0.notice(line) }
+        fn suspended(&mut self, command: &mut std::process::Command) -> io::Result<std::process::ExitStatus> { self.0.suspended(command) }
+        fn interrupted(&self) -> bool { true }
+    }
+    #[test]
+    fn cancelled_rename_or_tag_keeps_the_card_and_ctrl_c_leaves_it() {
+        let registry = Registry { screens: vec![], github_wizard: None };
+        for key in ["r", "E"] {
+            let mut client = ScriptedClient::new(vec![show(), show()]);
+            let mut ui = ScriptedUi::new(&[]);
+            ui.inputs.extend([Some(key.into()), None, Some("0".into())]);
+            let navigation = NodeCard("n".into()).run(&mut Context { client: &mut client, ui: &mut ui, registry: &registry }).unwrap();
+            assert!(matches!(navigation, Navigation::Back));
+            client.assert_finished();
+            assert!(ui.inputs.is_empty());
+            let mut client = ScriptedClient::new(vec![show()]);
+            let mut ui = Interrupted(ScriptedUi::new(&[key]));
+            let navigation = NodeCard("n".into()).run(&mut Context { client: &mut client, ui: &mut ui, registry: &registry }).unwrap();
+            assert!(matches!(navigation, Navigation::Back));
+            client.assert_finished();
+        }
     }
     #[test]
     fn frames_keep_list_sections_colours_and_separator_geometry() {
