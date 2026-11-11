@@ -70,6 +70,10 @@ jobs:
       - name: Cross-build release binary
         if: matrix.cross
         # VERSION and the server assets live outside the Cargo workspace.
+        env:
+          # cross 0.2.5's Android image ships NDK r21 without libunwind, which
+          # current Rust requires; the pinned main image has a newer NDK.
+          CROSS_TARGET_AARCH64_LINUX_ANDROID_IMAGE: ghcr.io/cross-rs/aarch64-linux-android@sha256:b081e122d075268e8f528b914ae0b2d0c6dc4dc4921ab05da86cc44726f4e2a0
         run: cross build --manifest-path remote-control/Cargo.toml -p essence-rc --release --locked --target "$TARGET"
       - name: Package (tar.gz)
         if: runner.os != 'Windows'
