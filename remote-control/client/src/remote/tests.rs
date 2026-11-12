@@ -130,6 +130,7 @@ fn pinned_fingerprint_is_accepted_and_lines_flow() {
     let mut client = DaemonClient::connect_remote(&url(addr, true), &pin(addr, &fingerprint)).unwrap();
     assert_eq!(client.hello().version, "9.9.9");
     assert_eq!(client.hello().origin, crate::Origin::Network);
+    assert_eq!(client.local_data_dir(), None, "a remote daemon's data directory is not on this machine");
     round_trip(&mut client);
 }
 
