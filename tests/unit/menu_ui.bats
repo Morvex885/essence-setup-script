@@ -1,15 +1,23 @@
 #!/usr/bin/env bats
-# Regression tests for shared framed menu contracts.
+# Regression tests for the shared framed menu contracts of common/common.sh
+# (server menus in setup-essence). The Rust TUI equivalents live in remote-control/tui.
 
 setup() {
     load '../helpers/test_helper'
     setup_test_env
     source_common
-    source_module groups.sh
 }
 
 teardown() {
     teardown_test_env
+}
+
+@test "menu_item resets the key color before the label" {
+    local key=10 label='Menu action' color reset
+    printf -v color '%b' "$GREEN"
+    printf -v reset '%b' "$NC"
+    output=$(menu_item "$key" "$label" GREEN)
+    [[ "$output" == *"${color}${key})${reset} ${label}"* ]]
 }
 
 @test "menu_index_valid rejects zero, leading zero, signs, and expressions" {
