@@ -68,11 +68,13 @@ const STOP_WAIT: Duration = Duration::from_secs(5);
 const TLS_HANDSHAKE: Duration = Duration::from_secs(10);
 const CHANNEL: usize = 64;
 
-const SECURITY_HEADERS: [(&str, &str); 5] = [
-    (
-        "content-security-policy",
-        "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
-    ),
+/// Политика содержимого до и после `connect-src`: между ними — `'self'` и
+/// точный адрес WebSocket проверенного `Host` (не во всех браузерах `'self'`
+/// разрешает `ws:`/`wss:`).
+const CSP_HEAD: &str = "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'";
+const CSP_TAIL: &str = "; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
+
+const SECURITY_HEADERS: [(&str, &str); 4] = [
     ("x-content-type-options", "nosniff"),
     ("x-frame-options", "DENY"),
     ("referrer-policy", "no-referrer"),
@@ -110,6 +112,10 @@ pub struct Limits {
     pub header_timeout: Duration,
     /// Одновременные TCP-соединения, включая открытые WebSocket; лишние закрываются сразу.
     pub max_connections: usize,
+    /// Из них ещё не приславшие заголовки первого запроса (включая
+    /// TLS-рукопожатие); лишние закрываются сразу. Молчащие соединения не
+    /// занимают весь `max_connections`.
+    pub max_pending: usize,
     /// Период ping WebSocket; без единого кадра от браузера за период — Close.
     pub ping_every: Duration,
 }
@@ -119,6 +125,7 @@ impl Default for Limits {
         Self {
             header_timeout: Duration::from_secs(30),
             max_connections: 128,
+            max_pending: 32,
             ping_every: Duration::from_secs(30),
         }
     }
@@ -302,6 +309,7 @@ async fn serve(
     limits: Limits,
 ) {
     let permits = Arc::new(Semaphore::new(limits.max_connections));
+    let pending = Arc::new(Semaphore::new(limits.max_pending));
     let mut connections = JoinSet::new();
     loop {
         tokio::select! {
@@ -312,10 +320,12 @@ async fn serve(
                     // Нехватка дескрипторов и подобное: не крутить цикл вхолостую.
                     Err(_) => { tokio::time::sleep(Duration::from_millis(100)).await; continue; }
                 };
-                // Сверх предела — закрыть сразу, не читая.
+                // Сверх пределов — закрыть сразу, не читая.
+                let Ok(waiting) = pending.clone().try_acquire_owned() else { drop(stream); continue; };
                 let Ok(permit) = permits.clone().try_acquire_owned() else { drop(stream); continue; };
                 let slot = Slot(Arc::new(Mutex::new(Some(permit))));
-                let service = router.clone().layer(Extension(Peer(peer))).layer(Extension(slot));
+                let waiting = Waiting(Slot(Arc::new(Mutex::new(Some(waiting)))));
+                let service = router.clone().layer(Extension(Peer(peer))).layer(Extension(slot)).layer(Extension(waiting));
                 connections.spawn(connection(stream, acceptor.clone(), service, limits.header_timeout));
             }
             Some(_) = connections.join_next(), if !connections.is_empty() => {}
@@ -442,6 +452,11 @@ struct Peer(SocketAddr);
 #[derive(Clone)]
 struct Slot(Arc<Mutex<Option<OwnedSemaphorePermit>>>);
 
+/// Место в пределе `max_pending`: освобождается, когда получены заголовки
+/// первого запроса (или с соединением).
+#[derive(Clone)]
+struct Waiting(Slot);
+
 struct Shared {
     port: u16,
     loopback: bool,
@@ -461,16 +476,44 @@ fn router(shared: Arc<Shared>) -> Router {
         .route("/ws", get(socket).fallback(not_found))
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(shared.clone(), host_guard))
-        .layer(middleware::map_response(security_headers))
+        .layer(middleware::from_fn_with_state(shared.clone(), security_headers))
+        .layer(middleware::from_fn(head_received))
         .with_state(shared)
 }
 
-async fn security_headers(mut response: Response) -> Response {
+/// Заголовки запроса получены: соединение больше не ждёт первых байтов.
+async fn head_received(request: Request, next: Next) -> Response {
+    if let Some(Waiting(Slot(held))) = request.extensions().get::<Waiting>() {
+        drop(held.lock().ok().and_then(|mut held| held.take()));
+    }
+    next.run(request).await
+}
+
+async fn security_headers(State(shared): State<Arc<Shared>>, request: Request, next: Next) -> Response {
+    let host = host_of(request.headers(), shared.tls).filter(|host| shared.host_allowed(host));
+    let mut response = next.run(request).await;
     let headers = response.headers_mut();
+    headers.insert(header::CONTENT_SECURITY_POLICY, content_security_policy(host.as_ref(), shared.tls));
     for (name, value) in SECURITY_HEADERS {
         headers.insert(name, HeaderValue::from_static(value));
     }
     response
+}
+
+/// CSP; `connect-src` дополняется адресом WebSocket допустимого `Host`.
+fn content_security_policy(host: Option<&Authority>, tls: bool) -> HeaderValue {
+    let mut policy = String::from(CSP_HEAD);
+    if let Some(Authority { host, port }) = host {
+        let scheme = if tls { "wss" } else { "ws" };
+        if host.contains(':') {
+            policy.push_str(&format!(" {scheme}://[{host}]:{port}"));
+        } else {
+            policy.push_str(&format!(" {scheme}://{host}:{port}"));
+        }
+    }
+    policy.push_str(CSP_TAIL);
+    // Host уже разобран и проверен: в нём только видимые ASCII-символы.
+    HeaderValue::from_str(&policy).unwrap_or_else(|_| HeaderValue::from_static("default-src 'none'"))
 }
 
 async fn host_guard(State(shared): State<Arc<Shared>>, request: Request, next: Next) -> Response {

@@ -29,6 +29,9 @@ pub const DEFAULT_PORT: u16 = 8377;
 /// TCP, TLS and WebSocket handshakes together; then `hello`.
 const CONNECT_WAIT: Duration = Duration::from_secs(15);
 const HELLO_WAIT: Duration = Duration::from_secs(15);
+/// No frame at all (pings included) for this long: the daemon is gone. The
+/// listener pings every 30 s, so long commands and terminals stay alive.
+const SILENCE_LIMIT: Duration = Duration::from_secs(90);
 
 /// A parsed `--connect` URL. `host` is lowercase, IPv6 without brackets.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -205,7 +208,7 @@ pub(crate) fn connect_remote_with(url: &str, trust: &dyn Trust, roots: RootCertS
     let (events, incoming) = mpsc::channel();
     let forward = events.clone();
     let io_thread = std::thread::Builder::new().name("essence-rc-ws".into())
-        .spawn(move || runtime.block_on(pump(socket, outgoing_receiver, forward)))
+        .spawn(move || runtime.block_on(pump(socket, outgoing_receiver, forward, SILENCE_LIMIT)))
         .map_err(|error| unreachable(&error))?;
     DaemonClient::start(incoming, events, Outgoing::Socket(outgoing), Some(io_thread), Some(Instant::now() + HELLO_WAIT))
         .map_err(|error| match error.get_ref().and_then(|inner| inner.downcast_ref::<ProtocolMismatch>()) {
@@ -245,29 +248,38 @@ fn connection_lost() -> io::Error {
 }
 
 /// WebSocket reader and writer: a text frame is one line. Ends when the
-/// daemon closes, on an error, when the client is gone or when the outgoing
-/// channel closes (then a Close frame is sent). Pings are answered by
-/// tungstenite while reading.
+/// daemon closes, on an error, after `silence` without a single frame, when
+/// the client is gone or when the outgoing channel closes (then a Close frame
+/// is sent). Pings are answered by tungstenite while reading.
 async fn pump<S: AsyncRead + AsyncWrite + Unpin>(socket: WebSocketStream<S>, mut outgoing: UnboundedReceiver<Zeroizing<String>>,
-    incoming: mpsc::Sender<Incoming>) {
+    incoming: mpsc::Sender<Incoming>, silence: Duration) {
     let (mut sink, mut frames) = socket.split();
     let mut broken = false;
+    let quiet = tokio::time::sleep(silence);
+    tokio::pin!(quiet);
     loop {
         tokio::select! {
-            frame = frames.next() => match frame {
-                Some(Ok(Message::Text(text))) => {
-                    if incoming.send(Incoming::Line(Zeroizing::new(text.as_str().to_owned()))).is_err() { return; }
+            frame = frames.next() => {
+                quiet.as_mut().reset(tokio::time::Instant::now() + silence);
+                match frame {
+                    Some(Ok(Message::Text(text))) => {
+                        if incoming.send(Incoming::Line(Zeroizing::new(text.as_str().to_owned()))).is_err() { return; }
+                    }
+                    Some(Ok(Message::Binary(_))) => {
+                        let _ = incoming.send(Incoming::Closed(protocol("Некорректный ответ демона")));
+                        return;
+                    }
+                    Some(Ok(Message::Close(_)) | Err(_)) | None => {
+                        let _ = incoming.send(Incoming::Closed(connection_lost()));
+                        return;
+                    }
+                    Some(Ok(_)) => {}
                 }
-                Some(Ok(Message::Binary(_))) => {
-                    let _ = incoming.send(Incoming::Closed(protocol("Некорректный ответ демона")));
-                    return;
-                }
-                Some(Ok(Message::Close(_)) | Err(_)) | None => {
-                    let _ = incoming.send(Incoming::Closed(connection_lost()));
-                    return;
-                }
-                Some(Ok(_)) => {}
-            },
+            }
+            () = &mut quiet => {
+                let _ = incoming.send(Incoming::Closed(connection_lost()));
+                return;
+            }
             message = outgoing.recv() => match message {
                 // A broken write side drops further messages; reading continues.
                 Some(_) if broken => {}

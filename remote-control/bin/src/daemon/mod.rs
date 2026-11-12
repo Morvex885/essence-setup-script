@@ -298,16 +298,34 @@ fn web_plan(args: &[OsString]) -> Result<Option<commands::ListenerPlan>, rc_core
     commands::daemon_web_plan(&rc_core::cli::parse_client(&argv)?)
 }
 
-/// The arguments of a restart: the original ones, plus `--web` and the
-/// flags of a listener started later by `web start`.
-fn restart_args(mut args: Vec<OsString>, web: Option<&WebInfo>) -> Vec<OsString> {
-    if let Some(web) = web
-        && !args.iter().any(|arg| arg == "--web")
-    {
-        args.push("--web".into());
-        args.extend(web.flags.iter().map(OsString::from));
+/// The arguments of a restart: the original ones without `--web` and the
+/// listener flags, then `--web` with the flags of the running listener (the
+/// actual port, absolute certificate paths). After `web stop` the restarted
+/// daemon has no listener.
+fn restart_args(args: Vec<OsString>, web: Option<&WebInfo>) -> Vec<OsString> {
+    const VALUED: [&str; 4] = ["--bind", "--port", "--tls-cert", "--tls-key"];
+    let mut kept = Vec::with_capacity(args.len());
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.to_str() {
+            Some("--web" | "--no-tls") => {}
+            Some(flag) if VALUED.contains(&flag) => {
+                args.next();
+            }
+            Some(flag) if flag.split_once('=').is_some_and(|(name, _)| VALUED.contains(&name)) => {}
+            // Its value stays as is, even one that looks like a listener flag.
+            Some("--data-dir") => {
+                kept.push(arg);
+                kept.extend(args.next());
+            }
+            _ => kept.push(arg),
+        }
     }
-    args
+    if let Some(web) = web {
+        kept.push("--web".into());
+        kept.extend(web.flags.iter().map(OsString::from));
+    }
+    kept
 }
 
 pub fn run(options: Options) -> ExitCode {
@@ -406,7 +424,8 @@ pub fn run(options: Options) -> ExitCode {
     if core_thread.join().is_err() {
         std::process::exit(1);
     }
-    // A restart brings back a listener started by `web start` too.
+    // A restart keeps the listener that runs now (started with `--web` or by
+    // `web start`) and drops one stopped by `web stop`.
     let args = restart_args(args, shared.web_info().as_ref());
     // Network connections close with the listener (and see their replies first).
     runtime.block_on(commands::stop(&shared));
@@ -528,16 +547,20 @@ mod tests {
     }
 
     #[test]
-    fn a_restart_brings_back_a_listener_started_later() {
+    fn a_restart_keeps_only_the_running_listener() {
         let args = |list: &[&str]| list.iter().map(OsString::from).collect::<Vec<_>>();
         let web = WebInfo { bind: "127.0.0.1".parse().unwrap(), port: 41000, tls: false, fingerprint: None,
             flags: ["--bind", "127.0.0.1", "--port", "41000"].map(str::to_owned).to_vec() };
         assert_eq!(restart_args(args(&["daemon", "run"]), None), args(&["daemon", "run"]));
         assert_eq!(restart_args(args(&["daemon", "run"]), Some(&web)),
             args(&["daemon", "run", "--web", "--bind", "127.0.0.1", "--port", "41000"]));
-        // Started with --web: its own flags stay.
-        assert_eq!(restart_args(args(&["daemon", "run", "--web", "--port", "0"]), Some(&web)),
-            args(&["daemon", "run", "--web", "--port", "0"]));
+        // Started with --web: the running listener's flags (the actual port) replace the original ones.
+        assert_eq!(restart_args(args(&["daemon", "run", "--web", "--port", "0", "--no-tls", "--tls-cert=c"]), Some(&web)),
+            args(&["daemon", "run", "--web", "--bind", "127.0.0.1", "--port", "41000"]));
+        // Stopped by `web stop`: no listener after the restart.
+        assert_eq!(restart_args(args(&["daemon", "run", "--web", "--bind", "0.0.0.0"]), None), args(&["daemon", "run"]));
+        assert_eq!(restart_args(args(&["daemon", "run", "--data-dir", "--web", "--web"]), None),
+            args(&["daemon", "run", "--data-dir", "--web"]));
     }
 
     #[test]

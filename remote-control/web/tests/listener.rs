@@ -95,12 +95,14 @@ async fn get(addr: SocketAddr, path: &str, host: &str, extra: &[(&str, &str)]) -
     exchange(TcpStream::connect(addr).await.unwrap(), path, host, extra).await
 }
 
-fn assert_security_headers(reply: &Reply) {
+/// `socket` — адрес WebSocket в `connect-src` (`None` — Host отклонён).
+fn assert_security_headers(reply: &Reply, socket: Option<&str>) {
+    let connect = socket.map_or_else(String::new, |socket| format!(" {socket}"));
     assert_eq!(
-        reply.header("content-security-policy").as_deref(),
-        Some(
-            "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
-        )
+        reply.header("content-security-policy"),
+        Some(format!(
+            "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'{connect}; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+        ))
     );
     assert_eq!(
         reply.header("x-content-type-options").as_deref(),
@@ -127,7 +129,8 @@ async fn serves_index_and_assets_with_security_headers_and_404() {
         Some("text/html; charset=utf-8")
     );
     assert!(String::from_utf8_lossy(&index.body).contains("/assets/js/app.js"));
-    assert_security_headers(&index);
+    let socket = format!("ws://{host}");
+    assert_security_headers(&index, Some(&socket));
 
     let asset = get(addr, "/assets/js/app.js", &host, &[]).await;
     assert_eq!(asset.status, 200);
@@ -136,7 +139,7 @@ async fn serves_index_and_assets_with_security_headers_and_404() {
         Some("text/javascript; charset=utf-8")
     );
     assert_eq!(asset.body, include_bytes!("../assets/js/app.js"));
-    assert_security_headers(&asset);
+    assert_security_headers(&asset, Some(&socket));
     let css = get(addr, "/assets/css/app.css", &host, &[]).await;
     assert_eq!(
         css.header("content-type").as_deref(),
@@ -152,7 +155,7 @@ async fn serves_index_and_assets_with_security_headers_and_404() {
     ] {
         let reply = get(addr, path, &host, &[]).await;
         assert_eq!(reply.status, 404, "{path}");
-        assert_security_headers(&reply);
+        assert_security_headers(&reply, Some(&socket));
     }
     listener.stop().await;
 }
@@ -167,7 +170,9 @@ async fn loopback_listener_refuses_foreign_host_on_every_route() {
         format!("[::1]:{port}"),
         format!("127.0.0.1:{port}"),
     ] {
-        assert_eq!(get(addr, "/", &host, &[]).await.status, 200, "{host}");
+        let reply = get(addr, "/", &host, &[]).await;
+        assert_eq!(reply.status, 200, "{host}");
+        assert_security_headers(&reply, Some(&format!("ws://{host}")));
     }
     for host in [
         format!("evil.example:{port}"),
@@ -178,7 +183,7 @@ async fn loopback_listener_refuses_foreign_host_on_every_route() {
         for path in ["/", "/assets/js/app.js", "/ws", "/missing"] {
             let reply = get(addr, path, &host, &[]).await;
             assert_eq!(reply.status, 403, "{host} {path}");
-            assert_security_headers(&reply);
+            assert_security_headers(&reply, None);
         }
     }
     listener.stop().await;
@@ -244,7 +249,7 @@ async fn websocket_refuses_foreign_and_null_origin() {
     ] {
         let reply = ws_request(addr, &host, Some(origin)).await;
         assert_eq!(reply.status, 403, "{origin}");
-        assert_security_headers(&reply);
+        assert_security_headers(&reply, Some(&format!("ws://{host}")));
     }
     listener.stop().await;
 }
@@ -502,7 +507,7 @@ async fn tls_with_self_signed_certificate_matches_fingerprint() {
         .unwrap();
     let index = exchange(stream, "/", &host, &[]).await;
     assert_eq!(index.status, 200);
-    assert_security_headers(&index);
+    assert_security_headers(&index, Some(&format!("wss://{host}")));
     let seen = leaf.lock().unwrap().clone().expect("сертификат предъявлен");
     assert_eq!(
         format!("SHA256:{}", hex::encode(Sha256::digest(&seen))),
@@ -653,6 +658,32 @@ async fn connections_over_the_limit_are_closed_at_once() {
 }
 
 #[tokio::test]
+async fn connections_without_a_request_have_their_own_limit() {
+    let limits = Limits {
+        max_pending: 1,
+        ..Limits::default()
+    };
+    let (listener, _accepted) = start_limited(limits).await;
+    let addr = local(&listener);
+    let host = format!("127.0.0.1:{}", addr.port());
+    let mut first = TcpStream::connect(addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut silent = TcpStream::connect(addr).await.unwrap();
+    let raw = closed_by_server(&mut silent).await;
+    assert!(raw.is_empty(), "второе молчащее соединение закрыто без ответа");
+    // Заголовки получены: место ожидания свободно, соединение остаётся открытым.
+    first
+        .write_all(format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut byte = [0; 1];
+    assert_eq!(timeout(WAIT, first.read(&mut byte)).await.unwrap().unwrap(), 1);
+    assert_eq!(get(addr, "/", &host, &[]).await.status, 200, "место освободилось");
+    drop(first);
+    listener.stop().await;
+}
+
+#[tokio::test]
 async fn absolute_form_request_is_forbidden() {
     let (listener, _accepted) = start(LOOPBACK, Tls::Off).await;
     let addr = local(&listener);
@@ -669,7 +700,7 @@ async fn absolute_form_request_is_forbidden() {
         .unwrap();
     let reply = parse(&raw);
     assert_eq!(reply.status, 403);
-    assert_security_headers(&reply);
+    assert_security_headers(&reply, Some(&format!("ws://127.0.0.1:{}", addr.port())));
     listener.stop().await;
 }
 

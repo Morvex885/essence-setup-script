@@ -7,7 +7,8 @@
 //! `y` закрепляет его), иначе — конверт `daemon_cert_unknown`.
 
 use std::collections::BTreeMap;
-use std::fs;
+use std::env::VarError;
+use std::fs::{self, File, TryLockError};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -23,8 +24,6 @@ const KNOWN_DAEMONS: &str = "known-daemons.json";
 /// Ожидание чужой блокировки файла закреплений.
 const LOCK_WAIT: Duration = Duration::from_secs(10);
 const LOCK_RETRY: Duration = Duration::from_millis(50);
-/// Блокировка старше этого брошена упавшим процессом.
-const STALE_LOCK: Duration = Duration::from_secs(30);
 
 /// Куда подключаться вместо локального демона.
 pub struct Target {
@@ -55,16 +54,18 @@ fn environment(name: &str) -> Result<Option<String>> {
     match std::env::var(name) {
         Ok(value) if value.is_empty() => Err(usage(format!("Переменная {name} пуста."))),
         Ok(value) => Ok(Some(value)),
-        Err(_) => Ok(None),
+        Err(VarError::NotPresent) => Ok(None),
+        Err(VarError::NotUnicode(_)) => Err(usage(format!("Переменная {name} не в кодировке UTF-8."))),
     }
 }
 
-/// Извлечь флаги подключения, стоящие перед командой (до первого слова не
-/// с `--`); затем переменные окружения. `None` — локальный демон.
+/// Извлечь флаги подключения, стоящие перед командой (до первого слова,
+/// которое не флаг; значения глобальных флагов пропускаются); затем
+/// переменные окружения. `None` — локальный демон.
 pub fn extract(argv: &mut Vec<String>) -> Result<Option<Target>> {
     let (mut connect, mut fingerprint, mut insecure) = (None, None, false);
     let mut index = 0;
-    while index < argv.len() && argv[index].starts_with("--") {
+    while index < argv.len() {
         let name = argv[index].split_once('=').map_or(argv[index].as_str(), |(name, _)| name).to_owned();
         match name.as_str() {
             "--connect" => connect = Some(flag_value(argv, index, "--connect URL")?),
@@ -73,7 +74,11 @@ pub fn extract(argv: &mut Vec<String>) -> Result<Option<Target>> {
                 argv.remove(index);
                 insecure = true;
             }
-            _ => index += 1,
+            _ => match rc_core::cli::global_width(argv, index) {
+                Some(width) => index += width,
+                None if name.starts_with("--") => index += 1,
+                None => break,
+            },
         }
     }
     let flagged = connect.is_some();
@@ -124,43 +129,48 @@ fn load_pins(path: &PathBuf) -> Result<BTreeMap<String, String>> {
     }
 }
 
-/// Исключительная блокировка чтения-изменения-записи закреплений: файл
-/// `known-daemons.json.lock`, создаваемый эксклюзивно; брошенный дольше
-/// [`STALE_LOCK`] считается оставленным упавшим процессом.
-struct PinLock(PathBuf);
+/// Исключительная блокировка чтения-изменения-записи закреплений: блокировка
+/// ОС (`flock` / `LockFileEx`) файла `known-daemons.json.lock`. ОС снимает её
+/// при закрытии файла, в том числе при падении процесса, поэтому файл не
+/// удаляется и брошенных блокировок не бывает.
+struct PinLock {
+    _file: File,
+}
 
 impl PinLock {
     fn acquire(path: &Path) -> Result<Self> {
         let lock = path.with_extension("json.lock");
+        let failed = |error: io::Error| RcError::new("failed", format!("Не удалось заблокировать {}: {error}", lock.display()));
+        let file = match secure_fs::create_new(&lock) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => open_lock(&lock).map_err(failed)?,
+            Err(error) => return Err(failed(error)),
+        };
         let deadline = Instant::now() + LOCK_WAIT;
         loop {
-            match secure_fs::create_new(&lock) {
-                Ok(_) => return Ok(Self(lock)),
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    let stale = fs::metadata(&lock)
-                        .and_then(|meta| meta.modified())
-                        .is_ok_and(|modified| modified.elapsed().is_ok_and(|age| age > STALE_LOCK));
-                    if stale {
-                        let _ = fs::remove_file(&lock);
-                        continue;
-                    }
-                    if Instant::now() >= deadline {
-                        return Err(RcError::new("locked", format!("Файл {} занят другим процессом.", path.display())));
-                    }
-                    std::thread::sleep(LOCK_RETRY);
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { _file: file }),
+                Err(TryLockError::WouldBlock) if Instant::now() < deadline => std::thread::sleep(LOCK_RETRY),
+                Err(TryLockError::WouldBlock) => {
+                    return Err(RcError::new("locked", format!("Файл {} занят другим процессом.", path.display())));
                 }
-                Err(error) => {
-                    return Err(RcError::new("failed", format!("Не удалось заблокировать {}: {error}", lock.display())));
-                }
+                Err(TryLockError::Error(error)) => return Err(failed(error)),
             }
         }
     }
 }
 
-impl Drop for PinLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+/// Существующий файл блокировки: только обычный файл, ссылка не разыменовывается.
+fn open_lock(lock: &Path) -> io::Result<File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NOFOLLOW);
+    let file = options.open(lock)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "не обычный файл"));
     }
+    Ok(file)
 }
 
 fn save_pin(path: &PathBuf, host_port: String, fingerprint: String) -> Result<()> {
@@ -200,7 +210,9 @@ pub fn connect(target: &Target) -> Result<DaemonClient> {
     }
     let path = known_daemons()?;
     loop {
-        let pins = Pins { flag: target.fingerprint.clone(), file: load_pins(&path)? };
+        // Явный отпечаток задаёт доверие сам: файл закреплений не читается.
+        let file = if target.fingerprint.is_some() { BTreeMap::new() } else { load_pins(&path)? };
+        let pins = Pins { flag: target.fingerprint.clone(), file };
         match DaemonClient::connect_remote(&target.url, &pins) {
             Ok(client) => return Ok(client),
             Err(ConnectError::CertUnknown { host, port, fingerprint }) => {
@@ -248,6 +260,10 @@ mod tests {
         let (target, rest) = extracted(&["--insecure", "--connect", "http://10.0.0.5", "status"]);
         assert!(target.unwrap().is_some());
         assert_eq!(rest, words(&["status"]));
+        // Значение глобального флага не останавливает поиск --connect.
+        let (target, rest) = extracted(&["--yes", "--plan-token", "tok", "--connect", "https://panel.example", "node", "delete"]);
+        assert!(target.unwrap().is_some());
+        assert_eq!(rest, words(&["--yes", "--plan-token", "tok", "node", "delete"]));
 
         let code = |list: &[&str]| extracted(list).0.err().map(|error| (error.code, error.message));
         let insecure = code(&["--connect", "http://10.0.0.5", "status"]).unwrap();
@@ -275,7 +291,8 @@ mod tests {
             writer.join().unwrap();
         }
         assert_eq!(load_pins(&path).unwrap().len(), 8);
-        assert!(!path.with_extension("json.lock").exists());
+        // Файл блокировки остаётся, но после закрытия всех дескрипторов свободен.
+        drop(PinLock::acquire(&path).unwrap());
         assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
     }
 

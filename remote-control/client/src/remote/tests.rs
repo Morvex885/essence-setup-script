@@ -232,3 +232,29 @@ fn fingerprints() {
     assert!(!valid_fingerprint(&format!("SHA256:{}", "g".repeat(64))));
     assert_eq!(certificate_fingerprint(b"x").len(), 7 + 64);
 }
+
+#[test]
+fn a_silent_connection_is_lost_but_pings_keep_it_open() {
+    use tokio_tungstenite::tungstenite::protocol::Role;
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    runtime.block_on(async {
+        let (near, far) = tokio::io::duplex(4096);
+        let client = WebSocketStream::from_raw_socket(near, Role::Client, None).await;
+        let mut server = WebSocketStream::from_raw_socket(far, Role::Server, None).await;
+        let (_outgoing, receiver) = unbounded_channel();
+        let (events, incoming) = mpsc::channel();
+        let started = Instant::now();
+        let pinging = async {
+            for _ in 0..4 {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                server.send(Message::Ping(Default::default())).await.unwrap();
+            }
+            assert!(incoming.try_recv().is_err(), "pings keep the connection");
+        };
+        // The server stays connected but silent after the pings.
+        tokio::join!(pump(client, receiver, events, Duration::from_millis(300)), pinging);
+        assert!(started.elapsed() >= Duration::from_millis(900));
+        assert!(matches!(incoming.try_recv(), Ok(Incoming::Closed(_))));
+        drop(server);
+    });
+}

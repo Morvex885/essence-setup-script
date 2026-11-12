@@ -383,13 +383,24 @@ pub fn run(invocation: &Invocation) -> ExitCode {
             return Ok(None);
         }
         let status = ok(call(&mut client, [words(&["web", "start"]), flags.clone()].concat())?)?;
-        let (link, file) = open_panel(&mut client, &endpoint, invocation, true)?;
+        // Сбой после запуска не оставляет панель работать: `web stop`, затем
+        // исходная ошибка (сбой остановки её не заменяет).
+        let watched = open_panel(&mut client, &endpoint, invocation, true).and_then(|(link, file)| {
+            client.set_watch(true).map_err(|error| local(oneshot::request_error(&error)))?;
+            Ok((link, file))
+        });
+        let (link, file) = match watched {
+            Ok(opened) => opened,
+            Err(error) => {
+                let _ = call(&mut client, words(&["web", "stop"]));
+                return Err(error);
+            }
+        };
         announce(&status);
         print_line("  [*] Ctrl+C — остановить.");
         if invocation.json {
             oneshot::finish(Output::success(json!({"web": status, "link": link})), true, Some(invocation));
         }
-        client.set_watch(true).map_err(|error| local(oneshot::request_error(&error)))?;
         Ok(Some((client, endpoint, file)))
     })();
     let (mut client, endpoint, _file) = match started {

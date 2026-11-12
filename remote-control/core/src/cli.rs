@@ -416,7 +416,7 @@ fn bare(noun: &str) -> bool {
 }
 
 /// Leading/interleaved global flags; `--plan-token` consumes its value.
-fn global_width(argv: &[String], index: usize) -> Option<usize> {
+pub fn global_width(argv: &[String], index: usize) -> Option<usize> {
     match argv[index].as_str() {
         "--json" | "--yes" | "--secrets-stdin" | "--help" | "-h" => Some(1),
         "--plan-token" => Some(2),
