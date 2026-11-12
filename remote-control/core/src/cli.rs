@@ -43,11 +43,14 @@ const fn spec(noun: &'static str, verb: &'static str, tokens: &'static str,
 
 const VAULT: &[&str] = &["vault-password", "new-vault-password"];
 const TELEGRAM: &str = "name+ all component=";
+/// Listener flags of `web start` (and, after `--web`, of `daemon run|start`).
+const WEB: &str = "bind= port= tls-cert= tls-key= no-tls";
+const DAEMON_WEB: &str = "web bind= port= tls-cert= tls-key= no-tls";
 
 static CATALOG: &[Spec] = &[
     spec("status", "", "", &[], 0),
     spec("session", "status", "", &[], NOSESSION),
-    spec("session", "open", "remember-key", &["vault-password", "script-password"], NOSESSION),
+    spec("session", "open", "remember-key", &["vault-password", "script-password", "access-token"], NOSESSION),
     spec("source", "init-local", "", &[], NOSESSION),
     spec("source", "status", "", &[], 0),
     spec("source", "github-accounts", "", &[], NOSESSION),
@@ -72,8 +75,14 @@ static CATALOG: &[Spec] = &[
     spec("self", "password-remove", "", &["current-password"], 0),
     spec("daemon", "status", "", &[], NOSESSION),
     spec("daemon", "stop", "", &[], NOSESSION | LOCAL),
-    spec("daemon", "run", "", &[], CLIENT),
-    spec("daemon", "start", "", &[], CLIENT),
+    spec("daemon", "run", DAEMON_WEB, &[], CLIENT),
+    spec("daemon", "start", DAEMON_WEB, &[], CLIENT),
+    spec("web", "status", "", &[], NOSESSION),
+    spec("web", "start", WEB, &[], NOSESSION | LOCAL),
+    spec("web", "stop", "", &[], NOSESSION | LOCAL),
+    spec("web", "link", "", &[], NOSESSION | LOCAL),
+    spec("web", "run", "bind= port= tls-cert= tls-key= no-tls no-open", &[], CLIENT),
+    spec("web", "open", "no-open", &[], CLIENT),
     spec("node", "list", "", &[], 0),
     spec("node", "show", "name=", &[], 0),
     spec("node", "aliases", "name= set+ unset+", &[], 0),
@@ -143,6 +152,8 @@ static HELP: &[(&str, &[(&str, &str)])] = &[
         ("… --yes [--plan-token T]", "Подтвердить опасное действие; T — plan_token из ответа confirmation_required"),
         ("… --secrets-stdin", "Секреты из stdin: JSON-объект {\"имя\":\"значение\"}; без флага — скрытый ввод с консоли"),
         ("ESSENCE_RC_DATA_DIR, RC_LOCK_WAIT, ESSENCE_RC_RUNTIME_DIR, ESSENCE_RC_DAEMON_LINGER", "Окружение: каталог данных, ожидание блокировки (с), каталог сокета демона, простой демона до выхода (с); RC_LOCK_WAIT и GITHUB_TOKEN читаются из окружения демона"),
+        ("--connect URL [--fingerprint SHA256:…] [--insecure] КОМАНДА", "Выполнить команду на удалённом демоне (https://host[:port]); --fingerprint закрепляет сертификат, --insecure разрешает http:// не на loopback"),
+        ("ESSENCE_RC_CONNECT, ESSENCE_RC_FINGERPRINT, ESSENCE_RC_INSECURE", "Окружение: то же, что --connect, --fingerprint и --insecure (=1)"),
         ("Коды выхода", "0 — успех; 1 — ошибка; 2 — неверное использование, нужно решение или --yes; telegram: 3 — не установлено, 4 — частично"),
     ]),
     ("awg", &[
@@ -169,8 +180,8 @@ static HELP: &[(&str, &[(&str, &str)])] = &[
     ("daemon", &[
         ("daemon status", "Состояние демона: клиенты, сессия, терминалы"),
         ("daemon stop", "Остановить демон после текущей операции"),
-        ("daemon run", "Запустить демон на переднем плане"),
-        ("daemon start", "Запустить демон в фоне и напечатать адрес подключения"),
+        ("daemon run [--web [--bind IP] [--port P] [--tls-cert PATH --tls-key PATH | --no-tls]]", "Запустить демон на переднем плане; с --web — постоянный режим с веб-панелью"),
+        ("daemon start [--web [--bind IP] [--port P] [--tls-cert PATH --tls-key PATH | --no-tls]]", "Запустить демон в фоне и напечатать адрес подключения"),
     ]),
     ("generate", &[
         ("generate (--all | --group G | --client C)", "Сгенерировать конфиги"),
@@ -256,6 +267,14 @@ static HELP: &[(&str, &[(&str, &str)])] = &[
         ("template create --name N [--from T] [--group G]", "Создать шаблон на основе другого"),
         ("template export --name T --output PATH [--yes]", "Сохранить шаблон в файл"),
         ("template import --name T --file PATH [--yes]", "Загрузить шаблон из файла"),
+    ]),
+    ("web", &[
+        ("web status", "Состояние веб-панели: адрес, TLS, отпечаток сертификата, подключения"),
+        ("web start [--bind IP] [--port P] [--tls-cert PATH --tls-key PATH | --no-tls]", "Запустить веб-панель в работающем демоне (порт 0 — выбирает ОС)"),
+        ("web stop", "Остановить веб-панель и закрыть сетевые подключения"),
+        ("web link", "Ссылка для входа в веб-панель; без пароля запуска — с одноразовым кодом на 5 минут"),
+        ("web run [--bind IP] [--port P] [--tls-cert PATH --tls-key PATH | --no-tls] [--no-open]", "Запустить веб-панель и открыть её в браузере; Ctrl+C — остановить"),
+        ("web open [--no-open]", "Открыть работающую веб-панель в браузере"),
     ]),
 ];
 
@@ -760,9 +779,12 @@ mod tests {
     fn client_rows_parse_on_the_client_and_are_marked() {
         let rows: Vec<&Spec> = CATALOG.iter().filter(|spec| spec.flags & CLIENT != 0).collect();
         assert_eq!(rows.iter().map(|spec| (spec.noun, spec.verb)).collect::<Vec<_>>(),
-            [("daemon", "run"), ("daemon", "start"), ("template", "export")]);
+            [("daemon", "run"), ("daemon", "start"), ("web", "run"), ("web", "open"), ("template", "export")]);
         for argv in [
             &["daemon", "run"][..], &["daemon", "start", "--json"],
+            &["daemon", "run", "--web", "--bind", "0.0.0.0", "--port", "0", "--no-tls"],
+            &["web", "run", "--port", "8443", "--tls-cert", "c.pem", "--tls-key", "k.pem", "--no-open"],
+            &["web", "open", "--no-open"],
             &["template", "export", "--name", "t", "--output", "/tmp/out.yaml", "--yes"],
         ] {
             let invocation = parse_client(&args(argv)).unwrap_or_else(|error| panic!("{argv:?}: {}", error.message));
@@ -779,6 +801,13 @@ mod tests {
         assert!(stop.local_only() && !stop.client_side() && !stop.requires_session());
         let status = parse(&args(&["daemon", "status"])).unwrap();
         assert!(!status.local_only() && !status.client_side() && !status.requires_session());
+        for verb in ["start", "stop", "link"] {
+            let web = parse(&args(&["web", verb])).unwrap();
+            assert!(web.local_only() && !web.client_side() && !web.requires_session(), "{verb}");
+        }
+        let web = parse(&args(&["web", "status"])).unwrap();
+        assert!(!web.local_only() && !web.requires_session());
+        assert_eq!(parse(&args(&["session", "open"])).unwrap().allowed_secrets(), ["vault-password", "script-password", "access-token"]);
         assert!(parse(&args(&["client", "config", "--name", "c"])).unwrap().requires_session());
     }
 

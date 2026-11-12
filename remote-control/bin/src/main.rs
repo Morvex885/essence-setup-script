@@ -1,14 +1,17 @@
 //! `essence-rc` — фронтенд: меню, разовый CLI и демон.
 //!
 //! Никакой логики команд здесь нет: ядро выполняется только в демоне
-//! (`daemon run`), меню и разовый CLI — его клиенты по локальному сокету.
+//! (`daemon run`), меню и разовый CLI — его клиенты по локальному сокету
+//! либо, с `--connect URL`, по WebSocket удалённого демона.
 //! Бинарник отвечает за маршрутизацию, вывод конверта JSON или русского
 //! человекочитаемого текста, скрытый ввод секретов с консоли, защиту от
 //! сигналов и аварийный ответ при панике.
 
 mod daemon;
 mod oneshot;
+mod remote;
 mod terminal;
+mod webcmd;
 
 use std::io::{self, IsTerminal, Write};
 use std::process::ExitCode;
@@ -17,12 +20,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use oneshot::Output;
 use rc_core::VERSION;
 use rc_core::cli;
+use rc_core::error::RcError;
 
 fn main() -> ExitCode {
     install_panic_hook();
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let mut argv: Vec<String> = std::env::args().skip(1).collect();
+    // До разбора команды: флаги подключения перед ней и переменные окружения.
+    let target = match remote::extract(&mut argv) {
+        Ok(target) => target,
+        Err(error) => {
+            let json = argv.iter().any(|arg| arg == "--json");
+            set_json_mode(json);
+            return oneshot::finish(Output::from_error(error), json, None);
+        }
+    };
     if argv.is_empty() && io::stdin().is_terminal() && io::stdout().is_terminal() {
-        return run_menu();
+        return run_menu(target.as_ref());
     }
     // --version/-V обслуживается бинарником до парсера.
     if argv.iter().any(|arg| arg == "--version" || arg == "-V") {
@@ -39,17 +52,28 @@ fn main() -> ExitCode {
         return oneshot::finish(Output::success(cli::help(invocation.help_noun())), json, Some(&invocation));
     }
     match (invocation.noun.as_str(), invocation.verb.as_str()) {
+        ("daemon", "run" | "start") | ("web", "run" | "open") if target.is_some() => {
+            let error = RcError::new("usage", "Команда выполняется только на машине демона.");
+            oneshot::finish(Output::from_error(error), json, Some(&invocation))
+        }
         ("daemon", "run") => daemon::run(daemon::Options { persistent: false }),
         ("daemon", "start") => oneshot::daemon_start(&invocation),
-        _ => oneshot::run(&argv, &invocation),
+        ("web", "run") => webcmd::run(&invocation),
+        ("web", "open") => webcmd::open(&invocation),
+        _ => oneshot::run(&argv, &invocation, target.as_ref()),
     }
 }
 
 /// Меню в этом процессе (библиотека без rc-core) поверх клиента демона; оно
-/// само ставит хук паники и политику сигналов.
-fn run_menu() -> ExitCode {
-    match oneshot::connect() {
-        Ok((client, _)) => essence_rc_tui::run_terminal(essence_rc_tui::Frontend {
+/// само ставит хук паники и политику сигналов. Удалённый сертификат
+/// подтверждается до входа в альтернативный экран.
+fn run_menu(target: Option<&remote::Target>) -> ExitCode {
+    let client = match target {
+        Some(target) => remote::connect(target),
+        None => oneshot::connect().map(|(client, _)| client),
+    };
+    match client {
+        Ok(client) => essence_rc_tui::run_terminal(essence_rc_tui::Frontend {
             client: Box::new(client),
             terminal: Box::new(|| Box::new(terminal::TerminalConsole::new())),
         }),

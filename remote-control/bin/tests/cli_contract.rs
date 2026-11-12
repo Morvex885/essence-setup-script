@@ -612,6 +612,8 @@ fn catalog_grammar_is_accepted_for_every_command() {
         &["template", "show", "--name", "default"],
         &["template", "create", "--name", "t1", "--from", "default", "--group", "G1"],
         &["daemon", "status"],
+        &["web", "status"],
+        &["web", "link"],
         &["template", "import", "--name", "t2", "--file", "in.yaml"],
         &["client", "list"],
         &["client", "list", "--group", "G1"],
@@ -656,6 +658,22 @@ fn catalog_grammar_is_accepted_for_every_command() {
             result.code
         );
     }
+
+    // `web start --port 0`: the listener keeps the on-demand daemon until `web stop`.
+    let mut start = base_command(&bin, &env);
+    start.args(["web", "start", "--port", "0", "--json"]);
+    let started = envelope(&exec(start, None, Duration::from_secs(30)));
+    assert_eq!(started["ok"], json!(true), "{started}");
+    assert_ne!(started["data"]["port"], json!(0), "the actual port: {started}");
+    assert_eq!(started["data"]["url"], json!(format!("http://127.0.0.1:{}", started["data"]["port"])));
+    let status = envelope(&{
+        let mut status = base_command(&bin, &env);
+        status.args(["web", "status", "--json"]);
+        exec(status, None, Duration::from_secs(30))
+    });
+    assert_eq!(status["data"]["port"], started["data"]["port"], "the same daemon still listens: {status}");
+    let stopped = envelope(&run_json(&bin, &env, &["web", "stop"], None));
+    assert_eq!(stopped["data"], json!({"enabled": false}), "{stopped}");
 
     // Сетевые команды: метаданные могут быть недоступны на стенде без сети,
     // но грамматика и конверт обязаны работать.

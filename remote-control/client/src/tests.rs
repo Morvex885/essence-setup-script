@@ -384,3 +384,25 @@ mod local {
         drop(peer);
     }
 }
+
+#[test]
+fn watch_and_activity_events_between_requests() {
+    let (mut client, script) = fake(|to_client, from_client| {
+        assert_eq!(next(&from_client), json!({"watch":true}));
+        to_client.send(line(json!({"id":7,"event":"log","level":"info","text":"stray"}))).unwrap();
+        to_client.send(line(json!({"event":"activity","state":"end","command":"self update","origin":"local"}))).unwrap();
+    });
+    client.set_watch(true).unwrap();
+    let event = client.next_event(std::time::Duration::from_secs(5)).unwrap().unwrap();
+    assert_eq!(event["command"], "self update");
+    script.join().unwrap();
+    // The script ended: the daemon side is gone.
+    assert!(client.next_event(std::time::Duration::from_secs(5)).is_err());
+    assert!(client.next_event(std::time::Duration::from_millis(1)).is_err(), "a dead connection stays dead");
+}
+
+#[test]
+fn next_event_times_out_quietly() {
+    let (mut client, _script) = fake(|_to_client, from_client| { let _ = from_client.recv(); });
+    assert!(client.next_event(std::time::Duration::from_millis(50)).unwrap().is_none());
+}

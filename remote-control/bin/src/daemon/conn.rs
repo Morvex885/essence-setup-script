@@ -2,10 +2,12 @@
 //!
 //! Routing order of a request (П4): parse and whitelist (`dispatch::checked`)
 //! → `client_side` → `local_only` → `help` → connection authorization →
-//! `daemon` → `requires_tty` →
+//! `daemon`/`web` → `requires_tty` →
 //! `session open` → queued command. Only `help`, `session status`,
-//! `session open` (and, locally, `self version`, `daemon *`) work before
-//! the connection authorized itself with `session open`.
+//! `session open` (and, locally, `self version`, `daemon *`, `web *`) work
+//! before the connection authorized itself with `session open`. Network
+//! connections arrive from the web listener and obey the limits of
+//! [`access`](super::access).
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -31,9 +33,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_json::value::RawValue;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, oneshot};
 use zeroize::Zeroizing;
 
+use super::access::{self, OpenOutcome};
 use super::core::{Job, Request, TerminalRequest};
 use super::local::LineReader;
 use super::terminal::{self, CLOSE_GRACE, Credit, InputSender};
@@ -44,6 +47,8 @@ const MAX_AGENT_PATH: usize = 4096;
 /// Bytes of events and replies queued for a client that does not read; more
 /// disconnects it (terminal output is bounded by its own credits).
 const MAX_QUEUED: usize = 4 * MAX_MESSAGE;
+/// How often an authorized network connection notices a lost authorization.
+const AUTHORIZATION_RECHECK: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// A message for the connection's writer task.
 pub enum Out {
@@ -100,6 +105,8 @@ pub struct Conn {
     authorized: AtomicBool,
     watch: AtomicBool,
     closed: AtomicBool,
+    /// A network `session open` of this connection is under way.
+    opening: AtomicBool,
     out: mpsc::UnboundedSender<Out>,
     /// Bytes of uncredited lines sent to the writer and not yet written.
     queued: AtomicUsize,
@@ -123,6 +130,7 @@ impl Conn {
             authorized: AtomicBool::new(false),
             watch: AtomicBool::new(false),
             closed: AtomicBool::new(false),
+            opening: AtomicBool::new(false),
             out,
             queued: AtomicUsize::new(0),
             kill: Notify::new(),
@@ -222,6 +230,10 @@ impl Conn {
         terminal::input_channel(format!("{}#{}", key(id), self.next_terminal.fetch_add(1, Ordering::Relaxed)))
     }
 
+    fn in_flight(&self) -> usize {
+        lock(&self.in_flight).len()
+    }
+
     pub fn link_terminal(&self, id: &Value, input: InputSender) {
         if !self.is_closed() {
             lock(&self.terminals).insert(key(id), input);
@@ -260,6 +272,8 @@ pub enum Route {
     Help,
     /// `daemon status|stop`: answered without the queue.
     Daemon,
+    /// `web *`: answered without the queue.
+    Web,
     /// `node shell`, `telegram menu` with a console: `Job::TerminalPrep`.
     Terminal,
     SessionOpen,
@@ -290,8 +304,10 @@ pub fn decide(invocation: &Invocation, origin: Origin, authorized: bool, termina
     if !authorized && !open {
         return Route::Fail(session_closed());
     }
-    if invocation.noun == "daemon" {
-        return Route::Daemon;
+    match invocation.noun.as_str() {
+        "daemon" => return Route::Daemon,
+        "web" => return Route::Web,
+        _ => {}
     }
     if invocation.requires_tty() {
         return if terminal { Route::Terminal } else { Route::Fail(tty_required(&invocation.noun)) };
@@ -381,14 +397,27 @@ fn parse_terminal(value: Option<&Value>) -> Result<Option<PtyRequest>, ()> {
     Ok(Some(PtyRequest { term: spec.term, size: ConsoleSize { cols: spec.cols, rows: spec.rows } }))
 }
 
+/// `hello`: local clients learn the daemon executable and its mode,
+/// network clients the kind of listener they came through.
 #[derive(Serialize)]
 struct Hello<'a> {
     event: &'static str,
     protocol: u32,
     version: &'static str,
     origin: Origin,
-    exe: &'a std::path::Path,
-    persistent: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exe: Option<&'a std::path::Path>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    persistent: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    listener: Option<ListenerHello>,
+}
+
+/// `hello.listener` of a network connection.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct ListenerHello {
+    pub loopback: bool,
+    pub tls: bool,
 }
 
 /// Serves one accepted (and already registered) connection until either
@@ -404,7 +433,10 @@ where
     }
     let (reader, writer) = tokio::io::split(stream);
     let origin = conn.origin;
-    conn.send(&Hello { event: "hello", protocol: PROTOCOL, version: VERSION, origin, exe: &shared.exe, persistent: shared.persistent });
+    conn.send(&Hello {
+        event: "hello", protocol: PROTOCOL, version: VERSION, origin,
+        exe: Some(&shared.exe), persistent: Some(shared.is_persistent()), listener: None,
+    });
     let mut writer = tokio::spawn(write_loop(writer, outgoing, conn.clone()));
     let mut lines = LineReader::new(reader, MAX_MESSAGE);
     loop {
@@ -454,6 +486,85 @@ async fn write_loop<W: AsyncWrite>(writer: W, mut outgoing: mpsc::UnboundedRecei
             }
         }
     }
+}
+
+/// Serves the WebSocket connections of one listener until it stops.
+pub async fn accept_network(shared: Arc<Shared>, mut accepted: mpsc::Receiver<essence_rc_web::Accepted>, listener: ListenerHello) {
+    while let Some(socket) = accepted.recv().await {
+        // Dropping the accepted socket closes it: during a stop, and beyond
+        // the limit of connections that have not authorized themselves.
+        if shared.is_stopping() || shared.unauthorized_network() >= access::MAX_UNAUTHORIZED {
+            continue;
+        }
+        let (out, outgoing) = mpsc::unbounded_channel();
+        let conn = shared.register(Origin::Network, out);
+        tokio::spawn(serve_network(shared.clone(), conn, outgoing, socket, listener));
+    }
+}
+
+async fn serve_network(
+    shared: Arc<Shared>,
+    conn: Arc<Conn>,
+    mut outgoing: mpsc::UnboundedReceiver<Out>,
+    socket: essence_rc_web::Accepted,
+    listener: ListenerHello,
+) {
+    let essence_rc_web::Accepted { mut incoming, outgoing: sink, .. } = socket;
+    conn.send(&Hello {
+        event: "hello", protocol: PROTOCOL, version: VERSION, origin: Origin::Network,
+        exe: None, persistent: None, listener: Some(listener),
+    });
+    let writer_conn = conn.clone();
+    // One protocol message per WebSocket frame, without the newline.
+    let writer = tokio::spawn(async move {
+        while let Some(Out::Line(mut line, credit)) = outgoing.recv().await {
+            if line.ends_with('\n') {
+                line.pop();
+            }
+            let sent = sink.send(line).await;
+            drop(credit);
+            if sent.is_err() {
+                writer_conn.mark_closed();
+                return;
+            }
+        }
+        // `Out::Close` or the connection is gone: dropping the sink closes the socket.
+    });
+    // An unauthorized connection — new, or reset by a password change —
+    // has 60 s to authorize itself; an authorized one is re-checked every
+    // second so a lost authorization starts that clock.
+    let mut unauthorized_since = Some(tokio::time::Instant::now());
+    let mut recheck = tokio::time::interval(AUTHORIZATION_RECHECK);
+    loop {
+        let authorized = conn.is_authorized();
+        if authorized {
+            unauthorized_since = None;
+        } else if unauthorized_since.is_none() {
+            unauthorized_since = Some(tokio::time::Instant::now());
+        }
+        let deadline = unauthorized_since.map(|since| since + access::PREAUTH_TIMEOUT);
+        tokio::select! {
+            line = incoming.recv() => {
+                // `web stop` closes the connection first: lines still in
+                // flight are not executed.
+                let Some(line) = line else { break };
+                if conn.is_closed() {
+                    break;
+                }
+                // The listener already assembled up to 4 MiB (`MAX_MESSAGE`)
+                // before this check — an accepted exception: the 64 KiB limit
+                // keeps unauthorized messages out of the parser and the queue.
+                if !conn.is_authorized() && line.len() > access::PREAUTH_MESSAGE {
+                    break;
+                }
+                handle_line(&shared, &conn, line.as_bytes()).await;
+            }
+            () = tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)), if deadline.is_some() => break,
+            _ = recheck.tick(), if authorized => {}
+        }
+    }
+    shared.disconnect(&conn);
+    writer.abort();
 }
 
 /// One line from the client. Never fails the connection: bad messages get
@@ -528,6 +639,12 @@ fn close_after_grace(shared: &Arc<Shared>, conn: &Conn, input: &InputSender) {
 
 fn request(shared: &Arc<Shared>, conn: &Arc<Conn>, id: Value, message: Message<'_>) {
     let Some(argv) = parse_argv(message.argv.as_ref()) else { return conn.reject(&id, invalid_request()) };
+    if conn.origin == Origin::Network {
+        let limit = if conn.is_authorized() { access::IN_FLIGHT } else { access::PREAUTH_IN_FLIGHT };
+        if conn.in_flight() >= limit {
+            return conn.reject(&id, RcError::new("usage", "Слишком много одновременных запросов."));
+        }
+    }
     if !conn.begin(&id) {
         // The running request keeps the id; this answer does not end it.
         return conn.reject(&id, RcError::new("usage", "Запрос с таким id уже выполняется."));
@@ -566,6 +683,9 @@ fn request(shared: &Arc<Shared>, conn: &Arc<Conn>, id: Value, message: Message<'
         Route::Fail(error) => conn.fail(&id, error),
         Route::Help => conn.reply(&id, Envelope::success(cli::help(invocation.help_noun()))),
         Route::Daemon => commands::run(shared, conn, &id, &invocation),
+        Route::Web => {
+            tokio::spawn(commands::web(shared.clone(), conn.clone(), id, invocation));
+        }
         Route::Terminal => {
             let (sender, receiver) = conn.terminal_channel(&id);
             let reservation = match invocation.value("name") {
@@ -590,9 +710,16 @@ fn request(shared: &Arc<Shared>, conn: &Arc<Conn>, id: Value, message: Message<'
                 conn.fail(&id, daemon_stopping());
             }
         }
+        Route::SessionOpen if conn.origin == Origin::Network => {
+            // One at a time per connection; the daemon-wide throttle orders the rest.
+            if conn.opening.swap(true, Ordering::SeqCst) {
+                return conn.fail(&id, invalid_request());
+            }
+            tokio::spawn(network_open(shared.clone(), job(false)));
+        }
         Route::SessionOpen => {
             announce_wait(shared, conn, &id);
-            if !shared.enqueue(Job::SessionOpen(job(false))) {
+            if !shared.enqueue(Job::SessionOpen(job(false), None)) {
                 conn.fail(&id, daemon_stopping());
             }
         }
@@ -605,8 +732,33 @@ fn request(shared: &Arc<Shared>, conn: &Arc<Conn>, id: Value, message: Message<'
     }
 }
 
-/// A request queued behind the executing one learns what it waits for.
+/// A network `session open`: under the daemon-wide throttle, after the
+/// pause its failure count asks for; the outcome moves the count.
+async fn network_open(shared: Arc<Shared>, request: Request) {
+    let conn = request.conn.clone();
+    let id = request.id.clone();
+    let mut failures = shared.throttle.lock().await;
+    let pause = access::throttle(*failures);
+    if !pause.is_zero() {
+        tokio::time::sleep(pause).await;
+    }
+    announce_wait(&shared, &conn, &id);
+    let (done, outcome) = oneshot::channel::<OpenOutcome>();
+    if !shared.enqueue(Job::SessionOpen(request, Some(done))) {
+        conn.fail(&id, daemon_stopping());
+    } else if let Ok(outcome) = outcome.await {
+        *failures = access::advance(*failures, outcome);
+    }
+    drop(failures);
+    conn.opening.store(false, Ordering::SeqCst);
+}
+
+/// A request queued behind the executing one learns what it waits for;
+/// an unauthorized network connection learns nothing about other work.
 fn announce_wait(shared: &Shared, conn: &Conn, id: &Value) {
+    if conn.origin == Origin::Network && !conn.is_authorized() {
+        return;
+    }
     if let Some(busy) = shared.busy() {
         conn.log(id, Level::Info, &format!("Ожидание: выполняется «{busy}»."));
     }
@@ -659,6 +811,14 @@ mod tests {
         assert_eq!(route(&["daemon", "stop"], Network, true, false), "local_only");
         assert_eq!(route(&["daemon", "run"], Local, true, false), "usage");
         assert_eq!(route(&["template", "export", "--name", "t", "--output", "o"], Local, true, false), "usage");
+        // `web *`: answered by the daemon; only `web status` reaches the network.
+        assert_eq!(route(&["web", "start", "--port", "0"], Local, false, false), "Web");
+        assert_eq!(route(&["web", "link"], Local, false, false), "Web");
+        assert_eq!(route(&["web", "status"], Network, true, false), "Web");
+        assert_eq!(route(&["web", "status"], Network, false, false), "session_closed");
+        assert_eq!(route(&["web", "stop"], Network, true, false), "local_only");
+        assert_eq!(route(&["web", "run"], Local, true, false), "usage");
+        assert_eq!(route(&["session", "open"], Network, false, false), "SessionOpen");
     }
 
     #[test]
@@ -734,6 +894,33 @@ mod tests {
         assert!(!conn.begin(&serde_json::json!(5)), "the original request still owns the id");
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn unauthorized_network_connections_keep_four_requests_in_flight() {
+        // The core never takes the jobs: every queued request stays in flight.
+        let (shared, _jobs) = super::super::tests::shared();
+        let (out, mut lines) = mpsc::unbounded_channel();
+        let conn = shared.register(Origin::Network, out);
+        for i in 0..5 {
+            let line = format!(r#"{{"id":{i},"argv":["session","status"]}}"#);
+            handle_line(&shared, &conn, line.as_bytes()).await;
+        }
+        let Ok(Out::Line(text, None)) = lines.try_recv() else { panic!("the fifth request is refused") };
+        let reply: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!((reply["id"].clone(), reply["error"]["code"].clone()), (serde_json::json!(4), serde_json::json!("usage")));
+        assert_eq!(reply["error"]["message"], "Слишком много одновременных запросов.");
+        assert!(lines.try_recv().is_err());
+        // Authorized: up to 32.
+        conn.set_authorized(true);
+        for i in 5..33 {
+            let line = format!(r#"{{"id":{i},"argv":["session","status"]}}"#);
+            handle_line(&shared, &conn, line.as_bytes()).await;
+        }
+        assert!(lines.try_recv().is_err(), "28 more fit: 32 in flight");
+        handle_line(&shared, &conn, br#"{"id":33,"argv":["session","status"]}"#).await;
+        let Ok(Out::Line(text, None)) = lines.try_recv() else { panic!("the 33rd request is refused") };
+        assert!(text.contains("Слишком много одновременных запросов."), "{}", text.as_str());
+    }
+
     #[test]
     fn a_closed_connection_sends_nothing() {
         let (out, mut lines) = mpsc::unbounded_channel();
@@ -744,9 +931,7 @@ mod tests {
     }
 
     fn shared() -> Arc<Shared> {
-        let jobs = mpsc::unbounded_channel().0;
-        let snapshot = tokio::sync::watch::channel(super::super::core::CoreSnapshot::default()).1;
-        Arc::new(Shared::new(false, PathBuf::from("/bin/essence-rc"), jobs, snapshot))
+        super::super::tests::shared().0
     }
 
     /// Reads nothing, accepts no writes.

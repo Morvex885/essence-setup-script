@@ -10,6 +10,9 @@ base64.workspace = true
 crossterm.workspace = true
 essence-rc-client.workspace = true
 essence-rc-tui.workspace = true
+essence-rc-web.workspace = true
+hex.workspace = true
+rand.workspace = true
 rc-core.workspace = true
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
@@ -25,7 +28,9 @@ libc.workspace = true
 windows-sys = { workspace = true, features = ["Win32_System_Console", "Win32_System_Pipes"] }
 
 [dev-dependencies]
+futures-util.workspace = true
 proptest.workspace = true
+tokio-tungstenite.workspace = true
 
 [target.'cfg(unix)'.dev-dependencies]
 libc.workspace = true

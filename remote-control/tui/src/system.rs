@@ -107,14 +107,20 @@ enum Opened {
     Absent(String),
     Failed,
 }
+/// Secret name of a network daemon's access code.
+const ACCESS_TOKEN: &str = "access-token";
 /// `session open` with accumulated secrets; every code per the startup plan.
+/// A network daemon may ask for its access code (`essence-rc web link`): it is
+/// single-use, so once the daemon has taken it, it never travels again.
 fn open_session(context: &mut Context<'_>, secrets: &mut Secrets) -> io::Result<Opened> {
-    let (mut script_tries, mut vault_tries) = (0, 0);
+    let (mut script_tries, mut vault_tries, mut token_tries) = (0, 0, 0);
     let mut remember = false;
     loop {
         let mut words = argv(&["session", "open"]);
         if remember { words.push("--remember-key".into()); }
         let reply = context.request_expecting(&words, secrets, "not_configured")?;
+        let token = reply.error["secret"] == ACCESS_TOKEN;
+        if !token { secrets.remove(ACCESS_TOKEN); }
         if reply.ok { return Ok(Opened::Open); }
         match reply.code() {
             "not_configured" => return Ok(Opened::Absent(reply.error["message"].as_str().unwrap_or_default().to_owned())),
@@ -129,6 +135,17 @@ fn open_session(context: &mut Context<'_>, secrets: &mut Secrets) -> io::Result<
                 let Some(password) = context.secret("Открытие сессии", "Пароль доступа к конфигурации GitHub")? else { return Ok(Opened::Failed); };
                 secrets.insert_hidden("vault-password", password);
                 remember = context.confirm(View::new("Ключ расшифровки"), "Сохранить ключ расшифровки на этом устройстве?")?;
+            },
+            "auth_required" | "auth_failed" if token => {
+                if token_tries >= 3 {
+                    token_tries = 0;
+                    secrets.clear();
+                    if !retry(context, "Код доступа не принят")? { return Ok(Opened::Failed); }
+                    continue;
+                }
+                token_tries += 1;
+                let Some(code) = context.secret("Открытие сессии", "Код доступа (essence-rc web link)")? else { return Ok(Opened::Failed); };
+                secrets.insert_hidden(ACCESS_TOKEN, code);
             },
             "auth_required" | "auth_failed" => {
                 if script_tries >= 3 {
@@ -439,6 +456,27 @@ pub(crate) mod tests {
         for secret in ["p1", "p2", "script-pw"] {
             assert!(!format!("{:?}{:?}", ui.views, client.calls).contains(secret));
         }
+    }
+    #[test] fn network_access_code_is_asked_then_never_resent() {
+        let token = |code: &str| (open(), error(code, json!({"secret":"access-token","message":"Требуется код доступа: essence-rc web link."})));
+        let mut client = ScriptedClient::new([configured(), token("auth_required"), token("auth_failed"),
+            (open(), error("auth_required", json!({"secret":"script-password"}))), (open(), ok())]);
+        let mut ui = ScriptedUi::new(&["c1", "c2", "pw"]);
+        assert!(gate(&mut client, &mut ui, &registry()));
+        client.assert_finished();
+        assert_eq!(client.secret_names[2], ["access-token"]);
+        assert_eq!(client.secret_names[3], ["access-token"]);
+        assert_eq!(client.secret_names[4], ["script-password"], "the accepted code is single-use");
+        assert_eq!(ui.views.iter().filter(|v| v.prompt == "Код доступа (essence-rc web link): ").count(), 2);
+        assert!(!format!("{:?}{:?}", ui.views, client.calls).contains("c2"));
+        // Three refused codes offer the retry screen.
+        let mut steps = vec![configured()];
+        steps.extend((0..4).map(|_| token("auth_failed")));
+        let mut client = ScriptedClient::new(steps);
+        let mut ui = ScriptedUi::new(&["a", "b", "c", "0"]);
+        assert!(!gate(&mut client, &mut ui, &registry()));
+        client.assert_finished();
+        assert!(ui.views.iter().any(|v| v.title == "Восстановление запуска"));
     }
     #[test] fn three_wrong_script_passwords_offer_retry_that_resets_secrets() {
         let mut steps = vec![configured()];
