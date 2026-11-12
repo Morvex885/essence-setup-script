@@ -847,7 +847,8 @@ mod tests {
         ] {
             let flags = listener_flags(&cli::parse_client(&argv).unwrap()).unwrap();
             let cert = cwd.join("c.pem").to_string_lossy().into_owned();
-            let key = cwd.join("k/k.pem").to_string_lossy().into_owned();
+            // `std::path::absolute` на Windows приводит `/` к `\`.
+            let key = cwd.join("k").join("k.pem").to_string_lossy().into_owned();
             assert_eq!(flags, args(&["--bind", "0.0.0.0", "--port", "9", "--tls-cert", &cert, "--tls-key", &key]), "{argv:?}");
         }
         let absolute = if cfg!(windows) { r"C:\certs\c.pem" } else { "/certs/c.pem" };
