@@ -1,8 +1,9 @@
 // Модальные диалоги экранов — аналог `Context::confirm/secret/select/toggle`
 // TUI: каждый вызов возвращает `Promise`, окно закрывается ответом. Диалоги
-// складываются стопкой (подтверждение поверх окна операции).
+// складываются стопкой (подтверждение поверх окна операции); фокус — в
+// верхнем окне, после закрытия возвращается туда, откуда окно открыто.
 import { html, useState, useEffect, useRef } from '../vendor/preact-htm.js';
-import { Button } from './ui.js';
+import { Button, useModalFocus } from './ui.js';
 
 /**
  * Хранилище стопки диалогов. `push(kind, props)` → `Promise` ответа.
@@ -66,11 +67,17 @@ export function useDialogs() {
 
 const TONE_KIND = { view: 'view', create: 'create', change: 'change', danger: 'danger', plain: 'plain' };
 
+/**
+ * Рамка окна. Фокус при открытии — на самом окне (Enter не подтверждает
+ * план случайно), поля ввода ставят его на себя.
+ */
 function Shell({ title, context, wide = false, children }) {
   const lines = Array.isArray(context) ? context : context ? [context] : [];
+  const modal = useRef(null);
+  useModalFocus(modal);
   return html`
-    <div class="overlay" role="dialog" aria-modal="true">
-      <div class="modal ${wide ? 'modal-wide' : ''}">
+    <div class="overlay" role="dialog" aria-modal="true" aria-label=${title}>
+      <div class="modal ${wide ? 'modal-wide' : ''}" ref=${modal} tabindex="-1">
         <h3>${title}</h3>
         ${lines.length > 0 && html`<div class="modal-context">${lines.map((line, index) => html`<div key=${index}>${line}</div>`)}</div>`}
         ${children}

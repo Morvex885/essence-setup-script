@@ -3,7 +3,7 @@
 import { html, useEffect, useState } from '../../vendor/preact-htm.js';
 import { Card } from '../ui.js';
 import { nodeLabel } from './nodes.js';
-import { useCommand, useBusy, Action, Actions, Context, Back, Loaded } from './kit.js';
+import { useCommand, useBusy, useMounted, Action, Actions, Context, Back, Loaded } from './kit.js';
 import {
   EMPTY, NO_NODES, rows, nodeText, awgStatusArgv, awgSyncArgv, awgRemovePeerArgv, awgOrphansArgv, awgView,
   AWG_REMOVE_TITLE, AWG_ORPHANS_TITLE,
@@ -30,12 +30,13 @@ function AwgNodes({ ctx }) {
 function AwgNode({ ctx, name }) {
   const [view, setView] = useState(null);
   const [busy, run] = useBusy();
+  const mounted = useMounted();
 
-  /** `awg status`; любой отказ возвращает к выбору ноды. */
+  /** `awg status`; любой отказ возвращает к выбору ноды (если карточка ещё открыта). */
   const load = async () => {
     const reply = await ctx.nodeRequest(name, awgStatusArgv(name), null);
     if (!reply.ok) {
-      ctx.navigate('awg');
+      if (mounted.current) ctx.navigate('awg');
       return;
     }
     setView(awgView(reply.data));

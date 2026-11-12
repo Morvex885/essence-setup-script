@@ -366,6 +366,20 @@ test('несовместимый протокол: без переподключ
   assert.equal(timers.pending, 0);
 });
 
+test('несовместимый протокол после переподключения: состояние incompatible с причиной', async () => {
+  const timers = manualTimers();
+  const { connection } = harness({ timers });
+  hello(FakeSocket.instances[0]);
+  await connection.ready;
+  const states = [];
+  connection.on('state', (state) => states.push([state, connection.failure]));
+  FakeSocket.instances[0].closeFromServer();
+  timers.run();
+  FakeSocket.instances[1].receive({ event: 'hello', protocol: 4, version: '3.0.0', origin: 'network' });
+  assert.deepEqual(states, [['reconnecting', null], ['incompatible', 'Несовместимый протокол демона: 4.']]);
+  assert.equal(timers.pending, 0);
+});
+
 test('close(): без переподключения, буфер очищен', async () => {
   const timers = manualTimers();
   const { connection } = harness({ timers });

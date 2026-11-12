@@ -6,10 +6,10 @@ import { html, useEffect, useRef, useState } from '../../vendor/preact-htm.js';
 import { Card } from '../ui.js';
 import { NODE_CODES } from '../flows.js';
 import { aliases } from './nodes.js';
-import { useBusy, Action, Actions, Context, Back, Loaded } from './kit.js';
+import { useBusy, useMounted, Action, Actions, Context, Back, Loaded } from './kit.js';
 import {
-  EMPTY, NOTHING_SELECTED, NO_NODES, rows, nodeText, syncedNode, syncData, overviewNodes,
-  connectionView, assignGroupsTitle, assignArgv, connSyncArgv, connListArgv, nodeCheckArgv, CONNECTION_ACTIONS,
+  NO_NODES, syncedNode, syncData, overviewNodes, connectionView, assignConnections,
+  connSyncArgv, connListArgv, nodeCheckArgv, CONNECTION_ACTIONS,
 } from './nodeops-model.js';
 
 const TITLE = 'Подключения нод';
@@ -32,30 +32,28 @@ function backToOverview(ctx) {
 function Overview({ ctx }) {
   const [state, setState] = useState({ synced: null, listed: null });
   const [busy, run] = useBusy();
-  const current = useRef(state);
-  current.current = state;
+  const mounted = useMounted();
 
+  /** `resync` — сначала `conn sync`; список показывается с последним снимком синхронизации. */
   const load = async (resync) => {
-    let synced = current.current.synced;
     if (resync) {
       const reply = await ctx.call(...connSyncArgv());
-      synced = syncData(reply);
+      const synced = syncData(reply);
       if (synced === null) {
         // `Connections::run`: сбой синхронизации — итог и выход из раздела.
         if (ctx.isFailure(reply)) ctx.failed();
-        ctx.navigate('summary');
+        if (mounted.current) ctx.navigate('summary');
         return;
       }
       memory.synced = synced;
     }
     const listed = await ctx.call(...connListArgv());
-    setState({ synced, listed });
+    setState({ synced: memory.synced === undefined ? null : memory.synced, listed });
   };
 
   useEffect(() => {
     const resume = memory.resume && memory.synced !== undefined;
     memory.resume = false;
-    if (resume) current.current = { ...current.current, synced: memory.synced };
     run(() => load(!resume));
   }, []);
 
@@ -85,6 +83,9 @@ function NodeConnections({ ctx, name }) {
   const [view, setView] = useState(null);
   const [busy, run] = useBusy();
   const synced = useRef(null);
+  const mounted = useMounted();
+  /** Поздний отказ ушедшей карточки не уводит из выбранного раздела. */
+  const leave = () => { if (mounted.current) backToOverview(ctx); };
 
   /** `conn sync --name`; при `partial` с кодом ноды — один раз `node check`. */
   const refresh = async () => {
@@ -109,7 +110,7 @@ function NodeConnections({ ctx, name }) {
         return true;
       }
       if (reply.error && reply.error.code !== 'not_found' && ctx.isFailure(reply)) ctx.failed();
-      backToOverview(ctx);
+      leave();
       return false;
     }
   };
@@ -118,7 +119,7 @@ function NodeConnections({ ctx, name }) {
     const listed = await ctx.request(connListArgv(name), { expect: 'not_found' });
     if (!listed.ok) {
       if (listed.error && listed.error.code !== 'not_found' && ctx.isFailure(listed)) ctx.failed();
-      backToOverview(ctx);
+      leave();
       return;
     }
     setView(connectionView(listed.data, synced.current, name));
@@ -152,39 +153,4 @@ function NodeConnections({ ctx, name }) {
       <${Action} tone="plain" disabled=${busy} onClick=${() => backToOverview(ctx)}>Назад<//>
     <//>
   <//>`;
-}
-
-/**
- * Сначала подключения (отмечены назначенные), затем целевые группы (без
- * отметок). Подтверждённый пустой набор подключений снимает назначение
- * выбранных групп (`conn set` без `--proxy`); отмена любого выбора ничего не меняет.
- */
-async function assignConnections(ctx, name, proxies, assigned) {
-  const selected = await ctx.toggle({
-    title: 'Подключения для групп',
-    options: proxies.map((proxy) => ({ value: proxy, label: proxy })),
-    selected: proxies.filter((_, index) => assigned[index].length > 0),
-    empty: EMPTY,
-    submit: 'Далее',
-  });
-  if (selected === null) return;
-  const listed = await ctx.call('group', 'list');
-  if (!listed.ok) {
-    if (ctx.isFailure(listed)) ctx.failed();
-    return;
-  }
-  const groups = rows(listed.data).map((row) => nodeText(row.name));
-  const targets = await ctx.toggle({
-    title: assignGroupsTitle(selected),
-    options: groups.map((group) => ({ value: group, label: group })),
-    selected: [],
-    empty: EMPTY,
-  });
-  if (targets === null) return;
-  if (targets.length === 0) {
-    ctx.notify('warn', NOTHING_SELECTED);
-    return;
-  }
-  const saved = await ctx.request(assignArgv(name, targets, selected));
-  if (ctx.isFailure(saved)) ctx.failed();
 }

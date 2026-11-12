@@ -70,7 +70,7 @@ export function App({ win = window, deps = {} }) {
   const dialogs = useDialogs();
 
   // Одноразовый код из `#ticket=…`: фрагмент стирается сразу, код уходит
-  // только с первым `session open`.
+  // только с первым `session open` и до отправки ждёт в `ticketRef`.
   const ticketRef = useRef(undefined);
   if (ticketRef.current === undefined) ticketRef.current = router.consumeTicket(win);
   if (!connectionRef.current) {
@@ -104,6 +104,14 @@ export function App({ win = window, deps = {} }) {
     const offState = connection.on('state', (state) => {
       setLinkState(state);
       if (state === 'reconnecting') notify('warn', 'Соединение с демоном потеряно. Переподключение…');
+      // Несовместимый `hello` после переподключения (обновлённый демон):
+      // переподключений больше не будет, вкладку нужно перезагрузить.
+      if (state === 'incompatible') {
+        setFailure(connection.failure);
+        setRestart((current) => (current === 'update' ? null : current));
+        setGate('incompatible');
+        setPhase('gate');
+      }
     });
     // После переподключения: без токена или с отклонённым токеном — снова вход.
     const offResumed = connection.on('resumed', (reply) => {
@@ -123,8 +131,9 @@ export function App({ win = window, deps = {} }) {
       setPhase('gate');
     });
     // Ссылка с кодом, вставленная в уже открытую вкладку, меняет только
-    // фрагмент (без перезагрузки): код забирается и вход повторяется. Этот
-    // обработчик стоит раньше маршрутизатора — тот видит уже очищенный адрес.
+    // фрагмент (без перезагрузки): код забирается и вход повторяется (после
+    // текущей попытки, если она идёт). Этот обработчик стоит раньше
+    // маршрутизатора — тот видит уже очищенный адрес.
     const onTicket = () => {
       const ticket = router.consumeTicket(win);
       if (!ticket) return;
@@ -166,7 +175,7 @@ export function App({ win = window, deps = {} }) {
   };
 
   /** Шаг входа: `session open` → экран по коду ответа. */
-  const open = async (options = {}) => {
+  const attemptOpen = async (options = {}) => {
     setBusy(true);
     const ticket = ticketRef.current;
     ticketRef.current = null;
@@ -179,6 +188,14 @@ export function App({ win = window, deps = {} }) {
     if (view === 'open') loadStatus();
     return { view, reply };
   };
+  const attemptRef = useRef(attemptOpen);
+  attemptRef.current = attemptOpen;
+  // Попытки входа по одной: вызов во время `session open` ждёт его итога.
+  const loginRef = useRef(null);
+  if (!loginRef.current) {
+    loginRef.current = session.serialLogin((options) => attemptRef.current(options), (result) => result.view === 'open');
+  }
+  const open = loginRef.current;
 
   useEffect(() => {
     let cancelled = false;
@@ -235,6 +252,8 @@ export function App({ win = window, deps = {} }) {
       case 'incompatible':
         return html`<div class="gate"><${Card} title="Не удалось подключиться к демону">
           <p class="tone-error">${failure}</p>
+          <p>Перезагрузите страницу, чтобы получить панель работающего демона.</p>
+          <div class="modal-buttons"><${Button} kind="view" onClick=${() => win.location.reload()}>Перезагрузить страницу<//></div>
         <//></div>`;
       case 'first-run':
         return html`<div class="gate"><${Card} title="Первый запуск">

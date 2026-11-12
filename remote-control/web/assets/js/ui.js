@@ -89,6 +89,38 @@ export function Button({ kind = 'plain', type = 'button', disabled = false, onCl
   return html`<button type=${type} class="btn btn-${kind}" disabled=${disabled} onClick=${onClick}>${children}</button>`;
 }
 
+const FOCUSABLE = 'button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+/**
+ * Фокус модального слоя `ref`: при открытии переходит в слой (`initial()` или
+ * сам слой, если фокус ещё снаружи), Tab и Shift+Tab не выходят из слоя, при
+ * закрытии фокус возвращается элементу, с которого слой открыт. Слой должен
+ * принимать фокус (`tabindex="-1"`).
+ */
+export function useModalFocus(ref, initial = null) {
+  const opener = useRef(document.activeElement);
+  useEffect(() => {
+    const root = ref.current;
+    if (!root.contains(document.activeElement)) ((initial && initial(root)) || root).focus();
+    const trap = (event) => {
+      if (event.key !== 'Tab') return;
+      const items = [...root.querySelectorAll(FOCUSABLE)].filter((item) => item.getClientRects().length > 0);
+      const active = document.activeElement;
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (!first) { event.preventDefault(); return; }
+      if (event.shiftKey && (active === first || active === root)) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && active === last) { event.preventDefault(); first.focus(); }
+    };
+    root.addEventListener('keydown', trap);
+    return () => {
+      root.removeEventListener('keydown', trap);
+      const target = opener.current;
+      if (target && target.isConnected && typeof target.focus === 'function') target.focus();
+    };
+  }, []);
+}
+
 /** Форма: `onSubmit(formData)` вызывается по «Отправить». */
 export function Form({ fields = [], submitLabel = 'Отправить', onSubmit, onCancel = null, busy = false, children }) {
   const [values, setValues] = useState(() => {

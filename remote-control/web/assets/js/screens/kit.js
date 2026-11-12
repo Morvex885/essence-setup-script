@@ -69,6 +69,19 @@ export function useBusy() {
   return [busy, run];
 }
 
+/**
+ * `ref.current` — экран ещё смонтирован. Поздний ответ ушедшего экрана не
+ * должен переводить пользователя из уже выбранного раздела.
+ */
+export function useMounted() {
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
+  return mounted;
+}
+
 /** Кнопка действия: `tone` — `view|create|change|danger`. */
 export function Action({ tone = 'view', disabled = false, onClick, children }) {
   return html`<${Button} kind=${tone} disabled=${disabled} onClick=${onClick}>${children}<//>`;

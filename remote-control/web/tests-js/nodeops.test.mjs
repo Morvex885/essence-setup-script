@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   EMPTY, nodeText, syncedNode, syncProblem, syncData, overviewNodes, overviewLines,
-  connectionView, assignGroupsTitle, assignArgv, connSyncArgv, connListArgv, nodeCheckArgv,
+  connectionView, assignGroupsTitle, assignArgv, assignConnections, connSyncArgv, connListArgv, nodeCheckArgv,
   CONNECTION_ACTIONS, awgStatusArgv, awgSyncArgv, awgRemovePeerArgv, awgOrphansArgv, awgView,
   TELEGRAM_VIEW, TELEGRAM_BATCH, TELEGRAM_COMPONENTS, TELEGRAM_STATUS_ARGV, telegramArgv, telegramResults,
 } from '../assets/js/screens/nodeops-model.js';
@@ -78,6 +78,51 @@ test('argv подключений', () => {
   assert.deepEqual(assignArgv('n', ['old'], []), ['conn', 'set', '--name', 'n', '--group', 'old']);
   assert.equal(assignGroupsTitle([]), 'Группы: снять назначение подключений');
   assert.equal(assignGroupsTitle(['p1']), 'Группы для подключений');
+});
+
+/** Поддельный `ctx` назначения: `steps` — `[argv, reply]`, `answers` — ответы `toggle`. */
+function assignCtx(steps, answers) {
+  const record = { calls: [], toggles: [], notices: [] };
+  const ctx = {
+    async request(argv) {
+      assert.ok(steps.length > 0, `лишний запрос ${argv.join(' ')}`);
+      const [expected, reply] = steps.shift();
+      assert.deepEqual(argv, expected);
+      record.calls.push(argv);
+      return reply;
+    },
+    call: (...words) => ctx.request(words),
+    async toggle(props) { record.toggles.push(props); return answers.shift(); },
+    notify: (level, text) => record.notices.push(text),
+    failed: () => record.notices.push('failed'),
+    isFailure: (reply) => !reply.ok,
+  };
+  return { ctx, record };
+}
+
+test('assignConnections: выбор подключений, затем групп (как assign_connections)', async () => {
+  const steps = [[['group', 'list'], ok([{ name: 'g1' }, { name: 'g2' }])], [assignArgv('n', ['g2'], ['p2']), ok()]];
+  const { ctx, record } = assignCtx(steps, [['p2'], ['g2']]);
+  await assignConnections(ctx, 'n', ['p1', 'p2'], [['g1'], []]);
+  assert.deepEqual(record.toggles.map((t) => [t.title, t.selected]), [['Подключения для групп', ['p1']], ['Группы для подключений', []]]);
+  assert.equal(steps.length, 0);
+});
+
+test('assignConnections: без подключений сразу выбор групп и снятие назначения', async () => {
+  const steps = [[['group', 'list'], ok([{ name: 'old' }])], [['conn', 'set', '--name', 'n', '--group', 'old'], ok()]];
+  const { ctx, record } = assignCtx(steps, [['old']]);
+  await assignConnections(ctx, 'n', [], []);
+  assert.deepEqual(record.toggles.map((t) => t.title), ['Группы: снять назначение подключений']);
+  assert.equal(steps.length, 0);
+});
+
+test('assignConnections: отмена выбора и пустой выбор групп ничего не меняют', async () => {
+  let { ctx, record } = assignCtx([], [null]);
+  await assignConnections(ctx, 'n', ['p1'], [[]]);
+  assert.deepEqual(record.calls, []);
+  ({ ctx, record } = assignCtx([[['group', 'list'], ok([{ name: 'g' }])]], [[]]));
+  await assignConnections(ctx, 'n', [], []);
+  assert.deepEqual(record.notices, ['Ничего не выбрано.']);
 });
 
 test('AmneziaWG: строки, удаляемые и действия', () => {

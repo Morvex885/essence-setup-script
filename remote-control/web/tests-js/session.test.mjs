@@ -2,7 +2,7 @@
 // отклонённый токен возобновления, варианты восстановления GitHub.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { routeReply, openSession, recoveryOptions } from '../assets/js/session.js';
+import { routeReply, openSession, recoveryOptions, serialLogin } from '../assets/js/session.js';
 
 const fail = (code, extra = {}) => ({ ok: false, data: null, error: { code, message: code, ...extra }, sync: null });
 const ok = (data = {}) => ({ ok: true, data, error: null, sync: null });
@@ -66,6 +66,71 @@ test('openSession: отклонённый одноразовый код не п�
   const reply = await openSession(connection, { ticket: 'dead' });
   assert.equal(reply.error.code, 'auth_failed');
   assert.equal(connection.calls.length, 1);
+});
+
+test('openSession: отклонённый код из ссылки — одна попытка с токеном возобновления', async () => {
+  const resume = 'c'.repeat(64);
+  const connection = fakeConnection([fail('auth_failed', { secret: 'access-token' }), ok()], resume);
+  const reply = await openSession(connection, { ticket: 'dead' });
+  assert.equal(reply.ok, true);
+  assert.deepEqual(connection.calls.map((call) => call.secrets), [{ 'access-token': 'dead' }, { 'access-token': resume }]);
+});
+
+test('openSession: код из ссылки и токен возобновления отклонены — отказ в коде', async () => {
+  const connection = fakeConnection([
+    fail('auth_failed', { secret: 'access-token', message: 'код' }),
+    fail('auth_failed', { secret: 'access-token' }),
+    fail('auth_required', { secret: 'access-token' }),
+  ], 'c'.repeat(64));
+  const reply = await openSession(connection, { ticket: 'dead' });
+  assert.equal(reply.error.message, 'код');
+  assert.equal(connection.resume, null);
+  assert.deepEqual(connection.calls.map((call) => call.secrets), [{ 'access-token': 'dead' }, { 'access-token': 'c'.repeat(64) }, {}]);
+});
+
+test('openSession: после отказа в коде токен возобновления открывает экран пароля', async () => {
+  const connection = fakeConnection([
+    fail('auth_failed', { secret: 'access-token' }),
+    fail('auth_required', { secret: 'script-password' }),
+  ], 'c'.repeat(64));
+  const reply = await openSession(connection, { ticket: 'dead' });
+  assert.equal(routeReply(reply), 'script-password');
+});
+
+/** Попытка входа, завершаемая вручную: `finish(index, view)`. */
+function manualAttempts() {
+  const started = [];
+  const attempt = (options) => new Promise((resolve) => started.push({ options, resolve }));
+  const finish = async (index, view) => {
+    started[index].resolve({ view });
+    for (let i = 0; i < 5; i += 1) await Promise.resolve();
+  };
+  return { started, attempt, finish };
+}
+
+test('serialLogin: вход во время попытки ждёт её и выполняется после неудачи', async () => {
+  const { started, attempt, finish } = manualAttempts();
+  const login = serialLogin(attempt, (result) => result.view === 'open');
+  const first = login({ n: 1 });
+  const second = login({ n: 2 });
+  const third = login({ n: 3 });
+  assert.equal(started.length, 1);
+  await finish(0, 'access-code');
+  assert.deepEqual(started.map((s) => s.options), [{ n: 1 }, { n: 3 }]);
+  await finish(1, 'open');
+  assert.deepEqual(await Promise.all([first, second, third]), [{ view: 'open' }, { view: 'open' }, { view: 'open' }]);
+  login({ n: 4 });
+  assert.equal(started.length, 3);
+});
+
+test('serialLogin: после открытой сессии отложенная попытка не выполняется', async () => {
+  const { started, attempt, finish } = manualAttempts();
+  const login = serialLogin(attempt, (result) => result.view === 'open');
+  const first = login();
+  login();
+  await finish(0, 'open');
+  assert.equal(started.length, 1);
+  assert.deepEqual(await first, { view: 'open' });
 });
 
 test('recoveryOptions: как system.rs::github_recovery', () => {

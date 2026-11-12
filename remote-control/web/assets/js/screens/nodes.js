@@ -76,7 +76,7 @@ const ADD_TITLE = 'Добавление ноды';
  * Попытки `node add` (`nodes.rs::add_node_with`): первый ключ сервера
  * принимается, изменённый заменяется только через план, `remote_failed` —
  * повтор с согласия (и, при входе по паролю, с новым паролем),
- * `onboarding_failed` — повтор или отложенная настройка.
+ * `onboarding_failed` — повтор или отложенная настройка. `true` — нода сохранена.
  */
 async function addNode(ctx, base, password) {
   const secrets = password ? { password } : undefined;
@@ -91,21 +91,21 @@ async function addNode(ctx, base, password) {
       if (reply.data && reply.data.needs_setup === true) {
         ctx.notify('warn', 'Нода сохранена, но требует SSH-настройки: раздел «Ноды» → «Завершить отложенную SSH-настройку».');
       }
-      return;
+      return true;
     }
     switch (code(reply)) {
       case 'host_key_changed': {
-        if (defer) { outcome(ctx, reply); return; }
+        if (defer) { outcome(ctx, reply); return false; }
         const fingerprint = rows(reply.error.fingerprints)[0];
-        if (typeof fingerprint !== 'string') { ctx.failed(); return; }
+        if (typeof fingerprint !== 'string') { ctx.failed(); return false; }
         hostKey = ['--replace-host-key', fingerprint];
         break;
       }
       case 'remote_failed': {
-        if (!(await ctx.confirm({ title: ADD_TITLE, question: 'Повторить попытку?' }))) return;
+        if (!(await ctx.confirm({ title: ADD_TITLE, question: 'Повторить попытку?' }))) return false;
         if (secrets) {
           const value = await ctx.askSecret({ title: ADD_TITLE, label: 'Новый пароль (пусто — прежний)', allowEmpty: true });
-          if (value === null) return;
+          if (value === null) return false;
           if (value) secrets.password = value;
         }
         break;
@@ -118,13 +118,13 @@ async function addNode(ctx, base, password) {
             { value: 'defer', label: 'Сохранить ноду и настроить позже', tone: 'create' },
           ],
         });
-        if (choice === null) return;
+        if (choice === null) return false;
         if (choice === 'defer') defer = true;
         break;
       }
       default:
         outcome(ctx, reply);
-        return;
+        return false;
     }
   }
 }
@@ -142,9 +142,10 @@ function AddForm({ ctx, busy, run, onClose }) {
       ctx.notify('warn', built.warning);
       return;
     }
-    setForm(EMPTY_FORM);
     run(async () => {
-      await addNode(ctx, built.argv, built.password);
+      // Неудача оставляет форму открытой с введёнными полями для исправления.
+      if (!(await addNode(ctx, built.argv, built.password))) return;
+      setForm(EMPTY_FORM);
       onClose(true);
     });
   };

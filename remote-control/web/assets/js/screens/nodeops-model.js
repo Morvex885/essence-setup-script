@@ -112,6 +112,46 @@ export function assignArgv(name, groups, proxies) {
   return argv;
 }
 
+/**
+ * Назначение подключений (`assign_connections`): сначала подключения
+ * (отмечены назначенные), затем целевые группы (без отметок). Без
+ * обнаруженных подключений их выбор пропускается: пустой набор снимает
+ * назначение выбранных групп (`conn set` без `--proxy`). Отмена любого
+ * выбора ничего не меняет.
+ */
+export async function assignConnections(ctx, name, proxies, assigned) {
+  let selected = [];
+  if (proxies.length > 0) {
+    selected = await ctx.toggle({
+      title: 'Подключения для групп',
+      options: proxies.map((proxy) => ({ value: proxy, label: proxy })),
+      selected: proxies.filter((_, index) => assigned[index].length > 0),
+      empty: EMPTY,
+      submit: 'Далее',
+    });
+    if (selected === null) return;
+  }
+  const listed = await ctx.call('group', 'list');
+  if (!listed.ok) {
+    if (ctx.isFailure(listed)) ctx.failed();
+    return;
+  }
+  const groups = rows(listed.data).map((row) => nodeText(row.name));
+  const targets = await ctx.toggle({
+    title: assignGroupsTitle(selected),
+    options: groups.map((group) => ({ value: group, label: group })),
+    selected: [],
+    empty: EMPTY,
+  });
+  if (targets === null) return;
+  if (targets.length === 0) {
+    ctx.notify('warn', NOTHING_SELECTED);
+    return;
+  }
+  const saved = await ctx.request(assignArgv(name, targets, selected));
+  if (ctx.isFailure(saved)) ctx.failed();
+}
+
 export const connSyncArgv = (name = null) => (name === null ? ['conn', 'sync'] : ['conn', 'sync', '--name', name]);
 export const connListArgv = (name = null) => (name === null ? ['conn', 'list'] : ['conn', 'list', '--name', name]);
 export const nodeCheckArgv = (name) => ['node', 'check', '--name', name];

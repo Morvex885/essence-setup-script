@@ -259,6 +259,8 @@ textarea.code, pre, .plan {
 }
 
 .modal h3 { margin: 0 0 10px; }
+/* Окно и оверлей терминала принимают фокус только программно (tabindex="-1"). */
+.modal:focus, .terminal-overlay:focus { outline: none; }
 .modal-context { white-space: pre-wrap; margin: 0 0 8px; }
 .plan {
   background: var(--bg-inset);
@@ -302,6 +304,7 @@ textarea.code, pre, .plan {
 
 .file-text { position: relative; overflow: hidden; }
 .file-text input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+.file-text:focus-within { outline: 2px solid currentColor; outline-offset: 2px; }
 .file-text.disabled { opacity: 0.5; cursor: default; }
 .file-text input:disabled { cursor: default; }
 

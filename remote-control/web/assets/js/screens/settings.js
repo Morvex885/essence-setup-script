@@ -4,7 +4,7 @@
 // `self uninstall` — `ctx.restart`.
 import { html } from '../../vendor/preact-htm.js';
 import { Card } from '../ui.js';
-import { useCommand, useCommands, useBusy, Action, Actions, Context, Back } from './kit.js';
+import { useCommand, useCommands, useBusy, Action, Actions, Context, Back, Loaded } from './kit.js';
 import { settingsView, settingsAction, daemonLines } from './system-model.js';
 
 export function SettingsScreen({ ctx }) {
@@ -15,26 +15,31 @@ export function SettingsScreen({ ctx }) {
   if (!version.reply || !state.replies) {
     return html`<${Card} title="Настройки" actions=${back}><p class="dim">Загрузка…</p><//>`;
   }
-  const password = Boolean(state.data.status && state.data.status.script_password === true);
-  const view = settingsView(version.reply, password);
-  const act = (key) => run(async () => {
-    const restart = await settingsAction(ctx, key, { password, available: view.available });
-    if (restart) { ctx.restart(restart); return; }
-    await state.reload();
-  });
-  return html`
-    <${Card} title="Настройки" actions=${back}>
-      <${Context} lines=${view.context} />
-      <${Actions}>
-        ${view.actions.map((item) => html`
-          <${Action} key=${item.key} tone=${item.tone} disabled=${busy || state.loading} onClick=${() => act(item.key)}>${item.label}<//>
-        `)}
+  // Пароль запуска известен только из успешного `status`: при ошибке — «Не
+  // удалось получить данные» с повтором, без действий с паролем.
+  const status = { reply: state.replies.status, data: state.data.status, loading: state.loading, reload: state.reload };
+  return html`<${Loaded} title="Настройки" state=${status} actions=${back}>${(data) => {
+    const password = data.script_password === true;
+    const view = settingsView(version.reply, password);
+    const act = (key) => run(async () => {
+      const restart = await settingsAction(ctx, key, { password, available: view.available });
+      if (restart) { ctx.restart(restart); return; }
+      await state.reload();
+    });
+    return html`
+      <${Card} title="Настройки" actions=${back}>
+        <${Context} lines=${view.context} />
+        <${Actions}>
+          ${view.actions.map((item) => html`
+            <${Action} key=${item.key} tone=${item.tone} disabled=${busy || state.loading} onClick=${() => act(item.key)}>${item.label}<//>
+          `)}
+        <//>
       <//>
-    <//>
-    <${Card} title="Демон">
-      ${state.data.daemon
-        ? html`<${Context} lines=${daemonLines(state.data.daemon).map((line) => `${line.label}: ${line.value}`)} />`
-        : html`<p class="tone-warn">Не удалось получить данные</p>`}
-    <//>
-  `;
+      <${Card} title="Демон">
+        ${state.data.daemon
+          ? html`<${Context} lines=${daemonLines(state.data.daemon).map((line) => `${line.label}: ${line.value}`)} />`
+          : html`<p class="tone-warn">Не удалось получить данные</p>`}
+      <//>
+    `;
+  }}<//>`;
 }

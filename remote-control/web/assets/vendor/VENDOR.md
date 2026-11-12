@@ -11,3 +11,15 @@
 | `qrcode.js` | `qrcode-generator` | 1.4.4 | `https://unpkg.com/qrcode-generator@1.4.4/qrcode.js` | `18ae399f81182bc9de916e9c77b195df20cc58d6f2d55a62b085a299f1bf1780` |
 
 Глобальные имена классических скриптов: `Terminal` (`xterm.js`), `FitAddon.FitAddon` (`xterm-addon-fit.js`), `qrcode` (`qrcode.js`). `preact-htm.js` — ES-модуль (`html`, `render`, `useState`, `useEffect`, `useRef`, …).
+
+## Лицензии
+
+Тексты лицензий лежат рядом и вшиваются в бинарник вместе с `assets` (`include_dir!`); слушатель их не отдаёт: файлы без расширения не входят в список типов содержимого.
+
+| Файл | Пакет | Лицензия | Источник | SHA-256 |
+|---|---|---|---|---|
+| `LICENSE-htm` | `htm` 3.1.1 (`preact-htm.js`) | Apache-2.0 | `https://raw.githubusercontent.com/developit/htm/3.1.1/LICENSE` | `740725f7252e750af735d0028cc534970772f513331e9f68150fede8fb3ce00f` |
+| `LICENSE-preact` | `preact` 10.x, вшитый в сборку `htm` 3.1.1 (`preact-htm.js`) | MIT | `https://raw.githubusercontent.com/preactjs/preact/10.2.0/LICENSE` | `1fe6958409c8c257a70c587a18b6f7f412b179b456630790d30b2ec9a8e4b7d4` |
+| `LICENSE-xterm` | `@xterm/xterm` 5.5.0, `@xterm/addon-fit` 0.10.0 (`xterm.js`, `xterm.css`, `xterm-addon-fit.js`) | MIT | `https://raw.githubusercontent.com/xtermjs/xterm.js/5.5.0/LICENSE` | `b569f629d00f2626a8100df2a1798210535621e42164dfd426a6fe5aac7b0ccd` |
+
+`qrcode.js` (MIT) несёт уведомление об авторских правах в заголовке файла.

@@ -77,12 +77,14 @@ function TemplateCard({ ctx, name }) {
     if (draft === null || draft === content) { ctx.notify('info', 'Изменений нет.'); discard(); return; }
     const reply = await ctx.runConfirmed('Импорт изменений шаблона', 'Сохранить изменения шаблона?',
       templateImport(name), { input: templateInput(draft) });
-    if (reply.ok || !ctx.isFailure(reply)) {
-      // Успех или отказ от плана: решение пользователя окончательное.
+    if (reply.ok) {
       discard();
       await reload();
       return;
     }
+    // Отказ от плана (`confirmation_required`, `plan_changed`) оставляет
+    // рабочую копию: удалить её — отдельное действие «Отменить изменения».
+    if (!ctx.isFailure(reply)) return;
     ctx.failed();
     setRejected(true);
   });

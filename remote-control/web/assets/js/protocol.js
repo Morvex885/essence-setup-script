@@ -104,6 +104,8 @@ export function connect({ WebSocket, location, storage = null, setTimeout: later
     hello: null,
     resume: resume || loadToken(storage),
     state: 'connecting',
+    /** Причина состояния `incompatible` (текст для экрана). */
+    failure: null,
     ready: new Promise((resolve, reject) => { readyResolve = resolve; readyReject = reject; }),
     request,
     terminal,
@@ -254,8 +256,9 @@ export function connect({ WebSocket, location, storage = null, setTimeout: later
     emit('hello', message);
     if (message.protocol !== PROTOCOL) {
       closed = true;
+      connection.failure = `Несовместимый протокол демона: ${message.protocol}.`;
       setState('incompatible');
-      readyReject(new Error(`Несовместимый протокол демона: ${message.protocol}.`));
+      readyReject(new Error(connection.failure));
       socket.close();
       return;
     }

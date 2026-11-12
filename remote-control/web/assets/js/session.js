@@ -33,7 +33,10 @@ export function routeReply(reply) {
  * предъявлении) либо токен возобновления `connection.resume` (обновляется
  * событием `access`). Отклонённый токен возобновления стирается, и вход
  * повторяется без него: демон сам скажет, нужен ли пароль или код доступа.
- * `remember` добавляет `--remember-key`.
+ * Отклонённый код из ссылки не отправляется снова; при сохранённом токене
+ * возобновления вход один раз повторяется с ним, а если и так нужен код
+ * доступа — возвращается отказ в коде из ссылки. `remember` добавляет
+ * `--remember-key`.
  */
 export async function openSession(connection, { secrets = {}, remember = false, ticket = null } = {}) {
   const argv = ['session', 'open'];
@@ -41,11 +44,50 @@ export async function openSession(connection, { secrets = {}, remember = false, 
   const token = ticket || connection.resume;
   const reply = await connection.request(argv, { secrets: token ? { ...secrets, 'access-token': token } : { ...secrets } });
   const rejected = !reply.ok && reply.error && reply.error.code === 'auth_failed' && reply.error.secret === 'access-token';
+  if (rejected && ticket && connection.resume) {
+    const resumed = await openSession(connection, { secrets, remember });
+    const needsCode = !resumed.ok && resumed.error && resumed.error.secret === 'access-token';
+    return needsCode ? reply : resumed;
+  }
   if (rejected && !ticket && token) {
     connection.forget();
     return connection.request(argv, { secrets: { ...secrets } });
   }
   return reply;
+}
+
+/**
+ * Попытки входа по одной: демон отклоняет одновременный `session open`
+ * (`usage`), не проверив код. `attempt(options)` не запускается, пока идёт
+ * предыдущая попытка; вызов во время неё запоминается (последние параметры)
+ * и выполняется после неё, если она не открыла сессию (`opened(result)`).
+ * `login(options)` → результат последней выполненной попытки цепочки.
+ */
+export function serialLogin(attempt, opened) {
+  let running = null;
+  let queued = null;
+  return (options = {}) => {
+    if (running) {
+      queued = { options };
+      return running;
+    }
+    running = (async () => {
+      try {
+        let next = { options };
+        let result;
+        while (next) {
+          queued = null;
+          result = await attempt(next.options);
+          next = queued && !opened(result) ? queued : null;
+        }
+        return result;
+      } finally {
+        queued = null;
+        running = null;
+      }
+    })();
+    return running;
+  };
 }
 
 /**
