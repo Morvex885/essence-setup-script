@@ -77,7 +77,7 @@ node --test web/tests-js/*.test.mjs
 - `source.json`: необязательные строгие метаданные GitHub; отсутствие означает local;
 - `templates/`, `ssh/identities/`, `ssh/known-hosts.json`;
 - `generated/`: конфиги клиентов;
-- `web/cert.pem`, `web/key.pem`: самоподписанный сертификат веб-панели;
+- `web/cert.pem`, `web/key.pem`: самоподписанный сертификат веб-панели; `web/autostart.json`: место установленного автозапуска;
 - `known-daemons.json` (+ `.lock`): закреплённые сертификаты удалённых демонов;
 - `.rc-lock/owner`: служебное владение блокировкой.
 
