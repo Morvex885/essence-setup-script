@@ -89,22 +89,8 @@ pub enum ConsoleEvent {
     Closed,
 }
 
-/// The operator's terminal, provided by the frontend. Absent in a public
-/// serve (only the TUI's `serve --inner` child attaches one) and whenever no
-/// controlling terminal exists.
-pub trait Console {
-    /// A controlling terminal that accepts raw mode is attached. Checked
-    /// before any remote effect.
-    fn available(&mut self) -> bool;
-    /// `TERM` for the remote pseudo-terminal.
-    fn term(&self) -> String;
-    fn size(&self) -> ConsoleSize;
-    /// Enter raw mode and start delivering input. Cooked mode returns when
-    /// the returned value drops, on every exit path.
-    fn raw(&mut self) -> io::Result<Box<dyn RawConsole + '_>>;
-}
-
-/// A console in raw mode: the input event stream and the output stream.
+/// A console in raw mode: the input event stream and the output stream. The
+/// owner of a terminal job (the daemon's terminal thread) provides it.
 pub trait RawConsole {
     /// Next input or resize event. `Pending` registers the waker.
     fn poll_event(&mut self, cx: &mut Context<'_>) -> Poll<ConsoleEvent>;

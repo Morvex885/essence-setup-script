@@ -52,7 +52,6 @@ pub async fn route<T: RemoteTransport>(noun: &str, verb: &str, invocation: &Invo
         ("node", "upload-scripts") => scripts::upload(session, invocation, transport).await,
         ("node", "harden") => harden::harden(session, invocation, transport).await,
         ("node", "setup-ssh") => setup::setup_ssh(session, invocation, transport).await,
-        ("node", "shell") => shell::shell(session, invocation, transport).await,
         ("conn", "list") => conn::list(session, invocation, transport).await,
         ("conn", "set") => conn::set(session, invocation),
         ("conn", "sync") => conn::sync(session, invocation, transport).await,
@@ -188,7 +187,7 @@ pub(crate) mod testing {
     //! Shared fixtures for node tests: an open local session in a temp dir.
     use std::{cell::RefCell, rc::Rc};
 
-    use crate::dispatch::{DispatchMode, Session};
+    use crate::dispatch::Session;
     use crate::log::{Level, LogSink};
     use crate::state::{State, StatePaths};
 
@@ -207,7 +206,7 @@ pub(crate) mod testing {
         let journal = Journal::default();
         let state = State::new(StatePaths::new(root));
         state.save_config(&crate::model::Config::default()).unwrap();
-        let mut session = Session::new(state, DispatchMode::OneShot, Box::new(Recorder(journal.clone())));
+        let mut session = Session::new(state, Box::new(Recorder(journal.clone())));
         session.open = true;
         session.authorized = true;
         (session, journal)
@@ -217,7 +216,8 @@ pub(crate) mod testing {
         crate::cli::parse(&argv.iter().map(|a| a.to_string()).collect::<Vec<_>>()).unwrap()
     }
 
-    /// Byte fingerprint of every file under the data directory.
+    /// Byte fingerprint of every file under the data directory; keys are
+    /// relative paths with `/` on every OS.
     pub fn fingerprint(root: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
         let mut map = std::collections::BTreeMap::new();
         let mut pending = vec![root.to_path_buf()];
@@ -225,7 +225,8 @@ pub(crate) mod testing {
             let Ok(entries) = std::fs::read_dir(&dir) else { continue };
             for entry in entries.flatten() {
                 let path = entry.path();
-                let rel = path.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+                let rel = path.strip_prefix(root).unwrap().components()
+                    .map(|part| part.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/");
                 if path.is_dir() { pending.push(path); } else { map.insert(rel, std::fs::read(&path).unwrap()); }
             }
         }

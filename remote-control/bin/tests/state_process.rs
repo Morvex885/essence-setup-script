@@ -1,3 +1,5 @@
+mod common;
+
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -5,6 +7,14 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+/// One-shot `status --json` through its own on-demand daemon (isolated
+/// runtime directory, gone before this returns).
+fn status_json(data: &Path) -> std::process::Output {
+    let runtime = common::runtime_dir();
+    let ctx = common::Ctx { data: data.to_path_buf(), runtime: runtime.path().to_path_buf(), vars: Vec::new() };
+    ctx.run(&["status", "--json"], b"")
+}
 
 use std::ops::{Deref, DerefMut};
 use rc_core::state::{State, StatePaths};
@@ -238,11 +248,7 @@ fn atomic_replacement_never_exposes_partial_content() {
 fn status_on_absent_data_directory_is_read_only() {
     let dir = TestDir::new();
     let data = dir.0.join("not-created");
-    let output = Command::new(env!("CARGO_BIN_EXE_essence-rc"))
-        .args(["status", "--json"])
-        .env("ESSENCE_RC_DATA_DIR", &data)
-        .output()
-        .unwrap();
+    let output = status_json(&data);
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["ok"], true);
@@ -292,10 +298,7 @@ fn protected_status_fails_closed_without_mutating_state() {
     State::new(paths.clone()).auth_store()
         .set(Zeroizing::new("never-echo-this-password".into())).unwrap();
     let auth_before = fs::read(paths.auth()).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_essence-rc"))
-        .args(["status", "--json"])
-        .env("ESSENCE_RC_DATA_DIR", paths.root())
-        .output().unwrap();
+    let output = status_json(paths.root());
     assert_eq!(output.status.code(), Some(2));
     let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(envelope["ok"], false);
@@ -313,10 +316,7 @@ fn invalid_state_status_reports_error_without_repairing_user_data() {
     let dir = TestDir::new();
     let malformed = b"{\"schema_version\":2,\"nodes\":\"malformed\"}";
     fs::write(dir.0.join("config.json"), malformed).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_essence-rc"))
-        .args(["status", "--json"])
-        .env("ESSENCE_RC_DATA_DIR", &dir.0)
-        .output().unwrap();
+    let output = status_json(&dir.0);
     assert_eq!(output.status.code(), Some(1));
     let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(envelope["ok"], false);

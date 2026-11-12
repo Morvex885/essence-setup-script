@@ -9,7 +9,7 @@ pub struct RcError {
     pub message: String,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
-    /// Process exit status for one-shot CLI runs; serve always reports 0.
+    /// CLI exit status; the daemon sends it as the reply's `exit` field.
     #[serde(skip)]
     pub exit: u8,
 }

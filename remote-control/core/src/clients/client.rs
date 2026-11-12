@@ -96,6 +96,18 @@ pub fn show(session: &mut Session, invocation: &Invocation) -> Result<Value> {
     Ok(data)
 }
 
+/// The generated config's text for download or display (with secrets, data
+/// only). `content` is `null` until `generate` created the file.
+pub fn config(session: &Session, invocation: &Invocation) -> Result<Value> {
+    let name = required(invocation, "name")?;
+    let config = session.state.load_config()?;
+    let client = find_client(&config, name)?;
+    let content = generate::config_file(session.state.paths(), client)?.map(String::from_utf8).transpose()
+        .map_err(|_| RcError::new("invalid", format!("Конфиг клиента «{}» не в кодировке UTF-8.", client.name))
+            .with_extra("name", client.name.clone()))?;
+    Ok(json!({"name": client.name, "group": client.group, "exists": content.is_some(), "content": content}))
+}
+
 /// v1 `_client_connections_check`: own connections exist only for a client
 /// with its own nodes and only on an assigned node.
 fn connections_check(config: &Config, name: &str, node: &str) -> Result<()> {
@@ -650,6 +662,7 @@ mod tests {
         match invocation.verb.as_str() {
             "list" => list(session, &invocation),
             "show" => show(session, &invocation),
+            "config" => super::config(session, &invocation),
             "connections" => connections(session, &invocation),
             "add" => add(session, &invocation),
             "rename" => rename(session, &invocation, connect).await,
@@ -964,5 +977,31 @@ mod tests {
         assert_eq!(data, json!({"deleted": ["my-router", "my-pc"]}));
         assert!(session.state.load_config().unwrap().clients.is_empty());
         assert!(!generated.join("ROUTER/my-router").exists() && !generated.join("PC/my-pc").exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn config_returns_the_generated_text_or_null() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut session, journal, generated) = setup(root.path(), config());
+        let before = fingerprint(root.path());
+        assert_eq!(run(&mut session, &["client", "config", "--name", "my-pc"], &no_ssh).await.unwrap(),
+            json!({"name": "my-pc", "group": "PC", "exists": true, "content": "keep pc\n"}));
+        fs::remove_file(generated.join("ROUTER/my-router/config.yaml")).unwrap();
+        assert_eq!(run(&mut session, &["client", "config", "--name", "my-router"], &no_ssh).await.unwrap(),
+            json!({"name": "my-router", "group": "ROUTER", "exists": false, "content": null}));
+        fs::write(generated.join("PC/my-pc/config.yaml"), [0xff, 0xfe]).unwrap();
+        let error = run(&mut session, &["client", "config", "--name", "my-pc"], &no_ssh).await.unwrap_err();
+        assert_eq!((error.code, error.message.as_str()), ("invalid", "Конфиг клиента «my-pc» не в кодировке UTF-8."));
+        for (argv, code) in [(&["client", "config", "--name", "ghost"][..], "not_found"), (&["client", "config"], "usage")] {
+            assert_eq!(run(&mut session, argv, &no_ssh).await.unwrap_err().code, code, "{argv:?}");
+        }
+        assert!(journal.borrow().is_empty(), "the config text never reaches the journal");
+        let mut after = fingerprint(root.path());
+        after.remove("generated/ROUTER/my-router/config.yaml");
+        after.remove("generated/PC/my-pc/config.yaml");
+        let mut expected = before;
+        expected.remove("generated/ROUTER/my-router/config.yaml");
+        expected.remove("generated/PC/my-pc/config.yaml");
+        assert_eq!(after, expected, "reading the config changes nothing");
     }
 }

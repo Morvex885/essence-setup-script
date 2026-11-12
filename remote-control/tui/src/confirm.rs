@@ -1,6 +1,7 @@
 //! One confirmation per frozen core plan; all decision-code flag names live here.
 use std::io;
-use crate::{app::Context, serve::{Reply, Secrets}, ui::{self, View}};
+use essence_rc_client::{Input, Reply, Secrets};
+use crate::{app::Context, ui::{self, View}};
 pub fn decision_flag(code: &str) -> Option<&'static str> {
     Some(match code {
         "repo_create_required"=>"--create-repo", "repo_private_required"=>"--make-private",
@@ -22,12 +23,21 @@ pub fn clear_flag(argv: &mut Vec<String>, flag: &str) { argv.retain(|s| s != fla
 /// `--force` is valid only inside this helper: the first call obtains its plan.
 /// Like v1 `tui_run_confirmed`, a plan that changes more than twice stops.
 pub fn run_confirmed(context: &mut Context<'_>, title: &str, question: &str, words: &[String], secrets: &Secrets) -> io::Result<Reply> {
-    let reply = context.request(words,secrets)?;
-    review_reply(context,title,question,words,secrets,reply,Some(2))
+    run_confirmed_with(context, title, question, words, secrets, &Input::default())
+}
+/// `run_confirmed` for a command with request input (file contents); every
+/// attempt carries the same input.
+pub fn run_confirmed_with(context: &mut Context<'_>, title: &str, question: &str, words: &[String], secrets: &Secrets, input: &Input) -> io::Result<Reply> {
+    let reply = context.request_with(words,secrets,input)?;
+    review(context,title,question,words,secrets,input,reply,Some(2))
 }
 /// Review an already-obtained plan (e.g. a harden preflight). A bounded
 /// replan policy is opt-in for screens whose command-specific parity requires it.
-pub fn review_reply(context: &mut Context<'_>, title: &str, question: &str, words: &[String], secrets: &Secrets, mut reply: Reply, max_changes: Option<usize>) -> io::Result<Reply> {
+pub fn review_reply(context: &mut Context<'_>, title: &str, question: &str, words: &[String], secrets: &Secrets, reply: Reply, max_changes: Option<usize>) -> io::Result<Reply> {
+    review(context,title,question,words,secrets,&Input::default(),reply,max_changes)
+}
+#[allow(clippy::too_many_arguments)]
+fn review(context: &mut Context<'_>, title: &str, question: &str, words: &[String], secrets: &Secrets, input: &Input, mut reply: Reply, max_changes: Option<usize>) -> io::Result<Reply> {
     let mut base=words.to_vec();
     let mut changes=0;
     loop {
@@ -57,12 +67,13 @@ pub fn review_reply(context: &mut Context<'_>, title: &str, question: &str, word
         let mut confirmed=base.clone();
         set_flag(&mut confirmed,"--yes",None);
         set_flag(&mut confirmed,"--plan-token",Some(&token));
-        reply=context.request(&confirmed,secrets)?;
+        reply=context.request_with(&confirmed,secrets,input)?;
     }
 }
 #[cfg(test)] mod tests {
     use super::*;
-    use crate::{app::{Registry,ScriptedUi},serve::{argv,ScriptedClient}};
+    use crate::app::{Registry,ScriptedUi};
+    use essence_rc_client::{argv,ScriptedClient};
     fn plan(code:&str, token:&str)->Reply { Reply { error:serde_json::json!({"code":code,"plan_token":token,"plan":["Delete all targets"]}),..Reply::default() } }
     #[test] fn confirmation_refusal_and_changed_plan() {
         let words=argv(&["group","delete","--name","LAB"]);
@@ -71,11 +82,11 @@ pub fn review_reply(context: &mut Context<'_>, title: &str, question: &str, word
         let registry=Registry{screens:vec![],github_wizard:None};
         let mut client=ScriptedClient::new([(words.clone(),plan("confirmation_required","one"))]);
         let mut ui=ScriptedUi::new(&[""]);
-        assert!(!run_confirmed(&mut Context{client:&mut client,ui:&mut ui,registry:&registry},"Delete","Continue?",&words,&Secrets::default()).unwrap().ok);
+        assert!(!run_confirmed(&mut Context::for_test(&mut client,&mut ui,&registry),"Delete","Continue?",&words,&Secrets::default()).unwrap().ok);
         client.assert_finished();
         let mut client=ScriptedClient::new([(words.clone(),plan("confirmation_required","one")),(yes,plan("plan_changed","two")),(yes2,Reply::success(serde_json::Value::Null))]);
         let mut ui=ScriptedUi::new(&["Y","y"]);
-        assert!(run_confirmed(&mut Context{client:&mut client,ui:&mut ui,registry:&registry},"Delete","Continue?",&words,&Secrets::default()).unwrap().ok);
+        assert!(run_confirmed(&mut Context::for_test(&mut client,&mut ui,&registry),"Delete","Continue?",&words,&Secrets::default()).unwrap().ok);
         assert_eq!(ui.views.len(),2); client.assert_finished();
     }
     #[test] fn decision_flags_are_unique() {
@@ -92,11 +103,11 @@ pub fn review_reply(context: &mut Context<'_>, title: &str, question: &str, word
         changed.error["port"]=serde_json::json!(2222);
         let mut client=ScriptedClient::new([(argv(&["node","harden","--name","n","--port","2222","--yes","--plan-token","new"]),Reply::success(serde_json::Value::Null))]);
         let mut ui=ScriptedUi::new(&["y"]);
-        assert!(review_reply(&mut Context{client:&mut client,ui:&mut ui,registry:&registry},"Harden","Continue?",&words,&Secrets::default(),changed.clone(),Some(2)).unwrap().ok);
+        assert!(review_reply(&mut Context::for_test(&mut client,&mut ui,&registry),"Harden","Continue?",&words,&Secrets::default(),changed.clone(),Some(2)).unwrap().ok);
         client.assert_finished();
-        let mut client=ScriptedClient::new([]);
+        let mut client=ScriptedClient::new(Vec::<essence_rc_client::Step>::new());
         let mut ui=ScriptedUi::new(&["y"]);
-        assert!(!review_reply(&mut Context{client:&mut client,ui:&mut ui,registry:&registry},"Harden","Continue?",&words,&Secrets::default(),changed,Some(0)).unwrap().ok);
+        assert!(!review_reply(&mut Context::for_test(&mut client,&mut ui,&registry),"Harden","Continue?",&words,&Secrets::default(),changed,Some(0)).unwrap().ok);
         assert!(ui.views.is_empty());client.assert_finished();
     }
 }

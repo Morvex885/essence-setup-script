@@ -1,23 +1,20 @@
-//! Console access for the one-shot CLI: hidden secret input and the raw
-//! terminal of interactive commands (`node shell`).
+//! Console access for the one-shot CLI and the menu: hidden secret input and
+//! the raw terminal of interactive commands (`node shell`, `telegram menu`).
 //!
 //! Cross-platform through crossterm raw mode on the controlling console
 //! (Unix `/dev/tty`, Windows console API — never `/dev/tty` paths on Windows).
 //! The prompt itself goes to stderr; stdout stays reserved for the single
-//! response. Protocol stdin is never a secret source: serve never prompts and
-//! redirected one-shot stdin is only read with `--secrets-stdin`. Raw mode is
-//! restored by its guard on every return path and by the panic hook, which
-//! exits without unwinding.
+//! response. Redirected one-shot stdin is only read with `--secrets-stdin`.
+//! Raw mode is restored by its guard on every return path and by the panic
+//! hook, which exits without unwinding.
 
 use std::io::{self, IsTerminal, Write};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::{Context, Poll};
 use std::time::Duration;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use rc_core::transport::{Console, ConsoleEvent, ConsoleSize, RawConsole};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use essence_rc_client::{TermEvent, TerminalIo};
 use zeroize::Zeroizing;
 
 /// Prompt labels for the whitelisted secrets, Russian v1 wording.
@@ -160,35 +157,57 @@ fn echo_newline() {
 /// its reader thread.
 const INPUT_POLL: Duration = Duration::from_millis(50);
 
-/// The controlling terminal of a one-shot run (v1 `</dev/tty >/dev/tty`).
-pub struct TerminalConsole;
+/// The controlling terminal is attached and accepts raw mode.
+pub fn console_attached() -> bool {
+    terminal_attached() && raw_mode_works()
+}
 
-impl Console for TerminalConsole {
-    fn available(&mut self) -> bool {
-        terminal_attached() && raw_mode_works()
+/// The controlling terminal of a terminal request (v1 `</dev/tty >/dev/tty`).
+#[derive(Default)]
+pub struct TerminalConsole {
+    raw: Option<RawTerminal>,
+}
+
+impl TerminalConsole {
+    pub fn new() -> Self {
+        Self { raw: None }
     }
+}
 
+impl TerminalIo for TerminalConsole {
     fn term(&self) -> String {
         std::env::var("TERM").ok().filter(|term| !term.is_empty()).unwrap_or_else(|| "xterm-256color".into())
     }
 
-    fn size(&self) -> ConsoleSize {
+    fn size(&self) -> (u16, u16) {
         match crossterm::terminal::size() {
-            Ok((cols, rows)) if cols > 0 && rows > 0 => ConsoleSize { cols, rows },
-            _ => ConsoleSize { cols: 80, rows: 24 },
+            Ok((cols, rows)) if cols > 0 && rows > 0 => (cols, rows),
+            _ => (80, 24),
         }
     }
 
-    fn raw(&mut self) -> io::Result<Box<dyn RawConsole + '_>> {
+    fn start(&mut self, events: Box<dyn Fn(TermEvent) + Send>) -> io::Result<()> {
+        self.stop();
         let output = console_output()?;
         let raw = RawModeGuard::enable()?;
-        let (events, receiver) = unbounded_channel();
         let stop = Arc::new(AtomicBool::new(false));
         let reader = {
             let stop = stop.clone();
-            std::thread::Builder::new().name("console-input".into()).spawn(move || read_input(&stop, &events))?
+            std::thread::Builder::new().name("console-input".into()).spawn(move || read_input(&stop, &*events))?
         };
-        Ok(Box::new(RawTerminal { events: receiver, output, stop, reader: Some(reader), _raw: raw }))
+        self.raw = Some(RawTerminal { output, stop, reader: Some(reader), _raw: raw });
+        Ok(())
+    }
+
+    fn write(&mut self, data: &[u8]) -> io::Result<()> {
+        let raw = self.raw.as_mut().ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "Терминал не открыт."))?;
+        raw.output.write_all(data)?;
+        raw.output.flush()
+    }
+
+    /// Stops the input thread, then leaves raw mode.
+    fn stop(&mut self) {
+        self.raw = None;
     }
 }
 
@@ -197,8 +216,7 @@ fn terminal_attached() -> bool {
     std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty").is_ok()
 }
 
-/// The console itself (`CONIN$`/`CONOUT$`), independent of redirected stdio:
-/// the TUI's `serve --inner` child has pipes on stdin/stdout.
+/// The console itself (`CONIN$`/`CONOUT$`), independent of redirected stdio.
 #[cfg(not(unix))]
 fn terminal_attached() -> bool {
     let open = |name: &str| std::fs::OpenOptions::new().read(true).write(true).open(name).is_ok();
@@ -221,22 +239,10 @@ fn console_output() -> io::Result<Box<dyn Write>> {
 
 /// Field order matters: the reader stops (Drop) before raw mode ends.
 struct RawTerminal {
-    events: UnboundedReceiver<ConsoleEvent>,
     output: Box<dyn Write>,
     stop: Arc<AtomicBool>,
     reader: Option<std::thread::JoinHandle<()>>,
     _raw: RawModeGuard,
-}
-
-impl RawConsole for RawTerminal {
-    fn poll_event(&mut self, cx: &mut Context<'_>) -> Poll<ConsoleEvent> {
-        self.events.poll_recv(cx).map(|event| event.unwrap_or(ConsoleEvent::Closed))
-    }
-
-    fn output(&mut self, data: &[u8]) -> io::Result<()> {
-        self.output.write_all(data)?;
-        self.output.flush()
-    }
 }
 
 impl Drop for RawTerminal {
@@ -249,7 +255,7 @@ impl Drop for RawTerminal {
 }
 
 /// Console events until stopped; a console error ends input with `Closed`.
-fn read_input(stop: &AtomicBool, events: &UnboundedSender<ConsoleEvent>) {
+fn read_input(stop: &AtomicBool, events: &(dyn Fn(TermEvent) + Send)) {
     while !stop.load(Ordering::SeqCst) {
         let event = match crossterm::event::poll(INPUT_POLL) {
             Ok(false) => continue,
@@ -257,19 +263,17 @@ fn read_input(stop: &AtomicBool, events: &UnboundedSender<ConsoleEvent>) {
             Err(error) => Err(error),
         };
         let event = match event {
-            Ok(Event::Key(key)) => key_bytes(key).map(ConsoleEvent::Input),
-            Ok(Event::Paste(text)) => Some(ConsoleEvent::Input(text.into_bytes())),
-            Ok(Event::Resize(cols, rows)) => Some(ConsoleEvent::Resize(ConsoleSize { cols, rows })),
+            Ok(Event::Key(key)) => key_bytes(key).map(|bytes| TermEvent::Input(Zeroizing::new(bytes))),
+            Ok(Event::Paste(text)) => Some(TermEvent::Input(Zeroizing::new(text.into_bytes()))),
+            Ok(Event::Resize(cols, rows)) => Some(TermEvent::Resize { cols, rows }),
             Ok(_) => None,
             Err(_) => {
-                let _ = events.send(ConsoleEvent::Closed);
+                events(TermEvent::Closed);
                 return;
             }
         };
-        if let Some(event) = event
-            && events.send(event).is_err()
-        {
-            return;
+        if let Some(event) = event {
+            events(event);
         }
     }
 }

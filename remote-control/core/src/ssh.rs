@@ -39,9 +39,20 @@ type RejectedKey = Arc<Mutex<Option<RcError>>>;
 type NativeAgent = AgentClient<Box<dyn AgentStream + Send + Unpin>>;
 
 /// An authenticated connection. Dropping the adapter does not revoke held leases.
+/// System authentication uses only the agent passed by the requesting client
+/// (`with_agent`); the default transport uses no agent at all.
 #[derive(Default)]
 pub struct SshTransport {
     connection: Option<Arc<Connection>>,
+    agent: Option<PathBuf>,
+}
+
+impl SshTransport {
+    /// A transport whose system authentication may use the SSH agent at
+    /// `agent_socket` (Unix socket path or Windows named pipe); `None` → no agent.
+    pub fn with_agent(agent_socket: Option<&Path>) -> Self {
+        Self { connection: None, agent: agent_socket.map(Path::to_path_buf) }
+    }
 }
 
 /// An independent lease on the already authenticated connection, never a relogin.
@@ -114,7 +125,7 @@ impl RemoteTransport for SshTransport {
         self.connection = None;
         validate_endpoint(&options)?;
         let deadline = Instant::now() + options.timeout;
-        let connection = timeout_at(deadline, connect_native(options)).await
+        let connection = timeout_at(deadline, connect_native(options, self.agent.as_deref())).await
             .map_err(|_| remote_failure("timeout"))??;
         self.connection = Some(Arc::new(connection));
         Ok(())
@@ -161,7 +172,7 @@ fn validate_endpoint(options: &ConnectOptions) -> Result<()> {
     Ok(())
 }
 
-async fn connect_native(options: ConnectOptions) -> Result<Connection> {
+async fn connect_native(options: ConnectOptions, agent: Option<&Path>) -> Result<Connection> {
     // Resolve managed-key/setup errors before DNS or opening a network socket.
     let auth = match options.auth {
         Authentication::Password(password) => {
@@ -191,7 +202,7 @@ async fn connect_native(options: ConnectOptions) -> Result<Connection> {
         PreparedAuth::Password(password) => handle.authenticate_password(&options.user, password.as_str())
             .await.map_err(|_| remote_failure("authentication"))?.success(),
         PreparedAuth::Key(key) => authenticate_key(&mut handle, &options.user, key).await?,
-        PreparedAuth::System => authenticate_system(&mut handle, &options.user).await?,
+        PreparedAuth::System => authenticate_system(&mut handle, &options.user, agent).await?,
     };
     if !authenticated { return Err(remote_failure("authentication")); }
     Ok(Connection { handle, rejected })
@@ -251,23 +262,23 @@ async fn authenticate_key(handle: &mut Handle<HostVerifier>, user: &str, key: Pr
 }
 
 #[cfg(unix)]
-async fn native_agent() -> Option<NativeAgent> {
-    AgentClient::connect_env().await.ok().map(|agent| agent.dynamic())
+async fn native_agent(socket: &Path) -> Option<NativeAgent> {
+    AgentClient::connect_uds(socket).await.ok().map(|agent| agent.dynamic())
 }
 
 #[cfg(windows)]
-async fn native_agent() -> Option<NativeAgent> {
-    // This is the Windows OpenSSH agent, not Pageant and not a shell helper.
-    AgentClient::connect_named_pipe(r"\\.\pipe\openssh-ssh-agent")
-        .await.ok().map(|agent| agent.dynamic())
+async fn native_agent(pipe: &Path) -> Option<NativeAgent> {
+    // The Windows OpenSSH agent pipe named by the client, not Pageant.
+    AgentClient::connect_named_pipe(pipe).await.ok().map(|agent| agent.dynamic())
 }
 
 #[cfg(not(any(unix, windows)))]
-async fn native_agent() -> Option<NativeAgent> { None }
+async fn native_agent(_: &Path) -> Option<NativeAgent> { None }
 
-async fn authenticate_system(handle: &mut Handle<HostVerifier>, user: &str) -> Result<bool> {
+async fn authenticate_system(handle: &mut Handle<HostVerifier>, user: &str, agent: Option<&Path>) -> Result<bool> {
     let mut attempted = false;
-    if let Some(mut agent) = native_agent().await {
+    let agent = match agent { Some(socket) => native_agent(socket).await, None => None };
+    if let Some(mut agent) = agent {
         if let Some(binding) = handle.agent_session_binding() {
             // Older agents may reject this extension; unrestricted identities
             // remain usable, while a constrained agent still enforces its policy.
@@ -371,11 +382,71 @@ async fn execute(connection: &Connection, command: &str, stdin: &[u8], timeout: 
 const INTERACTIVE_SETUP: Duration = Duration::from_secs(15);
 /// Console events buffered while the channel cannot take more input.
 const INPUT_QUEUE: usize = 64;
+/// Input bytes buffered (queued and in flight) while the channel cannot take
+/// more: a console delivering large pastes is not read beyond this.
+const INPUT_BYTES: usize = 4 << 20;
 
 enum Outgoing {
     Data(Vec<u8>),
     Resize(u32, u32),
     Eof,
+}
+
+impl Outgoing {
+    fn bytes(&self) -> usize {
+        match self {
+            Outgoing::Data(data) => data.len(),
+            _ => 0,
+        }
+    }
+}
+
+/// Console input waiting for the channel, bounded by [`INPUT_QUEUE`] events
+/// and [`INPUT_BYTES`] bytes. The bytes of the write in flight count until
+/// it completes.
+#[derive(Default)]
+struct InputQueue {
+    items: VecDeque<Outgoing>,
+    bytes: usize,
+    in_flight: usize,
+}
+
+impl InputQueue {
+    /// Room for one more console event.
+    fn accepting(&self) -> bool {
+        self.items.len() < INPUT_QUEUE && self.bytes < INPUT_BYTES
+    }
+
+    fn push(&mut self, event: ConsoleEvent) {
+        let outgoing = match event {
+            ConsoleEvent::Input(data) => Outgoing::Data(data),
+            ConsoleEvent::Resize(size) => {
+                // Only the latest pending size matters.
+                if let Some(Outgoing::Resize(..)) = self.items.back() { self.items.pop_back(); }
+                Outgoing::Resize(size.cols.into(), size.rows.into())
+            }
+            ConsoleEvent::Closed => Outgoing::Eof,
+        };
+        self.bytes += outgoing.bytes();
+        self.items.push_back(outgoing);
+    }
+
+    /// The next write; its bytes stay counted until [`InputQueue::sent`].
+    fn next(&mut self) -> Option<Outgoing> {
+        let outgoing = self.items.pop_front()?;
+        self.in_flight = outgoing.bytes();
+        Some(outgoing)
+    }
+
+    fn sent(&mut self) {
+        self.bytes -= self.in_flight;
+        self.in_flight = 0;
+    }
+
+    fn clear(&mut self) {
+        self.items.clear();
+        self.bytes = self.in_flight;
+    }
 }
 
 type Sending<'w> = Pin<Box<dyn Future<Output = std::result::Result<(), russh::Error>> + 'w>>;
@@ -415,35 +486,30 @@ async fn interactive(connection: &Connection, command: &str, pty: PtyRequest,
         Ok((reader, guard))
     }).await.map_err(|_| remote_failure("timeout"))??;
     let writer = guard.0.as_ref().expect("owned command writer");
-    let mut queue = VecDeque::new();
+    let mut queue = InputQueue::default();
     let mut sending: Option<Sending<'_>> = None;
     let mut input_open = true;
     let mut status = None;
     loop {
         if sending.is_none() {
-            sending = queue.pop_front().map(|outgoing| send(writer, outgoing));
+            sending = queue.next().map(|outgoing| send(writer, outgoing));
         }
-        let accepting = input_open && queue.len() < INPUT_QUEUE;
+        let accepting = input_open && queue.accepting();
         tokio::select! {
             sent = async { sending.as_mut().expect("in-flight input").await }, if sending.is_some() => {
                 sending = None;
+                queue.sent();
                 if sent.is_err() {
                     // The remote side stopped taking input; keep draining output.
                     input_open = false;
                     queue.clear();
                 }
             }
-            event = poll_fn(|cx| console.poll_event(cx)), if accepting => match event {
-                ConsoleEvent::Input(data) => queue.push_back(Outgoing::Data(data)),
-                ConsoleEvent::Resize(size) => {
-                    // Only the latest pending size matters.
-                    if let Some(Outgoing::Resize(..)) = queue.back() { queue.pop_back(); }
-                    queue.push_back(Outgoing::Resize(size.cols.into(), size.rows.into()));
-                }
-                ConsoleEvent::Closed => {
+            event = poll_fn(|cx| console.poll_event(cx)), if accepting => {
+                if matches!(event, ConsoleEvent::Closed) {
                     input_open = false;
-                    queue.push_back(Outgoing::Eof);
                 }
+                queue.push(event);
             },
             message = reader.wait() => match message {
                 Some(ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. }) => {
@@ -761,5 +827,43 @@ async fn publish_version(session: &RawSftpSession, temporary: &str, target: &str
     }
     session.rename(temporary, target).await.map_err(sftp_error)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::ConsoleSize;
+
+    /// Large pastes stop the console from being read once the buffered
+    /// bytes reach the limit, queued or in flight, until a write completes.
+    #[test]
+    fn interactive_input_is_bounded_by_bytes_until_written() {
+        let mut queue = InputQueue::default();
+        let chunk = 1 << 20;
+        for _ in 0..INPUT_BYTES / chunk {
+            assert!(queue.accepting());
+            queue.push(ConsoleEvent::Input(vec![b'k'; chunk]));
+        }
+        assert!(!queue.accepting(), "4 MiB buffered: the console is not read");
+        assert!(matches!(queue.next(), Some(Outgoing::Data(_))));
+        assert!(!queue.accepting(), "the write in flight still counts");
+        queue.sent();
+        assert!(queue.accepting(), "a completed write frees its bytes");
+        queue.clear();
+        assert_eq!(queue.bytes, 0);
+    }
+
+    #[test]
+    fn interactive_input_keeps_the_event_bound_and_one_pending_resize() {
+        let mut queue = InputQueue::default();
+        let size = ConsoleSize { cols: 80, rows: 24 };
+        queue.push(ConsoleEvent::Resize(size));
+        queue.push(ConsoleEvent::Resize(size));
+        assert_eq!(queue.items.len(), 1, "only the latest size is pending");
+        for _ in 1..INPUT_QUEUE {
+            queue.push(ConsoleEvent::Input(vec![b'k']));
+        }
+        assert!(!queue.accepting(), "64 events");
+    }
 }
 

@@ -19,13 +19,14 @@ use crate::cli::Invocation;
 use crate::dispatch::Session;
 use crate::error::{RcError, Result};
 use crate::model::{Client, Config, Group};
+use crate::request_input::Input;
 use crate::request_secrets::Secrets;
 use crate::state::StatePaths;
 use crate::transport::RemoteTransport;
 
 /// Dispatch of the domain's commands; `connect` creates a fresh transport per node.
 pub async fn route<T: RemoteTransport>(noun: &str, verb: &str, invocation: &Invocation, _secrets: &Secrets,
-    session: &mut Session, connect: &dyn Fn() -> T) -> Result<Value>
+    input: &Input, session: &mut Session, connect: &dyn Fn() -> T) -> Result<Value>
 {
     match (noun, verb) {
         ("generate", _) => generate::generate(session, invocation, connect).await,
@@ -36,10 +37,10 @@ pub async fn route<T: RemoteTransport>(noun: &str, verb: &str, invocation: &Invo
         ("template", "list") => templates::list_command(session),
         ("template", "show") => templates::show(session, invocation),
         ("template", "create") => templates::create(session, invocation),
-        ("template", "export") => templates::export(session, invocation),
-        ("template", "import") => templates::import(session, invocation),
+        ("template", "import") => templates::import(session, invocation, input),
         ("client", "list") => client::list(session, invocation),
         ("client", "show") => client::show(session, invocation),
+        ("client", "config") => client::config(session, invocation),
         ("client", "connections") => client::connections(session, invocation),
         ("client", "add") => client::add(session, invocation),
         ("client", "rename") => client::rename(session, invocation, connect).await,

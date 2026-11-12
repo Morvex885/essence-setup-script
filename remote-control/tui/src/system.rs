@@ -5,7 +5,8 @@ use std::io;
 use ratatui::{style::{Color, Style}, text::{Line, Span}};
 use serde_json::Value;
 use zeroize::Zeroizing;
-use crate::{app::{Context, Navigation, Screen}, confirm::run_confirmed, serve::{argv, Reply, Secrets}, source::{recovery_run, report}, ui::{self, Item, View}};
+use essence_rc_client::{argv, Reply, Secrets};
+use crate::{app::{Context, Navigation, Screen}, confirm::run_confirmed, source::{recovery_run, report}, ui::{self, Item, View}};
 
 /// `v` prefix exactly once (v1 `_tui_version`).
 pub fn version_label(version: &str) -> String { format!("v{}", version.strip_prefix('v').unwrap_or(version)) }
@@ -52,14 +53,32 @@ pub enum Gate {
     /// recovery): the menu exits with code 1.
     Failed,
 }
+/// `session status`, then `session open` (the daemon checks the script
+/// password even before the first run); `not_configured` leads to the
+/// first-run screen and a second `session open` once a source exists.
 pub fn session_gate(context: &mut Context<'_>) -> io::Result<Gate> {
     let status = context.call(&["session", "status"])?;
     if !status.ok { context.failed(); return Ok(Gate::Failed); }
-    if status.data["configured"] != true {
-        let gate = first_run(context)?;
-        if gate != Gate::Open { return Ok(gate); }
+    // One set of secrets for both opens: a password given before the first
+    // run is not asked again after it.
+    let mut secrets = Secrets::default();
+    match open_session(context, &mut secrets)? {
+        Opened::Open => return Ok(Gate::Open),
+        Opened::Failed => return Ok(Gate::Failed),
+        Opened::Absent(_) => {},
     }
-    Ok(if open_session(context)? { Gate::Open } else { Gate::Failed })
+    let gate = first_run(context)?;
+    if gate != Gate::Open { return Ok(gate); }
+    match open_session(context, &mut secrets)? {
+        Opened::Open => Ok(Gate::Open),
+        Opened::Failed => Ok(Gate::Failed),
+        // The first run reported success, yet no source exists: say so.
+        Opened::Absent(message) => {
+            if !message.is_empty() { context.ui.notice(ui::text(format!("[✗] {message}"), ui::RED)); }
+            context.failed();
+            Ok(Gate::Failed)
+        },
+    }
 }
 fn first_run(context: &mut Context<'_>) -> io::Result<Gate> {
     let mut view = View::menu("Первый запуск", vec![
@@ -79,26 +98,35 @@ fn first_run(context: &mut Context<'_>) -> io::Result<Gate> {
         }
     }
 }
+/// Result of `session open` at startup.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Opened {
+    Open,
+    /// `not_configured` with its message: the connection is authorized, no
+    /// source exists yet.
+    Absent(String),
+    Failed,
+}
 /// `session open` with accumulated secrets; every code per the startup plan.
-fn open_session(context: &mut Context<'_>) -> io::Result<bool> {
-    let mut secrets = Secrets::default();
+fn open_session(context: &mut Context<'_>, secrets: &mut Secrets) -> io::Result<Opened> {
     let (mut script_tries, mut vault_tries) = (0, 0);
     let mut remember = false;
     loop {
         let mut words = argv(&["session", "open"]);
         if remember { words.push("--remember-key".into()); }
-        let reply = context.request(&words, &secrets)?;
-        if reply.ok { return Ok(true); }
+        let reply = context.request_expecting(&words, secrets, "not_configured")?;
+        if reply.ok { return Ok(Opened::Open); }
         match reply.code() {
+            "not_configured" => return Ok(Opened::Absent(reply.error["message"].as_str().unwrap_or_default().to_owned())),
             "vault_password_required" | "vault_password_invalid" => {
                 if vault_tries >= 3 {
                     vault_tries = 0;
                     secrets.clear();
-                    if !retry(context, "Доступ к конфигурации GitHub")? { return Ok(false); }
+                    if !retry(context, "Доступ к конфигурации GitHub")? { return Ok(Opened::Failed); }
                     continue;
                 }
                 vault_tries += 1;
-                let Some(password) = context.secret("Открытие сессии", "Пароль доступа к конфигурации GitHub")? else { return Ok(false); };
+                let Some(password) = context.secret("Открытие сессии", "Пароль доступа к конфигурации GitHub")? else { return Ok(Opened::Failed); };
                 secrets.insert_hidden("vault-password", password);
                 remember = context.confirm(View::new("Ключ расшифровки"), "Сохранить ключ расшифровки на этом устройстве?")?;
             },
@@ -106,23 +134,23 @@ fn open_session(context: &mut Context<'_>) -> io::Result<bool> {
                 if script_tries >= 3 {
                     script_tries = 0;
                     secrets.clear();
-                    if !retry(context, "Восстановление доступа")? { return Ok(false); }
+                    if !retry(context, "Восстановление доступа")? { return Ok(Opened::Failed); }
                     continue;
                 }
                 script_tries += 1;
-                let Some(password) = context.secret("Открытие сессии", "Введите пароль")? else { return Ok(false); };
+                let Some(password) = context.secret("Открытие сессии", "Введите пароль")? else { return Ok(Opened::Failed); };
                 secrets.insert_hidden("script-password", password);
             },
             "github_format_outdated" | "github_format_newer" | "github_format_invalid" => {
-                if !github_recovery(context, &reply, &mut secrets)? { return Ok(false); }
+                if !github_recovery(context, &reply, secrets)? { return Ok(Opened::Failed); }
             },
             "locked" => {
                 secrets.clear();
-                if !retry(context, "Конфигурация занята")? { return Ok(false); }
+                if !retry(context, "Конфигурация занята")? { return Ok(Opened::Failed); }
             },
             _ => {
                 secrets.clear();
-                if !retry(context, "Не удалось открыть конфигурацию")? { return Ok(false); }
+                if !retry(context, "Не удалось открыть конфигурацию")? { return Ok(Opened::Failed); }
             },
         }
     }
@@ -212,7 +240,7 @@ impl Screen for Dashboard {
                 if retry(context, "Не удалось получить сводку")? { continue; }
                 return Ok(Navigation::Back);
             }
-            let view = dashboard_view(&reply.data, context.client.version());
+            let view = dashboard_view(&reply.data, &context.client.hello().version);
             let Some(choice) = context.choose(&view)? else { return Ok(Navigation::Back); };
             match dashboard_route(&choice) {
                 Some('0') => return Ok(Navigation::Back),
@@ -307,7 +335,8 @@ impl Screen for Settings {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::{app::{Registration, Registry, ScriptedUi}, serve::ScriptedClient};
+    use crate::app::{Registration, Registry, ScriptedUi};
+    use essence_rc_client::ScriptedClient;
     use serde_json::json;
     pub(crate) fn error(code: &str, extra: Value) -> Reply {
         let mut reply = Reply::failure(code);
@@ -336,34 +365,67 @@ pub(crate) mod tests {
     fn configured() -> (Vec<String>, Reply) { (words(&["session", "status"]), Reply::success(json!({"configured":true,"source":"github","open":false,"authorized":false}))) }
     fn open() -> Vec<String> { words(&["session", "open"]) }
     fn gate(client: &mut ScriptedClient, ui: &mut ScriptedUi, registry: &Registry) -> bool {
-        session_gate(&mut Context { client, ui, registry }).unwrap() == Gate::Open
+        session_gate(&mut Context::for_test(client, ui, registry)).unwrap() == Gate::Open
     }
 
+    fn absent() -> (Vec<String>, Reply) { (open(), error("not_configured", json!({"message":"Конфигурация не создана: source init-local или source github-connect."}))) }
     #[test] fn first_run_local_wizard_exit_and_eof() {
         let unconfigured = (words(&["session", "status"]), Reply::success(json!({"configured":false,"source":null,"open":false,"authorized":false})));
-        let mut client = ScriptedClient::new([unconfigured.clone(), (words(&["source", "init-local"]), error("conflict", json!({}))), (words(&["source", "init-local"]), Reply::success(json!({"source":"local"}))), (open(), Reply::success(json!({"source":"local"})))]);
+        let mut client = ScriptedClient::new([unconfigured.clone(), absent(), (words(&["source", "init-local"]), error("conflict", json!({}))), (words(&["source", "init-local"]), Reply::success(json!({"source":"local"}))), (open(), Reply::success(json!({"source":"local"})))]);
         let mut ui = ScriptedUi::new(&["x", "", "1", "1"]);
         assert!(gate(&mut client, &mut ui, &registry()));
         client.assert_finished();
         assert!(notice_texts(&ui).iter().filter(|n| n.contains("Неверный выбор.")).count() == 2);
+        assert!(!notice_texts(&ui).iter().any(|n| n.contains("Конфигурация не создана")), "not_configured is the first-run screen, not an error");
         assert_eq!(keys(&ui.views[0]), ["1", "2", "0"]);
         assert!(ui.views[0].sections[0][..2].iter().all(|i| i.color == ui::GREEN));
         assert_frames(&ui.views);
         fn wizard(_: &mut Context<'_>, mode: &str) -> io::Result<bool> { assert_eq!(mode, "connect"); Ok(true) }
         let with_wizard = Registry { screens: vec![], github_wizard: Some(wizard) };
-        let mut client = ScriptedClient::new([unconfigured.clone(), (open(), ok())]);
+        let mut client = ScriptedClient::new([unconfigured.clone(), absent(), (open(), ok())]);
         assert!(gate(&mut client, &mut ScriptedUi::new(&["2"]), &with_wizard));
         client.assert_finished();
         // v1 rc: «Выход» is a normal quit, EOF a failed start.
         for (inputs, expected) in [(&["0"][..], Gate::Quit), (&[][..], Gate::Failed)] {
-            let mut client = ScriptedClient::new([unconfigured.clone()]);
+            let mut client = ScriptedClient::new([unconfigured.clone(), absent()]);
             let mut ui = ScriptedUi::new(inputs);
-            assert_eq!(session_gate(&mut Context { client: &mut client, ui: &mut ui, registry: &registry() }).unwrap(), expected);
+            assert_eq!(session_gate(&mut Context::for_test(&mut client, &mut ui, &registry())).unwrap(), expected);
             client.assert_finished();
         }
         let mut client = ScriptedClient::new([(words(&["session", "status"]), error("failed", json!({})))]);
         let mut ui = ScriptedUi::new(&[]);
-        assert_eq!(session_gate(&mut Context { client: &mut client, ui: &mut ui, registry: &registry() }).unwrap(), Gate::Failed);
+        assert_eq!(session_gate(&mut Context::for_test(&mut client, &mut ui, &registry())).unwrap(), Gate::Failed);
+        // Still `not_configured` after a successful first run: an explicit failure.
+        let unconfigured = (words(&["session", "status"]), Reply::success(json!({"configured":false})));
+        let mut client = ScriptedClient::new([unconfigured, absent(), (words(&["source", "init-local"]), Reply::success(json!({"source":"local"}))), absent()]);
+        let mut ui = ScriptedUi::new(&["1"]);
+        assert_eq!(session_gate(&mut Context::for_test(&mut client, &mut ui, &registry())).unwrap(), Gate::Failed);
+        client.assert_finished();
+        let texts = notice_texts(&ui);
+        assert!(texts.iter().any(|n| n.contains("Конфигурация не создана")), "{texts:?}");
+        assert!(texts.iter().any(|n| n.contains("Операция завершилась ошибкой")), "{texts:?}");
+    }
+    /// The daemon checks the script password before the first run: the
+    /// password is asked like for an existing configuration.
+    #[test] fn first_run_asks_the_script_password_before_the_wizard() {
+        let unconfigured = (words(&["session", "status"]), Reply::success(json!({"configured":false,"source":null,"open":false,"authorized":false})));
+        let mut client = ScriptedClient::new([unconfigured, (open(), error("auth_required", json!({"secret":"script-password"}))),
+            (open(), error("auth_failed", json!({"secret":"script-password","message":"Неверный пароль запуска."}))), absent(),
+            (words(&["source", "init-local"]), Reply::success(json!({"source":"local"}))), (open(), ok())]);
+        let mut ui = ScriptedUi::new(&["bad", "good", "1"]);
+        assert!(gate(&mut client, &mut ui, &registry()));
+        client.assert_finished();
+        assert_eq!(client.secret_names[2], ["script-password"]);
+        assert_eq!(client.secret_names[3], ["script-password"]);
+        assert_eq!(client.secret_names[5], ["script-password"], "the open after the first run reuses the password");
+        assert_eq!(ui.views.iter().filter(|v| v.prompt == "Введите пароль: ").count(), 2, "asked only before the first run");
+        assert!(ui.inputs.is_empty());
+        assert!(!format!("{:?}{:?}", ui.views, client.calls).contains("good"));
+        // EOF at the password prompt fails the start without the first-run screen.
+        let unconfigured = (words(&["session", "status"]), Reply::success(json!({"configured":false})));
+        let mut client = ScriptedClient::new([unconfigured, (open(), error("auth_required", json!({})))]);
+        assert!(!gate(&mut client, &mut ScriptedUi::new(&[]), &registry()));
+        client.assert_finished();
     }
     #[test] fn vault_password_and_remember_key_accumulate_until_open() {
         let mut client = ScriptedClient::new([configured(), (open(), error("vault_password_required", json!({"secret":"vault-password"}))),
@@ -487,20 +549,25 @@ pub(crate) mod tests {
         let status = (words(&["status"]), Reply::success(status_data()));
         let mut client = ScriptedClient::new([(words(&["status"]), error("failed", json!({}))), status.clone(), status.clone(), status.clone()]);
         let mut ui = ScriptedUi::new(&["1", "", "z", "I"]);
-        assert!(matches!(Dashboard.run(&mut Context { client: &mut client, ui: &mut ui, registry: &registry }).unwrap(), Navigation::Push(_)));
+        assert!(matches!(Dashboard.run(&mut Context::for_test(&mut client, &mut ui, &registry)).unwrap(), Navigation::Push(_)));
         client.assert_finished();
         assert_eq!(ui.notices.iter().filter(|n| n.to_string().contains("Неверный выбор.")).count(), 2);
         let mut client = ScriptedClient::new([(words(&["status"]), error("failed", json!({})))]);
-        assert!(matches!(Dashboard.run(&mut Context { client: &mut client, ui: &mut ScriptedUi::new(&["0"]), registry: &registry }).unwrap(), Navigation::Back));
+        assert!(matches!(Dashboard.run(&mut Context::for_test(&mut client, &mut ScriptedUi::new(&["0"]), &registry)).unwrap(), Navigation::Back));
         let mut client = ScriptedClient::new([status]);
-        assert!(matches!(Dashboard.run(&mut Context { client: &mut client, ui: &mut ScriptedUi::new(&[]), registry: &registry }).unwrap(), Navigation::Back));
+        assert!(matches!(Dashboard.run(&mut Context::for_test(&mut client, &mut ScriptedUi::new(&[]), &registry)).unwrap(), Navigation::Back));
+        // Without `version` in `status` the header shows the daemon's `hello` version.
+        let mut client = ScriptedClient::new([(words(&["status"]), Reply::success(json!({})))]);
+        let mut ui = ScriptedUi::new(&[]);
+        Dashboard.run(&mut Context::for_test(&mut client, &mut ui, &registry)).unwrap();
+        assert_eq!(ui.views[0].title, "Remote Control vtest");
     }
     fn version(available: bool) -> (Vec<String>, Reply) {
         (words(&["self", "version"]), Reply::success(json!({"current":"1.1.0","latest":if available {json!("v1.2.0")} else {Value::Null},"update_available":available,"checked":available})))
     }
     fn status(password: bool) -> (Vec<String>, Reply) { (words(&["status"]), Reply::success(json!({"script_password":password}))) }
     fn settings(client: &mut ScriptedClient, ui: &mut ScriptedUi) -> Navigation {
-        Settings.run(&mut Context { client, ui, registry: &registry() }).unwrap()
+        Settings.run(&mut Context::for_test(client, ui, &registry())).unwrap()
     }
     #[test] fn settings_password_set_and_remove_send_secrets_only() {
         let set = words(&["self", "password-set"]);

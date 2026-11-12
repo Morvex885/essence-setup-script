@@ -1,13 +1,14 @@
 //! Node, SSH, connection, AmneziaWG and Telegram screens (v1 `tui/nodes.sh`)
-//! over serve v2 only.
+//! over the daemon protocol only.
 //!
 //! Lists keep their own menu section; dangerous actions consume the core's
 //! frozen plan through `confirm`. Terminal commands (`node shell`,
-//! `telegram menu`) run inside the serve child while the UI is suspended; they
+//! `telegram menu`) are terminal requests while the UI is suspended; they
 //! never upload scripts themselves — stale scripts become an explicit offer.
 use std::io;
 use serde_json::Value;
-use crate::{app::{Context, Navigation, Screen}, confirm::{self, set_flag}, serve::{argv, Reply, Secrets}, ui::{self, Item, View}};
+use essence_rc_client::{argv, Reply, Secrets};
+use crate::{app::{Context, Navigation, Screen}, confirm::{self, set_flag}, ui::{self, Item, View}};
 
 pub struct Nodes;
 pub struct Connections;
@@ -105,8 +106,8 @@ fn node_request(ctx: &mut Context<'_>, name: &str, words: &[String], review: Opt
         return Ok(reply);
     }
 }
-/// `node shell` / `telegram menu`: the serve child runs the PTY on the
-/// controlling terminal while the UI is suspended (same session, no lock).
+/// `node shell` / `telegram menu`: a terminal request; the daemon runs the
+/// remote PTY and the local console relays it while the UI is suspended.
 fn interactive(ctx: &mut Context<'_>, name: &str, telegram: bool) -> io::Result<()> {
     let words = if telegram { argv(&["telegram", "menu", "--name", name]) } else { argv(&["node", "shell", "--name", name]) };
     loop {
@@ -777,7 +778,8 @@ impl Screen for Telegram {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{app::{Registry, ScriptedUi, UserInterface}, serve::{Log, ScriptedClient}};
+    use crate::app::{Registry, ScriptedUi, UserInterface};
+    use essence_rc_client::{Log, ScriptedClient, Step};
     use serde_json::json;
 
     fn ok(data: Value) -> Reply { Reply::success(data) }
@@ -837,19 +839,19 @@ mod tests {
         assert!(parses(&argv(&["telegram", "install", "--name", "a", "--name", "b"])));
     }
 
-    /// Runs a flow over scripted serve replies; every request is v2 grammar
+    /// Runs a flow over scripted daemon replies; every request is v2 grammar
     /// and every scripted input and reply is consumed.
-    fn run<R>(steps: Vec<(Vec<String>, Reply)>, inputs: &[&str], flow: impl FnOnce(&mut Context<'_>) -> io::Result<R>) -> (R, ScriptedClient, ScriptedUi) {
+    fn run<R, S: Into<Step>>(steps: Vec<S>, inputs: &[&str], flow: impl FnOnce(&mut Context<'_>) -> io::Result<R>) -> (R, ScriptedClient, ScriptedUi) {
         let registry = Registry { screens: vec![], github_wizard: None };
         let mut client = ScriptedClient::new(steps);
         let mut ui = ScriptedUi::new(inputs);
-        let result = flow(&mut Context { client: &mut client, ui: &mut ui, registry: &registry }).unwrap();
+        let result = flow(&mut Context::for_test(&mut client, &mut ui, &registry)).unwrap();
         client.assert_finished();
         assert!(ui.inputs.is_empty(), "unused inputs: {:?}", ui.inputs);
         for call in &client.calls { assert!(parses(call), "not v2 grammar: {call:?}"); }
         (result, client, ui)
     }
-    fn screen(screen: &mut dyn Screen, inputs: &[&str], steps: Vec<(Vec<String>, Reply)>) -> (ScriptedClient, ScriptedUi) {
+    fn screen<S: Into<Step>>(screen: &mut dyn Screen, inputs: &[&str], steps: Vec<S>) -> (ScriptedClient, ScriptedUi) {
         let (navigation, client, ui) = run(steps, inputs, |ctx| screen.run(ctx));
         assert!(matches!(navigation, Navigation::Back));
         (client, ui)
@@ -904,7 +906,7 @@ mod tests {
         let registry = Registry { screens: vec![], github_wizard: None };
         let mut client = ScriptedClient::new([(add_words("password", ACCEPT), added(false)), step(&["node", "password", "--name", "n"], ok(json!({"name": "n"})))]);
         let mut ui = HiddenUi { script: ScriptedUi::new(&["", "192.0.2.1", "", "", "2", "pw", "tag", "pw2"]), hidden: vec![] };
-        let mut ctx = Context { client: &mut client, ui: &mut ui, registry: &registry };
+        let mut ctx = Context::for_test(&mut client, &mut ui, &registry);
         add_node(&mut ctx).unwrap();
         assert!(store_password(&mut ctx, "n").unwrap().unwrap().ok);
         client.assert_finished();
@@ -912,14 +914,14 @@ mod tests {
     }
     #[test]
     fn add_validates_ip_port_password_and_tag_and_cancels() {
-        let (_, _, ui) = run(vec![], &["", ""], add_node);
+        let (_, _, ui) = run(none(), &["", ""], add_node);
         assert!(noticed(&ui, "IP не указан"));
         let (_, _, ui) = run(vec![(add_words("password", ACCEPT), added(false))],
             &["", "192.0.2.1", "0", "70000", "x", "", "", "2", "", "pw", "", "tag"], add_node);
         assert_eq!(ui.notices.len(), 5);
         // EOF at any question sends nothing.
-        run(vec![], &["", "192.0.2.1", "", "", "1"], add_node);
-        run(vec![], &["", "192.0.2.1", "", ""], add_node);
+        run(none(), &["", "192.0.2.1", "", "", "1"], add_node);
+        run(none(), &["", "192.0.2.1", "", ""], add_node);
     }
     #[test]
     fn add_replaces_a_changed_key_only_through_its_plan() {
@@ -1050,7 +1052,7 @@ mod tests {
         // Without an explicit port, `invalid` is the core's verdict, not a port question.
         let (_, _, ui) = run(vec![(auto.clone(), Reply::failure("invalid"))], &[""], |ctx| harden(ctx, "n"));
         assert_eq!(ui.notices.len(), 1);
-        run(vec![], &[], |ctx| harden(ctx, "n"));
+        run(none(), &[], |ctx| harden(ctx, "n"));
     }
     #[test]
     fn harden_replans_at_most_twice_and_warns_about_the_console() {
@@ -1110,10 +1112,10 @@ mod tests {
     #[test]
     fn node_code_refusals_never_retry() {
         for inputs in [&[""][..], &["y", ""][..], &["y"][..]] {
-            let (resolved, _, _) = run(vec![], inputs, |ctx| handle_node_codes(ctx, &Reply::failure("missing_secret"), "n"));
+            let (resolved, _, _) = run(none(), inputs, |ctx| handle_node_codes(ctx, &Reply::failure("missing_secret"), "n"));
             assert!(!resolved);
         }
-        let (resolved, _, _) = run(vec![], &[], |ctx| handle_node_codes(ctx, &Reply::failure("host_key_changed"), "n"));
+        let (resolved, _, _) = run(none(), &[], |ctx| handle_node_codes(ctx, &Reply::failure("host_key_changed"), "n"));
         assert!(!resolved);
         let trust = argv(&["node", "trust-host-key", "--name", "n", "--host-key", "SHA256:new"]);
         let changed = err("host_key_changed", json!({"fingerprints": ["SHA256:new"]}));
@@ -1338,7 +1340,7 @@ mod tests {
         let (_, ui) = screen(&mut Telegram, &["i", "", "0"], vec![three_nodes()]);
         assert!(noticed(&ui, "Ничего не выбрано."));
         screen(&mut Telegram, &["i", "1", "0", "0"], vec![three_nodes()]);
-        screen(&mut Telegram, &["d", "0", "0"], vec![]);
+        screen(&mut Telegram, &["d", "0", "0"], none());
         let words = argv(&["telegram", "install", "--name", "n1"]);
         let (_, ui) = screen(&mut Telegram, &["i", "1", "", "n", "0"], vec![three_nodes(), (words, plan("confirmation_required", "tg"))]);
         assert!(ui.notices.is_empty());
@@ -1367,22 +1369,26 @@ mod tests {
 
     // ─── Терминальные команды ────────────────────────────────────────────────
 
+    /// `node shell` / `telegram menu` are terminal requests, never plain sends.
+    fn term(words: &[String], reply: Reply) -> Step { Step::terminal(words.to_vec(), reply) }
+    /// An empty script: no request is expected.
+    fn none() -> Vec<Step> { Vec::new() }
     #[test]
-    fn terminal_commands_run_suspended_inside_serve_both_cases() {
+    fn terminal_commands_run_suspended_as_terminal_requests_both_cases() {
         for key in ["o", "O", "t", "T"] {
             let words = if key.eq_ignore_ascii_case("t") { argv(&["telegram", "menu", "--name", "n"]) } else { argv(&["node", "shell", "--name", "n"]) };
-            let (_, ui) = screen(&mut NodeCard("n".into()), &[key, "0"], vec![show(), (words, ok(json!({}))), show()]);
+            let (_, ui) = screen(&mut NodeCard("n".into()), &[key, "0"], vec![show().into(), term(&words, ok(json!({}))), show().into()]);
             assert_eq!(ui.suspensions, 1);
             assert!(!ui.suspended_now);
         }
         for key in ["o", "O"] {
-            let (_, ui) = screen(&mut Telegram, &[key, "1", "0"], vec![three_nodes(), step(&["telegram", "menu", "--name", "n1"], ok(json!({})))]);
+            let (_, ui) = screen(&mut Telegram, &[key, "1", "0"], vec![three_nodes().into(), term(&argv(&["telegram", "menu", "--name", "n1"]), ok(json!({})))]);
             assert_eq!(ui.suspensions, 1);
         }
         let shell = argv(&["node", "shell", "--name", "n"]);
         let (_, client, ui) = run(vec![
-            (shell.clone(), err("missing_secret", json!({"name": "n", "secret": "password"}))),
-            step(&["node", "password", "--name", "n"], ok(json!({"name": "n"}))), (shell, ok(json!({}))),
+            term(&shell, err("missing_secret", json!({"name": "n", "secret": "password"}))),
+            step(&["node", "password", "--name", "n"], ok(json!({"name": "n"}))).into(), term(&shell, ok(json!({}))),
         ], &["y", "pw"], |ctx| interactive(ctx, "n", false));
         assert_eq!(ui.suspensions, 2);
         assert_eq!(client.secret_names[1], ["password"]);
@@ -1395,7 +1401,7 @@ mod tests {
         let stale = |state: &str| err("invalid", json!({"name": "n", "state": state, "message": "core says upload"}));
         let ready = ok(json!({"name": "n", "state": "ready", "version": "1.0.0"}));
         for (state, key) in [("missing", "u"), ("outdated", "U")] {
-            let (_, _, ui) = run(vec![(menu.clone(), stale(state)), step(&["node", "upload-scripts", "--name", "n"], ready.clone())],
+            let (_, _, ui) = run(vec![term(&menu, stale(state)), step(&["node", "upload-scripts", "--name", "n"], ready.clone()).into()],
                 &[key], |ctx| interactive(ctx, "n", true));
             assert_eq!(ui.suspensions, 1);
             assert!(noticed(&ui, "Скрипты загружены"));
@@ -1403,14 +1409,14 @@ mod tests {
             assert_eq!(confirms(&ui), 0);
         }
         let forced = argv(&["node", "upload-scripts", "--name", "n", "--force"]);
-        let (_, _, ui) = run(vec![(menu.clone(), stale("broken")), (forced.clone(), plan("confirmation_required", "f")), (with_yes(&forced, "f"), ready.clone())],
+        let (_, _, ui) = run(vec![term(&menu, stale("broken")), (forced.clone(), plan("confirmation_required", "f")).into(), (with_yes(&forced, "f"), ready.clone()).into()],
             &["z", "", "u", "y"], |ctx| interactive(ctx, "n", true));
         assert_eq!(confirms(&ui), 1);
         assert_eq!(ui.notices.iter().filter(|l| l.to_string().contains("Неверный выбор.")).count(), 2);
         let shell = argv(&["node", "shell", "--name", "n"]);
-        run(vec![(shell.clone(), stale("unknown")), (forced.clone(), plan("confirmation_required", "f"))], &["u", "n"], |ctx| interactive(ctx, "n", false));
-        run(vec![(shell, stale("unknown"))], &["0"], |ctx| interactive(ctx, "n", false));
-        run(vec![(menu, stale("missing"))], &[], |ctx| interactive(ctx, "n", true));
+        run(vec![term(&shell, stale("unknown")), (forced.clone(), plan("confirmation_required", "f")).into()], &["u", "n"], |ctx| interactive(ctx, "n", false));
+        run(vec![term(&shell, stale("unknown"))], &["0"], |ctx| interactive(ctx, "n", false));
+        run(vec![term(&menu, stale("missing"))], &[], |ctx| interactive(ctx, "n", true));
     }
 
     // ─── Пустые и ошибочные состояния, кадры ─────────────────────────────────
@@ -1428,7 +1434,7 @@ mod tests {
         let (_, ui) = screen(&mut NodeCard("n".into()), &[], vec![step(&["node", "show", "--name", "n"], Reply::failure("not_found"))]);
         assert!(ui.notices.is_empty() && ui.views.is_empty());
         screen(&mut AmneziaWg, &["0"], vec![step(&["node", "list"], ok(json!([])))]);
-        let (selected, _, ui) = run(vec![], &[], |ctx| ctx.toggle("empty", &[], vec![], EMPTY));
+        let (selected, _, ui) = run(none(), &[], |ctx| ctx.toggle("empty", &[], vec![], EMPTY));
         assert_eq!(selected, None);
         assert_eq!(ui.views.len(), 1);
     }
@@ -1449,13 +1455,13 @@ mod tests {
             let mut client = ScriptedClient::new(vec![show(), show()]);
             let mut ui = ScriptedUi::new(&[]);
             ui.inputs.extend([Some(key.into()), None, Some("0".into())]);
-            let navigation = NodeCard("n".into()).run(&mut Context { client: &mut client, ui: &mut ui, registry: &registry }).unwrap();
+            let navigation = NodeCard("n".into()).run(&mut Context::for_test(&mut client, &mut ui, &registry)).unwrap();
             assert!(matches!(navigation, Navigation::Back));
             client.assert_finished();
             assert!(ui.inputs.is_empty());
             let mut client = ScriptedClient::new(vec![show()]);
             let mut ui = Interrupted(ScriptedUi::new(&[key]));
-            let navigation = NodeCard("n".into()).run(&mut Context { client: &mut client, ui: &mut ui, registry: &registry }).unwrap();
+            let navigation = NodeCard("n".into()).run(&mut Context::for_test(&mut client, &mut ui, &registry)).unwrap();
             assert!(matches!(navigation, Navigation::Back));
             client.assert_finished();
         }

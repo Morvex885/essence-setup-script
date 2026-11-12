@@ -1131,7 +1131,9 @@ dependencies = [
 name = "essence-rc"
 version = "2.0.0"
 dependencies = [
+ "base64 0.22.1",
  "crossterm",
+ "essence-rc-client",
  "essence-rc-tui",
  "libc",
  "proptest",
@@ -1141,6 +1143,24 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "windows-sys 0.61.2",
+ "zeroize",
+]
+
+[[package]]
+name = "essence-rc-client"
+version = "2.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "dirs",
+ "hex",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 
@@ -1149,6 +1169,7 @@ name = "essence-rc-tui"
 version = "2.0.0"
 dependencies = [
  "crossterm",
+ "essence-rc-client",
  "ratatui",
  "serde",
  "serde_json",

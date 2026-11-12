@@ -110,10 +110,9 @@ pub fn client_config_path(paths: &StatePaths, client: &Client) -> Result<PathBuf
     Ok(generated_dir(paths).join(&client.group).join(&client.name).join("config.yaml"))
 }
 
-/// The client's rendered config when it is ready to publish: a regular file
-/// reached through real directories with at least one non-blank byte
-/// (v1 `_subscription_config_ready`). `None` when absent or blank.
-pub fn rendered_config(paths: &StatePaths, client: &Client) -> Result<Option<Vec<u8>>> {
+/// The client's generated config file: a regular file reached through real
+/// directories. `None` when absent.
+pub fn config_file(paths: &StatePaths, client: &Client) -> Result<Option<Vec<u8>>> {
     let path = client_config_path(paths, client)?;
     let mut dir = generated_dir(paths);
     for part in [client.group.as_str(), client.name.as_str()] {
@@ -131,8 +130,14 @@ pub fn rendered_config(paths: &StatePaths, client: &Client) -> Result<Option<Vec
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     }
-    let bytes = std::fs::read(&path)?;
-    Ok(has_content(&bytes).then_some(bytes))
+    Ok(Some(std::fs::read(&path)?))
+}
+
+/// The client's rendered config when it is ready to publish: `config_file`
+/// with at least one non-blank byte (v1 `_subscription_config_ready`).
+/// `None` when absent or blank.
+pub fn rendered_config(paths: &StatePaths, client: &Client) -> Result<Option<Vec<u8>>> {
+    Ok(config_file(paths, client)?.filter(|bytes| has_content(bytes)))
 }
 
 /// `[^[:space:]]` in the C locale.
