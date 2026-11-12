@@ -7,26 +7,31 @@
 - [common/](common/) — независимый серверный слой. Никогда не импортирует `setup-essence/` или код из `remote-control/`.
 - [setup-essence/](setup-essence/) — серверные скрипты; импортирует только `common/`.
 - YAML-билдеры протоколов живут **только** в [common/protocols/](common/protocols/) (`vless-tcp.sh`, `vless-xhttp.sh`, `vless-grpc.sh`, `hy2.sh`, `iptables-dnat.sh`, `uri.sh`); их Rust-порты — в `remote-control/core/src/protocols/` с golden-паритетом (`remote-control/core/tests/protocols_golden.rs`). Не дублировать билдер в модуле.
-- `remote-control/` — Cargo workspace из трёх крейтов:
-  - `remote-control/core` (`rc-core`) — всё доменное: модель состояния, блокировки, команды, SSH-эффекты (russh), GitHub-источник, билдеры протоколов. Не зависит от терминала и фронтенда.
-  - `remote-control/bin` (`essence-rc`) — единственный бинарник: clap-подобный парсер из каталога, разовый CLI, `serve` v2, запуск меню. Зависит и от `rc-core`, и от `essence-rc-tui`.
-  - `remote-control/tui` (`essence-rc-tui`) — библиотека терминального меню (ratatui). **Не зависит от `rc-core` и не импортирует его** (проверяет `remote-control/tui/tests/boundary.rs`); с ядром говорит только через дочерний `serve --inner` по JSONL v2. Это гарантия того, что любой будущий фронтенд (веб-панель) использует тот же протокол.
+- `remote-control/` — Cargo workspace из пяти крейтов:
+  - `remote-control/core` (`rc-core`) — ядро: модель состояния, блокировки, каталог команд, `dispatch`, SSH-эффекты (russh), GitHub-источник, билдеры протоколов. Не зависит от терминала и фронтенда.
+  - `remote-control/client` (`essence-rc-client`) — типы протокола v3, `Client`, `DaemonClient` (локальный сокет и WebSocket), `ScriptedClient`, точка подключения и запуск демона.
+  - `remote-control/web` (`essence-rc-web`) — HTTP/TLS/WebSocket-слушатель и вшитые ассеты веб-панели (`remote-control/web/assets`).
+  - `remote-control/tui` (`essence-rc-tui`) — библиотека экранов терминального меню (ratatui); зависит от `client`.
+  - `remote-control/bin` (`essence-rc`) — единственный бинарник: демон, разовый CLI, меню, `web *`, автозапуск. Зависит от всех крейтов.
+  - `tui`, `client` и `web` **не зависят от `rc-core`** (проверяет `remote-control/tui/tests/boundary.rs`); с ядром общаются только по протоколу v3 через демон.
 - Встроенные шаблоны конфигов — `remote-control/core/templates/*.yaml` (`include_dir!`); серверный комплект (setup-essence + common + VERSION) встраивается в `rc-core::bundle`.
 
 ## Rust-конвенции (remote-control/)
 
 - Сборка и тесты: `cd remote-control && cargo build --workspace --locked`, `cargo test --workspace --locked` (Cargo.lock не правится руками). Внешний cargo — `~/.cargo/bin/cargo`; локальные проверки — со своим `CARGO_TARGET_DIR`, чтобы не спорить с чужими сборками.
-- Ошибки — `RcError{code,message,extra,exit}` (`remote-control/core/src/error.rs`): код-литерал из каталога, `usage`/`host_key_unknown`/`plan_changed`/`*_required` → выход 2, прочее → 1 (Telegram 3/4). Сообщения на русском, имена в «кавычках-ёлочках».
+- Ошибки — `RcError{code,message,extra,exit}` (`remote-control/core/src/error.rs`): код-литерал из каталога, `usage`/`host_key_unknown`/`daemon_cert_unknown`/`plan_changed`/`*_required` → выход 2, прочее → 1 (Telegram 3/4). Сообщения на русском, имена в «кавычках-ёлочках».
 - Каталог команд один и служит парсеру, справке и справочной таблице: `remote-control/core/src/cli.rs` (`CATALOG`, `HELP`). Новая команда или флаг — только там плюс обработчик; алиасы не добавляются (`--name` — единый селектор, `subscription` вместо `sub`).
-- Диспетчер `rc_core::dispatch::dispatch(argv, secrets, &mut Session)` — единая точка разового CLI и `serve`; ровно один конверт `{"id","ok","data"|"error","sync"?}` на вызов.
+- Диспетчер `rc_core::dispatch::dispatch(argv, secrets, input, agent_socket, &mut Session)` — единая точка всех команд демона; терминальные команды — `prepare_terminal` → `TerminalJob`. Ровно один конверт `{"id","ok","data"|"error","sync"?}` на вызов.
 - Мутации состояния — только `Session::mutate(label, |state| …)` (блокировка → изменение → checkpoint/GitHub-flush). Никаких прямых записей конфигурации из обработчиков.
 - Подтверждение — `confirmation::Plan::new(lines, extra)` + `plan.confirm(invocation)`: без `--yes` → `confirmation_required{plan,plan_token}`, изменившийся план → `plan_changed`. План строится до любых мутаций и удалённых эффектов (read-only preflight допустим).
-- Секреты — только `rc_core::request_secrets::Secrets` (whitelist `password`, `current-password`, `vault-password`, `new-vault-password`, `script-password`): передаются полем `secrets` запроса serve или `--secrets-stdin`, хранятся в `Zeroizing`, не попадают в argv/env детей, журнал, `data` и extra.
+- Секреты — только `rc_core::request_secrets::Secrets` (whitelist `password`, `current-password`, `vault-password`, `new-vault-password`, `script-password`, `access-token` — только `session open`): передаются полем `secrets` запроса протокола v3 или `--secrets-stdin` разового CLI, хранятся в `Zeroizing`, не попадают в argv/env детей, журнал, `data` и extra.
+- Файлы команд — токен `@file` в каталоге: содержимое читает клиент и передаёт полем `input` (`rc_core::request_input::Input`); пути демону не передаются. Команды с флагом `CLIENT` выполняет сам клиент, с `LOCAL` — только локальные соединения.
 - SSH — только через `RemoteTransport` (`remote-control/core/src/transport.rs`); производство — `SshTransport` на russh, тесты — `FakeTransport` со скриптованными шагами и журналом.
 - Обработчик не спрашивает пользователя: нехватка решения — код `*_required` с extra (`choices`, `nodes`, отпечатки), вопрос задаёт фронтенд и повторяет команду с флагом или секретом.
-- Журнал — `session.log(Level, text)`; serve превращает записи в события `{"event":"log"}`, разовый CLI печатает их с префиксами v1. C0/C1 вырезаются.
-- UI-тексты и экраны меню — на русском, правила кадров/горячих клавиш — скилл [essence-menus](.agents/skills/essence-menus/SKILL.md); правила команд ядра — скилл [essence-commands](.agents/skills/essence-commands/SKILL.md).
-- Тесты: unit внутри модулей; процессные — `remote-control/bin/tests/` (`cli_contract`, `serve_protocol`, `github_source`, `state_process`, `tui_e2e` — PTY-сценарии настоящего бинарника); golden-протоколы — `remote-control/core/tests/protocols_golden.rs`; loopback SSH — `ssh_wire.rs`. Сетевые тесты только loopback, реальный SSH — под `E2E_SSH`.
+- Журнал — `session.log(Level, text)`; демон превращает записи в события `{"event":"log"}` запросившему соединению, разовый CLI печатает их с префиксами `[*] [✓] [!] [✗]`. C0/C1 вырезаются.
+- UI-тексты и экраны — на русском, правила кадров/горячих клавиш — скилл [essence-menus](.agents/skills/essence-menus/SKILL.md); правила экранов веб-панели — скилл [essence-web](.agents/skills/essence-web/SKILL.md); правила команд ядра — скилл [essence-commands](.agents/skills/essence-commands/SKILL.md).
+- Новое действие = команда ядра + экран в `remote-control/tui` + экран в `remote-control/web/assets/js/screens`.
+- Тесты: unit внутри модулей; процессные — `remote-control/bin/tests/` (`cli_contract`, `daemon_protocol`, `daemon_network`, `service_process`, `github_source`, `state_process`, `tui_e2e` — PTY-сценарии настоящего бинарника); клиент — `remote-control/client/src/tests.rs`, `remote-control/client/tests/listener_e2e.rs`; слушатель — `remote-control/web/tests/listener.rs`; golden-протоколы — `remote-control/core/tests/protocols_golden.rs`; loopback SSH — `ssh_wire.rs`; JS — `node --test remote-control/web/tests-js/*.test.mjs`. Сетевые тесты только loopback, реальный SSH — под `E2E_SSH`.
 
 ## Helpers Bash (серверная часть) — переиспользуй, не дублируй
 
@@ -75,6 +80,7 @@
 ## Тесты
 
 - Rust: `cd remote-control && cargo test --workspace --locked` (см. правила выше).
+- Веб-панель: `node --test remote-control/web/tests-js/*.test.mjs` (Node 22, без зависимостей).
 - Всё сразу: `bash tests/run_tests.sh --all` — серверные BATS + `cargo test --workspace --locked`. Отдельно серверная часть: `--unit` / `--fuzz` / `--ci`. При первом клоне: `git submodule update --init --recursive` (BATS подмодули в `tests/lib/`).
 
 Минимальная структура BATS-теста:
@@ -100,15 +106,14 @@ Fixtures: [tests/fixtures/sample_config.json](tests/fixtures/sample_config.json)
 
 ## Перед сдачей задачи
 
-- `bash -n <file>` для каждого изменённого `.sh` (для Claude Code — автоматически через `PostToolUse`-хук в [.claude/settings.json](.claude/settings.json)).
+- `bash -n <file>` для каждого изменённого `.sh`.
 - Релевантные тесты проходят локально (Rust — cargo, серверные — BATS).
 - Если правил `common/` — прогнать `bash tests/run_tests.sh --all`.
-- В Claude Code: `/preflight` ([.claude/commands/preflight.md](.claude/commands/preflight.md)) прогоняет чек-лист разом.
 
 ## Релиз и CI
 
-- Версия — [VERSION](VERSION) (бамп перед тегом); её читают `rc-core`, serve-hello и `self version`.
-- CI: [.github/workflows/tests.yml](.github/workflows/tests.yml) — серверные BATS + `cargo test --workspace --locked` на трёх ОС.
+- Версия — [VERSION](VERSION) (бамп перед тегом); её читают `rc-core`, hello демона и `self version`.
+- CI: [.github/workflows/tests.yml](.github/workflows/tests.yml) — серверные BATS + `cargo test --workspace --locked` на трёх ОС + JS-тесты веб-панели (job `web-js-test`).
 - Релиз: [.github/workflows/release.yml](.github/workflows/release.yml) — тест → сборка 9 целей (включая `aarch64-linux-android` для Termux) → `essence-rc-<target>.tar.gz|.zip` + `SHA256SUMS`; серверный комплект собирает `tests/ci/build_release_tarball.sh` (в архив не входят `remote-control/`).
 
 ## Что не коммитить
@@ -116,10 +121,11 @@ Fixtures: [tests/fixtures/sample_config.json](tests/fixtures/sample_config.json)
 В [.gitignore](.gitignore):
 - `remote-control/target/`, артефакты сборки.
 - `remote-control/.remote-data/` — данные прежней Bash-версии на машинах разработчиков; v2 хранит данные вне репозитория (каталог `essence-remote-control`, см. `ESSENCE_RC_DATA_DIR`).
-- `.claude/settings.local.json` — личные permission-оверрайды. Общий `.claude/settings.json` (с хуком `bash -n`) и `.claude/commands/` коммитятся.
-- `.claude/cache/` — кэш сабагента [mihomo-wiki](.claude/agents/mihomo-wiki.md), пересоздаётся автоматически.
+- `.claude/settings.local.json` — личные permission-оверрайды.
+- `.claude/cache/` — кэш сабагента [mihomo-wiki](.agents/agents/mihomo-wiki.md), пересоздаётся автоматически.
 
 ## Чувствительные данные
 
 - Пароли нод и секреты запросов — только в `Zeroizing`-структурах `rc-core` и поле `secrets`; не выводить в `info`/`warn`/журнал/`data`/extra и не передавать в argv дочерних процессов.
 - Токены подписок — печатать только по явному запросу (просмотр клиента, ротация). Не логировать массово.
+- Коды доступа и токены возобновления веб-панели существуют только в памяти демона (хранятся SHA-256); не выводить их в журнал. Ссылку с `#ticket=` печатают только `web link`, `web open` и `web run`.
