@@ -216,7 +216,8 @@ pub(crate) mod testing {
         crate::cli::parse(&argv.iter().map(|a| a.to_string()).collect::<Vec<_>>()).unwrap()
     }
 
-    /// Byte fingerprint of every file under the data directory.
+    /// Byte fingerprint of every file under the data directory; keys are
+    /// relative paths with `/` on every OS.
     pub fn fingerprint(root: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
         let mut map = std::collections::BTreeMap::new();
         let mut pending = vec![root.to_path_buf()];
@@ -224,7 +225,8 @@ pub(crate) mod testing {
             let Ok(entries) = std::fs::read_dir(&dir) else { continue };
             for entry in entries.flatten() {
                 let path = entry.path();
-                let rel = path.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+                let rel = path.strip_prefix(root).unwrap().components()
+                    .map(|part| part.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/");
                 if path.is_dir() { pending.push(path); } else { map.insert(rel, std::fs::read(&path).unwrap()); }
             }
         }
