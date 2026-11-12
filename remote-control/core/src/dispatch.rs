@@ -251,8 +251,9 @@ pub async fn dispatch(argv: &[String], secrets: &Secrets, input: &Input, agent_s
     }
 }
 
-/// Parse and whitelist: the command's own secrets and inputs only.
-fn checked(argv: &[String], secrets: &Secrets, input: &Input) -> Result<Invocation> {
+/// Parse and whitelist: the command's own secrets and inputs only. The daemon
+/// applies it to every request before routing.
+pub fn checked(argv: &[String], secrets: &Secrets, input: &Input) -> Result<Invocation> {
     let invocation = cli::parse(argv)?;
     if invocation.secrets_stdin {
         return Err(RcError::new("usage", "Секреты передаются полем secrets."));

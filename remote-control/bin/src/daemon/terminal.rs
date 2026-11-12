@@ -325,7 +325,17 @@ pub fn launch<T: RemoteTransport + Send + 'static>(shared: &Arc<Shared>, handle:
     let pressure = Pressure::new();
     // The owner left while the job was prepared: the job (and its SSH
     // connection) is dropped unanswered.
-    if conn.is_closed() || !shared.terminals.start(&reservation, cancel, pressure.clone()) {
+    if conn.is_closed() {
+        shared.terminals.release(&reservation);
+        return;
+    }
+    // The client closed the terminal (or overflowed its input) before it
+    // opened: nothing starts, the request ends like a closed terminal.
+    if input.is_closed() {
+        shared.terminals.release(&reservation);
+        return conn.fail(&id, remote_failure("closed").with_extra("name", job.node.clone()));
+    }
+    if !shared.terminals.start(&reservation, cancel, pressure.clone()) {
         shared.terminals.release(&reservation);
         return;
     }

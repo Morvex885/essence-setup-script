@@ -122,9 +122,11 @@ async fn core_loop(
     snapshot.send_replace(CoreSnapshot::of(&session));
     while let Some(job) = jobs.recv().await {
         if let Job::Shutdown { initiator } = job {
+            // Closed first: a later `enqueue` fails and its caller answers
+            // `daemon_stopping`; jobs already buffered are drained below.
+            jobs.close();
             shutdown(&shared, &mut session, initiator).await;
             snapshot.send_replace(CoreSnapshot::of(&session));
-            // A request that slipped in behind the shutdown still gets an answer.
             while let Ok(job) = jobs.try_recv() {
                 refuse(&shared, job);
             }

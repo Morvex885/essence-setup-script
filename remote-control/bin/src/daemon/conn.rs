@@ -1,7 +1,8 @@
 //! One client connection: protocol v3 messages in, events and replies out.
 //!
-//! Routing order of a request (П4): parse → `client_side` → `local_only` →
-//! `help` → connection authorization → `daemon` → `requires_tty` →
+//! Routing order of a request (П4): parse and whitelist (`dispatch::checked`)
+//! → `client_side` → `local_only` → `help` → connection authorization →
+//! `daemon` → `requires_tty` →
 //! `session open` → queued command. Only `help`, `session status`,
 //! `session open` (and, locally, `self version`, `daemon *`) work before
 //! the connection authorized itself with `session open`.
@@ -9,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -18,7 +19,7 @@ use base64::engine::general_purpose::STANDARD;
 use essence_rc_client::protocol::MAX_MESSAGE;
 use essence_rc_client::{Origin, PROTOCOL, TerminalSpec, WindowSize};
 use rc_core::cli::{self, Invocation};
-use rc_core::dispatch::Envelope;
+use rc_core::dispatch::{self, Envelope};
 use rc_core::error::RcError;
 use rc_core::log::Level;
 use rc_core::request_input::Input;
@@ -30,7 +31,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_json::value::RawValue;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{Notify, mpsc};
 use zeroize::Zeroizing;
 
 use super::core::{Job, Request, TerminalRequest};
@@ -40,8 +42,12 @@ use super::{Shared, commands, lock};
 
 /// Longest `SSH_AUTH_SOCK` path accepted in the request `env`.
 const MAX_AGENT_PATH: usize = 4096;
-/// Terminal input queued per terminal before the connection reader waits.
+/// Terminal input queued per terminal; a full queue closes the terminal
+/// instead of stalling the connection reader.
 const TERMINAL_INPUT_QUEUE: usize = 64;
+/// Bytes of events and replies queued for a client that does not read; more
+/// disconnects it (terminal output is bounded by its own credits).
+const MAX_QUEUED: usize = 4 * MAX_MESSAGE;
 
 /// A message for the connection's writer task.
 pub enum Out {
@@ -99,6 +105,10 @@ pub struct Conn {
     watch: AtomicBool,
     closed: AtomicBool,
     out: mpsc::UnboundedSender<Out>,
+    /// Bytes of uncredited lines sent to the writer and not yet written.
+    queued: AtomicUsize,
+    /// Stops the writer at once (a client that stopped reading).
+    kill: Notify,
     /// Requests of this connection not yet answered.
     in_flight: Mutex<HashSet<String>>,
     /// Console input of this connection's terminal requests.
@@ -115,6 +125,8 @@ impl Conn {
             watch: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             out,
+            queued: AtomicUsize::new(0),
+            kill: Notify::new(),
             in_flight: Mutex::default(),
             terminals: Mutex::default(),
         }
@@ -146,10 +158,20 @@ impl Conn {
         lock(&self.terminals).clear();
     }
 
+    /// Events and replies. A client that let [`MAX_QUEUED`] bytes pile up is
+    /// disconnected: nothing is dropped from a connection that stays.
     pub fn send(&self, value: &impl Serialize) {
-        if !self.is_closed() {
-            let _ = self.out.send(Out::Line(line(value), None));
+        if self.is_closed() {
+            return;
         }
+        let line = line(value);
+        let size = line.len();
+        if self.queued.fetch_add(size, Ordering::SeqCst) + size > MAX_QUEUED {
+            self.mark_closed();
+            self.kill.notify_one();
+            return;
+        }
+        let _ = self.out.send(Out::Line(line, None));
     }
 
     /// Terminal output: fails once the connection is gone.
@@ -378,10 +400,18 @@ where
     let (reader, writer) = tokio::io::split(stream);
     let origin = conn.origin;
     conn.send(&Hello { event: "hello", protocol: PROTOCOL, version: VERSION, origin, exe: &shared.exe, persistent: shared.persistent });
-    let writer = tokio::spawn(write_loop(writer, outgoing, conn.clone()));
+    let mut writer = tokio::spawn(write_loop(writer, outgoing, conn.clone()));
     let mut lines = LineReader::new(reader, MAX_MESSAGE);
-    while let Ok(Some(line)) = lines.next().await {
-        handle_line(&shared, &conn, &line).await;
+    loop {
+        tokio::select! {
+            line = lines.next() => match line {
+                Ok(Some(line)) => handle_line(&shared, &conn, &line).await,
+                _ => break,
+            },
+            // The writer stopped (write error, a client that does not read,
+            // daemon exit): the connection is over for both directions.
+            _ = &mut writer => break,
+        }
     }
     // A client that closed its side is gone: results are dropped.
     shared.disconnect(&conn);
@@ -390,10 +420,23 @@ where
 
 async fn write_loop<W: AsyncWrite>(writer: W, mut outgoing: mpsc::UnboundedReceiver<Out>, conn: Arc<Conn>) {
     tokio::pin!(writer);
-    while let Some(message) = outgoing.recv().await {
+    loop {
+        let message = tokio::select! {
+            () = conn.kill.notified() => return,
+            message = outgoing.recv() => match message {
+                Some(message) => message,
+                None => return,
+            },
+        };
         match message {
             Out::Line(line, credit) => {
-                let written = async { writer.write_all(line.as_bytes()).await?; writer.flush().await }.await;
+                let written = tokio::select! {
+                    () = conn.kill.notified() => return,
+                    written = async { writer.write_all(line.as_bytes()).await?; writer.flush().await } => written,
+                };
+                if credit.is_none() {
+                    conn.queued.fetch_sub(line.len(), Ordering::SeqCst);
+                }
                 drop(credit);
                 if written.is_err() {
                     conn.mark_closed();
@@ -421,7 +464,7 @@ pub async fn handle_line(shared: &Arc<Shared>, conn: &Arc<Conn>, line: &[u8]) {
     }
     let id = message.id.clone();
     if message.stdin.is_some() || message.resize.is_some() || message.close.is_some() {
-        return terminal_message(shared, conn, &id, message).await;
+        return terminal_message(shared, conn, &id, message);
     }
     if let Some(watch) = &message.watch
         && message.argv.is_none()
@@ -435,27 +478,42 @@ pub async fn handle_line(shared: &Arc<Shared>, conn: &Arc<Conn>, line: &[u8]) {
     request(shared, conn, id, message);
 }
 
-async fn terminal_message(shared: &Arc<Shared>, conn: &Arc<Conn>, id: &Value, message: Message<'_>) {
+fn terminal_message(shared: &Arc<Shared>, conn: &Arc<Conn>, id: &Value, message: Message<'_>) {
     let Some(input) = conn.terminal_input(id) else { return };
     if let Some(data) = message.stdin {
         let mut bytes = Zeroizing::new(Vec::new());
         if STANDARD.decode_vec(data.as_bytes(), &mut bytes).is_ok() {
-            let _ = input.send(ConsoleEvent::Input(std::mem::take(&mut *bytes))).await;
+            deliver(shared, conn, id, &input, ConsoleEvent::Input(std::mem::take(&mut *bytes)));
         }
     } else if let Some(resize) = message.resize {
         if let Ok(size) = serde_json::from_value::<WindowSize>(resize) {
-            let _ = input.send(ConsoleEvent::Resize(ConsoleSize { cols: size.cols, rows: size.rows })).await;
+            deliver(shared, conn, id, &input, ConsoleEvent::Resize(ConsoleSize { cols: size.cols, rows: size.rows }));
         }
     } else if message.close == Some(Value::Bool(true)) {
         // The remote side gets EOF first; a session that ignores it is
         // cancelled after the grace period.
-        let _ = input.send(ConsoleEvent::Closed).await;
-        let (shared, conn_id, request) = (shared.clone(), conn.id, key(id));
-        tokio::spawn(async move {
-            tokio::time::sleep(CLOSE_GRACE).await;
-            shared.terminals.cancel_request(conn_id, &request);
-        });
+        deliver(shared, conn, id, &input, ConsoleEvent::Closed);
+        close_after_grace(shared, conn, id);
     }
+}
+
+/// Never waits: the reader must stay free for `close` and new requests. A
+/// terminal whose input queue is full (not started yet, or stalled) is
+/// closed — its link goes, so the session reads EOF after the queued input.
+fn deliver(shared: &Arc<Shared>, conn: &Conn, id: &Value, input: &mpsc::Sender<ConsoleEvent>, event: ConsoleEvent) {
+    if let Err(TrySendError::Full(_)) = input.try_send(event) {
+        conn.unlink_terminal(id);
+        conn.log(id, Level::Error, "Ввод терминала не успевает обрабатываться: терминал закрыт.");
+        close_after_grace(shared, conn, id);
+    }
+}
+
+fn close_after_grace(shared: &Arc<Shared>, conn: &Conn, id: &Value) {
+    let (shared, conn_id, request) = (shared.clone(), conn.id, key(id));
+    tokio::spawn(async move {
+        tokio::time::sleep(CLOSE_GRACE).await;
+        shared.terminals.cancel_request(conn_id, &request);
+    });
 }
 
 fn request(shared: &Arc<Shared>, conn: &Arc<Conn>, id: Value, message: Message<'_>) {
@@ -477,7 +535,9 @@ fn request(shared: &Arc<Shared>, conn: &Arc<Conn>, id: Value, message: Message<'
     };
     let Ok(agent) = parse_env(message.env.as_ref(), conn.origin) else { return conn.fail(&id, invalid_request()) };
     let Ok(pty) = parse_terminal(message.terminal.as_ref()) else { return conn.fail(&id, invalid_request()) };
-    let invocation = match cli::parse(&argv) {
+    // The same parse and whitelist as the core: transport flags, foreign
+    // secrets and inputs never reach a route, `daemon *` included.
+    let invocation = match dispatch::checked(&argv, &secrets, &input) {
         Ok(invocation) => invocation,
         Err(error) => return conn.fail(&id, error),
     };
@@ -671,5 +731,107 @@ mod tests {
         conn.mark_closed();
         conn.log(&Value::Null, Level::Info, "x");
         assert!(lines.try_recv().is_err());
+    }
+
+    fn shared() -> Arc<Shared> {
+        let jobs = mpsc::unbounded_channel().0;
+        let snapshot = tokio::sync::watch::channel(super::super::core::CoreSnapshot::default()).1;
+        Arc::new(Shared::new(false, PathBuf::from("/bin/essence-rc"), jobs, snapshot))
+    }
+
+    /// Reads nothing, accepts no writes.
+    struct BrokenPipe;
+
+    impl AsyncRead for BrokenPipe {
+        fn poll_read(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>, _: &mut tokio::io::ReadBuf<'_>)
+            -> std::task::Poll<io::Result<()>>
+        {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for BrokenPipe {
+        fn poll_write(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>, _: &[u8]) -> std::task::Poll<io::Result<usize>> {
+            std::task::Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
+        }
+        fn poll_flush(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    async fn served(shared: &Arc<Shared>, task: tokio::task::JoinHandle<()>) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), task).await.expect("the connection ends").unwrap();
+        assert!(shared.connections().is_empty(), "the connection is unregistered");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_write_ends_the_reader_too() {
+        let shared = shared();
+        let (out, outgoing) = mpsc::unbounded_channel();
+        let conn = shared.register(Origin::Local, out);
+        let task = tokio::spawn(serve(shared.clone(), conn.clone(), outgoing, BrokenPipe));
+        served(&shared, task).await;
+        assert!(conn.is_closed());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_watcher_that_stops_reading_is_disconnected_not_buffered() {
+        let shared = shared();
+        let (out, outgoing) = mpsc::unbounded_channel();
+        let conn = shared.register(Origin::Local, out);
+        let (_client, server) = tokio::io::duplex(1024);
+        let task = tokio::spawn(serve(shared.clone(), conn.clone(), outgoing, server));
+        conn.watch.store(true, Ordering::SeqCst);
+        let text = "x".repeat(1 << 20);
+        for _ in 0..(MAX_QUEUED >> 20) + 2 {
+            shared.activity(&serde_json::json!({"event": "activity", "state": "log", "level": "info", "text": text}));
+        }
+        assert!(conn.is_closed(), "the queue limit closes the connection");
+        assert!(conn.queued.load(Ordering::SeqCst) <= MAX_QUEUED + text.len() + 128);
+        served(&shared, task).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_full_terminal_input_closes_the_terminal_without_blocking_the_reader() {
+        let shared = shared();
+        let (out, mut lines) = mpsc::unbounded_channel();
+        let conn = shared.register(Origin::Local, out);
+        let id = serde_json::json!("t");
+        let (input, mut receiver) = mpsc::channel(TERMINAL_INPUT_QUEUE);
+        conn.link_terminal(&id, input);
+        let message = format!(r#"{{"id":"t","stdin":"{}"}}"#, STANDARD.encode("k"));
+        for _ in 0..=TERMINAL_INPUT_QUEUE {
+            tokio::time::timeout(std::time::Duration::from_secs(1), handle_line(&shared, &conn, message.as_bytes()))
+                .await.expect("the reader never waits for the terminal");
+        }
+        assert!(conn.terminal_input(&id).is_none(), "the overflowing terminal is unlinked");
+        let Ok(Out::Line(text, None)) = lines.try_recv() else { panic!("the requester learns why") };
+        assert!(text.contains(r#""level":"error""#) && text.contains("терминал закрыт"), "{}", text.as_str());
+        let mut queued = 0;
+        while let Some(event) = receiver.recv().await {
+            assert!(matches!(event, ConsoleEvent::Input(_)));
+            queued += 1;
+        }
+        assert_eq!(queued, TERMINAL_INPUT_QUEUE, "queued input is kept, then the session reads EOF");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn daemon_commands_get_the_core_whitelist() {
+        let shared = shared();
+        let (out, mut lines) = mpsc::unbounded_channel();
+        let conn = shared.register(Origin::Local, out);
+        for message in [r#"{"id":1,"argv":["daemon","stop","--secrets-stdin"]}"#,
+            r#"{"id":2,"argv":["daemon","stop"],"secrets":{"password":"x"}}"#,
+            r#"{"id":3,"argv":["daemon","status"],"input":{"file":"x"}}"#]
+        {
+            handle_line(&shared, &conn, message.as_bytes()).await;
+            let Ok(Out::Line(text, None)) = lines.try_recv() else { panic!("one reply") };
+            let reply: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!((reply["ok"].as_bool(), reply["error"]["code"].as_str()), (Some(false), Some("usage")), "{message}");
+        }
+        assert!(!shared.is_stopping(), "a rejected stop stops nothing");
     }
 }

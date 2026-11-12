@@ -466,4 +466,24 @@ mod tests {
         assert!(local::idle_expired(now, Some(now), shared.ever_connected.load(Ordering::SeqCst), shared.started, &policy),
             "the on-demand daemon exits on idle");
     }
+
+    /// A terminal whose input was closed while it waited for the core (the
+    /// client closed it, or overflowed its input) never starts and answers.
+    #[test]
+    fn a_terminal_closed_before_it_opened_does_not_start() {
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let (shared, _jobs) = shared();
+        let (out, mut lines) = mpsc::unbounded_channel();
+        let conn = shared.register(Origin::Local, out);
+        let id = serde_json::json!("term-n1");
+        let reservation = shared.terminals.reserve("n1", conn.id, &id.to_string()).expect("free node");
+        let receiver = mpsc::channel(4).1;
+        let job = rc_core::terminal::TerminalJob::for_test("n1".into(), "menu".into(), "failed".into(), "done", Endless);
+        let pty = rc_core::transport::PtyRequest { term: "xterm".into(), size: rc_core::transport::ConsoleSize { cols: 80, rows: 24 } };
+        terminal::launch(&shared, runtime.handle(), conn.clone(), id, job, core::TerminalRequest { pty, reservation: Some(reservation), input: receiver });
+        assert!(shared.terminals.is_empty(), "the node is free again");
+        let Ok(Out::Line(text, None)) = lines.try_recv() else { panic!("the request is answered") };
+        assert!(text.contains(r#""ok":false"#) && text.contains(r#""reason":"closed""#), "{}", text.as_str());
+        assert!(lines.try_recv().is_err(), "no terminal opened");
+    }
 }

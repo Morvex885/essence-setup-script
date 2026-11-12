@@ -14,7 +14,8 @@ pub struct Endpoint {
     /// Absolute data directory the daemon serves (`ESSENCE_RC_DATA_DIR` of a spawned daemon).
     pub data_dir: PathBuf,
     pub runtime_dir: PathBuf,
-    /// `h`: first 16 hex digits of SHA-256 of `<data dir>\n<runtime dir>`.
+    /// `h`: first 16 hex digits of SHA-256 of `<data dir>\n<runtime dir>`
+    /// (raw path bytes; the data directory with its symlinks resolved).
     pub id: String,
     /// Unix socket `<runtime>/<h>.sock`.
     pub socket: PathBuf,
@@ -67,11 +68,35 @@ fn default_runtime_dir() -> io::Result<PathBuf> {
     Ok(dirs::data_local_dir().ok_or_else(no_home)?.join("essence-rc").join("run"))
 }
 
+/// The data directory with the symlinks of its longest existing ancestor
+/// resolved and the missing tail appended: every spelling of one directory
+/// names one daemon. Creates nothing.
+fn resolved(path: &Path) -> PathBuf {
+    let mut tail = Vec::new();
+    let mut current = path;
+    loop {
+        if let Ok(real) = std::fs::canonicalize(current) {
+            return tail.iter().rev().fold(real, |path, name| path.join(name));
+        }
+        match (current.parent(), current.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name.to_owned());
+                current = parent;
+            }
+            _ => return path.to_owned(),
+        }
+    }
+}
+
 /// Pure: the endpoint of `data_dir` inside `runtime_dir` (no environment).
 pub fn endpoint_in(runtime_dir: &Path, data_dir: &Path) -> io::Result<Endpoint> {
     if !runtime_dir.is_absolute() { return Err(invalid("ESSENCE_RC_RUNTIME_DIR должен быть абсолютным путём.")); }
     let data_dir = std::path::absolute(data_dir)?;
-    let digest = Sha256::digest(format!("{}\n{}", data_dir.to_string_lossy(), runtime_dir.to_string_lossy()));
+    let mut hasher = Sha256::new();
+    hasher.update(resolved(&data_dir).as_os_str().as_encoded_bytes());
+    hasher.update(b"\n");
+    hasher.update(runtime_dir.as_os_str().as_encoded_bytes());
+    let digest = hasher.finalize();
     let id = hex::encode(&digest[..8]);
     let socket = runtime_dir.join(format!("{id}.sock"));
     #[cfg(unix)]
@@ -147,7 +172,7 @@ mod tests {
         assert_eq!(first, endpoint_in(runtime.path(), &data).unwrap());
         assert_eq!(first.id.len(), 16);
         assert!(first.id.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()), "{}", first.id);
-        let expected = Sha256::digest(format!("{}\n{}", data.to_string_lossy(), runtime.path().to_string_lossy()));
+        let expected = Sha256::digest([resolved(&data).as_os_str().as_encoded_bytes(), b"\n", runtime.path().as_os_str().as_encoded_bytes()].concat());
         assert_eq!(first.id, hex::encode(&expected[..8]));
         assert_eq!(first.socket, runtime.path().join(format!("{}.sock", first.id)));
         assert_eq!(first.lock, runtime.path().join(format!("{}.lock", first.id)));
@@ -156,6 +181,33 @@ mod tests {
         assert_eq!(first.data_dir, data);
         assert_ne!(first.id, endpoint_in(&other, &data).unwrap().id, "the runtime directory isolates endpoints");
         assert_ne!(first.id, endpoint_in(runtime.path(), &other).unwrap().id);
+    }
+
+    /// The id of a UTF-8 path is the digest of its text, as before.
+    #[cfg(unix)]
+    #[test]
+    fn utf8_paths_keep_the_textual_id() {
+        let id = endpoint_in(Path::new("/run/rc"), Path::new("/nonexistent-rc/дата")).unwrap().id;
+        assert_eq!(id, hex::encode(&Sha256::digest("/nonexistent-rc/дата\n/run/rc")[..8]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_and_non_utf8_spellings_name_their_directory() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let runtime = runtime();
+        let real = runtime.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = runtime.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let id = |data: &Path| endpoint_in(runtime.path(), data).unwrap().id;
+        assert_eq!(id(&link), id(&real), "a link names the directory it points to");
+        assert_eq!(id(&link.join("absent/data")), id(&real.join("absent/data")), "a missing tail is appended");
+        assert!(!real.join("absent").exists(), "nothing is created");
+        assert_eq!(endpoint_in(runtime.path(), &link).unwrap().data_dir, link, "the daemon gets the path as given");
+        let lossy = |byte: u8| id(&runtime.path().join(OsStr::from_bytes(&[b'd', byte])));
+        assert_ne!(lossy(0xff), lossy(0xfe), "non-UTF-8 bytes are not merged");
     }
 
     #[test]
