@@ -36,7 +36,8 @@ description: "Правила веб-панели essence-rc (remote-control/web)
 - **Кнопки** — `Action` с тоном `view|create|change|danger` (те же значения, что цвета клавиш в меню: CYAN/GREEN/YELLOW/RED). `useBusy` блокирует кнопки экрана на время запроса.
 - **Терминал** — `ctx.terminal(argv, title)` (`node shell`, `telegram menu`).
 - **Файлы** — чтение `FileText` (`readInputFile` из `format.js`: не больше 1 МиБ, строго UTF-8, иначе `onText(null, причина)` — экран показывает причину или «Файл недоступен или не в UTF-8.»; содержимое уходит полем `input`), сохранение `downloadText` / `Download`; путей на машине пользователя панель не знает.
-- **Навигация** — `ctx.navigate(name, param)`; исчезнувший объект (`not_found` или нет строки в списке) возвращает к списку раздела.
+- **Навигация** — `ctx.navigate(name, param)`; исчезнувший объект (`not_found` или нет строки в списке) возвращает к списку раздела. Переход по ответу асинхронного запроса — только пока экран смонтирован (`useMounted` из `screens/kit.js`), иначе поздний ответ уведёт из раздела, выбранного пользователем.
+- **Фокус** — модальные слои (диалоги, терминал) используют `useModalFocus` из `ui.js`: фокус внутрь при открытии, Tab не выходит из слоя, при закрытии фокус возвращается.
 - Тексты — на русском; обработчики навешиваются компонентами, не inline-атрибутами разметки.
 
 ## Секреты и вход
@@ -48,8 +49,8 @@ description: "Правила веб-панели essence-rc (remote-control/web)
 ## Вендор и сборка
 
 - Сборки и npm нет: `package.json` — только `{"private":true,"type":"module"}` для `node --test`. Зависимости не добавляются.
-- Файлы `assets/vendor` не правятся. Обновление — новая загрузка с записью версии, источника и SHA-256 в `assets/vendor/VENDOR.md`.
-- CSP слушателя (`SECURITY_HEADERS` в `web/src/lib.rs`) — `default-src 'self'`, без внешних источников и inline-скриптов: никаких CDN, inline-`<script>`, `eval` и `new Function`. Стили inline допустимы (`style-src 'self' 'unsafe-inline'`), картинки — `self` и `data:`.
+- Файлы `assets/vendor` не правятся. Обновление — новая загрузка с записью версии, источника и SHA-256 в `assets/vendor/VENDOR.md`. Текст лицензии каждой библиотеки лежит рядом (`assets/vendor/LICENSE-*`) и вшивается вместе с ассетами; новая библиотека добавляется с ним.
+- CSP слушателя (`CSP_HEAD`/`CSP_TAIL` и `content_security_policy` в `web/src/lib.rs`) — `default-src 'self'`, `connect-src` — `'self'` и точный `ws(s)://` адрес из проверенного `Host`, без внешних источников и inline-скриптов: никаких CDN, inline-`<script>`, `eval` и `new Function`. Стили inline допустимы (`style-src 'self' 'unsafe-inline'`), картинки — `self` и `data:`.
 - Ассеты вшиваются в бинарник (`include_dir!`); отдаются только расширения из `content_type` в `web/src/lib.rs` (html, css, js, mjs, svg, json, woff2) — новое расширение добавляется туда.
 
 ## Тесты

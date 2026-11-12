@@ -220,7 +220,7 @@ Host-key callback сравнивает SHA256-отпечаток с явным �
 
 Сертификат, флаги слушателя, `web link` и коды доступа ведёт демон (`daemon/commands.rs`, `daemon/access.rs`); `web run|open` — `bin/src/webcmd.rs` (ссылка входа открывается через временный файл-переадресацию в каталоге времени выполнения, чтобы не попасть в argv).
 
-**Фронтенд** (`web/assets/`) — Preact + htm без сборки и npm (`web/package.json` — только `{"private":true,"type":"module"}`). `index.html` подключает классические скрипты вендора `xterm.js`, `xterm-addon-fit.js`, `qrcode.js` и модуль `js/app.js`; `vendor/preact-htm.js` — ES-модуль (`html`, `render`, хуки). Вендоренные файлы не правятся; версии и SHA-256 — в `assets/vendor/VENDOR.md`.
+**Фронтенд** (`web/assets/`) — Preact + htm без сборки и npm (`web/package.json` — только `{"private":true,"type":"module"}`). `index.html` подключает классические скрипты вендора `xterm.js`, `xterm-addon-fit.js`, `qrcode.js` и модуль `js/app.js`; `vendor/preact-htm.js` — ES-модуль (`html`, `render`, хуки). Вендоренные файлы не правятся; версии и SHA-256 — в `assets/vendor/VENDOR.md`, тексты лицензий — `assets/vendor/LICENSE-*` (вшиваются, но не отдаются слушателем).
 
 | Модуль `assets/js/` | Назначение |
 |---|---|
