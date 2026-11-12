@@ -162,7 +162,11 @@ async fn core_loop(
 /// Answers a job that will not run with `daemon_stopping`.
 fn refuse(shared: &Shared, job: Job) {
     let (request, reservation) = match job {
-        Job::Command(request) | Job::SessionOpen(request, _) => (request, None),
+        Job::SessionOpen(request, Some(_)) => {
+            request.conn.finish_open();
+            (request, None)
+        }
+        Job::Command(request) | Job::SessionOpen(request, None) => (request, None),
         Job::TerminalPrep(request, terminal) => (request, terminal.reservation),
         Job::Shutdown { .. } => return,
     };
@@ -203,6 +207,9 @@ async fn run_job(shared: &Arc<Shared>, session: &mut Session, current: &Current,
     };
     if let Some(error) = refusal {
         let reservation = match &kind { Kind::Terminal(terminal) => terminal.reservation.as_ref(), _ => None };
+        if matches!(kind, Kind::SessionOpen(Some(_))) {
+            conn.finish_open();
+        }
         discard(shared, &request, reservation);
         if let Some(error) = error {
             conn.fail(&request.id, error);
@@ -266,6 +273,10 @@ async fn run_job(shared: &Arc<Shared>, session: &mut Session, current: &Current,
     let succeeded = reply.as_ref().is_some_and(|envelope| envelope.ok);
     let code = reply.as_ref().and_then(|envelope| envelope.error.as_ref()).map(|error| error.code);
     if let Some(envelope) = reply {
+        // A network `session open` frees its slot before the client can answer the reply.
+        if matches!(opened, Some(Opened { done: Some(_), .. })) {
+            conn.finish_open();
+        }
         conn.reply(&request.id, envelope);
     }
     if let Some(Opened { resumed, done: Some(done), .. }) = opened {
