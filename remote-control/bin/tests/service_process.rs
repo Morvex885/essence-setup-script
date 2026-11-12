@@ -46,20 +46,24 @@ impl Env {
         };
         let (data, runtime, config, systemd, bin) = (path("data"), path("run"), path("config"), path("systemd"), path("bin"));
         let log = root.path().join("systemctl.log");
-        // Records its arguments; fails on the verbs listed in
-        // FAKE_SYSTEMCTL_FAIL_ON (so `is-enabled`/`is-active` failing = disabled/
-        // inactive). `restart` starts the unit's ExecStart in the background,
-        // as systemd would, unless FAKE_SYSTEMCTL_NO_START is set.
+        // Records its arguments; the first call of each verb listed in
+        // FAKE_SYSTEMCTL_FAIL_ON fails, later calls succeed (so a rollback can
+        // succeed; `is-enabled`/`is-active` failing = disabled/inactive).
+        // `restart` starts the unit's ExecStart in the background, as systemd
+        // would, unless FAKE_SYSTEMCTL_NO_START is set.
         let script = format!(
             concat!(
-                "#!/bin/sh\necho \"$*\" >> '{}'\n",
-                "case \" $FAKE_SYSTEMCTL_FAIL_ON \" in *\" $2 \"*) echo \"Failed to $2 unit: boom\" >&2; exit 1;; esac\n",
+                "#!/bin/sh\necho \"$*\" >> '{log}'\n",
+                "case \" $FAKE_SYSTEMCTL_FAIL_ON \" in *\" $2 \"*)\n",
+                "  if [ ! -e '{root}/failed-'\"$2\" ]; then : > '{root}/failed-'\"$2\"; echo \"Failed to $2 unit: boom\" >&2; exit 1; fi;;\n",
+                "esac\n",
                 "if [ \"$2\" = restart ] && [ -z \"$FAKE_SYSTEMCTL_NO_START\" ]; then\n",
                 "  eval \"set -- $(sed -n 's/^ExecStart=//p' \"$XDG_CONFIG_HOME/systemd/user/$3\")\"\n",
                 "  \"$@\" </dev/null >/dev/null 2>&1 &\n",
                 "fi\nexit 0\n",
             ),
-            log.display()
+            log = log.display(),
+            root = root.path().display(),
         );
         fs::write(bin.join("systemctl"), script).unwrap();
         fs::set_permissions(bin.join("systemctl"), fs::Permissions::from_mode(0o755)).unwrap();
@@ -151,15 +155,33 @@ fn user_unit_is_installed_started_and_removed() {
 }
 
 #[test]
-fn uninstall_finds_the_unit_where_it_was_installed() {
+fn uninstall_uses_only_the_recorded_unit_under_another_environment() {
     let Some(env) = Env::installable() else { return };
     assert_eq!(env.run(&["web", "install-service", "--port", "0"], "", &env.systemd)["ok"], true);
-    // Another config home: the default unit path differs, the record does not.
-    let elsewhere = env.data.join("other-config");
-    let removed = env.run_env(&["web", "uninstall-service"], "", &env.systemd, &[("XDG_CONFIG_HOME", &elsewhere)]);
+    // Another HOME and config home: their default unit path holds a decoy,
+    // which must stay; the recorded unit is removed.
+    let (home, elsewhere) = (env.data.join("other-home"), env.data.join("other-config"));
+    let decoy = elsewhere.join("systemd/user/essence-rc-web.service");
+    fs::create_dir_all(decoy.parent().unwrap()).unwrap();
+    fs::write(&decoy, "decoy").unwrap();
+    let removed = env.run_env(&["web", "uninstall-service"], "", &env.systemd, &[("HOME", &home), ("XDG_CONFIG_HOME", &elsewhere)]);
     assert_eq!(removed["data"], serde_json::json!({"removed": true}), "{removed}");
     assert!(!env.unit().exists());
     assert!(!env.record().exists());
+    assert_eq!(fs::read_to_string(&decoy).unwrap(), "decoy", "the default location is not touched");
+}
+
+#[test]
+fn a_damaged_record_stops_uninstall_before_the_daemon_is_stopped() {
+    let Some(env) = Env::installable() else { return };
+    assert_eq!(env.run(&["web", "install-service", "--port", "0"], "", &env.systemd)["ok"], true);
+    fs::write(env.record(), "{").unwrap();
+    let failed = env.run(&["web", "uninstall-service"], "", &env.systemd);
+    assert_eq!(failed["error"]["code"], "invalid", "{failed}");
+    let endpoint = essence_rc_client::endpoint_in(&env.runtime, &env.data).unwrap();
+    assert!(std::os::unix::net::UnixStream::connect(&endpoint.socket).is_ok(), "the daemon still runs");
+    assert!(env.unit().exists());
+    assert_eq!(env.calls().len(), 3, "no systemctl call");
 }
 
 #[test]
@@ -196,6 +218,12 @@ fn failed_reinstall_restores_the_previous_unit() {
     assert_eq!(&env.calls()[3..], ["--user is-enabled essence-rc-web.service", "--user is-active essence-rc-web.service",
         "--user daemon-reload", "--user enable essence-rc-web.service", "--user restart essence-rc-web.service",
         "--user daemon-reload", "--user enable essence-rc-web.service", "--user restart essence-rc-web.service"]);
+    // The rollback restart succeeds: the previous panel answers on its port again.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::net::TcpStream::connect(("127.0.0.1", 18997)).is_err() {
+        assert!(std::time::Instant::now() < deadline, "the previous panel is not back on 18997");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 #[test]

@@ -291,7 +291,8 @@ enum Kind {
     /// Unit-файл и признак системного (root).
     Systemd { unit: PathBuf, system: bool },
     Launchd { plist: PathBuf },
-    Windows { startup: PathBuf },
+    /// Задача планировщика (`task`) и/или файл автозагрузки.
+    Windows { task: bool, startup: Option<PathBuf> },
     Unsupported,
 }
 
@@ -313,7 +314,7 @@ fn kind() -> Kind {
         let startup = std::env::var_os("APPDATA").map(|appdata| {
             PathBuf::from(appdata).join(r"Microsoft\Windows\Start Menu\Programs\Startup").join(STARTUP_FILE)
         });
-        return startup.map_or(Kind::Unsupported, |startup| Kind::Windows { startup });
+        return startup.map_or(Kind::Unsupported, |startup| Kind::Windows { task: true, startup: Some(startup) });
     }
     if cfg!(target_os = "macos") {
         return dirs::home_dir().map_or(Kind::Unsupported, |home| Kind::Launchd {
@@ -342,25 +343,29 @@ fn present(path: &Path) -> Result<bool> {
         .map_err(|error| RcError::new("failed", format!("Не удалось проверить автозапуск: {}: {error}", path.display())))
 }
 
-/// Установлен ли автозапуск: служба из записи каталога данных `data_dir`
-/// (там, где её поставили) или в стандартном месте этого процесса — unit-файл
-/// (на Linux — и без признака systemd: оставшийся unit тоже считается),
-/// plist, задача или файл автозагрузки. Ошибка — проверить не удалось (это
-/// не «не установлен»).
+/// Установлен ли автозапуск. Есть запись в каталоге данных `data_dir` —
+/// только служба из неё (там, где её поставили); нет записи — стандартное
+/// место этого процесса: unit-файл (на Linux — и без признака systemd:
+/// оставшийся unit тоже считается), plist, задача или файл автозагрузки.
+/// Ошибка — проверить не удалось (это не «не установлен»).
 pub fn installed(data_dir: &Path) -> Result<bool> {
-    if let Some(record) = read_record(data_dir)?
-        && recorded_present(&record, data_dir)?
-    {
-        return Ok(true);
+    if let Some(record) = read_record(data_dir)? {
+        return service_present(&recorded_kind(Some(record)));
     }
     #[cfg(unix)]
     if cfg!(target_os = "linux") {
         return systemd_unit().map_or(Ok(false), |(unit, _)| present(&unit));
     }
-    match kind() {
-        Kind::Systemd { unit, .. } => present(&unit),
-        Kind::Launchd { plist } => present(&plist),
-        Kind::Windows { startup } => Ok(present(&startup)? || task_exists()?),
+    service_present(&kind())
+}
+
+fn service_present(kind: &Kind) -> Result<bool> {
+    match kind {
+        Kind::Systemd { unit, .. } => present(unit),
+        Kind::Launchd { plist } => present(plist),
+        Kind::Windows { task, startup } => {
+            Ok(startup.as_deref().map(present).transpose()?.unwrap_or(false) || (*task && task_exists()?))
+        }
         Kind::Unsupported => Ok(false),
     }
 }
@@ -393,7 +398,9 @@ fn read_record(data_dir: &Path) -> Result<Option<Record>> {
     };
     let value: Value = serde_json::from_slice(&bytes).map_err(|_| damaged(&path))?;
     match (value["service"].as_str(), value["unit"].as_str()) {
-        (Some(service @ ("systemd" | "launchd" | "schtasks" | "startup")), Some(unit)) if !unit.is_empty() => {
+        (Some(service @ ("systemd" | "launchd" | "startup")), Some(unit)) | (Some(service @ "schtasks"), Some(unit @ TASK_NAME))
+            if !unit.is_empty() =>
+        {
             Ok(Some(Record { service: service.to_owned(), unit: unit.to_owned() }))
         }
         _ => Err(damaged(&path)),
@@ -415,22 +422,16 @@ fn remove_record(data_dir: &Path) -> Result<()> {
     }
 }
 
-fn recorded_present(record: &Record, data_dir: &Path) -> Result<bool> {
-    match record.service.as_str() {
-        "schtasks" => task_exists(),
-        _ => present(Path::new(&record.unit)).map_err(|error| {
-            RcError::new(error.code, format!("{} (запись: {})", error.message, record_path(data_dir).display()))
-        }),
-    }
-}
-
-/// Служба для удаления: из записи (unit-файл и plist — где их поставили),
-/// иначе стандартная для этого процесса.
+/// Служба из записи — все пути и имена такие, какими их поставили; без
+/// записи — стандартная для окружения этого процесса.
 fn recorded_kind(record: Option<Record>) -> Kind {
-    match record {
-        Some(Record { service, unit }) if service == "systemd" => Kind::Systemd { unit: PathBuf::from(unit), system: is_root() },
-        Some(Record { service, unit }) if service == "launchd" => Kind::Launchd { plist: PathBuf::from(unit) },
-        _ => kind(),
+    let Some(Record { service, unit }) = record else { return kind() };
+    match service.as_str() {
+        "systemd" => Kind::Systemd { unit: PathBuf::from(unit), system: is_root() },
+        "launchd" => Kind::Launchd { plist: PathBuf::from(unit) },
+        "startup" => Kind::Windows { task: false, startup: Some(PathBuf::from(unit)) },
+        // `read_record` пропускает только известные службы.
+        _ => Kind::Windows { task: true, startup: None },
     }
 }
 
@@ -753,7 +754,9 @@ fn install_with(launch: &Launch, kind: Kind) -> Result<Value> {
             install_file(&plist, &plist_text(launch), &steps, &rollback)?;
             Ok(json!({"service": "launchd", "unit": path, "started": true}))
         }
-        Kind::Windows { startup } => {
+        // Стандартная служба всегда с файлом автозагрузки; без него — не поддерживается.
+        Kind::Windows { startup: None, .. } => Err(not_supported()),
+        Kind::Windows { startup: Some(startup), .. } => {
             if run("schtasks", &schtasks_create(launch)).is_ok() {
                 // `/F` заменил задачу; работающий экземпляр прежней — остановить.
                 let _ = run("schtasks", &words(&["/End", "/TN", TASK_NAME]));
@@ -825,15 +828,19 @@ fn uninstall_with(kind: Kind) -> Result<bool> {
             fs::remove_file(&plist).map_err(|error| RcError::new("failed", format!("Не удалось удалить {}: {error}", plist.display())))?;
             Ok(true)
         }
-        Kind::Windows { startup } => {
+        Kind::Windows { task, startup } => {
             let mut removed = false;
-            let _ = run("schtasks", &words(&["/End", "/TN", TASK_NAME]));
             // Ошибка удаления оставшейся задачи — ошибка: задача запустит панель снова.
-            if task_exists()? {
-                run("schtasks", &words(&["/Delete", "/TN", TASK_NAME, "/F"]))?;
-                removed = true;
+            if task {
+                let _ = run("schtasks", &words(&["/End", "/TN", TASK_NAME]));
+                if task_exists()? {
+                    run("schtasks", &words(&["/Delete", "/TN", TASK_NAME, "/F"]))?;
+                    removed = true;
+                }
             }
-            if present(&startup)? {
+            if let Some(startup) = startup
+                && present(&startup)?
+            {
                 fs::remove_file(&startup)
                     .map_err(|error| RcError::new("failed", format!("Не удалось удалить {}: {error}", startup.display())))?;
                 removed = true;
@@ -852,8 +859,10 @@ pub fn uninstall(invocation: &Invocation) -> ExitCode {
         let root = StatePaths::discover()?.root().to_owned();
         let root = std::path::absolute(&root)
             .map_err(|_| RcError::new("invalid", format!("Каталог данных {} недоступен.", root.display())))?;
+        // Запись — до остановки демона: повреждённая останавливает команду без изменений.
+        let kind = recorded_kind(read_record(&root)?);
         stop_running_daemon(&endpoint(&root)?)?;
-        let removed = uninstall_with(recorded_kind(read_record(&root)?))?;
+        let removed = uninstall_with(kind)?;
         remove_record(&root)?;
         Ok(Output::success(json!({"removed": removed})))
     })();
@@ -1012,16 +1021,23 @@ mod tests {
         write_record(data.path(), &json!({"service": "systemd", "unit": unit.to_string_lossy(), "started": true})).unwrap();
         let record = read_record(data.path()).unwrap().unwrap();
         assert_eq!(record, Record { service: "systemd".into(), unit: unit.to_string_lossy().into_owned() });
-        assert!(!recorded_present(&record, data.path()).unwrap(), "the unit is gone");
+        // Only the recorded location counts: whatever this process's default is.
+        assert!(!installed(data.path()).unwrap(), "the recorded unit is gone");
         fs::create_dir_all(unit.parent().unwrap()).unwrap();
         fs::write(&unit, "").unwrap();
         assert!(installed(data.path()).unwrap(), "found whatever this process's config dir is");
         assert_eq!(recorded_kind(Some(record)), Kind::Systemd { unit, system: is_root() });
+        // Every recorded path and name is used as installed.
+        let kind = |service: &str, unit: &str| recorded_kind(Some(Record { service: service.into(), unit: unit.into() }));
+        assert_eq!(kind("launchd", "/Users/u/x.plist"), Kind::Launchd { plist: "/Users/u/x.plist".into() });
+        assert_eq!(kind("startup", r"D:\AppData\x.cmd"), Kind::Windows { task: false, startup: Some(r"D:\AppData\x.cmd".into()) });
+        assert_eq!(kind("schtasks", TASK_NAME), Kind::Windows { task: true, startup: None });
 
         remove_record(data.path()).unwrap();
         assert_eq!(read_record(data.path()).unwrap(), None);
         remove_record(data.path()).unwrap();
-        for damaged in ["{", r#"{"service":"cron","unit":"x"}"#, r#"{"service":"systemd","unit":""}"#] {
+        let damaged_records = ["{", r#"{"service":"cron","unit":"x"}"#, r#"{"service":"systemd","unit":""}"#, r#"{"service":"schtasks","unit":"other"}"#];
+        for damaged in damaged_records {
             fs::write(record_path(data.path()), damaged).unwrap();
             // Same actionable error for `self uninstall` (installed) and `web uninstall-service` (read_record).
             for error in [read_record(data.path()).unwrap_err(), installed(data.path()).unwrap_err()] {
