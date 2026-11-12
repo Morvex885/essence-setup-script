@@ -753,7 +753,8 @@ fn request(shared: &Arc<Shared>, conn: &Arc<Conn>, id: Value, message: Message<'
         Route::Command { needs_auth } if invocation.noun == "self" && invocation.verb == "uninstall" => {
             let (shared, conn, request) = (shared.clone(), conn.clone(), job(needs_auth));
             tokio::spawn(async move {
-                let installed = tokio::task::spawn_blocking(crate::service::installed).await
+                let data_dir = shared.data_dir.clone();
+                let installed = tokio::task::spawn_blocking(move || crate::service::installed(&data_dir)).await
                     .unwrap_or_else(|_| Err(RcError::new("failed", "Не удалось проверить автозапуск.")));
                 match installed {
                     Ok(false) => {}

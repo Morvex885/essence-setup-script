@@ -31,8 +31,12 @@ const STARTUP_FILE: &str = "essence-rc-web.cmd";
 const SYSTEMD_DIR: &str = "/run/systemd/system";
 /// Сколько ждать выхода остановленного демона.
 const STOP_WAIT: Duration = Duration::from_secs(30);
-/// Сколько ждать запущенную службу, чтобы узнать `web.open`.
-const STATUS_WAIT: Duration = Duration::from_secs(5);
+/// Сколько ждать, пока запущенная служба поднимет веб-панель.
+const READY_WAIT: Duration = Duration::from_secs(10);
+/// Запись об установленной службе в каталоге данных: `self uninstall` и
+/// `web uninstall-service` находят службу и при другом окружении
+/// (`XDG_CONFIG_HOME`, `HOME`), чем у установившего её процесса.
+const RECORD: &str = "web/autostart.json";
 /// Пауза между попытками `launchctl bootstrap` (после `bootout` агент
 /// выгружается асинхронно).
 const RETRY_PAUSE: Duration = Duration::from_millis(500);
@@ -338,10 +342,17 @@ fn present(path: &Path) -> Result<bool> {
         .map_err(|error| RcError::new("failed", format!("Не удалось проверить автозапуск: {}: {error}", path.display())))
 }
 
-/// Установлен ли автозапуск: unit-файл (на Linux — и без признака systemd:
-/// оставшийся unit тоже считается), plist, задача или файл автозагрузки.
-/// Ошибка — проверить не удалось (это не «не установлен»).
-pub fn installed() -> Result<bool> {
+/// Установлен ли автозапуск: служба из записи каталога данных `data_dir`
+/// (там, где её поставили) или в стандартном месте этого процесса — unit-файл
+/// (на Linux — и без признака systemd: оставшийся unit тоже считается),
+/// plist, задача или файл автозагрузки. Ошибка — проверить не удалось (это
+/// не «не установлен»).
+pub fn installed(data_dir: &Path) -> Result<bool> {
+    if let Some(record) = read_record(data_dir)?
+        && recorded_present(&record, data_dir)?
+    {
+        return Ok(true);
+    }
     #[cfg(unix)]
     if cfg!(target_os = "linux") {
         return systemd_unit().map_or(Ok(false), |(unit, _)| present(&unit));
@@ -352,6 +363,84 @@ pub fn installed() -> Result<bool> {
         Kind::Windows { startup } => Ok(present(&startup)? || task_exists()?),
         Kind::Unsupported => Ok(false),
     }
+}
+
+// ─── Запись об установке ─────────────────────────────────────────────────────
+
+/// Записанная служба: ответ `web install-service` (`service`, `unit`).
+#[derive(Debug, PartialEq, Eq)]
+struct Record {
+    service: String,
+    unit: String,
+}
+
+fn record_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(RECORD)
+}
+
+/// Без записи обе команды проверяют стандартное место службы.
+fn damaged(path: &Path) -> RcError {
+    RcError::new("invalid", format!("Файл {} повреждён: удалите его и повторите команду.", path.display()))
+}
+
+/// Запись; `None` — её нет. Повреждённая — ошибка (не «не установлено»).
+fn read_record(data_dir: &Path) -> Result<Option<Record>> {
+    let path = record_path(data_dir);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(RcError::new("failed", format!("Не удалось прочитать {}: {error}", path.display()))),
+    };
+    let value: Value = serde_json::from_slice(&bytes).map_err(|_| damaged(&path))?;
+    match (value["service"].as_str(), value["unit"].as_str()) {
+        (Some(service @ ("systemd" | "launchd" | "schtasks" | "startup")), Some(unit)) if !unit.is_empty() => {
+            Ok(Some(Record { service: service.to_owned(), unit: unit.to_owned() }))
+        }
+        _ => Err(damaged(&path)),
+    }
+}
+
+fn write_record(data_dir: &Path, installed: &Value) -> Result<()> {
+    let record = json!({"service": installed["service"], "unit": installed["unit"]});
+    write_service_file(&record_path(data_dir), &format!("{record}\n"))
+}
+
+fn remove_record(data_dir: &Path) -> Result<()> {
+    let path = record_path(data_dir);
+    match fs::remove_file(&path) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => {
+            Err(RcError::new("failed", format!("Не удалось удалить {}: {error}", path.display())))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn recorded_present(record: &Record, data_dir: &Path) -> Result<bool> {
+    match record.service.as_str() {
+        "schtasks" => task_exists(),
+        _ => present(Path::new(&record.unit)).map_err(|error| {
+            RcError::new(error.code, format!("{} (запись: {})", error.message, record_path(data_dir).display()))
+        }),
+    }
+}
+
+/// Служба для удаления: из записи (unit-файл и plist — где их поставили),
+/// иначе стандартная для этого процесса.
+fn recorded_kind(record: Option<Record>) -> Kind {
+    match record {
+        Some(Record { service, unit }) if service == "systemd" => Kind::Systemd { unit: PathBuf::from(unit), system: is_root() },
+        Some(Record { service, unit }) if service == "launchd" => Kind::Launchd { plist: PathBuf::from(unit) },
+        _ => kind(),
+    }
+}
+
+#[cfg(unix)]
+fn is_root() -> bool {
+    euid() == 0
+}
+#[cfg(not(unix))]
+fn is_root() -> bool {
+    false
 }
 
 /// Есть ли задача планировщика. Полный список задач (`/Query /FO CSV /NH`)
@@ -480,9 +569,10 @@ fn stop_running_daemon(endpoint: &Endpoint) -> Result<()> {
     }
 }
 
-/// `web.open` запущенной службы (до [`STATUS_WAIT`]); `None` — не ответила.
+/// `web status` запущенной службы, когда веб-панель поднята (до
+/// [`READY_WAIT`]); `None` — не поднялась.
 fn service_web_status(endpoint: &Endpoint) -> Option<Value> {
-    let deadline = Instant::now() + STATUS_WAIT;
+    let deadline = Instant::now() + READY_WAIT;
     loop {
         if let Ok(mut client) = DaemonClient::connect_local(endpoint, None, None, None) {
             let status = call(&mut client, &["web", "status"]);
@@ -496,6 +586,22 @@ fn service_web_status(endpoint: &Endpoint) -> Option<Value> {
         }
         std::thread::sleep(Duration::from_millis(200));
     }
+}
+
+/// Служба установлена, но панель не поднялась: файл службы остаётся
+/// (служба перезапускается сама), подсказка — где смотреть ошибку.
+fn not_started(installed: &Value) -> RcError {
+    let hint = match installed["service"].as_str() {
+        Some("systemd") => {
+            let user = if is_root() { "" } else { "--user " };
+            format!(" Журнал службы: journalctl {user}-u {UNIT_NAME}")
+        }
+        _ => String::new(),
+    };
+    RcError::new("failed", format!(
+        "Служба установлена, но веб-панель не запустилась за {} с.{hint} Удалить автозапуск: essence-rc web uninstall-service.",
+        READY_WAIT.as_secs()
+    ))
 }
 
 // ─── Установка ───────────────────────────────────────────────────────────────
@@ -601,15 +707,25 @@ fn install_with(launch: &Launch, kind: Kind) -> Result<Value> {
                 Step::once("systemctl", systemctl(system, &["enable", UNIT_NAME])),
                 Step::once("systemctl", systemctl(system, &["restart", UNIT_NAME])),
             ];
-            // Откат: прежний unit — перечитать и вернуть в работу; нового не было —
-            // выключить и перечитать.
-            let rollback = |restored: bool| {
-                if !restored {
-                    let _ = run("systemctl", &systemctl(system, &["disable", "--now", UNIT_NAME]));
+            // Состояние прежнего unit (включён, работает) — до шагов: откат
+            // возвращает именно его.
+            let previous = if present(&unit)? {
+                let state = |verb: &str| output("systemctl", &systemctl(system, &[verb, UNIT_NAME])).map(|out| out.status.success());
+                Some((state("is-enabled")?, state("is-active")?))
+            } else {
+                None
+            };
+            // Откат: прежний unit — перечитать и вернуть прежнее состояние;
+            // нового не было (или прежний не восстановлен) — выключить и перечитать.
+            let rollback = |restored: bool| match previous.filter(|_| restored) {
+                Some((enabled, active)) => {
+                    let _ = run("systemctl", &systemctl(system, &["daemon-reload"]));
+                    let _ = run("systemctl", &systemctl(system, &[if enabled { "enable" } else { "disable" }, UNIT_NAME]));
+                    let _ = run("systemctl", &systemctl(system, &[if active { "restart" } else { "stop" }, UNIT_NAME]));
                 }
-                let _ = run("systemctl", &systemctl(system, &["daemon-reload"]));
-                if restored {
-                    let _ = run("systemctl", &systemctl(system, &["restart", UNIT_NAME]));
+                None => {
+                    let _ = run("systemctl", &systemctl(system, &["disable", "--now", UNIT_NAME]));
+                    let _ = run("systemctl", &systemctl(system, &["daemon-reload"]));
                 }
             };
             install_file(&unit, &unit_text(launch, system), &steps, &rollback)?;
@@ -641,17 +757,18 @@ fn install_with(launch: &Launch, kind: Kind) -> Result<Value> {
             if run("schtasks", &schtasks_create(launch)).is_ok() {
                 // `/F` заменил задачу; работающий экземпляр прежней — остановить.
                 let _ = run("schtasks", &words(&["/End", "/TN", TASK_NAME]));
-                let started = run("schtasks", &words(&["/Run", "/TN", TASK_NAME])).is_ok();
+                // Запуск подтверждает проверка готовности панели.
+                let _ = run("schtasks", &words(&["/Run", "/TN", TASK_NAME]));
                 // Прежний запасной путь больше не нужен.
                 let _ = fs::remove_file(&startup);
-                return Ok(json!({"service": "schtasks", "unit": TASK_NAME, "started": started}));
+                return Ok(json!({"service": "schtasks", "unit": TASK_NAME, "started": true}));
             }
             // Планировщик недоступен (политика, права): папка автозагрузки;
             // прежняя задача, если осталась, удаляется, чтобы не было двух запусков.
             let _ = run("schtasks", &words(&["/Delete", "/TN", TASK_NAME, "/F"]));
             write_service_file(&startup, &startup_script(launch))?;
-            let started = Command::new(&launch.exe).args(&launch.argv("start")[1..]).output().is_ok_and(|out| out.status.success());
-            Ok(json!({"service": "startup", "unit": startup.to_string_lossy(), "started": started}))
+            let _ = Command::new(&launch.exe).args(&launch.argv("start")[1..]).output();
+            Ok(json!({"service": "startup", "unit": startup.to_string_lossy(), "started": true}))
         }
         Kind::Unsupported => Err(not_supported()),
     }
@@ -668,9 +785,15 @@ pub fn install(invocation: &Invocation) -> ExitCode {
         let endpoint = endpoint(&launch.data_dir)?;
         stop_running_daemon(&endpoint)?;
         let data = install_with(&launch, kind)?;
+        // Служба поставлена: запись — до проверки запуска, ведь файл службы
+        // остаётся и при неудачном запуске.
+        write_record(&launch.data_dir, &data)?;
+        // `started` — только после подтверждения: панель поднята (Type=simple
+        // и планировщик успех запуска не подтверждают).
+        let web = service_web_status(&endpoint).ok_or_else(|| not_started(&data))?;
         let network = invocation.value("bind").and_then(|bind| bind.parse::<std::net::IpAddr>().ok())
             .is_some_and(|ip| !ip.to_canonical().is_loopback());
-        if network && let Some(web) = service_web_status(&endpoint) {
+        if network {
             oneshot::warn_open_panel(&web);
         }
         Ok(Output::success(data))
@@ -705,10 +828,12 @@ fn uninstall_with(kind: Kind) -> Result<bool> {
         Kind::Windows { startup } => {
             let mut removed = false;
             let _ = run("schtasks", &words(&["/End", "/TN", TASK_NAME]));
-            if run("schtasks", &words(&["/Delete", "/TN", TASK_NAME, "/F"])).is_ok() {
+            // Ошибка удаления оставшейся задачи — ошибка: задача запустит панель снова.
+            if task_exists()? {
+                run("schtasks", &words(&["/Delete", "/TN", TASK_NAME, "/F"]))?;
                 removed = true;
             }
-            if startup.exists() {
+            if present(&startup)? {
                 fs::remove_file(&startup)
                     .map_err(|error| RcError::new("failed", format!("Не удалось удалить {}: {error}", startup.display())))?;
                 removed = true;
@@ -720,12 +845,17 @@ fn uninstall_with(kind: Kind) -> Result<bool> {
 }
 
 /// `web uninstall-service`: сначала остановить локальный демон, затем
-/// снять автозапуск. Службы нет → `{"removed":false}`.
+/// снять автозапуск (записанный в каталоге данных, иначе стандартный) и
+/// запись о нём. Службы нет → `{"removed":false}`.
 pub fn uninstall(invocation: &Invocation) -> ExitCode {
     let output = (|| -> Result<Output> {
         let root = StatePaths::discover()?.root().to_owned();
+        let root = std::path::absolute(&root)
+            .map_err(|_| RcError::new("invalid", format!("Каталог данных {} недоступен.", root.display())))?;
         stop_running_daemon(&endpoint(&root)?)?;
-        Ok(Output::success(json!({"removed": uninstall_with(kind())?})))
+        let removed = uninstall_with(recorded_kind(read_record(&root)?))?;
+        remove_record(&root)?;
+        Ok(Output::success(json!({"removed": removed})))
     })();
     let output = output.unwrap_or_else(Output::from_error);
     oneshot::finish(output, invocation.json, Some(invocation))
@@ -872,5 +1002,36 @@ mod tests {
         for code in [1, 5, 37, 150] {
             assert!(!bootout_not_loaded(&exited(code)), "{code}");
         }
+    }
+
+    #[test]
+    fn the_recorded_service_is_found_where_it_was_installed() {
+        let data = tempfile::tempdir().unwrap();
+        assert_eq!(read_record(data.path()).unwrap(), None);
+        let unit = data.path().join("other-config").join(UNIT_NAME);
+        write_record(data.path(), &json!({"service": "systemd", "unit": unit.to_string_lossy(), "started": true})).unwrap();
+        let record = read_record(data.path()).unwrap().unwrap();
+        assert_eq!(record, Record { service: "systemd".into(), unit: unit.to_string_lossy().into_owned() });
+        assert!(!recorded_present(&record, data.path()).unwrap(), "the unit is gone");
+        fs::create_dir_all(unit.parent().unwrap()).unwrap();
+        fs::write(&unit, "").unwrap();
+        assert!(installed(data.path()).unwrap(), "found whatever this process's config dir is");
+        assert_eq!(recorded_kind(Some(record)), Kind::Systemd { unit, system: is_root() });
+
+        remove_record(data.path()).unwrap();
+        assert_eq!(read_record(data.path()).unwrap(), None);
+        remove_record(data.path()).unwrap();
+        for damaged in ["{", r#"{"service":"cron","unit":"x"}"#, r#"{"service":"systemd","unit":""}"#] {
+            fs::write(record_path(data.path()), damaged).unwrap();
+            // Same actionable error for `self uninstall` (installed) and `web uninstall-service` (read_record).
+            for error in [read_record(data.path()).unwrap_err(), installed(data.path()).unwrap_err()] {
+                assert_eq!(error.code, "invalid", "{damaged}");
+                assert!(error.message.ends_with("повреждён: удалите его и повторите команду."), "{}", error.message);
+                assert!(!error.message.contains("uninstall-service"), "no loop: {}", error.message);
+            }
+        }
+        // Once the damaged record is deleted, the default location is checked.
+        remove_record(data.path()).unwrap();
+        assert_eq!(read_record(data.path()).unwrap(), None);
     }
 }

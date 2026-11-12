@@ -46,14 +46,28 @@ impl Env {
         };
         let (data, runtime, config, systemd, bin) = (path("data"), path("run"), path("config"), path("systemd"), path("bin"));
         let log = root.path().join("systemctl.log");
-        // Records its arguments; fails on the verb in FAKE_SYSTEMCTL_FAIL_ON.
+        // Records its arguments; fails on the verbs listed in
+        // FAKE_SYSTEMCTL_FAIL_ON (so `is-enabled`/`is-active` failing = disabled/
+        // inactive). `restart` starts the unit's ExecStart in the background,
+        // as systemd would, unless FAKE_SYSTEMCTL_NO_START is set.
         let script = format!(
-            "#!/bin/sh\necho \"$*\" >> '{}'\nif [ -n \"$FAKE_SYSTEMCTL_FAIL_ON\" ] && [ \"$2\" = \"$FAKE_SYSTEMCTL_FAIL_ON\" ]; then echo \"Failed to $2 unit: boom\" >&2; exit 1; fi\nexit 0\n",
+            concat!(
+                "#!/bin/sh\necho \"$*\" >> '{}'\n",
+                "case \" $FAKE_SYSTEMCTL_FAIL_ON \" in *\" $2 \"*) echo \"Failed to $2 unit: boom\" >&2; exit 1;; esac\n",
+                "if [ \"$2\" = restart ] && [ -z \"$FAKE_SYSTEMCTL_NO_START\" ]; then\n",
+                "  eval \"set -- $(sed -n 's/^ExecStart=//p' \"$XDG_CONFIG_HOME/systemd/user/$3\")\"\n",
+                "  \"$@\" </dev/null >/dev/null 2>&1 &\n",
+                "fi\nexit 0\n",
+            ),
             log.display()
         );
         fs::write(bin.join("systemctl"), script).unwrap();
         fs::set_permissions(bin.join("systemctl"), fs::Permissions::from_mode(0o755)).unwrap();
         Self { _root: root, data, runtime, config, systemd, bin, log }
+    }
+
+    fn record(&self) -> PathBuf {
+        self.data.join("web/autostart.json")
     }
 
     fn unit(&self) -> PathBuf {
@@ -65,20 +79,39 @@ impl Env {
     }
 
     fn run(&self, args: &[&str], fail_on: &str, systemd: &Path) -> Value {
-        let path = format!("{}:{}", self.bin.display(), std::env::var("PATH").unwrap_or_default());
-        let output = Command::new(BIN)
-            .args(args)
-            .arg("--json")
-            .env("PATH", path)
-            .env("ESSENCE_RC_DATA_DIR", &self.data)
-            .env("ESSENCE_RC_RUNTIME_DIR", &self.runtime)
-            .env("XDG_CONFIG_HOME", &self.config)
-            .env("ESSENCE_RC_SYSTEMD_DIR", systemd)
-            .env("FAKE_SYSTEMCTL_FAIL_ON", fail_on)
+        self.run_env(args, fail_on, systemd, &[])
+    }
+
+    /// `extra` overrides the environment set here.
+    fn run_env(&self, args: &[&str], fail_on: &str, systemd: &Path, extra: &[(&str, &Path)]) -> Value {
+        let output = self.command(systemd).args(args).arg("--json").env("FAKE_SYSTEMCTL_FAIL_ON", fail_on)
+            .envs(extra.iter().copied())
             .output()
             .unwrap();
         let stdout = String::from_utf8(output.stdout).unwrap();
         serde_json::from_str(stdout.trim()).unwrap_or_else(|_| panic!("stdout: {stdout}\nstderr: {}", String::from_utf8_lossy(&output.stderr)))
+    }
+
+    fn command(&self, systemd: &Path) -> Command {
+        let path = format!("{}:{}", self.bin.display(), std::env::var("PATH").unwrap_or_default());
+        let mut command = Command::new(BIN);
+        command
+            .env("PATH", path)
+            .env("ESSENCE_RC_DATA_DIR", &self.data)
+            .env("ESSENCE_RC_RUNTIME_DIR", &self.runtime)
+            .env("XDG_CONFIG_HOME", &self.config)
+            .env("ESSENCE_RC_SYSTEMD_DIR", systemd);
+        command
+    }
+}
+
+/// A daemon started by the fake `systemctl restart` does not outlive the test.
+impl Drop for Env {
+    fn drop(&mut self) {
+        let endpoint = essence_rc_client::endpoint_in(&self.runtime, &self.data).unwrap();
+        if std::os::unix::net::UnixStream::connect(&endpoint.socket).is_ok() {
+            let _ = self.command(&self.systemd).args(["daemon", "stop", "--json"]).output();
+        }
     }
 }
 
@@ -97,20 +130,47 @@ fn user_unit_is_installed_started_and_removed() {
     assert!(text.contains(&format!("Environment=\"ESSENCE_RC_RUNTIME_DIR={}\"", env.runtime.display())), "explicit runtime dir is kept: {text}");
     assert!(text.contains("WantedBy=default.target"));
     assert_eq!(env.calls(), ["--user daemon-reload", "--user enable essence-rc-web.service", "--user restart essence-rc-web.service"]);
+    let record: Value = serde_json::from_str(&fs::read_to_string(env.record()).unwrap()).unwrap();
+    assert_eq!(record, serde_json::json!({"service": "systemd", "unit": env.unit().to_string_lossy()}), "where it was installed");
 
     // Reinstall applies the new unit to the running service.
     let again = env.run(&["web", "install-service", "--port", "18998"], "", &env.systemd);
     assert_eq!(again["ok"], true, "{again}");
     assert!(fs::read_to_string(env.unit()).unwrap().contains("\"--port\" \"18998\""));
-    assert_eq!(&env.calls()[3..], ["--user daemon-reload", "--user enable essence-rc-web.service", "--user restart essence-rc-web.service"]);
+    assert_eq!(&env.calls()[3..], ["--user is-enabled essence-rc-web.service", "--user is-active essence-rc-web.service",
+        "--user daemon-reload", "--user enable essence-rc-web.service", "--user restart essence-rc-web.service"]);
 
     let removed = env.run(&["web", "uninstall-service"], "", &env.systemd);
     assert_eq!(removed["data"], serde_json::json!({"removed": true}), "{removed}");
     assert!(!env.unit().exists());
-    assert_eq!(&env.calls()[6..], ["--user disable --now essence-rc-web.service", "--user daemon-reload"]);
+    assert!(!env.record().exists());
+    assert_eq!(&env.calls()[8..], ["--user disable --now essence-rc-web.service", "--user daemon-reload"]);
 
     let again = env.run(&["web", "uninstall-service"], "", &env.systemd);
     assert_eq!(again["data"], serde_json::json!({"removed": false}));
+}
+
+#[test]
+fn uninstall_finds_the_unit_where_it_was_installed() {
+    let Some(env) = Env::installable() else { return };
+    assert_eq!(env.run(&["web", "install-service", "--port", "0"], "", &env.systemd)["ok"], true);
+    // Another config home: the default unit path differs, the record does not.
+    let elsewhere = env.data.join("other-config");
+    let removed = env.run_env(&["web", "uninstall-service"], "", &env.systemd, &[("XDG_CONFIG_HOME", &elsewhere)]);
+    assert_eq!(removed["data"], serde_json::json!({"removed": true}), "{removed}");
+    assert!(!env.unit().exists());
+    assert!(!env.record().exists());
+}
+
+#[test]
+fn a_service_whose_panel_does_not_come_up_is_reported() {
+    let Some(env) = Env::installable() else { return };
+    let no_start = env.data.join("no-start");
+    let failed = env.run_env(&["web", "install-service", "--port", "0"], "", &env.systemd, &[("FAKE_SYSTEMCTL_NO_START", &no_start)]);
+    assert_eq!(failed["error"]["code"], "failed", "{failed}");
+    let message = failed["error"]["message"].as_str().unwrap();
+    assert!(message.contains("Служба установлена, но веб-панель не запустилась") && message.contains("journalctl --user"), "{failed}");
+    assert!(env.unit().exists() && env.record().exists(), "the service stays installed");
 }
 
 #[test]
@@ -132,14 +192,27 @@ fn failed_reinstall_restores_the_previous_unit() {
     let failed = env.run(&["web", "install-service", "--port", "18996"], "restart", &env.systemd);
     assert_eq!(failed["error"]["code"], "failed", "{failed}");
     assert_eq!(fs::read_to_string(env.unit()).unwrap(), before, "the previous unit is back");
-    assert_eq!(&env.calls()[3..], ["--user daemon-reload", "--user enable essence-rc-web.service", "--user restart essence-rc-web.service",
-        "--user daemon-reload", "--user restart essence-rc-web.service"]);
+    // Enabled and active before: both are restored.
+    assert_eq!(&env.calls()[3..], ["--user is-enabled essence-rc-web.service", "--user is-active essence-rc-web.service",
+        "--user daemon-reload", "--user enable essence-rc-web.service", "--user restart essence-rc-web.service",
+        "--user daemon-reload", "--user enable essence-rc-web.service", "--user restart essence-rc-web.service"]);
+}
+
+#[test]
+fn failed_reinstall_restores_a_disabled_inactive_unit() {
+    let Some(env) = Env::installable() else { return };
+    assert_eq!(env.run(&["web", "install-service", "--port", "0"], "", &env.systemd)["ok"], true);
+    let failed = env.run(&["web", "install-service", "--port", "0", "--bind", "127.0.0.1"], "is-enabled is-active restart", &env.systemd);
+    assert_eq!(failed["error"]["code"], "failed", "{failed}");
+    assert_eq!(&env.calls()[3..], ["--user is-enabled essence-rc-web.service", "--user is-active essence-rc-web.service",
+        "--user daemon-reload", "--user enable essence-rc-web.service", "--user restart essence-rc-web.service",
+        "--user daemon-reload", "--user disable essence-rc-web.service", "--user stop essence-rc-web.service"]);
 }
 
 #[test]
 fn failing_disable_keeps_the_unit_file() {
     let Some(env) = Env::installable() else { return };
-    assert_eq!(env.run(&["web", "install-service"], "", &env.systemd)["ok"], true);
+    assert_eq!(env.run(&["web", "install-service", "--port", "0"], "", &env.systemd)["ok"], true);
     let failed = env.run(&["web", "uninstall-service"], "disable", &env.systemd);
     assert_eq!(failed["error"]["code"], "failed", "{failed}");
     assert!(env.unit().exists(), "the service may still run: its unit stays");
@@ -157,7 +230,8 @@ fn an_unreadable_previous_unit_aborts_before_writing() {
     assert_eq!(failed["error"]["code"], "failed", "{failed}");
     assert!(failed["error"]["message"].as_str().unwrap().contains("Не удалось прочитать"), "{failed}");
     assert_eq!(fs::read_to_string(env.unit()).unwrap(), before, "the previous unit is untouched");
-    assert_eq!(env.calls().len(), 3, "no systemctl call after the refusal");
+    // Only the read-only state queries ran; nothing was changed.
+    assert_eq!(&env.calls()[3..], ["--user is-enabled essence-rc-web.service", "--user is-active essence-rc-web.service"]);
 }
 
 /// A daemon at the endpoint that refuses `daemon stop`.
