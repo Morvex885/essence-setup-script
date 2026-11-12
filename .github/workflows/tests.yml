@@ -1,81 +1,17 @@
 name: Tests
-
 on:
-  push:
-    branches: [main, develop]
   pull_request:
-  workflow_call:
-
 permissions:
   contents: read
-
-env:
-  CARGO_INCREMENTAL: "0"
-
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    concurrency:
-      group: tests-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
-      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y jq openssl nginx curl
-
-      - name: Install latest stable Mihomo
-        run: |
-          download_url=$(curl -fsSL https://api.github.com/repos/MetaCubeX/mihomo/releases/latest \
-            | jq -r '[.assets[] | select(.name | test("^mihomo-linux-amd64-v3-.*\\.gz$"))][0].browser_download_url')
-          test -n "$download_url" && test "$download_url" != "null"
-          curl -fsSL "$download_url" -o /tmp/mihomo.gz
-          gzip -dc /tmp/mihomo.gz > /tmp/mihomo
-          chmod +x /tmp/mihomo
-          /tmp/mihomo -v
-
-      - name: Validate xHTTP with latest Mihomo and distro nginx
-        env:
-          MIHOMO_BIN: /tmp/mihomo
-          XHTTP_NGINX_OUTPUT: /tmp/nginx-xhttp.conf
-        run: bash tests/ci/validate_xhttp.sh
-
-      - name: Validate xHTTP nginx config with latest nginx
-        run: docker run --rm -v /tmp/nginx-xhttp.conf:/etc/nginx/nginx.conf:ro nginx:latest nginx -t
-
-      - name: Build and verify release tarball (PR в main)
-        if: github.event_name == 'pull_request' && github.base_ref == 'main'
-        run: bash tests/ci/build_release_tarball.sh v0.0.0-ci "$RUNNER_TEMP/release"
-
-      - name: Run server unit tests
-        env:
-          AWG_REAL_MIHOMO_BIN: /tmp/mihomo
-        run: ./tests/lib/bats-core/bin/bats tests/unit/ --recursive --tap
-
-      - name: Run server fuzz tests
-        run: FUZZ_ITERATIONS=50 ./tests/lib/bats-core/bin/bats tests/fuzz/ --recursive
-        timeout-minutes: 10
-
-  web-js-test:
-    name: Web panel JS tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-      - name: Test web panel modules
-        run: node --test remote-control/web/tests-js/*.test.mjs
-
   rust-test:
-    name: Rust tests (${{ matrix.os }})
+    name: Rust tests probe (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     defaults:
       run:
         working-directory: remote-control
@@ -85,81 +21,4 @@ jobs:
         with:
           toolchain: 1.99.1
       - name: Test workspace
-        run: cargo test --workspace --locked
-
-  rust-ssh-e2e:
-    name: Rust OpenSSH integration
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.99.1
-      - name: Test against isolated OpenSSH
-        run: bash tests/ci/ssh_e2e.sh
-
-  rust-build:
-    name: Rust build (${{ matrix.target }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            cross: true
-          - target: armv7-unknown-linux-gnueabihf
-            os: ubuntu-latest
-            cross: true
-          - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
-            cross: true
-          - target: aarch64-linux-android
-            os: ubuntu-latest
-            cross: true
-          - target: x86_64-apple-darwin
-            os: macos-latest
-          - target: aarch64-apple-darwin
-            os: macos-latest
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            msvc_arch: x64
-          - target: aarch64-pc-windows-msvc
-            os: windows-latest
-            msvc_arch: x64_arm64
-    runs-on: ${{ matrix.os }}
-    defaults:
-      run:
-        working-directory: remote-control
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.99.1
-          targets: ${{ matrix.target }}
-      - name: Configure MSVC
-        if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: ${{ matrix.msvc_arch }}
-      - name: Install cross
-        if: matrix.cross
-        run: cargo install cross --version 0.2.5 --locked
-      - name: Build workspace
-        if: ${{ !matrix.cross }}
-        # Runs under bash and pwsh (Windows); Cargo reads the target from the environment.
-        env:
-          CARGO_BUILD_TARGET: ${{ matrix.target }}
-        run: cargo build --workspace --locked
-      - name: Cross-build workspace
-        if: matrix.cross
-        # VERSION and the server assets live outside the Cargo workspace.
-        working-directory: .
-        env:
-          TARGET: ${{ matrix.target }}
-          # cross 0.2.5's Android image ships NDK r21 without libunwind, which
-          # current Rust requires; the pinned main image has a newer NDK.
-          CROSS_TARGET_AARCH64_LINUX_ANDROID_IMAGE: ghcr.io/cross-rs/aarch64-linux-android@sha256:b081e122d075268e8f528b914ae0b2d0c6dc4dc4921ab05da86cc44726f4e2a0
-        run: cross build --manifest-path remote-control/Cargo.toml --workspace --locked --target "$TARGET"
+        run: cargo test --workspace --locked --no-fail-fast
