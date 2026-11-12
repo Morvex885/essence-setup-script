@@ -2,11 +2,12 @@
 //!
 //! The core thread owns the `Session` (and with it the lock manager and the
 //! password store) and executes queued jobs strictly one at a time. Runtime
-//! tasks accept local connections, serve one connection each, watch for
-//! idleness and signals. Terminal jobs run on their own threads after the
-//! core thread prepared them. Every client — TUI, CLI, browser — speaks the
-//! same protocol v3 of JSON lines.
+//! tasks accept local and network connections, serve one connection each,
+//! watch for idleness and signals. Terminal jobs run on their own threads
+//! after the core thread prepared them. Every client — TUI, CLI, browser —
+//! speaks the same protocol v3 of JSON lines.
 
+mod access;
 mod commands;
 mod conn;
 mod core;
@@ -16,6 +17,7 @@ mod terminal;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -33,7 +35,8 @@ use self::terminal::Registry;
 
 /// How the daemon was started.
 pub struct Options {
-    /// `--web` (phase 2): never exits when idle.
+    /// Never exits when idle; also implied by `--web` (read from the
+    /// daemon's own arguments).
     pub persistent: bool,
 }
 
@@ -47,11 +50,46 @@ const IDLE_TICK: Duration = Duration::from_millis(100);
 /// Pending replies get this long to reach their clients before exit.
 const FLUSH_WAIT: Duration = Duration::from_secs(2);
 
+/// The running web listener as the rest of the daemon sees it.
+#[derive(Clone, Debug)]
+pub(crate) struct WebInfo {
+    pub bind: IpAddr,
+    /// The actual port (`--port 0` lets the OS choose).
+    pub port: u16,
+    pub tls: bool,
+    pub fingerprint: Option<String>,
+    /// `daemon run --web` flags that bring this listener back (restart).
+    pub flags: Vec<String>,
+}
+
+impl WebInfo {
+    pub fn loopback(&self) -> bool {
+        self.bind.is_loopback()
+    }
+
+    /// `scheme://host:port`: loopback and unspecified addresses are reached
+    /// through the loopback address of their family.
+    pub fn url(&self) -> String {
+        let scheme = if self.tls { "https" } else { "http" };
+        let host = match self.bind {
+            IpAddr::V4(address) if address.is_loopback() || address.is_unspecified() => "127.0.0.1".to_owned(),
+            IpAddr::V4(address) => address.to_string(),
+            IpAddr::V6(address) if address.is_loopback() || address.is_unspecified() => "[::1]".to_owned(),
+            IpAddr::V6(address) => format!("[{address}]"),
+        };
+        format!("{scheme}://{host}:{}", self.port)
+    }
+}
+
 /// State shared by the runtime tasks, the core thread and terminal threads.
 pub(crate) struct Shared {
+    /// `daemon run --web` (or `Options::persistent`): never idles out, and
+    /// a successful `self update` restarts the daemon.
     pub persistent: bool,
     /// Canonical path of the daemon executable (`hello`, `daemon status`, restart).
     pub exe: PathBuf,
+    /// The data directory (self-signed listener certificate).
+    pub data_dir: PathBuf,
     pub started: Instant,
     pub terminals: Registry,
     /// Published by the core thread after start and after every job.
@@ -68,6 +106,14 @@ pub(crate) struct Shared {
     stop: watch::Sender<bool>,
     /// A successful `self update` in persistent mode: exec the new binary.
     restart: AtomicBool,
+    /// The web listener; held across `web start|stop`.
+    web: tokio::sync::Mutex<Option<essence_rc_web::Listener>>,
+    web_info: Mutex<Option<WebInfo>>,
+    /// One-time codes and resume tokens of network connections.
+    pub tokens: Mutex<access::Tokens>,
+    /// Network `session open` runs under it, after the pause for the
+    /// failures in a row it counts.
+    throttle: tokio::sync::Mutex<u32>,
 }
 
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -75,10 +121,11 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Shared {
-    fn new(persistent: bool, exe: PathBuf, jobs: mpsc::UnboundedSender<Job>, snapshot: watch::Receiver<CoreSnapshot>) -> Self {
+    fn new(persistent: bool, exe: PathBuf, data_dir: PathBuf, jobs: mpsc::UnboundedSender<Job>, snapshot: watch::Receiver<CoreSnapshot>) -> Self {
         Self {
             persistent,
             exe,
+            data_dir,
             started: Instant::now(),
             terminals: Registry::default(),
             snapshot,
@@ -91,7 +138,20 @@ impl Shared {
             stopping: AtomicBool::new(false),
             stop: watch::channel(false).0,
             restart: AtomicBool::new(false),
+            web: tokio::sync::Mutex::new(None),
+            web_info: Mutex::new(None),
+            tokens: Mutex::default(),
+            throttle: tokio::sync::Mutex::new(0),
         }
+    }
+
+    pub fn web_info(&self) -> Option<WebInfo> {
+        lock(&self.web_info).clone()
+    }
+
+    /// Started persistent, or a web listener runs (until `web stop`).
+    pub fn is_persistent(&self) -> bool {
+        self.persistent || lock(&self.web_info).is_some()
     }
 
     /// A new connection with its outgoing channel.
@@ -153,9 +213,10 @@ impl Shared {
         true
     }
 
-    /// No connections, no queued or executing jobs, no terminals.
+    /// No connections, no queued or executing jobs, no terminals, no listener.
     fn is_idle(&self) -> bool {
         lock(&self.conns).is_empty() && self.pending.load(Ordering::SeqCst) == 0 && self.terminals.is_empty()
+            && lock(&self.web_info).is_none()
     }
 
     /// `activity` events go to watchers: local ones, network ones only when authorized.
@@ -168,8 +229,10 @@ impl Shared {
     }
 
     /// The script password hash changed during a job of `requester`: every
-    /// other connection loses its authorization and its terminals.
+    /// other connection loses its authorization and its terminals; every
+    /// one-time code and resume token is void.
     pub fn password_changed(&self, requester: u64) {
+        lock(&self.tokens).clear();
         let reset: Vec<u64> = self.connections().into_iter()
             .filter(|conn| conn.id != requester)
             .map(|conn| {
@@ -178,6 +241,17 @@ impl Shared {
             })
             .collect();
         self.terminals.cancel_conns(&reset);
+    }
+
+    /// Unauthorized network connections (admission limit).
+    pub fn unauthorized_network(&self) -> usize {
+        lock(&self.conns).values().filter(|conn| conn.origin == Origin::Network && !conn.is_authorized()).count()
+    }
+
+    /// The confirmation plan of `self password-remove` while a non-loopback
+    /// listener runs names the consequence.
+    pub fn open_panel_after_password_removal(&self) -> bool {
+        lock(&self.web_info).as_ref().is_some_and(|info| !info.loopback())
     }
 }
 
@@ -215,12 +289,41 @@ fn locate() -> Result<(StatePaths, Endpoint), String> {
     Ok((StatePaths::new(&endpoint.data_dir), endpoint))
 }
 
+/// `--web` and the listener flags of the daemon's own `daemon run|start` arguments.
+fn web_plan(args: &[OsString]) -> Result<Option<commands::ListenerPlan>, rc_core::error::RcError> {
+    let argv: Vec<String> = args.iter()
+        .map(|arg| arg.to_str().map(str::to_owned))
+        .collect::<Option<_>>()
+        .ok_or_else(|| rc_core::error::RcError::new("usage", "Аргументы должны быть в UTF-8."))?;
+    commands::daemon_web_plan(&rc_core::cli::parse_client(&argv)?)
+}
+
+/// The arguments of a restart: the original ones, plus `--web` and the
+/// flags of a listener started later by `web start`.
+fn restart_args(mut args: Vec<OsString>, web: Option<&WebInfo>) -> Vec<OsString> {
+    if let Some(web) = web
+        && !args.iter().any(|arg| arg == "--web")
+    {
+        args.push("--web".into());
+        args.extend(web.flags.iter().map(OsString::from));
+    }
+    args
+}
+
 pub fn run(options: Options) -> ExitCode {
     install_panic_hook();
     // Read before anything else runs: the inherited lock of a restart.
     #[cfg(unix)]
     let inherited_lock = local::take_inherited_lock();
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let web = match web_plan(&args) {
+        Ok(web) => web,
+        Err(error) => {
+            let _ = writeln!(io::stderr().lock(), "  [✗] {}", error.message);
+            return ExitCode::from(error.exit_code());
+        }
+    };
+    let persistent = options.persistent || web.is_some();
     let linger = match parse_linger(std::env::var_os(LINGER_ENV).as_deref()) {
         Ok(linger) => linger,
         Err(message) => return fail(message),
@@ -256,6 +359,18 @@ pub fn run(options: Options) -> ExitCode {
         }
         Err(error) => return fail(error),
     };
+    // The listener starts while errors still reach the starter's terminal.
+    let started = match &web {
+        Some(plan) => match runtime.block_on(commands::open_listener(plan, &endpoint.data_dir)) {
+            Ok(started) => Some(started),
+            Err(error) => {
+                #[cfg(unix)]
+                let _ = std::fs::remove_file(&endpoint.socket);
+                return fail(error.message);
+            }
+        },
+        None => None,
+    };
     if let Err(error) = local::redirect_stderr(&endpoint) {
         return fail(format!("Не удалось открыть журнал демона: {error}"));
     }
@@ -265,7 +380,7 @@ pub fn run(options: Options) -> ExitCode {
 
     let (jobs, job_receiver) = mpsc::unbounded_channel();
     let (snapshot_sender, snapshot) = watch::channel(CoreSnapshot::default());
-    let shared = Arc::new(Shared::new(options.persistent, exe, jobs, snapshot));
+    let shared = Arc::new(Shared::new(persistent, exe, endpoint.data_dir.clone(), jobs, snapshot));
     let core_thread = match core::spawn(shared.clone(), paths, job_receiver, snapshot_sender, runtime.handle().clone()) {
         Ok(thread) => thread,
         Err(error) => return fail(format!("Не удалось запустить поток ядра: {error}")),
@@ -274,7 +389,15 @@ pub fn run(options: Options) -> ExitCode {
         let _context = runtime.enter();
         local::watch_signals(&shared);
     }
-    let policy = local::IdlePolicy { persistent: options.persistent, linger, first_client: FIRST_CLIENT_WAIT, tick: IDLE_TICK };
+    if let Some(started) = started {
+        runtime.block_on(async {
+            // The open-panel warning needs the core's first snapshot.
+            let _ = shared.snapshot.clone().changed().await;
+            let mut slot = shared.web.lock().await;
+            commands::install(&shared, &mut slot, started);
+        });
+    }
+    let policy = local::IdlePolicy { persistent, linger, first_client: FIRST_CLIENT_WAIT, tick: IDLE_TICK };
     // Returns once a stop began; on Windows the result keeps one pipe
     // instance (not accepting) until the session is closed.
     let kept = runtime.block_on(local::accept_loop(shared.clone(), listener, policy));
@@ -283,6 +406,10 @@ pub fn run(options: Options) -> ExitCode {
     if core_thread.join().is_err() {
         std::process::exit(1);
     }
+    // A restart brings back a listener started by `web start` too.
+    let args = restart_args(args, shared.web_info().as_ref());
+    // Network connections close with the listener (and see their replies first).
+    runtime.block_on(commands::stop(&shared));
     for conn in shared.connections() {
         conn.close_output();
     }
@@ -336,10 +463,10 @@ mod tests {
         }
     }
 
-    fn shared() -> (Arc<Shared>, mpsc::UnboundedReceiver<Job>) {
+    pub(super) fn shared() -> (Arc<Shared>, mpsc::UnboundedReceiver<Job>) {
         let (jobs, receiver) = mpsc::unbounded_channel();
         let snapshot = watch::channel(CoreSnapshot::default()).1;
-        (Arc::new(Shared::new(false, PathBuf::from("/bin/essence-rc"), jobs, snapshot)), receiver)
+        (Arc::new(Shared::new(false, PathBuf::from("/bin/essence-rc"), std::env::temp_dir(), jobs, snapshot)), receiver)
     }
 
     #[test]
@@ -365,6 +492,63 @@ mod tests {
         assert!(!shared.is_idle());
         shared.job_done();
         assert!(shared.is_idle());
+    }
+
+    #[test]
+    fn a_running_listener_keeps_the_daemon_until_web_stop() {
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let (shared, _jobs) = shared();
+        let argv: Vec<String> = ["web", "start", "--port", "0"].map(str::to_owned).to_vec();
+        let invocation = rc_core::cli::parse(&argv).unwrap();
+        let status = runtime.block_on(commands::start(&shared, &invocation)).unwrap();
+        assert_eq!(status["enabled"], true);
+        let port = status["port"].as_u64().unwrap();
+        assert_ne!(port, 0, "the actual port");
+        assert_eq!(status["url"], format!("http://127.0.0.1:{port}"));
+        assert_eq!((status["tls"].clone(), status["open"].clone()), (Value::Bool(false), Value::Bool(false)));
+        assert!(!shared.is_idle() && shared.is_persistent(), "a listener makes the daemon persistent");
+        let again = runtime.block_on(commands::start(&shared, &invocation)).unwrap_err();
+        assert_eq!(again.code, "conflict");
+        assert_eq!(commands::status(&shared)["web"]["port"], port);
+        assert_eq!(runtime.block_on(commands::stop(&shared)), serde_json::json!({"enabled": false}));
+        assert!(shared.is_idle() && !shared.is_persistent(), "on-demand rules again");
+        assert_eq!(commands::status(&shared)["web"], Value::Null);
+    }
+
+    #[test]
+    fn a_busy_port_is_port_in_use() {
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let (shared, _jobs) = shared();
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = taken.local_addr().unwrap().port().to_string();
+        let argv: Vec<String> = ["web", "start", "--port", &port].map(str::to_owned).to_vec();
+        let error = runtime.block_on(commands::start(&shared, &rc_core::cli::parse(&argv).unwrap())).unwrap_err();
+        assert_eq!((error.code, error.extra["port"].to_string()), ("port_in_use", port));
+        assert!(shared.web_info().is_none());
+    }
+
+    #[test]
+    fn a_restart_brings_back_a_listener_started_later() {
+        let args = |list: &[&str]| list.iter().map(OsString::from).collect::<Vec<_>>();
+        let web = WebInfo { bind: "127.0.0.1".parse().unwrap(), port: 41000, tls: false, fingerprint: None,
+            flags: ["--bind", "127.0.0.1", "--port", "41000"].map(str::to_owned).to_vec() };
+        assert_eq!(restart_args(args(&["daemon", "run"]), None), args(&["daemon", "run"]));
+        assert_eq!(restart_args(args(&["daemon", "run"]), Some(&web)),
+            args(&["daemon", "run", "--web", "--bind", "127.0.0.1", "--port", "41000"]));
+        // Started with --web: its own flags stay.
+        assert_eq!(restart_args(args(&["daemon", "run", "--web", "--port", "0"]), Some(&web)),
+            args(&["daemon", "run", "--web", "--port", "0"]));
+    }
+
+    #[test]
+    fn a_password_change_voids_codes_and_resume_tokens() {
+        let (shared, _jobs) = shared();
+        let now = Instant::now();
+        let code = lock(&shared.tokens).issue_ticket(now);
+        let resume = lock(&shared.tokens).issue_resume(now);
+        shared.password_changed(0);
+        assert_eq!(lock(&shared.tokens).check(&code, now), access::Token::Invalid);
+        assert_eq!(lock(&shared.tokens).check(&resume, now), access::Token::Invalid);
     }
 
     #[test]

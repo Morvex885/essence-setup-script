@@ -170,6 +170,48 @@ impl Raw {
         }
     }
 
+    /// A plain WebSocket connection to a daemon's web listener
+    /// (`ws://host:port/ws`): one protocol message per text frame.
+    pub fn websocket(url: &str) -> io::Result<Raw> {
+        let (to, mut outgoing) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (incoming, from) = mpsc::channel();
+        let (ready, connected) = mpsc::channel();
+        let url = url.to_owned();
+        let thread = thread::spawn(move || {
+            use futures_util::{SinkExt as _, StreamExt as _};
+            use tokio_tungstenite::tungstenite::Message;
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            runtime.block_on(async move {
+                let address = url.trim_start_matches("ws://").split('/').next().unwrap_or_default().to_owned();
+                let opened = async {
+                    let tcp = tokio::net::TcpStream::connect(&address).await?;
+                    tokio_tungstenite::client_async(url.as_str(), tcp).await.map_err(io::Error::other)
+                }.await;
+                let socket = match opened {
+                    Ok((socket, _)) => { let _ = ready.send(Ok(())); socket }
+                    Err(error) => { let _ = ready.send(Err(error)); return; }
+                };
+                let (mut sink, mut stream) = socket.split();
+                let mut writing = true;
+                loop {
+                    tokio::select! {
+                        message = stream.next() => match message {
+                            Some(Ok(Message::Text(text))) => if incoming.send(text.to_string()).is_err() { break },
+                            Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                            Some(Ok(_)) => {}
+                        },
+                        line = outgoing.recv(), if writing => match line {
+                            Some(line) => if sink.send(Message::Text(line.into())).await.is_err() { break },
+                            None => { writing = false; let _ = sink.close().await; }
+                        },
+                    }
+                }
+            });
+        });
+        connected.recv().map_err(|_| io::Error::other("connection thread died"))??;
+        Ok(Raw { to: Some(to), from, stash: Default::default(), thread: Some(thread) })
+    }
+
     pub fn send_line(&mut self, line: &str) {
         self.to.as_ref().expect("connection open").send(line.to_owned()).expect("connection alive");
     }
@@ -320,10 +362,15 @@ impl Daemon {
     }
 
     pub fn spawn_with(ctx: &Ctx, vars: &[(&str, &str)]) -> Daemon {
+        Self::spawn_args(ctx, &[], vars)
+    }
+
+    /// `daemon run ARGS…` (e.g. `--web --port 0`).
+    pub fn spawn_args(ctx: &Ctx, args: &[&str], vars: &[(&str, &str)]) -> Daemon {
         let endpoint = ctx.endpoint();
         stop(&endpoint);
         let mut command = ctx.command(BIN);
-        command.args(["daemon", "run"]).envs(vars.iter().copied())
+        command.args(["daemon", "run"]).args(args).envs(vars.iter().copied())
             .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
         let mut child = command.spawn().expect("spawn daemon run");
         let mut stderr = child.stderr.take().unwrap();

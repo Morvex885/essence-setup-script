@@ -20,6 +20,8 @@ impl Secrets {
     pub fn insert(&mut self, name: impl Into<String>, value: impl Into<String>) { self.0.insert(name.into(), Zeroizing::new(value.into())); }
     pub fn insert_hidden(&mut self, name: impl Into<String>, value: Zeroizing<String>) { self.0.insert(name.into(), value); }
     pub fn clear(&mut self) { self.0.clear(); }
+    pub fn remove(&mut self, name: &str) -> bool { self.0.remove(name).is_some() }
+    pub fn contains(&self, name: &str) -> bool { self.0.contains_key(name) }
     pub fn is_empty(&self) -> bool { self.0.is_empty() }
     pub(crate) fn names(&self) -> Vec<String> { self.0.keys().cloned().collect() }
 }

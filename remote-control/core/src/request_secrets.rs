@@ -13,8 +13,9 @@ use zeroize::Zeroizing;
 use crate::error::{RcError, Result};
 
 /// Every secret name a command may declare.
-pub const WHITELIST: [&str; 5] =
-    ["password", "current-password", "vault-password", "new-vault-password", "script-password"];
+pub const WHITELIST: [&str; 6] = [
+    "password", "current-password", "vault-password", "new-vault-password", "script-password", "access-token",
+];
 
 #[derive(Default)]
 pub struct Secrets {

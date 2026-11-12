@@ -4,7 +4,7 @@
 //! The source screen also supplies `Registry::github_wizard` for first-run entry.
 use std::{collections::{BTreeMap, VecDeque}, ffi::OsString, io::{self, IsTerminal, Write}, path::PathBuf, process::{Command, ExitCode}, time::Duration};
 use crossterm::{event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers}, execute, terminal::{self, EnterAlternateScreen, LeaveAlternateScreen}};
-use essence_rc_client::{Client, Input, Log, Progress, Reply, Request, Secrets, TermEvent, TerminalIo};
+use essence_rc_client::{Client, Input, Log, Origin, Progress, Reply, Request, Secrets, TermEvent, TerminalIo};
 use ratatui::{Terminal, backend::CrosstermBackend, text::Line};
 use zeroize::Zeroizing;
 use crate::ui::{self, Item, View};
@@ -98,7 +98,9 @@ impl TerminalIo for ClosedTerminal {
 }
 impl<'a> Context<'a> {
     pub fn new(client: &'a mut dyn Client, ui: &'a mut dyn UserInterface, registry: &'a Registry, terminal: TerminalFactory<'a>) -> Self {
-        Self { client, ui, registry, terminal: Some(terminal), env: agent_env(std::env::var_os("SSH_AUTH_SOCK")) }
+        // A network daemon refuses `env`: the agent travels only to a local one.
+        let env = if client.hello().origin == Origin::Local { agent_env(std::env::var_os("SSH_AUTH_SOCK")) } else { None };
+        Self { client, ui, registry, terminal: Some(terminal), env }
     }
     /// Screen tests: no agent `env`; a terminal whose input ends at once.
     pub fn for_test(client: &'a mut dyn Client, ui: &'a mut dyn UserInterface, registry: &'a Registry) -> Self {

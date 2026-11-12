@@ -58,6 +58,17 @@ jobs:
         run: FUZZ_ITERATIONS=50 ./tests/lib/bats-core/bin/bats tests/fuzz/ --recursive
         timeout-minutes: 10
 
+  web-js-test:
+    name: Web panel JS tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Test web panel modules
+        run: node --test remote-control/web/tests-js/*.test.mjs
+
   rust-test:
     name: Rust tests (${{ matrix.os }})
     strategy:

@@ -1,6 +1,6 @@
 //! Front ends reach the core only through the daemon protocol: neither the
-//! TUI nor the client crate depends on `rc-core`, and the TUI is a library
-//! linked into the single `essence-rc` executable.
+//! TUI, the client crate nor the web listener depends on `rc-core`, and the
+//! TUI is a library linked into the single `essence-rc` executable.
 use std::{fs, path::Path};
 fn scan(path: &Path) {
     for entry in fs::read_dir(path).unwrap() {
@@ -19,10 +19,11 @@ fn assert_without_core(root: &Path) {
     scan(&root.join("src"));
 }
 #[test]
-fn tui_and_client_cannot_import_core() {
+fn tui_client_and_web_cannot_import_core() {
     let tui = Path::new(env!("CARGO_MANIFEST_DIR"));
     assert_without_core(tui);
     assert_without_core(&tui.join("../client"));
+    assert_without_core(&tui.join("../web"));
 }
 #[test]
 fn tui_is_a_library_of_the_single_binary() {
