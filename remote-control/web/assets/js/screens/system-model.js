@@ -289,9 +289,9 @@ export async function recoveryRun(ctx, title, question, verb, secrets = {}) {
   }
 }
 
-/** Импорт ключа восстановления: текст файла → `input.file` (ключ `k`). */
-export async function importRecoveryKey(ctx, fileText) {
-  if (typeof fileText !== 'string') { ctx.notify('warn', FILE_UNREADABLE); return null; }
+/** Импорт ключа восстановления: текст файла → `input.file` (ключ `k`); `reason` — отказ чтения. */
+export async function importRecoveryKey(ctx, fileText, reason = null) {
+  if (typeof fileText !== 'string') { ctx.notify('warn', reason || FILE_UNREADABLE); return null; }
   const reply = await ctx.request(['source', 'github-import-recovery-key'], { input: { file: fileText } });
   report(ctx, reply);
   return reply;

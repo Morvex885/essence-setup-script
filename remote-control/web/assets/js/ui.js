@@ -2,6 +2,7 @@
 // не инлайн-атрибутами в разметке (CSP `default-src 'self'`). Тексты — русские.
 import { html } from '../vendor/preact-htm.js';
 import { useEffect, useRef, useState } from '../vendor/preact-htm.js';
+import { readInputFile } from './format.js';
 
 const TONE_CLASS = { ok: 'tone-ok', warn: 'tone-warn', error: 'tone-error', dim: 'tone-dim', info: 'tone-info' };
 
@@ -234,13 +235,17 @@ export function Download({ name, text, label = 'Скачать' }) {
   return html`<${Button} kind="view" onClick=${() => downloadText(name, text)}>${label}<//>`;
 }
 
-/** Чтение локального текстового файла (`onText(text)`). */
+/**
+ * Чтение локального текстового файла: `onText(text)`, при отказе
+ * `onText(null, причина)` (причина `null` — файл не читается или не в UTF-8).
+ */
 export function FileText({ onText, label = 'Выбрать файл', accept = '.txt,.yaml,.yml,.json,text/*', tone = 'view', disabled = false }) {
   const pick = async (event) => {
     const file = event.target.files && event.target.files[0];
     event.target.value = '';
     if (!file) return;
-    try { onText(await file.text()); } catch { onText(null); }
+    const read = await readInputFile(file);
+    onText(read.text ?? null, read.error ?? null);
   };
   return html`<label class="btn btn-${tone} file-text ${disabled ? 'disabled' : ''}" aria-disabled=${disabled}>${label}<input type="file" accept=${accept} disabled=${disabled} onChange=${pick} /></label>`;
 }

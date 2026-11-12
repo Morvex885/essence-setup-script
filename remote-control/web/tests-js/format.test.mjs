@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import {
   text, joined, versionLabel, syncState, sourceLabel, scriptsState,
   templateSource, activity, activityIndicator, openPanel, OPEN_PANEL_WARNING,
-  errorMessage,
+  errorMessage, readInputFile, MAX_INPUT, FILE_TOO_LARGE,
 } from '../assets/js/format.js';
 
 test('text: null, undefined и пустая строка — тире', () => {
@@ -100,4 +100,12 @@ test('errorMessage: текст ошибки ядра', () => {
   assert.equal(errorMessage({ error: {} }), 'Операция не выполнена.');
   assert.equal(errorMessage(null), 'Операция не выполнена.');
   assert.equal(errorMessage({ error: { code: 'x', message: '' } }), 'Операция не выполнена.');
+});
+
+test('readInputFile: UTF-8 не больше 1 МиБ, как у меню', async () => {
+  assert.deepEqual(await readInputFile(new Blob(['mode: rule\n'])), { text: 'mode: rule\n' });
+  assert.deepEqual(await readInputFile(new Blob(['\uFEFFkey'])), { text: '\uFEFFkey' }, 'BOM сохраняется');
+  assert.equal((await readInputFile(new Blob(['a'.repeat(MAX_INPUT)]))).text.length, MAX_INPUT);
+  assert.deepEqual(await readInputFile(new Blob(['a'.repeat(MAX_INPUT + 1)])), { error: FILE_TOO_LARGE });
+  assert.deepEqual(await readInputFile(new Blob([new Uint8Array([0xff, 0x00])])), { error: null }, 'не UTF-8');
 });

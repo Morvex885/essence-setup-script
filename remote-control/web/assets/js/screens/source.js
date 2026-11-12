@@ -30,8 +30,8 @@ export function SourceScreen({ ctx }) {
     await sourceAction(ctx, key, state.data, { link: (label, url) => showLink(ctx, label, url) });
     await state.reload();
   });
-  const importKey = (text) => run(async () => {
-    await importRecoveryKey(ctx, text);
+  const importKey = (text, reason) => run(async () => {
+    await importRecoveryKey(ctx, text, reason);
     await state.reload();
   });
   return html`<${Loaded} title="Источник конфигурации" state=${state} actions=${back}>${(data) => {
