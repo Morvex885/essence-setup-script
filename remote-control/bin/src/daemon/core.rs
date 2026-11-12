@@ -15,14 +15,14 @@ use rc_core::log::{self, Level, LogSink};
 use rc_core::request_input::Input;
 use rc_core::request_secrets::Secrets;
 use rc_core::state::{State, StatePaths};
-use rc_core::transport::{ConsoleEvent, PtyRequest};
+use rc_core::transport::PtyRequest;
 use serde_json::{Value, json};
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, watch};
 
 use super::Shared;
 use super::conn::{Conn, daemon_stopping, session_closed};
-use super::terminal::{self, Reservation, STOP_WAIT};
+use super::terminal::{self, InputReceiver, Reservation, STOP_WAIT};
 
 /// What the rest of the daemon may know about the core without asking it
 /// (`daemon status`, phase 2 admission and listener warnings).
@@ -66,7 +66,7 @@ pub struct Request {
 pub struct TerminalRequest {
     pub pty: PtyRequest,
     pub reservation: Option<Reservation>,
-    pub input: mpsc::Receiver<ConsoleEvent>,
+    pub input: InputReceiver,
 }
 
 pub enum Job {

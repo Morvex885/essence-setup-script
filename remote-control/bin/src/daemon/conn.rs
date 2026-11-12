@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -31,20 +31,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_json::value::RawValue;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Notify, mpsc};
 use zeroize::Zeroizing;
 
 use super::core::{Job, Request, TerminalRequest};
 use super::local::LineReader;
-use super::terminal::{CLOSE_GRACE, Credit};
+use super::terminal::{self, CLOSE_GRACE, Credit, InputSender};
 use super::{Shared, commands, lock};
 
 /// Longest `SSH_AUTH_SOCK` path accepted in the request `env`.
 const MAX_AGENT_PATH: usize = 4096;
-/// Terminal input queued per terminal; a full queue closes the terminal
-/// instead of stalling the connection reader.
-const TERMINAL_INPUT_QUEUE: usize = 64;
 /// Bytes of events and replies queued for a client that does not read; more
 /// disconnects it (terminal output is bounded by its own credits).
 const MAX_QUEUED: usize = 4 * MAX_MESSAGE;
@@ -112,7 +108,10 @@ pub struct Conn {
     /// Requests of this connection not yet answered.
     in_flight: Mutex<HashSet<String>>,
     /// Console input of this connection's terminal requests.
-    terminals: Mutex<HashMap<String, mpsc::Sender<ConsoleEvent>>>,
+    terminals: Mutex<HashMap<String, InputSender>>,
+    /// Numbers this connection's terminals (registry keys stay unique when a
+    /// request id is reused).
+    next_terminal: AtomicU64,
 }
 
 impl Conn {
@@ -129,6 +128,7 @@ impl Conn {
             kill: Notify::new(),
             in_flight: Mutex::default(),
             terminals: Mutex::default(),
+            next_terminal: AtomicU64::new(0),
         }
     }
 
@@ -217,7 +217,12 @@ impl Conn {
         lock(&self.in_flight).insert(key(id))
     }
 
-    pub fn link_terminal(&self, id: &Value, input: mpsc::Sender<ConsoleEvent>) {
+    /// A fresh input channel for terminal request `id`, keyed uniquely.
+    pub fn terminal_channel(&self, id: &Value) -> (InputSender, terminal::InputReceiver) {
+        terminal::input_channel(format!("{}#{}", key(id), self.next_terminal.fetch_add(1, Ordering::Relaxed)))
+    }
+
+    pub fn link_terminal(&self, id: &Value, input: InputSender) {
         if !self.is_closed() {
             lock(&self.terminals).insert(key(id), input);
         }
@@ -227,7 +232,7 @@ impl Conn {
         lock(&self.terminals).remove(&key(id));
     }
 
-    fn terminal_input(&self, id: &Value) -> Option<mpsc::Sender<ConsoleEvent>> {
+    fn terminal_input(&self, id: &Value) -> Option<InputSender> {
         lock(&self.terminals).get(&key(id)).cloned()
     }
 
@@ -491,25 +496,30 @@ fn terminal_message(shared: &Arc<Shared>, conn: &Arc<Conn>, id: &Value, message:
         }
     } else if message.close == Some(Value::Bool(true)) {
         // The remote side gets EOF first; a session that ignores it is
-        // cancelled after the grace period.
+        // cancelled after the grace period. The link goes too: a terminal
+        // still waiting for the core sees its input closed and never opens.
         deliver(shared, conn, id, &input, ConsoleEvent::Closed);
-        close_after_grace(shared, conn, id);
+        conn.unlink_terminal(id);
+        close_after_grace(shared, conn, &input);
     }
 }
 
 /// Never waits: the reader must stay free for `close` and new requests. A
-/// terminal whose input queue is full (not started yet, or stalled) is
-/// closed — its link goes, so the session reads EOF after the queued input.
-fn deliver(shared: &Arc<Shared>, conn: &Conn, id: &Value, input: &mpsc::Sender<ConsoleEvent>, event: ConsoleEvent) {
-    if let Err(TrySendError::Full(_)) = input.try_send(event) {
+/// terminal whose input queue is full — by events or by bytes (not started
+/// yet, or stalled) — is closed: its link goes, so the session reads EOF
+/// after the queued input.
+fn deliver(shared: &Arc<Shared>, conn: &Conn, id: &Value, input: &InputSender, event: ConsoleEvent) {
+    if input.send(event).is_err() {
         conn.unlink_terminal(id);
         conn.log(id, Level::Error, "Ввод терминала не успевает обрабатываться: терминал закрыт.");
-        close_after_grace(shared, conn, id);
+        close_after_grace(shared, conn, input);
     }
 }
 
-fn close_after_grace(shared: &Arc<Shared>, conn: &Conn, id: &Value) {
-    let (shared, conn_id, request) = (shared.clone(), conn.id, key(id));
+/// Cancels exactly this terminal after the grace period, not a later one
+/// that reuses the request id.
+fn close_after_grace(shared: &Arc<Shared>, conn: &Conn, input: &InputSender) {
+    let (shared, conn_id, request) = (shared.clone(), conn.id, input.key.clone());
     tokio::spawn(async move {
         tokio::time::sleep(CLOSE_GRACE).await;
         shared.terminals.cancel_request(conn_id, &request);
@@ -557,8 +567,9 @@ fn request(shared: &Arc<Shared>, conn: &Arc<Conn>, id: Value, message: Message<'
         Route::Help => conn.reply(&id, Envelope::success(cli::help(invocation.help_noun()))),
         Route::Daemon => commands::run(shared, conn, &id, &invocation),
         Route::Terminal => {
+            let (sender, receiver) = conn.terminal_channel(&id);
             let reservation = match invocation.value("name") {
-                Some(node) => match shared.terminals.reserve(node, conn.id, &key(&id)) {
+                Some(node) => match shared.terminals.reserve(node, conn.id, &sender.key) {
                     Some(reservation) => Some(reservation),
                     None => {
                         let error = RcError::new("conflict", format!("Терминал ноды «{node}» уже открыт.")).with_extra("name", node);
@@ -568,7 +579,6 @@ fn request(shared: &Arc<Shared>, conn: &Arc<Conn>, id: Value, message: Message<'
                 // The core answers for the missing --name.
                 None => None,
             };
-            let (sender, receiver) = mpsc::channel(TERMINAL_INPUT_QUEUE);
             conn.link_terminal(&id, sender);
             announce_wait(shared, conn, &id);
             let pty = pty.expect("Route::Terminal implies a terminal field");
@@ -800,10 +810,10 @@ mod tests {
         let (out, mut lines) = mpsc::unbounded_channel();
         let conn = shared.register(Origin::Local, out);
         let id = serde_json::json!("t");
-        let (input, mut receiver) = mpsc::channel(TERMINAL_INPUT_QUEUE);
+        let (input, mut receiver) = conn.terminal_channel(&id);
         conn.link_terminal(&id, input);
         let message = format!(r#"{{"id":"t","stdin":"{}"}}"#, STANDARD.encode("k"));
-        for _ in 0..=TERMINAL_INPUT_QUEUE {
+        for _ in 0..=terminal::INPUT_QUEUE {
             tokio::time::timeout(std::time::Duration::from_secs(1), handle_line(&shared, &conn, message.as_bytes()))
                 .await.expect("the reader never waits for the terminal");
         }
@@ -815,7 +825,53 @@ mod tests {
             assert!(matches!(event, ConsoleEvent::Input(_)));
             queued += 1;
         }
-        assert_eq!(queued, TERMINAL_INPUT_QUEUE, "queued input is kept, then the session reads EOF");
+        assert_eq!(queued, terminal::INPUT_QUEUE, "queued input is kept, then the session reads EOF");
+    }
+
+    /// A few large `stdin` messages to a terminal that is not reading yet:
+    /// the byte budget closes it long before the event count would.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_input_is_bounded_by_bytes() {
+        let shared = shared();
+        let (out, mut lines) = mpsc::unbounded_channel();
+        let conn = shared.register(Origin::Local, out);
+        let id = serde_json::json!("t");
+        let (input, mut receiver) = conn.terminal_channel(&id);
+        conn.link_terminal(&id, input);
+        let chunk = 1 << 20;
+        let message = format!(r#"{{"id":"t","stdin":"{}"}}"#, STANDARD.encode(vec![b'k'; chunk]));
+        for sent in 1..=terminal::INPUT_LIMIT / chunk {
+            handle_line(&shared, &conn, message.as_bytes()).await;
+            assert!(conn.terminal_input(&id).is_some(), "{sent} MiB fit");
+            assert_eq!(receiver.queued_bytes(), sent * chunk);
+        }
+        handle_line(&shared, &conn, message.as_bytes()).await;
+        assert!(conn.terminal_input(&id).is_none(), "one byte over the budget closes the terminal");
+        let Ok(Out::Line(text, None)) = lines.try_recv() else { panic!("the requester learns why") };
+        assert!(text.contains("терминал закрыт"), "{}", text.as_str());
+        let mut delivered = 0;
+        while let Some(ConsoleEvent::Input(data)) = receiver.recv().await {
+            delivered += data.len();
+        }
+        assert_eq!((delivered, receiver.queued_bytes()), (terminal::INPUT_LIMIT, 0), "reading releases the budget");
+    }
+
+    /// `close` before the terminal opened unlinks its input, so the launch
+    /// sees it closed; a later terminal that reuses the id gets a new key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_before_open_closes_the_input_and_ids_get_fresh_keys() {
+        let shared = shared();
+        let conn = shared.register(Origin::Local, mpsc::unbounded_channel().0);
+        let id = serde_json::json!("t");
+        let (input, mut receiver) = conn.terminal_channel(&id);
+        let first = input.key.clone();
+        conn.link_terminal(&id, input);
+        handle_line(&shared, &conn, br#"{"id":"t","close":true}"#).await;
+        assert!(conn.terminal_input(&id).is_none());
+        assert!(receiver.is_closed(), "launch refuses a terminal closed before it opened");
+        assert!(matches!(receiver.recv().await, Some(ConsoleEvent::Closed)));
+        assert!(receiver.recv().await.is_none());
+        assert_ne!(conn.terminal_channel(&id).0.key, first, "a reused id names another terminal");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

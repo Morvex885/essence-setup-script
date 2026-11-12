@@ -422,11 +422,11 @@ mod tests {
     /// A running terminal of `conn` on `node`, started as conn.rs and the
     /// core thread would; returns the console input sender.
     fn open_endless(shared: &Arc<Shared>, runtime: &tokio::runtime::Runtime, conn: &Arc<Conn>, node: &str)
-        -> mpsc::Sender<rc_core::transport::ConsoleEvent>
+        -> terminal::InputSender
     {
         let id = serde_json::json!(format!("term-{node}"));
-        let reservation = shared.terminals.reserve(node, conn.id, &id.to_string()).expect("free node");
-        let (input, receiver) = mpsc::channel(4);
+        let (input, receiver) = conn.terminal_channel(&id);
+        let reservation = shared.terminals.reserve(node, conn.id, &input.key).expect("free node");
         conn.link_terminal(&id, input.clone());
         let job = rc_core::terminal::TerminalJob::for_test(node.into(), "menu".into(), "failed".into(), "done", Endless);
         let pty = rc_core::transport::PtyRequest { term: "xterm".into(), size: rc_core::transport::ConsoleSize { cols: 80, rows: 24 } };
@@ -476,8 +476,8 @@ mod tests {
         let (out, mut lines) = mpsc::unbounded_channel();
         let conn = shared.register(Origin::Local, out);
         let id = serde_json::json!("term-n1");
-        let reservation = shared.terminals.reserve("n1", conn.id, &id.to_string()).expect("free node");
-        let receiver = mpsc::channel(4).1;
+        let receiver = conn.terminal_channel(&id).1;
+        let reservation = shared.terminals.reserve("n1", conn.id, &receiver.key).expect("free node");
         let job = rc_core::terminal::TerminalJob::for_test("n1".into(), "menu".into(), "failed".into(), "done", Endless);
         let pty = rc_core::transport::PtyRequest { term: "xterm".into(), size: rc_core::transport::ConsoleSize { cols: 80, rows: 24 } };
         terminal::launch(&shared, runtime.handle(), conn.clone(), id, job, core::TerminalRequest { pty, reservation: Some(reservation), input: receiver });

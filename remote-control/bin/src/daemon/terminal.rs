@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
@@ -25,6 +25,7 @@ use rc_core::transport::{ConsoleEvent, RawConsole, RemoteTransport, remote_failu
 use serde::Serialize;
 use serde_json::Value;
 use tokio::runtime::Handle;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, watch};
 
 use super::conn::{Conn, line};
@@ -39,6 +40,96 @@ pub const OUTPUT_WAIT: Duration = Duration::from_secs(60);
 pub const CLOSE_GRACE: Duration = Duration::from_secs(2);
 /// Shutdown waits this long for cancelled terminal threads.
 pub const STOP_WAIT: Duration = Duration::from_secs(5);
+/// Input events queued for one terminal before its session reads them.
+pub const INPUT_QUEUE: usize = 64;
+/// Decoded input bytes queued for one terminal (one `stdin` message decodes
+/// to at most 3 MiB, so a single message always fits).
+pub const INPUT_LIMIT: usize = 4 << 20;
+
+/// The connection side of a terminal's input: bounded by [`INPUT_QUEUE`]
+/// events and [`INPUT_LIMIT`] bytes; never waits. `key` names this terminal
+/// in the [`Registry`] (unique per request, even when an id is reused).
+#[derive(Clone)]
+pub struct InputSender {
+    sender: mpsc::Sender<ConsoleEvent>,
+    queued: Arc<AtomicUsize>,
+    pub key: String,
+}
+
+/// The session side of a terminal's input; reading releases the bytes.
+pub struct InputReceiver {
+    receiver: mpsc::Receiver<ConsoleEvent>,
+    queued: Arc<AtomicUsize>,
+    pub key: String,
+}
+
+/// The input queue would exceed a limit: the terminal is to be closed.
+#[derive(Debug, PartialEq, Eq)]
+pub struct InputOverflow;
+
+pub fn input_channel(key: String) -> (InputSender, InputReceiver) {
+    let (sender, receiver) = mpsc::channel(INPUT_QUEUE);
+    let queued = Arc::new(AtomicUsize::new(0));
+    (InputSender { sender, queued: queued.clone(), key: key.clone() }, InputReceiver { receiver, queued, key })
+}
+
+fn input_bytes(event: &ConsoleEvent) -> usize {
+    match event {
+        ConsoleEvent::Input(data) => data.len(),
+        _ => 0,
+    }
+}
+
+impl InputSender {
+    /// Queues `event`; a gone session is not an error (its input is moot).
+    pub fn send(&self, event: ConsoleEvent) -> Result<(), InputOverflow> {
+        if self.sender.is_closed() {
+            return Ok(());
+        }
+        let size = input_bytes(&event);
+        if self.queued.fetch_add(size, Ordering::SeqCst) + size > INPUT_LIMIT {
+            self.queued.fetch_sub(size, Ordering::SeqCst);
+            return Err(InputOverflow);
+        }
+        match self.sender.try_send(event) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Closed(_)) => {
+                self.queued.fetch_sub(size, Ordering::SeqCst);
+                Ok(())
+            }
+            Err(TrySendError::Full(_)) => {
+                self.queued.fetch_sub(size, Ordering::SeqCst);
+                Err(InputOverflow)
+            }
+        }
+    }
+}
+
+impl InputReceiver {
+    /// Every sender is gone: the client closed the terminal (or overflowed it).
+    pub fn is_closed(&self) -> bool {
+        self.receiver.is_closed()
+    }
+
+    fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<ConsoleEvent>> {
+        let polled = self.receiver.poll_recv(cx);
+        if let Poll::Ready(Some(event)) = &polled {
+            self.queued.fetch_sub(input_bytes(event), Ordering::SeqCst);
+        }
+        polled
+    }
+
+    /// The next event (tests drive the session side by hand).
+    #[cfg(test)]
+    pub(super) async fn recv(&mut self) -> Option<ConsoleEvent> {
+        std::future::poll_fn(|cx| self.poll_recv(cx)).await
+    }
+
+    #[cfg(test)]
+    pub(super) fn queued_bytes(&self) -> usize {
+        self.queued.load(Ordering::SeqCst)
+    }
+}
 
 /// Unsent terminal output of one terminal, in bytes. The terminal thread
 /// adds before queueing a line; the connection writer releases (by dropping
@@ -195,7 +286,9 @@ impl Registry {
         }
     }
 
-    /// `{"close":true}` grace period over: cancel if still running.
+    /// `{"close":true}` grace period over: cancel if still running. `request`
+    /// is the terminal's [`InputSender::key`], so a later terminal that reuses
+    /// the request id is not touched.
     pub fn cancel_request(&self, conn: u64, request: &str) {
         for entry in lock(&self.entries).values() {
             if entry.conn() == conn && entry.request() == request {
@@ -273,7 +366,7 @@ struct OutputEvent<'a> {
 /// The requester's console as seen by the remote session: input events
 /// from the connection, output as base64 `output` events with backpressure.
 pub struct ProtocolConsole {
-    input: mpsc::Receiver<ConsoleEvent>,
+    input: InputReceiver,
     conn: Arc<Conn>,
     id: Value,
     pressure: Arc<Pressure>,
@@ -312,7 +405,7 @@ pub fn launch<T: RemoteTransport + Send + 'static>(shared: &Arc<Shared>, handle:
     let TerminalRequest { pty, reservation, input } = terminal;
     let reservation = match reservation {
         Some(reservation) => reservation,
-        None => match shared.terminals.reserve(&job.node, conn.id, &id.to_string()) {
+        None => match shared.terminals.reserve(&job.node, conn.id, &input.key) {
             Some(reservation) => reservation,
             None => {
                 conn.unlink_terminal(&id);
@@ -455,5 +548,36 @@ mod tests {
         assert_eq!(cancelled(&receivers), [false, true, true]);
         assert!(registry.cancel_all().is_empty(), "no threads in this test");
         assert_eq!(cancelled(&receivers), [true, true, true]);
+    }
+
+    /// The delayed cancel of a closed terminal names its own key: a new
+    /// terminal that reuses the request id (`"7"#0` → `"7"#1`) survives it.
+    #[test]
+    fn a_late_cancel_spares_a_terminal_that_reuses_the_id() {
+        let registry = Registry::default();
+        let (old, _) = input_channel("\"7\"#0".into());
+        let (new, _) = input_channel("\"7\"#1".into());
+        let reservation = registry.reserve("n1", 1, &new.key).unwrap();
+        let (cancel, receiver) = watch::channel(false);
+        assert!(registry.start(&reservation, cancel, Pressure::new()));
+        registry.cancel_request(1, &old.key);
+        assert!(!*receiver.borrow(), "the earlier terminal's timer misses the new one");
+        registry.cancel_request(1, &new.key);
+        assert!(*receiver.borrow());
+    }
+
+    #[test]
+    fn input_is_bounded_by_events_and_bytes() {
+        let (sender, receiver) = input_channel("k".into());
+        assert_eq!(sender.send(ConsoleEvent::Input(vec![0; INPUT_LIMIT])), Ok(()));
+        assert_eq!(sender.send(ConsoleEvent::Input(vec![0; 1])), Err(InputOverflow), "bytes");
+        assert_eq!(sender.send(ConsoleEvent::Closed), Ok(()), "control events cost no bytes");
+        drop(receiver);
+        assert_eq!(sender.send(ConsoleEvent::Input(vec![0; INPUT_LIMIT])), Ok(()), "a gone session is not an overflow");
+        let (sender, _receiver) = input_channel("k".into());
+        for _ in 0..INPUT_QUEUE {
+            sender.send(ConsoleEvent::Closed).unwrap();
+        }
+        assert_eq!(sender.send(ConsoleEvent::Closed), Err(InputOverflow), "events");
     }
 }
