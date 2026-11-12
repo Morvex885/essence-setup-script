@@ -1256,7 +1256,9 @@ mod tests {
         assert_eq!(fs::read_to_string(&existing).unwrap(), "mode: rule\nproxies:\n", "overwritten only after consent");
         let overwrite = ui.views.iter().filter(|v| v.title == "Экспорт шаблона").collect::<Vec<_>>();
         assert_eq!(overwrite.len(), 2);
-        assert!(content(overwrite[0]).contains(&format!("Файл {existing_arg} будет перезаписан шаблоном m.yaml.")));
+        // Текст до переноса по ширине кадра: длинный путь временного каталога (macOS) переносится.
+        let warning = format!("Файл {existing_arg} будет перезаписан шаблоном m.yaml.");
+        assert!(overwrite[0].context.iter().any(|line| line.to_string() == warning), "{:?}", overwrite[0].context);
         assert_eq!(notices(&ui, "Шаблон m.yaml сохранён в"), 2);
         assert_eq!(notices(&ui, &format!("Не удалось записать {dir_arg}")), 1);
         assert_eq!(notices(&ui, "Файл недоступен или не в UTF-8."), 1);
