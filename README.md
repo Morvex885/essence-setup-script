@@ -48,7 +48,9 @@ Bash-скрипты для настройки прокси-сервера и Rus
 
 ### Локальная часть (Remote Control)
 
-- **Единое ядро команд** — вся логика в командах `сущность действие --флаги` → JSON `{ok,data|error}`; терминальное меню (`essence-rc` без аргументов) — только слой экранов поверх ядра, а `essence-rc serve` отдаёт то же ядро по протоколу JSON-строк для веб-панели и приложений ([remote-control/README.md](remote-control/README.md))
+- **Единое ядро команд** — вся логика в командах `сущность действие --флаги` → JSON `{ok,data|error}`. Ядро работает в фоновом демоне; терминальное меню, командная строка и веб-панель — его клиенты на одном протоколе ([remote-control/README.md](remote-control/README.md))
+- **Веб-панель** — `essence-rc web run`: все разделы меню в браузере, терминал нод, вход по одноразовой ссылке или паролю запуска, автозапуск `essence-rc web install-service` ([docs/remote-control.md](docs/remote-control.md#веб-панель))
+- **Удалённое управление** — `essence-rc --connect https://host:8377 …`: меню и команды на демоне другой машины с закреплением сертификата
 - **Управление нодами** — добавление VPS с паролями под AES-256-GCM (ключ устройства), переименование с каскадным апдейтом ссылок, теги, удаление с опциональной очисткой сервера
 - **Усиление защиты SSH** — генерация переносимого ed25519-ключа, копирование на сервер, отключение пароля, смена SSH-порта (49152-65535) и обновление firewall с проверкой результата
 - **Клиенты** — создание с auto-generated `vless_uuid` + `hy2_password`, наследование нод от группы или кастомный список, смена группы с миграцией, переименование с миграцией директории
@@ -124,6 +126,8 @@ git clone https://github.com/Morvex885/essence-setup-script.git
 cd essence-setup-script/remote-control
 cargo run -p essence-rc --release
 ```
+
+Веб-панель: `essence-rc web run` — откроет браузер со ссылкой входа; Ctrl+C — остановить.
 
 > **Ручная установка на VPS (альтернативный способ):**
 > Если нужно установить серверный скрипт без Remote Control:
@@ -209,12 +213,14 @@ essence-setup/
 |       +-- uninstall.sh           # Полное удаление
 +-- remote-control/                # Remote Control на Rust (Cargo workspace)
 |   +-- core/                      # rc-core: модель, состояние, команды, SSH, GitHub, билдеры
-|   |   +-- src/cli.rs             # Каталог команд (грамматика v2) и справка
-|   |   +-- src/dispatch.rs        # Единый диспетчер CLI и serve, Session::mutate
+|   |   +-- src/cli.rs             # Каталог команд и справка
+|   |   +-- src/dispatch.rs        # Единый диспетчер, Session::mutate
 |   |   +-- templates/default.yaml # Встроенный шаблон конфига
-|   +-- tui/                       # essence-rc-tui: терминальное меню (только через serve)
-|   +-- bin/                       # essence-rc: CLI, serve v2, запуск меню
-|   +-- README.md                  # Архитектура и проверки шагов переписывания
+|   +-- client/                    # essence-rc-client: протокол v3, подключение к демону
+|   +-- web/                       # essence-rc-web: веб-слушатель и панель (assets/)
+|   +-- tui/                       # essence-rc-tui: терминальное меню (клиент демона)
+|   +-- bin/                       # essence-rc: демон, CLI, меню, веб-панель, автозапуск
+|   +-- README.md                  # Устройство и тесты
 +-- install-essence-rc.sh          # Установщик essence-rc
 +-- tests/                         # BATS-тесты серверной части (unit + fuzz)
 +-- docs/                          # Документация
