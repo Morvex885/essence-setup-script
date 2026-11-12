@@ -611,3 +611,34 @@ impl FromRawFdDup for std::process::Stdio {
         unsafe { std::process::Stdio::from_raw_fd(libc::dup(fd)) }
     }
 }
+
+/// П8: with the autostart unit installed, `self uninstall` is refused before
+/// it is queued; the binary and the data stay.
+#[cfg(target_os = "linux")]
+#[test]
+fn self_uninstall_is_refused_while_the_autostart_service_is_installed() {
+    // As root the unit lives in /etc/systemd/system: not faked here.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let env = Env::new();
+    let ctx = env.ctx();
+    assert_eq!(ctx.run(&["source", "init-local", "--json"], b"").status.code(), Some(0));
+    let systemd = env.root.path().join("run-systemd");
+    let config = env.root.path().join("config");
+    std::fs::create_dir_all(&systemd).unwrap();
+    std::fs::create_dir_all(config.join("systemd/user")).unwrap();
+    std::fs::write(config.join("systemd/user/essence-rc-web.service"), "[Unit]\n").unwrap();
+    let (systemd, config) = (systemd.to_str().unwrap(), config.to_str().unwrap());
+    // A disposable copy: should the refusal fail, only the copy is removed.
+    let exe = env.root.path().join("essence-rc");
+    std::fs::copy(BIN, &exe).unwrap();
+    let mut daemon = Daemon::spawn_exe(&ctx, &exe, &[], &[("ESSENCE_RC_SYSTEMD_DIR", systemd), ("XDG_CONFIG_HOME", config)]);
+    let conn = daemon.conn();
+    assert!(ok(&conn.request("open", &["session", "open"], json!({})).1));
+    let (_, refused) = conn.request("uninstall", &["self", "uninstall", "--yes"], json!({}));
+    assert_eq!(code(&refused), "conflict", "{refused}");
+    assert_eq!(refused["error"]["message"], "Сначала удалите автозапуск: essence-rc web uninstall-service.");
+    assert!(exe.exists(), "the binary stays");
+    assert!(ok(&conn.request("status", &["daemon", "status"], json!({})).1), "the daemon keeps running");
+}

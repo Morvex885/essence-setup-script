@@ -367,9 +367,14 @@ impl Daemon {
 
     /// `daemon run ARGS…` (e.g. `--web --port 0`).
     pub fn spawn_args(ctx: &Ctx, args: &[&str], vars: &[(&str, &str)]) -> Daemon {
+        Self::spawn_exe(ctx, Path::new(BIN), args, vars)
+    }
+
+    /// `EXE daemon run ARGS…`: a disposable copy for tests that may uninstall it.
+    pub fn spawn_exe(ctx: &Ctx, exe: &Path, args: &[&str], vars: &[(&str, &str)]) -> Daemon {
         let endpoint = ctx.endpoint();
         stop(&endpoint);
-        let mut command = ctx.command(BIN);
+        let mut command = ctx.command(exe);
         command.args(["daemon", "run"]).args(args).envs(vars.iter().copied())
             .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
         let mut child = command.spawn().expect("spawn daemon run");

@@ -45,7 +45,9 @@ const VAULT: &[&str] = &["vault-password", "new-vault-password"];
 const TELEGRAM: &str = "name+ all component=";
 /// Listener flags of `web start` (and, after `--web`, of `daemon run|start`).
 const WEB: &str = "bind= port= tls-cert= tls-key= no-tls";
-const DAEMON_WEB: &str = "web bind= port= tls-cert= tls-key= no-tls";
+/// `daemon run|start`: the listener and the data directory (`--data-dir`
+/// wins over `ESSENCE_RC_DATA_DIR`; services pass it this way).
+const DAEMON_WEB: &str = "web bind= port= tls-cert= tls-key= no-tls data-dir=";
 
 static CATALOG: &[Spec] = &[
     spec("status", "", "", &[], 0),
@@ -83,6 +85,8 @@ static CATALOG: &[Spec] = &[
     spec("web", "link", "", &[], NOSESSION | LOCAL),
     spec("web", "run", "bind= port= tls-cert= tls-key= no-tls no-open", &[], CLIENT),
     spec("web", "open", "no-open", &[], CLIENT),
+    spec("web", "install-service", WEB, &[], CLIENT),
+    spec("web", "uninstall-service", "", &[], CLIENT),
     spec("node", "list", "", &[], 0),
     spec("node", "show", "name=", &[], 0),
     spec("node", "aliases", "name= set+ unset+", &[], 0),
@@ -180,8 +184,8 @@ static HELP: &[(&str, &[(&str, &str)])] = &[
     ("daemon", &[
         ("daemon status", "Состояние демона: клиенты, сессия, терминалы"),
         ("daemon stop", "Остановить демон после текущей операции"),
-        ("daemon run [--web [--bind IP] [--port P] [--tls-cert PATH --tls-key PATH | --no-tls]]", "Запустить демон на переднем плане; с --web — постоянный режим с веб-панелью"),
-        ("daemon start [--web [--bind IP] [--port P] [--tls-cert PATH --tls-key PATH | --no-tls]]", "Запустить демон в фоне и напечатать адрес подключения"),
+        ("daemon run [--data-dir PATH] [--web [--bind IP] [--port P] [--tls-cert PATH --tls-key PATH | --no-tls]]", "Запустить демон на переднем плане; с --web — постоянный режим с веб-панелью; --data-dir важнее ESSENCE_RC_DATA_DIR"),
+        ("daemon start [--data-dir PATH] [--web [--bind IP] [--port P] [--tls-cert PATH --tls-key PATH | --no-tls]]", "Запустить демон в фоне и напечатать адрес подключения"),
     ]),
     ("generate", &[
         ("generate (--all | --group G | --client C)", "Сгенерировать конфиги"),
@@ -275,6 +279,8 @@ static HELP: &[(&str, &[(&str, &str)])] = &[
         ("web link", "Ссылка для входа в веб-панель; без пароля запуска — с одноразовым кодом на 5 минут"),
         ("web run [--bind IP] [--port P] [--tls-cert PATH --tls-key PATH | --no-tls] [--no-open]", "Запустить веб-панель и открыть её в браузере; Ctrl+C — остановить"),
         ("web open [--no-open]", "Открыть работающую веб-панель в браузере"),
+        ("web install-service [--bind IP] [--port P] [--tls-cert PATH --tls-key PATH | --no-tls]", "Установить автозапуск веб-панели"),
+        ("web uninstall-service", "Удалить автозапуск веб-панели"),
     ]),
 ];
 
@@ -779,12 +785,16 @@ mod tests {
     fn client_rows_parse_on_the_client_and_are_marked() {
         let rows: Vec<&Spec> = CATALOG.iter().filter(|spec| spec.flags & CLIENT != 0).collect();
         assert_eq!(rows.iter().map(|spec| (spec.noun, spec.verb)).collect::<Vec<_>>(),
-            [("daemon", "run"), ("daemon", "start"), ("web", "run"), ("web", "open"), ("template", "export")]);
+            [("daemon", "run"), ("daemon", "start"), ("web", "run"), ("web", "open"), ("web", "install-service"),
+                ("web", "uninstall-service"), ("template", "export")]);
         for argv in [
             &["daemon", "run"][..], &["daemon", "start", "--json"],
             &["daemon", "run", "--web", "--bind", "0.0.0.0", "--port", "0", "--no-tls"],
             &["web", "run", "--port", "8443", "--tls-cert", "c.pem", "--tls-key", "k.pem", "--no-open"],
             &["web", "open", "--no-open"],
+            &["daemon", "run", "--data-dir", "/srv/essence", "--web"],
+            &["web", "install-service", "--bind", "0.0.0.0", "--port", "8443"],
+            &["web", "uninstall-service"],
             &["template", "export", "--name", "t", "--output", "/tmp/out.yaml", "--yes"],
         ] {
             let invocation = parse_client(&args(argv)).unwrap_or_else(|error| panic!("{argv:?}: {}", error.message));

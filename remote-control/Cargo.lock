@@ -1182,6 +1182,7 @@ version = "2.0.0"
 dependencies = [
  "base64 0.22.1",
  "crossterm",
+ "dirs",
  "essence-rc-client",
  "essence-rc-tui",
  "essence-rc-web",
