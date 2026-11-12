@@ -32,6 +32,8 @@ use tokio::sync::{mpsc, watch};
 use self::conn::{Conn, Out};
 use self::core::{CoreSnapshot, Job};
 use self::terminal::Registry;
+/// `web install-service` validates its listener flags exactly like `web start`.
+pub(crate) use self::commands::listener_plan;
 
 /// How the daemon was started.
 pub struct Options {
@@ -279,35 +281,66 @@ fn parse_linger(value: Option<&OsStr>) -> Result<Duration, String> {
     text.parse().map(Duration::from_secs).map_err(|_| format!("{LINGER_ENV} должна содержать от 1 до 6 цифр."))
 }
 
+/// The data directory: `--data-dir` wins over `ESSENCE_RC_DATA_DIR` (and
+/// the default that `discover` falls back to).
+fn data_root(flag: Option<&str>, discover: impl FnOnce() -> Result<PathBuf, String>) -> Result<PathBuf, String> {
+    match flag {
+        Some("") => Err("Укажите каталог данных: --data-dir PATH.".to_owned()),
+        Some(path) => Ok(PathBuf::from(path)),
+        None => discover(),
+    }
+}
+
 /// The data directory as an absolute path (the daemon changes its working
 /// directory) and its endpoint, with the runtime directory prepared.
-fn locate() -> Result<(StatePaths, Endpoint), String> {
-    let root = StatePaths::discover().map_err(|error| error.message)?.root().to_path_buf();
+fn locate(data_dir: Option<&str>) -> Result<(StatePaths, Endpoint), String> {
+    let root = data_root(data_dir, || {
+        Ok(StatePaths::discover().map_err(|error| error.message)?.root().to_path_buf())
+    })?;
     let root = std::path::absolute(&root).map_err(|error| format!("Каталог данных недоступен: {error}"))?;
     let endpoint = endpoint_for(&root).map_err(|error| error.to_string())?;
     prepare_runtime_dir(&endpoint).map_err(|error| error.to_string())?;
     Ok((StatePaths::new(&endpoint.data_dir), endpoint))
 }
 
-/// `--web` and the listener flags of the daemon's own `daemon run|start` arguments.
-fn web_plan(args: &[OsString]) -> Result<Option<commands::ListenerPlan>, rc_core::error::RcError> {
+/// What the daemon's own `daemon run|start` arguments ask for.
+struct DaemonArgs {
+    /// `--web` and the listener flags.
+    web: Option<commands::ListenerPlan>,
+    data_dir: Option<String>,
+}
+
+fn daemon_args(args: &[OsString]) -> Result<DaemonArgs, rc_core::error::RcError> {
     let argv: Vec<String> = args.iter()
         .map(|arg| arg.to_str().map(str::to_owned))
         .collect::<Option<_>>()
         .ok_or_else(|| rc_core::error::RcError::new("usage", "Аргументы должны быть в UTF-8."))?;
-    commands::daemon_web_plan(&rc_core::cli::parse_client(&argv)?)
+    let invocation = rc_core::cli::parse_client(&argv)?;
+    Ok(DaemonArgs { web: commands::daemon_web_plan(&invocation)?, data_dir: invocation.value("data-dir").map(str::to_owned) })
 }
 
-/// The arguments of a restart: the original ones, plus `--web` and the
-/// flags of a listener started later by `web start`.
-fn restart_args(mut args: Vec<OsString>, web: Option<&WebInfo>) -> Vec<OsString> {
-    if let Some(web) = web
-        && !args.iter().any(|arg| arg == "--web")
-    {
-        args.push("--web".into());
-        args.extend(web.flags.iter().map(OsString::from));
+/// The arguments of a restart: the original ones with `--data-dir` made
+/// absolute (the restart runs in the runtime directory), plus `--web` and
+/// the flags of a listener started later by `web start`.
+fn restart_args(args: Vec<OsString>, web: Option<&WebInfo>, data_dir: &std::path::Path) -> Vec<OsString> {
+    let mut kept = Vec::with_capacity(args.len() + 2);
+    let mut words = args.into_iter();
+    while let Some(word) = words.next() {
+        if word == "--data-dir" {
+            words.next();
+        } else if !word.to_str().is_some_and(|text| text.starts_with("--data-dir=")) {
+            kept.push(word);
+            continue;
+        }
+        kept.extend(["--data-dir".into(), data_dir.as_os_str().to_owned()]);
     }
-    args
+    if let Some(web) = web
+        && !kept.iter().any(|arg| arg == "--web")
+    {
+        kept.push("--web".into());
+        kept.extend(web.flags.iter().map(OsString::from));
+    }
+    kept
 }
 
 pub fn run(options: Options) -> ExitCode {
@@ -316,19 +349,20 @@ pub fn run(options: Options) -> ExitCode {
     #[cfg(unix)]
     let inherited_lock = local::take_inherited_lock();
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
-    let web = match web_plan(&args) {
-        Ok(web) => web,
+    let parsed = match daemon_args(&args) {
+        Ok(parsed) => parsed,
         Err(error) => {
             let _ = writeln!(io::stderr().lock(), "  [✗] {}", error.message);
             return ExitCode::from(error.exit_code());
         }
     };
+    let web = parsed.web;
     let persistent = options.persistent || web.is_some();
     let linger = match parse_linger(std::env::var_os(LINGER_ENV).as_deref()) {
         Ok(linger) => linger,
         Err(message) => return fail(message),
     };
-    let (paths, endpoint) = match locate() {
+    let (paths, endpoint) = match locate(parsed.data_dir.as_deref()) {
         Ok(found) => found,
         Err(message) => return fail(message),
     };
@@ -407,7 +441,7 @@ pub fn run(options: Options) -> ExitCode {
         std::process::exit(1);
     }
     // A restart brings back a listener started by `web start` too.
-    let args = restart_args(args, shared.web_info().as_ref());
+    let args = restart_args(args, shared.web_info().as_ref(), &endpoint.data_dir);
     // Network connections close with the listener (and see their replies first).
     runtime.block_on(commands::stop(&shared));
     for conn in shared.connections() {
@@ -532,12 +566,30 @@ mod tests {
         let args = |list: &[&str]| list.iter().map(OsString::from).collect::<Vec<_>>();
         let web = WebInfo { bind: "127.0.0.1".parse().unwrap(), port: 41000, tls: false, fingerprint: None,
             flags: ["--bind", "127.0.0.1", "--port", "41000"].map(str::to_owned).to_vec() };
-        assert_eq!(restart_args(args(&["daemon", "run"]), None), args(&["daemon", "run"]));
-        assert_eq!(restart_args(args(&["daemon", "run"]), Some(&web)),
+        let data = std::path::Path::new("/srv/essence");
+        assert_eq!(restart_args(args(&["daemon", "run"]), None, data), args(&["daemon", "run"]));
+        assert_eq!(restart_args(args(&["daemon", "run"]), Some(&web), data),
             args(&["daemon", "run", "--web", "--bind", "127.0.0.1", "--port", "41000"]));
         // Started with --web: its own flags stay.
-        assert_eq!(restart_args(args(&["daemon", "run", "--web", "--port", "0"]), Some(&web)),
+        assert_eq!(restart_args(args(&["daemon", "run", "--web", "--port", "0"]), Some(&web), data),
             args(&["daemon", "run", "--web", "--port", "0"]));
+        // A relative --data-dir becomes the absolute one the daemon uses.
+        for given in [&["daemon", "run", "--data-dir", "rel", "--web"][..], &["daemon", "run", "--data-dir=rel", "--web"]] {
+            assert_eq!(restart_args(args(given), Some(&web), data), args(&["daemon", "run", "--data-dir", "/srv/essence", "--web"]));
+        }
+    }
+
+    #[test]
+    fn data_dir_flag_wins_over_the_environment() {
+        let from_env = || Ok(PathBuf::from("/from/env"));
+        assert_eq!(data_root(Some("/from/flag"), from_env), Ok(PathBuf::from("/from/flag")));
+        assert_eq!(data_root(None, from_env), Ok(PathBuf::from("/from/env")));
+        assert!(data_root(Some(""), from_env).is_err());
+        let args = |list: &[&str]| list.iter().map(OsString::from).collect::<Vec<_>>();
+        let parsed = daemon_args(&args(&["daemon", "run", "--data-dir", "/srv/essence", "--web", "--port", "0"])).unwrap();
+        assert_eq!(parsed.data_dir.as_deref(), Some("/srv/essence"));
+        assert!(parsed.web.is_some());
+        assert_eq!(daemon_args(&args(&["daemon", "run"])).unwrap().data_dir, None);
     }
 
     #[test]

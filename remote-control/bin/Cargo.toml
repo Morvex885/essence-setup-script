@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 base64.workspace = true
 crossterm.workspace = true
+dirs.workspace = true
 essence-rc-client.workspace = true
 essence-rc-tui.workspace = true
 essence-rc-web.workspace = true
