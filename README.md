@@ -114,8 +114,9 @@ Intel/Apple Silicon, Termux aarch64), скачивает `essence-rc-<target>.ta
    New-Item -ItemType Directory -Force "$env:USERPROFILE\bin" | Out-Null
    [Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path', 'User') + ";$env:USERPROFILE\bin", 'User')
    ```
-   Затем запустите `essence-rc` (или без настройки `PATH` — по полному пути
-   `%USERPROFILE%\bin\essence-rc.exe`).
+   Затем запустите `essence-rc`. Без настройки `PATH` — по полному пути
+   (PowerShell: `& "$env:USERPROFILE\bin\essence-rc.exe"`, cmd:
+   `"%USERPROFILE%\bin\essence-rc.exe"`).
 
 **Из исходников (для разработки):**
 ```bash
