@@ -71,7 +71,7 @@ fn default_runtime_dir() -> io::Result<PathBuf> {
 /// The data directory with the symlinks of its longest existing ancestor
 /// resolved and the missing tail appended: every spelling of one directory
 /// names one daemon. Creates nothing.
-fn resolved(path: &Path) -> PathBuf {
+pub(crate) fn resolved(path: &Path) -> PathBuf {
     let mut tail = Vec::new();
     let mut current = path;
     loop {

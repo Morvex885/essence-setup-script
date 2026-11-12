@@ -1,5 +1,5 @@
 //! The front-end view of the daemon: screens and the CLI use [`Client`] exclusively.
-use std::{collections::BTreeMap, io};
+use std::{collections::BTreeMap, io, path::Path};
 use zeroize::Zeroizing;
 use crate::protocol::{Hello, Input, Log, Reply, Secrets};
 
@@ -42,6 +42,9 @@ pub trait Client {
     fn terminal(&mut self, request: Request<'_>, io: &mut dyn TerminalIo, progress: &mut dyn FnMut(Progress<'_>)) -> io::Result<Reply>;
     /// Closes the connection; the daemon keeps running.
     fn close(&mut self) -> io::Result<()> { Ok(()) }
+    /// The data directory of a daemon on this machine; `None` when it is
+    /// unknown or remote, so local path checks against it do not apply.
+    fn local_data_dir(&self) -> Option<&Path> { None }
 }
 
 pub fn argv(words: &[&str]) -> Vec<String> { words.iter().map(|s| (*s).to_owned()).collect() }

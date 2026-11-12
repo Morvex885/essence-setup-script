@@ -67,6 +67,21 @@ pub fn read_input_file(path: &Path) -> Result<Zeroizing<String>, InputFileError>
     Ok(owned)
 }
 
+/// The refusal of a recovery key file inside the data directory; the same
+/// code (`invalid`) and text as the core's former check.
+pub const RECOVERY_KEY_REFUSED: &str = "Не удалось импортировать ключ восстановления: файл ключа восстановления не найден, имеет недопустимый тип или расположен внутри служебного каталога.";
+
+/// `path` lies inside `data_dir`: the file resolved (or its directory plus
+/// name) against the data directory resolved like the daemon endpoint.
+pub fn inside_data_dir(path: &Path, data_dir: &Path) -> bool {
+    let candidate = std::fs::canonicalize(path).ok().or_else(|| {
+        let name = path.file_name()?;
+        std::fs::canonicalize(path.parent()?).ok().map(|parent| parent.join(name))
+    });
+    let Ok(data_dir) = std::path::absolute(data_dir) else { return false };
+    candidate.is_some_and(|candidate| candidate.starts_with(crate::endpoint::resolved(&data_dir)))
+}
+
 /// Publishes `bytes` at `path`: a fresh temporary file in the same directory,
 /// `sync_all`, a rename, then (Unix) the directory entry is synced. With
 /// `replace` an existing entry — a link too — is replaced, never followed;
@@ -86,6 +101,28 @@ pub fn write_file_atomic(path: &Path, bytes: &[u8], replace: bool) -> io::Result
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn files_inside_the_data_directory_are_detected_through_links() {
+        let base = tempfile::tempdir().unwrap();
+        let data = base.path().join("data");
+        fs::create_dir_all(data.join("credentials")).unwrap();
+        let key = data.join("credentials/key.txt");
+        fs::write(&key, "AGE-SECRET-KEY-1\n").unwrap();
+        let outside = base.path().join("key.txt");
+        fs::write(&outside, "AGE-SECRET-KEY-1\n").unwrap();
+        assert!(inside_data_dir(&key, &data));
+        assert!(inside_data_dir(&data.join("absent.txt"), &data), "a missing name in the directory");
+        assert!(!inside_data_dir(&outside, &data));
+        assert!(!inside_data_dir(&base.path().join("data-other.txt"), &data), "a common prefix is not containment");
+        #[cfg(unix)]
+        {
+            let alias = base.path().join("alias");
+            std::os::unix::fs::symlink(&data, &alias).unwrap();
+            assert!(inside_data_dir(&alias.join("credentials/key.txt"), &data), "the file through a link to the data directory");
+            assert!(inside_data_dir(&key, &alias), "the data directory spelled through a link");
+        }
+    }
 
     #[test]
     fn inputs_are_bounded_regular_utf8_files() {

@@ -322,6 +322,10 @@ fn execute(argv: &[String], invocation: &Invocation) -> Outcome<Output> {
     };
     let env = agent_env();
     let (mut client, _) = connect().map_err(local)?;
+    if let Err(error) = refuse_key_in_data_dir(invocation, client.local_data_dir()) {
+        let _ = client.close();
+        return Err(local(error));
+    }
     let mut prompts = SecretPrompts::default();
     if session {
         open_session(&mut client, &mut secrets, env.as_ref(), &mut prompts, invocation.requires_session())?;
@@ -450,6 +454,19 @@ fn read_input_file(path: &str) -> Result<Zeroizing<String>> {
         };
         RcError::new("invalid", message)
     })
+}
+
+/// Ключ восстановления не берётся из служебного каталога данных локального
+/// демона; каталог удалённого демона (`None`) не проверяется.
+fn refuse_key_in_data_dir(invocation: &Invocation, data_dir: Option<&Path>) -> Result<()> {
+    if (invocation.noun.as_str(), invocation.verb.as_str()) != ("source", "github-import-recovery-key") {
+        return Ok(());
+    }
+    let (Some(file), Some(data_dir)) = (invocation.value("file"), data_dir) else { return Ok(()) };
+    if client::files::inside_data_dir(Path::new(file), data_dir) {
+        return Err(RcError::new("invalid", client::files::RECOVERY_KEY_REFUSED));
+    }
+    Ok(())
 }
 
 // ─── template export ─────────────────────────────────────────────────────────
@@ -876,6 +893,23 @@ mod tests {
             assert!(!pointed.exists());
             assert!(fs::symlink_metadata(&link).unwrap().is_file());
         }
+    }
+
+    /// Паритет с ядром develop: ключ из каталога данных локального демона
+    /// отклоняется тем же кодом и текстом; удалённый каталог не проверяется.
+    #[test]
+    fn recovery_key_inside_the_local_data_dir_is_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let data = base.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        let (inside, outside) = (data.join("key.txt"), base.path().join("key.txt"));
+        let import = |path: &Path| cli::parse_client(&args(&["source", "github-import-recovery-key", "--file", path.to_str().unwrap()])).unwrap();
+        let error = refuse_key_in_data_dir(&import(&inside), Some(&data)).err().unwrap();
+        assert_eq!((error.code, error.message.as_str()), ("invalid", client::files::RECOVERY_KEY_REFUSED));
+        refuse_key_in_data_dir(&import(&outside), Some(&data)).unwrap();
+        refuse_key_in_data_dir(&import(&inside), None).unwrap();
+        let template = cli::parse_client(&args(&["template", "import", "--name", "t", "--file", inside.to_str().unwrap()])).unwrap();
+        refuse_key_in_data_dir(&template, Some(&data)).unwrap();
     }
 
     #[test]

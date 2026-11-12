@@ -1,6 +1,6 @@
 //! Deterministic screen fake; assertions include argv and keep secrets and
 //! input values out of diagnostics (only their names are recorded).
-use std::{collections::VecDeque, io};
+use std::{collections::VecDeque, io, path::{Path, PathBuf}};
 use crate::{client::{Client, Progress, Request, TerminalIo}, protocol::{Hello, Origin, Reply}};
 
 /// One scripted request: the expected argv and the reply. Terminal steps
@@ -20,6 +20,8 @@ pub struct ScriptedClient {
     pub secret_names: Vec<Vec<String>>,
     pub input_names: Vec<Vec<String>>,
     pub closed: bool,
+    /// [`Client::local_data_dir`]: `None` acts like a remote daemon.
+    pub data_dir: Option<PathBuf>,
     hello: Hello,
 }
 impl ScriptedClient {
@@ -30,6 +32,7 @@ impl ScriptedClient {
             secret_names: vec![],
             input_names: vec![],
             closed: false,
+            data_dir: None,
             hello: Hello { version: "test".into(), origin: Origin::Local, listener: None, exe: None, persistent: false },
         }
     }
@@ -62,4 +65,5 @@ impl Client for ScriptedClient {
         Ok(reply)
     }
     fn close(&mut self) -> io::Result<()> { self.closed = true; Ok(()) }
+    fn local_data_dir(&self) -> Option<&Path> { self.data_dir.as_deref() }
 }

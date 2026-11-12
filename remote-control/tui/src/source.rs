@@ -6,7 +6,7 @@
 use std::io;
 use ratatui::{style::Style, text::{Line, Span}};
 use serde_json::Value;
-use essence_rc_client::{argv, Reply, Secrets};
+use essence_rc_client::{argv, files, Reply, Secrets};
 use crate::{
     app::{Context, Navigation, Screen},
     clients::{expand_home, file_input},
@@ -148,7 +148,12 @@ impl Screen for Source {
                 },
                 "k" if encrypted => {
                     let Some(path) = ask(context, "Импорт ключа восстановления", "Путь к файлу")? else { continue; };
-                    if !path.is_empty() && let Some(input) = file_input(context, &expand_home(&path)) {
+                    if path.is_empty() { continue; }
+                    let path = expand_home(&path);
+                    // A key inside the local daemon's data directory is refused (core parity).
+                    if context.client.local_data_dir().is_some_and(|data_dir| files::inside_data_dir(&path, data_dir)) {
+                        context.ui.notice(ui::warn(files::RECOVERY_KEY_REFUSED));
+                    } else if let Some(input) = file_input(context, &path) {
                         let reply = context.request_with(&argv(&["source", "github-import-recovery-key"]), &Secrets::default(), &input)?;
                         report(context, &reply);
                     }
@@ -356,6 +361,23 @@ mod tests {
         // Failed read returns to the dashboard; EOF leaves too.
         let mut client = ScriptedClient::new([(words(&["source", "status"]), error("source_failed", json!({})))]);
         assert!(matches!(source(&mut client, &mut ScriptedUi::new(&[])), Navigation::Back));
+        client.assert_finished();
+    }
+    #[test] fn recovery_key_inside_the_local_data_dir_is_refused_without_a_request() {
+        let data = tempfile::tempdir().unwrap();
+        let key = data.path().join("key.txt");
+        std::fs::write(&key, "AGE-SECRET-KEY-1TEST\n").unwrap();
+        let key_path = key.to_str().unwrap();
+        let mut client = ScriptedClient::new([status("age"), status("age")]);
+        client.data_dir = Some(data.path().to_owned());
+        let mut ui = ScriptedUi::new(&["k", key_path, "0"]);
+        assert!(matches!(source(&mut client, &mut ui), Navigation::Back));
+        client.assert_finished();
+        assert!(notices(&ui).iter().any(|n| n.contains(essence_rc_client::files::RECOVERY_KEY_REFUSED)));
+        // A remote daemon (no local data directory): the same path is sent.
+        let mut client = ScriptedClient::new([status("age"), (words(&["source", "github-import-recovery-key"]), ok()), status("age")]);
+        let mut ui = ScriptedUi::new(&["k", key_path, "0"]);
+        source(&mut client, &mut ui);
         client.assert_finished();
     }
     #[test] fn cancelled_recovery_key_path_keeps_the_source_screen() {

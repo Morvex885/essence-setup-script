@@ -504,6 +504,8 @@ impl Client for DaemonClient {
     fn terminal(&mut self, request: Request<'_>, io: &mut dyn TerminalIo, progress: &mut dyn FnMut(Progress<'_>)) -> io::Result<Reply> {
         self.request(request, Some(io), progress)
     }
+    /// Local connections know their endpoint; test channels do not.
+    fn local_data_dir(&self) -> Option<&Path> { self.reconnect.as_ref().map(|reconnect| reconnect.endpoint.data_dir.as_path()) }
     /// Ends the I/O thread; waits for it at most [`CLOSE_WAIT`], then detaches
     /// it, so a write stuck on a full socket cannot hang the caller.
     fn close(&mut self) -> io::Result<()> {
