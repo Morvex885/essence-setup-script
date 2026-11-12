@@ -2,7 +2,7 @@
 // отклонённый токен возобновления, варианты восстановления GitHub.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { routeReply, openSession, recoveryOptions, serialLogin } from '../assets/js/session.js';
+import { routeReply, openSession, recoveryOptions, serialLogin, loginView, loginFinal } from '../assets/js/session.js';
 
 const fail = (code, extra = {}) => ({ ok: false, data: null, error: { code, message: code, ...extra }, sync: null });
 const ok = (data = {}) => ({ ok: true, data, error: null, sync: null });
@@ -131,6 +131,26 @@ test('serialLogin: после открытой сессии отложенная
   await finish(0, 'open');
   assert.equal(started.length, 1);
   assert.deepEqual(await first, { view: 'open' });
+});
+
+test('loginView: несовместимое соединение оставляет экран несовместимости', () => {
+  const disconnected = fail('disconnected');
+  assert.equal(loginView({ state: 'incompatible' }, disconnected), 'incompatible');
+  assert.equal(loginView({ state: 'reconnecting' }, disconnected), 'retry');
+  assert.equal(loginView({ state: 'open' }, ok()), 'open');
+  assert.equal(loginFinal({ view: 'incompatible' }), true);
+  assert.equal(loginFinal({ view: 'open' }), true);
+  assert.equal(loginFinal({ view: 'retry' }), false);
+});
+
+test('serialLogin: после несовместимости отложенная попытка не выполняется', async () => {
+  const { started, attempt, finish } = manualAttempts();
+  const login = serialLogin(attempt, loginFinal);
+  const first = login();
+  login({ ticket: 'x' });
+  await finish(0, 'incompatible');
+  assert.equal(started.length, 1);
+  assert.deepEqual(await first, { view: 'incompatible' });
 });
 
 test('recoveryOptions: как system.rs::github_recovery', () => {

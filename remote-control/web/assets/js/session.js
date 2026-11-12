@@ -28,6 +28,21 @@ export function routeReply(reply) {
 }
 
 /**
+ * Экран после попытки входа. Соединение, ставшее `incompatible` во время
+ * `session open` (несовместимый `hello` при переподключении), отвечает
+ * `disconnected` и больше не переподключается: остаётся экран
+ * несовместимости, а не «Повторить».
+ */
+export function loginView(connection, reply) {
+  return connection.state === 'incompatible' ? 'incompatible' : routeReply(reply);
+}
+
+/** Попытка входа завершила цепочку: сессия открыта или повторять бессмысленно. */
+export function loginFinal(result) {
+  return result.view === 'open' || result.view === 'incompatible';
+}
+
+/**
  * `session open` с секретами формы. `access-token` — одноразовый код из
  * ссылки (`ticket`, передаётся один раз: демон гасит его при первом
  * предъявлении) либо токен возобновления `connection.resume` (обновляется

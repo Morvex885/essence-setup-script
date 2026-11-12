@@ -108,9 +108,18 @@ export function Back({ ctx, to, param = null, label = 'Назад' }) {
   return html`<${Button} onClick=${() => ctx.navigate(to, param)}>${label}<//>`;
 }
 
+/** «Не удалось получить данные» с текстом ошибки и «Повторить чтение» (`nodes.rs::read_failed`). */
+export function ReadFailed({ reply, loading = false, reload }) {
+  return html`
+    <p class="tone-warn">Не удалось получить данные</p>
+    ${reply && reply.error && reply.error.message && html`<p>${reply.error.message}</p>`}
+    <${Actions}><${Action} tone="view" disabled=${loading} onClick=${() => reload()}>Повторить чтение<//><//>
+  `;
+}
+
 /**
- * Экран чтения: пока нет ответа — «Загрузка…»; ошибка — «Не удалось получить
- * данные» с «Повторить чтение» (`nodes.rs::read_failed`); иначе `children(data)`.
+ * Экран чтения: пока нет ответа — «Загрузка…»; ошибка — `ReadFailed`;
+ * иначе `children(data)`.
  */
 export function Loaded({ title, state, actions = null, children }) {
   if (!state.reply && !state.replies) {
@@ -119,9 +128,7 @@ export function Loaded({ title, state, actions = null, children }) {
   const failed = state.reply ? (!state.reply.ok ? state.reply : null) : state.failed;
   if (failed) {
     return html`<${Card} title=${title} actions=${actions}>
-      <p class="tone-warn">Не удалось получить данные</p>
-      ${failed.error && failed.error.message && html`<p>${failed.error.message}</p>`}
-      <${Actions}><${Action} tone="view" disabled=${state.loading} onClick=${() => state.reload()}>Повторить чтение<//><//>
+      <${ReadFailed} reply=${failed} loading=${state.loading} reload=${state.reload} />
     <//>`;
   }
   return children(state.data);

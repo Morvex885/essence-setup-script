@@ -4,7 +4,7 @@
 // `self uninstall` — `ctx.restart`.
 import { html } from '../../vendor/preact-htm.js';
 import { Card } from '../ui.js';
-import { useCommand, useCommands, useBusy, Action, Actions, Context, Back, Loaded } from './kit.js';
+import { useCommand, useCommands, useBusy, Action, Actions, Context, Back, Loaded, ReadFailed } from './kit.js';
 import { settingsView, settingsAction, daemonLines } from './system-model.js';
 
 export function SettingsScreen({ ctx }) {
@@ -26,8 +26,10 @@ export function SettingsScreen({ ctx }) {
       if (restart) { ctx.restart(restart); return; }
       await state.reload();
     });
+    // Отказ `self version` или `daemon status` — та же ошибка с повтором в своём блоке.
     return html`
       <${Card} title="Настройки" actions=${back}>
+        ${!version.reply.ok && html`<${ReadFailed} reply=${version.reply} loading=${version.loading} reload=${version.reload} />`}
         <${Context} lines=${view.context} />
         <${Actions}>
           ${view.actions.map((item) => html`
@@ -38,7 +40,7 @@ export function SettingsScreen({ ctx }) {
       <${Card} title="Демон">
         ${state.data.daemon
           ? html`<${Context} lines=${daemonLines(state.data.daemon).map((line) => `${line.label}: ${line.value}`)} />`
-          : html`<p class="tone-warn">Не удалось получить данные</p>`}
+          : html`<${ReadFailed} reply=${state.replies.daemon} loading=${state.loading} reload=${state.reload} />`}
       <//>
     `;
   }}<//>`;

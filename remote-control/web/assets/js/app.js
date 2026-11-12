@@ -181,8 +181,11 @@ export function App({ win = window, deps = {} }) {
     ticketRef.current = null;
     const reply = await session.openSession(connection, { ...options, ticket });
     setBusy(false);
+    const view = session.loginView(connection, reply);
+    // Экран несовместимости уже показан обработчиком `state`: ответ
+    // `disconnected` его не заменяет.
+    if (view === 'incompatible') return { view, reply };
     setGateReply(reply);
-    const view = session.routeReply(reply);
     setGate(view);
     setPhase(view === 'open' ? 'app' : 'gate');
     if (view === 'open') loadStatus();
@@ -193,7 +196,7 @@ export function App({ win = window, deps = {} }) {
   // Попытки входа по одной: вызов во время `session open` ждёт его итога.
   const loginRef = useRef(null);
   if (!loginRef.current) {
-    loginRef.current = session.serialLogin((options) => attemptRef.current(options), (result) => result.view === 'open');
+    loginRef.current = session.serialLogin((options) => attemptRef.current(options), session.loginFinal);
   }
   const open = loginRef.current;
 
