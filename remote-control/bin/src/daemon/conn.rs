@@ -747,14 +747,18 @@ fn request(shared: &Arc<Shared>, conn: &Arc<Conn>, id: Value, message: Message<'
                 conn.fail(&id, daemon_stopping());
             }
         }
-        // П8: the service would start the removed binary again. The check
-        // may run `schtasks` (Windows): off the runtime threads.
+        // П8: the service would start the removed binary again; an unknown
+        // state refuses too. The check may run `schtasks` (Windows): off the
+        // runtime threads.
         Route::Command { needs_auth } if invocation.noun == "self" && invocation.verb == "uninstall" => {
             let (shared, conn, request) = (shared.clone(), conn.clone(), job(needs_auth));
             tokio::spawn(async move {
-                let installed = tokio::task::spawn_blocking(crate::service::installed).await.unwrap_or(false);
-                if installed {
-                    return conn.fail(&id, RcError::new("conflict", "Сначала удалите автозапуск: essence-rc web uninstall-service."));
+                let installed = tokio::task::spawn_blocking(crate::service::installed).await
+                    .unwrap_or_else(|_| Err(RcError::new("failed", "Не удалось проверить автозапуск.")));
+                match installed {
+                    Ok(false) => {}
+                    Ok(true) => return conn.fail(&id, RcError::new("conflict", "Сначала удалите автозапуск: essence-rc web uninstall-service.")),
+                    Err(error) => return conn.fail(&id, error),
                 }
                 announce_wait(&shared, &conn, &id);
                 if !shared.enqueue(Job::Command(request)) {

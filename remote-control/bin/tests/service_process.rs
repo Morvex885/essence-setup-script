@@ -1,6 +1,8 @@
 //! `web install-service` / `web uninstall-service` on Linux with a fake
 //! `systemctl` first on `PATH` (it records its arguments) and an overridden
 //! `XDG_CONFIG_HOME`; systemd is detected through `ESSENCE_RC_SYSTEMD_DIR`.
+//! Tests that write a unit are skipped as root: root's unit lives in
+//! `/etc/systemd/system`, which a test must never touch.
 #![cfg(target_os = "linux")]
 
 use std::fs;
@@ -24,6 +26,16 @@ struct Env {
 }
 
 impl Env {
+    /// An environment for tests that write a unit; `None` (skipped) as root.
+    fn installable() -> Option<Self> {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped as root: the unit would go to /etc/systemd/system");
+            return None;
+        }
+        Some(Self::new())
+    }
+
     fn new() -> Self {
         let root = tempfile::Builder::new().prefix("rc").tempdir_in("/tmp").unwrap();
         let path = |name: &str| {
@@ -72,7 +84,7 @@ impl Env {
 
 #[test]
 fn user_unit_is_installed_started_and_removed() {
-    let env = Env::new();
+    let Some(env) = Env::installable() else { return };
     let installed = env.run(&["web", "install-service", "--port", "18999"], "", &env.systemd);
     assert_eq!(installed["ok"], true, "{installed}");
     assert_eq!(installed["data"]["service"], "systemd");
@@ -103,7 +115,7 @@ fn user_unit_is_installed_started_and_removed() {
 
 #[test]
 fn failing_systemctl_leaves_no_unit_file() {
-    let env = Env::new();
+    let Some(env) = Env::installable() else { return };
     let failed = env.run(&["web", "install-service"], "enable", &env.systemd);
     assert_eq!(failed["ok"], false, "{failed}");
     assert_eq!(failed["error"]["code"], "failed");
@@ -114,7 +126,7 @@ fn failing_systemctl_leaves_no_unit_file() {
 
 #[test]
 fn failed_reinstall_restores_the_previous_unit() {
-    let env = Env::new();
+    let Some(env) = Env::installable() else { return };
     assert_eq!(env.run(&["web", "install-service", "--port", "18997"], "", &env.systemd)["ok"], true);
     let before = fs::read_to_string(env.unit()).unwrap();
     let failed = env.run(&["web", "install-service", "--port", "18996"], "restart", &env.systemd);
@@ -122,6 +134,67 @@ fn failed_reinstall_restores_the_previous_unit() {
     assert_eq!(fs::read_to_string(env.unit()).unwrap(), before, "the previous unit is back");
     assert_eq!(&env.calls()[3..], ["--user daemon-reload", "--user enable essence-rc-web.service", "--user restart essence-rc-web.service",
         "--user daemon-reload", "--user restart essence-rc-web.service"]);
+}
+
+#[test]
+fn failing_disable_keeps_the_unit_file() {
+    let Some(env) = Env::installable() else { return };
+    assert_eq!(env.run(&["web", "install-service"], "", &env.systemd)["ok"], true);
+    let failed = env.run(&["web", "uninstall-service"], "disable", &env.systemd);
+    assert_eq!(failed["error"]["code"], "failed", "{failed}");
+    assert!(env.unit().exists(), "the service may still run: its unit stays");
+    assert_eq!(&env.calls()[3..], ["--user disable --now essence-rc-web.service"]);
+}
+
+#[test]
+fn an_unreadable_previous_unit_aborts_before_writing() {
+    let Some(env) = Env::installable() else { return };
+    assert_eq!(env.run(&["web", "install-service", "--port", "18995"], "", &env.systemd)["ok"], true);
+    let before = fs::read_to_string(env.unit()).unwrap();
+    fs::set_permissions(env.unit(), fs::Permissions::from_mode(0o000)).unwrap();
+    let failed = env.run(&["web", "install-service", "--port", "18994"], "", &env.systemd);
+    fs::set_permissions(env.unit(), fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(failed["error"]["code"], "failed", "{failed}");
+    assert!(failed["error"]["message"].as_str().unwrap().contains("Не удалось прочитать"), "{failed}");
+    assert_eq!(fs::read_to_string(env.unit()).unwrap(), before, "the previous unit is untouched");
+    assert_eq!(env.calls().len(), 3, "no systemctl call after the refusal");
+}
+
+/// A daemon at the endpoint that refuses `daemon stop`.
+fn stubborn_daemon(env: &Env) -> std::os::unix::net::UnixListener {
+    use std::io::{BufRead, BufReader, Write};
+    let endpoint = essence_rc_client::endpoint_in(&env.runtime, &env.data).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(&endpoint.socket).unwrap();
+    let serving = listener.try_clone().unwrap();
+    std::thread::spawn(move || {
+        for stream in serving.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let hello = r#"{"event":"hello","protocol":3,"version":"0.0.0","origin":"local","persistent":true}"#;
+            let _ = writeln!(stream, "{hello}");
+            let reader = BufReader::new(stream.try_clone().unwrap());
+            for line in reader.lines() {
+                let Ok(line) = line else { break };
+                let Ok(request) = serde_json::from_str::<Value>(&line) else { continue };
+                let reply = serde_json::json!({"id": request["id"], "ok": false, "error": {"code": "failed", "message": "Отказ."}, "exit": 1});
+                let _ = writeln!(stream, "{reply}");
+            }
+        }
+    });
+    listener
+}
+
+#[test]
+fn a_daemon_that_does_not_stop_aborts_install_and_uninstall() {
+    let Some(env) = Env::installable() else { return };
+    let _daemon = stubborn_daemon(&env);
+    let failed = env.run(&["web", "install-service"], "", &env.systemd);
+    assert_eq!(failed["error"]["code"], "failed", "{failed}");
+    assert!(failed["error"]["message"].as_str().unwrap().contains("Не удалось остановить работающий демон: Отказ."), "{failed}");
+    assert!(!env.unit().exists(), "nothing is installed next to the running daemon");
+    assert!(env.calls().is_empty());
+    let failed = env.run(&["web", "uninstall-service"], "", &env.systemd);
+    assert_eq!(failed["error"]["code"], "failed", "{failed}");
+    assert!(env.calls().is_empty());
 }
 
 #[test]

@@ -318,28 +318,52 @@ fn kind() -> Kind {
     }
     #[cfg(unix)]
     if cfg!(target_os = "linux") && systemd_present() {
-        if euid() == 0 {
-            return Kind::Systemd { unit: Path::new("/etc/systemd/system").join(UNIT_NAME), system: true };
-        }
-        return config_home().map_or(Kind::Unsupported, |config| Kind::Systemd {
-            unit: config.join("systemd/user").join(UNIT_NAME),
-            system: false,
-        });
+        return systemd_unit().map_or(Kind::Unsupported, |(unit, system)| Kind::Systemd { unit, system });
     }
     Kind::Unsupported
 }
 
-/// Установлен ли автозапуск: unit-файл, plist, задача или файл автозагрузки.
-pub fn installed() -> bool {
-    match kind() {
-        Kind::Systemd { unit, .. } => unit.exists(),
-        Kind::Launchd { plist } => plist.exists(),
-        Kind::Windows { startup } => {
-            startup.exists()
-                || Command::new("schtasks").args(["/Query", "/TN", TASK_NAME]).output().is_ok_and(|out| out.status.success())
-        }
-        Kind::Unsupported => false,
+/// Unit-файл службы и признак системного (root); `None` — нет домашнего каталога.
+#[cfg(unix)]
+fn systemd_unit() -> Option<(PathBuf, bool)> {
+    if euid() == 0 {
+        return Some((Path::new("/etc/systemd/system").join(UNIT_NAME), true));
     }
+    config_home().map(|config| (config.join("systemd/user").join(UNIT_NAME), false))
+}
+
+/// Есть ли файл; ошибка доступа — не «нет», а сбой проверки.
+fn present(path: &Path) -> Result<bool> {
+    path.try_exists()
+        .map_err(|error| RcError::new("failed", format!("Не удалось проверить автозапуск: {}: {error}", path.display())))
+}
+
+/// Установлен ли автозапуск: unit-файл (на Linux — и без признака systemd:
+/// оставшийся unit тоже считается), plist, задача или файл автозагрузки.
+/// Ошибка — проверить не удалось (это не «не установлен»).
+pub fn installed() -> Result<bool> {
+    #[cfg(unix)]
+    if cfg!(target_os = "linux") {
+        return systemd_unit().map_or(Ok(false), |(unit, _)| present(&unit));
+    }
+    match kind() {
+        Kind::Systemd { unit, .. } => present(&unit),
+        Kind::Launchd { plist } => present(&plist),
+        Kind::Windows { startup } => Ok(present(&startup)? || task_exists()?),
+        Kind::Unsupported => Ok(false),
+    }
+}
+
+/// Есть ли задача планировщика. Полный список задач (`/Query /FO CSV /NH`)
+/// отличает отсутствие задачи от сбоя запроса (у `/Query /TN` оба — код 1).
+fn task_exists() -> Result<bool> {
+    let args = words(&["/Query", "/FO", "CSV", "/NH"]);
+    let output = output("schtasks", &args)?;
+    if !output.status.success() {
+        return Err(command_failed("schtasks", &args, &output));
+    }
+    let name = format!("\"\\{TASK_NAME}\"");
+    Ok(String::from_utf8_lossy(&output.stdout).lines().any(|line| line.starts_with(&name)))
 }
 
 // ─── Внешние команды ─────────────────────────────────────────────────────────
@@ -352,18 +376,42 @@ fn tail(output: &std::process::Output) -> String {
     lines[lines.len().saturating_sub(5)..].join("\n")
 }
 
-/// Запуск программы без shell; ненулевой выход — `failed` с хвостом вывода.
-fn run(program: &str, args: &[String]) -> Result<()> {
-    let output = Command::new(program)
+fn output(program: &str, args: &[String]) -> Result<std::process::Output> {
+    Command::new(program)
         .args(args)
         .output()
-        .map_err(|error| RcError::new("failed", format!("Не удалось запустить {program}: {error}")))?;
-    if output.status.success() {
+        .map_err(|error| RcError::new("failed", format!("Не удалось запустить {program}: {error}")))
+}
+
+fn command_failed(program: &str, args: &[String], output: &std::process::Output) -> RcError {
+    let tail = tail(output);
+    let detail = if tail.is_empty() { String::new() } else { format!("\n{tail}") };
+    RcError::new("failed", format!("Команда {program} {} завершилась ошибкой.{detail}", args.join(" ")))
+}
+
+/// Запуск программы без shell; ненулевой выход, который не принимает
+/// `accept`, — `failed` с хвостом вывода.
+fn run_accepting(program: &str, args: &[String], accept: fn(&std::process::Output) -> bool) -> Result<()> {
+    let output = output(program, args)?;
+    if output.status.success() || accept(&output) {
         return Ok(());
     }
-    let tail = tail(&output);
-    let detail = if tail.is_empty() { String::new() } else { format!("\n{tail}") };
-    Err(RcError::new("failed", format!("Команда {program} {} завершилась ошибкой.{detail}", args.join(" "))))
+    Err(command_failed(program, args, &output))
+}
+
+fn run(program: &str, args: &[String]) -> Result<()> {
+    run_accepting(program, args, |_| false)
+}
+
+/// `launchctl bootout` агента, который не загружен: код 3 (ESRCH, «No such
+/// process») или 113 («Could not find specified service»). Прочие коды —
+/// сбой выгрузки.
+fn bootout_not_loaded(output: &std::process::Output) -> bool {
+    matches!(output.status.code(), Some(3 | 113))
+}
+
+fn bootout_args() -> Vec<String> {
+    vec!["bootout".into(), format!("{}/{PLIST_LABEL}", gui_domain())]
 }
 
 fn words(list: &[&str]) -> Vec<String> {
@@ -396,11 +444,22 @@ fn call(client: &mut DaemonClient, argv: &[&str]) -> Option<client::Reply> {
     client.send(Request::new(&argv, &Secrets::default(), &Input::default()), &mut |_| {}).ok()
 }
 
-/// Остановить работающий локальный демон и дождаться его выхода.
-fn stop_running_daemon(endpoint: &Endpoint) {
-    let Ok(mut client) = DaemonClient::connect_local(endpoint, None, None, None) else { return };
-    if call(&mut client, &["daemon", "stop"]).is_none_or(|reply| !reply.ok) {
-        return;
+/// Остановить работающий локальный демон и дождаться его выхода. Демона нет
+/// — `Ok`; он не остановился (отказ, нет ответа, точка подключения жива
+/// дольше [`STOP_WAIT`]) — ошибка: служба не должна стартовать рядом с ним.
+fn stop_running_daemon(endpoint: &Endpoint) -> Result<()> {
+    let mut client = match DaemonClient::connect_local(endpoint, None, None, None) {
+        Ok(client) => client,
+        Err(error) if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused) => return Ok(()),
+        Err(error) => return Err(oneshot::client_error(&error)),
+    };
+    let refused = |detail: &str| {
+        RcError::new("failed", format!("Не удалось остановить работающий демон{detail}. Остановите его: essence-rc daemon stop."))
+    };
+    match call(&mut client, &["daemon", "stop"]) {
+        Some(reply) if reply.ok => {}
+        Some(reply) => return Err(refused(&reply.error["message"].as_str().map_or(String::new(), |message| format!(": {message}")))),
+        None => return Err(refused("")),
     }
     let deadline = Instant::now() + STOP_WAIT;
     while Instant::now() < deadline {
@@ -410,7 +469,13 @@ fn stop_running_daemon(endpoint: &Endpoint) {
     }
     let _ = client.close();
     // Сокет удаляется до снятия блокировки: ждать, пока точка не исчезнет.
-    while Instant::now() < deadline && DaemonClient::connect_local(endpoint, None, None, None).is_ok() {
+    loop {
+        if DaemonClient::connect_local(endpoint, None, None, None).is_err() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(RcError::new("failed", "Работающий демон не остановился за 30 с. Остановите его: essence-rc daemon stop."));
+        }
         std::thread::sleep(Duration::from_millis(100));
     }
 }
@@ -471,22 +536,24 @@ fn write_service_file(path: &Path, text: &str) -> Result<()> {
     secure_fs::atomic_write(path, text.as_bytes()).map_err(failed)
 }
 
-/// Шаг установки: программа, аргументы и число попыток (пауза 500 мс).
+/// Шаг установки: программа, аргументы, число попыток (пауза 500 мс) и
+/// какой ненулевой выход считать успехом.
 struct Step<'a> {
     program: &'a str,
     args: Vec<String>,
     attempts: u32,
+    accept: fn(&std::process::Output) -> bool,
 }
 
 impl<'a> Step<'a> {
     fn once(program: &'a str, args: Vec<String>) -> Self {
-        Self { program, args, attempts: 1 }
+        Self { program, args, attempts: 1, accept: |_| false }
     }
 
     fn run(&self) -> Result<()> {
         let mut attempt = 1;
         loop {
-            match run(self.program, &self.args) {
+            match run_accepting(self.program, &self.args, self.accept) {
                 Err(_) if attempt < self.attempts => {
                     attempt += 1;
                     std::thread::sleep(RETRY_PAUSE);
@@ -497,11 +564,16 @@ impl<'a> Step<'a> {
     }
 }
 
-/// Записать файл и выполнить шаги. При сбое шага прежний файл
+/// Записать файл и выполнить шаги. Прежний файл, который не удалось
+/// прочитать, — ошибка до записи. При сбое шага прежний файл
 /// восстанавливается либо новый удаляется, затем `rollback(восстановлен)`
 /// приводит службу в соответствие (ошибки отката не учитываются).
 fn install_file(path: &Path, text: &str, steps: &[Step<'_>], rollback: &dyn Fn(bool)) -> Result<()> {
-    let previous = fs::read(path).ok();
+    let previous = match fs::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(RcError::new("failed", format!("Не удалось прочитать {}: {error}", path.display()))),
+    };
     write_service_file(path, text)?;
     for step in steps {
         if let Err(error) = step.run() {
@@ -549,8 +621,6 @@ fn install_with(launch: &Launch, kind: Kind) -> Result<Value> {
         }
         Kind::Launchd { plist } => {
             let path = plist.to_string_lossy().into_owned();
-            // Повторная установка: прежний агент выгружается (его может не быть).
-            let _ = run("launchctl", &["bootout".into(), format!("{}/{PLIST_LABEL}", gui_domain())]);
             let bootstrap = vec!["bootstrap".into(), gui_domain(), path.clone()];
             // Откат: прежний агент загружается снова.
             let rollback = |restored: bool| {
@@ -558,7 +628,12 @@ fn install_with(launch: &Launch, kind: Kind) -> Result<Value> {
                     let _ = run("launchctl", &bootstrap);
                 }
             };
-            let steps = [Step { program: "launchctl", args: bootstrap.clone(), attempts: 3 }];
+            // Прежний агент выгружается только после записи нового plist (его
+            // может не быть); сбой записи оставляет прежний агент загруженным.
+            let steps = [
+                Step { program: "launchctl", args: bootout_args(), attempts: 1, accept: bootout_not_loaded },
+                Step { program: "launchctl", args: bootstrap.clone(), attempts: 3, accept: |_| false },
+            ];
             install_file(&plist, &plist_text(launch), &steps, &rollback)?;
             Ok(json!({"service": "launchd", "unit": path, "started": true}))
         }
@@ -591,7 +666,7 @@ pub fn install(invocation: &Invocation) -> ExitCode {
             return Err(not_supported());
         }
         let endpoint = endpoint(&launch.data_dir)?;
-        stop_running_daemon(&endpoint);
+        stop_running_daemon(&endpoint)?;
         let data = install_with(&launch, kind)?;
         let network = invocation.value("bind").and_then(|bind| bind.parse::<std::net::IpAddr>().ok())
             .is_some_and(|ip| !ip.to_canonical().is_loopback());
@@ -609,20 +684,21 @@ pub fn install(invocation: &Invocation) -> ExitCode {
 fn uninstall_with(kind: Kind) -> Result<bool> {
     match kind {
         Kind::Systemd { unit, system } => {
-            if !unit.exists() {
+            if !present(&unit)? {
                 return Ok(false);
             }
-            // Уже выключенная служба — не ошибка удаления.
-            let _ = run("systemctl", &systemctl(system, &["disable", "--now", UNIT_NAME]));
+            // Уже выключенная служба — успех `systemctl`; иначе unit остаётся.
+            run("systemctl", &systemctl(system, &["disable", "--now", UNIT_NAME]))?;
             fs::remove_file(&unit).map_err(|error| RcError::new("failed", format!("Не удалось удалить {}: {error}", unit.display())))?;
             run("systemctl", &systemctl(system, &["daemon-reload"]))?;
             Ok(true)
         }
         Kind::Launchd { plist } => {
-            if !plist.exists() {
+            if !present(&plist)? {
                 return Ok(false);
             }
-            let _ = run("launchctl", &[ "bootout".into(), format!("{}/{PLIST_LABEL}", gui_domain())]);
+            // Не загруженный агент — не ошибка; прочие сбои оставляют plist.
+            run_accepting("launchctl", &bootout_args(), bootout_not_loaded)?;
             fs::remove_file(&plist).map_err(|error| RcError::new("failed", format!("Не удалось удалить {}: {error}", plist.display())))?;
             Ok(true)
         }
@@ -648,7 +724,7 @@ fn uninstall_with(kind: Kind) -> Result<bool> {
 pub fn uninstall(invocation: &Invocation) -> ExitCode {
     let output = (|| -> Result<Output> {
         let root = StatePaths::discover()?.root().to_owned();
-        stop_running_daemon(&endpoint(&root)?);
+        stop_running_daemon(&endpoint(&root)?)?;
         Ok(Output::success(json!({"removed": uninstall_with(kind())?})))
     })();
     let output = output.unwrap_or_else(Output::from_error);
@@ -780,5 +856,21 @@ mod tests {
             stderr: b"1\n2\n\n3\n4\n5\n6\n".to_vec(),
         };
         assert_eq!(tail(&output), "2\n3\n4\n5\n6");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_not_loaded_bootout_is_accepted() {
+        use std::os::unix::process::ExitStatusExt;
+        let exited = |code: i32| std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        assert!(bootout_not_loaded(&exited(3)), "ESRCH: not loaded");
+        assert!(bootout_not_loaded(&exited(113)), "service not found");
+        for code in [1, 5, 37, 150] {
+            assert!(!bootout_not_loaded(&exited(code)), "{code}");
+        }
     }
 }
