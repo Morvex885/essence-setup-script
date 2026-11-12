@@ -109,3 +109,21 @@ export function errorMessage(reply) {
   if (error && typeof error.message === 'string' && error.message) return error.message;
   return 'Операция не выполнена.';
 }
+
+/** Наибольший размер входных данных команды (`input.file`), байт — предел демона. */
+export const MAX_INPUT = 1 << 20;
+export const FILE_TOO_LARGE = 'Файл больше 1 МиБ.';
+
+/**
+ * Текст выбранного файла, как у терминального меню: не больше `MAX_INPUT`
+ * байт и строго UTF-8 (BOM сохраняется). `{text}` или `{error}`; `error: null`
+ * — файл не читается или не в UTF-8.
+ */
+export async function readInputFile(file) {
+  if (file.size > MAX_INPUT) return { error: FILE_TOO_LARGE };
+  try {
+    return { text: new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(await file.arrayBuffer()) };
+  } catch {
+    return { error: null };
+  }
+}

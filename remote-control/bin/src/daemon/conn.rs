@@ -515,20 +515,34 @@ async fn serve_network(
         exe: None, persistent: None, listener: Some(listener),
     });
     let writer_conn = conn.clone();
-    // One protocol message per WebSocket frame, without the newline.
-    let writer = tokio::spawn(async move {
-        while let Some(Out::Line(mut line, credit)) = outgoing.recv().await {
+    // One protocol message per WebSocket frame, without the newline. The
+    // queue limit of `Conn::send` applies here too: a client that stopped
+    // reading is cut off by `kill`, not buffered.
+    let mut writer = tokio::spawn(async move {
+        loop {
+            let message = tokio::select! {
+                () = writer_conn.kill.notified() => return,
+                message = outgoing.recv() => message,
+            };
+            // `Out::Close` or the connection is gone: dropping the sink closes the socket.
+            let Some(Out::Line(mut line, credit)) = message else { return };
+            let size = line.len();
             if line.ends_with('\n') {
                 line.pop();
             }
-            let sent = sink.send(line).await;
+            let sent = tokio::select! {
+                () = writer_conn.kill.notified() => return,
+                sent = sink.send(line) => sent,
+            };
+            if credit.is_none() {
+                writer_conn.queued.fetch_sub(size, Ordering::SeqCst);
+            }
             drop(credit);
             if sent.is_err() {
                 writer_conn.mark_closed();
                 return;
             }
         }
-        // `Out::Close` or the connection is gone: dropping the sink closes the socket.
     });
     // An unauthorized connection — new, or reset by a password change —
     // has 60 s to authorize itself; an authorized one is re-checked every
@@ -561,6 +575,9 @@ async fn serve_network(
             }
             () = tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)), if deadline.is_some() => break,
             _ = recheck.tick(), if authorized => {}
+            // The writer stopped (send error, a client that does not read,
+            // `Out::Close`): the connection is over for both directions.
+            _ = &mut writer => break,
         }
     }
     shared.disconnect(&conn);
@@ -970,6 +987,28 @@ mod tests {
         let task = tokio::spawn(serve(shared.clone(), conn.clone(), outgoing, BrokenPipe));
         served(&shared, task).await;
         assert!(conn.is_closed());
+    }
+
+    /// The WebSocket writer obeys the same limit: a browser that stopped
+    /// reading is disconnected, the reader ends with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_network_watcher_that_stops_reading_is_disconnected() {
+        let shared = shared();
+        let (out, outgoing) = mpsc::unbounded_channel();
+        let conn = shared.register(Origin::Network, out);
+        let (_to_daemon, incoming) = mpsc::channel(1);
+        let (sink, _unread) = mpsc::channel(1);
+        let socket = essence_rc_web::Accepted { peer: "127.0.0.1:1".parse().unwrap(), incoming, outgoing: sink };
+        let listener = ListenerHello { loopback: true, tls: false };
+        let task = tokio::spawn(serve_network(shared.clone(), conn.clone(), outgoing, socket, listener));
+        conn.set_authorized(true);
+        conn.watch.store(true, Ordering::SeqCst);
+        let text = "x".repeat(1 << 20);
+        for _ in 0..(MAX_QUEUED >> 20) + 2 {
+            shared.activity(&serde_json::json!({"event": "activity", "state": "log", "level": "info", "text": text}));
+        }
+        assert!(conn.is_closed(), "the queue limit closes the connection");
+        served(&shared, task).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

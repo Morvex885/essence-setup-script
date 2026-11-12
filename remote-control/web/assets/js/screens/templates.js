@@ -86,8 +86,8 @@ function TemplateCard({ ctx, name }) {
     ctx.failed();
     setRejected(true);
   });
-  const importFile = (text) => run(async () => {
-    if (text === null) { ctx.notify('warn', TEMPLATE_FILE_UNREADABLE); return; }
+  const importFile = (text, reason) => run(async () => {
+    if (text === null) { ctx.notify('warn', reason || TEMPLATE_FILE_UNREADABLE); return; }
     const reply = await ctx.runConfirmed('Импорт шаблона', 'Перезаписать шаблон?', templateImport(name), { input: templateInput(text) });
     if (ctx.isFailure(reply)) ctx.failed();
     if (reply.ok) discard();
