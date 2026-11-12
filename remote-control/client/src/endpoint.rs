@@ -186,8 +186,11 @@ mod tests {
         let a = choose_runtime_dir(0, &with_xdg, Some(home), None, Os::Linux, &run).unwrap();
         let b = choose_runtime_dir(0, &without, Some(home), None, Os::Linux, &run).unwrap();
         assert_eq!((a.as_path(), b.as_path()), (Path::new("/run/essence-rc"), Path::new("/run/essence-rc")));
-        let data = Path::new("/var/lib/essence");
-        assert_eq!(endpoint_in(&a, data).unwrap().socket, endpoint_in(&b, data).unwrap().socket);
+        // `/run/essence-rc` is an absolute path only on Unix hosts.
+        if cfg!(unix) {
+            let data = Path::new("/var/lib/essence");
+            assert_eq!(endpoint_in(&a, data).unwrap().socket, endpoint_in(&b, data).unwrap().socket);
+        }
         // No /run: /var/run; macOS root the same rule.
         assert_eq!(choose_runtime_dir(0, &without, Some(home), None, Os::Linux, &|_| None).unwrap(), Path::new("/var/run/essence-rc"));
         assert_eq!(choose_runtime_dir(0, &with_xdg, Some(home), None, Os::Mac, &run).unwrap(), Path::new("/run/essence-rc"));
@@ -210,8 +213,10 @@ mod tests {
 
     #[test]
     fn explicit_runtime_dir_wins_and_is_validated() {
-        let explicit = vars(&[("ESSENCE_RC_RUNTIME_DIR", "/srv/rc-run")]);
-        assert_eq!(choose_runtime_dir(0, &explicit, None, None, Os::Linux, &|_| Some(0)).unwrap(), Path::new("/srv/rc-run"));
+        // An absolute path of the host running the test.
+        const EXPLICIT: &str = if cfg!(windows) { r"C:\srv\rc-run" } else { "/srv/rc-run" };
+        let explicit = vars(&[("ESSENCE_RC_RUNTIME_DIR", EXPLICIT)]);
+        assert_eq!(choose_runtime_dir(0, &explicit, None, None, Os::Linux, &|_| Some(0)).unwrap(), Path::new(EXPLICIT));
         assert!(choose_runtime_dir(0, &vars(&[("ESSENCE_RC_RUNTIME_DIR", "")]), None, None, Os::Linux, &|_| None).is_err());
         assert!(choose_runtime_dir(0, &vars(&[("ESSENCE_RC_RUNTIME_DIR", "rel")]), None, None, Os::Linux, &|_| None).is_err());
     }
