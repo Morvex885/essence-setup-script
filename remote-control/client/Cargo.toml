@@ -8,12 +8,17 @@ publish.workspace = true
 [dependencies]
 base64.workspace = true
 dirs.workspace = true
+futures-util.workspace = true
 hex.workspace = true
+rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true
+tokio-tungstenite.workspace = true
+webpki-roots.workspace = true
 zeroize.workspace = true
 
 [target.'cfg(unix)'.dependencies]
@@ -22,3 +27,6 @@ libc.workspace = true
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_System_Console", "Win32_System_Pipes"] }
 
+[dev-dependencies]
+essence-rc-web.workspace = true
+rcgen.workspace = true

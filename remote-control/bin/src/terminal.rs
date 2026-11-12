@@ -24,6 +24,7 @@ pub fn secret_prompt(name: &str) -> &'static str {
         "current-password" => "  Текущий пароль запуска: ",
         "vault-password" => "  Пароль доступа к конфигурации GitHub: ",
         "new-vault-password" => "  Новый пароль доступа к конфигурации GitHub: ",
+        "access-token" => "  Код доступа (essence-rc web link): ",
         // script-password and any future whitelisted name.
         _ => "  Введите пароль: ",
     }

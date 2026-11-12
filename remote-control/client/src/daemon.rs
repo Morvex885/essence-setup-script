@@ -21,9 +21,9 @@ const READ_CHUNK: usize = 64 << 10;
 const CLOSE_WAIT: Duration = Duration::from_secs(2);
 
 /// Everything the request loop waits for arrives through one channel.
-enum Incoming { Line(Zeroizing<String>), Term(TermEvent), Closed(io::Error) }
+pub(crate) enum Incoming { Line(Zeroizing<String>), Term(TermEvent), Closed(io::Error) }
 
-enum Outgoing { Socket(UnboundedSender<Zeroizing<String>>), Channel(Sender<Zeroizing<String>>) }
+pub(crate) enum Outgoing { Socket(UnboundedSender<Zeroizing<String>>), Channel(Sender<Zeroizing<String>>) }
 impl Outgoing {
     fn send(&self, line: Zeroizing<String>) -> io::Result<()> {
         match self {
@@ -55,7 +55,7 @@ pub struct DaemonClient {
     reconnect: Option<Reconnect>,
 }
 
-fn protocol(message: &str) -> io::Error { io::Error::new(io::ErrorKind::InvalidData, message) }
+pub(crate) fn protocol(message: &str) -> io::Error { io::Error::new(io::ErrorKind::InvalidData, message) }
 fn core_exited() -> io::Error { io::Error::new(io::ErrorKind::UnexpectedEof, "Ядро remote-control завершилось.") }
 fn connection_closed() -> io::Error { io::Error::new(io::ErrorKind::BrokenPipe, "Соединение с демоном закрыто.") }
 fn other_version(version: &str) -> io::Error {
@@ -94,12 +94,21 @@ fn serialize_zeroizing(message: &impl Serialize) -> io::Result<Zeroizing<String>
     }
 }
 
+/// `hello` with another protocol number: the payload of the `InvalidData`
+/// error, so a remote connection can report it as such.
+#[derive(Debug)]
+pub(crate) struct ProtocolMismatch(pub Value);
+impl std::fmt::Display for ProtocolMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "Несовместимый протокол демона: {}.", self.0) }
+}
+impl std::error::Error for ProtocolMismatch {}
+
 /// `hello` must be the first message: protocol 3 with a version and an origin.
 fn parse_hello(line: &str) -> io::Result<Hello> {
     let value: Value = serde_json::from_str(line).map_err(|_| protocol("Некорректный ответ демона"))?;
     if value["event"] != "hello" { return Err(protocol("Демон не прислал приветствие")); }
     if value["protocol"] != PROTOCOL {
-        return Err(protocol(&format!("Несовместимый протокол демона: {}.", value["protocol"])));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, ProtocolMismatch(value["protocol"].clone())));
     }
     serde_json::from_value(value).map_err(|_| protocol("Некорректное приветствие демона"))
 }
@@ -280,7 +289,7 @@ impl DaemonClient {
     }
 
     /// Waits for `hello` (until `deadline`, if any; then `TimedOut`).
-    fn start(incoming: Receiver<Incoming>, events: Sender<Incoming>, outgoing: Outgoing, io_thread: Option<JoinHandle<()>>, deadline: Option<Instant>) -> io::Result<Self> {
+    pub(crate) fn start(incoming: Receiver<Incoming>, events: Sender<Incoming>, outgoing: Outgoing, io_thread: Option<JoinHandle<()>>, deadline: Option<Instant>) -> io::Result<Self> {
         let hello = loop {
             let message = match deadline {
                 None => incoming.recv().map_err(|_| core_exited())?,
@@ -473,6 +482,32 @@ impl DaemonClient {
         }
     }
 
+    /// `{"watch":true|false}`: subscribe to `activity` events of all clients.
+    pub fn set_watch(&mut self, on: bool) -> io::Result<()> {
+        if self.dead { return Err(core_exited()); }
+        self.send_message(&serde_json::json!({"watch": on}))
+    }
+
+    /// The next message without `id` (an `activity` event) within `wait`;
+    /// `Ok(None)` when nothing came. Stray request events are skipped; a closed
+    /// connection is an error. Only between requests.
+    pub fn next_event(&mut self, wait: Duration) -> io::Result<Option<Value>> {
+        if self.dead { return Err(core_exited()); }
+        let deadline = Instant::now() + wait;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let line = match self.incoming.recv_timeout(left) {
+                Ok(Incoming::Line(line)) => line,
+                Ok(Incoming::Term(_)) => continue,
+                Ok(Incoming::Closed(error)) => { self.dead = true; return Err(error); }
+                Err(RecvTimeoutError::Timeout) => return Ok(None),
+                Err(RecvTimeoutError::Disconnected) => { self.dead = true; return Err(core_exited()); }
+            };
+            let value: Value = serde_json::from_str(&line).map_err(|_| protocol("Некорректный ответ демона"))?;
+            if value.get("id").is_none() { return Ok(Some(value)); }
+        }
+    }
+
     /// `exchange`, repeated once on a fresh connection after `daemon_stopping`.
     fn request<'t>(&mut self, request: Request<'_>, mut io: Option<&mut (dyn TerminalIo + 't)>, progress: &mut dyn FnMut(Progress<'_>)) -> io::Result<Reply> {
         let reply = self.exchange(request, io.as_deref_mut(), progress)?;
@@ -504,7 +539,8 @@ impl Client for DaemonClient {
     fn terminal(&mut self, request: Request<'_>, io: &mut dyn TerminalIo, progress: &mut dyn FnMut(Progress<'_>)) -> io::Result<Reply> {
         self.request(request, Some(io), progress)
     }
-    /// Local connections know their endpoint; test channels do not.
+    /// Only `connect_local` keeps an endpoint: WebSocket (`--connect`) and
+    /// test channels answer `None`, so local path checks are skipped for them.
     fn local_data_dir(&self) -> Option<&Path> { self.reconnect.as_ref().map(|reconnect| reconnect.endpoint.data_dir.as_path()) }
     /// Ends the I/O thread; waits for it at most [`CLOSE_WAIT`], then detaches
     /// it, so a write stuck on a full socket cannot hang the caller.

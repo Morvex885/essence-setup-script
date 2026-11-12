@@ -36,9 +36,11 @@ impl RcError {
 }
 
 /// 0 never appears on errors; 2 marks decisions the caller must resolve,
-/// `host_key_unknown` and changed plans; 1 is every other failure.
+/// unconfirmed host keys and daemon certificates, and changed plans; 1 is
+/// every other failure.
 pub fn exit_code_for(code: &str) -> u8 {
-    if code == "usage" || code == "host_key_unknown" || code == "plan_changed" || code.ends_with("_required") {
+    const DECISIONS: [&str; 4] = ["usage", "host_key_unknown", "daemon_cert_unknown", "plan_changed"];
+    if DECISIONS.contains(&code) || code.ends_with("_required") {
         2
     } else {
         1

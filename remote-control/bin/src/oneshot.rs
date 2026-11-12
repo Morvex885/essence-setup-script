@@ -1,6 +1,6 @@
 //! Разовый CLI через демон: секреты и входные файлы читаются здесь, команда
-//! уходит демону по локальному сокету, ответ печатается конвертом JSON или
-//! русским человекочитаемым выводом.
+//! уходит демону по локальному сокету (или удалённому по `--connect`), ответ
+//! печатается конвертом JSON или русским человекочитаемым выводом.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -21,13 +21,16 @@ use rc_core::VERSION;
 use serde_json::{Map, Value, json};
 use zeroize::Zeroizing;
 
+use crate::remote::{self, Target};
 use crate::terminal;
 
 /// Скрытый ввод секрета: максимум три попытки на имя (цикл сессии v1).
 const MAX_SECRET_ATTEMPTS: u8 = 3;
 /// Секреты неявного `session open`; разовый вызов принимает их для любой
-/// команды, которой предшествует открытие сессии.
-const SESSION_SECRETS: [&str; 2] = ["script-password", "vault-password"];
+/// команды, которой предшествует открытие сессии. `access-token` — код
+/// доступа сетевого демона (одноразовый: после принятия не повторяется).
+const SESSION_SECRETS: [&str; 3] = ["script-password", "vault-password", "access-token"];
+const ACCESS_TOKEN: &str = "access-token";
 /// Предел пути сокета агента, принимаемый демоном.
 const MAX_AGENT_SOCKET: usize = 4096;
 
@@ -151,6 +154,15 @@ impl Output {
         self.error.as_ref().and_then(|error| error["code"].as_str()).unwrap_or("")
     }
 
+    pub fn exit_code(&self) -> u8 {
+        self.exit
+    }
+
+    /// Текст ошибки (`error.message`); пусто для успеха.
+    pub fn message(&self) -> &str {
+        self.error.as_ref().and_then(|error| error["message"].as_str()).unwrap_or("")
+    }
+
     /// `{"id":null,"ok",["data"],["error"],["sync"]}` — ровно в этом порядке.
     fn envelope(&self) -> Value {
         let mut map = Map::new();
@@ -167,6 +179,11 @@ impl Output {
         }
         Value::Object(map)
     }
+}
+
+/// Итог по ответу демона (для команд вне `run`).
+pub fn output_from_reply(reply: Reply) -> Output {
+    Output::from_reply(reply)
 }
 
 /// Вывод итога: с --json — ровно одна строка JSON на stdout; без него —
@@ -194,12 +211,12 @@ fn emit(output: &Output, json: bool, invocation: Option<&Invocation>) -> io::Res
 
 // ─── Подключение к демону ────────────────────────────────────────────────────
 
-fn failed(message: impl Into<String>) -> RcError {
+pub(crate) fn failed(message: impl Into<String>) -> RcError {
     RcError::new("failed", message)
 }
 
 /// Ошибка клиента протокола как код каталога.
-fn client_error(error: &io::Error) -> RcError {
+pub(crate) fn client_error(error: &io::Error) -> RcError {
     let code = match error.kind() {
         ErrorKind::PermissionDenied => "unsafe_path",
         ErrorKind::InvalidInput => "invalid",
@@ -209,7 +226,7 @@ fn client_error(error: &io::Error) -> RcError {
 }
 
 /// Обрыв соединения посреди запроса — аварийный ответ за демон.
-fn request_error(error: &io::Error) -> RcError {
+pub(crate) fn request_error(error: &io::Error) -> RcError {
     if error.kind() == ErrorKind::UnexpectedEof {
         failed("Ядро завершилось аварийно.")
     } else {
@@ -220,10 +237,15 @@ fn request_error(error: &io::Error) -> RcError {
 /// Локальный демон каталога данных; при отсутствии запускается этот же
 /// исполняемый файл (`daemon run`).
 pub fn connect() -> Result<(DaemonClient, Endpoint)> {
+    connect_spawning(vec!["daemon".into(), "run".into()])
+}
+
+/// `connect` с аргументами запуска демона (`daemon run --web …`).
+pub(crate) fn connect_spawning(args: Vec<String>) -> Result<(DaemonClient, Endpoint)> {
     let root = StatePaths::discover()?.root().to_owned();
     let endpoint = client::endpoint_for(&root).map_err(|error| client_error(&error))?;
     let exe = std::env::current_exe().map_err(|error| failed(format!("Не удалось определить исполняемый файл: {error}")))?;
-    let spawn = SpawnDaemon { exe: exe.clone(), args: vec!["daemon".into(), "run".into()], env: Vec::new() };
+    let spawn = SpawnDaemon { exe: exe.clone(), args, env: Vec::new() };
     let client = DaemonClient::connect_local(&endpoint, Some(&spawn), Some(VERSION), Some(&exe))
         .map_err(|error| client_error(&error))?;
     Ok((client, endpoint))
@@ -275,7 +297,7 @@ fn opens_session(invocation: &Invocation) -> bool {
         || matches!(invocation.noun.as_str(), "daemon" | "web"))
 }
 
-pub fn run(argv: &[String], invocation: &Invocation) -> ExitCode {
+pub fn run(argv: &[String], invocation: &Invocation, target: Option<&Target>) -> ExitCode {
     let runtime = match tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build() {
         Ok(runtime) => runtime,
         Err(error) => {
@@ -286,18 +308,18 @@ pub fn run(argv: &[String], invocation: &Invocation) -> ExitCode {
     // Поздний Ctrl+C не должен оборвать ни команду, ни запись ответа — от
     // подключения до вывода конверта, включая скрытый ввод и терминал.
     let _signals = SignalGuard::install_on(&runtime);
-    let output = execute(argv, invocation).unwrap_or_else(|output| *output);
+    let output = execute(argv, invocation, target).unwrap_or_else(|output| *output);
     finish(output, invocation.json, Some(invocation))
 }
 
 /// Ранний итог (ошибка до ответа команды) — в куче: `Output` велик.
-type Outcome<T> = std::result::Result<T, Box<Output>>;
+pub(crate) type Outcome<T> = std::result::Result<T, Box<Output>>;
 
-fn local(error: RcError) -> Box<Output> {
+pub(crate) fn local(error: RcError) -> Box<Output> {
     Box::new(Output::from_error(error))
 }
 
-fn execute(argv: &[String], invocation: &Invocation) -> Outcome<Output> {
+fn execute(argv: &[String], invocation: &Invocation, target: Option<&Target>) -> Outcome<Output> {
     let session = opens_session(invocation);
     let mut secrets = Secrets::default();
     if invocation.secrets_stdin {
@@ -318,10 +340,17 @@ fn execute(argv: &[String], invocation: &Invocation) -> Outcome<Output> {
     }
     let request_argv = match &export {
         Some(export) => vec!["template".into(), "show".into(), "--name".into(), export.name.clone()],
+        // Пути сертификата `web start` — абсолютные: у демона другой рабочий каталог.
+        None if (invocation.noun.as_str(), invocation.verb.as_str()) == ("web", "start") => {
+            [vec!["web".to_owned(), "start".to_owned()], listener_flags(invocation).map_err(local)?].concat()
+        }
         None => invocation.daemon_argv(argv),
     };
-    let env = agent_env();
-    let (mut client, _) = connect().map_err(local)?;
+    // Агент SSH передаётся только локальному демону (сетевому `env` запрещён).
+    let (mut client, env) = match target {
+        Some(target) => (remote::connect(target).map_err(local)?, None),
+        None => (connect().map_err(local)?.0, agent_env()),
+    };
     if let Err(error) = refuse_key_in_data_dir(invocation, client.local_data_dir()) {
         let _ = client.close();
         return Err(local(error));
@@ -370,7 +399,8 @@ fn execute(argv: &[String], invocation: &Invocation) -> Outcome<Output> {
 const SOURCE_ERRORS: [&str; 7] = ["vault_password_required", "vault_password_invalid", "github_format_outdated",
     "github_format_newer", "github_format_invalid", "locked", "source_failed"];
 
-/// Неявное открытие сессии: только `script-password` и `vault-password`,
+/// Неявное открытие сессии: только `script-password`, `vault-password` и
+/// (сетевой демон) `access-token`,
 /// журнал не печатается; `not_configured` — продолжить к команде, как и
 /// ошибка источника для команды без сессии (`needs_session == false`).
 fn open_session(client: &mut DaemonClient, secrets: &mut Secrets, env: Option<&BTreeMap<String, String>>,
@@ -378,11 +408,19 @@ fn open_session(client: &mut DaemonClient, secrets: &mut Secrets, env: Option<&B
     let argv = vec!["session".to_owned(), "open".to_owned()];
     let open = cli::parse(&argv).map_err(local)?;
     let input = client::Input::default();
+    // Принятый код доступа погашен демоном: повтор (после вопроса о пароле)
+    // идёт без него — соединение уже допущено.
+    let mut token_spent = false;
     loop {
-        let wire = wire_secrets(secrets, &SESSION_SECRETS);
+        let names: &[&str] = if token_spent { &SESSION_SECRETS[..2] } else { &SESSION_SECRETS };
+        let wire = wire_secrets(secrets, names);
+        let sent_token = names.contains(&ACCESS_TOKEN) && secrets.get(ACCESS_TOKEN).is_some();
         let reply = client
             .send(Request { argv: &argv, secrets: &wire, input: &input, env }, &mut |_| {})
             .map_err(|error| { let _ = client.close(); local(request_error(&error)) })?;
+        if sent_token && reply.error["secret"] != ACCESS_TOKEN {
+            token_spent = true;
+        }
         if reply.ok || reply.code() == "not_configured" {
             return Ok(());
         }
@@ -396,15 +434,64 @@ fn open_session(client: &mut DaemonClient, secrets: &mut Secrets, env: Option<&B
     }
 }
 
-/// `daemon start`: подключиться (запустив демон) и напечатать точку и pid.
+/// Флаги слушателя `--bind`, `--port`, `--tls-cert`, `--tls-key`, `--no-tls`
+/// как argv. Пути сертификата — абсолютные: демон работает в своём каталоге.
+pub fn listener_flags(invocation: &Invocation) -> Result<Vec<String>> {
+    let mut flags = Vec::new();
+    for name in ["bind", "port", "tls-cert", "tls-key"] {
+        let Some(value) = invocation.value(name) else { continue };
+        let value = if name.starts_with("tls-") { absolute_file(value)? } else { value.to_owned() };
+        flags.extend([format!("--{name}"), value]);
+    }
+    if invocation.has("no-tls") {
+        flags.push("--no-tls".into());
+    }
+    Ok(flags)
+}
+
+/// Путь файла от рабочего каталога CLI (у демона он свой).
+fn absolute_file(value: &str) -> Result<String> {
+    std::path::absolute(value)
+        .map(|path| path.to_string_lossy().into_owned())
+        .map_err(|_| RcError::new("invalid", format!("Файл {value} недоступен.")))
+}
+
+/// Предупреждение об открытой панели (`web.open`): не loopback, нет пароля.
+pub fn warn_open_panel(web: &Value) {
+    if web["open"] == true {
+        let _ = writeln!(io::stderr().lock(), "  [!] Пароль запуска не задан: панель доступна всем в сети.");
+    }
+}
+
+/// `daemon start [--web …]`: подключиться (запустив демон) и напечатать
+/// точку и pid. С `--web` новый демон запускается со слушателем; уже
+/// работающему без слушателя отправляется `web start` с теми же флагами.
 pub fn daemon_start(invocation: &Invocation) -> ExitCode {
     let output = (|| -> Outcome<Output> {
-        let (mut client, endpoint) = connect().map_err(local)?;
-        let argv = vec!["daemon".to_owned(), "status".to_owned()];
+        let web = invocation.has("web");
+        let flags = listener_flags(invocation).map_err(local)?;
+        if !web && !flags.is_empty() {
+            return Err(local(RcError::new("usage", "Флаги слушателя указываются вместе с --web.")));
+        }
+        let mut args = vec!["daemon".to_owned(), "run".to_owned()];
+        if web {
+            args.push("--web".into());
+            args.extend(flags.iter().cloned());
+        }
+        let (mut client, endpoint) = connect_spawning(args).map_err(local)?;
         let (secrets, input) = (client::Secrets::default(), client::Input::default());
-        let status = client
-            .send(Request::new(&argv, &secrets, &input), &mut |_| {})
-            .map_err(|error| local(request_error(&error)))?;
+        let ask = |client: &mut DaemonClient, argv: Vec<String>| {
+            client.send(Request::new(&argv, &secrets, &input), &mut |_| {}).map_err(|error| local(request_error(&error)))
+        };
+        let mut status = ask(&mut client, vec!["daemon".into(), "status".into()])?;
+        if status.ok && web && status.data["web"].is_null() {
+            let started = ask(&mut client, [vec!["web".to_owned(), "start".to_owned()], flags].concat())?;
+            if !started.ok {
+                let _ = client.close();
+                return Err(Box::new(Output::from_reply(started)));
+            }
+            status = ask(&mut client, vec!["daemon".into(), "status".into()])?;
+        }
         let _ = client.close();
         if !status.ok {
             return Err(Box::new(Output::from_reply(status)));
@@ -413,7 +500,12 @@ pub fn daemon_start(invocation: &Invocation) -> ExitCode {
         let address = endpoint.socket.display().to_string();
         #[cfg(windows)]
         let address = endpoint.pipe.clone();
-        Ok(Output::success(json!({"endpoint": address, "pid": status.data["pid"]})))
+        let mut data = json!({"endpoint": address, "pid": status.data["pid"]});
+        if web {
+            warn_open_panel(&status.data["web"]);
+            data["web"] = status.data["web"].clone();
+        }
+        Ok(Output::success(data))
     })()
     .unwrap_or_else(|output| *output);
     finish(output, invocation.json, Some(invocation))
@@ -744,6 +836,24 @@ mod tests {
 
     fn args(words: &[&str]) -> Vec<String> {
         words.iter().map(|word| (*word).to_owned()).collect()
+    }
+
+    #[test]
+    fn listener_flags_make_certificate_paths_absolute() {
+        let cwd = std::env::current_dir().unwrap();
+        for argv in [
+            args(&["web", "start", "--tls-cert", "c.pem", "--tls-key=k/k.pem", "--port", "9", "--bind", "0.0.0.0"]),
+            args(&["daemon", "start", "--web", "--tls-cert", "c.pem", "--tls-key=k/k.pem", "--port", "9", "--bind", "0.0.0.0"]),
+        ] {
+            let flags = listener_flags(&cli::parse_client(&argv).unwrap()).unwrap();
+            let cert = cwd.join("c.pem").to_string_lossy().into_owned();
+            // `std::path::absolute` на Windows приводит `/` к `\`.
+            let key = cwd.join("k").join("k.pem").to_string_lossy().into_owned();
+            assert_eq!(flags, args(&["--bind", "0.0.0.0", "--port", "9", "--tls-cert", &cert, "--tls-key", &key]), "{argv:?}");
+        }
+        let absolute = if cfg!(windows) { r"C:\certs\c.pem" } else { "/certs/c.pem" };
+        let flags = listener_flags(&cli::parse_client(&args(&["web", "start", "--tls-cert", absolute, "--tls-key", absolute, "--no-tls"])).unwrap()).unwrap();
+        assert_eq!(flags, args(&["--tls-cert", absolute, "--tls-key", absolute, "--no-tls"]));
     }
 
     fn export(words: &[&str]) -> Result<Export> {

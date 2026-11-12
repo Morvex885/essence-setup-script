@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use essence_rc_client::Origin;
 use rc_core::dispatch::{self, Envelope, Session};
 use rc_core::error::Result;
 use rc_core::log::{self, Level, LogSink};
@@ -16,13 +17,16 @@ use rc_core::request_input::Input;
 use rc_core::request_secrets::Secrets;
 use rc_core::state::{State, StatePaths};
 use rc_core::transport::PtyRequest;
+use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::runtime::Handle;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
-use super::Shared;
+use super::access::{self, Gate, OpenOutcome, Token};
+use super::commands::OPEN_PANEL_WARNING;
 use super::conn::{Conn, daemon_stopping, session_closed};
 use super::terminal::{self, InputReceiver, Reservation, STOP_WAIT};
+use super::{Shared, lock};
 
 /// What the rest of the daemon may know about the core without asking it
 /// (`daemon status`, phase 2 admission and listener warnings).
@@ -71,10 +75,28 @@ pub struct TerminalRequest {
 
 pub enum Job {
     Command(Request),
-    SessionOpen(Request),
+    /// A network `session open` reports how it ended to the throttle.
+    SessionOpen(Request, Option<oneshot::Sender<OpenOutcome>>),
     TerminalPrep(Request, TerminalRequest),
     /// The last job: terminals, `Session::close`, the initiator's reply.
     Shutdown { initiator: Option<(Arc<Conn>, Value)> },
+}
+
+/// `{"id","event":"access","resume"}`: the resume token of a network
+/// connection that just authorized itself.
+#[derive(Serialize)]
+struct AccessEvent<'a> {
+    id: &'a Value,
+    event: &'static str,
+    resume: &'a str,
+}
+
+/// What the end of a `session open` job still has to do.
+struct Opened {
+    network: bool,
+    was_authorized: bool,
+    resumed: bool,
+    done: Option<oneshot::Sender<OpenOutcome>>,
 }
 
 /// The request whose journal the session currently produces.
@@ -140,7 +162,11 @@ async fn core_loop(
 /// Answers a job that will not run with `daemon_stopping`.
 fn refuse(shared: &Shared, job: Job) {
     let (request, reservation) = match job {
-        Job::Command(request) | Job::SessionOpen(request) => (request, None),
+        Job::SessionOpen(request, Some(_)) => {
+            request.conn.finish_open();
+            (request, None)
+        }
+        Job::Command(request) | Job::SessionOpen(request, None) => (request, None),
         Job::TerminalPrep(request, terminal) => (request, terminal.reservation),
         Job::Shutdown { .. } => return,
     };
@@ -164,7 +190,7 @@ fn password_hash(session: &Session) -> Option<Option<String>> {
 async fn run_job(shared: &Arc<Shared>, session: &mut Session, current: &Current, handle: &Handle, job: Job) {
     let (request, kind) = match job {
         Job::Command(request) => (request, Kind::Command),
-        Job::SessionOpen(request) => (request, Kind::SessionOpen),
+        Job::SessionOpen(request, done) => (request, Kind::SessionOpen(done)),
         Job::TerminalPrep(request, terminal) => (request, Kind::Terminal(terminal)),
         Job::Shutdown { .. } => unreachable!("handled by core_loop"),
     };
@@ -181,6 +207,9 @@ async fn run_job(shared: &Arc<Shared>, session: &mut Session, current: &Current,
     };
     if let Some(error) = refusal {
         let reservation = match &kind { Kind::Terminal(terminal) => terminal.reservation.as_ref(), _ => None };
+        if matches!(kind, Kind::SessionOpen(Some(_))) {
+            conn.finish_open();
+        }
         discard(shared, &request, reservation);
         if let Some(error) = error {
             conn.fail(&request.id, error);
@@ -194,6 +223,7 @@ async fn run_job(shared: &Arc<Shared>, session: &mut Session, current: &Current,
     *current.borrow_mut() = Some((conn.clone(), request.id.clone()));
     let before = password_hash(session);
     let agent = request.agent.as_deref();
+    let mut opened = None;
     let reply = match kind {
         Kind::Command => {
             let mut envelope = dispatch::dispatch(&request.argv, &request.secrets, &request.input, agent, session).await;
@@ -201,11 +231,23 @@ async fn run_job(shared: &Arc<Shared>, session: &mut Session, current: &Current,
                 let core = data["authorized"].as_bool().unwrap_or(false);
                 data["authorized"] = Value::Bool(conn.is_authorized() && core);
             }
+            if request.label == "self password-remove" && shared.open_panel_after_password_removal() {
+                note_open_panel(&mut envelope);
+            }
             Some(envelope)
         }
-        Kind::SessionOpen => {
+        Kind::SessionOpen(done) => {
+            let network = conn.origin == Origin::Network;
+            let token = match request.secrets.get("access-token") {
+                Some(token) if network => lock(&shared.tokens).check(token, Instant::now()),
+                _ => Token::Absent,
+            };
+            let loopback = shared.web_info().is_none_or(|info| info.loopback());
+            let was_authorized = conn.is_authorized();
             let mut steps = SessionSteps { session: &mut *session, request: &request, agent };
-            Some(open_session(&mut steps, conn.authorized_flag()).await)
+            let (envelope, resumed) = open_session(&mut steps, conn.authorized_flag(), network, token, loopback).await;
+            opened = Some(Opened { network, was_authorized, resumed, done });
+            Some(envelope)
         }
         Kind::Terminal(terminal) => {
             match dispatch::prepare_terminal(&request.argv, &request.secrets, &request.input, agent, session).await {
@@ -224,9 +266,21 @@ async fn run_job(shared: &Arc<Shared>, session: &mut Session, current: &Current,
     if password_hash(session) != before {
         shared.password_changed(conn.id);
     }
+    // 7. After the reset above, which voids tokens.
+    if let Some(opened) = &opened {
+        grant_resume(shared, &conn, &request.id, opened.network, opened.was_authorized);
+    }
     let succeeded = reply.as_ref().is_some_and(|envelope| envelope.ok);
+    let code = reply.as_ref().and_then(|envelope| envelope.error.as_ref()).map(|error| error.code);
     if let Some(envelope) = reply {
+        // A network `session open` frees its slot before the client can answer the reply.
+        if matches!(opened, Some(Opened { done: Some(_), .. })) {
+            conn.finish_open();
+        }
         conn.reply(&request.id, envelope);
+    }
+    if let Some(Opened { resumed, done: Some(done), .. }) = opened {
+        let _ = done.send(access::outcome(code, conn.is_authorized(), resumed));
     }
     shared.activity(&json!({"event": "activity", "state": "end", "command": request.label, "origin": conn.origin}));
     shared.set_busy(None);
@@ -234,9 +288,10 @@ async fn run_job(shared: &Arc<Shared>, session: &mut Session, current: &Current,
     if succeeded {
         match request.label.as_str() {
             // The running binary is gone or replaced: stop after the reply;
-            // a persistent daemon comes back as the new binary.
+            // a persistent daemon (or one with a listener) comes back as the
+            // new binary, with its listener.
             "self update" => {
-                if shared.persistent {
+                if shared.is_persistent() {
                     shared.restart.store(true, Ordering::SeqCst);
                 }
                 shared.begin_stop(None);
@@ -251,8 +306,29 @@ async fn run_job(shared: &Arc<Shared>, session: &mut Session, current: &Current,
 
 enum Kind {
     Command,
-    SessionOpen,
+    SessionOpen(Option<oneshot::Sender<OpenOutcome>>),
     Terminal(TerminalRequest),
+}
+
+/// П4 step 7: a network connection that just authorized itself gets
+/// `{"id","event":"access","resume"}` before the reply; nothing while it
+/// is not authorized.
+fn grant_resume(shared: &Shared, conn: &Conn, id: &Value, network: bool, was_authorized: bool) {
+    if network && !was_authorized && conn.is_authorized() {
+        let resume = lock(&shared.tokens).issue_resume(Instant::now());
+        conn.send(&AccessEvent { id, event: "access", resume: &resume });
+    }
+}
+
+/// П9: removing the password while a non-loopback listener runs opens the
+/// panel to the network; the plan says so (its token stays the core's).
+fn note_open_panel(envelope: &mut Envelope) {
+    if let Some(error) = envelope.error.as_mut()
+        && error.code == "confirmation_required"
+        && let Some(Value::Array(plan)) = error.extra.get_mut("plan")
+    {
+        plan.push(Value::String(OPEN_PANEL_WARNING.to_owned()));
+    }
 }
 
 /// Cancel terminals and wait for them (≤ 5 s), close the session, answer
@@ -309,41 +385,55 @@ impl OpenSteps for SessionSteps<'_> {
     }
 }
 
-/// `session open` of connection `C` (П4, local steps 2, 4, 5, 6; the
-/// network admission steps 1, 3, 7 wrap this in phase 2).
-pub(super) async fn open_session(steps: &mut impl OpenSteps, authorized: &AtomicBool) -> Envelope {
-    // 2. The script password first, before anything else happens.
-    if let Err(error) = steps.verify_script_password() {
-        return Envelope::failure(error);
-    }
+/// `session open` of connection `C` (П4 steps 1–6; step 7, the resume
+/// token, follows in `run_job`). `network`, `token` and `loopback` feed the
+/// admission steps 1–3; returns the reply and whether a resume token
+/// admitted the connection.
+pub(super) async fn open_session(
+    steps: &mut impl OpenSteps,
+    authorized: &AtomicBool,
+    network: bool,
+    token: Token,
+    loopback: bool,
+) -> (Envelope, bool) {
+    let password_set = match steps.password_hash() {
+        Ok(hash) => hash.is_some(),
+        Err(error) => return (Envelope::failure(error), false),
+    };
+    // 1–3. The token, then the script password (unless resumed), before
+    // anything else happens.
+    let resumed = match access::admit(Gate { network, token, password_set, loopback }, || steps.verify_script_password()) {
+        Ok(resumed) => resumed,
+        Err(error) => return (Envelope::failure(error), false),
+    };
     // 4. Absent configuration: an empty local session, answered not_configured.
     match steps.configured() {
-        Err(error) => return Envelope::failure(error),
+        Err(error) => return (Envelope::failure(error), resumed),
         Ok(false) => {
             authorized.store(true, Ordering::SeqCst);
             if let Err(error) = steps.open_absent() {
-                return Envelope::failure(error);
+                return (Envelope::failure(error), resumed);
             }
-            return steps.dispatch().await;
+            return (steps.dispatch().await, resumed);
         }
         Ok(true) => {}
     }
     // 5. Opening may bring another password (a GitHub snapshot): prove it again.
     let before = match steps.password_hash() {
         Ok(hash) => hash,
-        Err(error) => return Envelope::failure(error),
+        Err(error) => return (Envelope::failure(error), resumed),
     };
     let envelope = steps.dispatch().await;
     if steps.password_hash().ok() != Some(before)
         && let Err(error) = steps.verify_script_password()
     {
         authorized.store(false, Ordering::SeqCst);
-        return Envelope::failure(error);
+        return (Envelope::failure(error), resumed);
     }
     // 6. The password is proven even when the source failed to open; the
     // core still refuses session commands until it opens.
     authorized.store(true, Ordering::SeqCst);
-    envelope
+    (envelope, resumed)
 }
 
 #[cfg(test)]
@@ -404,9 +494,16 @@ mod tests {
     }
 
     async fn open(steps: &mut FakeSteps, was: bool) -> (Option<&'static str>, bool) {
+        let (code, authorized, _) = open_network(steps, was, false, Token::Absent, true).await;
+        (code, authorized)
+    }
+
+    async fn open_network(steps: &mut FakeSteps, was: bool, network: bool, token: Token, loopback: bool)
+        -> (Option<&'static str>, bool, bool)
+    {
         let authorized = AtomicBool::new(was);
-        let envelope = open_session(steps, &authorized).await;
-        (envelope.error.map(|error| error.code), authorized.load(Ordering::SeqCst))
+        let (envelope, resumed) = open_session(steps, &authorized, network, token, loopback).await;
+        (envelope.error.map(|error| error.code), authorized.load(Ordering::SeqCst), resumed)
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -456,5 +553,73 @@ mod tests {
         // The source removed the password: nothing to prove.
         let mut steps = FakeSteps { password: Some("p"), secret: Some("p"), configured: true, opened_password: Some(None), ..FakeSteps::default() };
         assert_eq!(open(&mut steps, false).await, (None, true));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_loopback_panel_without_a_password_admits_code_holders_only() {
+        let mut steps = FakeSteps { configured: true, ..FakeSteps::default() };
+        assert_eq!(open_network(&mut steps, false, true, Token::Absent, true).await, (Some("auth_required"), false, false));
+        assert_eq!(open_network(&mut steps, false, true, Token::Invalid, true).await, (Some("auth_failed"), false, false));
+        assert!(steps.calls.is_empty(), "nothing opens before admission");
+        assert_eq!(open_network(&mut steps, false, true, Token::Ticket, true).await, (None, true, false));
+        // A non-loopback panel without a password is open to everyone.
+        assert_eq!(open_network(&mut steps, false, true, Token::Absent, false).await, (None, true, false));
+        // A resume token is enough.
+        assert_eq!(open_network(&mut steps, false, true, Token::Resume, true).await, (None, true, true));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_code_does_not_replace_the_password_but_a_resume_token_does() {
+        let mut steps = FakeSteps { password: Some("p"), configured: true, ..FakeSteps::default() };
+        assert_eq!(open_network(&mut steps, false, true, Token::Ticket, true).await, (Some("auth_required"), false, false));
+        assert_eq!(open_network(&mut steps, false, true, Token::Resume, true).await, (None, true, true));
+        // A resumed connection still proves a password the source brings.
+        let mut steps = FakeSteps { configured: true, opened_password: Some(Some("q")), ..FakeSteps::default() };
+        assert_eq!(open_network(&mut steps, false, true, Token::Resume, false).await, (Some("auth_required"), false, true));
+    }
+
+    #[test]
+    fn the_password_removal_plan_names_the_open_panel() {
+        let plan = || RcError::new("confirmation_required", "Нужно подтверждение.")
+            .with_extra("plan", json!(["Удалить пароль запуска."]))
+            .with_extra("plan_token", "09c26975fdb6404d");
+        let mut envelope = Envelope::failure(plan());
+        note_open_panel(&mut envelope);
+        let error = envelope.error.unwrap();
+        assert_eq!(error.extra["plan"], json!(["Удалить пароль запуска.", OPEN_PANEL_WARNING]));
+        assert_eq!(error.extra["plan_token"], "09c26975fdb6404d", "the token stays");
+        let mut other = Envelope::failure(RcError::new("auth_failed", "Неверный пароль запуска."));
+        note_open_panel(&mut other);
+        assert!(!other.error.unwrap().extra.contains_key("plan"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_code_without_the_set_password_emits_no_access_event() {
+        use super::super::conn::Out;
+        let (shared, _jobs) = super::super::tests::shared();
+        let (out, mut lines) = mpsc::unbounded_channel();
+        let conn = Conn::new(1, Origin::Network, out);
+        let id = json!("open");
+
+        // Password set, a valid code, no password: refused, and no token.
+        let mut steps = FakeSteps { password: Some("p"), configured: true, ..FakeSteps::default() };
+        let (envelope, _) = open_session(&mut steps, conn.authorized_flag(), true, Token::Ticket, true).await;
+        assert_eq!(envelope.error.map(|error| error.code), Some("auth_required"));
+        grant_resume(&shared, &conn, &id, true, false);
+        assert!(lines.try_recv().is_err(), "no access event for an unauthorized connection");
+
+        // No password: the code admits, the access event carries a resume token.
+        let mut steps = FakeSteps { configured: true, ..FakeSteps::default() };
+        let (envelope, _) = open_session(&mut steps, conn.authorized_flag(), true, Token::Ticket, true).await;
+        assert!(envelope.ok);
+        grant_resume(&shared, &conn, &id, true, false);
+        let Ok(Out::Line(line, None)) = lines.try_recv() else { panic!("an access event") };
+        let event: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!((event["id"].clone(), event["event"].clone()), (id.clone(), json!("access")));
+        let resume = event["resume"].as_str().unwrap();
+        assert_eq!(lock(&shared.tokens).check(resume, Instant::now()), Token::Resume);
+        // Already authorized before: no second token.
+        grant_resume(&shared, &conn, &id, true, true);
+        assert!(lines.try_recv().is_err());
     }
 }

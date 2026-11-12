@@ -21,7 +21,7 @@
 - Диспетчер `rc_core::dispatch::dispatch(argv, secrets, &mut Session)` — единая точка разового CLI и `serve`; ровно один конверт `{"id","ok","data"|"error","sync"?}` на вызов.
 - Мутации состояния — только `Session::mutate(label, |state| …)` (блокировка → изменение → checkpoint/GitHub-flush). Никаких прямых записей конфигурации из обработчиков.
 - Подтверждение — `confirmation::Plan::new(lines, extra)` + `plan.confirm(invocation)`: без `--yes` → `confirmation_required{plan,plan_token}`, изменившийся план → `plan_changed`. План строится до любых мутаций и удалённых эффектов (read-only preflight допустим).
-- Секреты — только `rc_core::request_secrets::Secrets` (whitelist `password`, `current-password`, `vault-password`, `new-vault-password`, `script-password`): передаются полем `secrets` запроса serve или `--secrets-stdin`, хранятся в `Zeroizing`, не попадают в argv/env детей, журнал, `data` и extra.
+- Секреты — только `rc_core::request_secrets::Secrets` (whitelist `password`, `current-password`, `vault-password`, `new-vault-password`, `script-password`, `access-token` — только `session open`): передаются полем `secrets` запроса serve или `--secrets-stdin`, хранятся в `Zeroizing`, не попадают в argv/env детей, журнал, `data` и extra.
 - SSH — только через `RemoteTransport` (`remote-control/core/src/transport.rs`); производство — `SshTransport` на russh, тесты — `FakeTransport` со скриптованными шагами и журналом.
 - Обработчик не спрашивает пользователя: нехватка решения — код `*_required` с extra (`choices`, `nodes`, отпечатки), вопрос задаёт фронтенд и повторяет команду с флагом или секретом.
 - Журнал — `session.log(Level, text)`; serve превращает записи в события `{"event":"log"}`, разовый CLI печатает их с префиксами v1. C0/C1 вырезаются.
