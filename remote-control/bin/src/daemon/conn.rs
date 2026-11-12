@@ -251,6 +251,13 @@ impl Conn {
     pub fn close_output(&self) {
         let _ = self.out.send(Out::Close);
     }
+
+    /// The network `session open` of this connection is answered: the next
+    /// one is accepted. Cleared before the reply goes out, so a client that
+    /// sends the next `session open` right after the reply is not refused.
+    pub(super) fn finish_open(&self) {
+        self.opening.store(false, Ordering::SeqCst);
+    }
 }
 
 pub fn invalid_request() -> RcError {
@@ -762,12 +769,14 @@ async fn network_open(shared: Arc<Shared>, request: Request) {
     announce_wait(&shared, &conn, &id);
     let (done, outcome) = oneshot::channel::<OpenOutcome>();
     if !shared.enqueue(Job::SessionOpen(request, Some(done))) {
+        conn.finish_open();
         conn.fail(&id, daemon_stopping());
     } else if let Ok(outcome) = outcome.await {
         *failures = access::advance(*failures, outcome);
     }
     drop(failures);
-    conn.opening.store(false, Ordering::SeqCst);
+    // The core clears it before its reply; a job dropped unanswered does not.
+    conn.finish_open();
 }
 
 /// A request queued behind the executing one learns what it waits for;
@@ -949,6 +958,37 @@ mod tests {
 
     fn shared() -> Arc<Shared> {
         super::super::tests::shared().0
+    }
+
+    /// The flag of a network `session open` is cleared before its reply is
+    /// queued: a client that answers the reply with the next `session open`
+    /// is never refused as a duplicate. Nothing else clears it here (no
+    /// `network_open` task), so the check is deterministic.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_network_open_frees_its_slot_before_the_reply() {
+        let (shared, jobs) = super::super::tests::shared();
+        let data = tempfile::tempdir().unwrap();
+        let snapshot = tokio::sync::watch::channel(super::super::core::CoreSnapshot::default()).0;
+        let paths = rc_core::state::StatePaths::new(data.path());
+        let core = super::super::core::spawn(shared.clone(), paths, jobs, snapshot, tokio::runtime::Handle::current()).unwrap();
+        let (out, mut lines) = mpsc::unbounded_channel();
+        let conn = shared.register(Origin::Network, out);
+        conn.opening.store(true, Ordering::SeqCst);
+        let (done, _outcome) = oneshot::channel::<OpenOutcome>();
+        let request = Request {
+            conn: conn.clone(), id: serde_json::json!(1), label: "session open".into(), argv: vec!["session".into(), "open".into()],
+            secrets: Secrets::default(), input: Input::default(), agent: None, needs_auth: false,
+        };
+        assert!(shared.enqueue(Job::SessionOpen(request, Some(done))));
+        let reply = loop {
+            let Some(Out::Line(text, None)) = lines.recv().await else { panic!("the connection stays open") };
+            if text.contains(r#""id":1"#) && text.contains(r#""ok""#) {
+                break text;
+            }
+        };
+        assert!(!conn.opening.load(Ordering::SeqCst), "the slot is free when the reply is out: {}", reply.as_str());
+        shared.begin_stop(None);
+        tokio::task::spawn_blocking(move || core.join().unwrap()).await.unwrap();
     }
 
     /// Reads nothing, accepts no writes.
