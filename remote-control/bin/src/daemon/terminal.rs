@@ -43,7 +43,9 @@ pub const STOP_WAIT: Duration = Duration::from_secs(5);
 /// Input events queued for one terminal before its session reads them.
 pub const INPUT_QUEUE: usize = 64;
 /// Decoded input bytes queued for one terminal (one `stdin` message decodes
-/// to at most 3 MiB, so a single message always fits).
+/// to at most 3 MiB, so a single message always fits). The session reads
+/// from this queue only while its own write buffer (`rc_core::ssh`, also
+/// 4 MiB) has room, so input stays bounded end to end.
 pub const INPUT_LIMIT: usize = 4 << 20;
 
 /// The connection side of a terminal's input: bounded by [`INPUT_QUEUE`]

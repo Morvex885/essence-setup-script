@@ -382,11 +382,71 @@ async fn execute(connection: &Connection, command: &str, stdin: &[u8], timeout: 
 const INTERACTIVE_SETUP: Duration = Duration::from_secs(15);
 /// Console events buffered while the channel cannot take more input.
 const INPUT_QUEUE: usize = 64;
+/// Input bytes buffered (queued and in flight) while the channel cannot take
+/// more: a console delivering large pastes is not read beyond this.
+const INPUT_BYTES: usize = 4 << 20;
 
 enum Outgoing {
     Data(Vec<u8>),
     Resize(u32, u32),
     Eof,
+}
+
+impl Outgoing {
+    fn bytes(&self) -> usize {
+        match self {
+            Outgoing::Data(data) => data.len(),
+            _ => 0,
+        }
+    }
+}
+
+/// Console input waiting for the channel, bounded by [`INPUT_QUEUE`] events
+/// and [`INPUT_BYTES`] bytes. The bytes of the write in flight count until
+/// it completes.
+#[derive(Default)]
+struct InputQueue {
+    items: VecDeque<Outgoing>,
+    bytes: usize,
+    in_flight: usize,
+}
+
+impl InputQueue {
+    /// Room for one more console event.
+    fn accepting(&self) -> bool {
+        self.items.len() < INPUT_QUEUE && self.bytes < INPUT_BYTES
+    }
+
+    fn push(&mut self, event: ConsoleEvent) {
+        let outgoing = match event {
+            ConsoleEvent::Input(data) => Outgoing::Data(data),
+            ConsoleEvent::Resize(size) => {
+                // Only the latest pending size matters.
+                if let Some(Outgoing::Resize(..)) = self.items.back() { self.items.pop_back(); }
+                Outgoing::Resize(size.cols.into(), size.rows.into())
+            }
+            ConsoleEvent::Closed => Outgoing::Eof,
+        };
+        self.bytes += outgoing.bytes();
+        self.items.push_back(outgoing);
+    }
+
+    /// The next write; its bytes stay counted until [`InputQueue::sent`].
+    fn next(&mut self) -> Option<Outgoing> {
+        let outgoing = self.items.pop_front()?;
+        self.in_flight = outgoing.bytes();
+        Some(outgoing)
+    }
+
+    fn sent(&mut self) {
+        self.bytes -= self.in_flight;
+        self.in_flight = 0;
+    }
+
+    fn clear(&mut self) {
+        self.items.clear();
+        self.bytes = self.in_flight;
+    }
 }
 
 type Sending<'w> = Pin<Box<dyn Future<Output = std::result::Result<(), russh::Error>> + 'w>>;
@@ -426,35 +486,30 @@ async fn interactive(connection: &Connection, command: &str, pty: PtyRequest,
         Ok((reader, guard))
     }).await.map_err(|_| remote_failure("timeout"))??;
     let writer = guard.0.as_ref().expect("owned command writer");
-    let mut queue = VecDeque::new();
+    let mut queue = InputQueue::default();
     let mut sending: Option<Sending<'_>> = None;
     let mut input_open = true;
     let mut status = None;
     loop {
         if sending.is_none() {
-            sending = queue.pop_front().map(|outgoing| send(writer, outgoing));
+            sending = queue.next().map(|outgoing| send(writer, outgoing));
         }
-        let accepting = input_open && queue.len() < INPUT_QUEUE;
+        let accepting = input_open && queue.accepting();
         tokio::select! {
             sent = async { sending.as_mut().expect("in-flight input").await }, if sending.is_some() => {
                 sending = None;
+                queue.sent();
                 if sent.is_err() {
                     // The remote side stopped taking input; keep draining output.
                     input_open = false;
                     queue.clear();
                 }
             }
-            event = poll_fn(|cx| console.poll_event(cx)), if accepting => match event {
-                ConsoleEvent::Input(data) => queue.push_back(Outgoing::Data(data)),
-                ConsoleEvent::Resize(size) => {
-                    // Only the latest pending size matters.
-                    if let Some(Outgoing::Resize(..)) = queue.back() { queue.pop_back(); }
-                    queue.push_back(Outgoing::Resize(size.cols.into(), size.rows.into()));
-                }
-                ConsoleEvent::Closed => {
+            event = poll_fn(|cx| console.poll_event(cx)), if accepting => {
+                if matches!(event, ConsoleEvent::Closed) {
                     input_open = false;
-                    queue.push_back(Outgoing::Eof);
                 }
+                queue.push(event);
             },
             message = reader.wait() => match message {
                 Some(ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. }) => {
@@ -772,5 +827,43 @@ async fn publish_version(session: &RawSftpSession, temporary: &str, target: &str
     }
     session.rename(temporary, target).await.map_err(sftp_error)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::ConsoleSize;
+
+    /// Large pastes stop the console from being read once the buffered
+    /// bytes reach the limit, queued or in flight, until a write completes.
+    #[test]
+    fn interactive_input_is_bounded_by_bytes_until_written() {
+        let mut queue = InputQueue::default();
+        let chunk = 1 << 20;
+        for _ in 0..INPUT_BYTES / chunk {
+            assert!(queue.accepting());
+            queue.push(ConsoleEvent::Input(vec![b'k'; chunk]));
+        }
+        assert!(!queue.accepting(), "4 MiB buffered: the console is not read");
+        assert!(matches!(queue.next(), Some(Outgoing::Data(_))));
+        assert!(!queue.accepting(), "the write in flight still counts");
+        queue.sent();
+        assert!(queue.accepting(), "a completed write frees its bytes");
+        queue.clear();
+        assert_eq!(queue.bytes, 0);
+    }
+
+    #[test]
+    fn interactive_input_keeps_the_event_bound_and_one_pending_resize() {
+        let mut queue = InputQueue::default();
+        let size = ConsoleSize { cols: 80, rows: 24 };
+        queue.push(ConsoleEvent::Resize(size));
+        queue.push(ConsoleEvent::Resize(size));
+        assert_eq!(queue.items.len(), 1, "only the latest size is pending");
+        for _ in 1..INPUT_QUEUE {
+            queue.push(ConsoleEvent::Input(vec![b'k']));
+        }
+        assert!(!queue.accepting(), "64 events");
+    }
 }
 
