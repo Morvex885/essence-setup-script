@@ -108,10 +108,14 @@ Intel/Apple Silicon, Termux aarch64), скачивает `essence-rc-<target>.ta
    (Get-FileHash .\essence-rc-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash.ToLower()
    Select-String essence-rc-x86_64-pc-windows-msvc.zip .\SHA256SUMS
    ```
-3. Распакуйте `essence-rc.exe` в каталог из `PATH` (например, `%USERPROFILE%\bin`) и запустите:
-   ```cmd
-   essence-rc
+3. Распакуйте `essence-rc.exe`, например, в `%USERPROFILE%\bin`. Если этого каталога
+   нет в `PATH`, добавьте его один раз (PowerShell, затем откройте новое окно терминала):
+   ```powershell
+   New-Item -ItemType Directory -Force "$env:USERPROFILE\bin" | Out-Null
+   [Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path', 'User') + ";$env:USERPROFILE\bin", 'User')
    ```
+   Затем запустите `essence-rc` (или без настройки `PATH` — по полному пути
+   `%USERPROFILE%\bin\essence-rc.exe`).
 
 **Из исходников (для разработки):**
 ```bash
