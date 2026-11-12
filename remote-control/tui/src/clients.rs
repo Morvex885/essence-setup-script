@@ -1,4 +1,4 @@
-//! Clients, groups/templates, generation and subscriptions: serve-only screens
+//! Clients, groups/templates, generation and subscriptions: daemon-only screens
 //! (v1 `tui/clients.sh` plus the share bundle of `tui/client.sh`).
 //!
 //! Deliberate v1 fixes: the TTL is a cancellable menu (12h/30d/2w, keep/none,
@@ -6,13 +6,16 @@
 //! `null` path; EOF while answering a question cancels only that action;
 //! editor changes are imported through the same frozen-plan confirmation as
 //! file imports (v1 passed a blind `--yes`); read failures of a screen offer
-//! an explicit retry. Partial results are read from `error` (serve v2 sends
-//! no `data` with a failure).
+//! an explicit retry. Partial results are read from `error` (the daemon sends
+//! no `data` with a failure). Template files are read and written here; the
+//! daemon gets file contents as request input and never sees a local path.
 use std::{env, fs, io::{self, Write}, path::{Path, PathBuf}, process::{Command, Stdio}};
 use ratatui::{style::Style, text::{Line, Span}};
 use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
-use crate::{app::{Context, Navigation, Screen}, confirm::run_confirmed, serve::{argv, Reply, Secrets}, ui::{self, Item, View}};
+use essence_rc_client::{argv, Input, Reply, Secrets};
+use zeroize::Zeroizing;
+use crate::{app::{Context, Navigation, Screen}, confirm::run_confirmed_with, ui::{self, Item, View}};
 
 pub struct Clients;
 pub struct Groups;
@@ -74,7 +77,10 @@ fn execute(ctx: &mut Context<'_>, words: &[&str]) -> io::Result<Reply> {
     Ok(reply)
 }
 fn confirmed(ctx: &mut Context<'_>, title: &str, question: &str, words: &[&str]) -> io::Result<Reply> {
-    let reply = run_confirmed(ctx, title, question, &argv(words), &Secrets::default())?;
+    confirmed_with(ctx, title, question, words, &Input::default())
+}
+fn confirmed_with(ctx: &mut Context<'_>, title: &str, question: &str, words: &[&str], input: &Input) -> io::Result<Reply> {
+    let reply = run_confirmed_with(ctx, title, question, &argv(words), &Secrets::default(), input)?;
     if !reply.ok && !matches!(reply.code(), "confirmation_required" | "plan_changed") { ctx.failed(); }
     Ok(reply)
 }
@@ -544,12 +550,52 @@ fn templates(ctx: &mut Context<'_>) -> io::Result<()> {
     }
 }
 /// Only `~` and `~/…` expand (v1); `~user` stays literal.
-fn expand_home(path: &str) -> PathBuf {
+pub(crate) fn expand_home(path: &str) -> PathBuf {
     if let Some(home) = env::var_os("HOME").or_else(|| env::var_os("USERPROFILE")) {
         if path == "~" { return PathBuf::from(home); }
         if let Some(suffix) = path.strip_prefix("~/") { return PathBuf::from(home).join(suffix); }
     }
     PathBuf::from(path)
+}
+/// Request input `file`: the text of a local regular file. The daemon never
+/// reads client paths. Not a file or not UTF-8 → a warning and `None`.
+pub(crate) fn file_input(ctx: &mut Context<'_>, path: &Path) -> Option<Input> {
+    let text = fs::metadata(path).ok().filter(fs::Metadata::is_file)
+        .and_then(|_| fs::read(path).ok()).and_then(|bytes| String::from_utf8(bytes).ok()).map(Zeroizing::new);
+    let Some(text) = text else { ctx.ui.notice(ui::warn("Файл недоступен или не в UTF-8.")); return None; };
+    let mut input = Input::default();
+    input.insert("file", text);
+    Some(input)
+}
+/// `template show` → the local file; an existing entry is replaced only after
+/// consent, by renaming a fresh file over it (a link is replaced, never followed).
+fn export_template(ctx: &mut Context<'_>, name: &str, path: &Path) -> io::Result<()> {
+    let Some(data) = fetch(ctx, &["template", "show", "--name", name])? else { return Ok(()); };
+    let Some(content) = data["content"].as_str() else { ctx.failed(); return Ok(()); };
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => {
+            ctx.ui.notice(ui::warn(format!("Не удалось записать {}: это каталог.", path.display())));
+            return Ok(());
+        }
+        Ok(_) => {
+            let mut view = View::new("Экспорт шаблона");
+            view.context.push(ui::text(format!("Файл {} будет перезаписан шаблоном {name}.", path.display()), ui::YELLOW));
+            if !ctx.confirm(view, "Перезаписать файл?")? { return Ok(()); }
+        }
+        Err(_) => {}
+    }
+    match write_export(path, content.as_bytes()) {
+        Ok(()) => ctx.ui.notice(ui::text(format!("Шаблон {name} сохранён в {}", path.display()), ui::GREEN)),
+        Err(error) => ctx.ui.notice(ui::warn(format!("Не удалось записать {}: {error}", path.display()))),
+    }
+    Ok(())
+}
+fn write_export(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let mut file = tempfile::Builder::new().prefix(".rc-export-").tempfile_in(parent)?;
+    file.write_all(bytes)?;
+    file.as_file().sync_all()?;
+    file.persist(path).map(drop).map_err(|error| error.error)
 }
 fn template_card(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
     loop {
@@ -578,11 +624,11 @@ fn template_card(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
             },
             "e" => edit_template(ctx, name)?,
             "x" | "i" => if let Some(path) = required(ctx, "Путь к файлу", "Путь не указан.")? {
-                let path = expand_home(&path).to_string_lossy().into_owned();
+                let path = expand_home(&path);
                 if choice == "x" {
-                    confirmed(ctx, "Экспорт шаблона", "Перезаписать файл?", &["template", "export", "--name", name, "--output", &path])?;
-                } else {
-                    confirmed(ctx, "Импорт шаблона", "Перезаписать шаблон?", &["template", "import", "--name", name, "--file", &path])?;
+                    export_template(ctx, name, &path)?;
+                } else if let Some(input) = file_input(ctx, &path) {
+                    confirmed_with(ctx, "Импорт шаблона", "Перезаписать шаблон?", &["template", "import", "--name", name], &input)?;
                 }
             },
             _ => ctx.invalid(),
@@ -677,10 +723,13 @@ fn edit_file(ctx: &mut Context<'_>, name: &str, editor: &[String], path: &Path, 
             return Ok(());
         }
         if edited {
-            let reply = confirmed(ctx, "Импорт изменений шаблона", "Сохранить изменения шаблона?",
-                &["template", "import", "--name", name, "--file", &path.to_string_lossy()])?;
-            // Success, or the plan was refused: the user's decision is final.
-            if reply.ok || matches!(reply.code(), "confirmation_required" | "plan_changed") { return Ok(()); }
+            // A working copy that is not UTF-8 is kept like a rejected import.
+            if let Some(input) = file_input(ctx, path) {
+                let reply = confirmed_with(ctx, "Импорт изменений шаблона", "Сохранить изменения шаблона?",
+                    &["template", "import", "--name", name], &input)?;
+                // Success, or the plan was refused: the user's decision is final.
+                if reply.ok || matches!(reply.code(), "confirmation_required" | "plan_changed") { return Ok(()); }
+            }
         } else {
             ctx.ui.notice(ui::warn("Редактор завершился с ошибкой."));
         }
@@ -788,7 +837,8 @@ fn subscription_list(ctx: &mut Context<'_>) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{app::{Registry, ScriptedUi, UserInterface}, serve::{Log, ScriptedClient}};
+    use crate::app::{Registry, ScriptedUi, UserInterface};
+    use essence_rc_client::{Log, ScriptedClient};
     use ratatui::{backend::TestBackend, style::Color, Terminal};
     use serde_json::json;
 
@@ -812,7 +862,7 @@ mod tests {
         let registry = Registry { screens: vec![], github_wizard: None };
         let mut core = ScriptedClient::new(steps);
         let mut ui = ScriptedUi::new(inputs);
-        run(&mut Context { client: &mut core, ui: &mut ui, registry: &registry }).unwrap();
+        run(&mut Context::for_test(&mut core, &mut ui, &registry)).unwrap();
         core.assert_finished();
         frames(&ui);
         (core, ui)
@@ -1172,21 +1222,48 @@ mod tests {
         assert_eq!(ui.views[0].sections[0][1].label, "m.yaml  (пользовательский)");
     }
     #[test]
-    fn template_card_shows_content_and_export_import_are_plan_confirmed() {
+    fn template_card_shows_content_and_files_stay_on_the_client() {
         let list = json!([{"name":"m.yaml","source":"custom","groups":["PC"]}]);
-        let imported = expand_home("~/in.yaml").to_string_lossy().into_owned();
-        let import = ["template", "import", "--name", "m.yaml", "--file", imported.as_str()];
-        let (_, ui) = drive(vec![
+        let shown = json!({"name":"m.yaml","source":"builtin","path":null,"content":"mode: rule\nproxies:\n"});
+        let dir = tempfile::tempdir().unwrap();
+        let (fresh, existing, source, binary) = (dir.path().join("new.yaml"), dir.path().join("old.yaml"), dir.path().join("in.yaml"), dir.path().join("bin.yaml"));
+        fs::write(&existing, "IMPORTANT\n").unwrap();
+        fs::write(&source, "mode: global\n").unwrap();
+        fs::write(&binary, [0xff, 0xfe]).unwrap();
+        let path = |p: &PathBuf| p.to_str().unwrap().to_owned();
+        let (fresh_arg, existing_arg, source_arg, binary_arg, dir_arg) = (path(&fresh), path(&existing), path(&source), path(&binary), path(&dir.path().to_path_buf()));
+        let import = ["template", "import", "--name", "m.yaml"];
+        let (core, ui) = drive(vec![
             ok(&["template", "list"], list.clone()),
-            ok(&["template", "show", "--name", "m.yaml"], json!({"name":"m.yaml","source":"builtin","path":null,"content":"mode: rule\nproxies:\n"})),
+            ok(&["template", "show", "--name", "m.yaml"], shown.clone()),
             ok(&["template", "list"], list.clone()),
-            step(&["template", "export", "--name", "m.yaml", "--output", "/tmp/export.yaml"], plan()),
+            ok(&["template", "show", "--name", "m.yaml"], shown.clone()),
+            ok(&["template", "list"], list.clone()),
+            ok(&["template", "show", "--name", "m.yaml"], shown.clone()),
+            ok(&["template", "list"], list.clone()),
+            ok(&["template", "show", "--name", "m.yaml"], shown.clone()),
+            ok(&["template", "list"], list.clone()),
+            ok(&["template", "show", "--name", "m.yaml"], shown),
             ok(&["template", "list"], list.clone()),
             step(&import, plan()), yes(&import, json!({"name":"m.yaml"})),
+            ok(&["template", "list"], list.clone()),
             ok(&["template", "list"], list),
-        ], &["V", "", "X", "/tmp/export.yaml", "n", "I", "~/in.yaml", "y", "0"], |ctx| template_card(ctx, "m.yaml"));
+        ], &["V", "", "X", &fresh_arg, "x", &existing_arg, "n", "X", &existing_arg, "y", "x", &dir_arg, "I", &source_arg, "y", "i", &binary_arg, "0"],
+            |ctx| template_card(ctx, "m.yaml"));
         let shown = content(view(&ui, "Содержимое: m.yaml"));
         assert!(shown.contains("встроенный шаблон") && shown.contains("mode: rule") && !shown.contains("null"));
+        assert_eq!(fs::read_to_string(&fresh).unwrap(), "mode: rule\nproxies:\n");
+        assert_eq!(fs::read_to_string(&existing).unwrap(), "mode: rule\nproxies:\n", "overwritten only after consent");
+        let overwrite = ui.views.iter().filter(|v| v.title == "Экспорт шаблона").collect::<Vec<_>>();
+        assert_eq!(overwrite.len(), 2);
+        assert!(content(overwrite[0]).contains(&format!("Файл {existing_arg} будет перезаписан шаблоном m.yaml.")));
+        assert_eq!(notices(&ui, "Шаблон m.yaml сохранён в"), 2);
+        assert_eq!(notices(&ui, &format!("Не удалось записать {dir_arg}")), 1);
+        assert_eq!(notices(&ui, "Файл недоступен или не в UTF-8."), 1);
+        let imports: Vec<_> = core.calls.iter().zip(&core.input_names).filter(|(call, _)| call[..2] == ["template", "import"]).collect();
+        assert_eq!(imports.len(), 2);
+        assert!(imports.iter().all(|(_, names)| *names == &["file".to_owned()]), "the content travels as input.file");
+        assert!(!core.calls.iter().flatten().any(|word| word.contains(dir.path().to_str().unwrap())), "no local path reaches the daemon");
         assert_eq!(expand_home("~other/path"), PathBuf::from("~other/path"));
     }
     #[test]
@@ -1315,7 +1392,7 @@ mod tests {
             let file = tempfile::NamedTempFile::new().unwrap();
             fs::write(file.path(), b"original").unwrap();
             let path = file.path().to_str().unwrap();
-            let import = ["template", "import", "--name", "m.yaml", "--file", path];
+            let import = ["template", "import", "--name", "m.yaml"];
             let mut steps = vec![];
             if replacement.is_some() && succeeds {
                 if planned {
@@ -1326,9 +1403,11 @@ mod tests {
             let registry = Registry { screens: vec![], github_wizard: None };
             let mut core = ScriptedClient::new(steps);
             let mut ui = EditorUi { inner: ScriptedUi::new(&[consent]), replacement, succeeds, suspended: 0, seen: vec![] };
-            edit_file(&mut Context { client: &mut core, ui: &mut ui, registry: &registry }, "m.yaml", &["editor".into()], file.path(), b"original").unwrap();
+            edit_file(&mut Context::for_test(&mut core, &mut ui, &registry), "m.yaml", &["editor".into()], file.path(), b"original").unwrap();
             assert_eq!(ui.suspended, 1);
             core.assert_finished();
+            assert!(core.input_names.iter().all(|names| names == &["file".to_owned()]));
+            assert!(!core.calls.iter().flatten().any(|word| word == path), "the working copy path stays local");
             if !notice.is_empty() { assert_eq!(notices(&ui.inner, notice), 1); }
             assert_eq!(ui.inner.views.iter().filter(|v| v.prompt.contains("(y/N)")).count(), usize::from(planned));
         }
@@ -1341,14 +1420,15 @@ mod tests {
             let file = tempfile::NamedTempFile::new().unwrap();
             fs::write(file.path(), b"original").unwrap();
             let path = file.path().to_str().unwrap();
-            let import = ["template", "import", "--name", "m.yaml", "--file", path];
+            let import = ["template", "import", "--name", "m.yaml"];
             let mut steps = vec![step(&import, fail("invalid", json!({"message": "Шаблон не является UTF-8"})))];
             if retried { steps.push(ok(&import, json!({"name":"m.yaml"}))); }
             let registry = Registry { screens: vec![], github_wizard: None };
             let mut core = ScriptedClient::new(steps);
             let mut ui = EditorUi { inner: ScriptedUi::new(inputs), replacement: Some(b"changed"), succeeds: true, suspended: 0, seen: vec![] };
-            edit_file(&mut Context { client: &mut core, ui: &mut ui, registry: &registry }, "m.yaml", &["editor".into()], file.path(), b"original").unwrap();
+            edit_file(&mut Context::for_test(&mut core, &mut ui, &registry), "m.yaml", &["editor".into()], file.path(), b"original").unwrap();
             core.assert_finished();
+            assert!(!core.calls.iter().flatten().any(|word| word == path), "the working copy path stays local");
             assert!(ui.inner.inputs.is_empty());
             assert_eq!(ui.suspended, 1 + usize::from(retried));
             if retried { assert_eq!(ui.seen[1], b"changed", "the editor reopens the edited copy"); }

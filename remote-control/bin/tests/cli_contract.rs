@@ -1,26 +1,25 @@
-//! Процесс-интеграционные тесты контракта шага 4: бинарник `essence-rc`
-//! запускается как реальный процесс (одноразовый CLI и `serve`).
+//! Процесс-интеграционные тесты контракта: бинарник `essence-rc`
+//! запускается как реальный процесс (разовый CLI через демон по требованию
+//! и сам демон `daemon run`).
 //!
 //! Инварианты проверяются по контракту, а не по деталям реализации:
 //! ровно одна JSON-строка на вызов в `--json`, коды выхода {0..4},
 //! грамматика всего каталога A.1, подтверждение планом, пароль запуска,
-//! секреты без утечек и протокол serve v2.
+//! секреты без утечек и протокол демона v3.
 //!
 //! Деструктивные команды (`self uninstall`) выполняются ТОЛЬКО на одноразовой
 //! копии исполняемого файла — cargo-бинарник никогда не удаляется.
+
+mod common;
 
 use std::{
     collections::BTreeMap,
     fs,
     hash::{Hash, Hasher},
-    io::{BufRead, BufReader, Read, Write},
+    io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, Command, Stdio},
-    sync::{
-        atomic::{AtomicU32, Ordering},
-        mpsc::{channel, Receiver, RecvTimeoutError},
-        Arc, Mutex,
-    },
+    process::{Command, Stdio},
+    sync::atomic::{AtomicU32, Ordering},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -41,9 +40,11 @@ fn version() -> &'static str {
 static DIR_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 /// Каталог теста лежит в CARGO_TARGET_TMPDIR — на одной файловой системе с
-/// бинарником, поэтому одноразовые копии делаются hard-link'ом.
+/// бинарником, поэтому одноразовые копии делаются hard-link'ом. Каталог
+/// времени выполнения демона — свой у каждого теста.
 struct TestEnv {
     root: PathBuf,
+    runtime: tempfile::TempDir,
 }
 
 impl TestEnv {
@@ -57,7 +58,18 @@ impl TestEnv {
         fs::create_dir_all(&base).expect("создать базовый каталог тестов");
         let root = base.join(format!("essence-rc-cli-contract-{}-{seq}-{nonce}", std::process::id()));
         fs::create_dir_all(root.join("home")).expect("создать HOME теста");
-        Self { root }
+        Self { root, runtime: common::runtime_dir() }
+    }
+
+    /// Окружение процессов теста (демоны запускаются с ним же).
+    fn ctx(&self) -> common::Ctx {
+        let tools = self.root.join("no-tools");
+        let _ = fs::create_dir_all(&tools);
+        common::Ctx {
+            data: self.data(),
+            runtime: self.runtime.path().to_path_buf(),
+            vars: vec![("HOME".into(), self.home().into()), ("PATH".into(), tools.into())],
+        }
     }
 
     fn data(&self) -> PathBuf {
@@ -86,6 +98,7 @@ impl TestEnv {
 
 impl Drop for TestEnv {
     fn drop(&mut self) {
+        common::stop(&self.ctx().endpoint());
         let _ = fs::remove_dir_all(&self.root);
     }
 }
@@ -94,13 +107,8 @@ impl Drop for TestEnv {
 /// PATH указывает на пустой каталог: команды GitHub не достанут настоящие
 /// `git`/`gh` и сеть (их сценарии — в `github_source`).
 fn base_command(bin: impl AsRef<Path>, env: &TestEnv) -> Command {
-    let mut cmd = Command::new(bin.as_ref());
-    let tools = env.root.join("no-tools");
-    let _ = fs::create_dir_all(&tools);
-    cmd.env("ESSENCE_RC_DATA_DIR", env.data())
-        .env("HOME", env.home())
-        .env("PATH", &tools)
-        .current_dir(&env.root);
+    let mut cmd = env.ctx().command(bin);
+    cmd.current_dir(&env.root);
     cmd
 }
 
@@ -159,10 +167,13 @@ fn exec(mut cmd: Command, stdin: Option<&str>, timeout: Duration) -> RunResult {
     RunResult { code: status.and_then(|s| s.code()), stdout, stderr, timed_out: status.is_none() }
 }
 
+/// Разовый вызов; возвращается после выхода его демона по требованию.
 fn run(bin: impl AsRef<Path>, env: &TestEnv, args: &[&str], stdin: Option<&str>, timeout: Duration) -> RunResult {
     let mut cmd = base_command(bin, env);
     cmd.args(args);
-    exec(cmd, stdin, timeout)
+    let result = exec(cmd, stdin, timeout);
+    env.ctx().settle();
+    result
 }
 
 /// Вызов с гарантией --json: ответ обязан быть ровно одной JSON-строкой.
@@ -373,142 +384,6 @@ fn install_script_password(env: &TestEnv, bin: impl AsRef<Path>, password: &str)
     );
 }
 
-// ─── serve v2 ────────────────────────────────────────────────────────────────
-
-struct Serve {
-    child: Child,
-    stdin: Option<ChildStdin>,
-    lines: Receiver<String>,
-    all_stdout: Arc<Mutex<Vec<String>>>,
-    all_stderr: Arc<Mutex<Vec<String>>>,
-}
-
-impl Serve {
-    fn spawn(bin: impl AsRef<Path>, env: &TestEnv, extra: &[&str]) -> Serve {
-        let mut cmd = base_command(bin, env);
-        cmd.arg("serve")
-            .args(extra)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = cmd.spawn().expect("запустить essence-rc serve");
-        let stdin = child.stdin.take().expect("stdin serve");
-        let stdout = child.stdout.take().expect("stdout serve");
-        let stderr = child.stderr.take().expect("stderr serve");
-
-        let (tx, lines) = channel();
-        let collected = Arc::new(Mutex::new(Vec::new()));
-        let sink = Arc::clone(&collected);
-        thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                sink.lock().unwrap().push(line.clone());
-                if tx.send(line).is_err() {
-                    break;
-                }
-            }
-        });
-        let err_collected = Arc::new(Mutex::new(Vec::new()));
-        let err_sink = Arc::clone(&err_collected);
-        thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                err_sink.lock().unwrap().push(line);
-            }
-        });
-        Serve { child, stdin: Some(stdin), lines, all_stdout: collected, all_stderr: err_collected }
-    }
-
-    fn send(&mut self, line: &str) {
-        let pipe = self.stdin.as_mut().expect("stdin serve открыт");
-        writeln!(pipe, "{line}").expect("записать строку в serve");
-        pipe.flush().expect("сбросить буфер serve");
-    }
-
-    fn close_stdin(&mut self) {
-        self.stdin = None;
-    }
-
-    /// Следующая строка stdout; None — по таймауту или EOF.
-    fn next_line(&self, timeout: Duration) -> Option<String> {
-        match self.lines.recv_timeout(timeout) {
-            Ok(line) => Some(line),
-            Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => None,
-        }
-    }
-
-    /// Ответ на запрос: первая строка с полем ok.
-    fn next_response(&self, timeout: Duration) -> Value {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            assert!(!remaining.is_zero(), "serve не ответил за {timeout:?}");
-            let line = self.next_line(remaining).expect("serve закрыл stdout без ответа");
-            let value: Value = serde_json::from_str(&line)
-                .unwrap_or_else(|error| panic!("строка serve не JSON ({error}): {line}"));
-            if value.get("ok").is_some() {
-                return value;
-            }
-            assert!(value.get("event").is_some(), "посторонняя строка stdout serve: {line}");
-        }
-    }
-
-    /// Пустая строка не порождает ответа: за окно `quiet` ответов быть не должно.
-    fn assert_quiet(&self, quiet: Duration) {
-        if let Some(line) = self.next_line(quiet) {
-            let value: Value = serde_json::from_str(&line)
-                .unwrap_or_else(|error| panic!("строка serve не JSON ({error}): {line}"));
-            assert!(
-                value.get("ok").is_none(),
-                "пропущенная строка не должна порождать ответ: {line}"
-            );
-        }
-    }
-
-    fn wait_exit(&mut self, timeout: Duration) -> i32 {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if let Some(status) = self.child.try_wait().expect("ожидание serve") {
-                return status.code().unwrap_or(-1);
-            }
-            if Instant::now() > deadline {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
-                panic!("serve не завершился по EOF за {timeout:?}");
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
-    }
-
-    fn stdout_all(&self) -> String {
-        self.all_stdout.lock().unwrap().join("\n")
-    }
-
-    fn stderr_all(&self) -> String {
-        self.all_stderr.lock().unwrap().join("\n")
-    }
-}
-
-impl Drop for Serve {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-fn is_response(value: &Value) -> bool {
-    value.get("ok").is_some()
-}
-
-/// Весь stdout serve — только JSONL-объекты.
-fn all_stdout_lines(text: &str) -> Vec<Value> {
-    text.split('\n')
-        .filter(|line| !line.is_empty())
-        .map(|line| {
-            serde_json::from_str::<Value>(line)
-                .unwrap_or_else(|error| panic!("stdout serve — только JSONL ({error}): {line}"))
-        })
-        .collect()
-}
-
 // ─── Версия и справка ────────────────────────────────────────────────────────
 
 #[test]
@@ -570,6 +445,10 @@ fn help_json_lists_whole_v2_catalog() {
         "self uninstall",
         "self password-set",
         "self password-remove",
+        "daemon status",
+        "daemon stop",
+        "daemon run",
+        "daemon start",
         "node list",
         "node show",
         "node aliases",
@@ -610,6 +489,7 @@ fn help_json_lists_whole_v2_catalog() {
         "template import",
         "client list",
         "client show",
+        "client config",
         "client connections",
         "client add",
         "client rename",
@@ -731,11 +611,12 @@ fn catalog_grammar_is_accepted_for_every_command() {
         &["template", "list"],
         &["template", "show", "--name", "default"],
         &["template", "create", "--name", "t1", "--from", "default", "--group", "G1"],
-        &["template", "export", "--name", "t1", "--output", "out.yaml"],
+        &["daemon", "status"],
         &["template", "import", "--name", "t2", "--file", "in.yaml"],
         &["client", "list"],
         &["client", "list", "--group", "G1"],
         &["client", "show", "--name", "c1"],
+        &["client", "config", "--name", "c1"],
         &["client", "connections", "--name", "c1", "--node", "n1", "--proxy", "p1"],
         &["client", "connections", "--name", "c1", "--node", "n1", "--reset"],
         &["client", "add", "--name", "c1", "--group", "G1"],
@@ -1060,162 +941,79 @@ fn password_remove_checks_secret_before_consent() {
     assert!(argon_files(&env.data()).is_empty());
 }
 
-// ─── serve v2 ────────────────────────────────────────────────────────────────
+// ─── Демон: протокол v3 и журнал ─────────────────────────────────────────────
 
 #[test]
-fn serve_protocol_hello_requests_and_eof() {
+fn daemon_protocol_hello_requests_and_disconnect() {
     let env = TestEnv::new();
-    const PW: &str = "serve-script-pass-7";
+    const PW: &str = "daemon-script-pass-7";
     install_script_password(&env, BIN, PW);
     let guarded = snapshot(&env.data());
+    let daemon = common::Daemon::spawn(&env.ctx());
+    assert_eq!(daemon.hello["event"], json!("hello"), "событие hello: {}", daemon.hello);
+    assert_eq!(daemon.hello["protocol"], json!(3), "протокол v3: {}", daemon.hello);
+    assert_eq!(daemon.hello["version"], json!(version()), "hello отдаёт версию: {}", daemon.hello);
+    let mut conn = daemon.connect();
+    let mut replies = Vec::new();
+    let mut ask = |conn: &mut common::Raw, request: Value| -> Value {
+        let id = request["id"].clone();
+        conn.send(&request);
+        let (_, reply) = conn.reply(id, Duration::from_secs(30));
+        replies.push(reply.clone());
+        reply
+    };
 
-    let mut serve = Serve::spawn(BIN, &env, &[]);
-
-    // hello
-    let hello_line = serve.next_line(Duration::from_secs(15)).expect("serve не прислал hello");
-    let hello: Value = serde_json::from_str(&hello_line).expect("hello — JSON");
-    assert_eq!(hello["event"], json!("hello"), "событие hello: {hello}");
-    assert_eq!(hello["protocol"], json!(2), "протокол v2: {hello}");
-    assert_eq!(hello["version"], json!(version()), "hello отдаёт версию: {hello}");
-
-    // Запрос до открытой сессии — отказ (нужна session open или секрет).
-    serve.send(&json!({"id": "pre", "argv": ["status", "--json"]}).to_string());
-    let pre = serve.next_response(Duration::from_secs(20));
-    assert_eq!(pre["id"], json!("pre"), "id эхом: {pre}");
-    assert_eq!(pre["ok"], json!(false), "без сессии отказ: {pre}");
-    assert!(
-        ["auth_required", "session_closed", "not_configured"].contains(&error_code(&pre)),
-        "код отказа до сессии: {pre}"
-    );
-
+    // Запрос до открытой сессии — отказ.
+    let pre = ask(&mut conn, json!({"id": "pre", "argv": ["status", "--json"]}));
+    assert_eq!((pre["ok"].clone(), error_code(&pre)), (json!(false), "session_closed"), "{pre}");
     // Неверный пароль при открытии — auth_failed, состояние не меняется.
-    serve.send(
-        &json!({"id": "wrong", "argv": ["session", "open", "--json"],
-                "secrets": {"script-password": "definitely-wrong"}})
-            .to_string(),
-    );
-    let wrong = serve.next_response(Duration::from_secs(20));
-    assert_eq!(wrong["id"], json!("wrong"));
-    assert_eq!(wrong["ok"], json!(false));
+    let wrong = ask(&mut conn, json!({"id": "wrong", "argv": ["session", "open", "--json"], "secrets": {"script-password": "definitely-wrong"}}));
     assert_eq!(error_code(&wrong), "auth_failed", "неверный пароль: {wrong}");
     assert_state_unchanged(&env, &guarded);
-
-    // Открытие с верным паролем.
-    serve.send(
-        &json!({"id": 1, "argv": ["session", "open", "--json"],
-                "secrets": {"script-password": PW}})
-            .to_string(),
-    );
-    let opened = serve.next_response(Duration::from_secs(20));
-    assert_eq!(opened["id"], json!(1), "числовой id сохраняется числом: {opened}");
-    assert_eq!(opened["ok"], json!(true), "session open с верным паролем: {opened}");
-
-    // Сессия персистентна: следующий запрос без секретов авторизован.
-    serve.send(&json!({"id": "after", "argv": ["status", "--json"]}).to_string());
-    let after = serve.next_response(Duration::from_secs(20));
-    assert_eq!(after["id"], json!("after"));
-    assert_eq!(after["ok"], json!(true), "авторизация сессии сохраняется: {after}");
-
-    // Отказ подтверждения через serve.
-    serve.send(
-        &json!({"id": "rm", "argv": ["self", "password-remove", "--json"],
-                "secrets": {"current-password": PW}})
-            .to_string(),
-    );
-    let rm = serve.next_response(Duration::from_secs(20));
-    assert_eq!(rm["id"], json!("rm"));
-    assert_eq!(error_code(&rm), "confirmation_required", "план требуется и в serve: {rm}");
+    let opened = ask(&mut conn, json!({"id": 1, "argv": ["session", "open", "--json"], "secrets": {"script-password": PW}}));
+    assert_eq!((opened["id"].clone(), opened["ok"].clone()), (json!(1), json!(true)), "числовой id сохраняется числом: {opened}");
+    // Авторизация соединения сохраняется.
+    let after = ask(&mut conn, json!({"id": "after", "argv": ["status", "--json"]}));
+    assert_eq!(after["ok"], json!(true), "{after}");
+    let rm = ask(&mut conn, json!({"id": "rm", "argv": ["self", "password-remove", "--json"], "secrets": {"current-password": PW}}));
+    assert_eq!(error_code(&rm), "confirmation_required", "план требуется и через демон: {rm}");
+    assert_eq!(rm["exit"], json!(2));
     assert!(rm["error"]["plan_token"].as_str().is_some_and(|t| t.len() == 16));
     assert_state_unchanged(&env, &guarded);
 
-    // Пустые строки пропускаются без ответа.
-    serve.send("");
-    serve.assert_quiet(Duration::from_millis(400));
-
-    // Строка «y» — мусор протокола: usage с id:null, никогда не согласие.
-    serve.send("y");
-    let y = serve.next_response(Duration::from_secs(20));
-    assert_eq!(y["id"], Value::Null, "мусор получает id:null: {y}");
+    // Пустые строки пропускаются без ответа; «y» — мусор протокола, не согласие.
+    conn.send_line("");
+    assert!(conn.next(Duration::from_millis(400)).is_none(), "пустая строка без ответа");
+    conn.send_line("y");
+    let (_, y) = conn.reply(Value::Null, Duration::from_secs(20));
     assert_eq!(error_code(&y), "usage", "не-JSON запрос — usage: {y}");
-    assert_state_unchanged(&env, &guarded);
-
-    // Битый JSON.
-    serve.send("{not json");
-    let bad = serve.next_response(Duration::from_secs(20));
-    assert_eq!(bad["id"], Value::Null);
+    conn.send_line("{not json");
+    let (_, bad) = conn.reply(Value::Null, Duration::from_secs(20));
     assert_eq!(error_code(&bad), "usage");
-
-    // NUL внутри argv строго запрещён.
-    serve.send(&json!({"id": "nul", "argv": ["stat\u{0}us", "--json"]}).to_string());
-    let nul = serve.next_response(Duration::from_secs(20));
-    assert_eq!(nul["id"], json!("nul"), "корректный id сохраняется и для неверного тела (v1): {nul}");
-    assert_eq!(error_code(&nul), "usage");
-
-    // --secrets-stdin внутри serve запрещён.
-    serve.send(&json!({"id": "sec", "argv": ["status", "--secrets-stdin"]}).to_string());
-    let sec = serve.next_response(Duration::from_secs(20));
-    assert_eq!(sec["id"], json!("sec"));
+    assert_state_unchanged(&env, &guarded);
+    let nul = ask(&mut conn, json!({"id": "nul", "argv": ["stat\u{0}us", "--json"]}));
+    assert_eq!((nul["id"].clone(), error_code(&nul)), (json!("nul"), "usage"), "{nul}");
+    let sec = ask(&mut conn, json!({"id": "sec", "argv": ["status", "--secrets-stdin"]}));
     assert_eq!(error_code(&sec), "usage");
-
-    // Неизвестный ключ секрета.
-    serve.send(
-        &json!({"id": "unk", "argv": ["self", "password-set", "--json"],
-                "secrets": {"bogus": "v"}})
-            .to_string(),
-    );
-    let unk = serve.next_response(Duration::from_secs(20));
-    assert_eq!(unk["id"], json!("unk"));
+    let unk = ask(&mut conn, json!({"id": "unk", "argv": ["self", "password-set", "--json"], "secrets": {"bogus": "v"}}));
     assert_eq!(error_code(&unk), "usage");
-
-    // EOF закрывает сессию с кодом 0.
-    serve.close_stdin();
-    let code = serve.wait_exit(Duration::from_secs(15));
-    assert_eq!(code, 0, "EOF → выход 0");
-    thread::sleep(Duration::from_millis(200)); // дочитываем хвосты потоков
-
-    // Итог: только JSONL на stdout, ровно один ответ на запрос, по порядку.
-    let stdout = serve.stdout_all();
-    let lines = all_stdout_lines(&stdout);
-    let responses: Vec<Value> = lines.iter().filter(|l| is_response(l)).cloned().collect();
-    let expected_ids = [
-        json!("pre"),
-        json!("wrong"),
-        json!(1),
-        json!("after"),
-        json!("rm"),
-        Value::Null,
-        Value::Null,
-        json!("nul"),
-        json!("sec"),
-        json!("unk"),
-    ];
-    assert!(
-        lines.len() >= expected_ids.len(),
-        "собраны все строки протокола: {} из {}",
-        lines.len(),
-        expected_ids.len()
-    );
-    assert_eq!(
-        responses.iter().map(|r| r["id"].clone()).collect::<Vec<_>>(),
-        expected_ids.to_vec(),
-        "ровно один ответ на запрос, в порядке поступления"
-    );
-    for response in &responses {
-        let has_data = response.get("data").is_some();
-        let has_error = response.get("error").is_some();
-        assert_ne!(has_data, has_error, "ровно одно из data/error: {response}");
+    for reply in replies.iter().chain([&y, &bad]) {
+        assert_ne!(reply.get("data").is_some(), reply.get("error").is_some(), "ровно одно из data/error: {reply}");
+        assert_eq!(reply.get("exit").is_some(), reply["ok"] == json!(false), "exit только у ошибки: {reply}");
     }
-    // Секрет не утёк ни в протокол, ни в диагностику.
-    assert!(!stdout.contains(PW), "пароль не в stdout serve");
-    assert!(!serve.stderr_all().contains(PW), "пароль не в stderr serve");
+    // Ровно один ответ на запрос: лишних сообщений нет.
+    assert!(conn.next(Duration::from_millis(500)).is_none(), "лишнее сообщение после всех ответов");
+    conn.close();
+    // Секрет не утёк ни в протокол, ни в журнал демона, ни в данные.
+    assert!(!format!("{replies:?}{y}{bad}").contains(PW), "пароль не в ответах");
+    assert!(!daemon.journal().contains(PW), "пароль не в журнале демона");
     assert_dir_has_no_bytes(&env.data(), PW.as_bytes());
 }
 
-/// Журнал команды: в serve — события `log` с id активного запроса строго до
-/// ответа; в разовом CLI — строки с префиксами v1 в stderr (stdout — только
-/// конверт).
+/// Журнал команды: у демона — события `log` с id запроса строго до ответа; в
+/// разовом CLI — строки с префиксами v1 в stderr (stdout — только конверт).
 #[test]
-fn command_journal_reaches_serve_events_and_one_shot_stderr() {
+fn command_journal_reaches_daemon_events_and_one_shot_stderr() {
     let env = TestEnv::new();
     const PW: &str = "journal-pass-5";
     assert_ok(&run_json(BIN, &env, &["source", "init-local"], None));
@@ -1224,35 +1022,89 @@ fn command_journal_reaches_serve_events_and_one_shot_stderr() {
     assert!(result.stderr.contains("  [✓] Пароль сохранён"), "журнал в stderr: {:?}", result.stderr);
     assert_no_leak(&env, &result, PW);
 
-    let mut serve = Serve::spawn(BIN, &env, &[]);
-    serve.next_line(Duration::from_secs(15)).expect("hello");
-    serve.send(&json!({"id": "open", "argv": ["session", "open"], "secrets": {"script-password": PW}}).to_string());
-    let open_log: Value = serde_json::from_str(&serve.next_line(Duration::from_secs(20)).unwrap()).unwrap();
-    assert_eq!(open_log, json!({"id": "open", "event": "log", "level": "info", "text": "Сессия открыта: локальная конфигурация."}));
-    assert_eq!(serve.next_response(Duration::from_secs(20))["ok"], json!(true));
-    serve.send(&json!({"id": 9, "argv": ["self", "password-remove", "--yes"], "secrets": {"current-password": PW}}).to_string());
-    let log: Value = serde_json::from_str(&serve.next_line(Duration::from_secs(20)).unwrap()).unwrap();
-    assert_eq!(log, json!({"id": 9, "event": "log", "level": "success", "text": "Пароль убран"}));
-    let reply = serve.next_response(Duration::from_secs(20));
-    assert_eq!((reply["id"].clone(), reply["ok"].clone()), (json!(9), json!(true)));
-    serve.close_stdin();
-    assert_eq!(serve.wait_exit(Duration::from_secs(15)), 0);
-    assert!(!serve.stdout_all().contains(PW) && !serve.stderr_all().contains(PW));
+    let daemon = common::Daemon::spawn(&env.ctx());
+    let mut conn = daemon.connect();
+    let (events, opened) = conn.request("open", &["session", "open"], json!({"script-password": PW}));
+    assert_eq!(events, [json!({"id": "open", "event": "log", "level": "info", "text": "Сессия открыта: локальная конфигурация."})]);
+    assert_eq!(opened["ok"], json!(true));
+    conn.send(&json!({"id": 9, "argv": ["self", "password-remove", "--yes"], "secrets": {"current-password": PW}}));
+    let (events, reply) = conn.reply(9, Duration::from_secs(30));
+    assert_eq!(events, [json!({"id": 9, "event": "log", "level": "success", "text": "Пароль убран"})]);
+    assert_eq!(reply["ok"], json!(true));
+    conn.close();
+    assert!(!daemon.journal().contains(PW));
+}
+
+// ─── Файлы на стороне клиента и конфиг клиента ───────────────────────────────
+
+#[test]
+fn template_import_reads_the_file_in_the_client() {
+    let env = TestEnv::new();
+    assert_ok(&run_json(BIN, &env, &["source", "init-local"], None));
+    assert_ok(&run_json(BIN, &env, &["template", "create", "--name", "t1"], None));
+    let file = env.root.join("in.yaml");
+    fs::write(&file, "mode: rule\n").unwrap();
+    let path = file.to_str().unwrap();
+    let planned = run_json(BIN, &env, &["template", "import", "--name", "t1", "--file", path], None);
+    let plan = assert_error(&planned, "confirmation_required", 2);
+    assert_eq!(plan["error"]["plan"], json!(["Шаблон t1.yaml будет перезаписан."]));
+    let imported = run_json(BIN, &env, &["template", "import", "--name", "t1", "--file", path, "--yes"], None);
+    assert_eq!(assert_ok(&imported)["data"], json!({"name": "t1.yaml"}));
+    let journal = fs::read_to_string(env.ctx().endpoint().log).unwrap_or_default();
+    assert!(!journal.contains(path), "путь файла не доходит до демона: {journal}");
+    let shown = assert_ok(&run_json(BIN, &env, &["template", "show", "--name", "t1"], None));
+    assert_eq!(shown["data"]["content"], json!("mode: rule\n"));
+
+    let missing = env.root.join("absent.yaml");
+    let absent = run_json(BIN, &env, &["template", "import", "--name", "t1", "--file", missing.to_str().unwrap()], None);
+    assert_error(&absent, "invalid", 1);
+    let binary = env.root.join("bin.yaml");
+    fs::write(&binary, [0xff, 0xfe]).unwrap();
+    let not_utf8 = run_json(BIN, &env, &["template", "import", "--name", "t1", "--file", binary.to_str().unwrap()], None);
+    assert_error(&not_utf8, "invalid", 1);
+    let without = run_json(BIN, &env, &["template", "import", "--name", "t1"], None);
+    let usage = assert_error(&without, "usage", 2);
+    assert_eq!(usage["error"]["message"], json!("Укажите файл: --file PATH."));
 }
 
 #[test]
-fn serve_inner_flag_speaks_same_protocol() {
+fn template_export_writes_the_file_and_requires_consent_to_overwrite() {
     let env = TestEnv::new();
-    let mut serve = Serve::spawn(BIN, &env, &["--inner"]);
-    let hello_line = serve.next_line(Duration::from_secs(15)).expect("serve --inner не прислал hello");
-    let hello: Value = serde_json::from_str(&hello_line).expect("hello — JSON");
-    assert_eq!(hello["event"], json!("hello"));
-    assert_eq!(hello["protocol"], json!(2));
-    serve.send(&json!({"id": 7, "argv": ["session", "status", "--json"]}).to_string());
-    let response = serve.next_response(Duration::from_secs(20));
-    assert_eq!(response["id"], json!(7));
-    serve.close_stdin();
-    assert_eq!(serve.wait_exit(Duration::from_secs(15)), 0);
+    assert_ok(&run_json(BIN, &env, &["source", "init-local"], None));
+    let shown = assert_ok(&run_json(BIN, &env, &["template", "show", "--name", "default"], None));
+    let content = shown["data"]["content"].as_str().unwrap().to_owned();
+    let target = env.root.join("out.yaml");
+    let output = target.to_str().unwrap();
+    let exported = assert_ok(&run_json(BIN, &env, &["template", "export", "--name", "default", "--output", output], None));
+    assert_eq!(exported["data"], json!({"name": "default.yaml", "output": output}));
+    assert_eq!(fs::read_to_string(&target).unwrap(), content);
+    fs::write(&target, "IMPORTANT\n").unwrap();
+    let planned = run_json(BIN, &env, &["template", "export", "--name", "default", "--output", output], None);
+    let plan = assert_error(&planned, "confirmation_required", 2);
+    assert_eq!(plan["error"]["plan"], json!([format!("Файл {output} будет перезаписан шаблоном default.yaml.")]));
+    assert_eq!(fs::read_to_string(&target).unwrap(), "IMPORTANT\n");
+    assert_ok(&run_json(BIN, &env, &["template", "export", "--name", "default", "--output", output, "--yes"], None));
+    assert_eq!(fs::read_to_string(&target).unwrap(), content);
+    let directory = run_json(BIN, &env, &["template", "export", "--name", "default", "--output", env.root.to_str().unwrap(), "--yes"], None);
+    assert_error(&directory, "invalid", 1);
+}
+
+#[test]
+fn client_config_returns_the_generated_content() {
+    let env = TestEnv::new();
+    assert_ok(&run_json(BIN, &env, &["source", "init-local"], None));
+    assert_ok(&run_json(BIN, &env, &["client", "add", "--name", "c1", "--group", "PC"], None));
+    let before = assert_ok(&run_json(BIN, &env, &["client", "config", "--name", "c1"], None));
+    assert_eq!(before["data"], json!({"name": "c1", "group": "PC", "exists": false, "content": null}));
+    let generated = run_json(BIN, &env, &["generate", "--client", "c1"], None);
+    assert!(matches!(generated.code, Some(0 | 1)), "{}", generated.stdout);
+    let after = assert_ok(&run_json(BIN, &env, &["client", "config", "--name", "c1"], None));
+    let path = env.data().join("generated/PC/c1/config.yaml");
+    assert_eq!(after["data"]["exists"], json!(path.is_file()), "{after}");
+    if path.is_file() {
+        assert_eq!(after["data"]["content"], json!(fs::read_to_string(&path).unwrap()));
+    }
+    assert_error(&run_json(BIN, &env, &["client", "config", "--name", "ghost"], None), "not_found", 1);
 }
 
 // ─── self uninstall: только одноразовая копия ────────────────────────────────
@@ -1325,6 +1177,28 @@ fn uninstall_with_yes_removes_only_disposable_copy() {
         assert!(marker.exists());
     }
     assert!(Path::new(BIN).exists(), "cargo-бинарник никогда не удаляется тестами");
+}
+
+/// Демон основного бинарника простаивает; разовый `self uninstall` с
+/// одноразовой копии останавливает его (другой исполняемый файл), работает
+/// со своим демоном и удаляет только копию.
+#[test]
+fn uninstall_from_a_copy_next_to_a_daemon_of_the_main_binary() {
+    let env = TestEnv::new();
+    let mut daemon = common::Daemon::spawn_with(&env.ctx(), &[("ESSENCE_RC_DAEMON_LINGER", "30")]);
+    assert_eq!(daemon.hello["exe"], json!(fs::canonicalize(BIN).unwrap()), "hello: {}", daemon.hello);
+    daemon.disconnect();
+    let bin = env.disposable_bin();
+    let result = run_json(&bin, &env, &["self", "uninstall", "--yes"], None);
+    let value = envelope(&result);
+    assert!(daemon.wait_exit(Duration::from_secs(30)).is_some(), "демон основного бинарника остановлен: {value}");
+    if value["ok"] == json!(true) {
+        assert!(!bin.exists(), "удалена одноразовая копия");
+    } else {
+        assert!(["root_required", "unsafe_path"].contains(&error_code(&value)), "{value}");
+        assert!(bin.exists());
+    }
+    assert!(Path::new(BIN).exists(), "cargo-бинарник цел");
 }
 
 // ─── proptest: случайные argv ────────────────────────────────────────────────

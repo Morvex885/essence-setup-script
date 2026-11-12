@@ -1,5 +1,6 @@
-//! The TUI's sole core interface is a serve-v2 child process, and the TUI is
-//! a library linked into the single `essence-rc` executable.
+//! Front ends reach the core only through the daemon protocol: neither the
+//! TUI nor the client crate depends on `rc-core`, and the TUI is a library
+//! linked into the single `essence-rc` executable.
 use std::{fs, path::Path};
 fn scan(path: &Path) {
     for entry in fs::read_dir(path).unwrap() {
@@ -12,12 +13,16 @@ fn scan(path: &Path) {
         }
     }
 }
-#[test]
-fn tui_cannot_import_core() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+fn assert_without_core(root: &Path) {
     let manifest = fs::read_to_string(root.join("Cargo.toml")).unwrap();
-    assert!(!manifest.contains("rc-core"));
+    assert!(!manifest.contains("rc-core"), "rc-core in {}", root.display());
     scan(&root.join("src"));
+}
+#[test]
+fn tui_and_client_cannot_import_core() {
+    let tui = Path::new(env!("CARGO_MANIFEST_DIR"));
+    assert_without_core(tui);
+    assert_without_core(&tui.join("../client"));
 }
 #[test]
 fn tui_is_a_library_of_the_single_binary() {

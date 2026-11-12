@@ -1,12 +1,13 @@
 //! Screen extension contract: implement `Screen::run`, return `Navigation`, and add
-//! a `Registration` in `registrations()`. Screens receive only `Context` (serve +
-//! UI); no state/SSH imports. Register a real factory, never an unfinished route.
+//! a `Registration` in `registrations()`. Screens receive only `Context` (daemon
+//! client + UI); no state/SSH imports. Register a real factory, never an unfinished route.
 //! The source screen also supplies `Registry::github_wizard` for first-run entry.
-use std::{collections::VecDeque, io::{self, IsTerminal, Write}, process::{Command, ExitCode}, time::Duration};
+use std::{collections::{BTreeMap, VecDeque}, ffi::OsString, io::{self, IsTerminal, Write}, path::PathBuf, process::{Command, ExitCode}, time::Duration};
 use crossterm::{event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers}, execute, terminal::{self, EnterAlternateScreen, LeaveAlternateScreen}};
+use essence_rc_client::{Client, Input, Log, Progress, Reply, Request, Secrets, TermEvent, TerminalIo};
 use ratatui::{Terminal, backend::CrosstermBackend, text::Line};
 use zeroize::Zeroizing;
-use crate::{serve::{Log, Progress, Reply, Secrets, ServeClient}, ui::{self, Item, View}};
+use crate::ui::{self, Item, View};
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 static SIGNAL_INTERRUPT: AtomicBool = AtomicBool::new(false);
@@ -54,32 +55,84 @@ pub trait UserInterface {
     fn command_finished(&mut self) -> io::Result<()> { Ok(()) }
     /// Run a local child (template editor) on the cooked terminal.
     fn suspended(&mut self, command: &mut Command) -> io::Result<std::process::ExitStatus>;
-    /// Hand the terminal to the serve child (`node shell`, `telegram menu`).
+    /// Hand the terminal to a terminal command (`node shell`, `telegram menu`).
     fn suspend(&mut self) -> io::Result<()> { Ok(()) }
     fn resume(&mut self) -> io::Result<()> { Ok(()) }
     fn interrupted(&self) -> bool { false }
 }
+/// A local terminal factory: one fresh console per terminal request.
+pub type TerminalFactory<'a> = &'a mut dyn FnMut() -> Box<dyn TerminalIo>;
 pub struct Context<'a> {
-    pub client: &'a mut dyn ServeClient,
+    pub client: &'a mut dyn Client,
     pub ui: &'a mut dyn UserInterface,
     pub registry: &'a Registry,
+    /// `None` (screen tests): a console whose input ends at once.
+    pub terminal: Option<TerminalFactory<'a>>,
+    /// `env` of every request: the operator's SSH agent for node connections.
+    env: Option<BTreeMap<String, String>>,
+}
+/// The daemon's limit for the agent path.
+const MAX_AGENT_PATH: usize = 4096;
+/// `{"SSH_AUTH_SOCK": path}` from the value of the operator's variable: only
+/// an absolute UTF-8 path within the daemon's limit. On Windows the OpenSSH
+/// agent pipe is used when the variable is unset.
+fn agent_env(value: Option<OsString>) -> Option<BTreeMap<String, String>> {
+    let path = value.filter(|value| !value.is_empty()).map(PathBuf::from);
+    #[cfg(windows)]
+    let path = path.or_else(|| Some(PathBuf::from(r"\\.\pipe\openssh-ssh-agent")));
+    let path = path.filter(|path| path.is_absolute())?.into_os_string().into_string().ok()?;
+    (path.len() <= MAX_AGENT_PATH).then(|| BTreeMap::from([("SSH_AUTH_SOCK".to_owned(), path)]))
+}
+/// The single place where a request is assembled: every request carries the agent `env`.
+fn request<'r>(env: &'r Option<BTreeMap<String, String>>, words: &'r [String], secrets: &'r Secrets, input: &'r Input) -> Request<'r> {
+    Request { env: env.as_ref(), ..Request::new(words, secrets, input) }
+}
+/// The console of `Context::for_test`: input ends at once.
+struct ClosedTerminal;
+impl TerminalIo for ClosedTerminal {
+    fn term(&self) -> String { "dumb".into() }
+    fn size(&self) -> (u16, u16) { (80, 24) }
+    fn start(&mut self, events: Box<dyn Fn(TermEvent) + Send>) -> io::Result<()> { events(TermEvent::Closed); Ok(()) }
+    fn write(&mut self, _: &[u8]) -> io::Result<()> { Ok(()) }
+    fn stop(&mut self) {}
+}
+impl<'a> Context<'a> {
+    pub fn new(client: &'a mut dyn Client, ui: &'a mut dyn UserInterface, registry: &'a Registry, terminal: TerminalFactory<'a>) -> Self {
+        Self { client, ui, registry, terminal: Some(terminal), env: agent_env(std::env::var_os("SSH_AUTH_SOCK")) }
+    }
+    /// Screen tests: no agent `env`; a terminal whose input ends at once.
+    pub fn for_test(client: &'a mut dyn Client, ui: &'a mut dyn UserInterface, registry: &'a Registry) -> Self {
+        Self { client, ui, registry, terminal: None, env: None }
+    }
 }
 impl Context<'_> {
-    pub fn call(&mut self, words: &[&str]) -> io::Result<Reply> { self.request(&crate::serve::argv(words), &Secrets::default()) }
-    /// Every core request goes through here: the status line of the request
-    /// is drawn before it is sent and animated until the reply (no screen
-    /// ever freezes on a slow gh/git/SSH call), core log events stream live.
+    pub fn call(&mut self, words: &[&str]) -> io::Result<Reply> { self.request(&essence_rc_client::argv(words), &Secrets::default()) }
     pub fn request(&mut self, words: &[String], secrets: &Secrets) -> io::Result<Reply> {
+        self.request_with(words, secrets, &Input::default())
+    }
+    /// Every daemon request goes through here: the status line of the request
+    /// is drawn before it is sent and animated until the reply (no screen
+    /// ever freezes on a slow gh/git/SSH call), daemon log events stream live.
+    pub fn request_with(&mut self, words: &[String], secrets: &Secrets, input: &Input) -> io::Result<Reply> {
+        self.send(words, secrets, input, None)
+    }
+    /// A request whose failure `expected` is an answer the caller handles
+    /// itself (startup `session open` → `not_configured`): it is not journaled.
+    pub(crate) fn request_expecting(&mut self, words: &[String], secrets: &Secrets, expected: &str) -> io::Result<Reply> {
+        self.send(words, secrets, &Input::default(), Some(expected))
+    }
+    fn send(&mut self, words: &[String], secrets: &Secrets, input: &Input, expected: Option<&str>) -> io::Result<Reply> {
         let _running=CommandGuard::new();
         self.ui.busy(activity(words))?;
         let ui = &mut self.ui;
-        let result = self.client.send(words, secrets, &mut |progress| match progress { Progress::Log(entry) => ui.log(entry), Progress::Tick => ui.tick() });
+        let result = self.client.send(request(&self.env, words, secrets, input),
+            &mut |progress| match progress { Progress::Log(entry) => ui.log(entry), Progress::Tick => ui.tick() });
         self.ui.command_finished()?;
         let reply = result?;
-        self.journal_error(&reply);
+        if expected.is_none_or(|code| code != reply.code()) { self.journal_error(&reply); }
         Ok(reply)
     }
-    /// serve v2 carries the core's failure text only in `error.message` (v1
+    /// The daemon carries the core's failure text only in `error.message` (v1
     /// printed it through the journal). It is shown exactly once, here;
     /// screens never repeat it. Plans and `*_required` decisions become
     /// review frames/questions instead.
@@ -90,15 +143,19 @@ impl Context<'_> {
             self.ui.notice(ui::text(format!("[✗] {message}"), ui::RED));
         }
     }
-    /// Terminal commands run INSIDE the serve child, which `serve --inner`
-    /// attaches to the controlling terminal: one process, one session lock.
+    /// Terminal commands (`node shell`, `telegram menu`): the daemon runs the
+    /// remote PTY and this process relays it through a fresh local console.
     /// The UI is suspended (cooked mode, main screen) for the whole request
     /// and never reads the terminal meanwhile; Ctrl+C reaches only the remote.
     pub fn interactive(&mut self, words: &[String]) -> io::Result<Reply> {
         let _running=CommandGuard::new();
+        let mut console = match self.terminal.as_mut() { Some(factory) => factory(), None => Box::new(ClosedTerminal) };
         self.ui.suspend()?;
         let ui = &mut self.ui;
-        let result = self.client.send(words, &Secrets::default(), &mut |progress| if let Progress::Log(entry) = progress { ui.log(entry) });
+        let (secrets, input) = (Secrets::default(), Input::default());
+        let result = self.client.terminal(request(&self.env, words, &secrets, &input), &mut *console,
+            &mut |progress| if let Progress::Log(entry) = progress { ui.log(entry) });
+        drop(console);
         let resumed = self.ui.resume();
         let reply = result?;
         resumed?;
@@ -189,9 +246,9 @@ pub fn activity(words: &[String]) -> &'static str {
         _ => "Выполняется…",
     }
 }
-pub fn run(client: &mut dyn ServeClient, ui: &mut dyn UserInterface, registry: &Registry) -> io::Result<i32> {
+pub fn run(client: &mut dyn Client, ui: &mut dyn UserInterface, registry: &Registry, terminal: TerminalFactory<'_>) -> io::Result<i32> {
     let result = (|| {
-        let mut context = Context { client, ui, registry };
+        let mut context = Context::new(client, ui, registry, terminal);
         match crate::system::session_gate(&mut context)? {
             _ if context.ui.interrupted() => return Ok(130),
             crate::system::Gate::Open => {},
@@ -211,16 +268,21 @@ pub fn run(client: &mut dyn ServeClient, ui: &mut dyn UserInterface, registry: &
     let close = client.close();
     result.and_then(|code| close.map(|_| code))
 }
-/// The `essence-rc` entrypoint without arguments. Runs in the launcher's own
-/// process; the core is a private `serve --inner` child of the SAME executable
-/// (never a PATH lookup), reached only through serve v2 JSONL.
+/// What the launcher hands to the menu: the daemon connection and the local
+/// console factory for terminal commands.
+pub struct Frontend {
+    pub client: Box<dyn Client>,
+    pub terminal: Box<dyn FnMut() -> Box<dyn TerminalIo>>,
+}
+/// The `essence-rc` entrypoint without arguments: the menu on this terminal,
+/// talking to the daemon only through `frontend.client`.
 ///
 /// Signals: SIGINT is consumed by a handler for the whole run. In a menu it
-/// closes the session (exit 130); while a request, editor or terminal command
-/// runs it is ignored (the serve child ignores it as well). TERM/HUP/QUIT
-/// restore the terminal and exit 128+N. A panic restores the terminal and
-/// exits 1 without printing its payload (it may carry secrets).
-pub fn run_terminal() -> ExitCode {
+/// ends the menu (exit 130); while a request, editor or terminal command runs
+/// it is ignored. TERM/HUP/QUIT restore the terminal and exit 128+N. A panic
+/// restores the terminal and exits 1 without printing its payload (it may
+/// carry secrets).
+pub fn run_terminal(frontend: Frontend) -> ExitCode {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         eprintln!("  [!] Терминальное меню требует терминал stdin/stdout.");
         return ExitCode::FAILURE;
@@ -235,10 +297,10 @@ pub fn run_terminal() -> ExitCode {
         Err(error) => { eprintln!("  [!] Не удалось запустить обработчик сигналов: {error}"); return ExitCode::FAILURE; }
     };
     let signals = install_signals(&runtime);
+    let Frontend { mut client, mut terminal } = frontend;
     let result = (|| {
-        let mut client = crate::serve::ProcessClient::start()?;
         let mut ui = TerminalUi::new()?;
-        run(&mut client, &mut ui, &registrations())
+        run(&mut *client, &mut ui, &registrations(), &mut *terminal)
     })();
     for task in signals { task.abort(); }
     match result {
@@ -486,8 +548,8 @@ impl UserInterface for TerminalUi {
         let color = match entry.level.as_str() { "success"=>ui::GREEN, "warn"=>ui::YELLOW, "error"=>ui::RED, _=>ui::CYAN };
         self.journal.push(ui::text(entry.text.clone(),color));
         if !self.active {
-            // Suspended for a terminal command: the serve child may already have
-            // switched the tty to raw mode, so end lines with an explicit CR.
+            // Suspended for a terminal command: the local console may already
+            // be in raw mode, so end lines with an explicit CR.
             let prefix = match entry.level.as_str() { "success"=>"  [✓] ", "warn"=>"  [!] ", "error"=>"  [✗] ", "output"=>"", _=>"  [*] " };
             let mut stdout = io::stdout().lock();
             let _ = write!(stdout, "{prefix}{}\r\n", entry.text);
@@ -543,7 +605,7 @@ impl UserInterface for ScriptedUi {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::serve::{argv, ScriptedClient};
+    use essence_rc_client::{argv, ScriptedClient};
     fn picker(keys: &[char], mode: ui::Mode, remembered: Option<&str>) -> Picker {
         let mut view = View::menu("T", keys.iter().map(|k| Item::new(k, "x", ui::CYAN)).collect());
         view.mode = mode;
@@ -656,9 +718,9 @@ mod tests {
     #[test]
     fn selector_empty_does_not_consume_and_invalid_indexes_stay() {
         let registry=Registry {screens:vec![],github_wizard:None};
-        let mut client=ScriptedClient::new([]);
+        let mut client=ScriptedClient::new(Vec::<essence_rc_client::Step>::new());
         let mut ui=ScriptedUi::new(&["01","+1","1+1","","2"]);
-        let mut context=Context {client:&mut client,ui:&mut ui,registry:&registry};
+        let mut context=Context::for_test(&mut client,&mut ui,&registry);
         assert_eq!(context.select("Empty",&[]).unwrap(),None);
         assert_eq!(context.select("Choose",&["one".into(),"two".into()]).unwrap(),Some(1));
         assert_eq!(ui.notices.len(),4);
@@ -684,40 +746,88 @@ mod tests {
             (argv(&["status"]),Reply::success(serde_json::json!({}))),
         ]);
         let mut ui=ScriptedUi::new(&["N","0"]);
-        assert_eq!(run(&mut client,&mut ui,&registry).unwrap(),0);
+        assert_eq!(run(&mut client,&mut ui,&registry,&mut || Box::new(ClosedTerminal) as Box<dyn TerminalIo>).unwrap(),0);
         assert!(client.closed);
         client.assert_finished();
     }
     fn failure(code:&str,message:&str)->Reply { Reply { error:serde_json::json!({"code":code,"message":message}),..Reply::default() } }
+    /// UI and client sharing one flag: whether the UI is suspended right now.
+    struct SharedUi { inner: ScriptedUi, suspended: std::rc::Rc<std::cell::Cell<bool>> }
+    impl UserInterface for SharedUi {
+        fn input(&mut self, view: &View, hidden: bool) -> io::Result<Option<Zeroizing<String>>> { self.inner.input(view, hidden) }
+        fn show(&mut self, view: &View) -> io::Result<()> { self.inner.show(view) }
+        fn log(&mut self, log: &Log) { self.inner.log(log) }
+        fn notice(&mut self, line: Line<'static>) { self.inner.notice(line) }
+        fn suspended(&mut self, command: &mut Command) -> io::Result<std::process::ExitStatus> { self.inner.suspended(command) }
+        fn suspend(&mut self) -> io::Result<()> { self.suspended.set(true); self.inner.suspend() }
+        fn resume(&mut self) -> io::Result<()> { self.suspended.set(false); self.inner.resume() }
+    }
+    /// Records the UI state at the moment the terminal request is made.
+    struct Observed { inner: ScriptedClient, suspended: std::rc::Rc<std::cell::Cell<bool>>, during_terminal: Option<bool> }
+    impl Client for Observed {
+        fn hello(&self) -> &essence_rc_client::Hello { self.inner.hello() }
+        fn send(&mut self, request: Request<'_>, progress: &mut dyn FnMut(Progress<'_>)) -> io::Result<Reply> { self.inner.send(request, progress) }
+        fn terminal(&mut self, request: Request<'_>, io: &mut dyn TerminalIo, progress: &mut dyn FnMut(Progress<'_>)) -> io::Result<Reply> {
+            self.during_terminal = Some(self.suspended.get());
+            self.inner.terminal(request, io, progress)
+        }
+    }
     #[test]
-    fn interactive_runs_inside_serve_while_suspended_and_journals_failure_once() {
+    fn interactive_runs_a_terminal_request_while_suspended_and_journals_failure_once() {
         let registry=Registry {screens:vec![],github_wizard:None};
         let words=argv(&["node","shell","--name","de"]);
-        let mut client=ScriptedClient::new([(words.clone(),failure("remote_failed","SSH failed"))]);
-        let mut ui=ScriptedUi::new(&[]);
-        let reply=Context {client:&mut client,ui:&mut ui,registry:&registry}.interactive(&words).unwrap();
+        let suspended=std::rc::Rc::new(std::cell::Cell::new(false));
+        let mut client=Observed { inner: ScriptedClient::new([essence_rc_client::Step::terminal(words.clone(),failure("remote_failed","SSH failed"))]),
+            suspended: suspended.clone(), during_terminal: None };
+        let mut ui=SharedUi { inner: ScriptedUi::new(&[]), suspended: suspended.clone() };
+        let mut consoles=0;
+        let mut factory=|| { consoles+=1; Box::new(ClosedTerminal) as Box<dyn TerminalIo> };
+        let reply=Context::new(&mut client,&mut ui,&registry,&mut factory).interactive(&words).unwrap();
         assert_eq!(reply.code(),"remote_failed");
-        assert_eq!((ui.suspensions,ui.suspended_now),(1,false));
-        assert_eq!(ui.notices.len(),1);
-        client.assert_finished();
+        assert_eq!(consoles,1,"one fresh console per terminal request");
+        assert_eq!(client.during_terminal,Some(true),"the UI is suspended while the terminal request runs");
+        assert!(!suspended.get(),"resumed afterwards");
+        assert_eq!((ui.inner.suspensions,ui.inner.suspended_now),(1,false));
+        assert_eq!(ui.inner.notices.len(),1);
+        client.inner.assert_finished();
+    }
+    #[test]
+    fn agent_env_is_an_absolute_path_within_the_limit() {
+        let env=|value:&str| agent_env(Some(value.into()));
+        #[cfg(unix)] {
+            assert_eq!(env("/run/agent.sock"),Some(BTreeMap::from([("SSH_AUTH_SOCK".to_owned(),"/run/agent.sock".to_owned())])));
+            assert_eq!(env("relative/agent"),None);
+            assert_eq!(env(""),None);
+            assert_eq!(agent_env(None),None);
+            assert_eq!(env(&format!("/{}","a".repeat(MAX_AGENT_PATH))),None);
+        }
+        #[cfg(windows)] {
+            assert_eq!(agent_env(None),Some(BTreeMap::from([("SSH_AUTH_SOCK".to_owned(),r"\\.\pipe\openssh-ssh-agent".to_owned())])));
+            assert_eq!(env(r"C:\agent"),Some(BTreeMap::from([("SSH_AUTH_SOCK".to_owned(),r"C:\agent".to_owned())])));
+        }
+        let (words,secrets,input)=(argv(&["status"]),Secrets::default(),Input::default());
+        let with=Some(BTreeMap::from([("SSH_AUTH_SOCK".to_owned(),"/a".to_owned())]));
+        assert_eq!(request(&with,&words,&secrets,&input).env,with.as_ref());
+        assert_eq!(request(&None,&words,&secrets,&input).env,None);
     }
     #[test]
     fn decisions_and_plans_are_not_journaled_as_errors() {
         let registry=Registry {screens:vec![],github_wizard:None};
-        let codes=["confirmation_required","plan_changed","repo_create_required","not_found"];
-        let mut client=ScriptedClient::new(codes.map(|code|(argv(&["status"]),failure(code,"text"))));
+        let codes=["confirmation_required","plan_changed","repo_create_required","not_found","not_configured"];
+        let mut client=ScriptedClient::new(codes.map(|code|(argv(&["status"]),failure(code,"text"))).into_iter()
+            .chain([(argv(&["session","open"]),failure("not_configured","quiet"))]));
         let mut ui=ScriptedUi::new(&[]);
-        let mut context=Context {client:&mut client,ui:&mut ui,registry:&registry};
+        let mut context=Context::for_test(&mut client,&mut ui,&registry);
         for _ in codes { context.call(&["status"]).unwrap(); }
-        assert_eq!(ui.notices.len(),1);
-        assert!(ui.notices[0].spans.iter().any(|span|span.content.contains("text")));
+        // Only the startup gate expects `not_configured`; elsewhere it is an error.
+        assert_eq!(context.request_expecting(&argv(&["session","open"]),&Secrets::default(),"not_configured").unwrap().code(),"not_configured");
+        assert_eq!(ui.notices.len(),2);
+        assert!(ui.notices.iter().all(|line|line.spans.iter().any(|span|span.content.contains("text"))));
         client.assert_finished();
     }
     /// The same drawing path as `TerminalUi` (ui::render_busy) on a TestBackend;
     /// each frame is recorded with the moment it was drawn.
-    #[cfg(unix)]
     struct DrawnUi { terminal: Terminal<ratatui::backend::TestBackend>, view: View, journal: Vec<Line<'static>>, busy: Option<ui::Busy>, frames: Vec<(std::time::Instant, String)> }
-    #[cfg(unix)]
     impl DrawnUi {
         fn draw(&mut self) {
             let frame = self.terminal.draw(|f| ui::render_busy(f, &self.view, "", false, &self.journal, self.busy.as_ref())).unwrap();
@@ -725,7 +835,6 @@ mod tests {
             self.frames.push((std::time::Instant::now(), text));
         }
     }
-    #[cfg(unix)]
     impl UserInterface for DrawnUi {
         fn input(&mut self, _: &View, _: bool) -> io::Result<Option<Zeroizing<String>>> { Ok(None) }
         fn show(&mut self, view: &View) -> io::Result<()> { self.view = view.clone(); self.draw(); Ok(()) }
@@ -736,22 +845,31 @@ mod tests {
         fn command_finished(&mut self) -> io::Result<()> { self.busy = None; Ok(()) }
         fn suspended(&mut self, command: &mut Command) -> io::Result<std::process::ExitStatus> { command.status() }
     }
-    /// A slow core reply (fake serve sleeps before answering): the status
-    /// line is on screen before the request is even written, the core's log
-    /// event appears live, and the spinner keeps redrawing until the reply.
-    #[cfg(unix)]
+    /// A slow daemon reply (the fake daemon sleeps before answering): the
+    /// status line is on screen before the request is even written, the
+    /// daemon's log event appears live, and the spinner keeps redrawing until
+    /// the reply.
     #[test]
     fn status_line_is_drawn_before_a_slow_reply_and_animates() {
-        let mut command = Command::new("/bin/sh");
-        command.args(["-c", "printf '%s\\n' '{\"event\":\"hello\",\"protocol\":2,\"version\":\"9\"}'; read -r req; \
-            printf '%s\\n' '{\"id\":1,\"event\":\"log\",\"level\":\"info\",\"text\":\"Проверка аккаунта GitHub\"}'; sleep 1; \
-            printf '%s\\n' '{\"id\":1,\"ok\":false,\"error\":{\"code\":\"repo_create_required\"}}'; read -r req"]);
-        let mut client = crate::serve::ProcessClient::spawn(&mut command).unwrap();
+        use std::sync::mpsc;
+        let line = |value: serde_json::Value| Zeroizing::new(value.to_string());
+        let (to_client, incoming) = mpsc::channel();
+        let (outgoing, from_client) = mpsc::channel::<Zeroizing<String>>();
+        to_client.send(line(serde_json::json!({"event":"hello","protocol":3,"version":"9","origin":"local"}))).unwrap();
+        let daemon = std::thread::spawn(move || {
+            let request: serde_json::Value = serde_json::from_str(&from_client.recv().unwrap()).unwrap();
+            let id = request["id"].clone();
+            to_client.send(line(serde_json::json!({"id":id,"event":"log","level":"info","text":"Проверка аккаунта GitHub"}))).unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            to_client.send(line(serde_json::json!({"id":id,"ok":false,"error":{"code":"repo_create_required"},"exit":2}))).unwrap();
+            let _ = from_client.recv();
+        });
+        let mut client = essence_rc_client::DaemonClient::from_channels(incoming, outgoing).unwrap();
         let mut ui = DrawnUi { terminal: Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap(), view: View::menu("Источник конфигурации", vec![]),
             journal: vec![], busy: None, frames: vec![] };
         let registry = Registry { screens: vec![], github_wizard: None };
         let started = std::time::Instant::now();
-        let reply = Context { client: &mut client, ui: &mut ui, registry: &registry }.call(&["source", "github-connect", "--login", "o"]).unwrap();
+        let reply = Context::for_test(&mut client, &mut ui, &registry).call(&["source", "github-connect", "--login", "o"]).unwrap();
         let replied = std::time::Instant::now();
         assert_eq!(reply.code(), "repo_create_required");
         assert!(replied.duration_since(started) >= std::time::Duration::from_millis(900));
@@ -764,6 +882,8 @@ mod tests {
         assert!(spinners.len() > 1, "the spinner advances: {spinners:?}");
         assert!(ui.frames.iter().all(|(at, _)| *at <= replied));
         client.close().unwrap();
+        drop(client);
+        daemon.join().unwrap();
     }
     #[test]
     fn os_interrupt_is_ignored_while_a_command_runs() {

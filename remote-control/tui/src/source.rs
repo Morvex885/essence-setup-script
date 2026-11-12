@@ -6,10 +6,11 @@
 use std::io;
 use ratatui::{style::Style, text::{Line, Span}};
 use serde_json::Value;
+use essence_rc_client::{argv, Reply, Secrets};
 use crate::{
     app::{Context, Navigation, Screen},
+    clients::{expand_home, file_input},
     confirm::{clear_flag, decision_flag, run_confirmed, set_flag},
-    serve::{argv, Reply, Secrets},
     system::{new_password, sync_state},
     ui::{self, Item, View},
 };
@@ -147,8 +148,8 @@ impl Screen for Source {
                 },
                 "k" if encrypted => {
                     let Some(path) = ask(context, "Импорт ключа восстановления", "Путь к файлу")? else { continue; };
-                    if !path.is_empty() {
-                        let reply = context.call(&["source", "github-import-recovery-key", "--file", &path])?;
+                    if !path.is_empty() && let Some(input) = file_input(context, &expand_home(&path)) {
+                        let reply = context.request_with(&argv(&["source", "github-import-recovery-key"]), &Secrets::default(), &input)?;
                         report(context, &reply);
                     }
                 },
@@ -296,7 +297,8 @@ pub fn github_wizard(context: &mut Context<'_>, mode: &str) -> io::Result<bool> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{app::{Registry, ScriptedUi}, serve::{Log, ScriptedClient}, system::tests::{assert_frames, error, ok, plan, words}};
+    use crate::{app::{Registry, ScriptedUi}, system::tests::{assert_frames, error, ok, plan, words}};
+    use essence_rc_client::{Log, ScriptedClient};
     use serde_json::json;
     fn registry() -> Registry { Registry { screens: vec![], github_wizard: Some(github_wizard) } }
     fn keys(view: &View) -> Vec<String> { view.sections.iter().flatten().map(|i| i.key.clone()).collect() }
@@ -308,8 +310,8 @@ mod tests {
         (words(&["source", "status"]), Reply::success(json!({"type":"local","repo":null,"branch":null,"storage":null,"sync":null,"key_saved":null})))
     }
     fn accounts() -> (Vec<String>, Reply) { (words(&["source", "github-accounts"]), Reply::success(json!({"accounts":["test-owner"],"global_login":"glob"}))) }
-    fn source(client: &mut ScriptedClient, ui: &mut ScriptedUi) -> Navigation { Source.run(&mut Context { client, ui, registry: &registry() }).unwrap() }
-    fn wizard(client: &mut ScriptedClient, ui: &mut ScriptedUi, mode: &str) -> bool { github_wizard(&mut Context { client, ui, registry: &registry() }, mode).unwrap() }
+    fn source(client: &mut ScriptedClient, ui: &mut ScriptedUi) -> Navigation { Source.run(&mut Context::for_test(client, ui, &registry())).unwrap() }
+    fn wizard(client: &mut ScriptedClient, ui: &mut ScriptedUi, mode: &str) -> bool { github_wizard(&mut Context::for_test(client, ui, &registry()), mode).unwrap() }
     fn notices(ui: &ScriptedUi) -> Vec<String> { ui.notices.iter().map(ToString::to_string).collect() }
 
     #[test] fn source_menu_items_follow_storage_and_colours() {
@@ -327,14 +329,20 @@ mod tests {
         assert_frames(&[age, plain, local_view]);
     }
     #[test] fn sync_switch_and_recovery_key_send_real_commands_in_both_cases() {
+        let key = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(key.path(), "AGE-SECRET-KEY-1TEST\n").unwrap();
+        let key_path = key.path().to_str().unwrap();
         let mut client = ScriptedClient::new([status("age"), (words(&["source", "github-fetch"]), Reply::success(json!({"sync":"clean"}))),
             status("age"), (words(&["source", "github-push"]), error("source_failed", json!({"message":"push rejected"}))),
             status("age"), (words(&["source", "github-switch-local"]), Reply::success(json!({"source":"local"}))),
-            status("age"), (words(&["source", "github-import-recovery-key", "--file", "/tmp/key.txt"]), ok()),
-            status("age"), status("age")]);
-        let mut ui = ScriptedUi::new(&["f", "P", "E", "k", "/tmp/key.txt", "", "0"]);
+            status("age"), (words(&["source", "github-import-recovery-key"]), ok()),
+            status("age"), status("age"), status("age")]);
+        let mut ui = ScriptedUi::new(&["f", "P", "E", "k", key_path, "k", "/nonexistent/key.txt", "", "0"]);
         assert!(matches!(source(&mut client, &mut ui), Navigation::Back));
         client.assert_finished();
+        assert_eq!(client.input_names[7], ["file"], "the key text travels as input.file");
+        assert!(!client.calls.iter().flatten().any(|word| word == key_path), "the key path stays local");
+        assert!(notices(&ui).iter().any(|n| n.contains("Файл недоступен или не в UTF-8.")), "an unreadable file sends nothing");
         let texts = notices(&ui);
         assert!(texts.iter().any(|n| n.contains("Операция завершилась ошибкой")));
         assert_eq!(texts.iter().filter(|n| n.contains("push rejected")).count(), 1, "core message shown once (centrally)");
@@ -393,7 +401,7 @@ mod tests {
         let registry = Registry { screens: vec![], github_wizard: Some(probe) };
         let mut client = ScriptedClient::new([local(), local(), local()]);
         let mut ui = ScriptedUi::new(&["G", "f", "0"]);
-        Source.run(&mut Context { client: &mut client, ui: &mut ui, registry: &registry }).unwrap();
+        Source.run(&mut Context::for_test(&mut client, &mut ui, &registry)).unwrap();
         client.assert_finished();
         assert_eq!(notices(&ui).iter().filter(|n| n.contains("Неверный выбор.")).count(), 1);
     }

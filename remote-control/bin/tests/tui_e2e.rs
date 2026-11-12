@@ -1,16 +1,21 @@
 //! Linux PTY cases drive the REAL `essence-rc` without arguments: the menu
-//! runs in that process and spawns the same executable as `serve --inner`.
-//! Each case has its own HOME/data dir; wait for prompts before sending keys.
-//! No network. Geometry/colour rules are covered by TestBackend unit tests.
+//! runs in that process and talks to an on-demand daemon of the same
+//! executable. Each case has its own HOME/data dir and runtime directory;
+//! wait for prompts before sending keys. No network. Geometry/colour rules
+//! are covered by TestBackend unit tests.
 #![cfg(target_os = "linux")]
+mod common;
+
 use std::{
     fs::File,
-    io::{self, BufRead, BufReader, Read, Write},
+    io::{self, Read, Write},
     os::{fd::{AsRawFd, FromRawFd, RawFd}, unix::process::CommandExt},
     path::Path,
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
+
+use essence_rc_client::{Client, DaemonClient, Hello, Progress, Request, SpawnDaemon, TerminalIo};
 
 const BINARY: &str = env!("CARGO_BIN_EXE_essence-rc");
 
@@ -96,29 +101,32 @@ fn controlling_terminal(command: &mut Command, slave: RawFd) {
     }
 }
 
-struct PtySession { child: Child, master: File, slave: File, home: tempfile::TempDir, screen: Screen, partial: Vec<u8> }
+struct PtySession { child: Child, master: File, slave: File, home: tempfile::TempDir, runtime: tempfile::TempDir, screen: Screen, partial: Vec<u8> }
 
 impl PtySession {
     fn start() -> Self { Self::start_with(|_, _| {}) }
-    /// `prepare` gets the data dir and the command before spawning.
-    fn start_with(prepare: impl FnOnce(&Path, &mut Command)) -> Self {
+    /// `prepare` gets the process context (data and runtime directories)
+    /// and the command before spawning.
+    fn start_with(prepare: impl FnOnce(&common::Ctx, &mut Command)) -> Self {
         let home = tempfile::tempdir().unwrap();
+        let runtime = common::runtime_dir();
         let (master, slave) = openpty();
         let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
         assert_eq!(unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) }, 0);
-        let mut command = Command::new(BINARY);
-        command.env("HOME", home.path()).env("XDG_DATA_HOME", home.path().join("data"))
-            .env("ESSENCE_RC_DATA_DIR", home.path().join("rc")).env("TERM", "xterm-256color")
+        let ctx = common::Ctx { data: home.path().join("rc"), runtime: runtime.path().to_path_buf(), vars: vec![("HOME".into(), home.path().into())] };
+        let mut command = ctx.command(BINARY);
+        command.env("XDG_DATA_HOME", home.path().join("data")).env("TERM", "xterm-256color")
             .env_remove("VISUAL").env_remove("EDITOR")
             .stdin(Stdio::from(slave.try_clone().unwrap()))
             .stdout(Stdio::from(slave.try_clone().unwrap()))
             .stderr(Stdio::from(slave.try_clone().unwrap()));
         controlling_terminal(&mut command, slave.as_raw_fd());
-        prepare(&home.path().join("rc"), &mut command);
+        prepare(&ctx, &mut command);
         let child = command.spawn().unwrap();
-        Self { child, master, slave, home, screen: Screen::new(), partial: vec![] }
+        Self { child, master, slave, home, runtime, screen: Screen::new(), partial: vec![] }
     }
     fn data(&self) -> std::path::PathBuf { self.home.path().join("rc") }
+    fn endpoint(&self) -> essence_rc_client::Endpoint { common::endpoint(self.runtime.path(), &self.data()) }
     fn pump(&mut self) {
         let mut buffer = [0; 8192];
         match self.master.read(&mut buffer) {
@@ -158,11 +166,12 @@ impl PtySession {
             let _ = self.master.read(&mut buffer);
             std::thread::sleep(Duration::from_millis(10));
         }
-        // The serve child got EOF and released the session lock.
+        // The menu's on-demand daemon exited and released the session lock.
+        assert!(common::wait_gone(&self.endpoint(), common::GONE_WAIT), "the daemon outlived the menu");
         let lock = self.data().join(".rc-lock");
         let start = Instant::now();
         while lock.exists() && start.elapsed() < Duration::from_secs(5) { std::thread::sleep(Duration::from_millis(20)); }
-        assert!(!lock.exists(), "serve session lock survived EOF");
+        assert!(!lock.exists(), "the session lock survived the daemon");
         let mut settings = std::mem::MaybeUninit::uninit();
         assert_eq!(unsafe { libc::tcgetattr(self.slave.as_raw_fd(), settings.as_mut_ptr()) }, 0);
         let settings = unsafe { settings.assume_init() };
@@ -172,7 +181,11 @@ impl PtySession {
 }
 
 impl Drop for PtySession {
-    fn drop(&mut self) { let _ = self.child.kill(); let _ = self.child.wait(); }
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        common::stop(&self.endpoint());
+    }
 }
 
 #[test]
@@ -246,17 +259,17 @@ fn startup_exit_codes_quit_0_failures_1() {
     quit.send("0\n");
     quit.finish(0);
 
-    // An unusable data dir: `serve --inner` exits before its hello.
+    // An unusable data dir: the menu cannot reach a daemon.
     let mut broken = PtySession::start_with(|_, command| { command.env("ESSENCE_RC_DATA_DIR", ""); });
     broken.expect("ESSENCE_RC_DATA_DIR");
     broken.finish(1);
 
     // A corrupt launch-password hash: `session open` answers auth_failed;
     // cancelling the hidden prompt (Ctrl+D) leaves the session closed.
-    let mut closed = PtySession::start_with(|data, _| {
-        let init = Command::new(BINARY).env("ESSENCE_RC_DATA_DIR", data).args(["source", "init-local", "--json"]).output().unwrap();
+    let mut closed = PtySession::start_with(|ctx, _| {
+        let init = ctx.run(&["source", "init-local", "--json"], b"");
         assert!(init.status.success());
-        std::fs::write(data.join("auth.txt"), "garbage\n").unwrap();
+        std::fs::write(ctx.data.join("auth.txt"), "garbage\n").unwrap();
     });
     closed.expect("Введите пароль");
     closed.send("\u{4}");
@@ -291,59 +304,25 @@ fn dashboard_ctrl_c_releases_open_session() {
     session.finish(130);
 }
 
-/// Issue 2: `node shell` / `telegram menu` run inside the TUI's own
-/// `serve --inner` child on the shared controlling terminal (a separate
-/// one-shot child would need a second session: `locked` while the serve
-/// holds a GitHub session). The inner child passes the terminal gate inside
-/// the open session (reaching node lookup: `not_found`); a public serve
-/// answers `tty_required`.
-#[test]
-fn inner_serve_runs_terminal_commands_inside_its_session() {
-    let home = tempfile::tempdir().unwrap();
-    let data = home.path().join("rc");
-    let init = Command::new(BINARY).env("ESSENCE_RC_DATA_DIR", &data)
-        .args(["source", "init-local", "--json"]).output().unwrap();
-    assert!(init.status.success());
-    for inner in [true, false] {
-        let (_master, slave) = openpty();
-        let mut command = Command::new(BINARY);
-        command.env("ESSENCE_RC_DATA_DIR", &data).arg("serve");
-        if inner { command.arg("--inner"); }
-        command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::from(slave.try_clone().unwrap()));
-        controlling_terminal(&mut command, slave.as_raw_fd());
-        let mut child = command.spawn().unwrap();
-        let mut input = child.stdin.take().unwrap();
-        let mut output = BufReader::new(child.stdout.take().unwrap());
-        let mut read = || {
-            let mut line = String::new();
-            assert!(output.read_line(&mut line).unwrap() > 0);
-            serde_json::from_str::<serde_json::Value>(&line).unwrap()
-        };
-        assert_eq!(read()["event"], "hello");
-        let requests = [r#"{"id":1,"argv":["session","open"]}"#, r#"{"id":2,"argv":["node","shell","--name","ghost"]}"#,
-            r#"{"id":3,"argv":["telegram","menu","--name","ghost"]}"#];
-        writeln!(input, "{}", requests.join("\n")).unwrap();
-        let mut reply = || loop { let value = read(); if value["event"].is_null() { break value; } };
-        assert_eq!(reply()["ok"], true);
-        for id in [2, 3] {
-            let reply = reply();
-            assert_eq!(reply["id"], id);
-            assert_eq!(reply["error"]["code"], if inner { "not_found" } else { "tty_required" }, "inner={inner}: {reply}");
-        }
-        drop(input);
-        assert!(child.wait().unwrap().success());
-        assert!(!Path::new(&data).join(".rc-lock").exists());
+/// Records every request the real screens send to the real daemon.
+struct Recording { inner: DaemonClient, calls: Vec<(Vec<String>, String)> }
+
+impl Recording {
+    fn record(&mut self, argv: &[String], reply: &essence_rc_client::Reply) {
+        self.calls.push((argv.to_vec(), if reply.ok { "ok".into() } else { reply.code().to_owned() }));
     }
 }
 
-/// Records every request the real screens send to the real `serve --inner`.
-struct Recording { inner: essence_rc_tui::serve::ProcessClient, calls: Vec<(Vec<String>, String)> }
-
-impl essence_rc_tui::serve::ServeClient for Recording {
-    fn version(&self) -> &str { self.inner.version() }
-    fn send(&mut self, argv: &[String], secrets: &essence_rc_tui::serve::Secrets, progress: &mut dyn FnMut(essence_rc_tui::serve::Progress<'_>)) -> io::Result<essence_rc_tui::serve::Reply> {
-        let reply = self.inner.send(argv, secrets, progress)?;
-        self.calls.push((argv.to_vec(), if reply.ok { "ok".into() } else { reply.code().to_owned() }));
+impl Client for Recording {
+    fn hello(&self) -> &Hello { self.inner.hello() }
+    fn send(&mut self, request: Request<'_>, progress: &mut dyn FnMut(Progress<'_>)) -> io::Result<essence_rc_client::Reply> {
+        let reply = self.inner.send(request, progress)?;
+        self.record(request.argv, &reply);
+        Ok(reply)
+    }
+    fn terminal(&mut self, request: Request<'_>, io: &mut dyn TerminalIo, progress: &mut dyn FnMut(Progress<'_>)) -> io::Result<essence_rc_client::Reply> {
+        let reply = self.inner.terminal(request, io, progress)?;
+        self.record(request.argv, &reply);
         Ok(reply)
     }
     fn close(&mut self) -> io::Result<()> { self.inner.close() }
@@ -355,15 +334,17 @@ impl essence_rc_tui::serve::ServeClient for Recording {
 #[test]
 fn screens_speak_the_real_v2_grammar() {
     let home = tempfile::tempdir().unwrap();
-    let mut command = Command::new(BINARY);
-    command.env("ESSENCE_RC_DATA_DIR", home.path().join("rc")).env("HOME", home.path()).args(["serve", "--inner"]);
-    let inner = essence_rc_tui::serve::ProcessClient::spawn(&mut command).unwrap();
+    let runtime = common::runtime_dir();
+    let ctx = common::Ctx { data: home.path().join("rc"), runtime: runtime.path().to_path_buf(), vars: vec![("HOME".into(), home.path().into())] };
+    let spawn = SpawnDaemon { exe: BINARY.into(), args: vec!["daemon".into(), "run".into()], env: ctx.spawn_env() };
+    let inner = DaemonClient::connect_local(&ctx.endpoint(), Some(&spawn), None, None).unwrap();
     let mut client = Recording { inner, calls: vec![] };
     let export = home.path().join("exported.yaml").to_string_lossy().into_owned();
     let walk = WALK.replace("EXPORT", &export);
     let script: Vec<&str> = walk.split_whitespace().map(|key| if key == "_" { "" } else { key }).collect();
     let mut ui = essence_rc_tui::app::ScriptedUi::new(&script);
-    let code = essence_rc_tui::app::run(&mut client, &mut ui, &essence_rc_tui::app::registrations()).unwrap();
+    let mut terminal = || -> Box<dyn TerminalIo> { panic!("the walk opens no terminal") };
+    let code = essence_rc_tui::app::run(&mut client, &mut ui, &essence_rc_tui::app::registrations(), &mut terminal).unwrap();
     for (argv, code) in &client.calls { eprintln!("{code:>24}  {}", argv.join(" ")); }
     eprintln!("unused input: {:?}; last frame: {:?}", ui.inputs, ui.views.last().map(|view| &view.title));
     assert_eq!(code, 0);
@@ -376,6 +357,10 @@ fn screens_speak_the_real_v2_grammar() {
     for noun in ["session", "source", "status", "group", "client", "template", "generate", "subscription", "node", "conn", "telegram"] {
         assert!(client.calls.iter().any(|(argv, _)| argv[0] == noun), "walk never reached {noun}");
     }
+    assert!(client.calls.iter().any(|(argv, code)| argv.starts_with(&["template".to_owned(), "show".to_owned()]) && code == "ok"));
+    assert!(Path::new(&export).is_file(), "the export is written by the menu itself");
+    drop(client);
+    ctx.settle();
 }
 
 /// Dashboard keys per section; `_` is Enter, EXPORT a temp file path.

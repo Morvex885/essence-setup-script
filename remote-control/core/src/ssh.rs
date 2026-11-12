@@ -39,9 +39,20 @@ type RejectedKey = Arc<Mutex<Option<RcError>>>;
 type NativeAgent = AgentClient<Box<dyn AgentStream + Send + Unpin>>;
 
 /// An authenticated connection. Dropping the adapter does not revoke held leases.
+/// System authentication uses only the agent passed by the requesting client
+/// (`with_agent`); the default transport uses no agent at all.
 #[derive(Default)]
 pub struct SshTransport {
     connection: Option<Arc<Connection>>,
+    agent: Option<PathBuf>,
+}
+
+impl SshTransport {
+    /// A transport whose system authentication may use the SSH agent at
+    /// `agent_socket` (Unix socket path or Windows named pipe); `None` → no agent.
+    pub fn with_agent(agent_socket: Option<&Path>) -> Self {
+        Self { connection: None, agent: agent_socket.map(Path::to_path_buf) }
+    }
 }
 
 /// An independent lease on the already authenticated connection, never a relogin.
@@ -114,7 +125,7 @@ impl RemoteTransport for SshTransport {
         self.connection = None;
         validate_endpoint(&options)?;
         let deadline = Instant::now() + options.timeout;
-        let connection = timeout_at(deadline, connect_native(options)).await
+        let connection = timeout_at(deadline, connect_native(options, self.agent.as_deref())).await
             .map_err(|_| remote_failure("timeout"))??;
         self.connection = Some(Arc::new(connection));
         Ok(())
@@ -161,7 +172,7 @@ fn validate_endpoint(options: &ConnectOptions) -> Result<()> {
     Ok(())
 }
 
-async fn connect_native(options: ConnectOptions) -> Result<Connection> {
+async fn connect_native(options: ConnectOptions, agent: Option<&Path>) -> Result<Connection> {
     // Resolve managed-key/setup errors before DNS or opening a network socket.
     let auth = match options.auth {
         Authentication::Password(password) => {
@@ -191,7 +202,7 @@ async fn connect_native(options: ConnectOptions) -> Result<Connection> {
         PreparedAuth::Password(password) => handle.authenticate_password(&options.user, password.as_str())
             .await.map_err(|_| remote_failure("authentication"))?.success(),
         PreparedAuth::Key(key) => authenticate_key(&mut handle, &options.user, key).await?,
-        PreparedAuth::System => authenticate_system(&mut handle, &options.user).await?,
+        PreparedAuth::System => authenticate_system(&mut handle, &options.user, agent).await?,
     };
     if !authenticated { return Err(remote_failure("authentication")); }
     Ok(Connection { handle, rejected })
@@ -251,23 +262,23 @@ async fn authenticate_key(handle: &mut Handle<HostVerifier>, user: &str, key: Pr
 }
 
 #[cfg(unix)]
-async fn native_agent() -> Option<NativeAgent> {
-    AgentClient::connect_env().await.ok().map(|agent| agent.dynamic())
+async fn native_agent(socket: &Path) -> Option<NativeAgent> {
+    AgentClient::connect_uds(socket).await.ok().map(|agent| agent.dynamic())
 }
 
 #[cfg(windows)]
-async fn native_agent() -> Option<NativeAgent> {
-    // This is the Windows OpenSSH agent, not Pageant and not a shell helper.
-    AgentClient::connect_named_pipe(r"\\.\pipe\openssh-ssh-agent")
-        .await.ok().map(|agent| agent.dynamic())
+async fn native_agent(pipe: &Path) -> Option<NativeAgent> {
+    // The Windows OpenSSH agent pipe named by the client, not Pageant.
+    AgentClient::connect_named_pipe(pipe).await.ok().map(|agent| agent.dynamic())
 }
 
 #[cfg(not(any(unix, windows)))]
-async fn native_agent() -> Option<NativeAgent> { None }
+async fn native_agent(_: &Path) -> Option<NativeAgent> { None }
 
-async fn authenticate_system(handle: &mut Handle<HostVerifier>, user: &str) -> Result<bool> {
+async fn authenticate_system(handle: &mut Handle<HostVerifier>, user: &str, agent: Option<&Path>) -> Result<bool> {
     let mut attempted = false;
-    if let Some(mut agent) = native_agent().await {
+    let agent = match agent { Some(socket) => native_agent(socket).await, None => None };
+    if let Some(mut agent) = agent {
         if let Some(binding) = handle.agent_session_binding() {
             // Older agents may reject this extension; unrestricted identities
             // remain usable, while a constrained agent still enforces its policy.

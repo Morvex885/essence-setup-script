@@ -8,6 +8,8 @@
 //! parsed by a clap command built from its catalog row. Global flags
 //! `--json --yes --plan-token --secrets-stdin --help` may appear anywhere.
 //! Flag values may not contain a newline; no flag carries a secret value.
+//! An `@name` token declares request input (file contents): the daemon's
+//! parser does not know it, the client's parser reads it as `--name PATH`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -18,8 +20,13 @@ use crate::error::{RcError, Result};
 
 const NOSESSION: u8 = 1;
 const TTY: u8 = 2;
+/// Accepted only from the local socket.
+const LOCAL: u8 = 4;
+/// Executed by the CLI process itself, never sent to the daemon.
+const CLIENT: u8 = 8;
 
-/// One command: tokens use v1 syntax without `@secret` / `!flag` markers.
+/// One command: tokens use v1 syntax without `@secret` / `!flag` markers;
+/// `@name` is request input (see the module docs).
 struct Spec {
     noun: &'static str,
     verb: &'static str,
@@ -53,7 +60,7 @@ static CATALOG: &[Spec] = &[
         "login= create-repo make-private storage= existing= without-cache replace-target", VAULT, 0),
     spec("source", "github-rewrap-password", "", VAULT, 0),
     spec("source", "github-rotate-key", "", &["new-vault-password"], 0),
-    spec("source", "github-import-recovery-key", "file=", &[], 0),
+    spec("source", "github-import-recovery-key", "@file", &[], 0),
     spec("source", "github-switch-local", "", &[], 0),
     spec("source", "github-replace-with-local", "provision-keys=", &["vault-password", "script-password"], NOSESSION),
     spec("source", "github-migrate-format", "", &["vault-password", "script-password"], NOSESSION),
@@ -63,6 +70,10 @@ static CATALOG: &[Spec] = &[
     spec("self", "uninstall", "remove-data", &[], 0),
     spec("self", "password-set", "", &["password", "current-password"], 0),
     spec("self", "password-remove", "", &["current-password"], 0),
+    spec("daemon", "status", "", &[], NOSESSION),
+    spec("daemon", "stop", "", &[], NOSESSION | LOCAL),
+    spec("daemon", "run", "", &[], CLIENT),
+    spec("daemon", "start", "", &[], CLIENT),
     spec("node", "list", "", &[], 0),
     spec("node", "show", "name=", &[], 0),
     spec("node", "aliases", "name= set+ unset+", &[], 0),
@@ -101,10 +112,11 @@ static CATALOG: &[Spec] = &[
     spec("template", "list", "", &[], 0),
     spec("template", "show", "name=", &[], 0),
     spec("template", "create", "name= from= group=", &[], 0),
-    spec("template", "export", "name= output=", &[], 0),
-    spec("template", "import", "name= file=", &[], 0),
+    spec("template", "export", "name= output=", &[], CLIENT),
+    spec("template", "import", "name= @file", &[], 0),
     spec("client", "list", "group=", &[], 0),
     spec("client", "show", "name=", &[], 0),
+    spec("client", "config", "name=", &[], 0),
     spec("client", "connections", "name= node= proxy+ reset", &[], 0),
     spec("client", "add", "name= group=", &[], 0),
     spec("client", "rename", "name= new-name=", &[], 0),
@@ -127,11 +139,10 @@ static CATALOG: &[Spec] = &[
 static HELP: &[(&str, &[(&str, &str)])] = &[
     ("help", &[
         ("help [СУЩНОСТЬ]", "Справка по командам (то же: --help, -h, <сущность> --help)"),
-        ("serve [--inner]", "Протокол JSON-строк v2 через stdin/stdout для интерфейсов (serve --help — описание)"),
         ("… --json", "Ответ одним JSON-объектом {id, ok, data} или {id, ok, error} в stdout; журнал — в stderr"),
         ("… --yes [--plan-token T]", "Подтвердить опасное действие; T — plan_token из ответа confirmation_required"),
         ("… --secrets-stdin", "Секреты из stdin: JSON-объект {\"имя\":\"значение\"}; без флага — скрытый ввод с консоли"),
-        ("ESSENCE_RC_DATA_DIR, RC_LOCK_WAIT", "Окружение: каталог данных, ожидание блокировки (с)"),
+        ("ESSENCE_RC_DATA_DIR, RC_LOCK_WAIT, ESSENCE_RC_RUNTIME_DIR, ESSENCE_RC_DAEMON_LINGER", "Окружение: каталог данных, ожидание блокировки (с), каталог сокета демона, простой демона до выхода (с); RC_LOCK_WAIT и GITHUB_TOKEN читаются из окружения демона"),
         ("Коды выхода", "0 — успех; 1 — ошибка; 2 — неверное использование, нужно решение или --yes; telegram: 3 — не установлено, 4 — частично"),
     ]),
     ("awg", &[
@@ -142,6 +153,7 @@ static HELP: &[(&str, &[(&str, &str)])] = &[
     ("client", &[
         ("client list [--group G]", "Список клиентов"),
         ("client show --name C", "Подробности клиента (с секретами)"),
+        ("client config --name C", "Содержимое готового конфига клиента (с секретами)"),
         ("client connections --name C [--node N (--proxy P… | --reset [--yes])]", "Подключения клиента"),
         ("client add --name C --group G", "Добавить клиента"),
         ("client rename --name C --new-name D [--yes]", "Переименовать клиента"),
@@ -153,6 +165,12 @@ static HELP: &[(&str, &[(&str, &str)])] = &[
         ("conn list [--name N [--discover]]", "Подключения нод по группам"),
         ("conn set --name N --group G… [--proxy P…]", "Назначить подключения группам (без --proxy — снять)"),
         ("conn sync [--name N]", "Обнаружить подключения нод по SSH и убрать устаревшие назначения"),
+    ]),
+    ("daemon", &[
+        ("daemon status", "Состояние демона: клиенты, сессия, терминалы"),
+        ("daemon stop", "Остановить демон после текущей операции"),
+        ("daemon run", "Запустить демон на переднем плане"),
+        ("daemon start", "Запустить демон в фоне и напечатать адрес подключения"),
     ]),
     ("generate", &[
         ("generate (--all | --group G | --client C)", "Сгенерировать конфиги"),
@@ -255,8 +273,13 @@ pub struct Invocation {
     values: BTreeMap<&'static str, Vec<String>>,
     flags: BTreeSet<&'static str>,
     secrets: &'static [&'static str],
+    inputs: Vec<&'static str>,
     session: bool,
     tty: bool,
+    local: bool,
+    client: bool,
+    /// Catalog row of a command (none for help).
+    spec: Option<&'static Spec>,
     confirmation: Vec<String>,
 }
 
@@ -265,7 +288,8 @@ impl Invocation {
         Self {
             noun: "help".into(), verb: String::new(), json, yes: false, plan_token: None,
             secrets_stdin: false, help: true, help_noun, values: BTreeMap::new(), flags: BTreeSet::new(),
-            secrets: &[], session: false, tty: false, confirmation: Vec::new(),
+            secrets: &[], inputs: Vec::new(), session: false, tty: false, local: false, client: false, spec: None,
+            confirmation: Vec::new(),
         }
     }
 
@@ -283,6 +307,53 @@ impl Invocation {
 
     pub fn allowed_secrets(&self) -> &'static [&'static str] {
         self.secrets
+    }
+
+    /// Request input names (`@name` tokens); the client reads them from `--name PATH`.
+    pub fn inputs(&self) -> &[&'static str] {
+        &self.inputs
+    }
+
+    /// Accepted only from the daemon's local socket.
+    pub fn local_only(&self) -> bool {
+        self.local
+    }
+
+    /// Executed by the CLI process; the daemon never runs it.
+    pub fn client_side(&self) -> bool {
+        self.client
+    }
+
+    /// `argv` as sent to the daemon: without `--secrets-stdin` and without
+    /// the client-side input flags (`--name PATH`, `--name=PATH` of every
+    /// `@name`). Flag values are skipped by the catalog's grammar, so a value
+    /// that looks like one of these flags stays.
+    pub fn daemon_argv(&self, argv: &[String]) -> Vec<String> {
+        let mut kept = Vec::with_capacity(argv.len());
+        let mut args = argv.iter();
+        while let Some(arg) = args.next() {
+            let Some(flag) = arg.strip_prefix("--") else {
+                kept.push(arg.clone());
+                continue;
+            };
+            if flag == "secrets-stdin" {
+                continue;
+            }
+            let (name, inline) = flag.split_once('=').map_or((flag, false), |(name, _)| (name, true));
+            let takes_value = !inline && (name == "plan-token"
+                || self.spec.is_some_and(|spec| matches!(token_kind(spec, name, true), Some('=' | '+'))));
+            if self.inputs.contains(&name) {
+                if takes_value {
+                    args.next();
+                }
+                continue;
+            }
+            kept.push(arg.clone());
+            if takes_value && let Some(value) = args.next() {
+                kept.push(value.clone());
+            }
+        }
+        kept
     }
 
     pub fn requires_session(&self) -> bool {
@@ -353,19 +424,41 @@ fn next_positional(argv: &[String], mut index: usize, help: &mut bool) -> Option
     None
 }
 
-fn token_kind(spec: &Spec, name: &str) -> Option<char> {
-    spec.tokens.split_whitespace().find_map(|token| {
-        let (base, kind) = match token.as_bytes().last() {
+/// Every catalog token of a row as `(name, kind)`: `=` value, `+`
+/// repeatable, `b` boolean, `@` request input.
+fn catalog_tokens(spec: &'static Spec) -> impl Iterator<Item = (&'static str, char)> {
+    spec.tokens.split_whitespace().map(|token| {
+        if let Some(name) = token.strip_prefix('@') {
+            return (name, '@');
+        }
+        match token.as_bytes().last() {
             Some(b'=') => (&token[..token.len() - 1], '='),
             Some(b'+') => (&token[..token.len() - 1], '+'),
             _ => (token, 'b'),
-        };
-        (base == name).then_some(kind)
+        }
     })
 }
 
+/// A row's flags as the parser sees them. An `@name` input is a value flag
+/// only for the client parser (`client`); the daemon's parser skips it.
+fn tokens(spec: &'static Spec, client: bool) -> impl Iterator<Item = (&'static str, char)> {
+    catalog_tokens(spec).filter_map(move |(name, kind)| match kind {
+        '@' => client.then_some((name, '=')),
+        _ => Some((name, kind)),
+    })
+}
+
+/// Request input names (`@name` tokens) of a row.
+fn inputs(spec: &'static Spec) -> impl Iterator<Item = &'static str> {
+    catalog_tokens(spec).filter_map(|(name, kind)| (kind == '@').then_some(name))
+}
+
+fn token_kind(spec: &'static Spec, name: &str, client: bool) -> Option<char> {
+    tokens(spec, client).find_map(|(base, kind)| (base == name).then_some(kind))
+}
+
 /// v1 `_cli_wants_help`: `--help`/`-h` in a flag position, never a flag value.
-fn help_in_flags(spec: &Spec, args: &[String]) -> bool {
+fn help_in_flags(spec: &'static Spec, args: &[String], client: bool) -> bool {
     let mut skip = false;
     for arg in args {
         if skip {
@@ -376,7 +469,7 @@ fn help_in_flags(spec: &Spec, args: &[String]) -> bool {
             "--help" | "-h" => return true,
             "--plan-token" => skip = true,
             flag if flag.starts_with("--") && !flag.contains('=') => {
-                skip = matches!(token_kind(spec, &flag[2..]), Some('=' | '+'));
+                skip = matches!(token_kind(spec, &flag[2..], client), Some('=' | '+'));
             }
             _ => {}
         }
@@ -384,8 +477,19 @@ fn help_in_flags(spec: &Spec, args: &[String]) -> bool {
     false
 }
 
-/// Parse an argument vector (without the program name).
+/// Parse an argument vector (without the program name) as the daemon does:
+/// `@name` inputs are not flags.
 pub fn parse(argv: &[String]) -> Result<Invocation> {
+    parse_with(argv, false)
+}
+
+/// The CLI's parse: additionally accepts `--name PATH` for every `@name`
+/// input, available through `value(name)`.
+pub fn parse_client(argv: &[String]) -> Result<Invocation> {
+    parse_with(argv, true)
+}
+
+fn parse_with(argv: &[String], client: bool) -> Result<Invocation> {
     if argv.iter().any(|arg| arg.contains('\0')) {
         return Err(usage("Аргументы не могут содержать NUL."));
     }
@@ -436,10 +540,10 @@ pub fn parse(argv: &[String]) -> Result<Invocation> {
         .filter(|(index, _)| *index != noun_index && Some(*index) != verb_index)
         .map(|(_, arg)| arg.clone())
         .collect();
-    if help || help_in_flags(spec, &rest) {
+    if help || help_in_flags(spec, &rest, client) {
         return Ok(Invocation::help(Some(noun.into()), json));
     }
-    parse_flags(spec, rest, json)
+    parse_flags(spec, rest, json, client)
 }
 
 /// Unknown tokens are echoed only as a flag name: positional or `=value`
@@ -454,7 +558,7 @@ fn printable(token: &str) -> String {
     }
 }
 
-fn command(spec: &'static Spec) -> Command {
+fn command(spec: &'static Spec, client: bool) -> Command {
     let global = |id: &'static str| Arg::new(id).long(id).action(ArgAction::SetTrue).overrides_with(id);
     let mut command = Command::new("essence-rc")
         .no_binary_name(true)
@@ -464,17 +568,11 @@ fn command(spec: &'static Spec) -> Command {
         .arg(global("yes"))
         .arg(global("secrets-stdin"))
         .arg(Arg::new("plan-token").long("plan-token").action(ArgAction::Set).num_args(1).allow_hyphen_values(true));
-    for token in spec.tokens.split_whitespace() {
-        let arg = match token.as_bytes().last() {
-            Some(b'=') => {
-                let name = &token[..token.len() - 1];
-                Arg::new(name).long(name).action(ArgAction::Set).num_args(1).allow_hyphen_values(true)
-            }
-            Some(b'+') => {
-                let name = &token[..token.len() - 1];
-                Arg::new(name).long(name).action(ArgAction::Append).num_args(1).allow_hyphen_values(true)
-            }
-            _ => Arg::new(token).long(token).action(ArgAction::SetTrue).overrides_with(token),
+    for (name, kind) in tokens(spec, client) {
+        let arg = match kind {
+            '=' => Arg::new(name).long(name).action(ArgAction::Set).num_args(1).allow_hyphen_values(true),
+            '+' => Arg::new(name).long(name).action(ArgAction::Append).num_args(1).allow_hyphen_values(true),
+            _ => Arg::new(name).long(name).action(ArgAction::SetTrue).overrides_with(name),
         };
         command = command.arg(arg);
     }
@@ -498,27 +596,21 @@ fn clap_error(spec: &Spec, error: &clap::Error) -> RcError {
     usage(format!("{message} {}", hint(noun)))
 }
 
-fn parse_flags(spec: &'static Spec, rest: Vec<String>, json: bool) -> Result<Invocation> {
+fn parse_flags(spec: &'static Spec, rest: Vec<String>, json: bool, client: bool) -> Result<Invocation> {
     // v1 has no end-of-options marker: `--` is never a valid flag.
     if rest.iter().any(|arg| arg == "--") {
         return Err(usage(format!("Лишний аргумент. {}", hint(spec.noun))));
     }
-    let matches = command(spec).try_get_matches_from(&rest).map_err(|error| clap_error(spec, &error))?;
+    let matches = command(spec, client).try_get_matches_from(&rest).map_err(|error| clap_error(spec, &error))?;
     let mut values = BTreeMap::new();
     let mut flags = BTreeSet::new();
-    for token in spec.tokens.split_whitespace() {
-        match token.as_bytes().last() {
-            Some(b'=' | b'+') => {
-                let name = &token[..token.len() - 1];
-                if let Some(found) = matches.get_many::<String>(name) {
-                    values.insert(name, found.cloned().collect::<Vec<_>>());
-                }
+    for (name, kind) in tokens(spec, client) {
+        if kind == 'b' {
+            if matches.get_flag(name) {
+                flags.insert(name);
             }
-            _ => {
-                if matches.get_flag(token) {
-                    flags.insert(token);
-                }
-            }
+        } else if let Some(found) = matches.get_many::<String>(name) {
+            values.insert(name, found.cloned().collect::<Vec<_>>());
         }
     }
     let plan_token = matches.get_one::<String>("plan-token").cloned();
@@ -545,8 +637,12 @@ fn parse_flags(spec: &'static Spec, rest: Vec<String>, json: bool) -> Result<Inv
         values,
         flags,
         secrets: spec.secrets,
+        inputs: inputs(spec).collect(),
         session: spec.flags & NOSESSION == 0,
         tty: spec.flags & TTY != 0,
+        local: spec.flags & LOCAL != 0,
+        client: spec.flags & CLIENT != 0,
+        spec: Some(spec),
         confirmation: rest.into_iter().filter(|arg| arg != "--secrets-stdin").collect(),
     })
 }
@@ -658,5 +754,64 @@ mod tests {
         assert!(parse(&args(&["node", "shell", "--name", "n"])).unwrap().requires_tty());
         assert_eq!(parse(&args(&["self", "password-set"])).unwrap().allowed_secrets(), ["password", "current-password"]);
         assert_eq!(help(Some("generate"))["commands"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn client_rows_parse_on_the_client_and_are_marked() {
+        let rows: Vec<&Spec> = CATALOG.iter().filter(|spec| spec.flags & CLIENT != 0).collect();
+        assert_eq!(rows.iter().map(|spec| (spec.noun, spec.verb)).collect::<Vec<_>>(),
+            [("daemon", "run"), ("daemon", "start"), ("template", "export")]);
+        for argv in [
+            &["daemon", "run"][..], &["daemon", "start", "--json"],
+            &["template", "export", "--name", "t", "--output", "/tmp/out.yaml", "--yes"],
+        ] {
+            let invocation = parse_client(&args(argv)).unwrap_or_else(|error| panic!("{argv:?}: {}", error.message));
+            assert!(invocation.client_side() && !invocation.local_only(), "{argv:?}");
+            // The daemon parses the same grammar and refuses it in dispatch.
+            assert!(parse(&args(argv)).unwrap().client_side(), "{argv:?}");
+        }
+        let export = parse_client(&args(&["template", "export", "--name", "t", "--output", "o"])).unwrap();
+        assert_eq!((export.value("name"), export.value("output")), (Some("t"), Some("o")));
+        for argv in [&["daemon", "run", "--bogus"][..], &["daemon", "start", "extra"], &["template", "export", "--file", "x"]] {
+            assert_eq!(parse_client(&args(argv)).err().map(|error| error.code), Some("usage"), "{argv:?}");
+        }
+        let stop = parse(&args(&["daemon", "stop"])).unwrap();
+        assert!(stop.local_only() && !stop.client_side() && !stop.requires_session());
+        let status = parse(&args(&["daemon", "status"])).unwrap();
+        assert!(!status.local_only() && !status.client_side() && !status.requires_session());
+        assert!(parse(&args(&["client", "config", "--name", "c"])).unwrap().requires_session());
+    }
+
+    #[test]
+    fn inputs_are_client_flags_and_never_reach_the_daemon() {
+        for argv in [
+            &["template", "import", "--name", "t", "--file", "in.yaml"][..],
+            &["source", "github-import-recovery-key", "--file=key.txt"],
+        ] {
+            assert_eq!(code(argv), "usage", "the daemon does not know --file: {argv:?}");
+            let invocation = parse_client(&args(argv)).unwrap();
+            assert_eq!(invocation.inputs(), ["file"]);
+            assert!(invocation.value("file").is_some());
+        }
+        let bare = parse(&args(&["template", "import", "--name", "t"])).unwrap();
+        assert_eq!((bare.inputs(), bare.value("file")), (&["file"][..], None));
+        assert!(parse(&args(&["template", "show", "--name", "t"])).unwrap().inputs().is_empty());
+        assert!(parse(&args(&["--json"])).unwrap().inputs().is_empty());
+        // Repeated input flags follow the value-flag rule.
+        assert_eq!(parse_client(&args(&["template", "import", "--file", "a", "--file", "b"])).err().map(|e| e.code), Some("usage"));
+
+        for (argv, sent) in [
+            (&["--json", "template", "import", "--name", "t", "--file", "in.yaml", "--secrets-stdin", "--yes"][..],
+                &["--json", "template", "import", "--name", "t", "--yes"][..]),
+            (&["template", "import", "--file=in.yaml", "--plan-token", "--file", "--yes", "--name", "--file"],
+                &["template", "import", "--plan-token", "--file", "--yes", "--name", "--file"]),
+            (&["source", "github-import-recovery-key", "--file", "k", "--json"], &["source", "github-import-recovery-key", "--json"]),
+            (&["--secrets-stdin", "help", "template"], &["help", "template"]),
+        ] {
+            let invocation = parse_client(&args(argv)).unwrap_or_else(|error| panic!("{argv:?}: {}", error.message));
+            let daemon = invocation.daemon_argv(&args(argv));
+            assert_eq!(daemon, args(sent), "{argv:?}");
+            parse(&daemon).unwrap_or_else(|error| panic!("{daemon:?}: {}", error.message));
+        }
     }
 }

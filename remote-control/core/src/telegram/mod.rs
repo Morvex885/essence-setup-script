@@ -35,7 +35,8 @@ use crate::nodes::{self, find, not_found, required, require_portable, scripts, s
 use crate::nodes::scripts::{ScriptsState, Version};
 use crate::request_secrets::Secrets;
 use crate::state::State;
-use crate::transport::{ExecResult, PtyRequest, RemoteTransport};
+use crate::terminal::TerminalJob;
+use crate::transport::{ExecResult, RemoteTransport};
 
 use status::{Network, Reach, evaluate, plain, redact, status_object};
 
@@ -47,7 +48,6 @@ pub async fn route<T: RemoteTransport>(noun: &str, verb: &str, invocation: &Invo
     session: &mut Session, connect: &dyn Fn() -> T) -> Result<Value>
 {
     match (noun, verb) {
-        ("telegram", "menu") => menu(session, invocation, connect).await,
         ("telegram", verb) => batch(session, invocation, verb, connect, &Network).await,
         _ => Err(RcError::new("usage", "Неизвестная команда.")),
     }
@@ -450,18 +450,14 @@ fn report<T>(session: &mut Session, action: Action, targets: &[Target<T>], outco
     }
 }
 
-fn tty_required() -> RcError {
-    RcError::new("tty_required", "Меню Telegram Proxy требует терминала.")
-}
-
 /// `telegram menu --name N`: the server Telegram Proxy menu on a remote
 /// pseudo-terminal. Read-only preflight of the one node; the scripts must
-/// already be current — the menu never uploads them.
-async fn menu<T: RemoteTransport>(session: &mut Session, invocation: &Invocation, connect: &dyn Fn() -> T) -> Result<Value> {
+/// already be current — the menu never uploads them. The returned job runs
+/// on the requester's console.
+pub async fn menu_prepare<T: RemoteTransport>(session: &mut Session, invocation: &Invocation, connect: &dyn Fn() -> T)
+    -> Result<TerminalJob<T>>
+{
     let name = required(invocation, "name")?;
-    if !session.console().is_some_and(|console| console.available()) {
-        return Err(tty_required());
-    }
     let node = session.state.load_config()?.nodes.into_iter().find(|node| node.name == name).ok_or_else(|| not_found(name))?;
     require_portable(session, &node)?;
     let local = scripts::local()?;
@@ -486,33 +482,20 @@ async fn menu<T: RemoteTransport>(session: &mut Session, invocation: &Invocation
     session.log(Level::Info, &format!("Открываю меню Telegram Proxy на {} ({})...", node.name, node.ip));
     session.log(Level::Output, "  (введите 0 в меню для выхода)");
     let command = format!("bash {} telegram-proxy menu", sh_quote(&format!("{}/setup-essence.sh", scripts::REMOTE_DIR)));
-    let status = {
-        let console = session.console().ok_or_else(tty_required)?;
-        let pty = PtyRequest { term: console.term(), size: console.size() };
-        let mut raw = console.raw().map_err(|_| tty_required())?;
-        transport.interactive(&command, pty, &mut *raw).await
-    };
-    let failed = || RcError::new("remote_failed", format!("SSH-сессия Telegram Proxy с нодой «{}» завершилась с ошибкой.", node.name))
-        .with_extra("name", node.name.clone());
-    match status {
-        Ok(0) => {}
-        Ok(code) => return Err(failed().with_extra("exit_status", code)),
-        Err(error) => return Err(failed().with_extra("reason", error.extra.get("reason").cloned().unwrap_or(Value::Null))),
-    }
-    session.log(Level::Info, "SSH-сессия завершена.");
-    Ok(json!({}))
+    let failure = format!("SSH-сессия Telegram Proxy с нодой «{}» завершилась с ошибкой.", node.name);
+    Ok(TerminalJob::new(node.name, command, failure, "SSH-сессия завершена.", transport))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, collections::VecDeque, io, rc::Rc, task::Context};
+    use std::{cell::RefCell, collections::VecDeque, io, task::Context};
 
     use super::*;
     use crate::fake_transport::{AuthMethod, ConnectExpectation, FakeScript, FakeTransport, Operation, ScriptStep};
     use crate::model::{Auth, Config, Fingerprint};
     use crate::nodes::testing::{Journal, fingerprint, invocation, session};
     use crate::nodes::{COMMAND_TIMEOUT, CONNECT_TIMEOUT, LONG_TIMEOUT, pin};
-    use crate::transport::{Console, ConsoleEvent, ConsoleSize, HostKeyPolicy, RawConsole, remote_failure};
+    use crate::transport::{ConsoleEvent, ConsoleSize, HostKeyPolicy, PtyRequest, RawConsole, remote_failure};
     use status::Ipv6;
     use status::tests::FakeReach;
 
@@ -725,73 +708,66 @@ mod tests {
         assert_eq!(fingerprint(root.path()), before);
     }
 
+    /// A raw console that records the remote output.
     #[derive(Default)]
-    struct Record {
-        raw_entered: usize,
-        output: Vec<u8>,
-    }
-
-    struct TestConsole(Rc<RefCell<Record>>);
-    struct TestRaw(Rc<RefCell<Record>>);
+    struct TestConsole(Vec<u8>);
 
     const SIZE: ConsoleSize = ConsoleSize { cols: 100, rows: 30 };
 
-    impl Console for TestConsole {
-        fn available(&mut self) -> bool { true }
-        fn term(&self) -> String { "xterm".into() }
-        fn size(&self) -> ConsoleSize { SIZE }
-        fn raw(&mut self) -> io::Result<Box<dyn RawConsole + '_>> {
-            self.0.borrow_mut().raw_entered += 1;
-            Ok(Box::new(TestRaw(self.0.clone())))
-        }
-    }
-
-    impl RawConsole for TestRaw {
+    impl RawConsole for TestConsole {
         fn poll_event(&mut self, _: &mut Context<'_>) -> Poll<ConsoleEvent> { Poll::Pending }
         fn output(&mut self, data: &[u8]) -> io::Result<()> {
-            self.0.borrow_mut().output.extend_from_slice(data);
+            self.0.extend_from_slice(data);
             Ok(())
         }
     }
 
-    fn run_menu(session: &mut Session, connect: &dyn Fn() -> FakeTransport) -> Result<Value> {
+    /// `menu_prepare` then `run`, as the daemon does.
+    fn run_menu(session: &mut Session, connect: &dyn Fn() -> FakeTransport, console: &mut TestConsole) -> Result<Value> {
         let invocation = invocation(&["telegram", "menu", "--name", "alpha"]);
-        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(menu(session, &invocation, connect))
-    }
-
-    #[test]
-    fn menu_without_console_is_tty_required_with_zero_effects() {
-        let root = tempfile::tempdir().unwrap();
-        let (mut session, journal) = fixture(root.path());
-        let before = fingerprint(root.path());
-        let never = || -> FakeTransport { panic!("no transport without a console") };
-        let error = run_menu(&mut session, &never).unwrap_err();
-        assert_eq!((error.code, error.exit_code()), ("tty_required", 2));
-        assert!(journal.borrow().is_empty());
-        assert_eq!(fingerprint(root.path()), before);
+        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(async {
+            let job = menu_prepare(session, &invocation, connect).await?;
+            assert_eq!((job.node.as_str(), job.done_log), ("alpha", "SSH-сессия завершена."));
+            job.run(PtyRequest { term: "xterm".into(), size: SIZE }, console).await
+        })
     }
 
     #[test]
     fn menu_opens_the_server_menu_and_never_uploads_scripts() {
         let root = tempfile::tempdir().unwrap();
-        let (mut session, _journal) = fixture(root.path());
-        let record = Rc::new(RefCell::new(Record::default()));
-        session.set_console(Box::new(TestConsole(record.clone())));
+        let (mut session, journal) = fixture(root.path());
         let command = "bash '/root/essence-setup/setup-essence.sh' telegram-proxy menu";
         let pty = PtyRequest { term: "xterm".into(), size: SIZE };
         let (connect, observers) = transports(vec![vec![connect_step(0, Ok(())), current(),
             ScriptStep::interactive(command, pty, b"MENU".to_vec(), Ok(0))]]);
-        assert_eq!(run_menu(&mut session, &connect).unwrap(), json!({}));
+        let mut console = TestConsole::default();
+        assert_eq!(run_menu(&mut session, &connect, &mut console).unwrap(), json!({}));
         observers[0].assert_finished();
-        assert_eq!((record.borrow().raw_entered, record.borrow().output.as_slice()), (1, &b"MENU"[..]));
+        assert_eq!(console.0, b"MENU");
+        assert_eq!(journal.borrow().last().unwrap(), &(Level::Output, "  (введите 0 в меню для выхода)".to_owned()));
 
         let before = fingerprint(root.path());
         let (connect, observers) = transports(vec![vec![connect_step(0, Ok(())), missing()]]);
-        let error = run_menu(&mut session, &connect).unwrap_err();
+        let mut console = TestConsole::default();
+        let error = run_menu(&mut session, &connect, &mut console).unwrap_err();
         assert_eq!((error.code, error.extra["state"].as_str()), ("invalid", Some("missing")));
         assert_eq!(error.message, "На ноде «alpha» нет скриптов: загрузите их командой node upload-scripts --name alpha.");
         observers[0].assert_finished();
-        assert_eq!(record.borrow().raw_entered, 1, "no menu without current scripts");
+        assert!(console.0.is_empty(), "no menu without current scripts");
         assert_eq!(fingerprint(root.path()), before);
+    }
+
+    #[test]
+    fn menu_failure_names_the_node() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut session, _journal) = fixture(root.path());
+        let command = "bash '/root/essence-setup/setup-essence.sh' telegram-proxy menu";
+        let pty = PtyRequest { term: "xterm".into(), size: SIZE };
+        let (connect, observers) = transports(vec![vec![connect_step(0, Ok(())), current(),
+            ScriptStep::interactive(command, pty, Vec::new(), Ok(5))]]);
+        let error = run_menu(&mut session, &connect, &mut TestConsole::default()).unwrap_err();
+        observers[0].assert_finished();
+        assert_eq!((error.code, error.message.as_str()), ("remote_failed", "SSH-сессия Telegram Proxy с нодой «alpha» завершилась с ошибкой."));
+        assert_eq!((error.extra["name"].as_str(), error.extra["exit_status"].as_u64()), (Some("alpha"), Some(5)));
     }
 }

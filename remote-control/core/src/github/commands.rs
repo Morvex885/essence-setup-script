@@ -14,12 +14,13 @@ use super::vault::{self, Keys, Snapshot};
 use super::{BRANCH, REPO_NAME, Storage, SyncStatus, Target, fail, login_valid, prefixed, random_hex, utc_stamp};
 use crate::cli::Invocation;
 use crate::confirmation::Plan;
-use crate::dispatch::{DispatchMode, Session};
+use crate::dispatch::{Session, session_closed};
 use crate::error::{RcError, Result};
 use crate::locking::{LockKind, LockManager};
 use crate::log::Level;
 use crate::model::{Config, Source, SourceType};
 use crate::nodes::setup::{self, LocalOnboarding, OnboardingPlan};
+use crate::request_input::Input;
 use crate::request_secrets::Secrets;
 use crate::secure_fs;
 use crate::state::{State, StatePaths, read_optional};
@@ -567,10 +568,7 @@ pub async fn connect<T: RemoteTransport>(session: &mut Session, invocation: &Inv
     let configured = session.configured()?;
     if configured {
         if !(session.open && session.authorized) {
-            match session.mode() {
-                DispatchMode::OneShot => { session.open_source(secrets, false)?; }
-                DispatchMode::Serve => return Err(RcError::new("session_closed", "Сначала откройте сессию: session open.")),
-            }
+            return Err(session_closed());
         }
         if session.github.is_some() {
             return Err(RcError::new("conflict", "Источник GitHub уже подключён."));
@@ -617,7 +615,7 @@ async fn connect_locked<T: RemoteTransport>(session: &mut Session, paths: &State
     invocation: &Invocation, secrets: &Secrets, transport: &mut T) -> Result<Value>
 {
     let target = Target::new(login, REPO_NAME, BRANCH);
-    // Live progress for the TUI (serve log events) during the slow gh/git calls.
+    // Live progress for the clients (daemon `log` events) during the slow gh/git calls.
     session.log(Level::Info, &format!("Проверка аккаунта GitHub {login}…"));
     store::prepare_account(paths, login).map_err(|error| if super::is_auth_relevant(&error) {
         store::auth_required(paths, login, format!("Аккаунт GitHub {login} не авторизован: source github-login --login {login}."))
@@ -946,28 +944,12 @@ pub fn rotate_key(session: &mut Session, invocation: &Invocation, secrets: &Secr
     Ok(sync_data(session))
 }
 
-fn inside(path: &Path, root: &Path) -> bool {
-    let canonical = |p: &Path| fs::canonicalize(p).ok();
-    let candidate = canonical(path).or_else(|| path.parent().and_then(canonical).map(|p| p.join(path.file_name().unwrap_or_default())));
-    match (candidate, canonical(root)) {
-        (Some(candidate), Some(root)) => candidate.starts_with(root),
-        _ => false,
-    }
-}
-
-pub fn import_recovery_key(session: &mut Session, invocation: &Invocation) -> Result<Value> {
+/// The key text arrives as request input `file`; the client read the file.
+pub fn import_recovery_key(session: &mut Session, input: &Input) -> Result<Value> {
     require_age(session)?;
-    let file = invocation.value("file").filter(|f| !f.is_empty())
-        .ok_or_else(|| RcError::new("usage", "Укажите файл ключа: --file PATH."))?;
-    let path = Path::new(file);
+    let text = input.get("file").ok_or_else(|| RcError::new("usage", "Передайте содержимое полем input.file."))?;
     let invalid = |message: &str| RcError::new("invalid", format!("Не удалось импортировать ключ восстановления: {message}"));
-    let regular = fs::symlink_metadata(path).is_ok_and(|m| m.is_file());
-    if !regular || inside(path, root(session).root()) {
-        return Err(invalid("файл ключа восстановления не найден, имеет недопустимый тип или расположен внутри служебного каталога."));
-    }
-    let text = read_optional(path)?.unwrap_or_default();
-    let keys = std::str::from_utf8(&text).ok().and_then(Keys::parse)
-        .ok_or_else(|| invalid("файл не содержит корректный секретный ключ age."))?;
+    let keys = Keys::parse(text).ok_or_else(|| invalid("файл не содержит корректный секретный ключ age."))?;
     let recipient = vault::read_recipient(&github(session).work()?.worktree)?;
     if keys.recipient != recipient {
         return Err(invalid("ключ восстановления не подходит к текущему хранилищу GitHub."));

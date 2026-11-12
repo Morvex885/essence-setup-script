@@ -1,12 +1,12 @@
 //! Template store and `template *` commands (v1 `templates.sh` and the
 //! template handlers of `cmd_clients.sh`). Built-in templates are embedded in
 //! the binary; a custom file `<state>/templates/<name>.yaml` shadows the
-//! built-in of the same name. Nothing outside the state directory is written
-//! except an explicitly requested export.
+//! built-in of the same name. Nothing outside the state directory is read or
+//! written: files of `template import`/`export` are the client's business.
 
 use std::fs;
 use std::io::{ErrorKind, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use include_dir::{Dir, include_dir};
 use serde_json::{Value, json};
@@ -18,6 +18,7 @@ use crate::error::{RcError, Result};
 use crate::log::Level;
 use crate::model::Config;
 use crate::nodes::required;
+use crate::request_input::Input;
 use crate::secure_fs;
 use crate::state::{State, read_optional};
 use crate::validation as v;
@@ -248,46 +249,11 @@ pub fn create(session: &mut Session, invocation: &Invocation) -> Result<Value> {
     Ok(data)
 }
 
-/// Writes a user-chosen file. An existing entry (including a dangling
-/// symlink) is replaced only after confirmation, by renaming a fresh file
-/// over it: the link itself is replaced, never followed.
-pub fn export(session: &mut Session, invocation: &Invocation) -> Result<Value> {
-    let name = file_name(required(invocation, "name")?);
-    let output = required(invocation, "output")?.to_owned();
-    let template = require(&session.state, &name)?;
-    let path = Path::new(&output);
-    match fs::symlink_metadata(path) {
-        Ok(meta) if meta.is_dir() => {
-            return Err(RcError::new("invalid", format!("Путь {output} — каталог; укажите файл.")));
-        }
-        Ok(_) => Plan::new(vec![format!("Файл {output} будет перезаписан шаблоном {name}.")], "").confirm(invocation)?,
-        Err(error) if error.kind() == ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    let written = tempfile::Builder::new().prefix(".rc-export-").tempfile_in(parent)
-        .and_then(|mut file| {
-            file.write_all(template.content.as_bytes())?;
-            file.as_file().sync_all()?;
-            file.persist(path).map(drop).map_err(|error| error.error)
-        });
-    if written.is_err() {
-        return Err(RcError::new("failed", format!("Не удалось записать {output}.")));
-    }
-    session.log(Level::Success, &format!("Шаблон {name} сохранён в {output}"));
-    Ok(json!({"name": name, "output": output}))
-}
-
-pub fn import(session: &mut Session, invocation: &Invocation) -> Result<Value> {
+/// The template text arrives as request input `file`; the client read the
+/// file (or the editor buffer).
+pub fn import(session: &mut Session, invocation: &Invocation, input: &Input) -> Result<Value> {
     let name = new_file_name(required(invocation, "name")?)?;
-    let file = required(invocation, "file")?.to_owned();
-    let unreadable = || RcError::new("invalid", format!("Файл «{file}» не найден или недоступен для чтения."));
-    if !fs::metadata(&file).map_err(|_| unreadable())?.is_file() {
-        return Err(unreadable());
-    }
-    let bytes = fs::read(&file).map_err(|_| unreadable())?;
-    let content = String::from_utf8(bytes)
-        .map_err(|_| RcError::new("invalid", format!("Файл «{file}» не в кодировке UTF-8.")))?;
+    let content = input.get("file").ok_or_else(|| RcError::new("usage", "Передайте содержимое полем input.file."))?;
     if custom_exists(&session.state, &name)? {
         Plan::new(vec![format!("Шаблон {name} будет перезаписан.")], "").confirm(invocation)?;
     }
@@ -310,10 +276,16 @@ mod tests {
         match invocation.verb.as_str() {
             "list" => list_command(session),
             "show" => show(session, &invocation),
-            "create" => create(session, &invocation),
-            "export" => export(session, &invocation),
-            _ => import(session, &invocation),
+            _ => create(session, &invocation),
         }
+    }
+
+    fn import_text(session: &mut Session, argv: &[&str], content: Option<&str>) -> Result<Value> {
+        let mut input = Input::default();
+        if let Some(content) = content {
+            input.insert("file", content.to_owned().into()).unwrap();
+        }
+        import(session, &invocation(argv), &input)
     }
 
     fn custom(session: &Session, name: &str, content: &str) -> PathBuf {
@@ -448,74 +420,30 @@ mod tests {
     }
 
     #[test]
-    fn export_gates_existing_entries_and_never_follows_links() {
+    fn import_takes_the_input_validates_the_name_and_gates_overwrites() {
         let root = tempfile::tempdir().unwrap();
-        let out = tempfile::tempdir().unwrap();
-        let (mut session, _) = session(root.path());
-        custom(&session, "default.yaml", "TEMPLATE\n");
-        let target = out.path().join("t.yaml");
-        let target_arg = target.to_str().unwrap();
-        assert_eq!(run(&mut session, &["template", "export", "--name", "default", "--output", target_arg]).unwrap(),
-            json!({"name": "default.yaml", "output": target_arg}));
-        assert_eq!(fs::read_to_string(&target).unwrap(), "TEMPLATE\n");
-        fs::write(&target, "IMPORTANT\n").unwrap();
-        let error = run(&mut session, &["template", "export", "--name", "default", "--output", target_arg]).unwrap_err();
-        assert_eq!((error.code, error.exit), ("confirmation_required", 2));
-        assert_eq!(error.extra["plan"], json!([format!("Файл {target_arg} будет перезаписан шаблоном default.yaml.")]));
-        assert_eq!(fs::read_to_string(&target).unwrap(), "IMPORTANT\n");
-        run(&mut session, &["template", "export", "--name", "default", "--output", target_arg, "--yes"]).unwrap();
-        assert_eq!(fs::read_to_string(&target).unwrap(), "TEMPLATE\n");
-        let dir_arg = out.path().to_str().unwrap();
-        assert_eq!(run(&mut session, &["template", "export", "--name", "default", "--output", dir_arg, "--yes"]).unwrap_err().code, "invalid");
-        let missing_parent = format!("-t{}/victim", out.path().display());
-        assert_eq!(run(&mut session, &["template", "export", "--name", "default", "--output", &missing_parent]).unwrap_err().code, "failed");
-        assert_eq!(run(&mut session, &["template", "export", "--name", "nope", "--output", target_arg]).unwrap_err().code, "not_found");
-        #[cfg(unix)]
-        {
-            let link = out.path().join("link");
-            let pointed = out.path().join("newtarget");
-            std::os::unix::fs::symlink(&pointed, &link).unwrap();
-            let link_arg = link.to_str().unwrap();
-            let error = run(&mut session, &["template", "export", "--name", "default", "--output", link_arg]).unwrap_err();
-            assert_eq!(error.code, "confirmation_required");
-            assert!(!pointed.exists());
-            run(&mut session, &["template", "export", "--name", "default", "--output", link_arg, "--yes"]).unwrap();
-            assert!(!pointed.exists());
-            assert!(fs::symlink_metadata(&link).unwrap().is_file());
-        }
-    }
-
-    #[test]
-    fn import_validates_the_name_and_file_and_gates_overwrites() {
-        let root = tempfile::tempdir().unwrap();
-        let out = tempfile::tempdir().unwrap();
-        let (mut session, _) = session(root.path());
-        let source = out.path().join("in.yaml");
-        fs::write(&source, "mode: rule\n").unwrap();
-        let file = source.to_str().unwrap();
-        assert_eq!(run(&mut session, &["template", "import", "--name", "lab.yaml", "--file", file]).unwrap(), json!({"name": "lab.yaml"}));
+        let (mut session, journal) = session(root.path());
+        assert_eq!(import_text(&mut session, &["template", "import", "--name", "lab.yaml"], Some("mode: rule\n")).unwrap(),
+            json!({"name": "lab.yaml"}));
         let stored = session.state.paths().templates().join("lab.yaml");
         assert_eq!(fs::read_to_string(&stored).unwrap(), "mode: rule\n");
-        fs::write(&source, "mode: global\n").unwrap();
+        assert_eq!(journal.borrow().last().unwrap().1, "Шаблон lab.yaml импортирован");
         let before = fingerprint(root.path());
-        let error = run(&mut session, &["template", "import", "--name", "lab", "--file", file]).unwrap_err();
+        let error = import_text(&mut session, &["template", "import", "--name", "lab"], Some("mode: global\n")).unwrap_err();
         assert_eq!(error.code, "confirmation_required");
         assert_eq!(error.extra["plan"], json!(["Шаблон lab.yaml будет перезаписан."]));
-        let binary = out.path().join("bin.yaml");
-        fs::write(&binary, [0xff, 0x00]).unwrap();
-        let dir = out.path().to_str().unwrap();
-        for (argv, code) in [
-            (&["template", "import", "--name", "../x", "--file", file][..], "invalid"),
-            (&["template", "import", "--name", "a b", "--file", file], "invalid"),
-            (&["template", "import", "--name", "new", "--file", "/nonexistent/in.yaml"], "invalid"),
-            (&["template", "import", "--name", "new", "--file", dir], "invalid"),
-            (&["template", "import", "--name", "new", "--file", binary.to_str().unwrap()], "invalid"),
-            (&["template", "import", "--name", "new"], "usage"),
+        for (argv, content, code) in [
+            (&["template", "import", "--name", "../x"][..], Some("x"), "invalid"),
+            (&["template", "import", "--name", "a b"], Some("x"), "invalid"),
+            (&["template", "import"], Some("x"), "usage"),
+            (&["template", "import", "--name", "new"], None, "usage"),
         ] {
-            assert_eq!(run(&mut session, argv).unwrap_err().code, code, "{argv:?}");
+            assert_eq!(import_text(&mut session, argv, content).unwrap_err().code, code, "{argv:?}");
         }
+        let missing = import_text(&mut session, &["template", "import", "--name", "new"], None).unwrap_err();
+        assert_eq!(missing.message, "Передайте содержимое полем input.file.");
         assert_eq!(fingerprint(root.path()), before);
-        run(&mut session, &["template", "import", "--name", "lab", "--file", file, "--yes"]).unwrap();
+        import_text(&mut session, &["template", "import", "--name", "lab", "--yes"], Some("mode: global\n")).unwrap();
         assert_eq!(fs::read_to_string(&stored).unwrap(), "mode: global\n");
     }
 }

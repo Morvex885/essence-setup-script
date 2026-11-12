@@ -11,7 +11,10 @@
 //! its environment. Portable to Windows: no shell scripts are involved except
 //! one git `pre-receive` hook (git runs hooks with its own shell everywhere).
 
+mod common;
+
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -19,6 +22,7 @@ use std::process::{Command, Stdio};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use essence_rc_client::{Client, DaemonClient, Hello, Progress, Request, SpawnDaemon, TerminalIo};
 use serde_json::{Value, json};
 
 const REPO: &str = "essence-remote-control-config";
@@ -122,10 +126,12 @@ struct Env {
     data: PathBuf,
     state: PathBuf,
     gitconfig: PathBuf,
+    runtime: tempfile::TempDir,
 }
 
 impl Drop for Env {
     fn drop(&mut self) {
+        common::stop(&self.ctx(&self.data).endpoint());
         let _ = fs::remove_dir_all(&self.root);
     }
 }
@@ -139,7 +145,7 @@ impl Env {
         fs::create_dir_all(root.join("home")).unwrap();
         fs::create_dir_all(root.join("remotes")).unwrap();
         fs::write(state.join("global"), owners.join("\n")).unwrap();
-        let env = Self { data: root.join("data"), gitconfig: root.join("gitconfig"), state, root };
+        let env = Self { data: root.join("data"), gitconfig: root.join("gitconfig"), state, root, runtime: common::runtime_dir() };
         let mut config = String::from("[protocol \"file\"]\n\tallow = always\n[init]\n\tdefaultBranch = main\n");
         for owner in owners {
             let remote = env.remote(owner);
@@ -199,26 +205,38 @@ impl Env {
         fs::read_to_string(self.state.join("calls.log")).unwrap_or_default()
     }
 
-    /// essence-rc with the fake GitHub: fake gh first on PATH, the rewriting
-    /// git config, and token variables that must never reach a child.
-    fn essence(&self) -> Command {
+    /// The environment of essence-rc processes (and the daemons they start)
+    /// for the data directory `data`: fake gh first on PATH, the rewriting git
+    /// config, and token variables that must never reach a child.
+    fn ctx(&self, data: &Path) -> common::Ctx {
         let mut path = vec![tools().to_path_buf()];
         path.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
-        let mut command = Command::new(env!("CARGO_BIN_EXE_essence-rc"));
-        command.env("ESSENCE_RC_DATA_DIR", &self.data).env("HOME", self.root.join("home"))
-            .env("GIT_CONFIG_GLOBAL", &self.gitconfig).env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("PATH", std::env::join_paths(path).unwrap()).env("FAKE_GH_STATE", &self.state)
-            .env("GH_TOKEN", "ghp_must_not_reach_children").env("GITHUB_TOKEN", "ghp_must_not_reach_children")
-            .env("RC_LOCK_WAIT", "5")
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        let vars: Vec<(OsString, OsString)> = vec![
+            ("HOME".into(), self.root.join("home").into()),
+            ("GIT_CONFIG_GLOBAL".into(), self.gitconfig.clone().into()),
+            ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
+            ("PATH".into(), std::env::join_paths(path).unwrap()),
+            ("FAKE_GH_STATE".into(), self.state.clone().into()),
+            ("GH_TOKEN".into(), "ghp_must_not_reach_children".into()),
+            ("GITHUB_TOKEN".into(), "ghp_must_not_reach_children".into()),
+            ("RC_LOCK_WAIT".into(), "5".into()),
+        ];
+        common::Ctx { data: data.to_path_buf(), runtime: self.runtime.path().to_path_buf(), vars }
+    }
+
+    fn essence(&self) -> Command {
+        let mut command = self.ctx(&self.data).command(common::BIN);
+        command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         command
     }
 
-    /// One-shot `essence-rc ARGS --json --secrets-stdin`.
+    /// One-shot `essence-rc ARGS --json --secrets-stdin`; returns after its
+    /// on-demand daemon has left (one call, one session).
     fn rc(&self, args: &[&str], secrets: Value) -> Reply {
         let mut child = self.essence().args(args).args(["--json", "--secrets-stdin"]).spawn().unwrap();
         child.stdin.take().unwrap().write_all(secrets.to_string().as_bytes()).unwrap();
         let out = child.wait_with_output().unwrap();
+        self.ctx(&self.data).settle();
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
         assert_eq!(stdout.lines().count(), 1, "exactly one envelope for {args:?}: {stdout}\n{stderr}");
@@ -273,23 +291,33 @@ impl Env {
         self.confirmed(&["source", "github-connect", "--login", owner, "--storage", "none"], json!({})).1
     }
 
-    /// The real TUI screens (scripted keys) over this environment's
-    /// `serve --inner` with the data directory `data`. The walk must use every
-    /// key, exit 0, and never report a failure: only `ok` and decision codes.
+    /// The real TUI screens (scripted keys) over a daemon of the data
+    /// directory `data`, started on demand like the menu does. The walk must
+    /// use every key, exit 0, and never report a failure: only `ok` and
+    /// decision codes.
     fn tui(&self, data: &Path, keys: &[&str]) -> Vec<(Vec<String>, String)> {
-        let mut command = self.essence();
-        command.env("ESSENCE_RC_DATA_DIR", data).args(["serve", "--inner"]);
-        let mut client = Recording { inner: essence_rc_tui::serve::ProcessClient::spawn(&mut command).unwrap(), calls: vec![] };
+        let ctx = self.ctx(data);
+        let endpoint = ctx.endpoint();
+        let spawn = SpawnDaemon { exe: common::BIN.into(), args: vec!["daemon".into(), "run".into()], env: ctx.spawn_env() };
+        let inner = DaemonClient::connect_local(&endpoint, Some(&spawn), None, None).unwrap();
+        let mut client = Recording { inner, calls: vec![] };
         let mut ui = essence_rc_tui::app::ScriptedUi::new(keys);
-        let code = essence_rc_tui::app::run(&mut client, &mut ui, &essence_rc_tui::app::registrations()).unwrap();
+        let mut terminal = || -> Box<dyn TerminalIo> { panic!("no terminal command in these walks") };
+        let code = essence_rc_tui::app::run(&mut client, &mut ui, &essence_rc_tui::app::registrations(), &mut terminal).unwrap();
+        let calls = std::mem::take(&mut client.calls);
+        drop(client);
+        ctx.settle();
         let notices: Vec<String> = ui.notices.iter().map(ToString::to_string).collect();
-        let trail = format!("calls: {:#?}\nnotices: {notices:#?}\nlast frame: {:?}", client.calls, ui.views.last().map(|view| &view.title));
+        let trail = format!("calls: {calls:#?}\nnotices: {notices:#?}\nlast frame: {:?}", ui.views.last().map(|view| &view.title));
         assert_eq!(code, 0, "{trail}");
         assert!(ui.inputs.is_empty(), "walk derailed: {trail}");
         assert!(!notices.iter().any(|n| n.starts_with("[✗]") || n.contains("Операция завершилась ошибкой")), "{trail}");
-        assert!(client.calls.iter().all(|(_, code)| code == "ok" || code.ends_with("_required")), "{trail}");
-        assert_eq!(ui.busy.len(), client.calls.len(), "every request shows its status line first");
-        client.calls
+        // A fresh device answers the startup `session open` with `not_configured`.
+        let expected = |argv: &[String], code: &str| code == "ok" || code.ends_with("_required")
+            || (argv == ["session", "open"] && code == "not_configured");
+        assert!(calls.iter().all(|(argv, code)| expected(argv, code)), "{trail}");
+        assert_eq!(ui.busy.len(), calls.len(), "every request shows its status line first");
+        calls
     }
 }
 
@@ -301,20 +329,30 @@ struct Reply {
 
 /// Records the outcome of every request the real screens send.
 struct Recording {
-    inner: essence_rc_tui::serve::ProcessClient,
+    inner: DaemonClient,
     calls: Vec<(Vec<String>, String)>,
 }
 
-impl essence_rc_tui::serve::ServeClient for Recording {
-    fn version(&self) -> &str {
-        essence_rc_tui::serve::ServeClient::version(&self.inner)
+impl Recording {
+    fn record(&mut self, argv: &[String], reply: &essence_rc_client::Reply) {
+        self.calls.push((argv.to_vec(), if reply.ok { "ok".into() } else { reply.code().to_owned() }));
+    }
+}
+
+impl Client for Recording {
+    fn hello(&self) -> &Hello {
+        self.inner.hello()
     }
 
-    fn send(&mut self, argv: &[String], secrets: &essence_rc_tui::serve::Secrets,
-        progress: &mut dyn FnMut(essence_rc_tui::serve::Progress<'_>)) -> std::io::Result<essence_rc_tui::serve::Reply>
-    {
-        let reply = self.inner.send(argv, secrets, progress)?;
-        self.calls.push((argv.to_vec(), if reply.ok { "ok".into() } else { reply.code().to_owned() }));
+    fn send(&mut self, request: Request<'_>, progress: &mut dyn FnMut(Progress<'_>)) -> std::io::Result<essence_rc_client::Reply> {
+        let reply = self.inner.send(request, progress)?;
+        self.record(request.argv, &reply);
+        Ok(reply)
+    }
+
+    fn terminal(&mut self, request: Request<'_>, io: &mut dyn TerminalIo, progress: &mut dyn FnMut(Progress<'_>)) -> std::io::Result<essence_rc_client::Reply> {
+        let reply = self.inner.terminal(request, io, progress)?;
+        self.record(request.argv, &reply);
         Ok(reply)
     }
 
@@ -746,36 +784,34 @@ fn tui_wizard_walks_github_paths() {
     assert!(codes.contains(&"vault_password_required") && codes.contains(&"existing_config_action_required"), "{calls:?}");
 }
 
-/// serve keeps one GitHub session: replies carry `sync`, the session lock
-/// turns a concurrent process away, EOF removes the worktree and the lock.
-fn serve_holds_one_github_session() {
-    use std::io::{BufRead, BufReader};
+/// The daemon keeps one GitHub session: replies carry `sync`; a second daemon
+/// on the same data directory (another runtime directory) is turned away by
+/// the session lock; `daemon stop` removes the worktree and the lock.
+fn daemon_holds_one_github_session() {
     let env = Env::new(&["alice"]);
     env.connect_plain("alice");
-    let mut child = env.essence().arg("serve").spawn().unwrap();
-    let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
-    let mut reply = || loop {
-        let mut line = String::new();
-        assert!(stdout.read_line(&mut line).unwrap() > 0, "serve closed stdout");
-        let value: Value = serde_json::from_str(&line).unwrap();
-        if value.get("event").is_none() {
-            break value;
-        }
-    };
-    let mut send = |value: Value| writeln!(stdin, "{value}").unwrap();
-    send(json!({"id": 1, "argv": ["session", "open"]}));
-    let open = reply();
+    let mut first = common::Daemon::spawn(&env.ctx(&env.data));
+    let mut conn = first.connect();
+    let (_, open) = conn.request("1", &["session", "open"], json!({}));
     assert_eq!(open["data"], json!({"source": "github", "repo": format!("alice/{REPO}"), "sync": "clean"}), "{open}");
     assert_eq!(open["sync"], "clean");
-    env.fail(&["status"], json!({}), "locked");
-    send(json!({"id": 2, "argv": ["self", "password-set"], "secrets": {"password": "serve-pw"}}));
-    let set = reply();
+
+    let other_runtime = common::runtime_dir();
+    let other = common::Ctx { runtime: other_runtime.path().to_path_buf(), ..env.ctx(&env.data) };
+    let second = common::Daemon::spawn(&other);
+    let mut rival = second.connect();
+    let (_, locked) = rival.request("rival", &["session", "open"], json!({}));
+    assert_eq!(locked["error"]["code"], "locked", "{locked}");
+    drop(rival);
+    drop(second);
+
+    let (_, set) = conn.request("2", &["self", "password-set"], json!({"password": "daemon-pw"}));
     assert_eq!((set["ok"].clone(), set["sync"].clone()), (json!(true), json!("clean")), "{set}");
-    drop(send);
-    drop(stdin);
-    assert!(child.wait().unwrap().success());
-    assert_eq!(fs::read_dir(env.data.join("github-sessions")).unwrap().count(), 0, "EOF closes the worktree");
+    let (_, stopped) = conn.request("stop", &["daemon", "stop"], json!({}));
+    assert_eq!(stopped["data"], json!({"stopping": true}));
+    let status = first.wait_exit(std::time::Duration::from_secs(30)).expect("the daemon exits");
+    assert!(status.success());
+    assert_eq!(fs::read_dir(env.data.join("github-sessions")).unwrap().count(), 0, "the stop closes the worktree");
     assert!(!env.data.join(".rc-lock").exists());
     let manifest: Value = serde_json::from_str(&env.show("alice", "manifest.json").unwrap()).unwrap();
     assert!(manifest["access"]["script_password_hash"].is_string());
@@ -819,7 +855,7 @@ fn main() {
         ("existing_repository_switch_local_and_delete", existing_repository_switch_local_and_delete),
         ("account_switch_journal_recovery", account_switch_journal_recovery),
         ("accounts_and_login", accounts_and_login),
-        ("serve_holds_one_github_session", serve_holds_one_github_session),
+        ("daemon_holds_one_github_session", daemon_holds_one_github_session),
         ("change_account_targets", change_account_targets),
         ("connect_replaces_foreign_v1_repository", connect_replaces_foreign_v1_repository),
         ("tui_wizard_walks_github_paths", tui_wizard_walks_github_paths),

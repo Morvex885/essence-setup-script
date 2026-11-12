@@ -660,6 +660,10 @@ async fn missing_authentication_material_returns_typed_errors_without_authentica
     }).await.expect("missing authentication material scenario exceeded its deadline");
 }
 
+/// Runs in a child process with its own `HOME` and `SSH_AUTH_SOCK`, so the
+/// process environment is never mutated. The variable names a listening
+/// socket that `connect_env` would use: the default transport (no agent
+/// passed by a client) must never connect to it.
 #[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
 async fn native_system_identity_discovery_uses_an_isolated_home() {
@@ -670,12 +674,14 @@ async fn native_system_identity_discovery_uses_an_isolated_home() {
             .args(["--exact", "native_system_identity_discovery_uses_an_isolated_home", "--nocapture"])
             .env(CHILD, "1")
             .env("HOME", home.path())
-            .env("SSH_AUTH_SOCK", home.path().join("absent-agent"))
+            .env("SSH_AUTH_SOCK", home.path().join("agent"))
             .output().unwrap();
         assert!(output.status.success(), "isolated identity scenario failed: {}{}",
             String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
         return;
     }
+    let agent = std::os::unix::net::UnixListener::bind(std::env::var_os("SSH_AUTH_SOCK").unwrap()).unwrap();
+    agent.set_nonblocking(true).unwrap();
     timeout(SCENARIO, async {
         let client = key();
         let fixture = Fixture::start(&client).await;
@@ -683,6 +689,8 @@ async fn native_system_identity_discovery_uses_an_isolated_home() {
         let error = ssh.connect(fixture.options(Authentication::System)).await.unwrap_err();
         assert_eq!(error.code, "needs_setup");
         private_error(&error);
+        assert_eq!(agent.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock,
+            "the default transport never consults SSH_AUTH_SOCK");
         let directory = dirs::home_dir().unwrap().join(".ssh");
         fs::create_dir(&directory).unwrap();
         write_key(&directory, "id_ed25519", &client);

@@ -1,9 +1,13 @@
-//! Single dispatch entry for the one-shot CLI and the serve transport.
+//! Single dispatch entry of the daemon's core thread.
 //!
-//! Both transports hand over the original argument vector, the request secrets
-//! and one long-lived session. Parsing, secret whitelisting and consent happen
-//! here; no handler asks questions or mutates before consent. Handlers report
-//! progress through the session's journal sink, owned by the transport.
+//! Every request hands over the original argument vector, the request secrets
+//! and input, and the daemon's one long-lived session. Parsing, secret and
+//! input whitelisting and consent happen here; no handler asks questions or
+//! mutates before consent. Handlers report progress through the session's
+//! journal sink, owned by the daemon. Terminal commands are prepared here
+//! (`prepare_terminal`) and run by the caller on the requester's console.
+
+use std::path::Path;
 
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -16,21 +20,14 @@ use crate::{
     github::{self, commands::GithubSession, switch},
     locking::LockKind,
     log::{Level, LogSink},
+    request_input::Input,
     request_secrets::Secrets,
     self_manage,
+    ssh::SshTransport,
     state::State,
     status,
-    transport::Console,
+    terminal::{TerminalJob, tty_required},
 };
-
-/// Which transport owns this dispatch loop.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DispatchMode {
-    /// One process per command: protected commands auto-open the local session.
-    OneShot,
-    /// Long-lived serve loop: only an explicit `session open` authorizes.
-    Serve,
-}
 
 /// A reply envelope. `id` is assigned by the requesting transport.
 #[derive(Debug, Serialize)]
@@ -60,9 +57,10 @@ impl Envelope {
     }
 }
 
-/// Secrets that open a one-shot session for any protected command. In v1
-/// they arrived through the transport rather than the command's own grammar.
-const SESSION_SECRETS: [&str; 2] = ["script-password", "vault-password"];
+/// A protected command before `session open` authorized the session.
+pub(crate) fn session_closed() -> RcError {
+    RcError::new("session_closed", "Сначала откройте сессию: session open.")
+}
 
 /// One authenticated source session for a sequence of commands. For an open
 /// GitHub source `state` points at `github-runtime/`; it always shares the
@@ -70,13 +68,10 @@ const SESSION_SECRETS: [&str; 2] = ["script-password", "vault-password"];
 pub struct Session {
     pub state: State,
     pub github: Option<GithubSession>,
-    mode: DispatchMode,
     sink: Box<dyn LogSink>,
     pub open: bool,
     pub authorized: bool,
     pub remember_key: bool,
-    /// The operator's terminal for TTY commands; never set by serve.
-    console: Option<Box<dyn Console>>,
 }
 
 /// A mutation that reached the configuration: success or `partial`.
@@ -85,25 +80,8 @@ fn persists<T>(result: &Result<T>) -> bool {
 }
 
 impl Session {
-    pub fn new(state: State, mode: DispatchMode, sink: Box<dyn LogSink>) -> Self {
-        Self { state, github: None, mode, sink, open: false, authorized: false, remember_key: false, console: None }
-    }
-
-    /// Attach the operator's terminal: the one-shot CLI for `!tty` commands,
-    /// and the TUI's private `serve --inner` child (it shares the TUI's
-    /// controlling terminal while the menu is suspended). A public serve
-    /// never attaches one, so its `!tty` commands answer `tty_required`.
-    pub fn set_console(&mut self, console: Box<dyn Console>) {
-        self.console = Some(console);
-    }
-
-    /// The attached terminal, if the transport attached one.
-    pub(crate) fn console(&mut self) -> Option<&mut (dyn Console + 'static)> {
-        self.console.as_deref_mut()
-    }
-
-    pub fn mode(&self) -> DispatchMode {
-        self.mode
+    pub fn new(state: State, sink: Box<dyn LogSink>) -> Self {
+        Self { state, github: None, sink, open: false, authorized: false, remember_key: false }
     }
 
     pub(crate) fn log(&mut self, level: Level, text: &str) {
@@ -125,12 +103,13 @@ impl Session {
     }
 
     /// v1: configured means a device-local `config.json` or `source.json`.
-    pub(crate) fn configured(&self) -> Result<bool> {
+    pub fn configured(&self) -> Result<bool> {
         let paths = self.state.paths().local();
         Ok(paths.config().try_exists()? || paths.source().try_exists()?)
     }
 
-    fn source_kind(&self) -> Result<Option<&'static str>> {
+    /// `local`, `github`, or `None` before the configuration exists.
+    pub fn source_kind(&self) -> Result<Option<&'static str>> {
         if !self.configured()? {
             return Ok(None);
         }
@@ -146,51 +125,59 @@ impl Session {
         }
     }
 
-    /// Open the source and verify the script password. One-shot auto-open
-    /// treats absent state as an open local session so read-only commands on a
-    /// fresh installation keep working; an explicit `session open` does not.
-    /// The script password hash of a GitHub source arrives with its snapshot,
-    /// so the source opens first.
-    pub(crate) fn open_source(&mut self, secrets: &Secrets, explicit: bool) -> Result<Value> {
-        let configured = self.configured()?;
-        if !configured && explicit {
+    /// `session open`: open the source and verify the script password. The
+    /// script password hash of a GitHub source arrives with its snapshot, so
+    /// the source opens first. Absent state is `not_configured`.
+    pub fn open_source(&mut self, secrets: &Secrets) -> Result<Value> {
+        if !self.configured()? {
             return Err(RcError::new(
                 "not_configured",
                 "Конфигурация не создана: source init-local или source github-connect.",
             ));
         }
         if !self.open {
-            if configured && self.state.paths().source().try_exists()? {
+            if self.state.paths().source().try_exists()? {
                 github::commands::open_github(self, secrets, self.remember_key)?;
             }
             self.open = true;
         }
         if !self.authorized {
-            if self.state.auth_store().is_configured()? {
-                let password = secrets.get("script-password").ok_or_else(|| {
-                    RcError::new("auth_required", "Требуется пароль запуска.")
-                        .with_extra("secret", "script-password")
-                })?;
-                if !self.state.auth_store().verify(password)? {
-                    return Err(RcError::new("auth_failed", "Неверный пароль запуска.")
-                        .with_extra("secret", "script-password"));
-                }
-            }
+            self.verify_script_password(secrets)?;
             self.authorized = true;
         }
         Ok(self.data())
     }
 
-    fn ensure_authorized(&mut self, secrets: &Secrets) -> Result<()> {
-        if self.open && self.authorized {
+    /// Absent state opens as an empty local session so read-only commands
+    /// and the first-run commands work on a fresh installation. Creates
+    /// nothing on disk; `false` (and no change) once the configuration exists.
+    pub fn open_absent(&mut self) -> Result<bool> {
+        if self.configured()? {
+            return Ok(false);
+        }
+        self.open = true;
+        self.authorized = true;
+        Ok(true)
+    }
+
+    /// The `script-password` secret against the stored script password; no
+    /// password configured passes.
+    pub fn verify_script_password(&self, secrets: &Secrets) -> Result<()> {
+        let auth = self.state.auth_store();
+        if !auth.is_configured()? {
             return Ok(());
         }
-        match self.mode {
-            DispatchMode::OneShot => self.open_source(secrets, false).map(drop),
-            DispatchMode::Serve => {
-                Err(RcError::new("session_closed", "Сначала откройте сессию: session open."))
-            }
+        let password = secrets.get("script-password").ok_or_else(|| {
+            RcError::new("auth_required", "Требуется пароль запуска.").with_extra("secret", "script-password")
+        })?;
+        if !auth.verify(password)? {
+            return Err(RcError::new("auth_failed", "Неверный пароль запуска.").with_extra("secret", "script-password"));
         }
+        Ok(())
+    }
+
+    fn ensure_authorized(&self) -> Result<()> {
+        if self.open && self.authorized { Ok(()) } else { Err(session_closed()) }
     }
 
     /// The single mutation path (v1 `state_action`): mutation lock → change →
@@ -250,8 +237,11 @@ impl Session {
 }
 
 /// Execute one command. Exactly one envelope is returned for every call.
-pub async fn dispatch(argv: &[String], secrets: &Secrets, session: &mut Session) -> Envelope {
-    match dispatch_inner(argv, secrets, session).await {
+/// `agent_socket` is the requesting client's SSH agent (`None` → no agent).
+pub async fn dispatch(argv: &[String], secrets: &Secrets, input: &Input, agent_socket: Option<&Path>,
+    session: &mut Session) -> Envelope
+{
+    match dispatch_inner(argv, secrets, input, agent_socket, session).await {
         Ok(data) => {
             let mut envelope = Envelope::success(data);
             envelope.sync = session.sync().map(str::to_owned);
@@ -261,32 +251,58 @@ pub async fn dispatch(argv: &[String], secrets: &Secrets, session: &mut Session)
     }
 }
 
-async fn dispatch_inner(argv: &[String], secrets: &Secrets, session: &mut Session) -> Result<Value> {
+/// Parse and whitelist: the command's own secrets and inputs only.
+fn checked(argv: &[String], secrets: &Secrets, input: &Input) -> Result<Invocation> {
     let invocation = cli::parse(argv)?;
-    if invocation.secrets_stdin && session.mode == DispatchMode::Serve {
-        return Err(RcError::new("usage", "В serve секреты передаются полем secrets."));
+    if invocation.secrets_stdin {
+        return Err(RcError::new("usage", "Секреты передаются полем secrets."));
     }
-    let mut accepted = invocation.allowed_secrets().to_vec();
-    // github-connect opens an existing local session itself (v1 auto-open).
-    let opens_session = invocation.requires_session() || (invocation.noun == "source" && invocation.verb == "github-connect");
-    if session.mode == DispatchMode::OneShot && opens_session {
-        for name in SESSION_SECRETS {
-            if !accepted.contains(&name) {
-                accepted.push(name);
-            }
-        }
-    }
-    secrets.validate_allowed(&accepted)?;
+    secrets.validate_allowed(invocation.allowed_secrets())?;
+    input.validate_allowed(invocation.inputs())?;
+    Ok(invocation)
+}
+
+async fn dispatch_inner(argv: &[String], secrets: &Secrets, input: &Input, agent_socket: Option<&Path>,
+    session: &mut Session) -> Result<Value>
+{
+    let invocation = checked(argv, secrets, input)?;
     if invocation.help {
         return Ok(cli::help(invocation.help_noun()));
     }
-    if invocation.requires_session() {
-        session.ensure_authorized(secrets)?;
+    if invocation.client_side() {
+        return Err(RcError::new("usage", "Команда выполняется на стороне клиента."));
     }
-    route(&invocation, secrets, session).await
+    if invocation.requires_tty() {
+        return Err(tty_required(&invocation.noun));
+    }
+    if invocation.requires_session() {
+        session.ensure_authorized()?;
+    }
+    route(&invocation, secrets, input, agent_socket, session).await
 }
 
-async fn route(invocation: &Invocation, secrets: &Secrets, session: &mut Session) -> Result<Value> {
+/// The session part of a terminal command (`node shell`, `telegram menu`):
+/// the same checks as `dispatch`, then lookup, connection and script checks.
+/// The caller runs the returned job on the requester's console.
+pub async fn prepare_terminal(argv: &[String], secrets: &Secrets, input: &Input, agent_socket: Option<&Path>,
+    session: &mut Session) -> Result<TerminalJob<SshTransport>>
+{
+    let invocation = checked(argv, secrets, input)?;
+    if invocation.requires_session() {
+        session.ensure_authorized()?;
+    }
+    let connect = || SshTransport::with_agent(agent_socket);
+    match (invocation.noun.as_str(), invocation.verb.as_str()) {
+        ("node", "shell") => crate::nodes::shell::prepare(session, &invocation, connect()).await,
+        ("telegram", "menu") => crate::telegram::menu_prepare(session, &invocation, &connect).await,
+        _ => Err(RcError::new("usage", "Неизвестная команда.")),
+    }
+}
+
+async fn route(invocation: &Invocation, secrets: &Secrets, input: &Input, agent_socket: Option<&Path>,
+    session: &mut Session) -> Result<Value>
+{
+    let connect = || SshTransport::with_agent(agent_socket);
     match (invocation.noun.as_str(), invocation.verb.as_str()) {
         ("status", "") => {
             let status = status::status(&session.state, session.sync())?;
@@ -300,12 +316,12 @@ async fn route(invocation: &Invocation, secrets: &Secrets, session: &mut Session
         })),
         ("session", "open") => {
             session.remember_key = invocation.has("remember-key");
-            let data = session.open_source(secrets, true)?;
+            let data = session.open_source(secrets)?;
             let text = if session.github.is_some() { "Сессия открыта: конфигурация GitHub." } else { "Сессия открыта: локальная конфигурация." };
             session.log(Level::Info, text);
             Ok(data)
         }
-        ("source", verb) => route_source(verb, invocation, secrets, session).await,
+        ("source", verb) => route_source(verb, invocation, secrets, input, &connect, session).await,
         ("self", "version") => self_manage::version().await,
         ("self", "update") => {
             let plan = self_manage::prepare_update().await?;
@@ -358,41 +374,37 @@ async fn route(invocation: &Invocation, secrets: &Secrets, session: &mut Session
             session.log(Level::Success, "Пароль убран");
             Ok(json!({"password_set": false}))
         }
-        (noun @ ("node" | "conn"), verb) => {
-            let mut transport = crate::ssh::SshTransport::default();
-            crate::nodes::route(noun, verb, invocation, secrets, session, &mut transport).await
-        }
+        (noun @ ("node" | "conn"), verb) => crate::nodes::route(noun, verb, invocation, secrets, session, &mut connect()).await,
         (noun @ ("group" | "template" | "client" | "generate"), verb) => {
-            crate::clients::route(noun, verb, invocation, secrets, session, &crate::ssh::SshTransport::default).await
+            crate::clients::route(noun, verb, invocation, secrets, input, session, &connect).await
         }
-        ("subscription", verb) => {
-            crate::subscription::route("subscription", verb, invocation, secrets, session, &crate::ssh::SshTransport::default).await
-        }
-        ("awg", verb) => crate::awg::route("awg", verb, invocation, secrets, session, &crate::ssh::SshTransport::default).await,
-        ("telegram", verb) => {
-            crate::telegram::route("telegram", verb, invocation, secrets, session, &crate::ssh::SshTransport::default).await
-        }
-        // The parser only yields catalog commands; every one is routed above.
+        ("subscription", verb) => crate::subscription::route("subscription", verb, invocation, secrets, session, &connect).await,
+        ("awg", verb) => crate::awg::route("awg", verb, invocation, secrets, session, &connect).await,
+        ("telegram", verb) => crate::telegram::route("telegram", verb, invocation, secrets, session, &connect).await,
+        // The parser only yields catalog commands; every session command is
+        // routed above. `daemon *` belongs to the daemon.
         _ => Err(RcError::new("usage", "Неизвестная команда.")),
     }
 }
 
-async fn route_source(verb: &str, invocation: &Invocation, secrets: &Secrets, session: &mut Session) -> Result<Value> {
+async fn route_source(verb: &str, invocation: &Invocation, secrets: &Secrets, input: &Input,
+    connect: &dyn Fn() -> SshTransport, session: &mut Session) -> Result<Value>
+{
     use github::commands as source;
     match verb {
         "init-local" => source::init_local(session),
         "status" => source::status(session),
         "github-accounts" => Ok(source::accounts(session)),
         "github-login" => source::login(session, invocation),
-        "github-connect" => source::connect(session, invocation, secrets, &mut crate::ssh::SshTransport::default()).await,
+        "github-connect" => source::connect(session, invocation, secrets, &mut connect()).await,
         "github-fetch" => source::fetch(session),
         "github-push" => source::push(session),
         "github-change-account" => switch::change_account(session, invocation, secrets),
         "github-rewrap-password" => source::rewrap_password(session, secrets),
         "github-rotate-key" => source::rotate_key(session, invocation, secrets),
-        "github-import-recovery-key" => source::import_recovery_key(session, invocation),
+        "github-import-recovery-key" => source::import_recovery_key(session, input),
         "github-switch-local" => source::switch_local(session),
-        "github-replace-with-local" => source::replace_with_local(session, invocation, secrets, &mut crate::ssh::SshTransport::default()).await,
+        "github-replace-with-local" => source::replace_with_local(session, invocation, secrets, &mut connect()).await,
         "github-migrate-format" => source::migrate_format(session, invocation, secrets),
         "github-delete-repo" => source::delete_repo(session, invocation),
         _ => Err(RcError::new("usage", "Неизвестная команда source.")),
@@ -432,9 +444,9 @@ mod tests {
         }
     }
 
-    fn session(root: &std::path::Path, mode: DispatchMode) -> (Session, Journal) {
+    fn session(root: &std::path::Path) -> (Session, Journal) {
         let journal = Journal::default();
-        let session = Session::new(State::new(StatePaths::new(root)), mode, Box::new(Recorder(journal.clone())));
+        let session = Session::new(State::new(StatePaths::new(root)), Box::new(Recorder(journal.clone())));
         (session, journal)
     }
 
@@ -447,44 +459,63 @@ mod tests {
     }
 
     async fn run(session: &mut Session, list: &[&str], text: &str) -> Envelope {
-        dispatch(&argv(list), &secrets(text), session).await
+        dispatch(&argv(list), &secrets(text), &Input::default(), None, session).await
+    }
+
+    async fn run_input(session: &mut Session, list: &[&str], input: &str) -> Envelope {
+        dispatch(&argv(list), &Secrets::default(), &Input::from_json(input).unwrap(), None, session).await
+    }
+
+    fn code(envelope: Envelope) -> &'static str {
+        envelope.error.map_or("ok", |error| error.code)
+    }
+
+    /// A local configuration with the script password `first`, closed.
+    async fn configured(root: &std::path::Path) -> Session {
+        let (mut session, _) = session(root);
+        assert!(session.open_absent().unwrap());
+        assert!(run(&mut session, &["source", "init-local"], "{}").await.ok);
+        assert!(run(&mut session, &["self", "password-set"], r#"{"password":"first"}"#).await.ok);
+        session.close().unwrap();
+        session
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn password_lifecycle_journals_and_gates_before_mutation() {
         let root = tempfile::tempdir().unwrap();
-        let (mut one_shot, journal) = session(root.path(), DispatchMode::OneShot);
-        let init = run(&mut one_shot, &["source", "init-local"], "{}").await;
+        let (mut first, journal) = session(root.path());
+        assert!(first.open_absent().unwrap());
+        let init = run(&mut first, &["source", "init-local"], "{}").await;
         assert!(init.ok, "{:?}", init.error.map(|e| e.message));
         assert!(root.path().join("config.json").exists() && root.path().join("manifest.json").exists());
-        let absent = run(&mut one_shot, &["self", "password-set"], "{}").await.error.unwrap();
+        let absent = run(&mut first, &["self", "password-set"], "{}").await.error.unwrap();
         assert_eq!((absent.code, absent.extra["secret"].clone()), ("missing_secret", json!("password")), "the front end prompts");
-        let empty = run(&mut one_shot, &["self", "password-set"], r#"{"password":""}"#).await.error.unwrap();
+        let empty = run(&mut first, &["self", "password-set"], r#"{"password":""}"#).await.error.unwrap();
         assert_eq!(empty.code, "invalid");
-        let set = run(&mut one_shot, &["self", "password-set"], r#"{"password":"first"}"#).await;
+        let set = run(&mut first, &["self", "password-set"], r#"{"password":"first"}"#).await;
         assert!(set.ok);
         assert_eq!(journal.borrow().last().unwrap(), &(Level::Success, "Пароль сохранён".to_owned()));
         let manifest: Value = serde_json::from_slice(&std::fs::read(root.path().join("manifest.json")).unwrap()).unwrap();
         assert!(manifest["access"]["script_password_hash"].as_str().unwrap().starts_with("$argon2id$"), "checkpoint mirrors the hash");
-        let again = run(&mut one_shot, &["source", "init-local"], "{}").await;
+        let again = run(&mut first, &["source", "init-local"], "{}").await;
         assert_eq!(again.error.unwrap().code, "conflict");
         let auth = std::fs::read(root.path().join("auth.txt")).unwrap();
 
-        let (mut serve, journal) = session(root.path(), DispatchMode::Serve);
-        let closed = run(&mut serve, &["self", "password-remove"], r#"{"current-password":"first"}"#).await;
-        assert_eq!(closed.error.unwrap().code, "session_closed");
-        let wrong = run(&mut serve, &["session", "open"], r#"{"script-password":"bad"}"#).await;
-        assert_eq!(wrong.error.unwrap().code, "auth_failed");
-        assert!(run(&mut serve, &["session", "open"], r#"{"script-password":"first"}"#).await.ok);
-        // Serve accepts only the command's own secrets.
-        let foreign = run(&mut serve, &["status"], r#"{"script-password":"first"}"#).await;
-        assert_eq!(foreign.error.unwrap().code, "usage");
-        let gated = run(&mut serve, &["self", "password-remove"], r#"{"current-password":"first"}"#).await;
+        let (mut second, journal) = session(root.path());
+        let closed = run(&mut second, &["self", "password-remove"], r#"{"current-password":"first"}"#).await;
+        assert_eq!(code(closed), "session_closed");
+        let wrong = run(&mut second, &["session", "open"], r#"{"script-password":"bad"}"#).await;
+        assert_eq!(code(wrong), "auth_failed");
+        assert!(run(&mut second, &["session", "open"], r#"{"script-password":"first"}"#).await.ok);
+        // Only the command's own secrets are accepted.
+        let foreign = run(&mut second, &["status"], r#"{"script-password":"first"}"#).await;
+        assert_eq!(code(foreign), "usage");
+        let gated = run(&mut second, &["self", "password-remove"], r#"{"current-password":"first"}"#).await;
         let error = gated.error.unwrap();
         assert_eq!(error.code, "confirmation_required");
         assert_eq!(std::fs::read(root.path().join("auth.txt")).unwrap(), auth);
         let token = error.extra["plan_token"].as_str().unwrap().to_owned();
-        let removed = run(&mut serve, &["self", "password-remove", "--yes", "--plan-token", &token],
+        let removed = run(&mut second, &["self", "password-remove", "--yes", "--plan-token", &token],
             r#"{"current-password":"first"}"#).await;
         assert!(removed.ok);
         assert!(!root.path().join("auth.txt").exists());
@@ -492,18 +523,117 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn session_status_reports_state_without_creating_data() {
+    async fn protected_commands_need_an_open_session_and_absent_state_opens_without_writing() {
         let root = tempfile::tempdir().unwrap();
-        let (mut one_shot, _) = session(&root.path().join("absent"), DispatchMode::OneShot);
-        let status = run(&mut one_shot, &["session", "status"], "{}").await;
+        let data = root.path().join("absent");
+        let (mut session, journal) = session(&data);
+        let status = run(&mut session, &["session", "status"], "{}").await;
         assert_eq!(status.data.unwrap(), json!({"configured": false, "source": null, "open": false, "authorized": false}));
-        // A protected one-shot command auto-opens the absent local state.
-        assert!(run(&mut one_shot, &["group", "list"], "{}").await.ok);
-        let status = run(&mut one_shot, &["session", "status"], "{}").await;
+        for list in [&["group", "list"][..], &["status"], &["client", "config", "--name", "c"], &["template", "list"]] {
+            assert_eq!(code(run(&mut session, list, "{}").await), "session_closed", "{list:?}");
+        }
+        assert_eq!(code(run(&mut session, &["session", "open"], "{}").await), "not_configured");
+        assert!(session.open_absent().unwrap());
+        assert!(run(&mut session, &["group", "list"], "{}").await.ok);
+        let status = run(&mut session, &["session", "status"], "{}").await;
         assert_eq!(status.data.unwrap(), json!({"configured": false, "source": null, "open": true, "authorized": true}));
-        let open = run(&mut one_shot, &["session", "open"], "{}").await;
-        assert_eq!(open.error.unwrap().code, "not_configured");
-        assert!(!root.path().join("absent").exists());
+        assert!(!data.exists(), "absent state stays absent");
+        assert!(journal.borrow().is_empty());
+
+        // Configured state never opens without `session open`.
+        let mut closed = configured(&root.path().join("data")).await;
+        assert!(!closed.open_absent().unwrap());
+        assert!(!closed.open && !closed.authorized);
+        assert_eq!(code(run(&mut closed, &["group", "list"], "{}").await), "session_closed");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn script_password_verification_covers_every_case() {
+        let root = tempfile::tempdir().unwrap();
+        let (absent, _) = session(&root.path().join("absent"));
+        assert!(absent.verify_script_password(&Secrets::default()).is_ok(), "no password configured");
+        let session = configured(&root.path().join("data")).await;
+        let missing = session.verify_script_password(&Secrets::default()).unwrap_err();
+        assert_eq!((missing.code, missing.message.as_str(), missing.extra["secret"].clone()),
+            ("auth_required", "Требуется пароль запуска.", json!("script-password")));
+        let wrong = session.verify_script_password(&secrets(r#"{"script-password":"bad"}"#)).unwrap_err();
+        assert_eq!((wrong.code, wrong.message.as_str(), wrong.extra["secret"].clone()),
+            ("auth_failed", "Неверный пароль запуска.", json!("script-password")));
+        assert!(session.verify_script_password(&secrets(r#"{"script-password":"first"}"#)).is_ok());
+        assert!(!session.open && !session.authorized, "verification alone opens nothing");
+        let before = session.state.auth_store().hash().unwrap();
+        assert!(before.is_some_and(|hash| hash.starts_with("$argon2id$")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn transport_flags_inputs_and_client_or_terminal_commands_are_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut session, _) = session(root.path());
+        assert!(session.open_absent().unwrap());
+        assert!(run(&mut session, &["source", "init-local"], "{}").await.ok);
+        let before = crate::nodes::testing::fingerprint(root.path());
+        let stdin = run(&mut session, &["group", "list", "--secrets-stdin"], "{}").await.error.unwrap();
+        assert_eq!((stdin.code, stdin.message.as_str()), ("usage", "Секреты передаются полем secrets."));
+        let foreign = run_input(&mut session, &["group", "list"], r#"{"file":"x"}"#).await.error.unwrap();
+        assert_eq!((foreign.code, foreign.message.as_str()), ("usage", "Поле input не поддерживается командой."));
+        let other = run_input(&mut session, &["template", "import", "--name", "t"], r#"{"other":"x"}"#).await;
+        assert_eq!(code(other), "usage");
+        assert_eq!(code(run(&mut session, &["template", "import", "--name", "t", "--file", "in.yaml"], "{}").await), "usage",
+            "the client strips --file");
+        for list in [&["template", "export", "--name", "default", "--output", "o"][..], &["daemon", "run"], &["daemon", "start"]] {
+            let error = run(&mut session, list, "{}").await.error.unwrap();
+            assert_eq!((error.code, error.message.as_str()), ("usage", "Команда выполняется на стороне клиента."), "{list:?}");
+        }
+        for list in [&["daemon", "status"][..], &["daemon", "stop"]] {
+            let error = run(&mut session, list, "{}").await.error.unwrap();
+            assert_eq!((error.code, error.message.as_str()), ("usage", "Неизвестная команда."), "{list:?}");
+        }
+        for (list, message) in [
+            (&["node", "shell", "--name", "ghost"][..], "Меню сервера требует терминала."),
+            (&["telegram", "menu", "--name", "ghost"], "Меню Telegram Proxy требует терминала."),
+        ] {
+            let error = run(&mut session, list, "{}").await.error.unwrap();
+            assert_eq!((error.code, error.message.as_str(), error.exit_code()), ("tty_required", message, 2), "{list:?}");
+        }
+        assert_eq!(crate::nodes::testing::fingerprint(root.path()), before);
+    }
+
+    async fn prepare(session: &mut Session, list: &[&str]) -> Option<&'static str> {
+        prepare_terminal(&argv(list), &Secrets::default(), &Input::default(), None, session).await.err().map(|e| e.code)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_preparation_checks_the_session_before_any_connection() {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = configured(root.path()).await;
+        assert_eq!(prepare(&mut session, &["node", "shell", "--name", "ghost"]).await, Some("session_closed"));
+        assert!(run(&mut session, &["session", "open"], r#"{"script-password":"first"}"#).await.ok);
+        assert_eq!(prepare(&mut session, &["node", "shell", "--name", "ghost"]).await, Some("not_found"));
+        assert_eq!(prepare(&mut session, &["telegram", "menu", "--name", "ghost"]).await, Some("not_found"));
+        assert_eq!(prepare(&mut session, &["node", "shell", "--name", "ghost", "--secrets-stdin"]).await, Some("usage"));
+        assert_eq!(prepare(&mut session, &["group", "list"]).await, Some("usage"));
+        assert_eq!(prepare(&mut session, &["help"]).await, Some("usage"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn template_import_and_client_config_go_through_dispatch() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut session, journal) = session(root.path());
+        assert!(session.open_absent().unwrap());
+        assert!(run(&mut session, &["source", "init-local"], "{}").await.ok);
+        let imported = run_input(&mut session, &["template", "import", "--name", "lab"], r#"{"file":"mode: rule\n"}"#).await;
+        assert_eq!(imported.data, Some(json!({"name": "lab.yaml"})));
+        let shown = run(&mut session, &["template", "show", "--name", "lab"], "{}").await;
+        assert_eq!(shown.data.unwrap()["content"], "mode: rule\n");
+        let missing = run(&mut session, &["template", "import", "--name", "other"], "{}").await.error.unwrap();
+        assert_eq!((missing.code, missing.message.as_str()), ("usage", "Передайте содержимое полем input.file."));
+        assert!(journal.borrow().iter().all(|(_, text)| !text.contains("mode: rule")), "input never reaches the journal");
+
+        assert!(run(&mut session, &["group", "add", "--name", "LAB"], "{}").await.ok);
+        assert!(run(&mut session, &["client", "add", "--name", "pc", "--group", "LAB"], "{}").await.ok);
+        let config = run(&mut session, &["client", "config", "--name", "pc"], "{}").await;
+        assert_eq!(config.data, Some(json!({"name": "pc", "group": "LAB", "exists": false, "content": null})));
+        assert_eq!(code(run(&mut session, &["client", "config", "--name", "ghost"], "{}").await), "not_found");
     }
 
     #[test]
@@ -511,7 +641,7 @@ mod tests {
         use crate::github::{BRANCH, REPO_NAME, Storage, SyncStatus, Target, commands::GithubSession, stage_of, store};
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("data");
-        let (mut session, journal) = session(&root, DispatchMode::OneShot);
+        let (mut session, journal) = session(&root);
         let paths = StatePaths::new(&root);
         session.state = State::with_locks(paths.runtime(), session.state.locks().clone());
         crate::secure_fs::create_dir_all(&paths.github_runtime()).unwrap();
@@ -543,7 +673,7 @@ mod tests {
         use crate::github::{BRANCH, REPO_NAME, Storage, SyncStatus, Target, commands::GithubSession, exec, stage_of, store};
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("data");
-        let (mut session, _journal) = session(&root, DispatchMode::OneShot);
+        let (mut session, _journal) = session(&root);
         let paths = StatePaths::new(&root);
         session.state = State::with_locks(paths.runtime(), session.state.locks().clone());
         crate::secure_fs::create_dir_all(&paths.github_runtime()).unwrap();

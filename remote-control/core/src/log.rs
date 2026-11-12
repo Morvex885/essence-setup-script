@@ -1,8 +1,8 @@
 //! Command journal: native levels and a transport-owned sink.
 //!
-//! Handlers report progress through the session's sink; serve turns entries
-//! into JSONL `log` events tagged with the active request id, the one-shot CLI
-//! prints them to stderr. Secrets must never be passed as journal text.
+//! Handlers report progress through the session's sink; the daemon turns
+//! entries into protocol `log` events tagged with the active request id, and
+//! the CLI prints those to stderr. Secrets must never be passed as journal text.
 
 use serde::Serialize;
 
