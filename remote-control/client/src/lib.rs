@@ -4,6 +4,7 @@
 pub mod client;
 pub mod daemon;
 pub mod endpoint;
+pub mod files;
 pub mod protocol;
 pub mod scripted;
 pub mod spawn;

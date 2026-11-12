@@ -13,8 +13,7 @@ use std::{env, fs, io::{self, Write}, path::{Path, PathBuf}, process::{Command, 
 use ratatui::{style::Style, text::{Line, Span}};
 use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
-use essence_rc_client::{argv, Input, Reply, Secrets};
-use zeroize::Zeroizing;
+use essence_rc_client::{argv, files::{self, InputFileError}, Input, Reply, Secrets};
 use crate::{app::{Context, Navigation, Screen}, confirm::run_confirmed_with, ui::{self, Item, View}};
 
 pub struct Clients;
@@ -557,22 +556,26 @@ pub(crate) fn expand_home(path: &str) -> PathBuf {
     }
     PathBuf::from(path)
 }
-/// Request input `file`: the text of a local regular file. The daemon never
-/// reads client paths. Not a file or not UTF-8 → a warning and `None`.
+/// Request input `file`: the text of a local regular file (a link is not
+/// followed) of at most 1 MiB. The daemon never reads client paths. Anything
+/// else → a warning and `None`.
 pub(crate) fn file_input(ctx: &mut Context<'_>, path: &Path) -> Option<Input> {
-    let text = fs::metadata(path).ok().filter(fs::Metadata::is_file)
-        .and_then(|_| fs::read(path).ok()).and_then(|bytes| String::from_utf8(bytes).ok()).map(Zeroizing::new);
-    let Some(text) = text else { ctx.ui.notice(ui::warn("Файл недоступен или не в UTF-8.")); return None; };
+    let text = match files::read_input_file(path) {
+        Ok(text) => text,
+        Err(InputFileError::TooLarge) => { ctx.ui.notice(ui::warn("Файл больше 1 МиБ.")); return None; }
+        Err(_) => { ctx.ui.notice(ui::warn("Файл недоступен или не в UTF-8.")); return None; }
+    };
     let mut input = Input::default();
     input.insert("file", text);
     Some(input)
 }
 /// `template show` → the local file; an existing entry is replaced only after
-/// consent, by renaming a fresh file over it (a link is replaced, never followed).
+/// consent, by renaming a fresh file over it (a link is replaced, never followed);
+/// an entry that appeared after the check is kept.
 fn export_template(ctx: &mut Context<'_>, name: &str, path: &Path) -> io::Result<()> {
     let Some(data) = fetch(ctx, &["template", "show", "--name", name])? else { return Ok(()); };
     let Some(content) = data["content"].as_str() else { ctx.failed(); return Ok(()); };
-    match fs::symlink_metadata(path) {
+    let replace = match fs::symlink_metadata(path) {
         Ok(meta) if meta.is_dir() => {
             ctx.ui.notice(ui::warn(format!("Не удалось записать {}: это каталог.", path.display())));
             return Ok(());
@@ -581,21 +584,18 @@ fn export_template(ctx: &mut Context<'_>, name: &str, path: &Path) -> io::Result
             let mut view = View::new("Экспорт шаблона");
             view.context.push(ui::text(format!("Файл {} будет перезаписан шаблоном {name}.", path.display()), ui::YELLOW));
             if !ctx.confirm(view, "Перезаписать файл?")? { return Ok(()); }
+            true
         }
-        Err(_) => {}
-    }
-    match write_export(path, content.as_bytes()) {
+        Err(_) => false,
+    };
+    match files::write_file_atomic(path, content.as_bytes(), replace) {
         Ok(()) => ctx.ui.notice(ui::text(format!("Шаблон {name} сохранён в {}", path.display()), ui::GREEN)),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            ctx.ui.notice(ui::warn(format!("Не удалось записать {}: файл появился во время экспорта.", path.display())));
+        }
         Err(error) => ctx.ui.notice(ui::warn(format!("Не удалось записать {}: {error}", path.display()))),
     }
     Ok(())
-}
-fn write_export(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    let mut file = tempfile::Builder::new().prefix(".rc-export-").tempfile_in(parent)?;
-    file.write_all(bytes)?;
-    file.as_file().sync_all()?;
-    file.persist(path).map(drop).map_err(|error| error.error)
 }
 fn template_card(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
     loop {
@@ -1267,6 +1267,26 @@ mod tests {
         assert!(imports.iter().all(|(_, names)| *names == &["file".to_owned()]), "the content travels as input.file");
         assert!(!core.calls.iter().flatten().any(|word| word.contains(dir.path().to_str().unwrap())), "no local path reaches the daemon");
         assert_eq!(expand_home("~other/path"), PathBuf::from("~other/path"));
+    }
+    #[test]
+    fn file_input_refuses_large_files_and_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, large) = (dir.path().join("in.yaml"), dir.path().join("large.yaml"));
+        fs::write(&source, "mode: rule\n").unwrap();
+        fs::write(&large, vec![b'a'; files::MAX_INPUT + 1]).unwrap();
+        let (_, ui) = drive(vec![], &[], |ctx| {
+            assert!(file_input(ctx, &source).is_some());
+            assert!(file_input(ctx, &large).is_none());
+            #[cfg(unix)]
+            {
+                let link = dir.path().join("link.yaml");
+                std::os::unix::fs::symlink(&source, &link).unwrap();
+                assert!(file_input(ctx, &link).is_none(), "a link is not followed");
+            }
+            Ok(())
+        });
+        assert_eq!(notices(&ui, "Файл больше 1 МиБ."), 1);
+        assert_eq!(notices(&ui, "Файл недоступен или не в UTF-8."), usize::from(cfg!(unix)));
     }
     #[test]
     fn generation_summary_reads_partial_fields_from_error_and_omits_empty_lines() {

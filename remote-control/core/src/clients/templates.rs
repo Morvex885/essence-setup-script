@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use include_dir::{Dir, include_dir};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::cli::Invocation;
 use crate::confirmation::Plan;
@@ -250,12 +251,15 @@ pub fn create(session: &mut Session, invocation: &Invocation) -> Result<Value> {
 }
 
 /// The template text arrives as request input `file`; the client read the
-/// file (or the editor buffer).
+/// file (or the editor buffer). The overwrite token covers the content: the
+/// path never reaches the daemon, so a token issued for one file must not
+/// consent to another.
 pub fn import(session: &mut Session, invocation: &Invocation, input: &Input) -> Result<Value> {
     let name = new_file_name(required(invocation, "name")?)?;
     let content = input.get("file").ok_or_else(|| RcError::new("usage", "Передайте содержимое полем input.file."))?;
     if custom_exists(&session.state, &name)? {
-        Plan::new(vec![format!("Шаблон {name} будет перезаписан.")], "").confirm(invocation)?;
+        let digest = hex::encode(Sha256::digest(content.as_bytes()));
+        Plan::new(vec![format!("Шаблон {name} будет перезаписан.")], digest).confirm(invocation)?;
     }
     session.mutate("template_import", |state| {
         secure_fs::create_dir_all(state.paths().templates())?;
@@ -443,7 +447,17 @@ mod tests {
         let missing = import_text(&mut session, &["template", "import", "--name", "new"], None).unwrap_err();
         assert_eq!(missing.message, "Передайте содержимое полем input.file.");
         assert_eq!(fingerprint(root.path()), before);
-        import_text(&mut session, &["template", "import", "--name", "lab", "--yes"], Some("mode: global\n")).unwrap();
+        let other = import_text(&mut session, &["template", "import", "--name", "lab"], Some("mode: direct\n")).unwrap_err();
+        let token = error.extra["plan_token"].as_str().unwrap();
+        assert_ne!(other.extra["plan_token"], error.extra["plan_token"], "the token covers the content");
+        let stale = import_text(&mut session, &["template", "import", "--name", "lab", "--yes", "--plan-token", token],
+            Some("mode: direct\n")).unwrap_err();
+        assert_eq!(stale.code, "plan_changed");
+        assert_eq!(fingerprint(root.path()), before);
+        import_text(&mut session, &["template", "import", "--name", "lab", "--yes", "--plan-token", token],
+            Some("mode: global\n")).unwrap();
         assert_eq!(fs::read_to_string(&stored).unwrap(), "mode: global\n");
+        import_text(&mut session, &["template", "import", "--name", "lab", "--yes"], Some("mode: rule\n")).unwrap();
+        assert_eq!(fs::read_to_string(&stored).unwrap(), "mode: rule\n");
     }
 }

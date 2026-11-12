@@ -9,6 +9,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use essence_rc_client::{self as client, Client, DaemonClient, Endpoint, Progress, Reply, Request, SpawnDaemon};
+use essence_rc_client::files::InputFileError;
 use rc_core::cli::{self, Invocation};
 use rc_core::clients::templates;
 use rc_core::confirmation::Plan;
@@ -351,7 +352,7 @@ fn execute(argv: &[String], invocation: &Invocation) -> Outcome<Output> {
         Some(export) if output.ok => {
             let content = output.data.as_ref().and_then(|data| data["content"].as_str()).unwrap_or_default();
             let name = output.data.as_ref().and_then(|data| data["name"].as_str()).unwrap_or(&export.name).to_owned();
-            write_export(&export.output, content).map_err(local)?;
+            write_export(&export, content).map_err(local)?;
             print_log(&client::Log { level: "success".into(), text: format!("Шаблон {name} сохранён в {}", export.output) });
             Ok(Output::success(json!({"name": name, "output": export.output})))
         }
@@ -439,14 +440,16 @@ fn read_inputs(invocation: &Invocation) -> Result<client::Input> {
     Ok(input)
 }
 
+/// Обычный файл в UTF-8 не больше 1 МиБ; ссылка отклоняется (`invalid`).
 fn read_input_file(path: &str) -> Result<Zeroizing<String>> {
-    let unavailable = || RcError::new("invalid", format!("Файл {path} недоступен."));
-    if !fs::metadata(path).map_err(|_| unavailable())?.is_file() {
-        return Err(unavailable());
-    }
-    let bytes = Zeroizing::new(fs::read(path).map_err(|_| unavailable())?);
-    let text = std::str::from_utf8(&bytes).map_err(|_| RcError::new("invalid", format!("Файл {path} не в кодировке UTF-8.")))?;
-    Ok(Zeroizing::new(text.to_owned()))
+    client::files::read_input_file(Path::new(path)).map_err(|error| {
+        let message = match error {
+            InputFileError::Unavailable => format!("Файл {path} недоступен."),
+            InputFileError::TooLarge => format!("Файл {path} больше 1 МиБ."),
+            InputFileError::NotUtf8 => format!("Файл {path} не в кодировке UTF-8."),
+        };
+        RcError::new("invalid", message)
+    })
 }
 
 // ─── template export ─────────────────────────────────────────────────────────
@@ -455,6 +458,8 @@ struct Export {
     /// Имя шаблона для `template show` (как передано).
     name: String,
     output: String,
+    /// Перезапись существующего пути подтверждена планом.
+    replace: bool,
 }
 
 fn required<'a>(invocation: &'a Invocation, flag: &str) -> Result<&'a str> {
@@ -467,34 +472,33 @@ fn required<'a>(invocation: &'a Invocation, flag: &str) -> Result<&'a str> {
 fn export_preflight(invocation: &Invocation) -> Result<Export> {
     let name = required(invocation, "name")?.to_owned();
     let output = required(invocation, "output")?.to_owned();
-    match fs::symlink_metadata(&output) {
+    let replace = match fs::symlink_metadata(&output) {
         Ok(meta) if meta.is_dir() => {
             return Err(RcError::new("invalid", format!("Путь {output} — каталог; укажите файл.")));
         }
         Ok(_) => {
             let file = templates::file_name(&name);
             Plan::new(vec![format!("Файл {output} будет перезаписан шаблоном {file}.")], String::new()).confirm(invocation)?;
+            true
         }
-        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => false,
         Err(error) => return Err(error.into()),
-    }
-    Ok(Export { name, output })
+    };
+    Ok(Export { name, output, replace })
 }
 
-/// Временный файл в том же каталоге, `sync_all`, атомарная замена: ссылка
-/// на месте `output` заменяется файлом, её цель не трогается.
-fn write_export(output: &str, content: &str) -> Result<()> {
-    let path = Path::new(output);
-    let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    tempfile::Builder::new()
-        .prefix(".rc-export-")
-        .tempfile_in(parent)
-        .and_then(|mut file| {
-            file.write_all(content.as_bytes())?;
-            file.as_file().sync_all()?;
-            file.persist(path).map(drop).map_err(|error| error.error)
-        })
-        .map_err(|_| failed(format!("Не удалось записать {output}.")))
+/// Атомарная запись: ссылка на месте `output` заменяется файлом, её цель не
+/// трогается. Без подтверждённой перезаписи появившийся тем временем файл
+/// сохраняется — `conflict`.
+fn write_export(export: &Export, content: &str) -> Result<()> {
+    let output = &export.output;
+    client::files::write_file_atomic(Path::new(output), content.as_bytes(), export.replace).map_err(|error| {
+        if error.kind() == ErrorKind::AlreadyExists {
+            RcError::new("conflict", format!("Файл {output} появился во время экспорта: повторите команду."))
+        } else {
+            failed(format!("Не удалось записать {output}."))
+        }
+    })
 }
 
 // ─── Повтор со скрытым вводом секрета ────────────────────────────────────────
@@ -809,6 +813,18 @@ mod tests {
         let error = read_input_file(binary.to_str().unwrap()).err().unwrap();
         assert_eq!(error.code, "invalid");
         assert!(error.message.ends_with("не в кодировке UTF-8."), "{}", error.message);
+        let large = dir.path().join("large");
+        fs::write(&large, vec![b'a'; client::files::MAX_INPUT + 1]).unwrap();
+        let large_arg = large.to_str().unwrap();
+        assert_eq!(read_input_file(large_arg).err().unwrap().message, format!("Файл {large_arg} больше 1 МиБ."));
+        assert_eq!(client::files::MAX_INPUT, rc_core::request_input::Input::MAX_VALUE, "the daemon's input limit");
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link.yaml");
+            std::os::unix::fs::symlink(&file, &link).unwrap();
+            let link_arg = link.to_str().unwrap();
+            assert_eq!(read_input_file(link_arg).err().unwrap().message, format!("Файл {link_arg} недоступен."), "links are refused");
+        }
     }
 
     /// Семантика удалённой `templates::export` ядра: каталог отклоняется,
@@ -819,8 +835,14 @@ mod tests {
         let target = out.path().join("t.yaml");
         let target_arg = target.to_str().unwrap();
         let fresh = export(&["template", "export", "--name", "default", "--output", target_arg]).unwrap();
-        assert_eq!((fresh.name.as_str(), fresh.output.as_str()), ("default", target_arg));
-        write_export(target_arg, "TEMPLATE\n").unwrap();
+        assert_eq!((fresh.name.as_str(), fresh.output.as_str(), fresh.replace), ("default", target_arg, false));
+        // A file that appeared after the check is kept: the overwrite was not confirmed.
+        fs::write(&target, "APPEARED\n").unwrap();
+        let error = write_export(&fresh, "TEMPLATE\n").err().unwrap();
+        assert_eq!((error.code, error.message), ("conflict", format!("Файл {target_arg} появился во время экспорта: повторите команду.")));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "APPEARED\n");
+        fs::remove_file(&target).unwrap();
+        write_export(&fresh, "TEMPLATE\n").unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "TEMPLATE\n");
 
         fs::write(&target, "IMPORTANT\n").unwrap();
@@ -828,14 +850,17 @@ mod tests {
         assert_eq!((error.code, error.exit), ("confirmation_required", 2));
         assert_eq!(error.extra["plan"], json!([format!("Файл {target_arg} будет перезаписан шаблоном default.yaml.")]));
         assert_eq!(fs::read_to_string(&target).unwrap(), "IMPORTANT\n");
-        export(&["template", "export", "--name", "default", "--output", target_arg, "--yes"]).unwrap();
+        let confirmed = export(&["template", "export", "--name", "default", "--output", target_arg, "--yes"]).unwrap();
+        assert!(confirmed.replace);
+        write_export(&confirmed, "TEMPLATE\n").unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "TEMPLATE\n");
 
         let dir_arg = out.path().to_str().unwrap();
         assert_eq!(export(&["template", "export", "--name", "default", "--output", dir_arg, "--yes"]).err().unwrap().code, "invalid");
         assert_eq!(export(&["template", "export", "--name", "default"]).err().unwrap().code, "usage");
         let missing_parent = format!("{}/absent/victim", out.path().display());
-        export(&["template", "export", "--name", "default", "--output", &missing_parent]).unwrap();
-        assert_eq!(write_export(&missing_parent, "x").err().unwrap().code, "failed");
+        let orphan = export(&["template", "export", "--name", "default", "--output", &missing_parent]).unwrap();
+        assert_eq!(write_export(&orphan, "x").err().unwrap().code, "failed");
 
         #[cfg(unix)]
         {
@@ -846,8 +871,8 @@ mod tests {
             assert_eq!(export(&["template", "export", "--name", "default", "--output", link_arg]).err().unwrap().code,
                 "confirmation_required");
             assert!(!pointed.exists());
-            export(&["template", "export", "--name", "default", "--output", link_arg, "--yes"]).unwrap();
-            write_export(link_arg, "TEMPLATE\n").unwrap();
+            let link_export = export(&["template", "export", "--name", "default", "--output", link_arg, "--yes"]).unwrap();
+            write_export(&link_export, "TEMPLATE\n").unwrap();
             assert!(!pointed.exists());
             assert!(fs::symlink_metadata(&link).unwrap().is_file());
         }
