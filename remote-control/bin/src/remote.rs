@@ -37,11 +37,13 @@ fn usage(message: impl Into<String>) -> RcError {
 }
 
 /// Значение флага: `--имя=значение` либо следующее слово; пустое — `usage`.
+/// Следующее слово-флаг (`--connect --json …`) значением не считается и
+/// остаётся в argv: режим `--json` определяется и для этой ошибки.
 fn flag_value(argv: &mut Vec<String>, index: usize, name: &str) -> Result<String> {
     let word = argv.remove(index);
     let value = match word.split_once('=') {
         Some((_, value)) => value.to_owned(),
-        None if index < argv.len() => argv.remove(index),
+        None if index < argv.len() && !argv[index].starts_with("--") => argv.remove(index),
         None => String::new(),
     };
     if value.is_empty() {
@@ -272,6 +274,10 @@ mod tests {
         assert_eq!(code(&["--connect", "ftp://x", "status"]).unwrap().0, "usage");
         assert_eq!(code(&["--connect"]).unwrap().0, "usage");
         assert_eq!(code(&["--connect=", "status"]).unwrap().0, "usage");
+        // Флаг не становится значением и остаётся в argv (JSON-конверт ошибки).
+        let (target, rest) = extracted(&["--connect", "--json", "status"]);
+        assert_eq!(target.err().map(|error| error.code), Some("usage"));
+        assert_eq!(rest, words(&["--json", "status"]));
     }
 
     #[cfg(unix)]

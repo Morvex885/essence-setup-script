@@ -740,6 +740,10 @@ fn grammar_violations_are_usage_errors() {
     // Глобальный флаг перед существительным тоже разбирается.
     let result = run_json(BIN, &env, &["--json", "foo"], None);
     assert_error(&result, "usage", 2);
+
+    // `--connect` без значения перед `--json`: флаг не съеден, ответ — JSON-конверт.
+    let result = run_json(BIN, &env, &["--connect", "--json", "status"], None);
+    assert_error(&result, "usage", 2);
 }
 
 // ─── Одиночный вызов: конверт и статусы ──────────────────────────────────────

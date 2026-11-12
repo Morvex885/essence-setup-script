@@ -247,46 +247,52 @@ fn connection_lost() -> io::Error {
     io::Error::new(io::ErrorKind::ConnectionAborted, "Соединение с демоном потеряно.")
 }
 
-/// WebSocket reader and writer: a text frame is one line. Ends when the
-/// daemon closes, on an error, after `silence` without a single frame, when
-/// the client is gone or when the outgoing channel closes (then a Close frame
+/// WebSocket reader and writer: a text frame is one line. Reading and
+/// writing run concurrently, so the silence timer works while a write waits.
+/// Ends with [`Incoming::Closed`] when the daemon closes, on a read error,
+/// after `silence` without a single frame, and when a write fails or does not
+/// complete within `silence` (a WebSocket whose write failed is unusable, so
+/// reading ends too: an unsent request would never get a reply). Ends quietly
+/// when the client is gone or the outgoing channel closes (then a Close frame
 /// is sent). Pings are answered by tungstenite while reading.
 async fn pump<S: AsyncRead + AsyncWrite + Unpin>(socket: WebSocketStream<S>, mut outgoing: UnboundedReceiver<Zeroizing<String>>,
     incoming: mpsc::Sender<Incoming>, silence: Duration) {
     let (mut sink, mut frames) = socket.split();
-    let mut broken = false;
-    let quiet = tokio::time::sleep(silence);
-    tokio::pin!(quiet);
-    loop {
-        tokio::select! {
-            frame = frames.next() => {
-                quiet.as_mut().reset(tokio::time::Instant::now() + silence);
-                match frame {
-                    Some(Ok(Message::Text(text))) => {
-                        if incoming.send(Incoming::Line(Zeroizing::new(text.as_str().to_owned()))).is_err() { return; }
-                    }
-                    Some(Ok(Message::Binary(_))) => {
-                        let _ = incoming.send(Incoming::Closed(protocol("Некорректный ответ демона")));
-                        return;
-                    }
-                    Some(Ok(Message::Close(_)) | Err(_)) | None => {
-                        let _ = incoming.send(Incoming::Closed(connection_lost()));
-                        return;
-                    }
-                    Some(Ok(_)) => {}
-                }
+    // `Some` — the connection is broken; `None` — the client is gone.
+    let writer = async {
+        while let Some(line) = outgoing.recv().await {
+            if !matches!(tokio::time::timeout(silence, sink.send(Message::text(line.as_str()))).await, Ok(Ok(()))) {
+                return Some(Incoming::Closed(connection_lost()));
             }
-            () = &mut quiet => {
-                let _ = incoming.send(Incoming::Closed(connection_lost()));
-                return;
-            }
-            message = outgoing.recv() => match message {
-                // A broken write side drops further messages; reading continues.
-                Some(_) if broken => {}
-                Some(line) => broken = sink.send(Message::text(line.as_str())).await.is_err(),
-                None => { let _ = sink.close().await; return; }
-            },
         }
+        let _ = tokio::time::timeout(silence, sink.close()).await;
+        None
+    };
+    let reader = async {
+        let quiet = tokio::time::sleep(silence);
+        tokio::pin!(quiet);
+        loop {
+            let frame = tokio::select! {
+                frame = frames.next() => frame,
+                () = &mut quiet => return Some(Incoming::Closed(connection_lost())),
+            };
+            quiet.as_mut().reset(tokio::time::Instant::now() + silence);
+            match frame {
+                Some(Ok(Message::Text(text))) => {
+                    if incoming.send(Incoming::Line(Zeroizing::new(text.as_str().to_owned()))).is_err() { return None; }
+                }
+                Some(Ok(Message::Binary(_))) => return Some(Incoming::Closed(protocol("Некорректный ответ демона"))),
+                Some(Ok(Message::Close(_)) | Err(_)) | None => return Some(Incoming::Closed(connection_lost())),
+                Some(Ok(_)) => {}
+            }
+        }
+    };
+    let ended = tokio::select! {
+        ended = writer => ended,
+        ended = reader => ended,
+    };
+    if let Some(closed) = ended {
+        let _ = incoming.send(closed);
     }
 }
 

@@ -217,7 +217,7 @@ static HELP: &[(&str, &[(&str, &str)])] = &[
     ]),
     ("session", &[
         ("session status", "Состояние: создана ли конфигурация, открыта ли сессия"),
-        ("session open [--remember-key]", "Открыть источник и проверить пароль запуска (секреты script-password, vault-password)"),
+        ("session open [--remember-key]", "Открыть источник и проверить пароль запуска (секреты script-password, vault-password, access-token)"),
     ]),
     ("source", &[
         ("source init-local", "Создать локальную конфигурацию"),

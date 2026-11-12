@@ -258,3 +258,76 @@ fn a_silent_connection_is_lost_but_pings_keep_it_open() {
         drop(server);
     });
 }
+
+/// Runs `pump` against `server` (pinging every 100 ms, never reading) after
+/// one 1 MiB line is queued; returns what the client saw and how long it took.
+async fn pump_against_pinging_server<S, T>(client: S, mut server: WebSocketStream<T>) -> (Option<Incoming>, Duration)
+where S: AsyncRead + AsyncWrite + Unpin, T: AsyncRead + AsyncWrite + Unpin {
+    use tokio_tungstenite::tungstenite::protocol::Role;
+    let client = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+    let (outgoing, receiver) = unbounded_channel();
+    let (events, incoming) = mpsc::channel();
+    outgoing.send(Zeroizing::new("x".repeat(1 << 20))).unwrap();
+    let started = Instant::now();
+    let pinging = async {
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if server.send(Message::Ping(Default::default())).await.is_err() { return; }
+        }
+    };
+    let pumped = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::select! {
+            () = pump(client, receiver, events, Duration::from_millis(400)) => {}
+            () = pinging => {}
+        }
+    }).await;
+    assert!(pumped.is_ok(), "pump ended");
+    (incoming.try_recv().ok(), started.elapsed())
+}
+
+#[test]
+fn a_write_that_does_not_complete_loses_the_connection_despite_pings() {
+    use tokio_tungstenite::tungstenite::protocol::Role;
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    runtime.block_on(async {
+        // The server never reads: a 1 MiB line cannot pass a 4 KiB pipe.
+        let (near, far) = tokio::io::duplex(4096);
+        let server = WebSocketStream::from_raw_socket(far, Role::Server, None).await;
+        let (closed, elapsed) = pump_against_pinging_server(near, server).await;
+        assert!(matches!(closed, Some(Incoming::Closed(_))));
+        assert!(elapsed >= Duration::from_millis(400), "after the write bound, not at once");
+    });
+}
+
+/// Reads pass through; every write fails.
+struct WriteFails(tokio::io::DuplexStream);
+impl AsyncRead for WriteFails {
+    fn poll_read(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut tokio::io::ReadBuf<'_>)
+        -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().0).poll_read(cx, buf)
+    }
+}
+impl AsyncWrite for WriteFails {
+    fn poll_write(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>, _: &[u8]) -> std::task::Poll<io::Result<usize>> {
+        std::task::Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
+    }
+    fn poll_flush(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+#[test]
+fn a_failed_write_loses_the_connection_at_once() {
+    use tokio_tungstenite::tungstenite::protocol::Role;
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    runtime.block_on(async {
+        let (near, far) = tokio::io::duplex(1 << 16);
+        let server = WebSocketStream::from_raw_socket(far, Role::Server, None).await;
+        let (closed, elapsed) = pump_against_pinging_server(WriteFails(near), server).await;
+        assert!(matches!(closed, Some(Incoming::Closed(_))));
+        assert!(elapsed < Duration::from_millis(400), "before the write bound");
+    });
+}
