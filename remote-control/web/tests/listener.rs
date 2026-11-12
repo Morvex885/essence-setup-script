@@ -658,29 +658,37 @@ async fn connections_over_the_limit_are_closed_at_once() {
 }
 
 #[tokio::test]
-async fn connections_without_a_request_have_their_own_limit() {
-    let limits = Limits {
-        max_pending: 1,
-        ..Limits::default()
-    };
-    let (listener, _accepted) = start_limited(limits).await;
-    let addr = local(&listener);
-    let host = format!("127.0.0.1:{}", addr.port());
-    let mut first = TcpStream::connect(addr).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let mut silent = TcpStream::connect(addr).await.unwrap();
-    let raw = closed_by_server(&mut silent).await;
-    assert!(raw.is_empty(), "второе молчащее соединение закрыто без ответа");
-    // Заголовки получены: место ожидания свободно, соединение остаётся открытым.
-    first
-        .write_all(format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
-        .await
-        .unwrap();
-    let mut byte = [0; 1];
-    assert_eq!(timeout(WAIT, first.read(&mut byte)).await.unwrap().unwrap(), 1);
-    assert_eq!(get(addr, "/", &host, &[]).await.status, 200, "место освободилось");
-    drop(first);
-    listener.stop().await;
+async fn connections_without_a_request_have_their_own_limits() {
+    // Общий предел и предел одного источника (все соединения — с 127.0.0.1).
+    for limits in [
+        Limits {
+            max_pending: 1,
+            ..Limits::default()
+        },
+        Limits {
+            max_pending_per_source: 1,
+            ..Limits::default()
+        },
+    ] {
+        let (listener, _accepted) = start_limited(limits).await;
+        let addr = local(&listener);
+        let host = format!("127.0.0.1:{}", addr.port());
+        let mut first = TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut silent = TcpStream::connect(addr).await.unwrap();
+        let raw = closed_by_server(&mut silent).await;
+        assert!(raw.is_empty(), "второе молчащее соединение закрыто без ответа: {limits:?}");
+        // Заголовки получены: место ожидания свободно, соединение остаётся открытым.
+        first
+            .write_all(format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut byte = [0; 1];
+        assert_eq!(timeout(WAIT, first.read(&mut byte)).await.unwrap().unwrap(), 1);
+        assert_eq!(get(addr, "/", &host, &[]).await.status, 200, "место освободилось: {limits:?}");
+        drop(first);
+        listener.stop().await;
+    }
 }
 
 #[tokio::test]

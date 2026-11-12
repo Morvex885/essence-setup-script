@@ -15,6 +15,7 @@
 //!   по умолчанию — по схеме), `Origin: null` → 403.
 
 use std::{
+    collections::HashMap,
     fmt, io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
@@ -116,6 +117,9 @@ pub struct Limits {
     /// TLS-рукопожатие); лишние закрываются сразу. Молчащие соединения не
     /// занимают весь `max_connections`.
     pub max_pending: usize,
+    /// Те же ожидающие соединения с одного IP-адреса: один источник не
+    /// занимает весь `max_pending`.
+    pub max_pending_per_source: usize,
     /// Период ping WebSocket; без единого кадра от браузера за период — Close.
     pub ping_every: Duration,
 }
@@ -126,6 +130,7 @@ impl Default for Limits {
             header_timeout: Duration::from_secs(30),
             max_connections: 128,
             max_pending: 32,
+            max_pending_per_source: 8,
             ping_every: Duration::from_secs(30),
         }
     }
@@ -310,6 +315,7 @@ async fn serve(
 ) {
     let permits = Arc::new(Semaphore::new(limits.max_connections));
     let pending = Arc::new(Semaphore::new(limits.max_pending));
+    let sources = Sources::new(limits.max_pending_per_source);
     let mut connections = JoinSet::new();
     loop {
         tokio::select! {
@@ -321,10 +327,11 @@ async fn serve(
                     Err(_) => { tokio::time::sleep(Duration::from_millis(100)).await; continue; }
                 };
                 // Сверх пределов — закрыть сразу, не читая.
-                let Ok(waiting) = pending.clone().try_acquire_owned() else { drop(stream); continue; };
+                let Some(source) = sources.take(peer.ip()) else { drop(stream); continue; };
+                let Ok(global) = pending.clone().try_acquire_owned() else { drop(stream); continue; };
                 let Ok(permit) = permits.clone().try_acquire_owned() else { drop(stream); continue; };
                 let slot = Slot(Arc::new(Mutex::new(Some(permit))));
-                let waiting = Waiting(Slot(Arc::new(Mutex::new(Some(waiting)))));
+                let waiting = Waiting(Arc::new(Mutex::new(Some((global, source)))));
                 let service = router.clone().layer(Extension(Peer(peer))).layer(Extension(slot)).layer(Extension(waiting));
                 connections.spawn(connection(stream, acceptor.clone(), service, limits.header_timeout));
             }
@@ -452,10 +459,55 @@ struct Peer(SocketAddr);
 #[derive(Clone)]
 struct Slot(Arc<Mutex<Option<OwnedSemaphorePermit>>>);
 
-/// Место в пределе `max_pending`: освобождается, когда получены заголовки
-/// первого запроса (или с соединением).
+/// Место в пределах `max_pending` и `max_pending_per_source`: освобождается,
+/// когда получены заголовки первого запроса (или с соединением).
 #[derive(Clone)]
-struct Waiting(Slot);
+struct Waiting(Arc<Mutex<Option<(OwnedSemaphorePermit, SourceSlot)>>>);
+
+/// Счётчики ожидающих соединений по IP-адресу источника (IPv4 в IPv6 — как IPv4).
+#[derive(Clone)]
+struct Sources {
+    limit: usize,
+    counts: Arc<Mutex<HashMap<IpAddr, usize>>>,
+}
+
+/// Занятое место источника; освобождается при падении.
+struct SourceSlot {
+    ip: IpAddr,
+    sources: Sources,
+}
+
+impl Sources {
+    fn new(limit: usize) -> Self {
+        Self { limit, counts: Arc::default() }
+    }
+
+    /// Место для `ip`; `None` — источник исчерпал свой предел.
+    fn take(&self, ip: IpAddr) -> Option<SourceSlot> {
+        let ip = ip.to_canonical();
+        let mut counts = self.counts.lock().ok()?;
+        let count = counts.entry(ip).or_default();
+        if *count >= self.limit {
+            return None;
+        }
+        *count += 1;
+        Some(SourceSlot { ip, sources: self.clone() })
+    }
+}
+
+impl Drop for SourceSlot {
+    fn drop(&mut self) {
+        // Отравленный мьютекс: `take` и так отказывает всем, счётчик не важен.
+        if let Ok(mut counts) = self.sources.counts.lock()
+            && let Some(count) = counts.get_mut(&self.ip)
+        {
+            *count -= 1;
+            if *count == 0 {
+                counts.remove(&self.ip);
+            }
+        }
+    }
+}
 
 struct Shared {
     port: u16,
@@ -483,7 +535,7 @@ fn router(shared: Arc<Shared>) -> Router {
 
 /// Заголовки запроса получены: соединение больше не ждёт первых байтов.
 async fn head_received(request: Request, next: Next) -> Response {
-    if let Some(Waiting(Slot(held))) = request.extensions().get::<Waiting>() {
+    if let Some(Waiting(held)) = request.extensions().get::<Waiting>() {
         drop(held.lock().ok().and_then(|mut held| held.take()));
     }
     next.run(request).await
@@ -798,6 +850,24 @@ fn certificate_names(cert: &CertificateDer<'_>, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_source_cannot_take_the_pending_share_of_another() {
+        let sources = Sources::new(2);
+        let a: IpAddr = "192.0.2.1".parse().unwrap();
+        let b: IpAddr = "2001:db8::1".parse().unwrap();
+        let first = sources.take(a).unwrap();
+        let second = sources.take(a).unwrap();
+        assert!(sources.take(a).is_none(), "предел источника исчерпан");
+        // IPv4 в IPv6 — тот же источник.
+        assert!(sources.take("::ffff:192.0.2.1".parse().unwrap()).is_none());
+        // Другой источник проходит, пока первый держит свою долю.
+        let _other = sources.take(b).unwrap();
+        drop(first);
+        let again = sources.take(a).unwrap();
+        drop((again, second));
+        assert!(!sources.counts.lock().unwrap().contains_key(&a), "пустой счётчик удалён");
+    }
 
     fn shared(loopback: bool, cert: Option<CertificateDer<'static>>) -> Shared {
         let (accepted, _) = mpsc::channel(1);
