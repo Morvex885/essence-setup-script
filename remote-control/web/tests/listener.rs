@@ -691,6 +691,37 @@ async fn connections_without_a_request_have_their_own_limits() {
     }
 }
 
+/// Linux: весь 127.0.0.0/8 — loopback, второй источник — 127.0.0.2.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_silent_source_does_not_block_another_source() {
+    let limits = Limits {
+        max_pending: 8,
+        max_pending_per_source: 1,
+        ..Limits::default()
+    };
+    let (listener, _accepted) = start_limited(limits).await;
+    let addr = local(&listener);
+    let host = format!("127.0.0.1:{}", addr.port());
+    // 127.0.0.1 занимает свою долю молчащим соединением.
+    let held = TcpStream::connect(addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Ещё одно соединение того же источника закрыто без ответа (общий предел не исчерпан).
+    let mut same = TcpStream::connect(addr).await.unwrap();
+    same.write_all(format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes())
+        .await
+        .ok();
+    assert!(closed_by_server(&mut same).await.is_empty(), "доля 127.0.0.1 занята");
+    // Другой источник получает ответ.
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.2:0".parse().unwrap()).unwrap();
+    let other = socket.connect(addr).await.unwrap();
+    assert_eq!(other.local_addr().unwrap().ip(), IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)));
+    assert_eq!(exchange(other, "/", &host, &[]).await.status, 200);
+    drop(held);
+    listener.stop().await;
+}
+
 #[tokio::test]
 async fn absolute_form_request_is_forbidden() {
     let (listener, _accepted) = start(LOOPBACK, Tls::Off).await;
