@@ -145,6 +145,9 @@ impl Raw {
                                 line.push('\n');
                                 if write.write_all(line.as_bytes()).await.is_err() { break; }
                             }
+                            // У именованного канала Windows нет полузакрытия: `shutdown` ничего
+                            // не передаёт, и демон не увидит конца ввода. Канал закрывается целиком.
+                            None if cfg!(windows) => break,
                             None => { writing = false; let _ = write.shutdown().await; }
                         },
                     }
@@ -240,7 +243,8 @@ impl Raw {
         self.reply(id, Duration::from_secs(60))
     }
 
-    /// Half-close our side and wait for the daemon to end the connection.
+    /// Close our side (Unix — half-close; Windows — the whole pipe) and wait
+    /// for the connection to end.
     pub fn close(mut self) {
         self.to.take();
         if let Some(thread) = self.thread.take() {
