@@ -1393,7 +1393,7 @@ Bash-версии) и вопрос «Заменить их конфигурац�
 | Telegram Proxy | `node list`, `telegram menu --name N`, `telegram status --all`, `telegram install\|refresh-ip\|web-update\|web-restart\|backend-restart\|remove-all --name N…`, `telegram remove --component web\|mtproto --name N…` |
 | Клиенты | `client list`, `group list`, `client add`, `client delete --name C…`, `client show`, `generate --client C`, `node list`, `client nodes --node N…` / `--inherit`, `client connections [--node N --proxy P… \| --reset]`, `conn list --name N --discover`, `client set-group`, `client rename` |
 | Подписка клиента | `subscription host`, `subscription publish --name C [--ttl T]`, `subscription show`, `subscription headers --client C [--set … \| --unset …]`, `subscription rotate`, `subscription revoke` |
-| Группы | `group list`, `group add`, `template list`, `group set-template`, `template create --group G`, `subscription headers --group G [--set … \| --unset …]`, `generate --group G`, `group delete` |
+| Группы | `group list`, `template list`, `group add --name G [--template T]`, `group set-template`, `template create --group G`, `subscription headers --group G [--set … \| --unset …]`, `generate --group G`, `group delete` |
 | Шаблоны | `template list`, `template create`, `template show` (и экспорт), `template import --name T` (+`input.file`), `template check --name T`, `group list`, `template groups --name T --group G…`, `template delete --name T` |
 | Генерация | `group list`, `client list`, `generate --all\|--group G\|--client C` |
 | Подписки | `subscription host [--name N]`, `node list`, `subscription list`, `subscription publish-all`, `subscription migrate --name N`, `client list`, `group list` |
@@ -1650,10 +1650,13 @@ Proxy, затем Источник, Настройки и Журнал. Дейс
   нет, проблемы других вариантов в списке приглушены, щелчок по проблеме
   переключает вариант и переходит к строке. Исчезнувший из отчёта тег
   возвращает выбор к «Без группы».
-  «Сохранить» — `template import --name T` с черновиком в `input.file` под
-  планом (в плане — найденные проблемы); отказ от плана оставляет черновик.
-  Первое сохранение встроенного шаблона без проблем создаёт пользовательскую
-  копию без плана (у ядра нечего подтверждать). Правки, сделанные во время
+  «Сохранить» — `template import --name T` с черновиком в `input.file`; план
+  ядро показывает при перезаписи сохранённого шаблона или ошибках проверки (в
+  плане — найденные проблемы, и предупреждения тоже); одни предупреждения
+  плана не требуют, отказ от плана оставляет черновик. Первое сохранение
+  встроенного шаблона без ошибок создаёт пользовательскую копию без плана.
+  Под списком проблем — версия встроенной схемы (`schema` ответа `template
+  check`). Правки, сделанные во время
   сохранения, остаются черновиком. Уход со страницы с несохранённым
   черновиком требует подтверждения; если шаблон удалён другим клиентом,
   панель предлагает скачать несохранённые изменения и возвращается к списку.
@@ -1663,7 +1666,7 @@ Proxy, затем Источник, Настройки и Журнал. Дейс
   скачивание сохранённого текста в файл `<имя>`; «Импорт из файла» — выбор
   файла (не больше 1 МиБ, строго UTF-8: иначе «Файл больше 1 МиБ.» или «Файл
   недоступен или не в UTF-8.»), при несохранённом черновике — сначала вопрос
-  о его замене, затем план ядра;
+  о его замене, затем импорт (план — по тем же правилам, что у «Сохранить»);
 - в клиенте — просмотр и скачивание готового конфига `<имя>.yaml`
   (`client config`);
 - выбор темы (системная, светлая, тёмная) — три кнопки внизу меню и блок

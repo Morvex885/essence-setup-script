@@ -19,7 +19,11 @@ export function settleDraft(current, sent) {
   return current === sent ? null : current;
 }
 
-/** «Сохранить»: `template import --name T` с черновиком по плану; `true` — сохранено. */
+/**
+ * «Сохранить»: `template import --name T` с черновиком; план ядро просит при
+ * перезаписи или ошибках шаблона (одни предупреждения — без плана).
+ * `true` — сохранено.
+ */
 export async function saveTemplate(ctx, name, text) {
   const reply = await ctx.runConfirmed('Сохранение шаблона', 'Сохранить шаблон?', templateImport(name), { input: templateInput(text) });
   // Отказ от плана — не сбой; черновик остаётся.
@@ -29,7 +33,7 @@ export async function saveTemplate(ctx, name, text) {
 
 /**
  * «Импорт из файла» (`FileText`: текст или `null` и причина). Несохранённый
- * черновик заменяется только после вопроса; затем — план ядра для файла.
+ * черновик заменяется только после вопроса; затем — импорт (план — по решению ядра).
  * `true` — шаблон перезаписан.
  */
 export async function importTemplateFile(ctx, name, fileText, reason, dirty) {

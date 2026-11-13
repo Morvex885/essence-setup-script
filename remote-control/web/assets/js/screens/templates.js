@@ -317,5 +317,6 @@ function ProblemsPanel({ check, report, current, variant, onPick }) {
       })}
     </ul>`}
     ${report.truncated === true && html`<p class="t-dim">Показаны первые 200</p>`}
+    ${typeof report.schema === 'string' && report.schema !== '' && html`<p class="t-dim">Схема: ${report.schema}</p>`}
   <//>`;
 }

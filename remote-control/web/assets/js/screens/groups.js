@@ -26,9 +26,15 @@ function NodeChips({ ctx, nodes }) {
 function GroupList({ ctx }) {
   const state = useCommand(ctx, ['group', 'list']);
   const [busy, run] = useBusy();
+  const mounted = useMounted();
   const act = (action) => run(async () => { await action(); await state.reload(); });
 
-  const add = () => act(() => model.addGroupFlow(ctx));
+  /** Новая группа открывается карточкой (имя — из ответа), пока список на экране. */
+  const add = () => run(async () => {
+    let opened = false;
+    await model.addGroupFlow(ctx, (name) => { opened = true; if (mounted.current) ctx.navigate('groups', name); });
+    if (!opened) await state.reload();
+  });
   const remove = (name) => act(() => model.confirmed(ctx, 'Удаление группы', 'Удалить группу?', model.groupDeleteArgv(name)));
 
   const actions = html`<${Button} kind="primary" icon="plus" disabled=${busy || !state.data} onClick=${add}>Добавить группу<//>`;

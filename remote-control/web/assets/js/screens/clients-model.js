@@ -403,12 +403,18 @@ export async function addClientFlow(ctx, go) {
   if (reply.ok) go(replyName(reply, values.name));
 }
 
+/** `group add --name G [--template T]`: встроенный `default.yaml` — без `--template`. */
+export function addGroupArgv(values) {
+  const template = values.template;
+  return ['group', 'add', '--name', values.name, ...(template && template !== DEFAULT_TEMPLATE ? ['--template', template] : [])];
+}
+
 /**
- * Добавление группы: имя и шаблон одной формой → `group add`, затем
- * `group set-template` для не встроенного шаблона (по имени из ответа: ядро
- * нормализует имя группы).
+ * Добавление группы: имя и шаблон одной формой → одна команда `group add`
+ * (шаблон проверяется и назначается ядром в той же записи); успех —
+ * `go(имя)` по имени из ответа (ядро переводит его в верхний регистр).
  */
-export async function addGroupFlow(ctx) {
+export async function addGroupFlow(ctx, go) {
   const read = await fetchData(ctx, ['template', 'list']);
   if (!read) return;
   const values = await ctx.form({
@@ -420,10 +426,8 @@ export async function addGroupFlow(ctx) {
     ],
   });
   if (values === null || values === undefined) return;
-  const reply = await execute(ctx, ['group', 'add', '--name', values.name]);
-  if (reply.ok && values.template !== DEFAULT_TEMPLATE) {
-    await execute(ctx, groupSetTemplateArgv(replyName(reply, values.name), values.template));
-  }
+  const reply = await execute(ctx, addGroupArgv(values));
+  if (reply.ok) go(replyName(reply, values.name));
 }
 
 /**

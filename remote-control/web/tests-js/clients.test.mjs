@@ -240,20 +240,33 @@ test('добавление клиента: группы до формы, пер�
   assert.deepEqual(went, ['Alice'], 'отказ ядра — без перехода');
 });
 
-test('добавление группы: встроенный шаблон — одна команда, свой — назначение по имени из ответа', async () => {
+test('добавление группы: argv одной командой, переход по имени из ответа', async () => {
+  assert.deepEqual(m.addGroupArgv({ name: 'lab', template: 'default.yaml' }), ['group', 'add', '--name', 'lab']);
+  assert.deepEqual(m.addGroupArgv({ name: 'lab', template: '' }), ['group', 'add', '--name', 'lab']);
+  assert.deepEqual(m.addGroupArgv({ name: 'lab', template: 'm.yaml' }), ['group', 'add', '--name', 'lab', '--template', 'm.yaml']);
+
   const templates = okReply([{ name: 'default.yaml' }, { name: 'm.yaml' }]);
-  const plain = fakeCtx({ replies: [templates, okReply({ name: 'LAB' })], answers: [{ name: 'lab', template: 'default.yaml' }] });
-  await m.addGroupFlow(plain);
+  const went = [];
+  const plain = fakeCtx({ replies: [templates, okReply({ name: 'LAB', template: 'default.yaml' })], answers: [{ name: 'lab', template: 'default.yaml' }] });
+  await m.addGroupFlow(plain, (name) => went.push(name));
   assert.deepEqual(commands(plain), [['template', 'list'], ['group', 'add', '--name', 'lab']]);
   assert.equal(plain.calls[1][1].fields.find((f) => f.name === 'template').value, 'default.yaml');
 
-  const custom = fakeCtx({ replies: [templates, okReply({ name: 'LAB' }), okReply()], answers: [{ name: 'lab', template: 'm.yaml' }] });
-  await m.addGroupFlow(custom);
-  assert.deepEqual(commands(custom).at(-1), ['group', 'set-template', '--name', 'LAB', '--template', 'm.yaml']);
+  const custom = fakeCtx({ replies: [templates, okReply({ name: 'LAB', template: 'm.yaml' })], answers: [{ name: 'lab', template: 'm.yaml' }] });
+  await m.addGroupFlow(custom, (name) => went.push(name));
+  assert.deepEqual(commands(custom), [['template', 'list'], ['group', 'add', '--name', 'lab', '--template', 'm.yaml']]);
+  assert.deepEqual(went, ['LAB', 'LAB']);
 
-  const refused = fakeCtx({ replies: [templates, failure('exists')], answers: [{ name: 'lab', template: 'm.yaml' }] });
-  await m.addGroupFlow(refused);
-  assert.deepEqual(kinds(refused), ['request', 'form', 'request', 'failed'], 'без группы шаблон не назначается');
+  for (const code of ['not_found', 'invalid', 'conflict']) {
+    const refused = fakeCtx({ replies: [templates, failure(code)], answers: [{ name: 'lab', template: 'm.yaml' }] });
+    await m.addGroupFlow(refused, (name) => went.push(name));
+    assert.deepEqual(kinds(refused), ['request', 'form', 'request', 'failed'], code);
+  }
+  assert.equal(went.length, 2, 'отказ ядра — без перехода');
+
+  const cancelled = fakeCtx({ replies: [templates], answers: [null] });
+  await m.addGroupFlow(cancelled, (name) => went.push(name));
+  assert.deepEqual(kinds(cancelled), ['request', 'form']);
 });
 
 test('шаблон группы: назначение, новый шаблон — имя для редактора, без изменений — без команды', async () => {
