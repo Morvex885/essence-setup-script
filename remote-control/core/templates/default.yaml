@@ -155,12 +155,14 @@ proxy-groups:
     proxies:
       - DIRECT
 
-  # Скачивание списков правил: сначала напрямую, при неудаче через VPN
+  # Скачивание списков правил: сначала напрямую, при неудаче через VPN.
+  # Проверка — по raw.githubusercontent.com: туда github.com/…/raw/… переадресует
+  # почти все списки (Telegram качается сразу через VPN).
   - name: '📥 Загрузки'
     type: fallback
     hidden: true
     proxies: [ '🏠 Без VPN', '🌍 VPN' ]
-    url: https://github.com/favicon.ico
+    url: https://raw.githubusercontent.com/legiz-ru/mihomo-rule-sets/main/other/games-direct.yaml
     interval: 300
     lazy: false
 
