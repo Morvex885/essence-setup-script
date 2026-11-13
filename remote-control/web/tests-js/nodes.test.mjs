@@ -235,3 +235,44 @@ test('псевдонимы из формы: без изменений → пус
   assert.deepEqual(model.aliasValues(entries.slice(0, 2), { a0: 'old', a1: 'Fast' }), ['', 'Fast']);
   assert.equal(model.aliasArgv('n', entries, model.aliasValues(entries, { a0: 'old', a1: '', a2: 'gone', a3: 'x' })), null);
 });
+
+test('усиление SSH: порт проверяется полем формы, пусто — подобрать свободный', async () => {
+  const s = scripted([], [null]);
+  await model.harden(s.ctx, 'n');
+  const [form] = s.record.dialogs;
+  const port = form.fields.find((f) => f.name === 'port');
+  for (const bad of ['abc', '0', '70000']) assert.ok(port.validate(bad), bad);
+  for (const good of ['', '2222']) assert.equal(port.validate(good), null, good);
+  s.done();
+});
+
+test('псевдонимы: чтение через nodeRequest, запись только изменённых, отмена — без записи', async () => {
+  const entries = [{ proxy: 'p1', alias: 'old' }, { proxy: 'p2', alias: '' }];
+  const read = [['node', 'aliases', '--name', 'n'], ok(entries)];
+  const nodeCtx = (s) => ({ ...s.ctx, nodeRequest: (_name, argv) => s.ctx.request(argv) });
+
+  const saved = scripted([read, [['node', 'aliases', '--name', 'n', '--set', 'p2=fast', '--unset', 'p1'], ok()]], [{ a0: '', a1: 'fast' }]);
+  await model.editAliases(nodeCtx(saved), 'n');
+  assert.deepEqual(saved.record.dialogs[0].fields.map((f) => f.value), ['old', '']);
+  assert.equal(saved.record.failed, 0);
+  saved.done();
+
+  const cancelled = scripted([read], [null]);
+  await model.editAliases(nodeCtx(cancelled), 'n');
+  cancelled.done();
+
+  const unchanged = scripted([read], [{ a0: 'old', a1: '' }]);
+  await model.editAliases(nodeCtx(unchanged), 'n');
+  assert.equal(unchanged.record.notices.length, 1);
+  unchanged.done();
+
+  const empty = scripted([[read[0], ok([])]], []);
+  await model.editAliases(nodeCtx(empty), 'n');
+  assert.equal(empty.record.dialogs.length, 0);
+  empty.done();
+
+  const refused = scripted([read, [['node', 'aliases', '--name', 'n', '--set', 'p2=x'], fail('remote_failed')]], [{ a0: 'old', a1: 'x' }]);
+  await model.editAliases(nodeCtx(refused), 'n');
+  assert.equal(refused.record.failed, 1);
+  refused.done();
+});

@@ -8,7 +8,7 @@ import { asList, strings } from '../format.js';
 import { useCommand, useBusy, useMounted, Context, Loaded } from './kit.js';
 import { showShare } from './share.js';
 import * as model from './clients-model.js';
-import { execute, confirmed, fetchData, nameOptions } from './clients-model.js';
+import { confirmed, fetchData } from './clients-model.js';
 
 export function ClientsScreen({ ctx, param, tab }) {
   return param === null || param === undefined
@@ -125,28 +125,10 @@ function ClientOverview({ ctx, name, row, busy, act, leave }) {
   const inherit = model.inherits(row);
   const nodes = strings(row.nodes);
 
-  /** Имя и группа одной формой: `client set-group`, затем `client rename` (по плану). */
+  /** Имя и группа одной формой (`editClientFlow`); переименованный — в новую карточку. */
   const edit = async () => {
-    const read = await fetchData(ctx, ['group', 'list']);
-    if (!read) return undefined;
-    const values = await ctx.form({
-      title: `Изменить клиента: ${name}`,
-      fields: [
-        { name: 'name', label: 'Имя клиента', type: 'text', value: name, required: 'Имя клиента не указано.', autofocus: true },
-        { name: 'group', label: 'Группа', type: 'select', value: model.str(row.group), options: nameOptions(read.data), required: true },
-      ],
-    });
-    if (values === null || values === undefined) return undefined;
-    for (const step of model.editSteps(name, row, values)) {
-      const result = await confirmed(ctx, step.title, step.question, step.argv);
-      if (step.rename) {
-        const renamed = model.renamedName(result);
-        if (renamed !== null && renamed !== name) return leave('clients', renamed);
-      } else if (!result.ok) {
-        return undefined;
-      }
-    }
-    return undefined;
+    const renamed = await model.editClientFlow(ctx, name, row);
+    return renamed === null ? undefined : leave('clients', renamed);
   };
   const remove = async () => {
     const result = await confirmed(ctx, 'Удаление клиента', 'Удалить клиента?', model.clientDeleteArgv(name));
@@ -212,45 +194,9 @@ function ClientAccess({ ctx, name, row, busy, act }) {
   const known = useCommand(ctx, inherit ? null : ['node', 'list'], [], { quiet: true });
   const change = (action) => act(async () => { await action(); if (!inherit) await assigned.reload(); });
 
-  /** `clients.rs::client_nodes`: режим и свои ноды одной формой. */
-  const editNodes = async () => {
-    const read = await fetchData(ctx, ['node', 'list']);
-    if (!read) return;
-    const options = nameOptions(read.data, model.nodeLabel);
-    const known = options.map((option) => option.value);
-    const values = await ctx.form({
-      title: `Ноды клиента: ${name}`,
-      fields: [
-        { name: 'mode', label: 'Ноды', type: 'radio', value: inherit ? 'inherit' : 'own',
-          options: [{ value: 'inherit', label: 'От группы' }, { value: 'own', label: 'Свои ноды' }] },
-        { name: 'nodes', label: 'Свои ноды', type: 'multi', options, value: inherit ? [] : nodes.filter((node) => known.includes(node)),
-          required: true, when: (v) => v.mode === 'own' },
-      ],
-    });
-    if (values === null || values === undefined) return;
-    const plan = model.nodesChange(name, inherit, values);
-    if (plan === null) return;
-    if (plan.kind === 'inherit') await confirmed(ctx, 'Ноды клиента', 'Вернуть ноды от группы?', plan.argv);
-    else await execute(ctx, plan.argv);
-  };
-  /** `clients.rs::client_connections`: найденные на ноде подключения. */
-  const configure = async (node) => {
-    const found = await ctx.nodeRequest(node, model.discoverArgv(node), null);
-    if (!found.ok) return;
-    const proxies = model.discoveredProxies(found.data);
-    if (proxies.length === 0) { ctx.notify('warn', model.EMPTY); return; }
-    const current = model.assignedProxies(assigned.data, node);
-    const values = await ctx.form({
-      title: `Подключения клиента на ${node}`,
-      fields: [{ name: 'proxies', label: 'Подключения', type: 'multi', options: proxies.map((proxy) => ({ value: proxy, label: proxy })),
-        value: proxies.filter((proxy) => current.includes(proxy)), required: true }],
-    });
-    if (values === null || values === undefined) return;
-    await execute(ctx, model.clientConnectionsArgv(name, node, values.proxies));
-  };
   const reset = (node) => confirmed(ctx, 'Сброс подключений', 'Сбросить подключения ноды?', model.resetConnectionsArgv(name, node));
 
-  const actions = html`<${Button} kind="primary" icon="pencil" disabled=${busy} onClick=${() => change(editNodes)}>Изменить ноды<//>`;
+  const actions = html`<${Button} kind="primary" icon="pencil" disabled=${busy} onClick=${() => change(() => model.clientNodesFlow(ctx, name, row))}>Изменить ноды<//>`;
   return html`
     <${Card} title="Доступ" actions=${actions}>
       <${Facts} items=${[
@@ -263,7 +209,8 @@ function ClientAccess({ ctx, name, row, busy, act }) {
         <${DataTable} rows=${model.ownNodeRows(nodes, known.data)} empty="Нет своих нод"
           href=${(item) => ctx.href('nodes', item.name)}
           menu=${(item) => [
-            { label: 'Настроить', icon: 'settings', disabled: busy || item.missing, onClick: () => change(() => configure(item.name)) },
+            { label: 'Настроить', icon: 'settings', disabled: busy || item.missing,
+              onClick: () => change(() => model.clientConnectionsFlow(ctx, name, item.name, assigned.data)) },
             { label: 'Сбросить', icon: 'refresh-cw', danger: true, disabled: busy, onClick: () => change(() => reset(item.name)) },
           ]}
           columns=${[
@@ -284,22 +231,7 @@ function ClientSubscription({ ctx, name, row, busy, act }) {
   const host = useCommand(ctx, ['subscription', 'host'], [], { quiet: true });
   const isPublished = Boolean(row.subscription && row.subscription.published === true);
 
-  /** Срок публикации (`clients.rs::ttl`) одной формой и `subscription publish`. */
-  const publish = async () => {
-    const values = await ctx.form({
-      title: `Подписка: ${name}`,
-      submit: isPublished ? 'Продлить' : 'Опубликовать',
-      fields: [
-        { name: 'ttl', label: 'Срок', type: 'radio', value: 'keep', options: model.ttlOptions(model.currentExpiry(row)) },
-        { name: 'custom', label: 'Свой срок', type: 'text', placeholder: '7d', required: true, validate: model.ttlError,
-          when: (v) => v.ttl === 'custom' },
-      ],
-    });
-    if (values === null || values === undefined) return;
-    const reply = await ctx.request(model.publishArgv(name, model.ttlValue(values)));
-    if (model.published(reply)) await showShare(ctx, name);
-    else ctx.failed();
-  };
+  const publish = () => model.publishFlow(ctx, name, row, (client) => showShare(ctx, client));
   const rotate = async () => {
     const reply = await confirmed(ctx, 'Смена токена подписки', 'Сменить токен?', model.subscriptionRotateArgv(name));
     if (model.published(reply)) await showShare(ctx, name);

@@ -1,10 +1,14 @@
-// Модель экранов клиентов, групп и генерации — перенос подписей, строк
-// контекста, argv и действий из `remote-control/tui/src/clients.rs`. Без DOM:
-// действия (`fetch`, `load`, `generate`, `headers`, добавление и перенос) —
-// формы и диалоги `ctx` (`app.js::makeContext`).
+// Модель экранов клиентов, групп, подписок и генерации — перенос подписей,
+// строк контекста, argv и действий из `remote-control/tui/src/clients.rs`.
+// Без DOM: действия (`fetch`, `load`, `generate`, `headers`, добавление,
+// перенос, карточка клиента, подписки) — формы и диалоги `ctx`
+// (`app.js::makeContext`); окна с разметкой экран передаёт функцией.
 import { asList, strings } from '../format.js';
 import { isFailure } from '../flows.js';
-import { DEFAULT_TEMPLATE, generateGroup, generateClient, generateScope } from './catalog-model.js';
+import {
+  DEFAULT_TEMPLATE, generateGroup, generateClient, generateScope,
+  PUBLISH_FIELDS, SUBSCRIPTION_PUBLISH_ALL, subscriptionSetHost, subscriptionMigrate, publishSummary,
+} from './catalog-model.js';
 
 /** Пустое состояние мультивыбора (`clients.rs::EMPTY`). */
 export const EMPTY = 'Нет вариантов для выбора';
@@ -553,4 +557,144 @@ export async function resolvedHeaders(ctx, name) {
   const read = await fetchData(ctx, ['subscription', 'headers', '--client', name]);
   if (!read) return;
   await ctx.show({ title: `Итоговые заголовки: ${name}`, lines: headerLines(read.data, true) });
+}
+
+// ─── Карточка клиента ────────────────────────────────────────────────────────
+
+/**
+ * «Изменить» (`clients.rs::client_card`): имя и группа одной формой, шаги
+ * `editSteps` по плану. Итог — новое имя после переименования (экран
+ * открывает его карточку) или `null`.
+ */
+export async function editClientFlow(ctx, name, row) {
+  const read = await fetchData(ctx, ['group', 'list']);
+  if (!read) return null;
+  const values = await ctx.form({
+    title: `Изменить клиента: ${name}`,
+    fields: [
+      { name: 'name', label: 'Имя клиента', type: 'text', value: name, required: 'Имя клиента не указано.', autofocus: true },
+      { name: 'group', label: 'Группа', type: 'select', value: str(row.group), options: nameOptions(read.data), required: true },
+    ],
+  });
+  if (values === null || values === undefined) return null;
+  for (const step of editSteps(name, row, values)) {
+    const result = await confirmed(ctx, step.title, step.question, step.argv);
+    if (step.rename) {
+      const renamed = renamedName(result);
+      return renamed !== null && renamed !== name ? renamed : null;
+    }
+    if (!result.ok) return null;
+  }
+  return null;
+}
+
+/** `clients.rs::client_nodes`: режим и свои ноды одной формой; наследование — по плану. */
+export async function clientNodesFlow(ctx, name, row) {
+  const inherit = inherits(row);
+  const nodes = strings(row.nodes);
+  const read = await fetchData(ctx, ['node', 'list']);
+  if (!read) return;
+  const options = nameOptions(read.data, nodeLabel);
+  const known = options.map((option) => option.value);
+  const values = await ctx.form({
+    title: `Ноды клиента: ${name}`,
+    fields: [
+      { name: 'mode', label: 'Ноды', type: 'radio', value: inherit ? 'inherit' : 'own',
+        options: [{ value: 'inherit', label: 'От группы' }, { value: 'own', label: 'Свои ноды' }] },
+      { name: 'nodes', label: 'Свои ноды', type: 'multi', options, value: inherit ? [] : nodes.filter((node) => known.includes(node)),
+        required: true, when: (v) => v.mode === 'own' },
+    ],
+  });
+  if (values === null || values === undefined) return;
+  const plan = nodesChange(name, inherit, values);
+  if (plan === null) return;
+  if (plan.kind === 'inherit') await confirmed(ctx, 'Ноды клиента', 'Вернуть ноды от группы?', plan.argv);
+  else await execute(ctx, plan.argv);
+}
+
+/**
+ * `clients.rs::client_connections`: найденные на ноде подключения
+ * (`nodeRequest … --discover`) одной формой; `assigned` — ответ
+ * `client connections --name` (отмечает назначенные).
+ */
+export async function clientConnectionsFlow(ctx, name, node, assigned) {
+  const found = await ctx.nodeRequest(node, discoverArgv(node), null);
+  if (!found.ok) return;
+  const proxies = discoveredProxies(found.data);
+  if (proxies.length === 0) { ctx.notify('warn', EMPTY); return; }
+  const current = assignedProxies(assigned, node);
+  const values = await ctx.form({
+    title: `Подключения клиента на ${node}`,
+    fields: [{ name: 'proxies', label: 'Подключения', type: 'multi', options: proxies.map((proxy) => ({ value: proxy, label: proxy })),
+      value: proxies.filter((proxy) => current.includes(proxy)), required: true }],
+  });
+  if (values === null || values === undefined) return;
+  await execute(ctx, clientConnectionsArgv(name, node, values.proxies));
+}
+
+/**
+ * Срок публикации (`clients.rs::ttl`) одной формой и `subscription publish`;
+ * опубликованная ссылка — `share(имя)` (окно ссылки на экране).
+ */
+export async function publishFlow(ctx, name, row, share) {
+  const isPublished = Boolean(row.subscription && row.subscription.published === true);
+  const values = await ctx.form({
+    title: `Подписка: ${name}`,
+    submit: isPublished ? 'Продлить' : 'Опубликовать',
+    fields: [
+      { name: 'ttl', label: 'Срок', type: 'radio', value: 'keep', options: ttlOptions(currentExpiry(row)) },
+      { name: 'custom', label: 'Свой срок', type: 'text', placeholder: '7d', required: true, validate: ttlError,
+        when: (v) => v.ttl === 'custom' },
+    ],
+  });
+  if (values === null || values === undefined) return;
+  const reply = await ctx.request(publishArgv(name, ttlValue(values)));
+  if (published(reply)) await share(name);
+  else ctx.failed();
+}
+
+// ─── Подписки ────────────────────────────────────────────────────────────────
+
+/** Выбор ноды одной формой: `null` — сбой чтения (сообщён) или отмена. */
+export async function chooseNode(ctx, title, submit, current = null) {
+  const read = await fetchData(ctx, ['node', 'list']);
+  if (!read) return null;
+  const values = await ctx.form({
+    title, submit,
+    fields: [{ name: 'node', label: 'Нода', type: 'select', value: current, options: nameOptions(read.data, nodeLabel), required: true }],
+  });
+  return values ? values.node : null;
+}
+
+/** Хост-нода подписок: выбор ноды → `subscription host --name` через `nodeRequest` (сбой сообщает он). */
+export async function subscriptionHostFlow(ctx, current) {
+  const node = await chooseNode(ctx, 'Хост-нода подписок', 'Выбрать', current);
+  if (node !== null) await ctx.nodeRequest(node, subscriptionSetHost(node), null);
+}
+
+/** `subscription publish-all` по плану и итог публикации. */
+export async function publishAllFlow(ctx) {
+  const reply = await ctx.runConfirmed('Обновление подписок', 'Опубликовать подписки?', SUBSCRIPTION_PUBLISH_ALL);
+  if (ctx.isFailure(reply)) ctx.failed();
+  const data = publishSummary(reply);
+  if (data) await ctx.show({ title: 'Итог публикации подписок', context: summaryLines(data, PUBLISH_FIELDS, 'Нечего публиковать.') });
+}
+
+/** Перенос подписок на выбранную ноду (`subscription migrate`) по плану. */
+export async function migrateFlow(ctx) {
+  const node = await chooseNode(ctx, 'Перенос подписок на ноду', 'Далее');
+  if (node === null) return;
+  const reply = await ctx.runConfirmed('Перенос подписок', 'Перенести подписки?', subscriptionMigrate(node));
+  if (ctx.isFailure(reply)) ctx.failed();
+}
+
+/** Заголовки группы: выбор группы одной формой → `showHeaders`. */
+export async function groupHeadersFlow(ctx) {
+  const read = await fetchData(ctx, ['group', 'list']);
+  if (!read) return;
+  const values = await ctx.form({
+    title: 'Заголовки группы', submit: 'Открыть',
+    fields: [{ name: 'group', label: 'Группа', type: 'select', options: nameOptions(read.data), required: true }],
+  });
+  if (values) await showHeaders(ctx, 'group', values.group);
 }

@@ -164,3 +164,24 @@ export async function nodeRequest(name, argv, review, deps) {
     return reply;
   }
 }
+
+/** Значение отмены окна по виду (как Esc и «Отмена»): `confirm` → `false`, `show` → `undefined`, прочие → `null`. */
+const CANCEL = { confirm: false, show: undefined };
+export const cancelValue = (kind) => (kind in CANCEL ? CANCEL[kind] : null);
+
+/** Методы `ctx` с окнами-вопросами и вид окна (`dialogs.js`). */
+const DIALOG_KINDS = { confirm: 'confirm', askSecret: 'secret', ask: 'text', choose: 'choose', form: 'form', show: 'show' };
+
+/**
+ * Окна экрана: пока `alive()` — окна `api`, после ухода с экрана —
+ * сразу значение отмены без окна. Поток ушедшего экрана (цикл меню, повтор
+ * формы) завершается сам и не открывает окна поверх нового раздела; окна
+ * операций (`operation`) не затрагиваются — их закрывает сама команда.
+ */
+export function screenDialogs(api, alive) {
+  const scoped = { ...api };
+  for (const [method, kind] of Object.entries(DIALOG_KINDS)) {
+    scoped[method] = (props) => (alive() ? api[method](props) : Promise.resolve(cancelValue(kind)));
+  }
+  return scoped;
+}

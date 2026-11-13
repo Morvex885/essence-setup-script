@@ -8,7 +8,7 @@ import * as session from './session.js';
 import * as router from './router.js';
 import * as fmt from './format.js';
 import * as theme from './theme.js';
-import { runConfirmed, nodeRequest, isFailure } from './flows.js';
+import { runConfirmed, nodeRequest, isFailure, screenDialogs } from './flows.js';
 import { Layout, Card, Button, SecretField, Checkbox, Snackbars } from './ui.js';
 import { useDialogs, DialogHost } from './dialogs.js';
 import { TerminalOverlay } from './terminal.js';
@@ -95,6 +95,9 @@ export function App({ win = window, deps = {} }) {
   const currentHash = useRef(String(win.location.hash || ''));
   const leavePending = useRef(false); // вопрос защиты открыт
   const routeRef = useRef(route);
+  // Номер экрана: растёт со сменой экрана; окна потоков ушедшего экрана
+  // сразу отменяются (`flows.js::screenDialogs`).
+  const screenEpoch = useRef(0);
 
   // Одноразовый код из `#ticket=…`: фрагмент стирается сразу, код уходит
   // только с первым `session open` и до отправки ждёт в `ticketRef`.
@@ -154,7 +157,10 @@ export function App({ win = window, deps = {} }) {
   /** Применить маршрут; смена экрана закрывает его окна (кроме окон операций). */
   const applyRoute = (next, hash) => {
     currentHash.current = hash;
-    if (router.screenKey(screenRoute(next)) !== router.screenKey(screenRoute(routeRef.current))) dialogs.api.cancelAll();
+    if (router.screenKey(screenRoute(next)) !== router.screenKey(screenRoute(routeRef.current))) {
+      screenEpoch.current += 1;
+      dialogs.api.cancelAll();
+    }
     routeRef.current = next;
     setRoute(next);
   };
@@ -181,9 +187,12 @@ export function App({ win = window, deps = {} }) {
         win.history.replaceState(win.history.state, '', router.hashUrl(win.location, previous));
         return;
       }
-      leaveGuard.current = null;
       const latest = String(win.location.hash || '');
-      applyRoute(router.parse(latest), latest);
+      const target = router.parse(latest);
+      // Защита снимается только со сменой экрана: на том же экране черновик
+      // остаётся, его эффект защиту заново не поставит.
+      if (router.screenKey(screenRoute(target)) !== router.screenKey(screenRoute(routeRef.current))) leaveGuard.current = null;
+      applyRoute(target, latest);
     })();
   };
 
@@ -254,8 +263,11 @@ export function App({ win = window, deps = {} }) {
     if (route.name === 'journal') setJournalSeen(journalId.current);
   }, [route.name, journal]);
 
+  // Окна контекста — окна текущего экрана: после его смены поток со старым
+  // `ctx` получает отмену и не открывает окна поверх нового раздела.
+  const epoch = screenEpoch.current;
   const ctx = makeContext({
-    connection, dialogs: dialogs.api, notify, record, hello, status, win,
+    connection, dialogs: screenDialogs(dialogs.api, () => screenEpoch.current === epoch), notify, record, hello, status, win,
     refreshStatus: () => loadStatus(),
     openTerminal: (argv, title) => new Promise((resolve) => setTerminalState({ argv, title, resolve })),
     restart: (kind) => {

@@ -65,7 +65,8 @@ export function Layout({ menu, activity = null, source = null, linkState = 'open
     const first = root && root.querySelector('a[href]');
     if (first) first.focus();
     const onKey = (event) => {
-      if (event.defaultPrevented) return;
+      // Над меню открыто окно или терминал: Esc и Tab — их (верхний слой).
+      if (event.defaultPrevented || document.querySelector('.modal-open, .terminal-overlay')) return;
       if (event.key === 'Escape') setOpen(false);
       else if (event.key === 'Tab' && root) trapTab(root, event);
     };

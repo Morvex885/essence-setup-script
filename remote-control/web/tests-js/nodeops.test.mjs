@@ -7,6 +7,7 @@ import {
   connectionView, assignGroupsTitle, assignArgv, assignConnections, connSyncArgv, connListArgv, nodeCheckArgv,
   awgStatusArgv, awgSyncArgv, awgRemovePeerArgv, awgOrphansArgv, awgView,
   TELEGRAM_BATCH, TELEGRAM_COMPONENTS, TELEGRAM_STATUS_ARGV, telegramArgv, telegramResults,
+  telegramMenu, telegramBatch, telegramStatus,
 } from '../assets/js/screens/nodeops-model.js';
 import { isFailure } from '../assets/js/flows.js';
 
@@ -206,4 +207,69 @@ test('Telegram: таблица результатов', () => {
   assert.equal(telegramResults(ok(results)).length, 4);
   assert.equal(telegramResults(ok({ results: [] })), null);
   assert.equal(telegramResults(err('invalid')), null);
+});
+
+/** `ctx` Telegram: `assignCtx` с планом (`runConfirmed`), терминалом и окном результата. */
+function telegramCtx(steps, answers) {
+  const s = assignCtx(steps, answers);
+  s.record.terminals = [];
+  s.ctx.runConfirmed = (_title, _question, argv) => s.ctx.request(argv);
+  s.ctx.terminal = async (argv) => { s.record.terminals.push(argv); return ok(); };
+  return s;
+}
+const nodeRows = [{ name: 'n1', ip: '192.0.2.1', port: 22 }, { name: 'n2', ip: '192.0.2.2', port: 22 }];
+
+test('Telegram: управление нодой — выбор ноды и telegram menu; нет нод — без формы', async () => {
+  const s = telegramCtx([[['node', 'list'], ok(nodeRows)]], [{ node: 'n2' }]);
+  await telegramMenu(s.ctx);
+  assert.deepEqual(s.record.forms[0].fields[0].options.map((o) => o.value), ['n1', 'n2']);
+  assert.deepEqual(s.record.terminals, [['telegram', 'menu', '--name', 'n2']]);
+
+  const cancelled = telegramCtx([[['node', 'list'], ok(nodeRows)]], [null]);
+  await telegramMenu(cancelled.ctx);
+  assert.deepEqual(cancelled.record.terminals, []);
+
+  const empty = telegramCtx([[['node', 'list'], ok([])]], []);
+  await telegramMenu(empty.ctx);
+  assert.deepEqual([empty.record.forms.length, empty.record.notices], [0, [EMPTY]]);
+});
+
+test('Telegram: пакетное действие — ноды и способ доступа формой, план, таблица результатов', async () => {
+  const remove = TELEGRAM_BATCH.find((a) => a.component);
+  const results = { results: [{ node: 'n1', status: 'ok', reason: '' }] };
+  const argv = telegramArgv(remove.argv, ['n1'], 'web');
+  const shown = [];
+  const s = telegramCtx([[['node', 'list'], ok(nodeRows)], [argv, ok(results)]], [{ nodes: ['n1'], component: 'web' }]);
+  assert.equal(await telegramBatch(s.ctx, remove, async (table) => { shown.push(table); }), true);
+  assert.deepEqual(s.record.forms[0].fields.map((f) => f.name), ['nodes', 'component']);
+  assert.deepEqual(shown, [telegramResults(ok(results))]);
+
+  // partial с результатами — таблица без итога сбоя; отказ от плана — ничего не менялось.
+  const partial = telegramCtx([[['node', 'list'], ok(nodeRows)], [argv, err('partial', results)]], [{ nodes: ['n1'], component: 'web' }]);
+  assert.equal(await telegramBatch(partial.ctx, remove, async (table) => { shown.push(table); }), true);
+  assert.equal(shown.length, 2);
+  const declined = telegramCtx([[['node', 'list'], ok(nodeRows)], [argv, err('confirmation_required')]], [{ nodes: ['n1'], component: 'web' }]);
+  assert.equal(await telegramBatch(declined.ctx, remove, async () => assert.fail('нет таблицы')), false);
+  assert.deepEqual(declined.record.notices, []);
+
+  const install = TELEGRAM_BATCH.find((a) => !a.component);
+  const cancelled = telegramCtx([[['node', 'list'], ok(nodeRows)]], [null]);
+  assert.equal(await telegramBatch(cancelled.ctx, install, async () => assert.fail('нет таблицы')), false);
+  assert.deepEqual(cancelled.record.forms[0].fields.map((f) => f.name), ['nodes']);
+  const failed = telegramCtx([[['node', 'list'], err('locked')]], []);
+  assert.equal(await telegramBatch(failed.ctx, install, async () => assert.fail('нет таблицы')), false);
+  assert.deepEqual(failed.record.notices, ['failed']);
+});
+
+test('Telegram: статус — строки таблицы, сбой без таблицы — null и итог сбоя', async () => {
+  const results = { results: [{ node: 'n1', status: 'not_installed', reason: '' }] };
+  let s = telegramCtx([[TELEGRAM_STATUS_ARGV, ok(results)]], []);
+  assert.deepEqual(await telegramStatus(s.ctx), telegramResults(ok(results)));
+  s = telegramCtx([[TELEGRAM_STATUS_ARGV, ok({ results: [] })]], []);
+  assert.deepEqual(await telegramStatus(s.ctx), []);
+  s = telegramCtx([[TELEGRAM_STATUS_ARGV, err('partial', results)]], []);
+  assert.equal((await telegramStatus(s.ctx)).length, 1);
+  s = telegramCtx([[TELEGRAM_STATUS_ARGV, err('locked')]], []);
+  assert.equal(await telegramStatus(s.ctx), null);
+  assert.deepEqual(s.record.notices, ['failed']);
 });

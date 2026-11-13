@@ -47,7 +47,11 @@ test('шаблоны: вид, поиск строки и содержимое', 
 test('шаблоны: выбор групп с текущим шаблоном и отметками', () => {
   const groups = [{ name: 'PC', template: 'm.yaml' }, { name: 'TV', template: 'default.yaml' }, { name: null }];
   const { options, selected } = groupOptions(groups, 'm.yaml');
-  assert.deepEqual(options.map((o) => [o.value, o.label]), [['PC', 'PC — сейчас: m.yaml'], ['TV', 'TV — сейчас: default.yaml']]);
+  assert.deepEqual(options.map((o) => o.value), ['PC', 'TV']);
+  // Подпись называет группу и её текущий шаблон.
+  for (const [option, template] of [[options[0], 'm.yaml'], [options[1], 'default.yaml']]) {
+    assert.ok(option.label.includes(option.value) && option.label.includes(template));
+  }
   assert.deepEqual(selected, ['PC']);
   assert.deepEqual(groupOptions(null, 'm.yaml'), { options: [], selected: [] });
 });

@@ -8,10 +8,7 @@ import { Button, useModalFocus } from './ui.js';
 import { Icon } from './icons.js';
 import { initialValues, visibleFields, validate, result } from './form-model.js';
 import { asList } from './format.js';
-
-/** Значение отмены окна по виду (как Esc и «Отмена»). */
-const CANCEL = { confirm: false, show: undefined };
-const cancelValue = (kind) => (kind in CANCEL ? CANCEL[kind] : null);
+import { cancelValue } from './flows.js';
 
 /**
  * Хранилище стопки диалогов. `push(kind, props)` → `Promise` ответа.

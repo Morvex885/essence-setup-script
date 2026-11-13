@@ -138,6 +138,8 @@ function TemplateEditor({ ctx, name }) {
   const mounted = useMounted();
   // Черновик редактора; `null` — без изменений.
   const [draft, setDraft] = useState(null);
+  const draftRef = useRef(draft);
+  draftRef.current = draft;
   // Замена текста редактора снаружи (сброс, импорт, новый текст с сервера).
   const [version, setVersion] = useState(0);
   // Повтор проверки при неизменном тексте (группы изменились).
@@ -216,13 +218,17 @@ function TemplateEditor({ ctx, name }) {
     return () => ctx.win.removeEventListener('keydown', onKey);
   }, []);
   const importFile = (fileText, reason) => run(async () => {
+    // Правки, набранные пока идёт импорт, не затираются импортированным текстом.
+    const before = draftRef.current;
     const imported = await importTemplateFile(ctx, name, fileText, reason, dirty);
     if (fileText === null) return;
     await reload();
-    if (imported) replaceText();
+    if (imported && settleDraft(draftRef.current, before) === null) replaceText();
   });
   const remove = () => run(async () => {
     if (!(await deleteTemplate(ctx, row))) return;
+    // Редактор уже закрыт: защита ухода принадлежит другому экрану.
+    if (!mounted.current) return;
     if (kind === 'override') { await reload(); replaceText(); return; }
     ctx.setLeaveGuard(null);
     leave('templates');

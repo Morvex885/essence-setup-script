@@ -187,7 +187,7 @@ const failure = (code = 'failed') => ({ ok: false, error: { code, message: '' } 
 const PLAN = failure('confirmation_required');
 
 /**
- * ctx по сценарию: `replies` — ответы `request`/`runConfirmed` по порядку,
+ * ctx по сценарию: `replies` — ответы `request`/`runConfirmed`/`nodeRequest` по порядку,
  * `answers` — ответы `form`/`choose`/`confirm`. `calls` — порядок вызовов.
  */
 function fakeCtx({ replies = [], answers = [] } = {}) {
@@ -197,6 +197,7 @@ function fakeCtx({ replies = [], answers = [] } = {}) {
     calls,
     request: async (argv) => { calls.push(['request', argv]); return replies.shift(); },
     runConfirmed: async (title, question, argv) => { calls.push(['run', argv]); return replies.shift(); },
+    nodeRequest: async (node, argv) => { calls.push(['node', argv]); return replies.shift(); },
     form: answer('form'),
     choose: answer('choose'),
     confirm: answer('confirm'),
@@ -207,7 +208,7 @@ function fakeCtx({ replies = [], answers = [] } = {}) {
   };
 }
 const kinds = (ctx) => ctx.calls.map((call) => call[0]);
-const commands = (ctx) => ctx.calls.filter((call) => call[0] === 'request' || call[0] === 'run').map((call) => call[1]);
+const commands = (ctx) => ctx.calls.filter((call) => ['request', 'run', 'node'].includes(call[0])).map((call) => call[1]);
 
 test('execute и confirmed: сбой — failed, отказ от плана — не сбой', async () => {
   const a = fakeCtx({ replies: [failure()] });
@@ -300,4 +301,126 @@ test('перенос клиента: другие группы, смена по 
   const alone = fakeCtx();
   await m.moveClientFlow(alone, 'PC', [{ name: 'PC' }], 'alice');
   assert.deepEqual(kinds(alone), ['notify']);
+});
+
+test('изменение клиента: смена группы, затем переименование; итог — новое имя', async () => {
+  const groups = okReply([{ name: 'PC' }, { name: 'LAB' }]);
+  const r = row('alice', true, unpublished);
+  const both = fakeCtx({ replies: [groups, okReply(), okReply({ name: 'BOB' })], answers: [{ name: 'bob', group: 'LAB' }] });
+  assert.equal(await m.editClientFlow(both, 'alice', r), 'BOB');
+  assert.deepEqual(commands(both), [
+    ['group', 'list'],
+    ['client', 'set-group', '--name', 'alice', '--group', 'LAB'],
+    ['client', 'rename', '--name', 'alice', '--new-name', 'bob'],
+  ]);
+
+  const partial = fakeCtx({ replies: [groups, failure('partial')], answers: [{ name: 'alice', group: 'LAB' }] });
+  assert.equal(await m.editClientFlow(partial, 'alice', r), null);
+  assert.equal(kinds(partial).at(-1), 'failed', 'partial смены группы — итог сбоя');
+
+  const refused = fakeCtx({ replies: [groups, PLAN], answers: [{ name: 'bob', group: 'LAB' }] });
+  assert.equal(await m.editClientFlow(refused, 'alice', r), null);
+  assert.equal(commands(refused).length, 2, 'отказ от плана группы — без переименования');
+
+  const cancelled = fakeCtx({ replies: [groups], answers: [null] });
+  assert.equal(await m.editClientFlow(cancelled, 'alice', r), null);
+  assert.deepEqual(kinds(cancelled), ['request', 'form']);
+});
+
+test('ноды клиента: свои — client nodes, возврат к группе — по плану, отмена и partial', async () => {
+  const listed = okReply(nodes);
+  const own = fakeCtx({ replies: [listed, okReply()], answers: [{ mode: 'own', nodes: ['ru'] }] });
+  await m.clientNodesFlow(own, 'alice', row('alice', true, unpublished));
+  assert.deepEqual(commands(own).at(-1), ['client', 'nodes', '--name', 'alice', '--node', 'ru']);
+  assert.equal(own.calls.at(-1)[0], 'request');
+
+  const back = fakeCtx({ replies: [listed, okReply()], answers: [{ mode: 'inherit' }] });
+  await m.clientNodesFlow(back, 'alice', row('alice', false, unpublished));
+  assert.deepEqual(back.calls[1][1].fields.find((f) => f.name === 'nodes').value, ['de']);
+  assert.deepEqual(back.calls.at(-1), ['run', ['client', 'nodes', '--name', 'alice', '--inherit']]);
+
+  const same = fakeCtx({ replies: [listed], answers: [{ mode: 'inherit' }] });
+  await m.clientNodesFlow(same, 'alice', row('alice', true, unpublished));
+  assert.deepEqual(kinds(same), ['request', 'form']);
+
+  const cancelled = fakeCtx({ replies: [listed], answers: [null] });
+  await m.clientNodesFlow(cancelled, 'alice', row('alice', true, unpublished));
+  assert.deepEqual(kinds(cancelled), ['request', 'form']);
+
+  const partial = fakeCtx({ replies: [listed, failure('partial')], answers: [{ mode: 'own', nodes: ['de'] }] });
+  await m.clientNodesFlow(partial, 'alice', row('alice', true, unpublished));
+  assert.equal(kinds(partial).at(-1), 'failed');
+});
+
+test('подключения клиента на ноде: поиск через nodeRequest, отмечены назначенные', async () => {
+  const assigned = [{ node: 'de', proxies: ['p2'] }];
+  const found = okReply([{ node: 'de', discovered: ['p1', 'p2'] }]);
+  const ctx = fakeCtx({ replies: [found, okReply()], answers: [{ proxies: ['p1'] }] });
+  await m.clientConnectionsFlow(ctx, 'alice', 'de', assigned);
+  assert.deepEqual(ctx.calls[0], ['node', m.discoverArgv('de')]);
+  assert.deepEqual(ctx.calls[1][1].fields[0].value, ['p2']);
+  assert.deepEqual(commands(ctx).at(-1), m.clientConnectionsArgv('alice', 'de', ['p1']));
+
+  const none = fakeCtx({ replies: [okReply([{ node: 'de', discovered: [] }])] });
+  await m.clientConnectionsFlow(none, 'alice', 'de', assigned);
+  assert.deepEqual(kinds(none), ['node', 'notify']);
+
+  const unreachable = fakeCtx({ replies: [failure('remote_failed')] });
+  await m.clientConnectionsFlow(unreachable, 'alice', 'de', assigned);
+  assert.deepEqual(kinds(unreachable), ['node'], 'сбой сообщает nodeRequest');
+
+  const cancelled = fakeCtx({ replies: [found], answers: [null] });
+  await m.clientConnectionsFlow(cancelled, 'alice', 'de', assigned);
+  assert.deepEqual(kinds(cancelled), ['node', 'form']);
+});
+
+test('публикация подписки: срок формой, ссылка после успеха и partial, отмена — без команды', async () => {
+  const r = row('alice', true, unpublished);
+  const shared = [];
+  const share = async (name) => { shared.push(name); };
+  const keep = fakeCtx({ replies: [okReply()], answers: [{ ttl: 'keep' }] });
+  await m.publishFlow(keep, 'alice', r, share);
+  assert.deepEqual(commands(keep), [m.publishArgv('alice', null)]);
+  const custom = fakeCtx({ replies: [failure('partial')], answers: [{ ttl: 'custom', custom: '7d' }] });
+  await m.publishFlow(custom, 'alice', r, share);
+  assert.deepEqual(commands(custom), [m.publishArgv('alice', '7d')]);
+  assert.deepEqual(shared, ['alice', 'alice']);
+
+  const refused = fakeCtx({ replies: [failure('remote_failed')], answers: [{ ttl: 'keep' }] });
+  await m.publishFlow(refused, 'alice', r, share);
+  assert.equal(kinds(refused).at(-1), 'failed');
+  const cancelled = fakeCtx({ answers: [null] });
+  await m.publishFlow(cancelled, 'alice', r, share);
+  assert.deepEqual(kinds(cancelled), ['form']);
+  assert.equal(shared.length, 2);
+});
+
+test('подписки: хост-нода через nodeRequest, перенос по плану, заголовки группы', async () => {
+  const listed = okReply(nodes);
+  const host = fakeCtx({ replies: [listed, okReply()], answers: [{ node: 'ru' }] });
+  await m.subscriptionHostFlow(host, 'de');
+  assert.equal(host.calls[1][1].fields[0].value, 'de');
+  assert.deepEqual(host.calls.at(-1), ['node', ['subscription', 'host', '--name', 'ru']]);
+  const noHost = fakeCtx({ replies: [listed], answers: [null] });
+  await m.subscriptionHostFlow(noHost, null);
+  assert.deepEqual(kinds(noHost), ['request', 'form']);
+
+  const moved = fakeCtx({ replies: [listed, failure('remote_failed')], answers: [{ node: 'ru' }] });
+  await m.migrateFlow(moved);
+  assert.deepEqual(moved.calls.filter((c) => c[0] === 'run').map((c) => c[1]), [['subscription', 'migrate', '--name', 'ru']]);
+  assert.equal(kinds(moved).at(-1), 'failed');
+  const declined = fakeCtx({ replies: [listed, PLAN], answers: [{ node: 'ru' }] });
+  await m.migrateFlow(declined);
+  assert.notEqual(kinds(declined).at(-1), 'failed', 'отказ от плана — не сбой');
+
+  const published = fakeCtx({ replies: [okReply({ published: ['alice'], failed: [] })] });
+  await m.publishAllFlow(published);
+  assert.deepEqual(kinds(published), ['run', 'show']);
+
+  const headers = fakeCtx({ replies: [okReply([{ name: 'PC' }]), okReply({ headers: [] })], answers: [{ group: 'PC' }, null] });
+  await m.groupHeadersFlow(headers);
+  assert.deepEqual(commands(headers), [['group', 'list'], m.headersArgv('group', 'PC')]);
+  const noGroup = fakeCtx({ replies: [okReply([{ name: 'PC' }])], answers: [null] });
+  await m.groupHeadersFlow(noGroup);
+  assert.deepEqual(kinds(noGroup), ['request', 'form']);
 });

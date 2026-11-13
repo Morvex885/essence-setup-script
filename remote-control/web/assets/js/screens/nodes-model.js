@@ -313,6 +313,39 @@ export function aliasArgv(name, entries, values) {
   return ['node', 'aliases', '--name', name, ...sets, ...unsets];
 }
 
+/**
+ * Псевдонимы подключений ноды одной формой (`nodes.rs::aliases`): чтение
+ * через `nodeRequest`, форма с полем на подключение, запись только изменённых.
+ * Отмена формы ничего не пишет.
+ */
+export async function editAliases(ctx, name) {
+  const reply = await ctx.nodeRequest(name, ['node', 'aliases', '--name', name]);
+  if (!reply.ok) return;
+  const entries = asList(reply.data);
+  if (entries.length === 0) {
+    ctx.notify('info', 'Подключения на ноде не найдены.');
+    return;
+  }
+  const form = await ctx.form({
+    title: `Псевдонимы подключений: ${name}`,
+    fields: entries.map((entry, index) => ({
+      name: `a${index}`,
+      label: plain(entry.proxy),
+      type: 'text',
+      value: plain(entry.alias),
+      hint: 'пусто — без псевдонима',
+    })),
+  });
+  if (form === null) return;
+  const argv = aliasArgv(name, entries, aliasValues(entries, form));
+  if (!argv) {
+    ctx.notify('info', 'Изменений нет.');
+    return;
+  }
+  const saved = await ctx.request(argv);
+  if (ctx.isFailure(saved)) ctx.failed();
+}
+
 // ─── Действия над нодой ──────────────────────────────────────────────────────
 
 /** Зависимости `flows.js` из контекста экрана. */
@@ -451,7 +484,7 @@ export async function harden(ctx, name) {
   const ask = async () => {
     const values = await ctx.form({
       title,
-      fields: [{ name: 'port', label: 'SSH-порт (пусто — подобрать свободный)', type: 'text' }],
+      fields: [{ name: 'port', label: 'SSH-порт (пусто — подобрать свободный)', type: 'text', validate: portError }],
       submit: 'Далее',
     });
     return values === null ? null : values.port;

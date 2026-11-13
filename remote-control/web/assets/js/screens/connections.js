@@ -6,39 +6,9 @@ import { html, useEffect, useRef, useState } from '../../vendor/preact-htm.js';
 import { Card, DataTable, Chips, Button } from '../ui.js';
 import { Icon } from '../icons.js';
 import { NODE_CODES } from '../flows.js';
-import { asList } from '../format.js';
 import { useBusy, useMounted, ReadFailed } from './kit.js';
 import { syncedNode, connectionView, assignConnections, connSyncArgv, connListArgv, nodeCheckArgv } from './nodeops-model.js';
-import { aliasArgv, aliasValues, plain } from './nodes-model.js';
-
-/** Псевдонимы подключений ноды одной формой (`nodes.rs::aliases`). */
-async function editAliases(ctx, name) {
-  const reply = await ctx.nodeRequest(name, ['node', 'aliases', '--name', name]);
-  if (!reply.ok) return;
-  const entries = asList(reply.data);
-  if (entries.length === 0) {
-    ctx.notify('info', 'Подключения на ноде не найдены.');
-    return;
-  }
-  const form = await ctx.form({
-    title: `Псевдонимы подключений: ${name}`,
-    fields: entries.map((entry, index) => ({
-      name: `a${index}`,
-      label: plain(entry.proxy),
-      type: 'text',
-      value: plain(entry.alias),
-      hint: 'пусто — без псевдонима',
-    })),
-  });
-  if (form === null) return;
-  const argv = aliasArgv(name, entries, aliasValues(entries, form));
-  if (!argv) {
-    ctx.notify('info', 'Изменений нет.');
-    return;
-  }
-  const saved = await ctx.request(argv);
-  if (ctx.isFailure(saved)) ctx.failed();
-}
+import { editAliases } from './nodes-model.js';
 
 export function NodeConnections({ ctx, name }) {
   const [state, setState] = useState({ view: null, failed: null });
@@ -124,7 +94,9 @@ export function NodeConnections({ ctx, name }) {
     <${Button} icon="pencil" disabled=${busy} onClick=${() => act(() => editAliases(ctx, name))}>Псевдонимы<//>
     <${Button} icon="refresh-cw" disabled=${busy} onClick=${() => run(synchronize)}>Синхронизировать<//>
   </div>`;
+  // Сбой повторного чтения — над прежней таблицей: она могла устареть.
   return html`<${Card} title="Подключения" actions=${actions}>
+    ${failed && html`<${ReadFailed} reply=${failed} loading=${busy} reload=${() => run(synchronize)} />`}
     ${view.problem && html`<div role="alert" class="alert alert-warning alert-soft">
       <${Icon} name="triangle-alert" size=${18} /><span>Нода ${view.problem}</span>
     </div>`}

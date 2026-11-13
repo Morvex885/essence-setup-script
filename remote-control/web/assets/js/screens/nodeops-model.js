@@ -1,9 +1,12 @@
 // Модель обзора подключений нод, вкладок ноды «Подключения», «AmneziaWG» и
 // экрана «Telegram Proxy» — перенос чистой логики `tui/src/nodes.rs`
 // (`Connections::run`, `synced_node`, `sync_problem`, `assign_connections`,
-// `awg_node`, argv команд, таблица `telegram_table`). Без DOM и вендоренных
-// файлов. Тоны: `ok` (GREEN), `warn` (YELLOW), `error` (RED), `neutral` (DIM).
+// `awg_node`, argv команд, таблица `telegram_table`) и потоки Telegram
+// (`telegram_batch`) поверх `ctx`. Без DOM и вендоренных файлов: окно
+// результатов экран передаёт функцией. Тоны: `ok` (GREEN), `warn` (YELLOW),
+// `error` (RED), `neutral` (DIM).
 import { asList } from '../format.js';
+import { interactive, nodeLabel } from './nodes-model.js';
 
 /** Пустой выбор (`nodes.rs::EMPTY`). */
 export const EMPTY = 'Нет объектов для выбора';
@@ -235,4 +238,64 @@ export function telegramResults(reply) {
         : row.status === 'partial' ? ['частично', 'warn'] : ['ошибка', 'error'];
     return { node: nodeText(row.node), status, reason: nodeText(row.reason), tone };
   });
+}
+
+/** Ноды (`node list`) как варианты формы; сбой или пустой список — сообщение и `null`. */
+export async function telegramNodes(ctx) {
+  const listed = await ctx.call('node', 'list');
+  if (!listed.ok) {
+    if (ctx.isFailure(listed)) ctx.failed();
+    return null;
+  }
+  const nodes = asList(listed.data).map((row) => ({ value: nodeText(row.name), label: nodeLabel(row) }));
+  if (nodes.length === 0) {
+    ctx.notify('warn', EMPTY);
+    return null;
+  }
+  return nodes;
+}
+
+/** «Управление нодой…»: выбор ноды → `telegram menu` в терминале (`interactive`). */
+export async function telegramMenu(ctx) {
+  const nodes = await telegramNodes(ctx);
+  if (nodes === null) return;
+  const values = await ctx.form({
+    title: TELEGRAM_SELECT_TITLE,
+    fields: [{ name: 'node', label: 'Нода', type: 'select', options: nodes }],
+    submit: 'Открыть',
+  });
+  if (values !== null) await interactive(ctx, values.node, true);
+}
+
+/**
+ * Пакетное действие (`telegram_batch`): ноды и способ доступа одной формой,
+ * план ядра, таблица результатов — `present(строки)` (экран показывает окно).
+ * `true` — команда отправлена (отказ от плана и отмена формы ничего не меняли).
+ */
+export async function telegramBatch(ctx, action, present) {
+  const nodes = await telegramNodes(ctx);
+  if (nodes === null) return false;
+  const fields = [{ name: 'nodes', label: 'Ноды', type: 'multi', options: nodes, required: true }];
+  if (action.component) {
+    fields.push({ name: 'component', label: 'Способ доступа', type: 'radio', options: TELEGRAM_COMPONENTS, required: true });
+  }
+  const values = await ctx.form({ title: action.title, fields, submit: 'Далее', tone: action.danger ? 'danger' : 'primary' });
+  if (values === null) return false;
+  const argv = telegramArgv(action.argv, values.nodes, action.component ? values.component : null);
+  const reply = await ctx.runConfirmed(action.title, 'Выполнить?', argv);
+  const table = telegramResults(reply);
+  if (table !== null) await present(table);
+  else if (ctx.isFailure(reply)) ctx.failed();
+  return reply.ok || ctx.isFailure(reply);
+}
+
+/** `telegram status --all`: строки таблицы или `null` — сбой без таблицы (сообщён). */
+export async function telegramStatus(ctx) {
+  const reply = await ctx.call(...TELEGRAM_STATUS_ARGV);
+  const table = telegramResults(reply);
+  if (table === null && !reply.ok) {
+    if (ctx.isFailure(reply)) ctx.failed();
+    return null;
+  }
+  return table || [];
 }

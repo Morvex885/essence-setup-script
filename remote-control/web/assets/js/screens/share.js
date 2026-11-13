@@ -17,15 +17,17 @@ function QrCode({ text }) {
       qr.make();
       const count = qr.getModuleCount();
       const scale = Math.max(2, Math.floor(256 / count));
-      target.width = count * scale;
-      target.height = count * scale;
+      // Свободное поле в четыре модуля — внутри холста, при любом масштабе.
+      const quiet = 4 * scale;
+      target.width = count * scale + 2 * quiet;
+      target.height = target.width;
       const draw = target.getContext('2d');
       draw.fillStyle = '#fff';
       draw.fillRect(0, 0, target.width, target.height);
       draw.fillStyle = '#000';
       for (let row = 0; row < count; row += 1) {
         for (let col = 0; col < count; col += 1) {
-          if (qr.isDark(row, col)) draw.fillRect(col * scale, row * scale, scale, scale);
+          if (qr.isDark(row, col)) draw.fillRect(quiet + col * scale, quiet + row * scale, scale, scale);
         }
       }
       setDrawn(true);

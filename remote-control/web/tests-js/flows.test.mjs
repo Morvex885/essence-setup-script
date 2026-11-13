@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   decisionFlag, setFlag, clearFlag, runConfirmed, reviewReply, nodeRequest,
-  handleNodeCodes, PLAN_KEEPS_CHANGING, PLAN_CHANGED, BROKEN_PLAN, NODE_CODES, OPERATION_FAILED,
+  handleNodeCodes, PLAN_KEEPS_CHANGING, PLAN_CHANGED, BROKEN_PLAN, NODE_CODES, OPERATION_FAILED, screenDialogs,
 } from '../assets/js/flows.js';
 
 const plan = (code, token, extra = {}) => ({
@@ -246,4 +246,50 @@ test('nodeRequest: оставшийся сбой — OPERATION_FAILED, отка�
 test('handleNodeCodes: прочий код не обрабатывается', async () => {
   assert.equal(await handleNodeCodes(ok(), 'de', { request: async () => ok(), confirm: async () => true }), false);
   assert.equal(await handleNodeCodes({ ok: false, error: { code: 'not_found' } }, 'de', { request: async () => ok(), confirm: async () => true }), false);
+});
+
+test('screenDialogs: после ухода с экрана окна сразу отменяются, операции и прочее — как есть', async () => {
+  const opened = [];
+  const api = {
+    confirm: async () => { opened.push('confirm'); return true; },
+    askSecret: async () => { opened.push('secret'); return 's'; },
+    ask: async () => { opened.push('text'); return 't'; },
+    choose: async () => { opened.push('choose'); return 'x'; },
+    form: async () => { opened.push('form'); return {}; },
+    show: async () => { opened.push('show'); return 'shown'; },
+    operation: () => 'operation',
+    dialogOpen: () => false,
+  };
+  let alive = true;
+  const scoped = screenDialogs(api, () => alive);
+  assert.equal(await scoped.confirm({}), true);
+  assert.deepEqual(await scoped.form({}), {});
+  alive = false;
+  assert.equal(await scoped.confirm({}), false);
+  assert.equal(await scoped.askSecret({}), null);
+  assert.equal(await scoped.ask({}), null);
+  assert.equal(await scoped.choose({}), null);
+  assert.equal(await scoped.form({}), null);
+  assert.equal(await scoped.show({}), undefined);
+  assert.deepEqual(opened, ['confirm', 'form'], 'окна ушедшего экрана не открываются');
+  assert.equal(scoped.operation(), 'operation');
+  assert.equal(scoped.dialogOpen, api.dialogOpen);
+});
+
+test('screenDialogs: цикл заголовков подписки завершается после ухода с экрана', async () => {
+  const { showHeaders } = await import('../assets/js/screens/clients-model.js');
+  let alive = true;
+  const requests = [];
+  const api = {
+    // «Установить», затем форма, закрытая уходом с экрана (`cancelAll` → `null`).
+    choose: async () => 'set',
+    form: async () => { alive = false; return null; },
+  };
+  const ctx = {
+    ...screenDialogs(api, () => alive),
+    request: async (argv) => { requests.push(argv); return { ok: true, data: { headers: [] } }; },
+    failed: () => assert.fail('нет сбоя'),
+  };
+  await showHeaders(ctx, 'client', 'alice');
+  assert.equal(requests.length, 2, 'после ухода — одно перечитывание и выход без окна');
 });
