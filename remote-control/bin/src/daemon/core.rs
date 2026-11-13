@@ -272,6 +272,9 @@ async fn run_job(shared: &Arc<Shared>, session: &mut Session, current: &Current,
     }
     let succeeded = reply.as_ref().is_some_and(|envelope| envelope.ok);
     let code = reply.as_ref().and_then(|envelope| envelope.error.as_ref()).map(|error| error.code);
+    // Before the reply: a request the client sends right after it must not
+    // read this finished command as the one it waits for.
+    shared.set_busy(None);
     if let Some(envelope) = reply {
         // A network `session open` frees its slot before the client can answer the reply.
         if matches!(opened, Some(Opened { done: Some(_), .. })) {
@@ -283,7 +286,6 @@ async fn run_job(shared: &Arc<Shared>, session: &mut Session, current: &Current,
         let _ = done.send(access::outcome(code, conn.is_authorized(), resumed));
     }
     shared.activity(&json!({"event": "activity", "state": "end", "command": request.label, "origin": conn.origin}));
-    shared.set_busy(None);
     shared.job_done();
     if succeeded {
         match request.label.as_str() {
