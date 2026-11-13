@@ -732,7 +732,7 @@ GitHub и пароль доступа; при недоступной сети �
 | Команда | Описание |
 |---|---|
 | `conn list [--name N [--discover]]` | Подключения нод по группам |
-| `conn set --name N --group G… [--proxy P…]` | Назначить подключения группам (без --proxy — снять) |
+| `conn set --name N --assign G=P1,P2…` | Задать подключения групп на ноде: каждой указанной группе — ровно этот список (`G=` — снять назначение); остальные группы не меняются |
 | `conn sync [--name N]` | Обнаружить подключения нод по SSH и убрать устаревшие назначения |
 
 ### AmneziaWG (`awg`)
@@ -1228,9 +1228,13 @@ C`), `h` заголовки клиента, `r` сменить токен (`subs
 затем выбор шаблона из `template list` (`default.yaml` первым) → `group add --name G
 --template T`. **Карточка группы**: шаблон, число клиентов, ноды. `t` — выбрать
 шаблон (`group set-template`) или «Создать новый шаблон» (`template create --name T
---group G`, затем редактор), `h` — заголовки подписки группы, `f` — сгенерировать
-конфиги группы (`generate --group G`), `d` — удалить группу (`group delete` с
-планом).
+--group G`, затем редактор), `c` — подключения нод: выбор ноды (единственная
+берётся сразу; нод нет — «Нет нод.») → `conn list --name N --discover` →
+мультивыбор найденных прокси (и назначенных, но больше не найденных) с отметками
+текущих прокси группы → `conn set --name N --assign G=P…` (пустой выбор снимает
+назначение; без изменений команда не отправляется), `h` — заголовки подписки
+группы, `f` — сгенерировать конфиги группы (`generate --group G`), `d` — удалить
+группу (`group delete` с планом).
 
 ### Шаблоны (`m`)
 
@@ -1278,10 +1282,12 @@ UTF-8 не больше 1 МиБ: иначе «Файл недоступен и�
 тусклый — неизвестно или нет), проблемные ноды — «недоступна», «не загружена»,
 «не сохранена», «пропущена». Список нод → **подключения ноды**
 (`conn sync --name N` при входе и по `s`, перерисовка — `conn list --name N`):
-найденные прокси с метками групп; `b` — назначить подключения группам
-(мультивыбор прокси, затем групп → `conn set --name N --group G… --proxy P…`;
-подтверждённый пустой выбор прокси снимает назначение с выбранных групп —
-`conn set` без `--proxy`; пустой выбор групп — «Ничего не выбрано.»), `l` —
+найденные прокси с метками групп; `b` — назначить подключения группам: список
+прокси ноды (найденные и назначенные, но больше не найденные) с их группами,
+выбор прокси открывает мультивыбор всех групп с отметками текущих; правки
+копятся локально, `s` «Сохранить» отправляет одну команду `conn set --name N
+--assign G=P…` только для групп, чей набор прокси изменился (без изменений —
+«Изменений нет.», команда не отправляется), `0` — отмена без изменений; `l` —
 псевдонимы подключений, `s` — синхронизировать с нодой. Если синхронизация
 ноды упала на исправимой ошибке
 ноды, меню выполняет `node check` и предлагает её решить.
@@ -1388,15 +1394,15 @@ Bash-версии) и вопрос «Заменить их конфигурац�
 |---|---|
 | Запуск | `session status`; `source init-local`; `session open [--remember-key]` (секреты `script-password`, `vault-password`, `access-token`) |
 | Восстановление GitHub | `source github-migrate-format`, `source github-replace-with-local [--provision-keys yes\|no]` |
-| Сводка | `status` |
+| Сводка | `status`, `subscription list`, `group list`, `node list` |
 | Ноды | `node list`, `status`; `node add --name N --ip IP --port P --user U --auth key\|password --tag T --accept-new-host-key` / `--replace-host-key SHA256:…` / `--defer-ssh-setup`; `node setup-ssh [--provision-keys yes\|no] [--on-failure defer]` |
 | Карточка ноды | `node show`, `node shell`, `telegram menu`, `node check`, `node upload-scripts [--force]`, `node harden [--port P]`, `node rename`, `node tag`, `node password`, `node aliases [--set …] [--unset …]`, `node delete --scope … [--revoke-key]`, `node trust-host-key --host-key SHA256:…` |
-| Подключения | `conn sync [--name N]`, `conn list [--name N]`, `group list`, `conn set --name N --group G… --proxy P…`, `node check` |
+| Подключения | `conn sync [--name N]`, `conn list [--name N]`, `group list`, `conn set --name N --assign G=P1,P2…`, `node check` |
 | AmneziaWG | `node list`, `awg status`, `awg sync`, `awg remove --peer P` / `--orphans` |
 | Telegram Proxy | `node list`, `telegram menu --name N`, `telegram status --all`, `telegram install\|refresh-ip\|web-update\|web-restart\|backend-restart\|remove-all --name N…`, `telegram remove --component web\|mtproto --name N…` |
 | Клиенты | `client list`, `group list`, `client add`, `client delete --name C…`, `client show`, `generate --client C`, `node list`, `client nodes --node N…` / `--inherit`, `client connections [--node N --proxy P… \| --reset]`, `conn list --name N --discover`, `client set-group`, `client rename` |
 | Подписка клиента | `subscription host`, `subscription publish --name C [--ttl T]`, `subscription show`, `subscription headers --client C [--set … \| --unset …]`, `subscription rotate`, `subscription revoke` |
-| Группы | `group list`, `template list`, `group add --name G [--template T]`, `group set-template`, `template create --group G`, `subscription headers --group G [--set … \| --unset …]`, `generate --group G`, `group delete` |
+| Группы | `group list`, `template list`, `group add --name G [--template T]`, `node list`, `conn list --name N --discover`, `conn set --name N --assign G=P…`, `group set-template`, `template create --group G`, `subscription headers --group G [--set … \| --unset …]`, `generate --group G`, `group delete` |
 | Шаблоны | `template list`, `template create`, `template show` (и экспорт), `template import --name T` (+`input.file`), `template check --name T`, `group list`, `template groups --name T --group G…`, `template delete --name T` |
 | Генерация | `group list`, `client list`, `generate --all\|--group G\|--client C` |
 | Подписки | `subscription host [--name N]`, `node list`, `subscription list`, `subscription publish-all`, `subscription migrate --name N`, `client list`, `group list` |
@@ -1625,9 +1631,9 @@ Proxy, затем Источник, Настройки и Журнал. Дейс
 | Раздел | Что на экране |
 |---|---|
 | Сводка | Счётчики нод, клиентов, групп и подписок; «Требует внимания» (нет пароля SSH, отложенная SSH-настройка, не задан хост подписок, рассинхронизация GitHub, обновление, открытая панель, группа без нод — по `group list`, нода, чьи подключения не назначены ни одной группе — по `group list` и `node list`, со ссылкой на вкладку «Подключения» ноды); «Добавить ноду», «Добавить клиента», «Сгенерировать конфиги» |
-| Ноды | Таблица нод с состоянием; «Синхронизировать все» — `conn sync` по всем нодам и `conn list`, ниже — обзор «Подключения по группам» (назначено группе / найдено на ноде, недоступные ноды отмечены), как экран меню «Подключения»; страница ноды с вкладками «Обзор», «Подключения» (`conn sync --name`/`conn list --name`, назначение группам, псевдонимы), «AmneziaWG» (`awg status\|sync\|remove`), «Обслуживание» (проверка, загрузка скриптов, усиление SSH, Telegram Proxy ноды, удаление) |
+| Ноды | Таблица нод с состоянием; «Синхронизировать все» — `conn sync` по всем нодам и `conn list`, ниже — обзор «Подключения по группам» (назначено группе / найдено на ноде, недоступные ноды отмечены), как экран меню «Подключения»; страница ноды с вкладками «Обзор», «Подключения» (`conn sync --name`/`conn list --name`; назначение группам — форма с полем на каждое подключение, текущие группы отмечены, снятая отметка снимает назначение; одна `conn set --name N --assign G=P1,P2 …` только для изменённых групп (без изменений команды нет); псевдонимы), «AmneziaWG» (`awg status\|sync\|remove`), «Обслуживание» (проверка, загрузка скриптов, усиление SSH, Telegram Proxy ноды, удаление) |
 | Клиенты | Таблица с отметками для удаления нескольких («Выбрать все» при поиске отмечает только найденные строки); страница клиента с вкладками «Обзор», «Доступ» (ноды и подключения по нодам; удалённая нода отмечена), «Подписка» (публикация, ссылка, заголовки, токен; нечитаемый хост подписок — «не удалось прочитать») |
-| Группы | Таблица групп; страница группы: шаблон, клиенты группы, генерация, заголовки подписки |
+| Группы | Таблица групп (у группы без нод вместо списка нод — «Добавить подключения»); страница группы: шаблон, ноды, клиенты группы, генерация, заголовки подписки; «Подключения нод…» — выбор ноды (единственная выбирается сама), найденные на ней подключения (`conn list --name N --discover`, назначенные группе отмечены) → `conn set --name N --assign G=P…` (без отметок назначение снимается) |
 | Шаблоны | Таблица шаблонов (встроенный, пользовательский, изменённый встроенный); редактор шаблона |
 | Подписки | Хост-нода и базовый URL (или «не задана»), таблица опубликованных подписок; «Обновить все подписки», «Хост-нода…», «Заголовки группы» и перенос на другую ноду доступны и без хоста — сбой объясняет ядро |
 | Telegram Proxy | Статус нод загружается кнопкой (опрос по SSH) и перечитывается после пакетного действия; пакетные действия по выбранным нодам |
@@ -1798,7 +1804,7 @@ SSH с терминалом (ссылки, смена секрета, спонс
 
 1. `conn sync [--name N]` по SSH читает `/etc/mihomo/client-config.txt` нод, обнаруживает подключения и убирает устаревшие назначения (в том числе из `clients[].connections`; запись клиента остаётся). Сначала опрашиваются все ноды, затем по одной записи на изменённую ноду. Недоступные ноды пропускаются; при ошибках ответ — `partial` с `{nodes, ok, failed, total, stopped_at}`.
 2. `conn list [--name N [--discover]]` показывает назначения без SSH; с `--discover` добавляет найденные на ноде подключения.
-3. `conn set --name N --group G… [--proxy P…]` назначает подключения группам одной записью (без `--proxy` — снимает).
+3. `conn set --name N --assign G=P1,P2…` задаёт подключения групп на ноде одной записью: каждой группе из `--assign` — ровно этот список (порядок сохраняется, повторы убираются), `G=` снимает назначение, остальные группы не меняются. Группа, у которой набор прокси (без учёта порядка) уже такой же, не меняется; если не изменилось ничего — записи нет. Ответ `{"node", "changed": [{"group", "proxies"}]}` — только изменённые группы. Без `--assign` — `usage`; пустое имя группы, нет `=` или группа дважды — `invalid`; неизвестная нода или группа — `not_found` (у группы extra `group`).
 
 Покрытие по группам в меню показано цветом (зелёный/жёлтый/тусклый).
 
@@ -1967,7 +1973,7 @@ client   (из clients[].subscription.headers)
 
 ### 4. Назначить подключения группам
 
-**p** → выбрать ноду → **b** → отметить подключения и группы (`conn set --name N --group G… --proxy P…`).
+**p** → выбрать ноду → **b** → выбрать подключение, отметить его группы, **s** — сохранить (`conn set --name N --assign G=P…`); или в карточке группы **g** → группа → **c**.
 
 ### 5. Добавить клиентов
 

@@ -586,7 +586,7 @@ fn connection_node(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
         }
         let Some(choice) = ctx.choose(&view)? else { return Ok(()); };
         match choice.as_str() {
-            "b" | "B" => assign_connections(ctx, name, &proxies, &assigned)?,
+            "b" | "B" => assign_connections(ctx, name, &proxies, groups)?,
             "l" | "L" => aliases(ctx, name)?,
             "s" | "S" => { refresh = true; resolve = true; }
             "0" => return Ok(()),
@@ -594,28 +594,80 @@ fn connection_node(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
         }
     }
 }
-/// Proxies (marked as currently assigned) first, then target groups (unmarked).
-/// A confirmed empty proxy set removes the assignment of the chosen groups
-/// (`conn set` without `--proxy`); `0`/EOF in either toggle changes nothing.
-/// Without discovered proxies (node not synced) only removal is possible:
-/// the proxy toggle is skipped.
-fn assign_connections(ctx: &mut Context<'_>, name: &str, proxies: &[String], assigned: &[Vec<String>]) -> io::Result<()> {
-    let selected = if proxies.is_empty() { vec![] } else {
-        let Some(selected) = ctx.toggle("Подключения для групп", proxies, assigned.iter().map(|g| !g.is_empty()).collect(), EMPTY)? else { return Ok(()); };
-        selected
-    };
+/// Proxy by proxy: the menu lists the node's proxies (discovered, then
+/// assigned ones no longer discovered) with their groups; a proxy opens a
+/// toggle of every group, preselected with its current groups. Edits stay
+/// local: «Сохранить» sends one `conn set` with an `--assign` for each group
+/// whose proxy set changed (others are not sent: a stale form must not undo
+/// concurrent changes), nothing changed — no command; `0`/EOF discards.
+fn assign_connections(ctx: &mut Context<'_>, name: &str, discovered: &[String], current: &[Value]) -> io::Result<()> {
     let listed = ctx.call(&["group", "list"])?;
     if !listed.ok { outcome(ctx, &listed); return Ok(()); }
     let groups = names(&listed.data);
-    let title = if selected.is_empty() { "Группы: снять назначение подключений" } else { "Группы для подключений" };
-    let Some(targets) = ctx.toggle(title, &groups, vec![], EMPTY)? else { return Ok(()); };
-    if targets.is_empty() { ctx.ui.notice(ui::warn("Ничего не выбрано.")); return Ok(()); }
-    let mut words = argv(&["conn", "set", "--name", name]);
-    for i in targets { words.extend(argv(&["--group", &groups[i]])); }
-    for i in selected { words.extend(argv(&["--proxy", &proxies[i]])); }
-    let saved = ctx.request(&words, &Secrets::default())?;
-    outcome(ctx, &saved);
-    Ok(())
+    if groups.is_empty() { ctx.ui.notice(ui::warn("Нет групп.")); return Ok(()); }
+    // Proxies of every group on the node, as edited.
+    let mut assignment: Vec<Vec<String>> = groups.iter()
+        .map(|group| current.iter().find(|entry| text(&entry["name"]) == *group)
+            .map(|entry| rows(&entry["proxies"]).iter().map(text).collect()).unwrap_or_default())
+        .collect();
+    let mut proxies = discovered.to_vec();
+    for proxy in assignment.iter().flatten() {
+        if !proxies.contains(proxy) { proxies.push(proxy.clone()); }
+    }
+    if proxies.is_empty() { ctx.ui.notice(ui::warn("Подключения не найдены: синхронизируйте ноду.")); return Ok(()); }
+    let saved = assignment.clone();
+    loop {
+        let mut view = View::new(format!("Назначение подключений: {name}"));
+        view.prompt = "Выберите подключение или действие: ".into();
+        view.sections.push(proxies.iter().enumerate().map(|(i, proxy)| {
+            let of: Vec<&str> = groups.iter().zip(&assignment).filter(|(_, list)| list.contains(proxy)).map(|(group, _)| group.as_str()).collect();
+            Item::new(i + 1, format!("{proxy}  [{}]", of.join(", ")), ui::CYAN)
+        }).collect());
+        view.sections.push(vec![Item::new('s', "Сохранить", ui::YELLOW), Item::new(0, "Отмена", ui::NC)]);
+        if assignment.iter().zip(&saved).any(|(list, before)| !same_set(list, before)) {
+            view.context.push(ui::text("Есть несохранённые изменения", ui::YELLOW));
+        }
+        let Some(choice) = ctx.choose(&view)? else { return Ok(()); };
+        match choice.as_str() {
+            "0" => return Ok(()),
+            "s" | "S" => {
+                let changed: Vec<(&str, &[String])> = groups.iter().zip(assignment.iter().zip(&saved))
+                    .filter(|(_, (list, before))| !same_set(list, before))
+                    .map(|(group, (list, _))| (group.as_str(), list.as_slice())).collect();
+                if changed.is_empty() { ctx.ui.notice(ui::warn("Изменений нет.")); return Ok(()); }
+                let reply = ctx.request(&conn_set_argv(name, &changed), &Secrets::default())?;
+                outcome(ctx, &reply);
+                return Ok(());
+            }
+            _ => match index(&choice, proxies.len()) {
+                Some(i) => {
+                    let proxy = &proxies[i];
+                    let flags = assignment.iter().map(|list| list.contains(proxy)).collect();
+                    let Some(chosen) = ctx.toggle(&format!("Группы подключения {proxy}"), &groups, flags, EMPTY)? else { continue };
+                    for (g, list) in assignment.iter_mut().enumerate() {
+                        match (list.contains(proxy), chosen.contains(&g)) {
+                            (false, true) => list.push(proxy.clone()),
+                            (true, false) => list.retain(|p| p != proxy),
+                            _ => {}
+                        }
+                    }
+                }
+                None => ctx.invalid(),
+            },
+        }
+    }
+}
+/// The same proxies regardless of order (how `conn set` compares them).
+pub(crate) fn same_set(a: &[String], b: &[String]) -> bool {
+    a.iter().all(|p| b.contains(p)) && b.iter().all(|p| a.contains(p))
+}
+/// `conn set --name N --assign G=P1,P2…` for the given groups (`G=` unassigns).
+pub(crate) fn conn_set_argv(node: &str, assignments: &[(&str, &[String])]) -> Vec<String> {
+    let mut words = argv(&["conn", "set", "--name", node]);
+    for (group, proxies) in assignments {
+        words.extend(argv(&["--assign", &format!("{group}={}", proxies.join(","))]));
+    }
+    words
 }
 
 // ─── AmneziaWG ───────────────────────────────────────────────────────────────
@@ -804,7 +856,7 @@ mod tests {
         ("node", "add", "name= ip= port= user= auth= tag= host-key= accept-new-host-key replace-host-key= defer-ssh-setup"),
         ("node", "trust-host-key", "name= host-key="), ("node", "delete", "name= scope= revoke-key"), ("node", "check", "name="),
         ("node", "upload-scripts", "name= force"), ("node", "harden", "name= port="), ("node", "setup-ssh", "provision-keys= on-failure="),
-        ("node", "shell", "name="), ("conn", "list", "name= discover"), ("conn", "set", "name= group+ proxy+"), ("conn", "sync", "name="),
+        ("node", "shell", "name="), ("conn", "list", "name= discover"), ("conn", "set", "name= assign+"), ("conn", "sync", "name="),
         ("awg", "status", "name="), ("awg", "sync", "name="), ("awg", "remove", "name= peer+ orphans"),
         ("telegram", "status", TG), ("telegram", "install", TG), ("telegram", "refresh-ip", TG), ("telegram", "web-update", TG),
         ("telegram", "web-restart", TG), ("telegram", "backend-restart", TG), ("telegram", "remove", TG), ("telegram", "remove-all", TG),
@@ -1198,42 +1250,34 @@ mod tests {
     }
     fn node_list() -> (Vec<String>, Reply) { step(&["conn", "list", "--name", "n"], ok(json!([{"node": "n", "groups": [{"name": "old", "proxies": ["p1"]}]}]))) }
     #[test]
-    fn connection_assignment_toggles_proxies_then_groups_and_cancels_atomically() {
-        for key in ["b", "B"] {
-            let (_, _, ui) = run(vec![
-                node_sync(json!(["p1", "p2"])), node_list(), step(&["group", "list"], ok(json!([{"name": "g1"}, {"name": "g2"}]))),
-                step(&["conn", "set", "--name", "n", "--group", "g2", "--proxy", "p2"], ok(json!({}))), node_list(),
-            ], &[key, "1", "2", "", "2", "", "0"], |ctx| connection_node(ctx, "n"));
-            assert!(ui.views[1].sections[0][0].label.starts_with("[x]") && ui.views[1].sections[0][1].label.starts_with("[ ]"));
-            assert!(ui.views[4].sections[0].iter().take(2).all(|i| i.label.starts_with("[ ]")));
-            assert!(ui.views[0].context.iter().any(|l| l.to_string() == "p1  [old]"));
-        }
-        run(vec![node_sync(json!(["p1", "p2"])), node_list(), node_list()], &["b", "2", "0", "0"], |ctx| connection_node(ctx, "n"));
-        run(vec![node_sync(json!(["p1"])), node_list(), step(&["group", "list"], ok(json!([{"name": "g1"}]))), node_list()],
-            &["b", "", "1", "0", "0"], |ctx| connection_node(ctx, "n"));
-        // A confirmed empty selection removes the last assignment of the chosen
-        // groups (no `--proxy`); cancelling the group toggle changes nothing.
+    fn connection_assignment_edits_per_proxy_and_sends_only_changed_groups() {
         let groups = || step(&["group", "list"], ok(json!([{"name": "old"}, {"name": "g2"}])));
-        let (_, client, ui) = run(vec![node_sync(json!(["p1"])), node_list(), groups(),
-            step(&["conn", "set", "--name", "n", "--group", "old"], ok(json!({}))), node_list()],
-            &["b", "1", "", "1", "", "0"], |ctx| connection_node(ctx, "n"));
-        assert!(client.calls.iter().all(|call| !call.contains(&"--proxy".to_owned())));
-        assert!(ui.notices.is_empty());
-        run(vec![node_sync(json!(["p1"])), node_list(), groups(), node_list()], &["b", "1", "", "1", "0", "0"], |ctx| connection_node(ctx, "n"));
-        run(vec![node_sync(json!(["p1"])), node_list(), node_list()], &["b", "1", "0", "0"], |ctx| connection_node(ctx, "n"));
-        let (_, _, ui) = run(vec![node_sync(json!(["p1"])), node_list(), groups(), node_list()], &["b", "1", "", "", "0"], |ctx| connection_node(ctx, "n"));
-        assert!(noticed(&ui, "Ничего не выбрано."));
-        // Unreachable node: nothing discovered, the proxy toggle is skipped and
-        // the chosen group's assignment can still be removed.
+        for key in ["b", "B"] {
+            // p2 → g2; p1: off old, on g2. One command with both changed groups.
+            let (_, _, ui) = run(vec![
+                node_sync(json!(["p1", "p2"])), node_list(), groups(),
+                step(&["conn", "set", "--name", "n", "--assign", "old=", "--assign", "g2=p2,p1"], ok(json!({"node": "n", "changed": []}))), node_list(),
+            ], &[key, "2", "2", "", "1", "1", "2", "", "s", "0"], |ctx| connection_node(ctx, "n"));
+            assert!(ui.views[0].context.iter().any(|l| l.to_string() == "p1  [old]"));
+            assert_eq!(ui.views[1].sections[0][0].label, "p1  [old]");
+            assert!(ui.views[4].context.iter().any(|l| l.style.fg == Some(ui::YELLOW)), "unsaved edits are marked");
+            assert!(ui.views[5].sections[0][0].label.starts_with("[x]") && ui.views[5].sections[0][1].label.starts_with("[ ]"));
+            assert_eq!(ui.views[8].sections[0][0].label, "p1  [g2]");
+        }
+        // A cancelled form sends nothing; an unchanged one says so and sends nothing.
+        run(vec![node_sync(json!(["p1", "p2"])), node_list(), groups(), node_list()], &["b", "1", "2", "", "0", "0"], |ctx| connection_node(ctx, "n"));
+        let (_, _, ui) = run(vec![node_sync(json!(["p1"])), node_list(), groups(), node_list()],
+            &["b", "1", "2", "", "1", "2", "", "s", "0"], |ctx| connection_node(ctx, "n"));
+        assert!(noticed(&ui, "Изменений нет."));
+        // Unreachable node: nothing discovered, an assigned proxy can still be removed.
         let unreachable = step(&["conn", "sync", "--name", "n"], err("partial", json!({"nodes": [{"name": "n", "status": "unreachable", "error": "remote_failed"}]})));
-        let (_, client, ui) = run(vec![unreachable, node_list(), groups(),
-            step(&["conn", "set", "--name", "n", "--group", "old"], ok(json!({}))), node_list()],
-            &["b", "1", "", "0"], |ctx| connection_node(ctx, "n"));
-        assert!(client.calls.iter().all(|call| !call.contains(&"--proxy".to_owned())));
-        assert!(ui.views.iter().all(|v| v.title != "Подключения для групп"));
-        // Cancelling the group toggle still changes nothing.
-        let unreachable = step(&["conn", "sync", "--name", "n"], err("partial", json!({"nodes": [{"name": "n", "status": "unreachable", "error": "remote_failed"}]})));
-        run(vec![unreachable, node_list(), groups(), node_list()], &["b", "0", "0"], |ctx| connection_node(ctx, "n"));
+        run(vec![unreachable, node_list(), groups(),
+            step(&["conn", "set", "--name", "n", "--assign", "old="], ok(json!({"node": "n", "changed": []}))), node_list()],
+            &["b", "1", "1", "", "s", "0"], |ctx| connection_node(ctx, "n"));
+        // No proxies at all: nothing to edit.
+        let empty = step(&["conn", "list", "--name", "n"], ok(json!([{"node": "n", "groups": []}])));
+        let (_, _, ui) = run(vec![node_sync(json!([])), empty.clone(), groups(), empty], &["b", "0"], |ctx| connection_node(ctx, "n"));
+        assert!(noticed(&ui, "Подключения не найдены: синхронизируйте ноду."));
     }
     #[test]
     fn connection_node_sync_and_alias_hotkeys_both_cases() {

@@ -105,7 +105,7 @@ static CATALOG: &[Spec] = &[
     spec("node", "setup-ssh", "provision-keys= on-failure=", &[], 0),
     spec("node", "shell", "name=", &[], TTY),
     spec("conn", "list", "name= discover", &[], 0),
-    spec("conn", "set", "name= group+ proxy+", &[], 0),
+    spec("conn", "set", "name= assign+", &[], 0),
     spec("conn", "sync", "name=", &[], 0),
     spec("awg", "status", "name=", &[], 0),
     spec("awg", "sync", "name=", &[], 0),
@@ -182,7 +182,7 @@ static HELP: &[(&str, &[(&str, &str)])] = &[
     ]),
     ("conn", &[
         ("conn list [--name N [--discover]]", "Подключения нод по группам"),
-        ("conn set --name N --group G… [--proxy P…]", "Назначить подключения группам (без --proxy — снять)"),
+        ("conn set --name N --assign G=P1,P2…", "Задать подключения групп на ноде (G= — снять назначение; другие группы не меняются)"),
         ("conn sync [--name N]", "Обнаружить подключения нод по SSH и убрать устаревшие назначения"),
     ]),
     ("daemon", &[

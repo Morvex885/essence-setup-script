@@ -495,7 +495,8 @@ fn group_card(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
         };
         let template = text(&row["template"]).to_owned();
         let mut view = View::menu(format!("Группа: {name}"), vec![
-            Item::new('t', "Шаблон", ui::YELLOW), Item::new('h', "Заголовки подписки группы", ui::YELLOW),
+            Item::new('t', "Шаблон", ui::YELLOW), Item::new('c', "Подключения нод", ui::YELLOW),
+            Item::new('h', "Заголовки подписки группы", ui::YELLOW),
             Item::new('f', "Сгенерировать конфиги группы", ui::YELLOW), Item::new('d', "Удалить группу", ui::RED), back(),
         ]);
         view.context = vec![
@@ -507,12 +508,43 @@ fn group_card(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
         match choice.to_ascii_lowercase().as_str() {
             "0" => return Ok(()),
             "t" => group_template(ctx, name, &template)?,
+            "c" => group_connections(ctx, name)?,
             "h" => headers(ctx, "group", name)?,
             "f" => generate(ctx, &["--group", name])?,
             "d" => if confirmed(ctx, "Удаление группы", "Удалить группу?", &["group", "delete", "--name", name])?.ok { return Ok(()); },
             _ => ctx.invalid(),
         }
     }
+}
+/// The group's proxies on one node (the only node is taken without asking):
+/// a toggle of the node's discovered proxies (and assigned ones no longer
+/// discovered) preselected with the group's; a changed set is sent as one
+/// `conn set --assign G=…` (empty — the assignment is removed).
+fn group_connections(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
+    let Some(data) = fetch(ctx, &["node", "list"])? else { return Ok(()); };
+    let node = match rows(&data) {
+        [] => { ctx.ui.notice(ui::warn("Нет нод.")); return Ok(()); }
+        [only] => text(&only["name"]).to_owned(),
+        nodes => {
+            let labels: Vec<String> = nodes.iter().map(node_label).collect();
+            let Some(i) = ctx.select(&format!("Подключения группы {name}: нода"), &labels)? else { return Ok(()); };
+            text(&nodes[i]["name"]).to_owned()
+        }
+    };
+    let Some(found) = node_request(ctx, &node, &["conn", "list", "--name", &node, "--discover"])? else { return Ok(()); };
+    let current: Vec<String> = rows(&found[0]["groups"]).iter().filter(|g| g["name"] == name).flat_map(|g| strings(&g["proxies"])).collect();
+    let mut proxies = strings(&found[0]["discovered"]);
+    for proxy in &current {
+        if !proxies.contains(proxy) { proxies.push(proxy.clone()); }
+    }
+    let flags = proxies.iter().map(|p| current.contains(p)).collect();
+    let Some(selected) = ctx.toggle(&format!("Подключения группы {name} на {node}"), &proxies, flags, EMPTY)? else { return Ok(()); };
+    let chosen: Vec<String> = selected.into_iter().map(|i| proxies[i].clone()).collect();
+    if crate::nodes::same_set(&chosen, &current) { ctx.ui.notice(ui::warn("Изменений нет.")); return Ok(()); }
+    let words = crate::nodes::conn_set_argv(&node, &[(name, &chosen)]);
+    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+    execute(ctx, &words)?;
+    Ok(())
 }
 fn group_template(ctx: &mut Context<'_>, name: &str, current: &str) -> io::Result<()> {
     let Some(data) = fetch(ctx, &["template", "list"])? else { return Ok(()); };
@@ -1264,7 +1296,37 @@ mod tests {
         let card = view(&ui, "Группа: PC");
         assert!(content(card).contains("Клиентов: 1"));
         assert_eq!(keys(card).last().unwrap(), &("0".into(), ui::NC));
-        assert_eq!(keys(card)[3], ("d".into(), ui::RED));
+        assert_eq!(keys(card)[1], ("c".into(), ui::YELLOW));
+        assert_eq!(keys(card)[4], ("d".into(), ui::RED));
+    }
+    #[test]
+    fn group_connections_pick_a_node_and_send_only_a_changed_set() {
+        let nodes = json!([{"name":"de","ip":"1.2.3.4","port":22},{"name":"ru","ip":"5.6.7.8","port":22}]);
+        let found = json!([{"node":"ru","groups":[{"name":"PC","proxies":["p1","stale"]},{"name":"X","proxies":["p2"]}],"discovered":["p1","p2"]}]);
+        let discover = ["conn", "list", "--name", "ru", "--discover"];
+        // Two nodes: the second is chosen; the toggle lists stale assigned
+        // proxies too and starts from the group's set.
+        let (core, ui) = drive(vec![
+            ok(&["node", "list"], nodes.clone()), ok(&discover, found.clone()),
+            ok(&["conn", "set", "--name", "ru", "--assign", "PC=p1,p2"], json!({"node":"ru","changed":[{"group":"PC","proxies":["p1","p2"]}]})),
+        ], &["2", "2", "3", ""], |ctx| group_connections(ctx, "PC"));
+        core.assert_finished();
+        let toggle = &ui.views[1];
+        let labels: Vec<&str> = toggle.sections[0].iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(&labels[..3], ["[x] p1", "[ ] p2", "[x] stale"]);
+        // One node is taken without asking; an unchanged set sends nothing.
+        let (core, ui) = drive(vec![ok(&["node", "list"], json!([nodes[1].clone()])), ok(&discover, found.clone())],
+            &["2", "2", ""], |ctx| group_connections(ctx, "PC"));
+        core.assert_finished();
+        assert!(ui.notices.iter().any(|n| n.to_string().contains("Изменений нет")));
+        // Clearing the set removes the group's assignment on the node.
+        let (core, _) = drive(vec![ok(&["node", "list"], json!([nodes[1].clone()])), ok(&discover, found),
+            ok(&["conn", "set", "--name", "ru", "--assign", "PC="], json!({"node":"ru","changed":[{"group":"PC","proxies":[]}]}))],
+            &["1", "3", ""], |ctx| group_connections(ctx, "PC"));
+        core.assert_finished();
+        let (core, ui) = drive(vec![ok(&["node", "list"], json!([]))], &[], |ctx| group_connections(ctx, "PC"));
+        core.assert_finished();
+        assert!(ui.notices.iter().any(|n| n.to_string().contains("Нет нод")));
     }
     #[test]
     fn group_new_template_choice_creates_bound_template_then_opens_editor() {
