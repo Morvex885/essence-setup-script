@@ -32,6 +32,9 @@ const WORK_BUDGET: usize = 4_000_000;
 /// Nesting of YAML collections at most; deeper is a `yaml` error before any
 /// recursive step (the tree loader, `to_json`, `locate`, the validator).
 const MAX_DEPTH: usize = 128;
+/// Scalar bytes of a variant at most, counted as aliases expand them; more
+/// is a `yaml` error before the loader copies a scalar per alias.
+const MAX_EXPANDED: usize = 8 << 20;
 /// A collection with more nodes than this is validated child by child.
 const SPLIT_NODES: usize = 2000;
 /// A mapping is split only with more entries than this (a map of names, not
@@ -45,17 +48,40 @@ static SCHEMA: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/schemas
 /// The embedded schema (`core/schemas/README.md`), in `template check` replies.
 pub const SCHEMA_VERSION: &str = "meta-json-schema v1.19.33";
 
+/// The compiled schema and every key it names in `properties`: other keys
+/// of a template (provider names, hosts, a mis-indented value) never enter
+/// a problem.
+struct Schema {
+    validator: jsonschema::Validator,
+    keys: HashSet<String>,
+}
+
 /// Draft-07 from the schema's `$schema`; patterns use the default
 /// fancy-regex engine (the schema has lookaheads); formats are not checked.
 /// A schema that does not compile is an error of the command, not a panic.
-static VALIDATOR: LazyLock<std::result::Result<jsonschema::Validator, String>> = LazyLock::new(|| {
+static COMPILED: LazyLock<std::result::Result<Schema, String>> = LazyLock::new(|| {
     let schema: Value = serde_json::from_str(SCHEMA).map_err(|error| error.to_string())?;
-    jsonschema::options().should_validate_formats(false).build(&schema).map_err(|error| error.to_string())
+    let validator = jsonschema::options().should_validate_formats(false).build(&schema).map_err(|error| error.to_string())?;
+    let mut keys = HashSet::new();
+    let mut pending = vec![&schema];
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::Object(fields) => {
+                if let Some(Value::Object(properties)) = fields.get("properties") {
+                    keys.extend(properties.keys().cloned());
+                }
+                pending.extend(fields.values());
+            }
+            Value::Array(items) => pending.extend(items),
+            _ => {}
+        }
+    }
+    Ok(Schema { validator, keys })
 });
 
 /// The schema validator is usable; callers of `check` ask first.
 pub fn ready() -> Result<()> {
-    VALIDATOR.as_ref().map(|_| ()).map_err(|error| {
+    COMPILED.as_ref().map(|_| ()).map_err(|error| {
         RcError::new("failed", format!("Встроенная схема конфигурации mihomo не загрузилась: {error}"))
     })
 }
@@ -266,10 +292,13 @@ fn check_variant(kept: &[(usize, &str)], budget: &mut Budget) -> Vec<Problem> {
         text.push_str(line);
         text.push('\n');
     }
-    if let Some(marker) = too_deep(&text) {
+    if let Some((marker, excess)) = too_large(&text) {
         let (line, column) = source_position(kept, &marker);
-        problems.push(problem(line, column, "error", "yaml",
-            format!("Ошибка YAML: вложенность глубже {MAX_DEPTH} уровней (с учётом ссылок *имя).")));
+        let message = match excess {
+            Excess::Depth => format!("Ошибка YAML: вложенность глубже {MAX_DEPTH} уровней (с учётом ссылок *имя)."),
+            Excess::Volume => format!("Ошибка YAML: с раскрытием ссылок *имя значения занимают больше {} МиБ.", MAX_EXPANDED >> 20),
+        };
+        problems.push(problem(line, column, "error", "yaml", message));
         return problems;
     }
     let documents = match MarkedYaml::load_from_str(&text) {
@@ -291,39 +320,83 @@ fn check_variant(kept: &[(usize, &str)], budget: &mut Budget) -> Vec<Problem> {
     for (path, what) in found {
         let marker = root.map_or_else(Marker::default, |root| locate(root, &path));
         let (line, column) = source_position(kept, &marker);
+        let path = masked(&instance, &path);
         let message = schema_message(&what, &path);
         problems.push(Problem { path: Some(path), ..problem(line, column.max(1), "warning", "schema", message) });
     }
     problems
 }
 
-/// The start of the first collection nested deeper than `MAX_DEPTH`,
-/// counting what an alias expands to; read from parser events, without
-/// recursion. A syntax error is left to the loader.
-fn too_deep(text: &str) -> Option<Marker> {
+/// A JSON pointer into `document` with every key the schema does not name
+/// replaced by `*` (list indices stay): the position is in line and column.
+fn masked(document: &Value, pointer: &str) -> String {
+    let keys = COMPILED.as_ref().map(|schema| &schema.keys).ok();
+    let mut node = Some(document);
+    let mut out = String::with_capacity(pointer.len());
+    for segment in pointer.split('/').skip(1) {
+        let key = segment.replace("~1", "/").replace("~0", "~");
+        let shown = match node {
+            Some(Value::Array(_)) => true,
+            _ => keys.is_some_and(|keys| keys.contains(&key)),
+        };
+        node = match node {
+            Some(Value::Array(items)) => key.parse::<usize>().ok().and_then(|index| items.get(index)),
+            Some(Value::Object(fields)) => fields.get(&key),
+            _ => None,
+        };
+        out.push('/');
+        out.push_str(if shown { segment } else { "*" });
+    }
+    out
+}
+
+enum Excess {
+    Depth,
+    Volume,
+}
+
+/// Where the text goes over a limit counting what aliases expand to: the
+/// start of the first collection nested deeper than `MAX_DEPTH`, or the
+/// first scalar or alias past `MAX_EXPANDED` scalar bytes. Read from parser
+/// events, without recursion. A syntax error is left to the loader.
+fn too_large(text: &str) -> Option<(Marker, Excess)> {
     use saphyr_parser::{Event, Parser};
-    // Open collections: (anchor id, height of the deepest child so far).
-    let mut open: Vec<(usize, usize)> = Vec::new();
-    // Height of each anchored collection (a scalar anchor has height 0).
-    let mut heights: HashMap<usize, usize> = HashMap::new();
+    /// An open collection.
+    struct Open { anchor: usize, height: usize, bytes: usize }
+    let mut open: Vec<Open> = Vec::new();
+    // Height and scalar bytes of each anchored node (a scalar has height 0).
+    let mut anchored: HashMap<usize, (usize, usize)> = HashMap::new();
+    let mut total: usize = 0;
     for event in Parser::new_from_str(text) {
         let Ok((event, span)) = event else { return None };
-        match event {
+        // Height and bytes of a complete node that enters its parent.
+        let node = match event {
             Event::SequenceStart(anchor, _) | Event::MappingStart(anchor, _) => {
-                if open.len() + 1 > MAX_DEPTH { return Some(span.start); }
-                open.push((anchor, 0));
+                if open.len() + 1 > MAX_DEPTH { return Some((span.start, Excess::Depth)); }
+                open.push(Open { anchor, height: 0, bytes: 0 });
+                None
             }
-            Event::SequenceEnd | Event::MappingEnd => {
-                let Some((anchor, height)) = open.pop() else { continue };
-                if anchor != 0 { heights.insert(anchor, height + 1); }
-                if let Some(parent) = open.last_mut() { parent.1 = parent.1.max(height + 1); }
+            Event::SequenceEnd | Event::MappingEnd => open.pop().map(|done| {
+                if done.anchor != 0 { anchored.insert(done.anchor, (done.height + 1, done.bytes)); }
+                (done.height + 1, done.bytes)
+            }),
+            Event::Scalar(value, _, anchor, _) => {
+                if anchor != 0 { anchored.insert(anchor, (0, value.len())); }
+                total = total.saturating_add(value.len());
+                Some((0, value.len()))
             }
             Event::Alias(anchor) => {
-                let height = heights.get(&anchor).copied().unwrap_or(0);
-                if open.len() + height > MAX_DEPTH { return Some(span.start); }
-                if let Some(parent) = open.last_mut() { parent.1 = parent.1.max(height); }
+                let (height, bytes) = anchored.get(&anchor).copied().unwrap_or_default();
+                if open.len() + height > MAX_DEPTH { return Some((span.start, Excess::Depth)); }
+                total = total.saturating_add(bytes);
+                Some((height, bytes))
             }
-            _ => {}
+            _ => None,
+        };
+        if total > MAX_EXPANDED { return Some((span.start, Excess::Volume)); }
+        if let (Some((height, bytes)), Some(parent)) = (node, open.last_mut()) {
+            parent.height = parent.height.max(height);
+            parent.bytes = parent.bytes.saturating_add(bytes);
         }
     }
     None
@@ -413,7 +486,7 @@ fn split_children(value: &Value) -> Vec<(Step, Value)> {
 /// top-level key with that collection holding only this child.
 fn schema_errors(document: &Value, budget: &mut Budget, out: &mut Vec<(String, String)>) {
     // `ready()` was asked before `check`; without a schema nothing is checked.
-    let Ok(validator) = VALIDATOR.as_ref() else { return };
+    let Ok(Schema { validator, .. }) = COMPILED.as_ref() else { return };
     if !budget.spend(nodes(document)) || validator.is_valid(document) { return; }
     let mut split = Vec::new();
     large(document, &mut Vec::new(), &mut split);
@@ -465,8 +538,15 @@ fn schema_errors(document: &Value, budget: &mut Budget, out: &mut Vec<(String, S
             let mut found = Vec::new();
             schema_errors(&part, budget, &mut found);
             for (path, what) in found {
-                let Some(rest) = path.strip_prefix(shown.as_str()).filter(|rest| rest.is_empty() || rest.starts_with('/')) else { continue };
-                out.push((format!("{original}{rest}"), what));
+                if let Some(rest) = path.strip_prefix(shown.as_str()).filter(|rest| rest.is_empty() || rest.starts_with('/')) {
+                    out.push((format!("{original}{rest}"), what));
+                } else if !path.is_empty() && base.strip_prefix(path.as_str()).is_some_and(|rest| rest.starts_with('/')) {
+                    // An ancestor below the root (an anyOf item holding the
+                    // collection) fails with this child: the same path in the
+                    // document, once for all children.
+                    let found = (path, what);
+                    if !out.contains(&found) { out.push(found); }
+                }
             }
         }
     }
@@ -836,6 +916,25 @@ mod tests {
     }
 
     #[test]
+    fn aliases_of_large_values_are_a_yaml_error_before_loading() {
+        // Under 1 MiB of text, about 1 GiB once every alias is a copy.
+        let big = "x".repeat(512 * 1024);
+        for value in [format!("\"{big}\""), big.clone(), format!("[{big}]")] {
+            let content = format!("proxies:\nx-big: &s {value}\nx-refs: [{}]\n", vec!["*s"; 2000].join(","));
+            assert!(content.len() < crate::request_input::Input::MAX_VALUE);
+            let report = check(&content, &groups());
+            assert_eq!(codes(&report), [(3, "yaml", None)], "{:?}", report.problems);
+            assert!(report.problems[0].message.contains("МиБ"), "{}", report.problems[0].message);
+        }
+        // Aliases nested in anchors multiply.
+        let nested = format!("proxies:\na: &a \"{}\"\nb: &b [*a, *a, *a, *a]\nc: &c [*b, *b, *b, *b]\nd: [*c, *c, *c, *c]\n", "y".repeat(200_000));
+        assert_eq!(codes(&check(&nested, &groups())), [(5, "yaml", None)]);
+        // A value used a few times is checked as usual.
+        let few = format!("proxies:\na: &a \"{}\"\nb: [*a, *a, *a]\n", "y".repeat(100_000));
+        assert!(check(&few, &groups()).problems.is_empty());
+    }
+
+    #[test]
     fn unexpected_keys_are_counted_not_quoted() {
         let kind = ValidationErrorKind::AdditionalProperties { unexpected: vec!["hunter2".into(), "x".into()] };
         let message = schema_message(&schema_what(&kind), "/dns");
@@ -858,6 +957,34 @@ mod tests {
     }
 
     #[test]
+    fn keys_the_schema_does_not_name_are_masked() {
+        let secret = "S3CR3T";
+        let content = format!("proxies:\nproxy-providers:\n  {secret}:\n    type: bogus\n    url: http://x\n");
+        let report = check(&content, &groups());
+        assert!(!report.problems.is_empty());
+        for p in &report.problems {
+            assert!(!p.message.contains(secret) && p.path.as_deref().is_some_and(|path| path.starts_with("/proxy-providers/*")), "{p:?}");
+            assert!((3..=4).contains(&p.line), "the position still points at the key: {p:?}");
+        }
+    }
+
+    #[test]
+    fn an_ancestor_of_a_split_list_fails_with_any_item() {
+        let users = |last_has_password: bool| -> String {
+            (0..1000).map(|i| if i == 999 && !last_has_password {
+                format!("      - {{username: u{i}}}\n")
+            } else {
+                format!("      - {{username: u{i}, password: p}}\n")
+            }).collect()
+        };
+        let listener = |users: String| format!("proxies:\nlisteners:\n  - name: in\n    type: socks\n    port: 1080\n    users:\n{users}");
+        assert!(check(&listener(users(true)), &groups()).problems.is_empty());
+        let report = check(&listener(users(false)), &groups());
+        let schema: Vec<_> = report.problems.iter().map(|p| (p.line, p.code, p.path.as_deref())).collect();
+        assert_eq!(schema, [(3, "schema", Some("/listeners/0"))], "the listener, once");
+    }
+
+    #[test]
     fn problems_are_limited() {
         let content: String = std::iter::once("proxies:\n".to_owned())
             .chain((0..250).map(|i| format!("# --- G{i} ---\n# --- G{i} ---\n"))).collect();
@@ -872,7 +999,7 @@ mod tests {
         let before = fingerprint(root.path());
         let stored = command(&mut session, &invocation(&["template", "check", "--name", "default"]), &Input::default()).unwrap();
         assert_eq!((stored["name"].clone(), stored["errors"].clone(), stored["problems"].clone()), (json!("default.yaml"), json!(0), json!([])));
-        assert_eq!(stored["variants"][0], json!({"tag": null, "dropped": [[30, 39], [49, 51], [80, 88], [113, 123], [155, 158], [392, 394], [398, 401]]}));
+        assert_eq!(stored["variants"][0], json!({"tag": null, "dropped": [[8, 13], [35, 44], [54, 56], [85, 93], [117, 127], [175, 178], [287, 299], [368, 370], [388, 391]]}));
         let mut input = Input::default();
         input.insert("file", "mode: rule\n".to_owned().into()).unwrap();
         let file = command(&mut session, &invocation(&["template", "check"]), &input).unwrap();
