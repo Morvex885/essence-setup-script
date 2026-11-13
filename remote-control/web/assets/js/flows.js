@@ -151,14 +151,17 @@ export async function handleNodeCodes(reply, name, deps) {
  * для команды под подтверждением либо `null`. После устранённого состояния
  * ноды исходная команда повторяется. Оставшийся сбой (не отказ от плана)
  * сообщается `OPERATION_FAILED` (`nodes.rs::outcome`); текст ядра (`error.message`)
- * уже показал `request` — вызывающий экран сбой не повторяет.
+ * уже показал `request` — вызывающий экран сбой не повторяет. Коды `expect`
+ * (команда без подтверждения) экран обрабатывает сам: `request` их не
+ * показывает, `OPERATION_FAILED` нет.
  */
-export async function nodeRequest(name, argv, review, deps) {
+export async function nodeRequest(name, argv, review, deps, { expect = null } = {}) {
   for (;;) {
     const reply = review
       ? await runConfirmed(review.title, review.question, argv, { request: deps.request, confirm: deps.confirm, notify: deps.notify })
-      : await deps.request([...argv], {});
+      : await deps.request([...argv], expect === null ? {} : { expect });
     if (reply.ok) return reply;
+    if (!review && expect !== null && reply.error && reply.error.code === expect) return reply;
     if (await handleNodeCodes(reply, name, deps)) continue;
     if (isFailure(reply) && deps.notify) deps.notify('warn', OPERATION_FAILED);
     return reply;

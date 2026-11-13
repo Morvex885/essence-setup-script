@@ -12,10 +12,15 @@ export function NodeAwg({ ctx, name }) {
   const [busy, run] = useBusy();
   const mounted = useMounted();
 
-  /** `awg status`; отказ (уже показан `nodeRequest`) — «Повторить чтение» на вкладке. */
+  /**
+   * `awg status`; исчезнувшая нода (`not_found`) — к списку нод, пока вкладка
+   * открыта; прочий отказ (уже показан `nodeRequest`) — «Повторить чтение».
+   */
   const load = async () => {
-    const answer = await ctx.nodeRequest(name, awgStatusArgv(name), null);
-    if (mounted.current) setReply(answer);
+    const answer = await ctx.nodeRequest(name, awgStatusArgv(name), null, { expect: 'not_found' });
+    if (!mounted.current) return;
+    if (answer.error && answer.error.code === 'not_found') ctx.navigate('nodes');
+    else setReply(answer);
   };
 
   useEffect(() => { run(load); }, [name]);

@@ -20,6 +20,17 @@ export function settleDraft(current, sent) {
 }
 
 /**
+ * Нужна ли защита ухода: черновик отличается от сохранённого `content` либо
+ * идёт сохранение `saving` (отправленный текст, иначе `null`), а в редакторе
+ * уже другой текст — даже совпавший с прежним сохранённым: после ухода
+ * команда запишет `saving`, а не последнюю правку.
+ */
+export function unsavedChanges(draft, content, saving) {
+  const text = draft !== null ? draft : content;
+  return (draft !== null && draft !== content) || (saving !== null && saving !== text);
+}
+
+/**
  * «Сохранить»: `template import --name T` с черновиком; план ядро просит при
  * перезаписи или ошибках шаблона (одни предупреждения — без плана).
  * `true` — сохранено.

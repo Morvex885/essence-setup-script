@@ -400,8 +400,9 @@ test('подключения клиента на ноде: поиск через
   assert.deepEqual(ctx.calls[1][1].fields[0].value, ['p2']);
   assert.deepEqual(commands(ctx).at(-1), m.clientConnectionsArgv('alice', 'de', ['p1']));
 
+  // Ни найденных, ни назначенных — предупреждение без формы.
   const none = fakeCtx({ replies: [okReply([{ node: 'de', discovered: [] }])] });
-  await m.clientConnectionsFlow(none, 'alice', 'de', assigned);
+  await m.clientConnectionsFlow(none, 'alice', 'de', []);
   assert.deepEqual(kinds(none), ['node', 'notify']);
 
   const unreachable = fakeCtx({ replies: [failure('remote_failed')] });
@@ -411,6 +412,26 @@ test('подключения клиента на ноде: поиск через
   const cancelled = fakeCtx({ replies: [found], answers: [null] });
   await m.clientConnectionsFlow(cancelled, 'alice', 'de', assigned);
   assert.deepEqual(kinds(cancelled), ['node', 'form']);
+});
+
+test('подключения клиента на ноде: назначенные, но не найденные (awg-<peer>, устаревшие) отмечены и сохраняются', async () => {
+  const assigned = [{ node: 'de', proxies: ['p1', 'awg-alice', 'old'] }];
+  const found = okReply([{ node: 'de', discovered: ['p1', 'p2', 'AWG'] }]);
+  const ctx = fakeCtx({ replies: [found, okReply()], answers: [] });
+  ctx.form = async (props) => { ctx.calls.push(['form', props]); return { proxies: props.fields[0].value }; };
+  await m.clientConnectionsFlow(ctx, 'alice', 'de', assigned);
+  const [field] = ctx.calls[1][1].fields;
+  assert.deepEqual(field.options.map((option) => option.value), ['p1', 'p2', 'AWG', 'awg-alice', 'old']);
+  assert.deepEqual(field.value, ['p1', 'awg-alice', 'old']);
+  const labels = Object.fromEntries(field.options.map((option) => [option.value, option.label]));
+  assert.equal(labels['awg-alice'], 'awg-alice', 'клиент AmneziaWG при найденном AWG не помечен');
+  assert.notEqual(labels.old, 'old', 'устаревшее подключение помечено');
+  assert.deepEqual(commands(ctx).at(-1), m.clientConnectionsArgv('alice', 'de', ['p1', 'awg-alice', 'old']));
+
+  // Ничего не найдено, но назначения есть — форма с ними, а не «пусто».
+  const only = fakeCtx({ replies: [okReply([{ node: 'de', discovered: [] }])], answers: [null] });
+  await m.clientConnectionsFlow(only, 'alice', 'de', assigned);
+  assert.deepEqual(kinds(only), ['node', 'form']);
 });
 
 test('публикация подписки: срок формой, ссылка после успеха и partial, отмена — без команды', async () => {

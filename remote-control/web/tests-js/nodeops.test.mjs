@@ -176,3 +176,17 @@ test('assignConnections: отмена и форма без изменений н
   await assignConnections(ctx, 'n', ['p1'], [['g']]);
   assert.deepEqual(record.notices, ['failed']);
 });
+
+test('assignConnections: группа, удалённая после чтения подключений, не снимается и не роняет запрос', async () => {
+  // p1 назначен gone и g1; gone уже нет в `group list` — форма без неё, в команде её нет.
+  const steps = [[['group', 'list'], ok([{ name: 'g1' }, { name: 'g2' }])], [assignArgv('n', [['g2', ['p1']]]), ok()]];
+  let { ctx, record } = assignCtx(steps, [{ 'proxy-0': ['g1', 'g2'] }]);
+  await assignConnections(ctx, 'n', ['p1'], [['gone', 'g1']]);
+  assert.deepEqual(field(record.forms[0], 'proxy-0').value, ['g1']);
+  assert.equal(steps.length, 0);
+  assert.deepEqual(record.notices, []);
+  // Без изменений в форме — команды нет.
+  ({ ctx, record } = assignCtx([[['group', 'list'], ok([{ name: 'g1' }])]], [{ 'proxy-0': ['g1'] }]));
+  await assignConnections(ctx, 'n', ['p1'], [['gone', 'g1']]);
+  assert.deepEqual(record.calls, [['group', 'list']]);
+});

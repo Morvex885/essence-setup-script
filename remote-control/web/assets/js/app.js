@@ -486,7 +486,7 @@ function silent(reply, expect) {
  * - `confirm`, `askSecret`, `ask`, `choose`, `form`, `show`, `operation` — диалоги;
  *   `dialogOpen()` — открыто ли окно (горячие клавиши экрана поверх окон молчат);
  * - `runConfirmed(title, question, argv, { secrets, input })`,
- *   `nodeRequest(name, argv, review)` — `flows.js` с этим контекстом;
+ *   `nodeRequest(name, argv, review, { expect })` — `flows.js` с этим контекстом;
  * - `failed()` — «Операция завершилась ошибкой…» для отказов без текста ядра;
  * - `navigate(name, param, tab)`, `href(name, param, tab)`, `terminal(argv, title)` →
  *   ответ после закрытия оверлея (`{ expect }` — как у `request`), `wizard(mode)` →
@@ -534,9 +534,9 @@ function makeContext({ connection, dialogs, notify, record, hello, status, win, 
     runConfirmed: (title, question, argv, { secrets, input } = {}) => runConfirmed(title, question, argv, {
       request: (words, opts) => ctx.request(words, opts), confirm: dialogs.confirm, notify, secrets, input,
     }),
-    nodeRequest: (name, argv, review = null) => nodeRequest(name, argv, review, {
+    nodeRequest: (name, argv, review = null, options = {}) => nodeRequest(name, argv, review, {
       request: (words, opts) => ctx.request(words, opts), confirm: dialogs.confirm, askSecret: dialogs.askSecret, notify,
-    }),
+    }, options),
     navigate: (name, param = null, tab = null) => router.navigate(win, name === 'summary' ? '' : name, param, tab),
     href,
     async terminal(argv, title, { expect = null } = {}) {

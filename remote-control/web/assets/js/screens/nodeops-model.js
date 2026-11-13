@@ -175,7 +175,9 @@ export async function assignConnections(ctx, name, proxies, assigned, stale = []
     fields, submit: 'Сохранить',
   });
   if (values === null || values === undefined) return;
-  const changes = assignmentChanges(proxies, assigned, values);
+  // Сравнение с начальными значениями формы: группа, удалённая после чтения
+  // подключений (её нет в `group list`), не превращается в `--assign G=`.
+  const changes = assignmentChanges(proxies, fields.map((field) => field.value), values);
   if (changes.length === 0) return;
   const saved = await ctx.request(assignArgv(name, changes));
   if (ctx.isFailure(saved)) ctx.failed();

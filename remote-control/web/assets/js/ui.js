@@ -43,6 +43,9 @@ export function Segmented({ options, value, onChange, label = null }) {
   </div>`;
 }
 
+/** Узкий экран (`css/app.css`, `max-width: 639.98px`): меню разделов — по кнопке. */
+const NARROW_QUERY = '(max-width: 639.98px)';
+
 // ─── Каркас ──────────────────────────────────────────────────────────────────
 
 /**
@@ -61,6 +64,12 @@ export function Layout({ menu, activity = null, source = null, linkState = 'open
   const burger = useRef(null);
   useEffect(() => {
     if (!open) return undefined;
+    // Меню по кнопке — только на узком экране: при расширении окна до 640 px
+    // оно становится постоянным, и удержание Tab в нём снимается.
+    const narrow = typeof window.matchMedia === 'function' ? window.matchMedia(NARROW_QUERY) : null;
+    if (narrow && !narrow.matches) { setOpen(false); return undefined; }
+    const onWiden = () => { if (!narrow.matches) setOpen(false); };
+    if (narrow) narrow.addEventListener('change', onWiden);
     const root = nav.current;
     const first = root && root.querySelector('a[href]');
     if (first) first.focus();
@@ -72,6 +81,7 @@ export function Layout({ menu, activity = null, source = null, linkState = 'open
     };
     document.addEventListener('keydown', onKey);
     return () => {
+      if (narrow) narrow.removeEventListener('change', onWiden);
       document.removeEventListener('keydown', onKey);
       // Скрытое меню уже могло сбросить фокус на `body`: возвращаем его кнопке.
       const active = document.activeElement;

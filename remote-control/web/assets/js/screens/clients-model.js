@@ -668,17 +668,22 @@ export async function clientNodesFlow(ctx, name, row) {
 /**
  * `clients.rs::client_connections`: найденные на ноде подключения
  * (`nodeRequest … --discover`) одной формой; `assigned` — ответ
- * `client connections --name` (отмечает назначенные).
+ * `client connections --name` (отмечает назначенные). Назначенные, но не
+ * найденные (клиенты AmneziaWG `awg-<peer>`, устаревшие) — в конце, отмечены:
+ * `client connections` заменяет список, без них отправка их бы сняла.
  */
 export async function clientConnectionsFlow(ctx, name, node, assigned) {
   const found = await ctx.nodeRequest(node, discoverArgv(node), null);
   if (!found.ok) return;
-  const proxies = discoveredProxies(found.data);
-  if (proxies.length === 0) { ctx.notify('warn', EMPTY); return; }
   const current = assignedProxies(assigned, node);
+  const discovered = discoveredProxies(found.data);
+  const { extra, stale } = unlisted(current, discovered);
+  const proxies = [...discovered, ...extra];
+  if (proxies.length === 0) { ctx.notify('warn', EMPTY); return; }
   const values = await ctx.form({
     title: `Подключения клиента на ${node}`,
-    fields: [{ name: 'proxies', label: 'Подключения', type: 'multi', options: proxies.map((proxy) => ({ value: proxy, label: proxy })),
+    fields: [{ name: 'proxies', label: 'Подключения', type: 'multi',
+      options: proxies.map((proxy) => ({ value: proxy, label: proxyLabel(proxy, stale) })),
       value: proxies.filter((proxy) => current.includes(proxy)), required: true }],
   });
   if (values === null || values === undefined) return;

@@ -20,7 +20,7 @@ import {
   droppedRanges, variantOptions, effectiveVariant, problemVariant, inVariant,
 } from './catalog-model.js';
 import {
-  settleDraft, saveTemplate, importTemplateFile, deleteLabel, deleteTemplate, editTemplateGroups, checkRunner,
+  settleDraft, unsavedChanges, saveTemplate, importTemplateFile, deleteLabel, deleteTemplate, editTemplateGroups, checkRunner,
 } from './templates-model.js';
 
 /** Задержка проверки черновика после последней правки, мс. */
@@ -150,6 +150,9 @@ function TemplateEditor({ ctx, name }) {
   const content = templateContent(shown.data);
   const text = draft !== null ? draft : content;
   const dirty = draft !== null && draft !== content;
+  // Отправленный на сохранение текст (пока команда идёт), иначе `null`.
+  const [saving, setSaving] = useState(null);
+  const guarded = unsavedChanges(draft, content, saving);
   const { check, current } = useCheck(ctx, name, text, revision);
   const report = check && check.ok ? check.data || {} : null;
   const variant = effectiveVariant(report && report.variants, chosen);
@@ -180,13 +183,13 @@ function TemplateEditor({ ctx, name }) {
   useEffect(() => {
     if (shown.reply && !shown.reply.ok && shown.reply.error && shown.reply.error.code === 'not_found') leaveGone();
   }, [shown.reply]);
-  // Несохранённые изменения: уход с экрана — только после вопроса.
+  // Несохранённые изменения (и правки поверх идущего сохранения): уход с экрана — только после вопроса.
   useEffect(() => {
     if (gone.current) return;
-    ctx.setLeaveGuard(dirty
+    ctx.setLeaveGuard(guarded
       ? () => ctx.confirm({ title: 'Несохранённые изменения', question: 'Уйти без сохранения?', yes: 'Уйти', tone: 'danger' })
       : null);
-  }, [dirty]);
+  }, [guarded]);
   useEffect(() => () => ctx.setLeaveGuard(null), []);
 
   // Отметки — только по отчёту для текущего текста.
@@ -199,11 +202,16 @@ function TemplateEditor({ ctx, name }) {
   const save = () => run(async () => {
     if (!dirty) return;
     const sent = draft;
-    if (!(await saveTemplate(ctx, name, sent))) return;
-    // Сначала новый текст с сервера, потом черновик: правки, набранные во
-    // время сохранения, остаются, а редактор не показывает прежний текст.
-    await reload();
-    setDraft((now) => settleDraft(now, sent));
+    setSaving(sent);
+    try {
+      if (!(await saveTemplate(ctx, name, sent))) return;
+      // Сначала новый текст с сервера, потом черновик: правки, набранные во
+      // время сохранения, остаются, а редактор не показывает прежний текст.
+      await reload();
+      setDraft((now) => settleDraft(now, sent));
+    } finally {
+      if (mounted.current) setSaving(null);
+    }
   });
   // Ctrl/Cmd+S на всей странице редактора (и в Ace), кроме открытых окон.
   const saveRef = useRef(save);
@@ -226,10 +234,16 @@ function TemplateEditor({ ctx, name }) {
     if (imported && settleDraft(draftRef.current, before) === null) replaceText();
   });
   const remove = () => run(async () => {
+    // Правки, набранные пока идёт сброс к встроенному, не затираются его текстом.
+    const before = draftRef.current;
     if (!(await deleteTemplate(ctx, row))) return;
     // Редактор уже закрыт: защита ухода принадлежит другому экрану.
     if (!mounted.current) return;
-    if (kind === 'override') { await reload(); replaceText(); return; }
+    if (kind === 'override') {
+      await reload();
+      if (settleDraft(draftRef.current, before) === null) replaceText();
+      return;
+    }
     ctx.setLeaveGuard(null);
     leave('templates');
   });

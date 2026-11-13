@@ -243,6 +243,24 @@ test('nodeRequest: оставшийся сбой — OPERATION_FAILED, отка�
   refused.assertDone();
 });
 
+test('nodeRequest expect: ожидаемый код — ответ экрану без OPERATION_FAILED, request получает expect', async () => {
+  const words = ['awg', 'status', '--name', 'de'];
+  const sent = [];
+  const notices = [];
+  const deps = {
+    request: async (argv, options) => { sent.push([argv, options]); return { ok: false, error: { code: 'not_found', message: '' } }; },
+    confirm: async () => false, askSecret: async () => null, notify: (level, text) => notices.push([level, text]),
+  };
+  const result = await nodeRequest('de', words, null, deps, { expect: 'not_found' });
+  assert.equal(result.error.code, 'not_found');
+  assert.deepEqual(sent, [[words, { expect: 'not_found' }]]);
+  assert.deepEqual(notices, []);
+  // Без expect — прежнее поведение.
+  await nodeRequest('de', words, null, deps);
+  assert.deepEqual(sent[1], [words, {}]);
+  assert.deepEqual(notices, [['warn', OPERATION_FAILED]]);
+});
+
 test('handleNodeCodes: прочий код не обрабатывается', async () => {
   assert.equal(await handleNodeCodes(ok(), 'de', { request: async () => ok(), confirm: async () => true }), false);
   assert.equal(await handleNodeCodes({ ok: false, error: { code: 'not_found' } }, 'de', { request: async () => ok(), confirm: async () => true }), false);

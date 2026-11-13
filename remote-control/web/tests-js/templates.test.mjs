@@ -3,7 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  settleDraft, saveTemplate, importTemplateFile, deleteLabel, deleteTemplate, editTemplateGroups, checkRunner,
+  settleDraft, unsavedChanges, saveTemplate, importTemplateFile, deleteLabel, deleteTemplate, editTemplateGroups, checkRunner,
   GROUPS_UNCHANGED, DRAFT_REPLACED,
 } from '../assets/js/screens/templates-model.js';
 import { TEMPLATE_FILE_UNREADABLE, DEFAULT_GROUP_HINT, DEFAULT_TEMPLATE } from '../assets/js/screens/catalog-model.js';
@@ -33,6 +33,18 @@ test('черновик после сохранения: сохранённый �
   assert.equal(settleDraft('a', 'a'), null);
   assert.equal(settleDraft('ab', 'a'), 'ab');
   assert.equal(settleDraft(null, 'a'), null);
+});
+
+test('защита ухода: черновик или правка поверх идущего сохранения', () => {
+  assert.equal(unsavedChanges(null, 'A', null), false);
+  assert.equal(unsavedChanges('A', 'A', null), false);
+  assert.equal(unsavedChanges('B', 'A', null), true);
+  // Сохраняется B: тот же текст в редакторе — уход не теряет правок.
+  assert.equal(unsavedChanges('B', 'A', 'B'), true, 'до записи B черновик отличается от сохранённого');
+  assert.equal(unsavedChanges(null, 'B', 'B'), false);
+  // Во время сохранения B в редакторе вернули A: уход записал бы B.
+  assert.equal(unsavedChanges('A', 'A', 'B'), true);
+  assert.equal(unsavedChanges(null, 'A', 'B'), true);
 });
 
 test('сохранение: import с черновиком; отказ от плана — не сбой, ошибка — failed', async () => {
