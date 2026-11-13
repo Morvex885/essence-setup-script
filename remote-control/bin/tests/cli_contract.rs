@@ -591,7 +591,7 @@ fn catalog_grammar_is_accepted_for_every_command() {
         &["node", "shell", "--name", "n1"],
         &["conn", "list"],
         &["conn", "list", "--name", "n1", "--discover"],
-        &["conn", "set", "--name", "n1", "--assign", "G1=p1,p2", "--assign", "G2="],
+        &["conn", "set", "--name", "n1", "--assign", "G1=p1", "--assign", "G1=p2", "--assign", "G2="],
         &["conn", "sync", "--name", "n1"],
         &["awg", "status", "--name", "n1"],
         &["awg", "sync", "--name", "n1"],

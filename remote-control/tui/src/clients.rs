@@ -301,9 +301,15 @@ fn client_connections(ctx: &mut Context<'_>, name: &str, own: &[String]) -> io::
     let Some(assigned) = fetch(ctx, &["client", "connections", "--name", name])? else { return Ok(()); };
     let current: Vec<String> = rows(&assigned).iter().filter(|r| r["node"] == node.as_str()).flat_map(|r| strings(&r["proxies"])).collect();
     let Some(found) = node_request(ctx, &node, &["conn", "list", "--name", &node, "--discover"])? else { return Ok(()); };
-    let proxies = strings(&found[0]["discovered"]);
+    // `client connections` replaces the list: assigned but unreported ones
+    // (AmneziaWG peers `awg-<peer>`, stale) are listed checked to survive.
+    let discovered = strings(&found[0]["discovered"]);
+    let (extra, stale) = crate::nodes::unlisted(&current, &discovered);
+    let proxies: Vec<String> = discovered.into_iter().chain(extra).collect();
+    if proxies.is_empty() { ctx.ui.notice(ui::warn(EMPTY)); return Ok(()); }
+    let labels: Vec<String> = proxies.iter().map(|p| crate::nodes::proxy_label(p, &stale)).collect();
     let flags = proxies.iter().map(|p| current.contains(p)).collect();
-    let Some(selected) = ctx.toggle(&format!("Подключения клиента на {node}"), &proxies, flags, EMPTY)? else { return Ok(()); };
+    let Some(selected) = ctx.toggle(&format!("Подключения клиента на {node}"), &labels, flags, EMPTY)? else { return Ok(()); };
     if selected.is_empty() { ctx.ui.notice(ui::warn("Ничего не выбрано.")); return Ok(()); }
     let mut words = vec!["client", "connections", "--name", name, "--node", &node];
     for i in selected { words.extend(["--proxy", proxies[i].as_str()]); }
@@ -533,12 +539,12 @@ fn group_connections(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
     };
     let Some(found) = node_request(ctx, &node, &["conn", "list", "--name", &node, "--discover"])? else { return Ok(()); };
     let current: Vec<String> = rows(&found[0]["groups"]).iter().filter(|g| g["name"] == name).flat_map(|g| strings(&g["proxies"])).collect();
-    let mut proxies = strings(&found[0]["discovered"]);
-    for proxy in &current {
-        if !proxies.contains(proxy) { proxies.push(proxy.clone()); }
-    }
+    let discovered = strings(&found[0]["discovered"]);
+    let (extra, stale) = crate::nodes::unlisted(&current, &discovered);
+    let proxies: Vec<String> = discovered.into_iter().chain(extra).collect();
+    let labels: Vec<String> = proxies.iter().map(|p| crate::nodes::proxy_label(p, &stale)).collect();
     let flags = proxies.iter().map(|p| current.contains(p)).collect();
-    let Some(selected) = ctx.toggle(&format!("Подключения группы {name} на {node}"), &proxies, flags, EMPTY)? else { return Ok(()); };
+    let Some(selected) = ctx.toggle(&format!("Подключения группы {name} на {node}"), &labels, flags, EMPTY)? else { return Ok(()); };
     let chosen: Vec<String> = selected.into_iter().map(|i| proxies[i].clone()).collect();
     if crate::nodes::same_set(&chosen, &current) { ctx.ui.notice(ui::warn("Изменений нет.")); return Ok(()); }
     let words = crate::nodes::conn_set_argv(&node, &[(name, &chosen)]);
@@ -1156,6 +1162,29 @@ mod tests {
         assert!(!core.calls.iter().any(|c| c.contains(&"--yes".to_owned())));
     }
     #[test]
+    fn client_connections_keep_assigned_proxies_the_node_did_not_report() {
+        // AWG discovered: the peer `awg-alice` is listed checked without a
+        // mark, `gone` is marked; both survive an unchanged submit.
+        let (core, ui) = drive(vec![
+            ok(&["node", "list"], nodes()),
+            ok(&["client", "connections", "--name", "alice"], json!([{"node":"de","mode":"own","proxies":["p1","awg-alice","gone"]}])),
+            ok(&["conn", "list", "--name", "de", "--discover"], json!([{"node":"de","groups":[],"discovered":["AWG","p1"]}])),
+            ok(&["client", "connections", "--name", "alice", "--node", "de", "--proxy", "p1", "--proxy", "awg-alice", "--proxy", "gone"], json!({})),
+        ], &["1", "1", ""], |ctx| client_connections(ctx, "alice", &["de".into()]));
+        core.assert_finished();
+        let toggle = view(&ui, "Подключения клиента на de");
+        let labels: Vec<&str> = toggle.sections[0].iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(&labels[..4], ["[ ] AWG", "[x] p1", "[x] awg-alice", "[x] gone (не найдено на ноде)"]);
+        // Nothing discovered and nothing assigned: a warning, no toggle.
+        let (core, ui) = drive(vec![
+            ok(&["node", "list"], nodes()),
+            ok(&["client", "connections", "--name", "alice"], json!([])),
+            ok(&["conn", "list", "--name", "de", "--discover"], json!([{"node":"de","groups":[],"discovered":[]}])),
+        ], &["1", "1"], |ctx| client_connections(ctx, "alice", &["de".into()]));
+        core.assert_finished();
+        assert_eq!(notices(&ui, EMPTY), 1);
+    }
+    #[test]
     fn ttl_menu_maps_values_and_cancellation_never_publishes() {
         for (selection, ttl) in [("1", None), ("2", Some("12h")), ("3", Some("30d")), ("4", Some("2w")), ("5", Some("7d")), ("0", None)] {
             let mut steps = vec![ok(&["client", "list"], alice(true)), ok(&["subscription", "host"], host())];
@@ -1308,12 +1337,12 @@ mod tests {
         // proxies too and starts from the group's set.
         let (core, ui) = drive(vec![
             ok(&["node", "list"], nodes.clone()), ok(&discover, found.clone()),
-            ok(&["conn", "set", "--name", "ru", "--assign", "PC=p1,p2"], json!({"node":"ru","changed":[{"group":"PC","proxies":["p1","p2"]}]})),
+            ok(&["conn", "set", "--name", "ru", "--assign", "PC=p1", "--assign", "PC=p2"], json!({"node":"ru","changed":[{"group":"PC","proxies":["p1","p2"]}]})),
         ], &["2", "2", "3", ""], |ctx| group_connections(ctx, "PC"));
         core.assert_finished();
         let toggle = &ui.views[1];
         let labels: Vec<&str> = toggle.sections[0].iter().map(|i| i.label.as_str()).collect();
-        assert_eq!(&labels[..3], ["[x] p1", "[ ] p2", "[x] stale"]);
+        assert_eq!(&labels[..3], ["[x] p1", "[ ] p2", "[x] stale (не найдено на ноде)"]);
         // One node is taken without asking; an unchanged set sends nothing.
         let (core, ui) = drive(vec![ok(&["node", "list"], json!([nodes[1].clone()])), ok(&discover, found.clone())],
             &["2", "2", ""], |ctx| group_connections(ctx, "PC"));

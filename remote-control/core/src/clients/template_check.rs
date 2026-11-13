@@ -32,9 +32,15 @@ const WORK_BUDGET: usize = 4_000_000;
 /// Nesting of YAML collections at most; deeper is a `yaml` error before any
 /// recursive step (the tree loader, `to_json`, `locate`, the validator).
 const MAX_DEPTH: usize = 128;
-/// Scalar bytes of a variant at most, counted as aliases expand them; more
-/// is a `yaml` error before the loader copies a scalar per alias.
+/// Scalar bytes of a variant at most, counted as aliases expand them and as
+/// the loader copies anchored nodes; more is a `yaml` error before the loader
+/// copies a scalar per alias or anchor.
 const MAX_EXPANDED: usize = 8 << 20;
+/// Nodes the loader copies when it registers anchored nodes (`&имя`: each
+/// one is deep-copied, nested anchors copy their contents again) at most;
+/// more is a `yaml` error before loading. Alias expansion has its own limit
+/// in the loader (100 000 nodes).
+const MAX_ANCHOR_COPIES: usize = 200_000;
 /// A collection with more nodes than this is validated child by child.
 const SPLIT_NODES: usize = 2000;
 /// A mapping is split only with more entries than this (a map of names, not
@@ -58,9 +64,11 @@ struct Schema {
 
 /// Draft-07 from the schema's `$schema`; patterns use the default
 /// fancy-regex engine (the schema has lookaheads); formats are not checked.
-/// A schema that does not compile is an error of the command, not a panic.
+/// The upstream file is patched first (`patch`). A schema that does not
+/// compile is an error of the command, not a panic.
 static COMPILED: LazyLock<std::result::Result<Schema, String>> = LazyLock::new(|| {
-    let schema: Value = serde_json::from_str(SCHEMA).map_err(|error| error.to_string())?;
+    let mut schema: Value = serde_json::from_str(SCHEMA).map_err(|error| error.to_string())?;
+    patch(&mut schema)?;
     let validator = jsonschema::options().should_validate_formats(false).build(&schema).map_err(|error| error.to_string())?;
     let mut keys = HashSet::new();
     let mut pending = vec![&schema];
@@ -78,6 +86,32 @@ static COMPILED: LazyLock<std::result::Result<Schema, String>> = LazyLock::new(|
     }
     Ok(Schema { validator, keys })
 });
+
+/// Fixes of the embedded upstream schema (kept byte-identical, see
+/// `core/schemas/README.md`); a shape they do not expect — a new upstream
+/// version — is an error, so an update reviews them.
+/// 1. `compatible/{string,integer,number,boolean}`: the second `anyOf`
+///    branch has a `pattern` but no `type`, so it accepts any non-string
+///    (an object or a list in a scalar field). It gets the type of the
+///    alternative form: a number for `string`, a string for the others.
+/// 2. `proxy-groups` `groupbase/allOf/0`: `required: [name, type]` next to
+///    `$ref` is ignored in draft-07; the `$ref` moves into an `allOf`.
+fn patch(schema: &mut Value) -> std::result::Result<(), String> {
+    const COMPATIBLE: &str = "/definitions/proxies/definitions/shadowsocksr/definitions/compatible";
+    const GROUPBASE: &str = "/definitions/proxy-groups/definitions/load-balance/definitions/groupbase/allOf/0";
+    for (kind, alternative) in [("string", "number"), ("integer", "string"), ("number", "string"), ("boolean", "string")] {
+        let branch = schema.pointer_mut(&format!("{COMPATIBLE}/{kind}/anyOf/1")).and_then(Value::as_object_mut)
+            .filter(|branch| branch.contains_key("pattern") && !branch.contains_key("type"))
+            .ok_or_else(|| format!("исправление схемы: нет {COMPATIBLE}/{kind}/anyOf/1 с pattern без type"))?;
+        branch.insert("type".into(), Value::from(alternative));
+    }
+    let base = schema.pointer_mut(GROUPBASE).and_then(Value::as_object_mut)
+        .filter(|base| base.contains_key("$ref") && base.contains_key("required"))
+        .ok_or_else(|| format!("исправление схемы: нет {GROUPBASE} с $ref и required"))?;
+    let reference = base.remove("$ref").unwrap_or_default();
+    base.insert("allOf".into(), serde_json::json!([{"$ref": reference}]));
+    Ok(())
+}
 
 /// The schema validator is usable; callers of `check` ask first.
 pub fn ready() -> Result<()> {
@@ -296,7 +330,8 @@ fn check_variant(kept: &[(usize, &str)], budget: &mut Budget) -> Vec<Problem> {
         let (line, column) = source_position(kept, &marker);
         let message = match excess {
             Excess::Depth => format!("Ошибка YAML: вложенность глубже {MAX_DEPTH} уровней (с учётом ссылок *имя)."),
-            Excess::Volume => format!("Ошибка YAML: с раскрытием ссылок *имя значения занимают больше {} МиБ.", MAX_EXPANDED >> 20),
+            Excess::Volume => format!("Ошибка YAML: с раскрытием ссылок *имя и якорей &имя значения занимают больше {} МиБ.", MAX_EXPANDED >> 20),
+            Excess::Anchors => format!("Ошибка YAML: якоря &имя копируют больше {MAX_ANCHOR_COPIES} узлов."),
         };
         problems.push(problem(line, column, "error", "yaml", message));
         return problems;
@@ -353,50 +388,63 @@ fn masked(document: &Value, pointer: &str) -> String {
 enum Excess {
     Depth,
     Volume,
+    Anchors,
 }
 
-/// Where the text goes over a limit counting what aliases expand to: the
-/// start of the first collection nested deeper than `MAX_DEPTH`, or the
-/// first scalar or alias past `MAX_EXPANDED` scalar bytes. Read from parser
-/// events, without recursion. A syntax error is left to the loader.
+/// Where the text goes over a limit counting what the loader builds: the
+/// start of the first collection nested deeper than `MAX_DEPTH`; the first
+/// scalar, alias or anchored node past `MAX_EXPANDED` scalar bytes (aliases
+/// and anchor copies included); the first anchored node whose copy takes the
+/// copied nodes past `MAX_ANCHOR_COPIES`. Read from parser events, without
+/// recursion. A syntax error is left to the loader.
 fn too_large(text: &str) -> Option<(Marker, Excess)> {
     use saphyr_parser::{Event, Parser};
+    /// A complete node: height (a scalar has 0), scalar bytes, nodes.
+    #[derive(Clone, Copy, Default)]
+    struct Size { height: usize, bytes: usize, nodes: usize }
     /// An open collection.
-    struct Open { anchor: usize, height: usize, bytes: usize }
+    struct Open { anchor: usize, start: Marker, size: Size }
     let mut open: Vec<Open> = Vec::new();
-    // Height and scalar bytes of each anchored node (a scalar has height 0).
-    let mut anchored: HashMap<usize, (usize, usize)> = HashMap::new();
+    let mut anchored: HashMap<usize, Size> = HashMap::new();
     let mut total: usize = 0;
+    let mut copies: usize = 0;
     for event in Parser::new_from_str(text) {
         let Ok((event, span)) = event else { return None };
-        // Height and bytes of a complete node that enters its parent.
-        let node = match event {
+        // A complete node that enters its parent, and its anchor.
+        let (node, anchor, at) = match event {
             Event::SequenceStart(anchor, _) | Event::MappingStart(anchor, _) => {
                 if open.len() + 1 > MAX_DEPTH { return Some((span.start, Excess::Depth)); }
-                open.push(Open { anchor, height: 0, bytes: 0 });
-                None
+                open.push(Open { anchor, start: span.start, size: Size::default() });
+                continue;
             }
-            Event::SequenceEnd | Event::MappingEnd => open.pop().map(|done| {
-                if done.anchor != 0 { anchored.insert(done.anchor, (done.height + 1, done.bytes)); }
-                (done.height + 1, done.bytes)
-            }),
+            Event::SequenceEnd | Event::MappingEnd => match open.pop() {
+                Some(done) => (Size { height: done.size.height + 1, bytes: done.size.bytes, nodes: done.size.nodes + 1 }, done.anchor, done.start),
+                None => continue,
+            },
             Event::Scalar(value, _, anchor, _) => {
-                if anchor != 0 { anchored.insert(anchor, (0, value.len())); }
                 total = total.saturating_add(value.len());
-                Some((0, value.len()))
+                (Size { height: 0, bytes: value.len(), nodes: 1 }, anchor, span.start)
             }
             Event::Alias(anchor) => {
-                let (height, bytes) = anchored.get(&anchor).copied().unwrap_or_default();
-                if open.len() + height > MAX_DEPTH { return Some((span.start, Excess::Depth)); }
-                total = total.saturating_add(bytes);
-                Some((height, bytes))
+                let size = anchored.get(&anchor).copied().unwrap_or_default();
+                if open.len() + size.height > MAX_DEPTH { return Some((span.start, Excess::Depth)); }
+                total = total.saturating_add(size.bytes);
+                (size, 0, span.start)
             }
-            _ => None,
+            _ => continue,
         };
+        // The loader deep-copies every anchored node when it registers it.
+        if anchor != 0 {
+            anchored.insert(anchor, node);
+            total = total.saturating_add(node.bytes);
+            copies = copies.saturating_add(node.nodes);
+            if copies > MAX_ANCHOR_COPIES { return Some((at, Excess::Anchors)); }
+        }
         if total > MAX_EXPANDED { return Some((span.start, Excess::Volume)); }
-        if let (Some((height, bytes)), Some(parent)) = (node, open.last_mut()) {
-            parent.height = parent.height.max(height);
-            parent.bytes = parent.bytes.saturating_add(bytes);
+        if let Some(parent) = open.last_mut() {
+            parent.size.height = parent.size.height.max(node.height);
+            parent.size.bytes = parent.size.bytes.saturating_add(node.bytes);
+            parent.size.nodes = parent.size.nodes.saturating_add(node.nodes);
         }
     }
     None
@@ -928,10 +976,53 @@ mod tests {
         }
         // Aliases nested in anchors multiply.
         let nested = format!("proxies:\na: &a \"{}\"\nb: &b [*a, *a, *a, *a]\nc: &c [*b, *b, *b, *b]\nd: [*c, *c, *c, *c]\n", "y".repeat(200_000));
-        assert_eq!(codes(&check(&nested, &groups())), [(5, "yaml", None)]);
+        // (anchor `&c` already copies past the limit: the loader clones each anchored node).
+        assert_eq!(codes(&check(&nested, &groups())), [(4, "yaml", None)]);
         // A value used a few times is checked as usual.
         let few = format!("proxies:\na: &a \"{}\"\nb: [*a, *a, *a]\n", "y".repeat(100_000));
         assert!(check(&few, &groups()).problems.is_empty());
+    }
+
+    #[test]
+    fn nested_anchors_without_aliases_are_a_yaml_error_before_loading() {
+        // Each anchored list is deep-copied by the loader when registered:
+        // 120 nested anchors around 100 000 nodes copy 12 million nodes.
+        let open: String = (0..120).map(|i| format!("&a{i} [")).collect();
+        let content = format!("proxies:\nx: {open}{}0{}\n", "0,".repeat(100_000), "]".repeat(120));
+        assert!(content.len() < crate::request_input::Input::MAX_VALUE);
+        let started = std::time::Instant::now();
+        let report = check(&content, &groups());
+        assert_eq!(codes(&report), [(2, "yaml", None)], "{:?}", report.problems);
+        assert!(report.problems[0].message.contains("якоря"), "{}", report.problems[0].message);
+        assert!(started.elapsed().as_secs() < 5);
+        // One anchored list, used once (within the loader's alias budget), is checked as usual.
+        let once = format!("proxies:\nx-big: &big [{}0]\ny: *big\n", "0,".repeat(50_000));
+        assert!(check(&once, &groups()).problems.iter().all(|p| p.code != "yaml"));
+    }
+
+    #[test]
+    fn patched_schema_rejects_collections_in_scalar_fields_and_unnamed_groups() {
+        let schema = |content: &str| -> Vec<Option<String>> {
+            check(content, &groups()).problems.into_iter().filter(|p| p.code == "schema").map(|p| p.path).collect()
+        };
+        let vless = |udp: &str| format!("proxies:\n  - {{name: v, type: vless, server: example.com, port: 443, uuid: 0b1e2c3d-1111-2222-3333-444455556666, udp: {udp}}}\n");
+        // An object or a list where a string, an integer or a boolean is expected.
+        for value in ["{}", "[1]"] {
+            assert_eq!(schema(&format!("proxies:\ndns:\n  nameserver: [{value}]\n")), [Some("/dns/nameserver/0".to_owned())], "{value}");
+            assert_eq!(schema(&format!("proxies:\nmixed-port: {value}\n")), [Some("/mixed-port".to_owned())], "{value}");
+            // (a proxy matches one of its types: the problem is the whole proxy)
+            assert_eq!(schema(&vless(value)), [Some("/proxies/0".to_owned())], "{value}");
+        }
+        // The compatible forms stay accepted.
+        for content in ["proxies:\nmixed-port: \"7890\"\ndns:\n  nameserver: [1.1.1.1, 8]\n".to_owned(), vless("true"), vless("\"false\"")] {
+            let accepted = check(&content, &groups());
+            assert!(accepted.problems.is_empty(), "{content}: {:?}", accepted.problems);
+        }
+        // A group without `name` or `type`.
+        for group in ["{}", "{name: g}", "{type: select, proxies: [DIRECT]}"] {
+            assert_eq!(schema(&format!("proxies:\nproxy-groups:\n  - {group}\n")), [Some("/proxy-groups/0".to_owned())], "{group}");
+        }
+        assert!(schema("proxies:\nproxy-groups:\n  - {name: g, type: select, proxies: [DIRECT]}\n").is_empty());
     }
 
     #[test]

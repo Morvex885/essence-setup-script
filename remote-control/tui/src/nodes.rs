@@ -569,7 +569,10 @@ fn connection_node(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
         }
         let groups = rows(&listed.data).iter().find(|entry| entry["node"] == name).map(|entry| rows(&entry["groups"])).unwrap_or(&[]);
         let proxies: Vec<String> = rows(&state["discovered"]).iter().map(text).collect();
-        let assigned: Vec<Vec<String>> = proxies.iter()
+        let all: Vec<String> = groups.iter().flat_map(|g| rows(&g["proxies"]).iter().map(text)).collect();
+        let (extra, stale) = unlisted(&all, &proxies);
+        let shown: Vec<String> = proxies.iter().chain(&extra).cloned().collect();
+        let assigned: Vec<Vec<String>> = shown.iter()
             .map(|proxy| groups.iter().filter(|g| rows(&g["proxies"]).iter().any(|p| p == proxy)).map(|g| text(&g["name"])).collect())
             .collect();
         let mut view = View::menu(format!("Подключения ноды: {name}"), vec![
@@ -581,8 +584,8 @@ fn connection_node(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
         } else if proxies.is_empty() {
             view.context.push(ui::text("Подключения не найдены", ui::DIM));
         }
-        for (proxy, groups) in proxies.iter().zip(&assigned) {
-            view.context.push(ui::text(format!("{proxy}  [{}]", groups.join(", ")), ui::NC));
+        for (proxy, groups) in shown.iter().zip(&assigned) {
+            view.context.push(ui::text(format!("{}  [{}]", proxy_label(proxy, &stale), groups.join(", ")), ui::NC));
         }
         let Some(choice) = ctx.choose(&view)? else { return Ok(()); };
         match choice.as_str() {
@@ -605,15 +608,21 @@ fn assign_connections(ctx: &mut Context<'_>, name: &str, discovered: &[String], 
     if !listed.ok { outcome(ctx, &listed); return Ok(()); }
     let groups = names(&listed.data);
     if groups.is_empty() { ctx.ui.notice(ui::warn("Нет групп.")); return Ok(()); }
-    // Proxies of every group on the node, as edited.
+    // Proxies of every group on the node, as edited (a group may sit in
+    // several entries of the node: their proxies are merged, as in the core).
     let mut assignment: Vec<Vec<String>> = groups.iter()
-        .map(|group| current.iter().find(|entry| text(&entry["name"]) == *group)
-            .map(|entry| rows(&entry["proxies"]).iter().map(text).collect()).unwrap_or_default())
+        .map(|group| {
+            let mut list: Vec<String> = Vec::new();
+            for proxy in current.iter().filter(|entry| text(&entry["name"]) == *group).flat_map(|entry| rows(&entry["proxies"]).iter().map(text)) {
+                if !list.contains(&proxy) { list.push(proxy); }
+            }
+            list
+        })
         .collect();
+    let all: Vec<String> = assignment.iter().flatten().cloned().collect();
+    let (extra, stale) = unlisted(&all, discovered);
     let mut proxies = discovered.to_vec();
-    for proxy in assignment.iter().flatten() {
-        if !proxies.contains(proxy) { proxies.push(proxy.clone()); }
-    }
+    proxies.extend(extra);
     if proxies.is_empty() { ctx.ui.notice(ui::warn("Подключения не найдены: синхронизируйте ноду.")); return Ok(()); }
     let saved = assignment.clone();
     loop {
@@ -621,7 +630,7 @@ fn assign_connections(ctx: &mut Context<'_>, name: &str, discovered: &[String], 
         view.prompt = "Выберите подключение или действие: ".into();
         view.sections.push(proxies.iter().enumerate().map(|(i, proxy)| {
             let of: Vec<&str> = groups.iter().zip(&assignment).filter(|(_, list)| list.contains(proxy)).map(|(group, _)| group.as_str()).collect();
-            Item::new(i + 1, format!("{proxy}  [{}]", of.join(", ")), ui::CYAN)
+            Item::new(i + 1, format!("{}  [{}]", proxy_label(proxy, &stale), of.join(", ")), ui::CYAN)
         }).collect());
         view.sections.push(vec![Item::new('s', "Сохранить", ui::YELLOW), Item::new(0, "Отмена", ui::NC)]);
         if assignment.iter().zip(&saved).any(|(list, before)| !same_set(list, before)) {
@@ -661,11 +670,34 @@ fn assign_connections(ctx: &mut Context<'_>, name: &str, discovered: &[String], 
 pub(crate) fn same_set(a: &[String], b: &[String]) -> bool {
     a.iter().all(|p| b.contains(p)) && b.iter().all(|p| a.contains(p))
 }
-/// `conn set --name N --assign G=P1,P2…` for the given groups (`G=` unassigns).
+/// Assigned proxies the node did not report (unique, in order) and the
+/// stale ones among them: AmneziaWG peers `awg-<peer>` are not stale while
+/// the node reports `AWG` (discovery does not list peers). Forms list the
+/// unreported ones after the discovered, checked, so sending keeps them.
+pub(crate) fn unlisted(assigned: &[String], discovered: &[String]) -> (Vec<String>, Vec<String>) {
+    let awg = discovered.iter().any(|name| name == "AWG");
+    let mut extra: Vec<String> = Vec::new();
+    for proxy in assigned {
+        if !discovered.contains(proxy) && !extra.contains(proxy) { extra.push(proxy.clone()); }
+    }
+    let stale = extra.iter().filter(|proxy| !(awg && proxy.starts_with("awg-"))).cloned().collect();
+    (extra, stale)
+}
+/// A proxy in forms: one not found on the node is marked.
+pub(crate) fn proxy_label(proxy: &str, stale: &[String]) -> String {
+    if stale.iter().any(|name| name == proxy) { format!("{proxy} (не найдено на ноде)") } else { proxy.to_owned() }
+}
+/// `conn set --name N --assign G=P …` for the given groups: one `--assign`
+/// per proxy (names may contain commas), `G=` unassigns.
 pub(crate) fn conn_set_argv(node: &str, assignments: &[(&str, &[String])]) -> Vec<String> {
     let mut words = argv(&["conn", "set", "--name", node]);
     for (group, proxies) in assignments {
-        words.extend(argv(&["--assign", &format!("{group}={}", proxies.join(","))]));
+        if proxies.is_empty() {
+            words.extend(argv(&["--assign", &format!("{group}=")]));
+        }
+        for proxy in *proxies {
+            words.extend(argv(&["--assign", &format!("{group}={proxy}")]));
+        }
     }
     words
 }
@@ -1256,7 +1288,7 @@ mod tests {
             // p2 → g2; p1: off old, on g2. One command with both changed groups.
             let (_, _, ui) = run(vec![
                 node_sync(json!(["p1", "p2"])), node_list(), groups(),
-                step(&["conn", "set", "--name", "n", "--assign", "old=", "--assign", "g2=p2,p1"], ok(json!({"node": "n", "changed": []}))), node_list(),
+                step(&["conn", "set", "--name", "n", "--assign", "old=", "--assign", "g2=p2", "--assign", "g2=p1"], ok(json!({"node": "n", "changed": []}))), node_list(),
             ], &[key, "2", "2", "", "1", "1", "2", "", "s", "0"], |ctx| connection_node(ctx, "n"));
             assert!(ui.views[0].context.iter().any(|l| l.to_string() == "p1  [old]"));
             assert_eq!(ui.views[1].sections[0][0].label, "p1  [old]");
@@ -1278,6 +1310,19 @@ mod tests {
         let empty = step(&["conn", "list", "--name", "n"], ok(json!([{"node": "n", "groups": []}])));
         let (_, _, ui) = run(vec![node_sync(json!([])), empty.clone(), groups(), empty], &["b", "0"], |ctx| connection_node(ctx, "n"));
         assert!(noticed(&ui, "Подключения не найдены: синхронизируйте ноду."));
+    }
+    #[test]
+    fn connection_assignment_merges_entries_of_a_group_and_keeps_commas() {
+        // The group sits in two entries of the node: both proxies are
+        // preselected, adding p3 keeps them; a name with a comma is one value.
+        let split = step(&["conn", "list", "--name", "n"], ok(json!([{"node": "n", "groups": [
+            {"name": "old", "proxies": ["p1"]}, {"name": "old", "proxies": ["a,b"]}]}])));
+        let (_, _, ui) = run(vec![
+            node_sync(json!(["p1", "p3"])), split.clone(), step(&["group", "list"], ok(json!([{"name": "old"}]))),
+            step(&["conn", "set", "--name", "n", "--assign", "old=p1", "--assign", "old=a,b", "--assign", "old=p3"], ok(json!({"node": "n", "changed": []}))), split,
+        ], &["b", "2", "1", "", "s", "0"], |ctx| connection_node(ctx, "n"));
+        assert_eq!(ui.views[1].sections[0][2].label, "a,b (не найдено на ноде)  [old]");
+        assert!(ui.views[0].context.iter().any(|l| l.to_string() == "a,b (не найдено на ноде)  [old]"));
     }
     #[test]
     fn connection_node_sync_and_alias_hotkeys_both_cases() {
