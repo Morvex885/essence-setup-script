@@ -609,6 +609,7 @@ fn catalog_grammar_is_accepted_for_every_command() {
         &["telegram", "menu", "--name", "n1"],
         &["group", "list"],
         &["group", "add", "--name", "lab"],
+        &["group", "add", "--name", "lab2", "--template", "default"],
         &["group", "delete", "--name", "LAB"],
         &["group", "set-template", "--name", "LAB", "--template", "default.yaml"],
         &["template", "list"],

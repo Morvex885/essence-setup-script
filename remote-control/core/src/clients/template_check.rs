@@ -42,12 +42,23 @@ const MESSAGE_CHARS: usize = 200;
 
 static SCHEMA: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/schemas/meta-json-schema.json"));
 
+/// The embedded schema (`core/schemas/README.md`), in `template check` replies.
+pub const SCHEMA_VERSION: &str = "meta-json-schema v1.19.33";
+
 /// Draft-07 from the schema's `$schema`; patterns use the default
 /// fancy-regex engine (the schema has lookaheads); formats are not checked.
-static VALIDATOR: LazyLock<jsonschema::Validator> = LazyLock::new(|| {
-    let schema: Value = serde_json::from_str(SCHEMA).expect("embedded mihomo schema is JSON");
-    jsonschema::options().should_validate_formats(false).build(&schema).expect("embedded mihomo schema compiles")
+/// A schema that does not compile is an error of the command, not a panic.
+static VALIDATOR: LazyLock<std::result::Result<jsonschema::Validator, String>> = LazyLock::new(|| {
+    let schema: Value = serde_json::from_str(SCHEMA).map_err(|error| error.to_string())?;
+    jsonschema::options().should_validate_formats(false).build(&schema).map_err(|error| error.to_string())
 });
+
+/// The schema validator is usable; callers of `check` ask first.
+pub fn ready() -> Result<()> {
+    VALIDATOR.as_ref().map(|_| ()).map_err(|error| {
+        RcError::new("failed", format!("Встроенная схема конфигурации mihomo не загрузилась: {error}"))
+    })
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Problem {
@@ -401,11 +412,13 @@ fn split_children(value: &Value) -> Vec<(Step, Value)> {
 /// `MAP_ENTRIES` entries), and every other child is validated in its
 /// top-level key with that collection holding only this child.
 fn schema_errors(document: &Value, budget: &mut Budget, out: &mut Vec<(String, String)>) {
-    if !budget.spend(nodes(document)) || VALIDATOR.is_valid(document) { return; }
+    // `ready()` was asked before `check`; without a schema nothing is checked.
+    let Ok(validator) = VALIDATOR.as_ref() else { return };
+    if !budget.spend(nodes(document)) || validator.is_valid(document) { return; }
     let mut split = Vec::new();
     large(document, &mut Vec::new(), &mut split);
     if split.is_empty() {
-        for error in VALIDATOR.iter_errors(document) {
+        for error in validator.iter_errors(document) {
             if !budget.take_problem() { return; }
             out.push((error.instance_path().as_str().to_owned(), schema_what(error.kind())));
         }
@@ -643,10 +656,12 @@ pub fn command(session: &mut Session, invocation: &Invocation, input: &Input) ->
         }
         (None, None) => return Err(RcError::new("usage", "Укажите шаблон: --name T или --file PATH.")),
     };
+    ready()?;
     let groups: Vec<String> = session.state.load_config()?.groups.into_iter().map(|group| group.name).collect();
     let report = check(content, &groups);
     Ok(json!({
         "name": name,
+        "schema": SCHEMA_VERSION,
         "errors": report.errors,
         "warnings": report.warnings,
         "truncated": report.truncated,
@@ -861,7 +876,7 @@ mod tests {
         let mut input = Input::default();
         input.insert("file", "mode: rule\n".to_owned().into()).unwrap();
         let file = command(&mut session, &invocation(&["template", "check"]), &input).unwrap();
-        assert_eq!(file, json!({"name": null, "errors": 1, "warnings": 0, "truncated": false,
+        assert_eq!(file, json!({"name": null, "schema": SCHEMA_VERSION, "errors": 1, "warnings": 0, "truncated": false,
             "problems": [{"line": 1, "column": 1, "level": "error", "code": "proxies",
                 "message": "Нет строки «proxies:» — конфиг клиента не будет сгенерирован.", "path": null, "variant": null}],
             "variants": [{"tag": null, "dropped": []}]}));

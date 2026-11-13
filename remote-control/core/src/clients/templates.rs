@@ -406,30 +406,56 @@ pub fn create(session: &mut Session, invocation: &Invocation) -> Result<Value> {
     Ok(data)
 }
 
+/// Plan of `template import` from the state and the content, `None` — no
+/// confirmation needed. Overwriting a file or errors of the template
+/// (`template check` level `error`) need it; warnings alone do not, but a
+/// shown plan lists every problem. The token covers the content.
+fn import_plan(state: &State, name: &str, content: &str) -> Result<Option<Plan>> {
+    let exists = custom_exists(state, name)?;
+    let group_names: Vec<String> = state.load_config()?.groups.into_iter().map(|g| g.name).collect();
+    let report = super::template_check::check(content, &group_names);
+    if !exists && report.errors == 0 { return Ok(None); }
+    let mut lines = Vec::new();
+    if exists {
+        lines.push(format!("Шаблон «{name}» будет перезаписан."));
+    }
+    lines.extend(problem_lines(&report));
+    Ok(Some(Plan::new(lines, hex::encode(Sha256::digest(content.as_bytes())))))
+}
+
 /// The template text arrives as request input `file`; the client read the
-/// file (or the editor buffer). The token covers the content: the path never
-/// reaches the daemon, so a token issued for one file must not consent to
-/// another. Overwriting and a template with problems need confirmation.
+/// file (or the editor buffer). The path never reaches the daemon, so the
+/// plan token covers the content. The plan is rebuilt under the mutation
+/// lock: a changed plan is `plan_changed`, a file that appeared without a
+/// plan is `conflict`.
 pub fn import(session: &mut Session, invocation: &Invocation, input: &Input) -> Result<Value> {
     let name = new_file_name(required(invocation, "name")?)?;
     let content = input.get("file").ok_or_else(|| RcError::new("usage", "Передайте содержимое полем input.file."))?;
-    let mut lines = Vec::new();
-    if custom_exists(&session.state, &name)? {
-        lines.push(format!("Шаблон «{name}» будет перезаписан."));
+    super::template_check::ready()?;
+    let planned = import_plan(&session.state, &name, content)?;
+    if let Some(plan) = &planned {
+        plan.confirm(invocation)?;
     }
-    let group_names: Vec<String> = session.state.load_config()?.groups.into_iter().map(|g| g.name).collect();
-    lines.extend(problem_lines(&super::template_check::check(content, &group_names)));
-    if !lines.is_empty() {
-        let digest = hex::encode(Sha256::digest(content.as_bytes()));
-        Plan::new(lines, digest).confirm(invocation)?;
-    }
-    session.mutate("template_import", |state| {
-        secure_fs::create_dir_all(state.paths().templates())?;
-        secure_fs::atomic_write(&custom_path(state, &name), content.as_bytes())
-            .map_err(|error| RcError::new("failed", format!("Не удалось сохранить шаблон «{name}»: {error}")))
-    })?;
+    session.mutate("template_import", |state| import_planned(state, &name, content, planned.as_ref(), invocation))?;
     session.log(Level::Success, &format!("Шаблон «{name}» импортирован"));
     Ok(json!({"name": name}))
+}
+
+/// The confirmed import under the mutation lock.
+fn import_planned(state: &State, name: &str, content: &str, planned: Option<&Plan>, invocation: &Invocation) -> Result<()> {
+    match (planned, import_plan(state, name, content)?) {
+        (Some(planned), Some(current)) if planned.lines != current.lines => return Err(current.changed(invocation)),
+        (None, Some(current)) => return Err(if custom_exists(state, name)? {
+            RcError::new("conflict", format!("Шаблон «{name}» появился во время импорта. Повторите команду.")).with_extra("name", name)
+        } else {
+            current.changed(invocation)
+        }),
+        // Consent given for more than is left now (or nothing to consent to).
+        _ => {}
+    }
+    secure_fs::create_dir_all(state.paths().templates())?;
+    secure_fs::atomic_write(&custom_path(state, name), content.as_bytes())
+        .map_err(|error| RcError::new("failed", format!("Не удалось сохранить шаблон «{name}»: {error}")))
 }
 
 /// Plan lines of `template import` for the problems of a template: a problem
@@ -671,15 +697,41 @@ mod tests {
             "  строка 2: Маркер «GHOST»: группы с таким именем нет.",
         ]));
         assert_eq!(fingerprint(root.path()), before);
+        // Warnings alone need no plan.
         let many: String = (0..12).map(|i| format!("# --- G{i} ---\n# --- G{i} ---\n")).collect();
-        let error = import_text(&mut session, &["template", "import", "--name", "new"], Some(&format!("proxies:\n{many}"))).unwrap_err();
-        let plan = error.extra["plan"].as_array().unwrap();
-        assert_eq!((plan.len(), plan[0].as_str().unwrap(), plan[11].as_str().unwrap()),
-            (12, "Проблемы шаблона: ошибок — 0, предупреждений — 12.", "  … ещё 2"));
-        let token = error.extra["plan_token"].as_str().unwrap();
-        import_text(&mut session, &["template", "import", "--name", "new", "--yes", "--plan-token", token],
-            Some(&format!("proxies:\n{many}"))).unwrap();
+        let warned = format!("proxies:\n{many}");
+        import_text(&mut session, &["template", "import", "--name", "new"], Some(&warned)).unwrap();
         assert!(session.state.paths().templates().join("new.yaml").exists());
+        // A plan for another reason lists the warnings too.
+        let error = import_text(&mut session, &["template", "import", "--name", "new"], Some(&warned)).unwrap_err();
+        let plan = error.extra["plan"].as_array().unwrap();
+        assert_eq!((plan.len(), error.code), (13, "confirmation_required"), "overwrite, the summary, 10 problems and the rest");
+        let token = error.extra["plan_token"].as_str().unwrap();
+        import_text(&mut session, &["template", "import", "--name", "new", "--yes", "--plan-token", token], Some(&warned)).unwrap();
+    }
+
+    #[test]
+    fn import_rechecks_the_plan_under_the_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut session, _) = session(root.path());
+        let content = clean("x");
+        let yes = invocation(&["template", "import", "--name", "lab", "--yes"]);
+        // No plan was needed, but the file appeared meanwhile: conflict.
+        let planned = import_plan(&session.state, "lab.yaml", &content).unwrap();
+        assert!(planned.is_none());
+        let path = custom(&session, "lab.yaml", "proxies:\n");
+        let before = fingerprint(root.path());
+        let error = session.mutate("t", |state| import_planned(state, "lab.yaml", &content, planned.as_ref(), &yes)).unwrap_err();
+        assert_eq!(error.code, "conflict");
+        // The overwrite plan; the template gets an error meanwhile: plan_changed.
+        let broken = "mode: rule\n";
+        let planned = import_plan(&session.state, "lab.yaml", broken).unwrap().unwrap();
+        fs::remove_file(&path).unwrap();
+        let error = session.mutate("t", |state| import_planned(state, "lab.yaml", broken, Some(&planned), &yes)).unwrap_err();
+        assert_eq!(error.code, "plan_changed");
+        assert!(error.extra["plan_token"].is_string());
+        fs::write(&path, "proxies:\n").unwrap();
+        assert_eq!(fingerprint(root.path()), before);
     }
 
     #[test]

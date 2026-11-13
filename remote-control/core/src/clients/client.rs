@@ -198,12 +198,12 @@ struct RenamePlan {
 
 /// v1 `core_client_rename_plan`: checks only; plan lines exist only when an
 /// AmneziaWG client with the old name is removed on servers.
-fn rename_plan(session: &Session, config: &Config, old: &str, new: &str) -> Result<RenamePlan> {
+fn rename_plan(state: &crate::state::State, config: &Config, old: &str, new: &str) -> Result<RenamePlan> {
     let client = find_client(config, old)?;
     if config.clients.iter().any(|c| c.name == new) {
         return Err(RcError::new("conflict", format!("Клиент «{new}» уже существует.")).with_extra("name", new));
     }
-    let paths = session.state.paths();
+    let paths = state.paths();
     let old_dir = client_dir(paths, client)?;
     let new_dir = old_dir.with_file_name(new);
     if entry_exists(&old_dir)? {
@@ -225,7 +225,20 @@ fn rename_plan(session: &Session, config: &Config, old: &str, new: &str) -> Resu
     Ok(RenamePlan { old_dir, new_dir, awg_nodes, lines })
 }
 
-/// The config directory moves before the record and moves back when the
+/// `rename_plan` again under the mutation lock: a different plan (other
+/// AmneziaWG nodes, another directory) is `plan_changed` with the current one.
+fn rename_recheck(state: &crate::state::State, config: &Config, old: &str, new: &str, planned: &RenamePlan,
+    invocation: &Invocation) -> Result<()>
+{
+    let current = rename_plan(state, config, old, new)?;
+    if current.lines != planned.lines || current.new_dir != planned.new_dir {
+        return Err(Plan::new(current.lines, "").changed(invocation));
+    }
+    Ok(())
+}
+
+/// The plan is rebuilt under the mutation lock (`plan_changed` when it
+/// differs). The config directory moves before the record and moves back when the
 /// record cannot be saved; AmneziaWG removal failures afterwards → partial.
 pub async fn rename<T: RemoteTransport>(session: &mut Session, invocation: &Invocation, connect: &dyn Fn() -> T) -> Result<Value> {
     let old = required(invocation, "name")?.to_owned();
@@ -234,7 +247,7 @@ pub async fn rename<T: RemoteTransport>(session: &mut Session, invocation: &Invo
     find_client(&config, &old)?;
     if !v::name_valid(&new) { return Err(name_invalid()); }
     if new == old { return Ok(json!({"name": new})); }
-    let plan = rename_plan(session, &config, &old, &new)?;
+    let plan = rename_plan(&session.state, &config, &old, &new)?;
     if !plan.lines.is_empty() {
         Plan::new(plan.lines.clone(), "").confirm(invocation)?;
     }
@@ -248,10 +261,7 @@ pub async fn rename<T: RemoteTransport>(session: &mut Session, invocation: &Invo
     let mut moved = false;
     let saved = session.mutate("rename_client", |state| {
         let mut config = state.load_config()?;
-        find_client(&config, &old)?;
-        if config.clients.iter().any(|c| c.name == new) || entry_exists(&new_dir)? {
-            return Err(RcError::new("plan_changed", "Состояние изменилось после проверки. Повторите команду."));
-        }
+        rename_recheck(state, &config, &old, &new, &plan, invocation)?;
         if fs::symlink_metadata(&old_dir).is_ok_and(|meta| meta.is_dir()) {
             fs::rename(&old_dir, &new_dir).map_err(|_| RcError::new("failed", format!(
                 "Не удалось перенести каталог конфигов клиента «{old}»; клиент не переименован.")))?;
@@ -841,6 +851,21 @@ mod tests {
         assert_eq!((error.extra["name"].clone(), error.extra["nodes"].clone()), (json!("r3"), json!(["ru-vps"])));
         assert_eq!(session.state.load_config().unwrap().clients[0].name, "r3");
         assert!(generated.join("ROUTER/r3/config.yaml").is_file());
+    }
+
+    #[test]
+    fn rename_rechecks_the_plan_under_the_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let (session, _, _) = setup(root.path(), config());
+        let invocation = invocation(&["client", "rename", "--name", "my-router", "--new-name", "r3", "--yes"]);
+        let planned = rename_plan(&session.state, &config(), "my-router", "r3").unwrap();
+        assert!(planned.lines.is_empty());
+        rename_recheck(&session.state, &config(), "my-router", "r3", &planned, &invocation).unwrap();
+        // An AmneziaWG client appears meanwhile: the plan now removes it on a node.
+        let error = rename_recheck(&session.state, &with_awg(config()), "my-router", "r3", &planned, &invocation).unwrap_err();
+        assert_eq!(error.code, "plan_changed");
+        assert_eq!(error.extra["plan"].as_array().unwrap().len(), 4);
+        assert!(error.extra["plan_token"].is_string());
     }
 
     #[cfg(unix)]

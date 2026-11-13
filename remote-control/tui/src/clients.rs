@@ -477,8 +477,10 @@ fn groups(ctx: &mut Context<'_>) -> io::Result<()> {
         let Some(choice) = ctx.choose(&view)? else { return Ok(()); };
         match choice.to_ascii_lowercase().as_str() {
             "0" => return Ok(()),
-            "a" => if let Some(name) = required(ctx, "Название группы", "Название не указано.")? {
-                execute(ctx, &["group", "add", "--name", &name])?;
+            "a" => if let Some(name) = required(ctx, "Название группы", "Название не указано.")?
+                && let Some(template) = pick_template(ctx, &format!("Шаблон группы {name}"))?
+            {
+                execute(ctx, &["group", "add", "--name", &name, "--template", &template])?;
             },
             _ => match index(&choice, list.len()) { Some(i) => group_card(ctx, &list[i])?, None => ctx.invalid() },
         }
@@ -530,6 +532,17 @@ fn group_template(ctx: &mut Context<'_>, name: &str, current: &str) -> io::Resul
 
 // ─── Templates ───────────────────────────────────────────────────────────────
 
+/// A template from `template list`, `default.yaml` first; `None` — cancelled
+/// or the list could not be read (already reported).
+fn pick_template(ctx: &mut Context<'_>, title: &str) -> io::Result<Option<String>> {
+    let Some(data) = fetch(ctx, &["template", "list"])? else { return Ok(None); };
+    let mut labels = names(&data);
+    if let Some(i) = labels.iter().position(|name| name == "default.yaml") {
+        let default = labels.remove(i);
+        labels.insert(0, default);
+    }
+    Ok(ctx.select(title, &labels)?.map(|i| labels.swap_remove(i)))
+}
 fn source_label(row: &Value) -> &'static str { if row["source"] == "builtin" { "встроенный" } else { "пользовательский" } }
 fn templates(ctx: &mut Context<'_>) -> io::Result<()> {
     loop {
@@ -540,8 +553,10 @@ fn templates(ctx: &mut Context<'_>) -> io::Result<()> {
         let Some(choice) = ctx.choose(&view)? else { return Ok(()); };
         match choice.to_ascii_lowercase().as_str() {
             "0" => return Ok(()),
-            "a" => if let Some(name) = required(ctx, "Имя шаблона", "Имя шаблона не указано.")? {
-                let reply = execute(ctx, &["template", "create", "--name", &name])?;
+            "a" => if let Some(name) = required(ctx, "Имя шаблона", "Имя шаблона не указано.")?
+                && let Some(base) = pick_template(ctx, &format!("Шаблон {name}: на основе"))?
+            {
+                let reply = execute(ctx, &["template", "create", "--name", &name, "--from", &base])?;
                 if let Some(created) = reply.data["name"].as_str().filter(|_| reply.ok) { edit_template(ctx, created)?; }
             },
             _ => match index(&choice, list.len()) { Some(i) => template_card(ctx, &list[i])?, None => ctx.invalid() },
@@ -1236,14 +1251,15 @@ mod tests {
     fn groups_add_card_set_template_and_confirmed_delete() {
         let templates = json!([{"name":"default.yaml","source":"builtin","groups":["PC"]},{"name":"m.yaml","source":"custom","groups":[]}]);
         let (_, ui) = drive(vec![
-            ok(&["group", "list"], json!([])), ok(&["group", "add", "--name", "pc"], json!({"name":"PC"})),
+            ok(&["group", "list"], json!([])), ok(&["template", "list"], templates.clone()),
+            ok(&["group", "add", "--name", "pc", "--template", "default.yaml"], json!({"name":"PC","template":"default.yaml"})),
             ok(&["group", "list"], group_list()), ok(&["group", "list"], group_list()),
             ok(&["template", "list"], templates),
             ok(&["group", "set-template", "--name", "PC", "--template", "m.yaml"], json!({})),
             ok(&["group", "list"], group_list()),
             step(&["group", "delete", "--name", "PC"], plan()), yes(&["group", "delete", "--name", "PC"], json!({"name":"PC"})),
             ok(&["group", "list"], json!([])),
-        ], &["A", "pc", "1", "T", "2", "D", "y", "0"], groups);
+        ], &["A", "pc", "1", "1", "T", "2", "D", "y", "0"], groups);
         assert_eq!(keys(&ui.views[0]), [("a".into(), ui::GREEN), ("0".into(), ui::NC)]);
         let card = view(&ui, "Группа: PC");
         assert!(content(card).contains("Клиентов: 1"));
@@ -1263,12 +1279,13 @@ mod tests {
     #[test]
     fn templates_list_sources_and_create_opens_editor() {
         let list = json!([{"name":"default.yaml","source":"builtin","groups":["PC"]},{"name":"m.yaml","source":"custom","groups":[]}]);
-        let (_, ui) = drive(vec![
-            ok(&["template", "list"], list.clone()),
-            ok(&["template", "create", "--name", "x"], json!({"name":"x.yaml","based_on":"default.yaml","group":null})),
+        let (core, ui) = drive(vec![
+            ok(&["template", "list"], list.clone()), ok(&["template", "list"], list.clone()),
+            ok(&["template", "create", "--name", "x", "--from", "m.yaml"], json!({"name":"x.yaml","based_on":"m.yaml","group":null})),
             step(&["template", "show", "--name", "x.yaml"], fail("not_found", json!({}))),
             ok(&["template", "list"], list),
-        ], &["a", "x", "0"], templates);
+        ], &["a", "x", "2", "0"], templates);
+        core.assert_finished();
         assert_eq!(ui.views[0].sections[0][0].label, "default.yaml  (встроенный)");
         assert_eq!(ui.views[0].sections[0][1].label, "m.yaml  (пользовательский)");
     }

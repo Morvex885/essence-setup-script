@@ -120,7 +120,7 @@ static CATALOG: &[Spec] = &[
     spec("telegram", "remove-all", TELEGRAM, &[], 0),
     spec("telegram", "menu", "name=", &[], TTY),
     spec("group", "list", "", &[], 0),
-    spec("group", "add", "name=", &[], 0),
+    spec("group", "add", "name= template=", &[], 0),
     spec("group", "delete", "name=", &[], 0),
     spec("group", "set-template", "name= template=", &[], 0),
     spec("template", "list", "", &[], 0),
@@ -196,7 +196,7 @@ static HELP: &[(&str, &[(&str, &str)])] = &[
     ]),
     ("group", &[
         ("group list", "Список групп"),
-        ("group add --name G", "Добавить группу"),
+        ("group add --name G [--template T]", "Добавить группу (с шаблоном T; без него — default.yaml)"),
         ("group delete --name G [--yes]", "Удалить группу"),
         ("group set-template --name G --template T", "Назначить шаблон группе"),
     ]),

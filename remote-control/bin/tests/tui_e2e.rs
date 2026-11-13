@@ -199,6 +199,8 @@ fn first_run_init_local_add_group_generate_and_exit() {
     session.send("a\n");
     session.expect("Название группы");
     session.send("LAB\n");
+    session.expect("Шаблон группы");
+    session.send("1\n");
     session.expect("LAB");
     session.send("0\n");
     session.expect("Remote Control v");
@@ -232,6 +234,8 @@ fn arrow_keys_navigate_menus() {
     session.send("a\n");
     session.expect("Название группы");
     session.send("ARROWS\n");
+    session.expect("Шаблон группы");
+    session.send("1\n");
     session.expect("ARROWS");
     session.send("1\n");
     session.expect("Сгенерировать конфиги группы");
@@ -368,7 +372,7 @@ fn screens_speak_the_real_v2_grammar() {
 
 /// Dashboard keys per section; `_` is Enter, EXPORT a temp file path.
 const WALK: &str = "1 \
-    g a LAB 4 t 1 f _ h 0 0 0 \
+    g a LAB 1 4 t 1 f _ h 0 0 0 \
     c a alice 4 1 v _ f _ s 0 r bob 0 0 \
     m 1 v _ c _ g x EXPORT 0 0 \
     n 0 p 0 a 0 t s 0 \
