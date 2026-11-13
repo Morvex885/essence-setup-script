@@ -462,6 +462,57 @@ export async function groupTemplateFlow(ctx, name, current) {
   return created.ok ? replyName(created, null) : null;
 }
 
+/** `conn set` группы на ноде: только эта группа, полный набор подключений (пустой снимает назначение). */
+export function groupConnectionsArgv(group, node, proxies) {
+  return ['conn', 'set', '--name', node, '--assign', `${group}=${proxies.join(',')}`];
+}
+
+/** Подключения группы на ноде из ответа `conn list --name N --discover`. */
+export function groupProxies(found, group) {
+  const entry = asList(found)[0];
+  const row = entry ? asList(entry.groups).find((item) => item && item.name === group) : null;
+  return row ? strings(row.proxies) : [];
+}
+
+/**
+ * Подключения нод для группы: нода (единственная выбирается сама) →
+ * найденные на ней подключения (`conn list --discover` по SSH) одной формой,
+ * назначенные группе отмечены → `conn set --name N --assign G=P…` (без
+ * отметок — назначение группы на ноде снимается). Отмена и выбор без
+ * изменений ничего не меняют.
+ */
+export async function groupConnectionsFlow(ctx, group) {
+  const read = await fetchData(ctx, ['node', 'list']);
+  if (!read) return;
+  const options = nameOptions(read.data, nodeLabel);
+  if (options.length === 0) { ctx.notify('warn', 'Нод нет — сначала добавьте ноду.'); return; }
+  let node = options[0].value;
+  if (options.length > 1) {
+    const picked = await ctx.form({
+      title: `Подключения группы ${group}`, submit: 'Далее',
+      fields: [{ name: 'node', label: 'Нода', type: 'select', options, required: true }],
+    });
+    if (picked === null || picked === undefined) return;
+    node = picked.node;
+  }
+  const found = await ctx.nodeRequest(node, discoverArgv(node), null);
+  if (!found.ok) return;
+  const proxies = discoveredProxies(found.data);
+  if (proxies.length === 0) { ctx.notify('warn', `На ноде «${node}» подключений не найдено.`); return; }
+  const current = groupProxies(found.data, group);
+  const values = await ctx.form({
+    title: `Подключения группы ${group}`, context: [`Нода: ${node}`], submit: 'Назначить',
+    fields: [{ name: 'proxies', label: 'Подключения', type: 'multi', hint: 'Без отметок назначение группы на этой ноде снимается',
+      options: proxies.map((proxy) => ({ value: proxy, label: proxy })),
+      value: proxies.filter((proxy) => current.includes(proxy)) }],
+  });
+  if (values === null || values === undefined) return;
+  const chosen = asList(values.proxies);
+  const known = current.filter((proxy) => proxies.includes(proxy));
+  if (chosen.length === known.length && chosen.every((proxy) => known.includes(proxy))) return;
+  await execute(ctx, groupConnectionsArgv(group, node, chosen));
+}
+
 /** Перенос клиента группы `group` в другую из `groups` (`group list`) по плану. */
 export async function moveClientFlow(ctx, group, groups, client) {
   const others = nameOptions(groups).filter((option) => option.value !== group);

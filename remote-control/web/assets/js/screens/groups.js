@@ -21,6 +21,13 @@ function NodeChips({ ctx, nodes }) {
   return html`<${Chips} items=${strings(nodes).map((node) => ({ label: node, href: ctx.href('nodes', node) }))} />`;
 }
 
+/** Ноды группы; без нод — кнопка назначения подключений вместо «нет». */
+function GroupNodes({ ctx, nodes, busy, onAdd }) {
+  return strings(nodes).length > 0
+    ? html`<${NodeChips} ctx=${ctx} nodes=${nodes} />`
+    : html`<${Button} icon="plus" disabled=${busy} onClick=${onAdd}>Добавить подключения<//>`;
+}
+
 // ─── Список ─────────────────────────────────────────────────────────────────
 
 function GroupList({ ctx }) {
@@ -40,6 +47,7 @@ function GroupList({ ctx }) {
   const actions = html`<${Button} kind="primary" icon="plus" disabled=${busy || !state.data} onClick=${add}>Добавить группу<//>`;
   const menu = (row) => [
     { label: 'Сгенерировать конфиги', icon: 'file-code', disabled: busy, onClick: () => act(() => model.generateFlow(ctx, { group: row.name })) },
+    { label: 'Подключения нод…', icon: 'server', disabled: busy, onClick: () => act(() => model.groupConnectionsFlow(ctx, row.name)) },
     { label: 'Удалить', icon: 'trash-2', danger: true, disabled: busy, onClick: () => remove(row.name) },
   ];
   return html`<${Loaded} title="Группы" state=${state} actions=${actions}>
@@ -54,7 +62,8 @@ function GroupList({ ctx }) {
                   { key: 'name', label: 'Группа', search: true },
                   { key: 'template', label: 'Шаблон', render: (row) => html`<${TemplateLink} ctx=${ctx} template=${row.template} />` },
                   { key: 'clients', label: 'Клиентов', render: (row) => model.scalar(row.clients) },
-                  { key: 'nodes', label: 'Ноды', render: (row) => html`<${NodeChips} ctx=${ctx} nodes=${row.nodes} />` },
+                  { key: 'nodes', label: 'Ноды', render: (row) => html`<${GroupNodes} ctx=${ctx} nodes=${row.nodes} busy=${busy}
+                    onAdd=${() => act(() => model.groupConnectionsFlow(ctx, row.name))} />` },
                 ]} />`}
         <//>
       <//>`;
@@ -102,7 +111,10 @@ function GroupCard({ ctx, name }) {
     <${Button} kind="primary" icon="file-code" disabled=${busy} onClick=${() => act(() => model.generateFlow(ctx, { group: name }))}>Сгенерировать конфиги группы<//>
     <${Button} icon="scroll-text" disabled=${busy} onClick=${() => act(chooseTemplate)}>Шаблон…<//>
     <${Button} icon="rss" disabled=${busy} onClick=${() => act(() => model.showHeaders(ctx, 'group', name))}>Заголовки подписки<//>
-    <${MoreMenu} items=${[{ label: 'Удалить группу', icon: 'trash-2', danger: true, disabled: busy, onClick: () => act(remove) }]} />`;
+    <${MoreMenu} items=${[
+      { label: 'Подключения нод…', icon: 'server', disabled: busy, onClick: () => act(() => model.groupConnectionsFlow(ctx, name)) },
+      { label: 'Удалить группу', icon: 'trash-2', danger: true, disabled: busy, onClick: () => act(remove) },
+    ]} />`;
 
   return html`<${Loaded} title=${name} back=${back} state=${state}>
     ${() => html`<${Page} title=${name} back=${back} actions=${actions}>
@@ -110,7 +122,8 @@ function GroupCard({ ctx, name }) {
         <${Facts} items=${[
           { label: 'Шаблон', value: html`<${TemplateLink} ctx=${ctx} template=${row.template} />` },
           { label: 'Клиентов', value: model.scalar(row.clients) },
-          { label: 'Ноды', value: html`<${NodeChips} ctx=${ctx} nodes=${row.nodes} />` },
+          { label: 'Ноды', value: html`<${GroupNodes} ctx=${ctx} nodes=${row.nodes} busy=${busy}
+            onAdd=${() => act(() => model.groupConnectionsFlow(ctx, name))} />` },
         ]} />
       <//>
       <${Loaded} title="Клиенты группы" state=${clients} inline>

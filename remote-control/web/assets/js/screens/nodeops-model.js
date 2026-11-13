@@ -98,26 +98,58 @@ export function connectionView(listed, state, name) {
   return { proxies, assigned, problem, table };
 }
 
-/** Заголовок выбора групп (`assign_connections`). */
-export function assignGroupsTitle(proxies) {
-  return proxies.length === 0 ? 'Группы: снять назначение подключений' : 'Группы для подключений';
-}
-
-/** `conn set`: пустой набор подключений снимает назначение групп (без `--proxy`). */
-export function assignArgv(name, groups, proxies) {
+/**
+ * `conn set --name N --assign G=P1,P2 …`: полный набор подключений каждой
+ * перечисленной группы на ноде (`G=` снимает назначение); какие группы
+ * изменились, решает ядро. `assignments` — `[[группа, [подключения]]]`.
+ */
+export function assignArgv(name, assignments) {
   const argv = ['conn', 'set', '--name', name];
-  for (const group of groups) argv.push('--group', group);
-  for (const proxy of proxies) argv.push('--proxy', proxy);
+  for (const [group, proxies] of assignments) argv.push('--assign', `${group}=${proxies.join(',')}`);
   return argv;
 }
 
+const proxyField = (index) => `proxy-${index}`;
+
 /**
- * Назначение подключений (`assign_connections`) одной формой: подключения
- * (отмечены назначенные) и целевые группы (без отметок, хотя бы одна). Без
- * обнаруженных подключений поля подключений нет: пустой набор снимает
- * назначение выбранных групп (`conn set` без `--proxy`). Отмена ничего не меняет.
+ * Изменённые группы формы «по подключению»: `assigned[i]` — группы
+ * `proxies[i]` при открытии формы, `values[proxy-i]` — отмеченные.
+ * Возвращает `[[группа, [подключения]]]` только для групп, чей набор
+ * (среди найденных подключений) изменился, — назначения, сделанные другим
+ * клиентом в других группах, форма не перезаписывает.
+ */
+export function assignmentChanges(proxies, assigned, values) {
+  const order = [];
+  const sets = (pick) => {
+    const map = new Map();
+    proxies.forEach((proxy, index) => {
+      for (const group of asList(pick(index))) {
+        if (!order.includes(group)) order.push(group);
+        if (!map.has(group)) map.set(group, []);
+        map.get(group).push(proxy);
+      }
+    });
+    return map;
+  };
+  const before = sets((index) => assigned[index]);
+  const after = sets((index) => values[proxyField(index)]);
+  return order
+    .map((group) => [group, after.get(group) || [], before.get(group) || []])
+    .filter(([, next, old]) => next.length !== old.length || next.some((proxy) => !old.includes(proxy)))
+    .map(([group, next]) => [group, next]);
+}
+
+/**
+ * Назначение подключений (`assign_connections`) одной формой: по полю на
+ * каждое найденное подключение со списком групп, текущие группы отмечены —
+ * снятая отметка снимает назначение. Изменённые группы уходят одной
+ * `conn set`; без изменений команды нет. Отмена ничего не меняет.
  */
 export async function assignConnections(ctx, name, proxies, assigned) {
+  if (proxies.length === 0) {
+    ctx.notify('warn', `На ноде «${name}» подключений не найдено.`);
+    return;
+  }
   const listed = await ctx.call('group', 'list');
   if (!listed.ok) {
     if (ctx.isFailure(listed)) ctx.failed();
@@ -128,27 +160,19 @@ export async function assignConnections(ctx, name, proxies, assigned) {
     ctx.notify('warn', EMPTY);
     return;
   }
-  const fields = [];
-  if (proxies.length > 0) {
-    fields.push({
-      name: 'proxies',
-      label: 'Подключения',
-      type: 'multi',
-      options: proxies.map((proxy) => ({ value: proxy, label: proxy })),
-      value: proxies.filter((_, index) => assigned[index].length > 0),
-      hint: 'Без отмеченных подключений назначение выбранных групп снимается',
-    });
-  }
-  fields.push({
-    name: 'groups',
-    label: 'Группы',
-    type: 'multi',
-    options: groups.map((group) => ({ value: group, label: group })),
-    required: true,
+  const options = groups.map((group) => ({ value: group, label: group }));
+  const fields = proxies.map((proxy, index) => ({
+    name: proxyField(index), label: proxy, type: 'multi', options,
+    value: asList(assigned[index]).filter((group) => groups.includes(group)),
+  }));
+  const values = await ctx.form({
+    title: 'Назначение подключений группам', context: [`Нода: ${name}`, 'Снятая отметка снимает назначение подключения группе.'],
+    fields, submit: 'Сохранить',
   });
-  const values = await ctx.form({ title: assignGroupsTitle(proxies), context: [`Нода: ${name}`], fields, submit: 'Назначить' });
-  if (values === null) return;
-  const saved = await ctx.request(assignArgv(name, values.groups, values.proxies || []));
+  if (values === null || values === undefined) return;
+  const changes = assignmentChanges(proxies, assigned, values);
+  if (changes.length === 0) return;
+  const saved = await ctx.request(assignArgv(name, changes));
   if (ctx.isFailure(saved)) ctx.failed();
 }
 

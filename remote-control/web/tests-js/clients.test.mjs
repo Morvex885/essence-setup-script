@@ -352,6 +352,38 @@ test('ноды клиента: свои — client nodes, возврат к гр
   assert.equal(kinds(partial).at(-1), 'failed');
 });
 
+test('подключения группы: нода по выбору (одна — сама), назначенные группе отмечены, conn set только для группы', async () => {
+  const two = okReply([{ name: 'de', ip: '1.1.1.1', port: 22 }, { name: 'nl', ip: '2.2.2.2', port: 22 }]);
+  const found = okReply([{ node: 'nl', groups: [{ name: 'PC', proxies: ['p2'] }, { name: 'TV', proxies: ['p1'] }], discovered: ['p1', 'p2'] }]);
+  const ctx = fakeCtx({ replies: [two, found, okReply()], answers: [{ node: 'nl' }, { proxies: ['p1', 'p2'] }] });
+  await m.groupConnectionsFlow(ctx, 'PC');
+  assert.deepEqual(commands(ctx), [['node', 'list'], m.discoverArgv('nl'),
+    ['conn', 'set', '--name', 'nl', '--assign', 'PC=p1,p2']]);
+  assert.deepEqual(ctx.calls.filter((c) => c[0] === 'form')[1][1].fields[0].value, ['p2']);
+
+  const one = fakeCtx({ replies: [okReply([{ name: 'de', ip: '1.1.1.1', port: 22 }]), okReply([{ node: 'de', discovered: ['p1'] }]), okReply()],
+    answers: [{ proxies: ['p1'] }] });
+  await m.groupConnectionsFlow(one, 'PC');
+  assert.deepEqual(kinds(one), ['request', 'node', 'form', 'request'], 'единственная нода без выбора');
+
+  const noNodes = fakeCtx({ replies: [okReply([])] });
+  await m.groupConnectionsFlow(noNodes, 'PC');
+  assert.deepEqual(kinds(noNodes), ['request', 'notify']);
+
+  const nothing = fakeCtx({ replies: [okReply([{ name: 'de' }]), okReply([{ node: 'de', discovered: [] }])] });
+  await m.groupConnectionsFlow(nothing, 'PC');
+  assert.deepEqual(kinds(nothing), ['request', 'node', 'notify']);
+
+  const same = fakeCtx({ replies: [okReply([{ name: 'de' }]), okReply([{ node: 'de', groups: [{ name: 'PC', proxies: ['p1'] }], discovered: ['p1', 'p2'] }])],
+    answers: [{ proxies: ['p1'] }] });
+  await m.groupConnectionsFlow(same, 'PC');
+  assert.deepEqual(kinds(same), ['request', 'node', 'form'], 'без изменений команды нет');
+
+  const cancelled = fakeCtx({ replies: [two], answers: [null] });
+  await m.groupConnectionsFlow(cancelled, 'PC');
+  assert.deepEqual(kinds(cancelled), ['request', 'form']);
+});
+
 test('подключения клиента на ноде: поиск через nodeRequest, отмечены назначенные', async () => {
   const assigned = [{ node: 'de', proxies: ['p2'] }];
   const found = okReply([{ node: 'de', discovered: ['p1', 'p2'] }]);

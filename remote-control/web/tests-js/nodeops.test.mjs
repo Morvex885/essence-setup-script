@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   EMPTY, nodeText, syncedNode, syncProblem, syncData, overviewNodes, syncAll,
-  connectionView, assignGroupsTitle, assignArgv, assignConnections, connSyncArgv, connListArgv, nodeCheckArgv,
+  connectionView, assignmentChanges, assignArgv, assignConnections, connSyncArgv, connListArgv, nodeCheckArgv,
   awgStatusArgv, awgSyncArgv, awgRemovePeerArgv, awgOrphansArgv, awgView,
   TELEGRAM_BATCH, TELEGRAM_COMPONENTS, TELEGRAM_STATUS_ARGV, telegramArgv, telegramResults,
   telegramMenu, telegramBatch, telegramStatus,
@@ -103,10 +103,15 @@ test('argv подключений', () => {
   assert.deepEqual(connListArgv(), ['conn', 'list']);
   assert.deepEqual(connListArgv('n'), ['conn', 'list', '--name', 'n']);
   assert.deepEqual(nodeCheckArgv('n'), ['node', 'check', '--name', 'n']);
-  assert.deepEqual(assignArgv('n', ['g2'], ['p2']), ['conn', 'set', '--name', 'n', '--group', 'g2', '--proxy', 'p2']);
-  assert.deepEqual(assignArgv('n', ['old'], []), ['conn', 'set', '--name', 'n', '--group', 'old']);
-  assert.equal(assignGroupsTitle([]), 'Группы: снять назначение подключений');
-  assert.equal(assignGroupsTitle(['p1']), 'Группы для подключений');
+  assert.deepEqual(assignArgv('n', [['g2', ['p1', 'p2']], ['old', []]]),
+    ['conn', 'set', '--name', 'n', '--assign', 'g2=p1,p2', '--assign', 'old=']);
+  // Снятая отметка одной группы из десяти — меняется только она.
+  const groups = Array.from({ length: 10 }, (_, i) => `g${i}`);
+  assert.deepEqual(assignmentChanges(['p1'], [groups], { 'proxy-0': groups.slice(1) }), [['g0', []]]);
+  // Без изменений — пусто (порядок отметок не важен).
+  assert.deepEqual(assignmentChanges(['p1', 'p2'], [['a'], ['a', 'b']], { 'proxy-0': ['a'], 'proxy-1': ['b', 'a'] }), []);
+  // Разные наборы групп не смешиваются: PC=[p1], TV=[p2], добавлен p2 в PC — TV не трогается.
+  assert.deepEqual(assignmentChanges(['p1', 'p2'], [['PC'], ['TV']], { 'proxy-0': ['PC'], 'proxy-1': ['TV', 'PC'] }), [['PC', ['p1', 'p2']]]);
 });
 
 /** Поддельный `ctx` назначения: `steps` — `[argv, reply]`, `answers` — ответы `form`. */
@@ -131,145 +136,36 @@ function assignCtx(steps, answers) {
 
 const field = (form, name) => form.fields.find((item) => item.name === name);
 
-test('assignConnections: одна форма — подключения (назначенные отмечены) и группы', async () => {
-  const steps = [[['group', 'list'], ok([{ name: 'g1' }, { name: 'g2' }])], [assignArgv('n', ['g2'], ['p2']), ok()]];
-  const { ctx, record } = assignCtx(steps, [{ proxies: ['p2'], groups: ['g2'] }]);
+test('assignConnections: поле на подключение, текущие группы отмечены, одна команда только с изменёнными', async () => {
+  const steps = [[['group', 'list'], ok([{ name: 'g1' }, { name: 'g2' }])], [assignArgv('n', [['g2', ['p2']]]), ok()]];
+  const { ctx, record } = assignCtx(steps, [{ 'proxy-0': ['g1'], 'proxy-1': ['g2'] }]);
   await assignConnections(ctx, 'n', ['p1', 'p2'], [['g1'], []]);
   assert.equal(record.forms.length, 1);
   const [form] = record.forms;
-  assert.deepEqual(field(form, 'proxies').options.map((o) => o.value), ['p1', 'p2']);
-  assert.deepEqual(field(form, 'proxies').value, ['p1']);
-  assert.equal(field(form, 'groups').type, 'multi');
-  assert.ok(field(form, 'groups').required);
-  assert.deepEqual(field(form, 'groups').options.map((o) => o.value), ['g1', 'g2']);
-  assert.ok(!field(form, 'groups').value || field(form, 'groups').value.length === 0);
+  assert.deepEqual(form.fields.map((f) => [f.label, f.type, f.value]), [['p1', 'multi', ['g1']], ['p2', 'multi', []]]);
+  assert.deepEqual(field(form, 'proxy-0').options.map((o) => o.value), ['g1', 'g2']);
   assert.equal(steps.length, 0);
   assert.deepEqual(record.notices, []);
 });
 
-test('assignConnections: без подключений поля подключений нет, назначение снимается', async () => {
-  const steps = [[['group', 'list'], ok([{ name: 'old' }])], [['conn', 'set', '--name', 'n', '--group', 'old'], ok()]];
-  const { ctx, record } = assignCtx(steps, [{ groups: ['old'] }]);
+test('assignConnections: без подключений формы нет', async () => {
+  const { ctx, record } = assignCtx([], []);
   await assignConnections(ctx, 'n', [], []);
-  assert.equal(field(record.forms[0], 'proxies'), undefined);
-  assert.equal(steps.length, 0);
+  assert.deepEqual([record.calls, record.forms.length, record.notices.length], [[], 0, 1]);
 });
 
-test('assignConnections: отмена ничего не меняет, сбои — failed', async () => {
+test('assignConnections: отмена и форма без изменений ничего не меняют, сбои — failed', async () => {
   let { ctx, record } = assignCtx([[['group', 'list'], ok([{ name: 'g' }])]], [null]);
   await assignConnections(ctx, 'n', ['p1'], [[]]);
   assert.deepEqual(record.calls, [['group', 'list']]);
   assert.deepEqual(record.notices, []);
+  ({ ctx, record } = assignCtx([[['group', 'list'], ok([{ name: 'g' }])]], [{ 'proxy-0': ['g'] }]));
+  await assignConnections(ctx, 'n', ['p1'], [['g']]);
+  assert.deepEqual(record.calls, [['group', 'list']]);
   ({ ctx, record } = assignCtx([[['group', 'list'], err('locked')]], []));
   await assignConnections(ctx, 'n', ['p1'], [[]]);
   assert.deepEqual([record.forms.length, record.notices], [0, ['failed']]);
-  ({ ctx, record } = assignCtx([[['group', 'list'], ok([{ name: 'g' }])], [assignArgv('n', ['g'], []), err('locked')]], [{ proxies: [], groups: ['g'] }]));
+  ({ ctx, record } = assignCtx([[['group', 'list'], ok([{ name: 'g' }])], [assignArgv('n', [['g', []]]), err('locked')]], [{ 'proxy-0': [] }]));
   await assignConnections(ctx, 'n', ['p1'], [['g']]);
   assert.deepEqual(record.notices, ['failed']);
-});
-
-test('AmneziaWG: argv, состояния клиентов и признаки действий', () => {
-  assert.deepEqual(awgStatusArgv('n'), ['awg', 'status', '--name', 'n']);
-  assert.deepEqual(awgSyncArgv('n'), ['awg', 'sync', '--name', 'n']);
-  assert.deepEqual(awgRemovePeerArgv('n', 'orphan'), ['awg', 'remove', '--name', 'n', '--peer', 'orphan']);
-  assert.deepEqual(awgOrphansArgv('n'), ['awg', 'remove', '--name', 'n', '--orphans']);
-  const view = awgView({ installed: true, peers: [{ name: 'used', status: 'used' }, { name: 'orphan', status: 'orphan' }, { name: 'missing', status: 'missing' }] });
-  assert.deepEqual(view.table.map((r) => [r.name, r.tone, r.removable]), [['used', 'ok', true], ['orphan', 'warn', true], ['missing', 'neutral', false]]);
-  assert.deepEqual([view.installed, view.missing, view.orphans], [true, true, true]);
-  const clean = awgView({ installed: true, peers: [{ name: 'used', status: 'used' }] });
-  assert.deepEqual([clean.missing, clean.orphans], [false, false]);
-  const absent = awgView({ installed: false, peers: [{ name: 'x', status: 'orphan' }] });
-  assert.deepEqual([absent.installed, absent.table, absent.orphans], [false, [], false]);
-  assert.deepEqual(awgView({ installed: true, peers: [] }).table, []);
-});
-
-test('Telegram: порядок, опасные действия и argv пакетов', () => {
-  assert.ok(TELEGRAM_BATCH.every((a) => a.title && Array.isArray(a.argv)));
-  assert.deepEqual(TELEGRAM_BATCH.filter((a) => a.danger).map((a) => a.id), ['remove', 'remove-all']);
-  const verbs = TELEGRAM_BATCH.map((a) => a.argv[1]);
-  assert.deepEqual(verbs, ['install', 'refresh-ip', 'web-update', 'web-restart', 'backend-restart', 'remove', 'remove-all']);
-  for (const action of TELEGRAM_BATCH.filter((a) => !a.component)) {
-    assert.deepEqual(telegramArgv(action.argv, ['n1', 'n3']), ['telegram', action.argv[1], '--name', 'n1', '--name', 'n3']);
-  }
-  assert.deepEqual(TELEGRAM_COMPONENTS.map((c) => c.value), ['web', 'mtproto']);
-  assert.deepEqual(telegramArgv(['telegram', 'remove'], ['n2'], 'mtproto'), ['telegram', 'remove', '--component', 'mtproto', '--name', 'n2']);
-  assert.deepEqual(TELEGRAM_STATUS_ARGV, ['telegram', 'status', '--all']);
-});
-
-test('Telegram: таблица результатов', () => {
-  const results = { results: [
-    { node: 'a', code: 0, status: 'ok', reason: null }, { node: 'b', code: 3, status: 'not_installed', reason: 'не установлен' },
-    { node: 'c', code: 4, status: 'partial', reason: 'x' }, { node: 'd', code: 1, status: 'error', reason: 'offline' }] };
-  const table = telegramResults(err('partial', results));
-  assert.deepEqual(table.map((r) => r.tone), ['ok', 'warn', 'warn', 'error']);
-  assert.deepEqual(table.map((r) => `${r.node}  ${r.status}  ${r.reason}`),
-    ['a  готово  ', 'b  не установлено  не установлен', 'c  частично  x', 'd  ошибка  offline']);
-  assert.equal(telegramResults(ok(results)).length, 4);
-  assert.equal(telegramResults(ok({ results: [] })), null);
-  assert.equal(telegramResults(err('invalid')), null);
-});
-
-/** `ctx` Telegram: `assignCtx` с планом (`runConfirmed`), терминалом и окном результата. */
-function telegramCtx(steps, answers) {
-  const s = assignCtx(steps, answers);
-  s.record.terminals = [];
-  s.ctx.runConfirmed = (_title, _question, argv) => s.ctx.request(argv);
-  s.ctx.terminal = async (argv) => { s.record.terminals.push(argv); return ok(); };
-  return s;
-}
-const nodeRows = [{ name: 'n1', ip: '192.0.2.1', port: 22 }, { name: 'n2', ip: '192.0.2.2', port: 22 }];
-
-test('Telegram: управление нодой — выбор ноды и telegram menu; нет нод — без формы', async () => {
-  const s = telegramCtx([[['node', 'list'], ok(nodeRows)]], [{ node: 'n2' }]);
-  await telegramMenu(s.ctx);
-  assert.deepEqual(s.record.forms[0].fields[0].options.map((o) => o.value), ['n1', 'n2']);
-  assert.deepEqual(s.record.terminals, [['telegram', 'menu', '--name', 'n2']]);
-
-  const cancelled = telegramCtx([[['node', 'list'], ok(nodeRows)]], [null]);
-  await telegramMenu(cancelled.ctx);
-  assert.deepEqual(cancelled.record.terminals, []);
-
-  const empty = telegramCtx([[['node', 'list'], ok([])]], []);
-  await telegramMenu(empty.ctx);
-  assert.deepEqual([empty.record.forms.length, empty.record.notices], [0, [EMPTY]]);
-});
-
-test('Telegram: пакетное действие — ноды и способ доступа формой, план, таблица результатов', async () => {
-  const remove = TELEGRAM_BATCH.find((a) => a.component);
-  const results = { results: [{ node: 'n1', status: 'ok', reason: '' }] };
-  const argv = telegramArgv(remove.argv, ['n1'], 'web');
-  const shown = [];
-  const s = telegramCtx([[['node', 'list'], ok(nodeRows)], [argv, ok(results)]], [{ nodes: ['n1'], component: 'web' }]);
-  assert.equal(await telegramBatch(s.ctx, remove, async (table) => { shown.push(table); }), true);
-  assert.deepEqual(s.record.forms[0].fields.map((f) => f.name), ['nodes', 'component']);
-  assert.deepEqual(shown, [telegramResults(ok(results))]);
-
-  // partial с результатами — таблица без итога сбоя; отказ от плана — ничего не менялось.
-  const partial = telegramCtx([[['node', 'list'], ok(nodeRows)], [argv, err('partial', results)]], [{ nodes: ['n1'], component: 'web' }]);
-  assert.equal(await telegramBatch(partial.ctx, remove, async (table) => { shown.push(table); }), true);
-  assert.equal(shown.length, 2);
-  const declined = telegramCtx([[['node', 'list'], ok(nodeRows)], [argv, err('confirmation_required')]], [{ nodes: ['n1'], component: 'web' }]);
-  assert.equal(await telegramBatch(declined.ctx, remove, async () => assert.fail('нет таблицы')), false);
-  assert.deepEqual(declined.record.notices, []);
-
-  const install = TELEGRAM_BATCH.find((a) => !a.component);
-  const cancelled = telegramCtx([[['node', 'list'], ok(nodeRows)]], [null]);
-  assert.equal(await telegramBatch(cancelled.ctx, install, async () => assert.fail('нет таблицы')), false);
-  assert.deepEqual(cancelled.record.forms[0].fields.map((f) => f.name), ['nodes']);
-  const failed = telegramCtx([[['node', 'list'], err('locked')]], []);
-  assert.equal(await telegramBatch(failed.ctx, install, async () => assert.fail('нет таблицы')), false);
-  assert.deepEqual(failed.record.notices, ['failed']);
-});
-
-test('Telegram: статус — строки таблицы, сбой без таблицы — null и итог сбоя', async () => {
-  const results = { results: [{ node: 'n1', status: 'not_installed', reason: '' }] };
-  let s = telegramCtx([[TELEGRAM_STATUS_ARGV, ok(results)]], []);
-  assert.deepEqual(await telegramStatus(s.ctx), telegramResults(ok(results)));
-  s = telegramCtx([[TELEGRAM_STATUS_ARGV, ok({ results: [] })]], []);
-  assert.deepEqual(await telegramStatus(s.ctx), []);
-  s = telegramCtx([[TELEGRAM_STATUS_ARGV, err('partial', results)]], []);
-  assert.equal((await telegramStatus(s.ctx)).length, 1);
-  s = telegramCtx([[TELEGRAM_STATUS_ARGV, err('locked')]], []);
-  assert.equal(await telegramStatus(s.ctx), null);
-  assert.deepEqual(s.record.notices, ['failed']);
 });

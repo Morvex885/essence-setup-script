@@ -50,8 +50,8 @@ export async function passwordForm(ctx, title, { current = false, currentLabel =
 
 /**
  * «Требует внимания» на сводке из `status` и `hello`: `[{ id, tone, text,
- * action }]`; `action` — `{ label, type: 'password'|'ssh-setup'|'route',
- * node?, route?, param?, tab? }` (экран выполняет действие по `type`).
+ * action }]`; `action` — `{ label, type: 'password'|'ssh-setup'|'group-connections'|'route',
+ * node?, group?, route?, param?, tab? }` (экран выполняет действие по `type`).
  * Третий аргумент — ответы `group list` и `node list` (`null`, если не
  * прочитаны): группы без нод и ноды, чьи подключения не назначены ни одной группе.
  */
@@ -104,16 +104,12 @@ export function attentionItems(status, hello, { groups = null, nodes = null } = 
       const name = str(group && group.name);
       if (!name || strings(group.nodes).length > 0) continue;
       const clients = Number.isInteger(group.clients) ? group.clients : 0;
-      // Назначение — на вкладке подключений ноды; единственная нода открывается сразу.
-      const only = nodeNames.length === 1 ? nodeNames[0] : null;
       items.push({
         id: `group-nodes:${name}`, tone: clients > 0 ? 'warn' : 'info',
         text: clients > 0
           ? `Группа «${name}»: нет нод — клиенты группы (${clients}) получат конфиг без подключений`
           : `Группа «${name}»: нет нод`,
-        action: only
-          ? { label: 'Назначить подключения', type: 'route', route: 'nodes', param: only, tab: 'connections' }
-          : { label: 'Ноды', type: 'route', route: 'nodes' },
+        action: { label: 'Добавить подключения', type: 'group-connections', group: name },
       });
     }
     if (Array.isArray(nodes)) {

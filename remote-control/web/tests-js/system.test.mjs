@@ -107,11 +107,10 @@ test('сводка: группы без нод и ноды без назначе
   assert.deepEqual(items.map((item) => [item.id, item.tone]), [
     ['group-nodes:PC', 'warn'], ['group-nodes:EMPTY', 'info'], ['node-groups:nl', 'info'],
   ]);
+  // Группа без нод — поток назначения подключений этой группе.
+  assert.deepEqual([items[0].action.type, items[0].action.group], ['group-connections', 'PC']);
   // Нода без назначений ведёт на свою вкладку подключений.
   assert.deepEqual(items[2].action, { label: items[2].action.label, type: 'route', route: 'nodes', param: 'nl', tab: 'connections' });
-  // Единственная нода — группа без нод сразу ведёт к её подключениям.
-  const single = attentionItems(calm, null, { groups: [{ name: 'PC', clients: 1, nodes: [] }], nodes: [{ name: 'de' }] });
-  assert.deepEqual([single[0].action.param, single[0].action.tab], ['de', 'connections']);
   // Списки не прочитаны — пунктов нет.
   assert.deepEqual(attentionItems(calm, null, { groups: null, nodes }), []);
   assert.deepEqual(attentionItems(calm, null, { groups: [{ name: 'PC', clients: 0, nodes: ['de'] }], nodes: null }), []);

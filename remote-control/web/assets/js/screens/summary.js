@@ -7,7 +7,7 @@ import { asList } from '../format.js';
 import { useCommand, useBusy, useMounted, Loaded } from './kit.js';
 import { dashboardTitle, attentionItems } from './system-model.js';
 import { addNodeFlow, setNodePassword, setupSsh } from './nodes-model.js';
-import { addClientFlow, generateFlow } from './clients-model.js';
+import { addClientFlow, generateFlow, groupConnectionsFlow } from './clients-model.js';
 
 const count = (value) => (Number.isInteger(value) && value >= 0 ? value : 0);
 
@@ -28,6 +28,7 @@ export function SummaryScreen({ ctx }) {
     const { action } = item;
     if (action.type === 'password') return act(() => setNodePassword(ctx, action.node));
     if (action.type === 'ssh-setup') return act(() => setupSsh(ctx));
+    if (action.type === 'group-connections') return act(() => groupConnectionsFlow(ctx, action.group));
     return ctx.navigate(action.route, action.param || null, action.tab || null);
   };
   const actions = html`
