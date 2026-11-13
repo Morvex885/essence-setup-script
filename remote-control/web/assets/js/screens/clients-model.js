@@ -471,8 +471,9 @@ export function groupConnectionsArgv(group, node, proxies) {
 /** Подключения группы на ноде из ответа `conn list --name N --discover`. */
 export function groupProxies(found, group) {
   const entry = asList(found)[0];
-  const row = entry ? asList(entry.groups).find((item) => item && item.name === group) : null;
-  return row ? strings(row.proxies) : [];
+  // Записей группы может быть несколько (несколько записей подключений ноды) — набор объединяется.
+  const proxies = entry ? asList(entry.groups).filter((item) => item && item.name === group).flatMap((item) => strings(item.proxies)) : [];
+  return [...new Set(proxies)];
 }
 
 /**

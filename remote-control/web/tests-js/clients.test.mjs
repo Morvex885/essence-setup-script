@@ -352,6 +352,11 @@ test('ноды клиента: свои — client nodes, возврат к гр
   assert.equal(kinds(partial).at(-1), 'failed');
 });
 
+test('подключения группы: записи одной группы объединяются', () => {
+  assert.deepEqual(m.groupProxies([{ node: 'de', groups: [{ name: 'PC', proxies: ['p1'] }, { name: 'TV', proxies: ['x'] }, { name: 'PC', proxies: ['a,b', 'p1'] }] }], 'PC'),
+    ['p1', 'a,b']);
+});
+
 test('подключения группы: нода по выбору (одна — сама), назначенные группе отмечены, conn set только для группы', async () => {
   const two = okReply([{ name: 'de', ip: '1.1.1.1', port: 22 }, { name: 'nl', ip: '2.2.2.2', port: 22 }]);
   const found = okReply([{ node: 'nl', groups: [{ name: 'PC', proxies: ['p2'] }, { name: 'TV', proxies: ['p1'] }], discovered: ['p1', 'p2'] }]);

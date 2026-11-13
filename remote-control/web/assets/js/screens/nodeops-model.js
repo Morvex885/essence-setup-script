@@ -95,9 +95,9 @@ export function connectionView(listed, state, name) {
   const discovered = asList(state && state.discovered).map(nodeText);
   const { extra, stale } = unlisted(groups.flatMap((group) => asList(group.proxies).map(nodeText)), discovered);
   const proxies = [...discovered, ...extra];
-  const assigned = proxies.map((proxy) => groups
+  const assigned = proxies.map((proxy) => [...new Set(groups
     .filter((group) => asList(group.proxies).includes(proxy))
-    .map((group) => nodeText(group.name)));
+    .map((group) => nodeText(group.name)))]);
   const problem = syncProblem(state && state.status);
   const table = proxies.map((proxy, index) => ({ proxy, groups: assigned[index], stale: stale.includes(proxy) }));
   return { proxies, assigned, stale, problem, table };

@@ -100,6 +100,10 @@ test('подключения ноды: группы подключений и п
   assert.deepEqual([awg.proxies, awg.stale, awg.assigned], [['AWG', 'p1', 'awg-alice'], [], [['PC'], [], ['PC']]]);
   const values = { 'proxy-0': ['PC'], 'proxy-1': ['PC'], 'proxy-2': ['PC'] };
   assert.deepEqual(assignmentChanges(awg.proxies, awg.assigned, values), [['PC', ['AWG', 'p1', 'awg-alice']]]);
+  // Несколько записей одной группы: группы подключения без повторов.
+  const twice = connectionView([{ node: 'n', groups: [{ name: 'G', proxies: ['p1'] }, { name: 'G', proxies: ['p1', 'p2'] }] }],
+    { status: 'synced', discovered: ['p1', 'p2'] }, 'n');
+  assert.deepEqual(twice.assigned, [['G'], ['G']]);
   const empty = connectionView([], null, 'n');
   assert.deepEqual([empty.problem, empty.table], [null, []]);
 });
