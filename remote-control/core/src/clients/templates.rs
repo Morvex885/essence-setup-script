@@ -142,7 +142,7 @@ pub fn group_template(config: &Config, group: &str) -> String {
 /// v1 `process_template`: `# --- TAG ---` / `# --- A/B ---` blocks are kept
 /// (without markers) for a listed group and dropped otherwise. A marker with
 /// a different tag inside a block is plain content. Every emitted line ends
-/// with a newline; a CRLF marker is recognised like an LF one.
+/// with LF; CRLF line ends are read like LF ones (`lines`).
 pub fn process(content: &str, group: &str) -> String {
     let mut output = String::with_capacity(content.len());
     for (_, line) in process_lines(content, group) {
@@ -157,8 +157,7 @@ pub fn process(content: &str, group: &str) -> String {
 pub(crate) fn process_lines<'a>(content: &'a str, group: &str) -> Vec<(usize, &'a str)> {
     let mut kept = Vec::new();
     let mut block: Option<(&str, bool)> = None;
-    for (index, line) in content.split_inclusive('\n').enumerate() {
-        let line = line.strip_suffix('\n').unwrap_or(line);
+    for (number, line) in lines(content) {
         if let Some(tag) = marker(line) {
             match block {
                 None => {
@@ -173,7 +172,7 @@ pub(crate) fn process_lines<'a>(content: &'a str, group: &str) -> Vec<(usize, &'
             }
         }
         if block.is_none_or(|(_, keep)| keep) {
-            kept.push((index + 1, line));
+            kept.push((number, line));
         }
     }
     kept
@@ -192,12 +191,12 @@ pub(crate) struct MarkerBlock {
 pub(crate) fn marker_blocks(content: &str) -> Vec<MarkerBlock> {
     let mut blocks = Vec::new();
     let mut open: Option<(&str, usize)> = None;
-    for (index, line) in content.split_inclusive('\n').enumerate() {
-        let Some(tag) = marker(line.strip_suffix('\n').unwrap_or(line)) else { continue };
+    for (number, line) in lines(content) {
+        let Some(tag) = marker(line) else { continue };
         match open {
-            None => open = Some((tag, index + 1)),
+            None => open = Some((tag, number)),
             Some((current, line)) if current == tag => {
-                blocks.push(MarkerBlock { tags: tag.split('/').map(str::to_owned).collect(), open: line, close: Some(index + 1) });
+                blocks.push(MarkerBlock { tags: tag.split('/').map(str::to_owned).collect(), open: line, close: Some(number) });
                 open = None;
             }
             Some(_) => {}
@@ -209,8 +208,17 @@ pub(crate) fn marker_blocks(content: &str) -> Vec<MarkerBlock> {
     blocks
 }
 
+/// Lines of a template with their 1-based numbers, without the line end
+/// (`\n` or `\r\n`): the generator and `template check` read a CRLF
+/// template like an LF one.
+fn lines(content: &str) -> impl Iterator<Item = (usize, &str)> {
+    content.split_inclusive('\n').enumerate().map(|(index, line)| {
+        let line = line.strip_suffix('\n').unwrap_or(line);
+        (index + 1, line.strip_suffix('\r').unwrap_or(line))
+    })
+}
+
 fn marker(line: &str) -> Option<&str> {
-    let line = line.strip_suffix('\r').unwrap_or(line);
     let tag = line.strip_prefix("# --- ")?.strip_suffix(" ---")?;
     (!tag.is_empty() && tag.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'/' || b == b'_'))
         .then_some(tag)
@@ -535,8 +543,8 @@ mod tests {
             ("# --- MOBILE ---\n# --- PC ---\nhidden\n# --- PC ---\n# --- MOBILE ---\nafter", "PC", "after\n"),
             ("", "PC", ""),
             ("# --- PC ---\nx\n# --- PC ---\n", "", ""),
-            // A CRLF template filters like an LF one; content lines keep their CR.
-            ("a\r\n# --- MOBILE ---\r\nm\r\n# --- MOBILE ---\r\nb\r\n", "PC", "a\r\nb\r\n"),
+            // A CRLF template filters like an LF one and comes out with LF.
+            ("a\r\n# --- MOBILE ---\r\nm\r\n# --- MOBILE ---\r\nb\r\nproxies:\r\n", "PC", "a\nb\nproxies:\n"),
         ];
         for (input, group, expected) in cases {
             assert_eq!(process(input, group), *expected, "{input:?} for {group}");
@@ -888,7 +896,8 @@ mod tests {
                 let lines = process_lines(content, group);
                 let joined: String = lines.iter().map(|(_, line)| format!("{line}\n")).collect();
                 assert_eq!(process(content, group), joined, "{content:?} {group}");
-                let source: Vec<&str> = content.split_inclusive('\n').map(|l| l.strip_suffix('\n').unwrap_or(l)).collect();
+                let source: Vec<&str> = content.split_inclusive('\n')
+                    .map(|l| l.strip_suffix('\n').unwrap_or(l)).map(|l| l.strip_suffix('\r').unwrap_or(l)).collect();
                 assert!(lines.iter().all(|(number, line)| source[number - 1] == *line));
             }
         }
@@ -896,5 +905,9 @@ mod tests {
             MarkerBlock { tags: vec!["PC".into(), "R".into()], open: 2, close: Some(4) },
             MarkerBlock { tags: vec!["M".into()], open: 5, close: None },
         ]);
+        // CRLF: the same numbers and blocks as LF.
+        let crlf = "a\r\n# --- PC ---\r\nb\r\n# --- PC ---\r\nc\r\n";
+        assert_eq!(process_lines(crlf, "PC"), [(1, "a"), (3, "b"), (5, "c")]);
+        assert_eq!(marker_blocks(crlf), [MarkerBlock { tags: vec!["PC".into()], open: 2, close: Some(4) }]);
     }
 }

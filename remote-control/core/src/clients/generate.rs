@@ -1074,6 +1074,30 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn crlf_template_renders_like_the_lf_one() {
+        let mut rendered = Vec::new();
+        for template in [TEMPLATE.to_owned(), TEMPLATE.replace('\n', "\r\n")] {
+            let root = tempfile::tempdir().unwrap();
+            let (mut session, _) = fixture(root.path());
+            std::fs::write(session.state.paths().templates().join("t.yaml"), &template).unwrap();
+            let config = session.state.load_config().unwrap();
+            let remote = format!("--- VLESS TCP ---\n{SAMPLE}");
+            let users = |node: &str| listener_payload(&["vless-tcp"], &node_users(&config, node).unwrap()).len();
+            let mut steps = node_steps(&config.nodes[0], &remote, users("de"));
+            steps.extend(node_steps(&config.nodes[1], &remote, users("ru")));
+            let (script, cell) = once(FakeTransport::new(steps));
+            let connect = || cell.borrow_mut().take().expect("one transport per command");
+            generate(&mut session, &invocation(&["generate", "--all"]), &connect).await.unwrap();
+            script.assert_finished();
+            let dir = generated_dir(session.state.paths());
+            rendered.push(["ROUTER/my-router", "PC/my-pc"].map(|client| std::fs::read_to_string(dir.join(client).join("config.yaml")).unwrap()));
+        }
+        assert_eq!(rendered[0], rendered[1]);
+        assert!(rendered[1][1].contains("proxies:\n  - name: \"DE vless-reality\"\n") && rendered[1][1].contains("pc-only: true\n"));
+        assert!(!rendered[1].iter().any(|config| config.contains('\r')));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn failed_awg_peer_creation_keeps_the_client_config() {
         let root = tempfile::tempdir().unwrap();
         let (mut session, journal) = fixture(root.path());

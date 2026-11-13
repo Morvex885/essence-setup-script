@@ -32,15 +32,18 @@ const WORK_BUDGET: usize = 4_000_000;
 /// Nesting of YAML collections at most; deeper is a `yaml` error before any
 /// recursive step (the tree loader, `to_json`, `locate`, the validator).
 const MAX_DEPTH: usize = 128;
-/// Scalar bytes of a variant at most, counted as aliases expand them and as
-/// the loader copies anchored nodes; more is a `yaml` error before the loader
-/// copies a scalar per alias or anchor.
+/// Scalar and tag bytes of a variant at most, counted as aliases expand them
+/// and as the loader copies anchored nodes; more is a `yaml` error before the
+/// loader copies a scalar or a tag (`%TAG` prefix included) per node, alias or
+/// anchor.
 const MAX_EXPANDED: usize = 8 << 20;
 /// Nodes the loader copies when it registers anchored nodes (`&имя`: each
 /// one is deep-copied, nested anchors copy their contents again) at most;
-/// more is a `yaml` error before loading. Alias expansion has its own limit
-/// in the loader (100 000 nodes).
+/// more is a `yaml` error before loading.
 const MAX_ANCHOR_COPIES: usize = 200_000;
+/// Nodes aliases (`*имя`) expand to at most, the contents of collection keys
+/// included (the loader's own limit of 100 000 counts a key as one node).
+const MAX_ALIAS_NODES: usize = 100_000;
 /// A collection with more nodes than this is validated child by child.
 const SPLIT_NODES: usize = 2000;
 /// A mapping is split only with more entries than this (a map of names, not
@@ -330,8 +333,9 @@ fn check_variant(kept: &[(usize, &str)], budget: &mut Budget) -> Vec<Problem> {
         let (line, column) = source_position(kept, &marker);
         let message = match excess {
             Excess::Depth => format!("Ошибка YAML: вложенность глубже {MAX_DEPTH} уровней (с учётом ссылок *имя)."),
-            Excess::Volume => format!("Ошибка YAML: с раскрытием ссылок *имя и якорей &имя значения занимают больше {} МиБ.", MAX_EXPANDED >> 20),
+            Excess::Volume => format!("Ошибка YAML: с раскрытием ссылок *имя и якорей &имя значения и теги занимают больше {} МиБ.", MAX_EXPANDED >> 20),
             Excess::Anchors => format!("Ошибка YAML: якоря &имя копируют больше {MAX_ANCHOR_COPIES} узлов."),
+            Excess::Aliases => format!("Ошибка YAML: ссылки *имя раскрываются больше чем в {MAX_ALIAS_NODES} узлов."),
         };
         problems.push(problem(line, column, "error", "yaml", message));
         return problems;
@@ -389,45 +393,58 @@ enum Excess {
     Depth,
     Volume,
     Anchors,
+    Aliases,
 }
 
 /// Where the text goes over a limit counting what the loader builds: the
 /// start of the first collection nested deeper than `MAX_DEPTH`; the first
-/// scalar, alias or anchored node past `MAX_EXPANDED` scalar bytes (aliases
-/// and anchor copies included); the first anchored node whose copy takes the
-/// copied nodes past `MAX_ANCHOR_COPIES`. Read from parser events, without
+/// scalar, tagged collection, alias or anchored node past `MAX_EXPANDED`
+/// scalar and tag bytes (aliases and anchor copies included); the first
+/// anchored node whose copy takes the copied nodes past `MAX_ANCHOR_COPIES`;
+/// the first alias that takes the expanded nodes (every node of collection
+/// keys counted) past `MAX_ALIAS_NODES`. Read from parser events, without
 /// recursion. A syntax error is left to the loader.
 fn too_large(text: &str) -> Option<(Marker, Excess)> {
-    use saphyr_parser::{Event, Parser};
-    /// A complete node: height (a scalar has 0), scalar bytes, nodes.
+    use std::borrow::Cow;
+    use saphyr_parser::{Event, Parser, Tag};
+    /// A complete node: height (a scalar has 0), scalar and tag bytes, nodes.
     #[derive(Clone, Copy, Default)]
     struct Size { height: usize, bytes: usize, nodes: usize }
     /// An open collection.
     struct Open { anchor: usize, start: Marker, size: Size }
+    // The loader keeps a copy of the expanded tag in every tagged node.
+    let tag_bytes = |tag: &Option<Cow<Tag>>| tag.as_ref().map_or(0, |tag| tag.handle.len().saturating_add(tag.suffix.len()));
     let mut open: Vec<Open> = Vec::new();
     let mut anchored: HashMap<usize, Size> = HashMap::new();
     let mut total: usize = 0;
     let mut copies: usize = 0;
+    let mut aliased: usize = 0;
     for event in Parser::new_from_str(text) {
         let Ok((event, span)) = event else { return None };
         // A complete node that enters its parent, and its anchor.
         let (node, anchor, at) = match event {
-            Event::SequenceStart(anchor, _) | Event::MappingStart(anchor, _) => {
+            Event::SequenceStart(anchor, tag) | Event::MappingStart(anchor, tag) => {
                 if open.len() + 1 > MAX_DEPTH { return Some((span.start, Excess::Depth)); }
-                open.push(Open { anchor, start: span.start, size: Size::default() });
+                let bytes = tag_bytes(&tag);
+                total = total.saturating_add(bytes);
+                if total > MAX_EXPANDED { return Some((span.start, Excess::Volume)); }
+                open.push(Open { anchor, start: span.start, size: Size { bytes, ..Size::default() } });
                 continue;
             }
             Event::SequenceEnd | Event::MappingEnd => match open.pop() {
                 Some(done) => (Size { height: done.size.height + 1, bytes: done.size.bytes, nodes: done.size.nodes + 1 }, done.anchor, done.start),
                 None => continue,
             },
-            Event::Scalar(value, _, anchor, _) => {
-                total = total.saturating_add(value.len());
-                (Size { height: 0, bytes: value.len(), nodes: 1 }, anchor, span.start)
+            Event::Scalar(value, _, anchor, tag) => {
+                let bytes = value.len().saturating_add(tag_bytes(&tag));
+                total = total.saturating_add(bytes);
+                (Size { height: 0, bytes, nodes: 1 }, anchor, span.start)
             }
             Event::Alias(anchor) => {
                 let size = anchored.get(&anchor).copied().unwrap_or_default();
                 if open.len() + size.height > MAX_DEPTH { return Some((span.start, Excess::Depth)); }
+                aliased = aliased.saturating_add(size.nodes);
+                if aliased > MAX_ALIAS_NODES { return Some((span.start, Excess::Aliases)); }
                 total = total.saturating_add(size.bytes);
                 (size, 0, span.start)
             }
@@ -823,9 +840,12 @@ mod tests {
         assert!(!names.is_empty());
         for (name, source) in names {
             assert_eq!(source, TemplateSource::Builtin);
-            let report = check(builtin(&name).unwrap(), &groups());
-            assert_eq!(report.errors, 0, "{name}: {:?}", report.problems);
-            assert_eq!(report.warnings, 0, "{name}: {:?}", report.problems);
+            // LF and CRLF copies (a Windows checkout or editor) check the same.
+            let text = builtin(&name).unwrap().replace("\r\n", "\n");
+            let lf = check(&text, &groups());
+            assert_eq!(lf, check(&text.replace('\n', "\r\n"), &groups()), "{name}");
+            assert_eq!(lf.errors, 0, "{name}: {:?}", lf.problems);
+            assert_eq!(lf.warnings, 0, "{name}: {:?}", lf.problems);
         }
     }
 
@@ -1001,6 +1021,28 @@ mod tests {
     }
 
     #[test]
+    fn expanded_tags_and_complex_keys_are_counted_before_loading() {
+        // A 512 KiB `%TAG` prefix copied into each of 2000 tagged nodes.
+        let prefix = format!("tag:{}:", "p".repeat(512 * 1024));
+        let content = format!("%TAG !t! {prefix}\n---\nproxies:\nx: [{}]\n", vec!["!t!s []"; 2000].join(","));
+        assert!(content.len() < crate::request_input::Input::MAX_VALUE);
+        let report = check(&content, &groups());
+        assert_eq!(report.problems.iter().map(|p| p.code).collect::<Vec<_>>(), ["yaml"], "{:?}", report.problems);
+        assert!(report.problems[0].message.contains("МиБ"), "{}", report.problems[0].message);
+        // An anchored mapping whose key is a list of 10 000 empty strings,
+        // aliased 2000 times: few bytes, one anchor, keys hide the nodes.
+        let key = vec!["''"; 10_000].join(",");
+        let content = format!("proxies:\nx: &m\n  ? [{key}]\n  : 0\ny: [{}]\n", vec!["*m"; 2000].join(","));
+        let started = std::time::Instant::now();
+        let report = check(&content, &groups());
+        assert_eq!(codes(&report), [(5, "yaml", None)], "{:?}", report.problems);
+        assert!(report.problems[0].message.contains("ссылки"), "{}", report.problems[0].message);
+        assert!(started.elapsed().as_secs() < 5);
+        // A short tag on a few nodes is checked as usual.
+        assert!(check("proxies:\nx: !!str a\n", &groups()).problems.iter().all(|p| p.code != "yaml"));
+    }
+
+    #[test]
     fn patched_schema_rejects_collections_in_scalar_fields_and_unnamed_groups() {
         let schema = |content: &str| -> Vec<Option<String>> {
             check(content, &groups()).problems.into_iter().filter(|p| p.code == "schema").map(|p| p.path).collect()
@@ -1090,7 +1132,7 @@ mod tests {
         let before = fingerprint(root.path());
         let stored = command(&mut session, &invocation(&["template", "check", "--name", "default"]), &Input::default()).unwrap();
         assert_eq!((stored["name"].clone(), stored["errors"].clone(), stored["problems"].clone()), (json!("default.yaml"), json!(0), json!([])));
-        assert_eq!(stored["variants"][0], json!({"tag": null, "dropped": [[8, 13], [35, 44], [54, 56], [85, 93], [117, 127], [175, 178], [287, 299], [368, 370], [388, 391]]}));
+        assert_eq!(stored["variants"][0], json!({"tag": null, "dropped": [[8, 13], [35, 44], [54, 56], [85, 93], [117, 127], [177, 180], [289, 301], [370, 372], [390, 393]]}));
         let mut input = Input::default();
         input.insert("file", "mode: rule\n".to_owned().into()).unwrap();
         let file = command(&mut session, &invocation(&["template", "check"]), &input).unwrap();
