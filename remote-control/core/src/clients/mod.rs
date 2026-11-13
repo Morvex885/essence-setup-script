@@ -7,6 +7,7 @@
 pub mod client;
 pub mod generate;
 pub mod groups;
+pub mod template_check;
 pub mod templates;
 
 use std::fs;
@@ -38,6 +39,9 @@ pub async fn route<T: RemoteTransport>(noun: &str, verb: &str, invocation: &Invo
         ("template", "show") => templates::show(session, invocation),
         ("template", "create") => templates::create(session, invocation),
         ("template", "import") => templates::import(session, invocation, input),
+        ("template", "delete") => templates::delete(session, invocation),
+        ("template", "groups") => templates::groups(session, invocation),
+        ("template", "check") => template_check::command(session, invocation, input),
         ("client", "list") => client::list(session, invocation),
         ("client", "show") => client::show(session, invocation),
         ("client", "config") => client::config(session, invocation),

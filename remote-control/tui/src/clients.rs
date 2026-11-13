@@ -604,10 +604,17 @@ fn template_card(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
             ctx.ui.notice(ui::warn(format!("Шаблон «{name}» не найден.")));
             return Ok(());
         };
-        let mut view = View::menu(format!("Шаблон: {name}"), vec![
+        let custom = row["source"] == "custom";
+        let mut items = vec![
             Item::new('v', "Показать", ui::CYAN), Item::new('x', "Экспорт в файл", ui::CYAN),
-            Item::new('e', "Редактировать", ui::YELLOW), Item::new('i', "Импорт из файла", ui::YELLOW), back(),
-        ]);
+            Item::new('e', "Редактировать", ui::YELLOW), Item::new('i', "Импорт из файла", ui::YELLOW),
+            Item::new('c', "Проверить", ui::CYAN), Item::new('g', "Группы шаблона", ui::YELLOW),
+        ];
+        if custom {
+            items.push(Item::new('d', if row["overrides"] == true { "Сбросить к встроенному" } else { "Удалить шаблон" }, ui::RED));
+        }
+        items.push(back());
+        let mut view = View::menu(format!("Шаблон: {name}"), items);
         view.context = vec![
             ui::text(format!("Источник: {}", source_label(&row)), ui::NC),
             ui::text(format!("Группы: {}", joined(&row["groups"])), ui::NC),
@@ -631,9 +638,48 @@ fn template_card(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
                     confirmed_with(ctx, "Импорт шаблона", "Перезаписать шаблон?", &["template", "import", "--name", name], &input)?;
                 }
             },
+            "c" => if let Some(report) = fetch(ctx, &["template", "check", "--name", name])? {
+                present(ctx, &check_view(name, &report))?;
+            },
+            "g" => template_groups(ctx, name, &strings(&row["groups"]))?,
+            "d" if custom => if confirmed(ctx, "Удаление шаблона", "Удалить шаблон?", &["template", "delete", "--name", name])?.ok {
+                return Ok(());
+            },
             _ => ctx.invalid(),
         }
     }
+}
+/// `template check` result: one line per problem, or «Проблем нет».
+fn check_view(name: &str, report: &Value) -> View {
+    let mut view = View::new(format!("Проверка шаблона: {name}"));
+    let problems = rows(&report["problems"]);
+    if problems.is_empty() { view.context.push(ui::text("Проблем нет", ui::GREEN)); }
+    for problem in problems {
+        let (level, color) = if problem["level"] == "error" { ("ошибка", ui::RED) } else { ("предупреждение", ui::YELLOW) };
+        let variant = match problem["variant"].as_str() {
+            None => String::new(),
+            Some("") => " (без групп)".into(),
+            Some(tag) => format!(" ({tag})"),
+        };
+        view.context.push(ui::text(format!("строка {}: {level} — {}{variant}", scalar(&problem["line"]), text(&problem["message"])), color));
+    }
+    if report["truncated"] == true { view.context.push(ui::text("Показаны не все проблемы.", ui::DIM)); }
+    view
+}
+/// Multi-select of the groups that use the template; the rest of its groups
+/// fall back to `default.yaml` (the core plans both).
+fn template_groups(ctx: &mut Context<'_>, name: &str, current: &[String]) -> io::Result<()> {
+    let Some(data) = fetch(ctx, &["group", "list"])? else { return Ok(()); };
+    let groups = names(&data);
+    let flags = groups.iter().map(|g| current.contains(g)).collect();
+    let Some(selected) = ctx.toggle(&format!("Группы шаблона: {name}"), &groups, flags, EMPTY)? else { return Ok(()); };
+    let mut words = vec!["template", "groups", "--name", name];
+    for i in selected { words.extend(["--group", groups[i].as_str()]); }
+    let reply = confirmed(ctx, "Группы шаблона", "Применить?", &words)?;
+    if reply.ok && strings(&reply.data["assigned"]).is_empty() && strings(&reply.data["reset"]).is_empty() {
+        ctx.ui.notice(ui::text("Изменений нет.", ui::DIM));
+    }
+    Ok(())
 }
 fn executable(name: &str) -> bool {
     env::var_os("PATH").is_some_and(|path| env::split_paths(&path).any(|dir| {
@@ -1267,6 +1313,54 @@ mod tests {
         assert!(imports.iter().all(|(_, names)| *names == &["file".to_owned()]), "the content travels as input.file");
         assert!(!core.calls.iter().flatten().any(|word| word.contains(dir.path().to_str().unwrap())), "no local path reaches the daemon");
         assert_eq!(expand_home("~other/path"), PathBuf::from("~other/path"));
+    }
+    #[test]
+    fn template_card_checks_sets_groups_and_deletes() {
+        let list = json!([{"name":"m.yaml","source":"custom","overrides":false,"groups":["PC"]}]);
+        let report = json!({"name":"m.yaml","errors":1,"warnings":1,"truncated":false,"problems":[
+            {"line":1,"column":1,"level":"error","code":"proxies","message":"Нет строки «proxies:»","path":null,"variant":null},
+            {"line":7,"column":3,"level":"warning","code":"schema","message":"bad mode","path":"/mode","variant":"PC"}],
+            "variants":[{"tag":null,"dropped":[]}]});
+        let groups = ["template", "groups", "--name", "m.yaml", "--group", "PC", "--group", "ROUTER"];
+        let delete = ["template", "delete", "--name", "m.yaml"];
+        let (core, ui) = drive(vec![
+            ok(&["template", "list"], list.clone()),
+            ok(&["template", "check", "--name", "m.yaml"], report),
+            ok(&["template", "list"], list.clone()),
+            ok(&["group", "list"], json!([{"name":"PC","template":"m.yaml"},{"name":"ROUTER","template":"default.yaml"}])),
+            step(&groups, plan()), yes(&groups, json!({"name":"m.yaml","assigned":["ROUTER"],"reset":[]})),
+            ok(&["template", "list"], list),
+            step(&delete, plan()), yes(&delete, json!({"name":"m.yaml","groups":["PC","ROUTER"],"builtin":false})),
+        ], &["c", "", "G", "2", "", "y", "D", "y"], |ctx| template_card(ctx, "m.yaml"));
+        let card = &ui.views[0];
+        assert_eq!(keys(card), ["v", "x", "e", "i", "c", "g", "d", "0"].iter().map(|k| (k.to_string(), match *k {
+            "v" | "x" | "c" => ui::CYAN, "e" | "i" | "g" => ui::YELLOW, "d" => ui::RED, _ => ui::NC,
+        })).collect::<Vec<_>>());
+        assert_eq!(card.sections.iter().flatten().find(|i| i.key == "d").unwrap().label, "Удалить шаблон");
+        let checked = content(view(&ui, "Проверка шаблона: m.yaml"));
+        assert!(checked.contains("строка 1: ошибка — Нет строки «proxies:»") && checked.contains("строка 7: предупреждение — bad mode (PC)"), "{checked}");
+        let toggle = view(&ui, "Группы шаблона: m.yaml");
+        assert!(toggle.sections[0][0].label.starts_with("[x]") && toggle.sections[0][1].label.starts_with("[ ]"), "current groups are checked");
+        assert!(sent(&core, &groups) && sent(&core, &delete));
+        assert_eq!(ui.views.iter().filter(|v| v.prompt.contains("(y/N)")).count(), 2);
+        assert!(ui.inputs.is_empty(), "the card returns to the list after deletion");
+    }
+    #[test]
+    fn template_card_offers_deletion_only_for_custom_and_reports_a_clean_check() {
+        let builtin = json!([{"name":"default.yaml","source":"builtin","overrides":false,"groups":[]}]);
+        let clean = json!({"name":"default.yaml","errors":0,"warnings":0,"truncated":false,"problems":[],"variants":[]});
+        let (core, ui) = drive(vec![
+            ok(&["template", "list"], builtin.clone()),
+            ok(&["template", "list"], builtin.clone()),
+            ok(&["template", "check", "--name", "default.yaml"], clean),
+            ok(&["template", "list"], builtin),
+        ], &["d", "c", "", "0"], |ctx| template_card(ctx, "default.yaml"));
+        assert!(keys(&ui.views[0]).iter().all(|(key, _)| key != "d"));
+        assert!(!core.calls.iter().any(|call| call[1] == "delete"));
+        assert!(content(view(&ui, "Проверка шаблона: default.yaml")).contains("Проблем нет"));
+        let shadow = json!([{"name":"default.yaml","source":"custom","overrides":true,"groups":[]}]);
+        let (_, ui) = drive(vec![ok(&["template", "list"], shadow)], &["0"], |ctx| template_card(ctx, "default.yaml"));
+        assert_eq!(ui.views[0].sections.iter().flatten().find(|i| i.key == "d").unwrap().label, "Сбросить к встроенному");
     }
     #[test]
     fn file_input_refuses_large_files_and_links() {

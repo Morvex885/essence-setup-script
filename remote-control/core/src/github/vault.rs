@@ -1136,4 +1136,24 @@ mod tests {
         assert!(!on_disk.contains("fixture-secret-xyz"), "runtime passwords stay machine-encrypted");
         assert_eq!(fs::read_to_string(runtime.paths().templates().join("default.yaml")).unwrap(), "proxies: []\n");
     }
+
+    #[test]
+    fn a_deleted_template_leaves_the_plain_tree_and_its_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = State::new(StatePaths::new(dir.path().join("data")));
+        local.save_config(&Config::default()).unwrap();
+        secure_fs::create_dir_all(local.paths().templates()).unwrap();
+        fs::write(local.paths().templates().join("keep.yaml"), "proxies:\n").unwrap();
+        fs::write(local.paths().templates().join("gone.yaml"), "proxies:\n").unwrap();
+        let worktree = dir.path().join("worktree");
+        fs::create_dir(&worktree).unwrap();
+        checkpoint(&worktree, Storage::Plain, None, &serialize(&local).unwrap()).unwrap();
+        assert!(worktree.join("templates/gone.yaml").exists());
+        fs::remove_file(local.paths().templates().join("gone.yaml")).unwrap();
+        checkpoint(&worktree, Storage::Plain, None, &serialize(&local).unwrap()).unwrap();
+        assert!(!worktree.join("templates/gone.yaml").exists());
+        assert!(worktree.join("templates/keep.yaml").exists());
+        let manifest: Value = serde_json::from_slice(&fs::read(worktree.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["templates"].as_object().unwrap().keys().collect::<Vec<_>>(), ["keep.yaml"]);
+    }
 }

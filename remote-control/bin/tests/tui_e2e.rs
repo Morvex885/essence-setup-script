@@ -358,6 +358,9 @@ fn screens_speak_the_real_v2_grammar() {
         assert!(client.calls.iter().any(|(argv, _)| argv[0] == noun), "walk never reached {noun}");
     }
     assert!(client.calls.iter().any(|(argv, code)| argv.starts_with(&["template".to_owned(), "show".to_owned()]) && code == "ok"));
+    for verb in ["check", "groups"] {
+        assert!(client.calls.iter().any(|(argv, code)| argv.starts_with(&["template".to_owned(), verb.to_owned()]) && code == "ok"), "template {verb}");
+    }
     assert!(Path::new(&export).is_file(), "the export is written by the menu itself");
     drop(client);
     ctx.settle();
@@ -367,7 +370,7 @@ fn screens_speak_the_real_v2_grammar() {
 const WALK: &str = "1 \
     g a LAB 4 t 1 f _ h 0 0 0 \
     c a alice 4 1 v _ f _ s 0 r bob 0 0 \
-    m 1 v _ x EXPORT 0 0 \
+    m 1 v _ c _ g _ x EXPORT 0 0 \
     n 0 p 0 a 0 t s 0 \
     f a _ 0 \
     s l _ 0 \

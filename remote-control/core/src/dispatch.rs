@@ -530,7 +530,8 @@ mod tests {
         let (mut session, journal) = session(&data);
         let status = run(&mut session, &["session", "status"], "{}").await;
         assert_eq!(status.data.unwrap(), json!({"configured": false, "source": null, "open": false, "authorized": false}));
-        for list in [&["group", "list"][..], &["status"], &["client", "config", "--name", "c"], &["template", "list"]] {
+        for list in [&["group", "list"][..], &["status"], &["client", "config", "--name", "c"], &["template", "list"],
+            &["template", "check", "--name", "default"]] {
             assert_eq!(code(run(&mut session, list, "{}").await), "session_closed", "{list:?}");
         }
         assert_eq!(code(run(&mut session, &["session", "open"], "{}").await), "not_configured");
@@ -622,13 +623,23 @@ mod tests {
         let (mut session, journal) = session(root.path());
         assert!(session.open_absent().unwrap());
         assert!(run(&mut session, &["source", "init-local"], "{}").await.ok);
-        let imported = run_input(&mut session, &["template", "import", "--name", "lab"], r#"{"file":"mode: rule\n"}"#).await;
+        let content = crate::clients::templates::builtin("default.yaml").unwrap();
+        let input = serde_json::to_string(&json!({"file": content})).unwrap();
+        let imported = run_input(&mut session, &["template", "import", "--name", "lab"], &input).await;
         assert_eq!(imported.data, Some(json!({"name": "lab.yaml"})));
         let shown = run(&mut session, &["template", "show", "--name", "lab"], "{}").await;
-        assert_eq!(shown.data.unwrap()["content"], "mode: rule\n");
+        assert_eq!(shown.data.unwrap()["content"], content);
         let missing = run(&mut session, &["template", "import", "--name", "other"], "{}").await.error.unwrap();
         assert_eq!((missing.code, missing.message.as_str()), ("usage", "Передайте содержимое полем input.file."));
-        assert!(journal.borrow().iter().all(|(_, text)| !text.contains("mode: rule")), "input never reaches the journal");
+        // A template with problems needs confirmation; nothing is written before it.
+        let before = crate::nodes::testing::fingerprint(root.path());
+        let planned = run_input(&mut session, &["template", "import", "--name", "rough"], r#"{"file":"mode: rule\n"}"#).await;
+        assert_eq!(code(planned), "confirmation_required");
+        assert_eq!(crate::nodes::testing::fingerprint(root.path()), before);
+        let checked = run_input(&mut session, &["template", "check"], r#"{"file":"mode: rule\n"}"#).await;
+        assert_eq!(checked.data.unwrap()["problems"][0]["code"], "proxies");
+        assert!(journal.borrow().iter().all(|(_, text)| !text.contains("mode: rule") && !text.contains("mixed-port")),
+            "input never reaches the journal");
 
         assert!(run(&mut session, &["group", "add", "--name", "LAB"], "{}").await.ok);
         assert!(run(&mut session, &["client", "add", "--name", "pc", "--group", "LAB"], "{}").await.ok);

@@ -527,14 +527,17 @@ fn read_stdin_secrets() -> Result<Secrets> {
 
 // ─── Входные файлы ───────────────────────────────────────────────────────────
 
-/// Содержимое `--имя ПУТЬ` каждого `@имя` команды; флаг обязателен.
+/// Содержимое `--имя ПУТЬ` каждого `@имя` команды; флаг обязателен, кроме
+/// необязательного `@имя?` (без флага поле input не передаётся).
 fn read_inputs(invocation: &Invocation) -> Result<client::Input> {
     let mut input = client::Input::default();
     for name in invocation.inputs() {
-        let path = invocation
-            .value(name)
-            .filter(|path| !path.is_empty())
-            .ok_or_else(|| RcError::new("usage", format!("Укажите файл: --{name} PATH.")))?;
+        let path = invocation.value(name).filter(|path| !path.is_empty());
+        let path = match path {
+            Some(path) => path,
+            None if invocation.input_optional(name) && invocation.value(name).is_none() => continue,
+            None => return Err(RcError::new("usage", format!("Укажите файл: --{name} PATH."))),
+        };
         input.insert(*name, read_input_file(path)?);
     }
     Ok(input)

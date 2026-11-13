@@ -487,6 +487,9 @@ fn help_json_lists_whole_v2_catalog() {
         "template create",
         "template export",
         "template import",
+        "template delete",
+        "template groups",
+        "template check",
         "client list",
         "client show",
         "client config",
@@ -615,6 +618,10 @@ fn catalog_grammar_is_accepted_for_every_command() {
         &["web", "status"],
         &["web", "link"],
         &["template", "import", "--name", "t2", "--file", "in.yaml"],
+        &["template", "delete", "--name", "t1"],
+        &["template", "groups", "--name", "t1", "--group", "G1", "--group", "G2"],
+        &["template", "check", "--name", "default"],
+        &["template", "check", "--file", "in.yaml"],
         &["client", "list"],
         &["client", "list", "--group", "G1"],
         &["client", "show", "--name", "c1"],
@@ -790,6 +797,7 @@ fn read_only_lists_work_on_a_fresh_install() {
     let env = TestEnv::new();
     for row in [
         &["template", "list"][..],
+        &["template", "check", "--name", "default"][..],
         &["client", "list"][..],
         &["group", "list"][..],
         &["subscription", "list"][..],
@@ -1065,7 +1073,7 @@ fn template_import_reads_the_file_in_the_client() {
     assert_ok(&run_json(BIN, &env, &["source", "init-local"], None));
     assert_ok(&run_json(BIN, &env, &["template", "create", "--name", "t1"], None));
     let file = env.root.join("in.yaml");
-    fs::write(&file, "mode: rule\n").unwrap();
+    fs::write(&file, "proxies:\nmode: rule\n").unwrap();
     let path = file.to_str().unwrap();
     let planned = run_json(BIN, &env, &["template", "import", "--name", "t1", "--file", path], None);
     let plan = assert_error(&planned, "confirmation_required", 2);
@@ -1075,7 +1083,15 @@ fn template_import_reads_the_file_in_the_client() {
     let journal = fs::read_to_string(env.ctx().endpoint().log).unwrap_or_default();
     assert!(!journal.contains(path), "путь файла не доходит до демона: {journal}");
     let shown = assert_ok(&run_json(BIN, &env, &["template", "show", "--name", "t1"], None));
-    assert_eq!(shown["data"]["content"], json!("mode: rule\n"));
+    assert_eq!(shown["data"]["content"], json!("proxies:\nmode: rule\n"));
+
+    let rough = env.root.join("rough.yaml");
+    fs::write(&rough, "mode: rule\n").unwrap();
+    let planned = run_json(BIN, &env, &["template", "import", "--name", "t3", "--file", rough.to_str().unwrap()], None);
+    let plan = assert_error(&planned, "confirmation_required", 2);
+    assert_eq!(plan["error"]["plan"][0], json!("Проблемы шаблона: ошибок — 1, предупреждений — 0."));
+    let listed = assert_ok(&run_json(BIN, &env, &["template", "list"], None));
+    assert!(listed["data"].as_array().unwrap().iter().all(|row| row["name"] != "t3.yaml"), "без согласия шаблон не записан");
 
     let missing = env.root.join("absent.yaml");
     let absent = run_json(BIN, &env, &["template", "import", "--name", "t1", "--file", missing.to_str().unwrap()], None);
@@ -1087,6 +1103,43 @@ fn template_import_reads_the_file_in_the_client() {
     let without = run_json(BIN, &env, &["template", "import", "--name", "t1"], None);
     let usage = assert_error(&without, "usage", 2);
     assert_eq!(usage["error"]["message"], json!("Укажите файл: --file PATH."));
+}
+
+#[test]
+fn template_check_reads_an_optional_file_in_the_client() {
+    let env = TestEnv::new();
+    assert_ok(&run_json(BIN, &env, &["source", "init-local"], None));
+    let file = env.root.join("t.yaml");
+    fs::write(&file, "proxies:\nfoo: [1,\n").unwrap();
+    let checked = assert_ok(&run_json(BIN, &env, &["template", "check", "--file", file.to_str().unwrap()], None));
+    let problems = checked["data"]["problems"].as_array().unwrap();
+    assert_eq!((problems[0]["code"].clone(), checked["data"]["errors"].clone(), checked["data"]["name"].clone()),
+        (json!("yaml"), json!(1), json!(null)));
+    let stored = assert_ok(&run_json(BIN, &env, &["template", "check", "--name", "default"], None));
+    assert_eq!((stored["data"]["name"].clone(), stored["data"]["errors"].clone()), (json!("default.yaml"), json!(0)));
+    let neither = run_json(BIN, &env, &["template", "check"], None);
+    assert_error(&neither, "usage", 2);
+    let empty = run_json(BIN, &env, &["template", "check", "--file", ""], None);
+    assert_error(&empty, "usage", 2);
+}
+
+#[test]
+fn template_groups_and_delete_go_through_confirmation() {
+    let env = TestEnv::new();
+    assert_ok(&run_json(BIN, &env, &["source", "init-local"], None));
+    assert_ok(&run_json(BIN, &env, &["template", "create", "--name", "y"], None));
+    let planned = run_json(BIN, &env, &["template", "groups", "--name", "y", "--group", "PC"], None);
+    assert_eq!(assert_error(&planned, "confirmation_required", 2)["error"]["plan"], json!(["Группа PC: шаблон — y.yaml"]));
+    let assigned = assert_ok(&run_json(BIN, &env, &["template", "groups", "--name", "y", "--group", "PC", "--yes"], None));
+    assert_eq!(assigned["data"], json!({"name": "y.yaml", "assigned": ["PC"], "reset": []}));
+    let groups = assert_ok(&run_json(BIN, &env, &["group", "list"], None));
+    assert!(groups["data"].as_array().unwrap().iter().any(|g| g["name"] == "PC" && g["template"] == "y.yaml"));
+    let deleted = assert_ok(&run_json(BIN, &env, &["template", "delete", "--name", "y", "--yes"], None));
+    assert_eq!(deleted["data"], json!({"name": "y.yaml", "groups": ["PC"], "builtin": false}));
+    let groups = assert_ok(&run_json(BIN, &env, &["group", "list"], None));
+    assert!(groups["data"].as_array().unwrap().iter().all(|g| g["template"] == "default.yaml"));
+    let builtin = run_json(BIN, &env, &["template", "delete", "--name", "default", "--yes"], None);
+    assert_error(&builtin, "invalid", 1);
 }
 
 #[test]
