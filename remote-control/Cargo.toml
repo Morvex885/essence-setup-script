@@ -23,6 +23,7 @@ libc = "0.2"
 proptest = "1"
 rand = "0.8"
 saphyr = "0.3.4"
+saphyr-parser = "0.3.4"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm", "crossterm_0_29"] }
 rc-core = { path = "core" }
 essence-rc-tui = { path = "tui" }

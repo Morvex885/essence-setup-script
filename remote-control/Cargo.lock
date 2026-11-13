@@ -3360,6 +3360,7 @@ dependencies = [
  "russh",
  "russh-sftp",
  "saphyr",
+ "saphyr-parser",
  "semver",
  "serde",
  "serde_json",

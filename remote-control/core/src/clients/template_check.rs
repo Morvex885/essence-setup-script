@@ -24,9 +24,19 @@ use super::templates::{self, file_name, marker_blocks, process_lines};
 /// Problems beyond this many are dropped (`truncated`).
 const LIMIT: usize = 200;
 /// Variants checked at most, the one without groups included.
-const MAX_VARIANTS: usize = 64;
-/// Schema problems kept per variant; more set `truncated`.
-const VARIANT_PROBLEMS: usize = 1000;
+const MAX_VARIANTS: usize = 16;
+/// Schema problems collected per request, all variants together.
+const PROBLEM_BUDGET: usize = 1000;
+/// JSON nodes given to the validator per request, all variants together.
+const WORK_BUDGET: usize = 4_000_000;
+/// Nesting of YAML collections at most; deeper is a `yaml` error before any
+/// recursive step (the tree loader, `to_json`, `locate`, the validator).
+const MAX_DEPTH: usize = 128;
+/// A collection with more nodes than this is validated child by child.
+const SPLIT_NODES: usize = 2000;
+/// A mapping is split only with more entries than this (a map of names, not
+/// a fixed set of keys whose siblings the schema may depend on).
+const MAP_ENTRIES: usize = 64;
 /// Messages are cut to this many characters.
 const MESSAGE_CHARS: usize = 200;
 
@@ -117,17 +127,20 @@ pub fn check(content: &str, groups: &[String]) -> Report {
     let mut variants = Vec::with_capacity(tags.len() + 1);
     let mut found: Vec<Vec<Problem>> = Vec::with_capacity(tags.len() + 1);
     let mut checked: HashMap<Vec<usize>, usize> = HashMap::new();
-    let mut truncated = false;
+    let mut budget = Budget::default();
     // The variant without groups: no group is named "", so no block is kept.
-    for tag in std::iter::once(None).chain(tags.into_iter().map(Some)) {
+    for (index, tag) in std::iter::once(None).chain(tags.into_iter().map(Some)).enumerate() {
+        if budget.exhausted { break; }
         let kept = process_lines(content, tag.as_deref().unwrap_or(""));
         let numbers: Vec<usize> = kept.iter().map(|(line, _)| *line).collect();
         let list = match checked.get(&numbers) {
             // The same lines as a checked variant: the same problems.
-            Some(&index) => found[index].clone(),
+            Some(&same) => found[same].clone(),
             None => {
-                let (list, capped) = check_variant(&kept);
-                truncated |= capped;
+                let list = check_variant(&kept, &mut budget);
+                // A variant cut by the budget would look like it lacks the
+                // problems of the others: only the first one is kept partial.
+                if budget.exhausted && index > 0 { break; }
                 checked.insert(numbers, found.len());
                 list
             }
@@ -135,6 +148,11 @@ pub fn check(content: &str, groups: &[String]) -> Report {
         variants.push(Variant { tag, dropped: dropped(&kept, total) });
         found.push(list);
     }
+    if budget.exhausted {
+        problems.push(problem(1, 1, "warning", "check_limit",
+            "Проверка остановлена: слишком много проблем или слишком большой шаблон; показаны не все.".into()));
+    }
+    let mut truncated = budget.exhausted;
     merge(&mut problems, &variants, found);
     problems.sort_by(|a, b| (a.line, a.column, a.level).cmp(&(b.line, b.column, b.level)));
     let mut distinct = HashSet::new();
@@ -201,8 +219,32 @@ fn source_position(kept: &[(usize, &str)], marker: &Marker) -> (usize, usize) {
     (line, marker.col() + 1)
 }
 
-/// Problems of one variant; `true` — schema problems were cut at `VARIANT_PROBLEMS`.
-fn check_variant(kept: &[(usize, &str)]) -> (Vec<Problem>, bool) {
+/// The request's share of work: schema problems and validated JSON nodes.
+#[derive(Default)]
+struct Budget {
+    problems: usize,
+    work: usize,
+    exhausted: bool,
+}
+
+impl Budget {
+    /// Spend on validating `nodes` nodes; `false` — nothing is left.
+    fn spend(&mut self, nodes: usize) -> bool {
+        self.work += nodes;
+        if self.work > WORK_BUDGET { self.exhausted = true; }
+        !self.exhausted
+    }
+
+    /// Count one problem; `false` — the problem budget is used up.
+    fn take_problem(&mut self) -> bool {
+        if self.problems >= PROBLEM_BUDGET { self.exhausted = true; }
+        self.problems += 1;
+        !self.exhausted
+    }
+}
+
+/// Problems of one variant.
+fn check_variant(kept: &[(usize, &str)], budget: &mut Budget) -> Vec<Problem> {
     let mut problems = Vec::new();
     if !kept.iter().any(|(_, line)| *line == "proxies:") {
         problems.push(problem(1, 1, "error", "proxies",
@@ -213,13 +255,19 @@ fn check_variant(kept: &[(usize, &str)]) -> (Vec<Problem>, bool) {
         text.push_str(line);
         text.push('\n');
     }
+    if let Some(marker) = too_deep(&text) {
+        let (line, column) = source_position(kept, &marker);
+        problems.push(problem(line, column, "error", "yaml",
+            format!("Ошибка YAML: вложенность глубже {MAX_DEPTH} уровней (с учётом ссылок *имя).")));
+        return problems;
+    }
     let documents = match MarkedYaml::load_from_str(&text) {
         Ok(documents) => documents,
         Err(error) => {
             let (line, column) = source_position(kept, error.marker());
             let message: String = format!("Ошибка YAML: {}.", error.info()).chars().take(MESSAGE_CHARS).collect();
             problems.push(problem(line, column, "error", "yaml", message));
-            return (problems, false);
+            return problems;
         }
     };
     let root = documents.first();
@@ -227,27 +275,205 @@ fn check_variant(kept: &[(usize, &str)]) -> (Vec<Problem>, bool) {
     if let Some(proxies) = instance.get_mut("proxies") && proxies.is_null() {
         *proxies = Value::Array(Vec::new());
     }
-    let mut errors = VALIDATOR.iter_errors(&instance);
-    for error in errors.by_ref().take(VARIANT_PROBLEMS) {
-        let path = error.instance_path().as_str().to_owned();
+    let mut found = Vec::new();
+    schema_errors(&instance, budget, &mut found);
+    for (path, what) in found {
         let marker = root.map_or_else(Marker::default, |root| locate(root, &path));
         let (line, column) = source_position(kept, &marker);
-        let message = schema_message(error.kind(), &path);
+        let message = schema_message(&what, &path);
         problems.push(Problem { path: Some(path), ..problem(line, column.max(1), "warning", "schema", message) });
     }
-    let capped = errors.next().is_some();
-    (problems, capped)
+    problems
 }
 
-/// A Russian schema message from the error kind and the JSON pointer; the
-/// checked value itself is never quoted (a template may hold secrets).
-fn schema_message(kind: &ValidationErrorKind, path: &str) -> String {
+/// The start of the first collection nested deeper than `MAX_DEPTH`,
+/// counting what an alias expands to; read from parser events, without
+/// recursion. A syntax error is left to the loader.
+fn too_deep(text: &str) -> Option<Marker> {
+    use saphyr_parser::{Event, Parser};
+    // Open collections: (anchor id, height of the deepest child so far).
+    let mut open: Vec<(usize, usize)> = Vec::new();
+    // Height of each anchored collection (a scalar anchor has height 0).
+    let mut heights: HashMap<usize, usize> = HashMap::new();
+    for event in Parser::new_from_str(text) {
+        let Ok((event, span)) = event else { return None };
+        match event {
+            Event::SequenceStart(anchor, _) | Event::MappingStart(anchor, _) => {
+                if open.len() + 1 > MAX_DEPTH { return Some(span.start); }
+                open.push((anchor, 0));
+            }
+            Event::SequenceEnd | Event::MappingEnd => {
+                let Some((anchor, height)) = open.pop() else { continue };
+                if anchor != 0 { heights.insert(anchor, height + 1); }
+                if let Some(parent) = open.last_mut() { parent.1 = parent.1.max(height + 1); }
+            }
+            Event::Alias(anchor) => {
+                let height = heights.get(&anchor).copied().unwrap_or(0);
+                if open.len() + height > MAX_DEPTH { return Some(span.start); }
+                if let Some(parent) = open.last_mut() { parent.1 = parent.1.max(height); }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// One step from a collection to a child.
+#[derive(Clone)]
+enum Step {
+    Key(String),
+    Index(usize),
+}
+
+fn pointer(steps: &[Step]) -> String {
+    steps.iter().map(|step| match step {
+        Step::Key(key) => format!("/{}", key.replace('~', "~0").replace('/', "~1")),
+        Step::Index(index) => format!("/{index}"),
+    }).collect()
+}
+
+/// Nodes of a JSON value (depth is bounded by `MAX_DEPTH`).
+fn nodes(value: &Value) -> usize {
+    1 + match value {
+        Value::Array(items) => items.iter().map(nodes).sum(),
+        Value::Object(fields) => fields.values().map(nodes).sum(),
+        _ => 0,
+    }
+}
+
+/// The outermost collections below the root worth splitting: more than
+/// `SPLIT_NODES` nodes and several items (a sequence) or more than
+/// `MAP_ENTRIES` entries (a mapping). Returns the node count of `value`.
+fn large(value: &Value, steps: &mut Vec<Step>, found: &mut Vec<Vec<Step>>) -> usize {
+    let start = found.len();
+    let (size, splittable) = match value {
+        Value::Array(items) => {
+            let mut size = 1;
+            for (index, item) in items.iter().enumerate() {
+                steps.push(Step::Index(index));
+                size += large(item, steps, found);
+                steps.pop();
+            }
+            (size, items.len() > 1)
+        }
+        Value::Object(fields) => {
+            let mut size = 1;
+            for (key, field) in fields {
+                steps.push(Step::Key(key.clone()));
+                size += large(field, steps, found);
+                steps.pop();
+            }
+            (size, fields.len() > MAP_ENTRIES)
+        }
+        _ => (1, false),
+    };
+    if !steps.is_empty() && splittable && size > SPLIT_NODES {
+        found.truncate(start);
+        found.push(steps.clone());
+    }
+    size
+}
+
+fn at_mut<'a>(mut value: &'a mut Value, steps: &[Step]) -> Option<&'a mut Value> {
+    for step in steps {
+        value = match (step, value) {
+            (Step::Key(key), Value::Object(fields)) => fields.get_mut(key)?,
+            (Step::Index(index), Value::Array(items)) => items.get_mut(*index)?,
+            _ => return None,
+        };
+    }
+    Some(value)
+}
+
+/// The children of a split collection the skeleton does not keep.
+fn split_children(value: &Value) -> Vec<(Step, Value)> {
+    match value {
+        Value::Array(items) => items.iter().cloned().enumerate().map(|(index, item)| (Step::Index(index), item)).collect(),
+        Value::Object(fields) => fields.iter().skip(MAP_ENTRIES).map(|(key, field)| (Step::Key(key.clone()), field.clone())).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Schema problems `(JSON pointer, what is wrong)` of a document within the
+/// budget. A large document is not given to the validator whole (its error
+/// lists keep every anyOf branch): its large collections are cut to a
+/// skeleton (a sequence keeps its first item, a mapping its first
+/// `MAP_ENTRIES` entries), and every other child is validated in its
+/// top-level key with that collection holding only this child.
+fn schema_errors(document: &Value, budget: &mut Budget, out: &mut Vec<(String, String)>) {
+    if !budget.spend(nodes(document)) || VALIDATOR.is_valid(document) { return; }
+    let mut split = Vec::new();
+    large(document, &mut Vec::new(), &mut split);
+    if split.is_empty() {
+        for error in VALIDATOR.iter_errors(document) {
+            if !budget.take_problem() { return; }
+            out.push((error.instance_path().as_str().to_owned(), schema_what(error.kind())));
+        }
+        return;
+    }
+    let mut skeleton = document.clone();
+    let mut parts = Vec::with_capacity(split.len());
+    // Items of split sequences come from their parts (the first one too).
+    let mut sequences = Vec::new();
+    for steps in &split {
+        let Some(collection) = at_mut(&mut skeleton, steps) else { continue };
+        parts.push((steps.clone(), split_children(collection)));
+        match collection {
+            Value::Array(items) => {
+                items.truncate(1);
+                sequences.push(format!("{}/", pointer(steps)));
+            }
+            Value::Object(fields) => {
+                let kept: Map<String, Value> = std::mem::take(fields).into_iter().take(MAP_ENTRIES).collect();
+                *fields = kept;
+            }
+            _ => {}
+        }
+    }
+    let mut found = Vec::new();
+    schema_errors(&skeleton, budget, &mut found);
+    out.extend(found.into_iter().filter(|(path, _)| !sequences.iter().any(|prefix| path.starts_with(prefix.as_str()))));
+    for (steps, children) in parts {
+        let Some((Step::Key(top), below)) = steps.split_first().map(|(first, rest)| (first.clone(), rest)) else { continue };
+        let base = pointer(&steps);
+        for (step, child) in children {
+            if budget.exhausted { return; }
+            let mut subtree = skeleton.get(&top).cloned().unwrap_or(Value::Null);
+            let (inner, original) = match &step {
+                Step::Index(index) => (Value::Array(vec![child]), format!("{base}/{index}")),
+                Step::Key(key) => (Value::Object(Map::from_iter([(key.clone(), child)])), format!("{base}{}", pointer(std::slice::from_ref(&step)))),
+            };
+            match at_mut(&mut subtree, below) {
+                Some(slot) => *slot = inner,
+                None => continue,
+            }
+            let part = Value::Object(Map::from_iter([(top.clone(), subtree)]));
+            let shown = match &step { Step::Index(_) => format!("{base}/0"), Step::Key(_) => original.clone() };
+            let mut found = Vec::new();
+            schema_errors(&part, budget, &mut found);
+            for (path, what) in found {
+                let Some(rest) = path.strip_prefix(shown.as_str()).filter(|rest| rest.is_empty() || rest.starts_with('/')) else { continue };
+                out.push((format!("{original}{rest}"), what));
+            }
+        }
+    }
+}
+
+/// A Russian schema message: the place (the path) and what is wrong. Values
+/// and unexpected keys of the checked template are never quoted (a template
+/// may hold secrets, also as mis-indented keys); the place is the path of
+/// keys the problem is at.
+fn schema_message(what: &str, path: &str) -> String {
     let place = if path.is_empty() {
         "Конфиг".to_owned()
     } else {
         format!("«{}»", path[1..].replace("~1", "/").replace("~0", "~"))
     };
-    let what = match kind {
+    format!("{place}: {what}.").chars().take(MESSAGE_CHARS).collect()
+}
+
+fn schema_what(kind: &ValidationErrorKind) -> String {
+    match kind {
         ValidationErrorKind::Type { kind } => format!("ожидается {}", match kind {
             TypeKind::Single(single) => type_name(*single).to_owned(),
             TypeKind::Multiple(set) => set.iter().map(type_name).collect::<Vec<_>>().join(" или "),
@@ -256,7 +482,7 @@ fn schema_message(kind: &ValidationErrorKind, path: &str) -> String {
         ValidationErrorKind::Constant { expected_value } => format!("ожидается {}", values(expected_value)),
         ValidationErrorKind::Required { property } => format!("нет обязательного ключа «{}»", property.as_str().unwrap_or("?")),
         ValidationErrorKind::AdditionalProperties { unexpected } | ValidationErrorKind::UnevaluatedProperties { unexpected } =>
-            format!("неизвестные ключи: {}", unexpected.iter().map(|key| format!("«{key}»")).collect::<Vec<_>>().join(", ")),
+            format!("неизвестных ключей: {}", unexpected.len()),
         ValidationErrorKind::AnyOf { .. } | ValidationErrorKind::OneOfNotValid { .. } =>
             "значение не подходит ни под один допустимый вариант".to_owned(),
         ValidationErrorKind::OneOfMultipleValid { .. } => "значение подходит сразу под несколько вариантов".to_owned(),
@@ -275,8 +501,7 @@ fn schema_message(kind: &ValidationErrorKind, path: &str) -> String {
         ValidationErrorKind::PropertyNames { .. } => "недопустимое имя ключа".to_owned(),
         ValidationErrorKind::FalseSchema => "ключ не допускается".to_owned(),
         _ => "значение не соответствует схеме mihomo".to_owned(),
-    };
-    format!("{place}: {what}.").chars().take(MESSAGE_CHARS).collect()
+    }
 }
 
 fn type_name(kind: JsonType) -> &'static str {
@@ -406,6 +631,9 @@ fn locate(root: &MarkedYaml<'_>, pointer: &str) -> Marker {
 /// given; with both the file content is checked and the name labels it.
 pub fn command(session: &mut Session, invocation: &Invocation, input: &Input) -> Result<Value> {
     let name = invocation.value("name").filter(|name| !name.is_empty()).map(file_name);
+    if let Some(name) = &name && !crate::validation::template_filename_valid(name) {
+        return Err(templates::name_invalid());
+    }
     let stored;
     let content = match (input.get("file"), &name) {
         (Some(content), _) => content,
@@ -541,12 +769,62 @@ mod tests {
     }
 
     #[test]
-    fn many_schema_problems_are_capped_per_variant() {
+    fn the_problem_budget_stops_the_check() {
         let content: String = std::iter::once("proxies:\nproxy-groups:\n".to_owned())
-            .chain((0..VARIANT_PROBLEMS + 5).map(|i| format!("  - {{name: g{i}, type: bogus}}\n"))).collect();
+            .chain((0..PROBLEM_BUDGET + 5).map(|i| format!("  - {{name: g{i}, type: bogus}}\n"))).collect();
         let report = check(&content, &groups());
         assert!(report.truncated);
-        assert_eq!((report.problems.len(), report.warnings), (LIMIT, VARIANT_PROBLEMS));
+        assert!(codes(&report).iter().any(|(_, code, _)| *code == "check_limit"));
+        assert!(report.warnings <= PROBLEM_BUDGET + 1, "{}", report.warnings);
+    }
+
+    #[test]
+    fn a_large_list_is_validated_item_by_item_with_source_positions() {
+        let bad = 437;
+        let content: String = std::iter::once("proxies:\nproxy-groups:\n".to_owned())
+            .chain((0..500).map(|i| format!("  - {{name: g{i}, type: {}, proxies: [DIRECT]}}\n", if i == bad { "bogus" } else { "select" })))
+            .collect();
+        let report = check(&content, &groups());
+        let schema: Vec<_> = report.problems.iter().map(|p| (p.line, p.path.as_deref())).collect();
+        let path = format!("/proxy-groups/{bad}");
+        assert_eq!(schema, [(bad + 3, Some(path.as_str()))], "{:?}", report.problems);
+        assert!(!report.truncated);
+    }
+
+    #[test]
+    fn deep_nesting_is_a_yaml_error_before_any_recursion() {
+        // Runs on a test thread (2 MiB stack, like the daemon's core thread).
+        let deep = format!("proxies:\nx:\n  {}1\n", "- ".repeat(100_000));
+        let report = check(&deep, &groups());
+        assert_eq!(codes(&report), [(3, "yaml", None)], "{:?}", report.problems);
+        let flow = format!("proxies:\nx: {}{}\n", "[".repeat(MAX_DEPTH - 2), "]".repeat(MAX_DEPTH - 2));
+        assert!(check(&flow, &groups()).problems.iter().all(|p| p.code != "yaml"), "the limit itself is accepted");
+        // Depth through aliases counts what they expand to.
+        let inner = format!("{}1{}", "[".repeat(100), "]".repeat(100));
+        let nested = format!("proxies:\na: &a {inner}\nb: {}*a{}\n", "[".repeat(60), "]".repeat(60));
+        assert_eq!(codes(&check(&nested, &groups())), [(3, "yaml", None)], "the line of `b`");
+    }
+
+    #[test]
+    fn anchors_aliases_and_merge_keys_are_expanded() {
+        let content = "proxies:\nx-group: &group {name: g, type: select, proxies: [DIRECT]}\nx-groups: &groups [*group]\n\
+            proxy-groups: *groups\nx-flag: &flag true\nx-dns: &dns {enable: true, ipv6: false}\ndns:\n  <<: *dns\n  listen: 0.0.0.0:53\nallow-lan: *flag\n";
+        let report = check(content, &groups());
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        // A billion laughs is stopped by the loader's node budget, quickly.
+        let mut laughs = vec!["proxies:".to_owned(), "a0: &a0 [lol,lol,lol,lol,lol,lol,lol,lol,lol,lol]".to_owned()];
+        laughs.extend((1..9).map(|i| format!("a{i}: &a{i} [{}]", vec![format!("*a{}", i - 1); 10].join(","))));
+        let started = std::time::Instant::now();
+        let report = check(&(laughs.join("\n") + "\n"), &groups());
+        assert_eq!(report.problems.iter().map(|p| p.code).collect::<Vec<_>>(), ["yaml"]);
+        assert!(started.elapsed().as_secs() < 5);
+    }
+
+    #[test]
+    fn unexpected_keys_are_counted_not_quoted() {
+        let kind = ValidationErrorKind::AdditionalProperties { unexpected: vec!["hunter2".into(), "x".into()] };
+        let message = schema_message(&schema_what(&kind), "/dns");
+        assert!(!message.contains("hunter2") && message.contains('2'), "{message}");
     }
 
     #[test]

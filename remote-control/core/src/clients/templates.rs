@@ -216,7 +216,7 @@ fn marker(line: &str) -> Option<&str> {
         .then_some(tag)
 }
 
-fn name_invalid() -> RcError {
+pub(crate) fn name_invalid() -> RcError {
     RcError::new("invalid", "Имя шаблона может содержать только буквы, цифры, точку, - и _")
 }
 
