@@ -10,6 +10,7 @@
 mod daemon;
 mod oneshot;
 mod remote;
+mod service;
 mod terminal;
 mod webcmd;
 
@@ -52,7 +53,7 @@ fn main() -> ExitCode {
         return oneshot::finish(Output::success(cli::help(invocation.help_noun())), json, Some(&invocation));
     }
     match (invocation.noun.as_str(), invocation.verb.as_str()) {
-        ("daemon", "run" | "start") | ("web", "run" | "open") if target.is_some() => {
+        ("daemon", "run" | "start") | ("web", "run" | "open" | "install-service" | "uninstall-service") if target.is_some() => {
             let error = RcError::new("usage", "Команда выполняется только на машине демона.");
             oneshot::finish(Output::from_error(error), json, Some(&invocation))
         }
@@ -60,6 +61,8 @@ fn main() -> ExitCode {
         ("daemon", "start") => oneshot::daemon_start(&invocation),
         ("web", "run") => webcmd::run(&invocation),
         ("web", "open") => webcmd::open(&invocation),
+        ("web", "install-service") => service::install(&invocation),
+        ("web", "uninstall-service") => service::uninstall(&invocation),
         _ => oneshot::run(&argv, &invocation, target.as_ref()),
     }
 }

@@ -242,7 +242,11 @@ pub fn connect() -> Result<(DaemonClient, Endpoint)> {
 
 /// `connect` с аргументами запуска демона (`daemon run --web …`).
 pub(crate) fn connect_spawning(args: Vec<String>) -> Result<(DaemonClient, Endpoint)> {
-    let root = StatePaths::discover()?.root().to_owned();
+    connect_spawning_in(StatePaths::discover()?.root().to_owned(), args)
+}
+
+/// `connect_spawning` для явного каталога данных (`daemon start --data-dir`).
+fn connect_spawning_in(root: std::path::PathBuf, args: Vec<String>) -> Result<(DaemonClient, Endpoint)> {
     let endpoint = client::endpoint_for(&root).map_err(|error| client_error(&error))?;
     let exe = std::env::current_exe().map_err(|error| failed(format!("Не удалось определить исполняемый файл: {error}")))?;
     let spawn = SpawnDaemon { exe: exe.clone(), args, env: Vec::new() };
@@ -478,7 +482,16 @@ pub fn daemon_start(invocation: &Invocation) -> ExitCode {
             args.push("--web".into());
             args.extend(flags.iter().cloned());
         }
-        let (mut client, endpoint) = connect_spawning(args).map_err(local)?;
+        // `--data-dir` (автозапуск Windows) — приоритетнее ESSENCE_RC_DATA_DIR;
+        // демону передаётся тем же флагом, абсолютным.
+        let root = match invocation.value("data-dir") {
+            Some(dir) => std::path::PathBuf::from(absolute_file(dir).map_err(local)?),
+            None => StatePaths::discover().map_err(local)?.root().to_owned(),
+        };
+        if invocation.value("data-dir").is_some() {
+            args.extend(["--data-dir".to_owned(), root.to_string_lossy().into_owned()]);
+        }
+        let (mut client, endpoint) = connect_spawning_in(root, args).map_err(local)?;
         let (secrets, input) = (client::Secrets::default(), client::Input::default());
         let ask = |client: &mut DaemonClient, argv: Vec<String>| {
             client.send(Request::new(&argv, &secrets, &input), &mut |_| {}).map_err(|error| local(request_error(&error)))

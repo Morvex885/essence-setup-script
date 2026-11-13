@@ -1,6 +1,6 @@
 //! Where the daemon of a data directory listens: runtime directory, socket
 //! (Unix) or named pipe (Windows), lock and journal files.
-use std::{io, path::{Path, PathBuf}};
+use std::{ffi::OsString, io, path::{Path, PathBuf}};
 use sha2::{Digest, Sha256};
 
 /// Explicit runtime directory; must be an absolute path.
@@ -29,43 +29,59 @@ pub struct Endpoint {
 
 pub(crate) fn invalid(message: impl Into<String>) -> io::Error { io::Error::new(io::ErrorKind::InvalidInput, message.into()) }
 
+/// The platform family that decides the default runtime directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Os { Linux, Mac, Windows }
+
+fn current_os() -> Os {
+    if cfg!(windows) { Os::Windows } else if cfg!(target_os = "macos") { Os::Mac } else { Os::Linux }
+}
+
 /// The runtime directory: `ESSENCE_RC_RUNTIME_DIR`, otherwise the platform default.
 pub fn runtime_dir() -> io::Result<PathBuf> {
-    if let Some(dir) = std::env::var_os(RUNTIME_DIR_ENV) {
+    #[cfg(unix)]
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    #[cfg(not(unix))]
+    let euid = u32::MAX;
+    choose_runtime_dir(euid, &|name| std::env::var_os(name), dirs::home_dir().as_deref(), dirs::data_local_dir().as_deref(),
+        current_os(), &directory_owner)
+}
+
+/// Owner uid of a real directory (not a link); `None` otherwise.
+fn directory_owner(path: &Path) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(path).ok().filter(|meta| meta.is_dir()).map(|meta| meta.uid())
+    }
+    #[cfg(not(unix))]
+    { std::fs::symlink_metadata(path).ok().filter(|meta| meta.is_dir()).map(|_| 0) }
+}
+
+fn no_home() -> io::Error { io::Error::new(io::ErrorKind::NotFound, "Не удалось определить домашний каталог пользователя.") }
+
+/// Pure choice of the runtime directory (П5). `env` reads variables, `owner`
+/// tells the owner of an existing directory. Shared directories such as
+/// `/tmp`, `XDG_RUNTIME_DIR` and `TMPDIR` are never used.
+pub(crate) fn choose_runtime_dir(euid: u32, env: &dyn Fn(&str) -> Option<OsString>, home: Option<&Path>, local_data: Option<&Path>,
+    os: Os, owner: &dyn Fn(&Path) -> Option<u32>) -> io::Result<PathBuf> {
+    if let Some(dir) = env(RUNTIME_DIR_ENV) {
         if dir.is_empty() { return Err(invalid("ESSENCE_RC_RUNTIME_DIR не должен быть пустым.")); }
         let dir = PathBuf::from(dir);
         if !dir.is_absolute() { return Err(invalid("ESSENCE_RC_RUNTIME_DIR должен быть абсолютным путём.")); }
         return Ok(dir);
     }
-    default_runtime_dir()
-}
-
-fn no_home() -> io::Error { io::Error::new(io::ErrorKind::NotFound, "Не удалось определить домашний каталог пользователя.") }
-
-/// Never shared directories such as `/tmp`, and never `XDG_RUNTIME_DIR`/`TMPDIR`.
-#[cfg(unix)]
-fn default_runtime_dir() -> io::Result<PathBuf> {
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    let uid = unsafe { libc::geteuid() };
-    if uid == 0 {
-        return Ok(PathBuf::from(if Path::new("/run").is_dir() { "/run/essence-rc" } else { "/var/run/essence-rc" }));
-    }
-    #[cfg(target_os = "macos")]
-    { Ok(dirs::home_dir().ok_or_else(no_home)?.join("Library/Caches/essence-rc/run")) }
-    #[cfg(not(target_os = "macos"))]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let user = PathBuf::from(format!("/run/user/{uid}"));
-        if std::fs::symlink_metadata(&user).is_ok_and(|meta| meta.is_dir() && meta.uid() == uid) {
-            return Ok(user.join("essence-rc"));
+    match os {
+        Os::Windows => Ok(local_data.ok_or_else(no_home)?.join("essence-rc").join("run")),
+        _ if euid == 0 => Ok(PathBuf::from(if owner(Path::new("/run")).is_some() { "/run/essence-rc" } else { "/var/run/essence-rc" })),
+        Os::Mac => Ok(home.ok_or_else(no_home)?.join("Library/Caches/essence-rc/run")),
+        Os::Linux => {
+            let user = PathBuf::from(format!("/run/user/{euid}"));
+            if owner(&user) == Some(euid) { return Ok(user.join("essence-rc")); }
+            Ok(home.ok_or_else(no_home)?.join(".cache/essence-rc/run"))
         }
-        Ok(dirs::home_dir().ok_or_else(no_home)?.join(".cache/essence-rc/run"))
     }
-}
-
-#[cfg(windows)]
-fn default_runtime_dir() -> io::Result<PathBuf> {
-    Ok(dirs::data_local_dir().ok_or_else(no_home)?.join("essence-rc").join("run"))
 }
 
 /// The data directory with the symlinks of its longest existing ancestor
@@ -87,7 +103,6 @@ pub(crate) fn resolved(path: &Path) -> PathBuf {
         }
     }
 }
-
 /// Pure: the endpoint of `data_dir` inside `runtime_dir` (no environment).
 pub fn endpoint_in(runtime_dir: &Path, data_dir: &Path) -> io::Result<Endpoint> {
     if !runtime_dir.is_absolute() { return Err(invalid("ESSENCE_RC_RUNTIME_DIR должен быть абсолютным путём.")); }
@@ -157,6 +172,54 @@ pub fn verify_runtime_dir(dir: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn vars(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<OsString> {
+        move |name| pairs.iter().find(|(key, _)| *key == name).map(|(_, value)| OsString::from(value))
+    }
+
+    #[test]
+    fn root_runtime_dir_ignores_xdg_runtime_dir() {
+        let home = Path::new("/root");
+        let run = |path: &Path| (path == Path::new("/run")).then_some(0);
+        let with_xdg = vars(&[("XDG_RUNTIME_DIR", "/run/user/0"), ("TMPDIR", "/tmp")]);
+        let without = vars(&[]);
+        let a = choose_runtime_dir(0, &with_xdg, Some(home), None, Os::Linux, &run).unwrap();
+        let b = choose_runtime_dir(0, &without, Some(home), None, Os::Linux, &run).unwrap();
+        assert_eq!((a.as_path(), b.as_path()), (Path::new("/run/essence-rc"), Path::new("/run/essence-rc")));
+        // `/run/essence-rc` is an absolute path only on Unix hosts.
+        if cfg!(unix) {
+            let data = Path::new("/var/lib/essence");
+            assert_eq!(endpoint_in(&a, data).unwrap().socket, endpoint_in(&b, data).unwrap().socket);
+        }
+        // No /run: /var/run; macOS root the same rule.
+        assert_eq!(choose_runtime_dir(0, &without, Some(home), None, Os::Linux, &|_| None).unwrap(), Path::new("/var/run/essence-rc"));
+        assert_eq!(choose_runtime_dir(0, &with_xdg, Some(home), None, Os::Mac, &run).unwrap(), Path::new("/run/essence-rc"));
+    }
+
+    #[test]
+    fn user_runtime_dir_prefers_owned_run_user() {
+        let home = Path::new("/home/u");
+        let env = vars(&[("XDG_RUNTIME_DIR", "/elsewhere")]);
+        let owned = |path: &Path| (path == Path::new("/run/user/1000")).then_some(1000);
+        let foreign = |path: &Path| (path == Path::new("/run/user/1000")).then_some(0);
+        assert_eq!(choose_runtime_dir(1000, &env, Some(home), None, Os::Linux, &owned).unwrap(), Path::new("/run/user/1000/essence-rc"));
+        assert_eq!(choose_runtime_dir(1000, &env, Some(home), None, Os::Linux, &foreign).unwrap(), Path::new("/home/u/.cache/essence-rc/run"));
+        assert_eq!(choose_runtime_dir(1000, &env, Some(home), None, Os::Linux, &|_| None).unwrap(), Path::new("/home/u/.cache/essence-rc/run"));
+        assert_eq!(choose_runtime_dir(501, &env, Some(Path::new("/Users/u")), None, Os::Mac, &owned).unwrap(),
+            Path::new("/Users/u/Library/Caches/essence-rc/run"));
+        assert_eq!(choose_runtime_dir(1, &env, None, Some(Path::new(r"C:\Users\u\AppData\Local")), Os::Windows, &|_| None).unwrap(),
+            Path::new(r"C:\Users\u\AppData\Local").join("essence-rc").join("run"));
+    }
+
+    #[test]
+    fn explicit_runtime_dir_wins_and_is_validated() {
+        // An absolute path of the host running the test.
+        const EXPLICIT: &str = if cfg!(windows) { r"C:\srv\rc-run" } else { "/srv/rc-run" };
+        let explicit = vars(&[("ESSENCE_RC_RUNTIME_DIR", EXPLICIT)]);
+        assert_eq!(choose_runtime_dir(0, &explicit, None, None, Os::Linux, &|_| Some(0)).unwrap(), Path::new(EXPLICIT));
+        assert!(choose_runtime_dir(0, &vars(&[("ESSENCE_RC_RUNTIME_DIR", "")]), None, None, Os::Linux, &|_| None).is_err());
+        assert!(choose_runtime_dir(0, &vars(&[("ESSENCE_RC_RUNTIME_DIR", "rel")]), None, None, Os::Linux, &|_| None).is_err());
+    }
 
     #[cfg(unix)]
     fn runtime() -> tempfile::TempDir { tempfile::Builder::new().prefix("rc").tempdir_in("/tmp").unwrap() }
