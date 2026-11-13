@@ -260,6 +260,7 @@ mod tests {
         Node {
             id: "0123456789abcdef0123456789abcdef".into(), name: "de".into(), ip: "198.51.100.7".into(), port: 22,
             user: "root".into(), auth: Auth::Key, identity: Some("system".into()), secret_id: None, tag: None, aliases: Default::default(),
+            ..Node::default()
         }
     }
 

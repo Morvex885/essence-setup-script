@@ -219,7 +219,7 @@ mod tests {
         let node = Node {
             id: "0123456789abcdef0123456789abcdef".into(), name: "de".into(), ip: "198.51.100.7".into(), port: 22,
             user: "root".into(), auth: Auth::Key, identity: Some("system".into()), secret_id: None,
-            tag: Some("DE".into()), aliases: Default::default(),
+            tag: Some("DE".into()), aliases: Default::default(), ..Node::default()
         };
         session.state.save_config(&Config { nodes: vec![node], ..Config::default() }).unwrap();
         pin(&session.state, "198.51.100.7", 22, vec![fingerprint()]).unwrap();

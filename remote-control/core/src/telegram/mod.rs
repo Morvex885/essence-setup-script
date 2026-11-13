@@ -509,7 +509,7 @@ mod tests {
         let (session, journal) = session(root);
         let nodes = NODES.iter().enumerate().map(|(index, (name, ip, port))| Node {
             id: format!("{index:032x}"), name: (*name).into(), ip: (*ip).into(), port: *port, user: "root".into(),
-            auth: Auth::Key, identity: None, secret_id: None, tag: None, aliases: Default::default(),
+            auth: Auth::Key, identity: None, secret_id: None, tag: None, aliases: Default::default(), ..Node::default()
         }).collect();
         session.state.save_config(&Config { nodes, ..Config::default() }).unwrap();
         for (_, ip, port) in NODES {

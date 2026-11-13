@@ -6,9 +6,10 @@
 //! ControlMaster socket): if anything later fails while the node is kept, the
 //! revoked key is put back through that lease and a fresh login verifies it.
 //! The state change is one `Session::mutate` transaction: node, its
-//! connections, client references, `subscription_host` (if it named the node),
-//! password secret, host pins (unless another node shares the endpoint),
-//! portability issues and, last, the managed identity files.
+//! connections, client references, cascades through it, its Telegram Proxy,
+//! `subscription_host` (if it named the node), every `node:<id>:*` secret,
+//! host pins (unless another node shares the endpoint), portability issues
+//! and, last, the managed identity files.
 
 use std::io::ErrorKind;
 use std::path::PathBuf;
@@ -20,7 +21,7 @@ use crate::confirmation::Plan;
 use crate::dispatch::Session;
 use crate::error::{RcError, Result, exit_code_for};
 use crate::log::Level;
-use crate::model::{Config, Node, PortabilityReason};
+use crate::model::{Cascade, CascadeExit, Config, Node, PortabilityReason};
 use crate::state::State;
 use crate::transport::{RemoteSession, RemoteTransport};
 
@@ -80,6 +81,14 @@ fn plan(config: &Config, node: &Node, server: bool, revoke: bool) -> Vec<String>
     if config.subscription_host.as_ref().is_some_and(|host| host.node == node.name) {
         lines.push("Хостинг подписок размещён на этой ноде: его настройка (subscription_host) будет удалена.".to_owned());
     }
+    let cascades: Vec<&str> = config.cascades.iter().filter(|cascade| cascade_uses(cascade, &node.name))
+        .map(|cascade| cascade.name.as_str()).collect();
+    if !cascades.is_empty() {
+        lines.push(format!("Каскады через эту ноду будут удалены: {}", cascades.join(" ")));
+    }
+    if config.telegram.iter().any(|proxy| proxy.node == node.name) {
+        lines.push("Telegram Proxy этой ноды будет удалён из конфигурации.".to_owned());
+    }
     lines.push(if revoke { "Управляемый SSH-ключ будет отозван на ноде." } else { "SSH-ключ на ноде сохранится." }.to_owned());
     lines
 }
@@ -133,6 +142,10 @@ async fn restore_key<T: RemoteTransport>(session: &mut Session, transport: &mut 
     restored
 }
 
+fn cascade_uses(cascade: &Cascade, name: &str) -> bool {
+    cascade.entry == name || matches!(&cascade.exit, CascadeExit::Node(exit) if exit.node == name)
+}
+
 /// Remove the node and everything that only it referenced.
 fn remove(state: &State, node: &Node) -> Result<()> {
     let mut config = state.load_config()?;
@@ -150,12 +163,16 @@ fn remove(state: &State, node: &Node) -> Result<()> {
             connections.retain(|connection| connection.node != node.name);
         }
     }
+    config.cascades.retain(|cascade| !cascade_uses(cascade, &node.name));
+    config.telegram.retain(|proxy| proxy.node != node.name);
     if config.subscription_host.as_ref().is_some_and(|host| host.node == node.name) {
         config.subscription_host = None;
     }
     state.save_config(&config)?;
-    if let Some(secret_id) = node.secret_id.as_deref() {
-        state.secret_store().remove(secret_id)?;
+    let store = state.secret_store();
+    let prefix = format!("node:{}:", node.id);
+    for secret_id in store.ids()?.iter().filter(|id| id.starts_with(&prefix)) {
+        store.remove(secret_id)?;
     }
     let shared = config.nodes.iter().any(|other| other.ip == node.ip && other.port == node.port);
     if !shared && !pins(&state.load_known_hosts()?, node)?.is_empty() {
@@ -309,7 +326,8 @@ mod tests {
     use super::*;
     use crate::fake_transport::{AuthMethod, ConnectExpectation, FakeTransport, Operation, ScriptStep};
     use crate::github::{SyncStatus, Storage, Target, commands::GithubSession};
-    use crate::model::{Auth, Client, Connection, ConnectionGroup, Fingerprint, SubscriptionHost};
+    use crate::model::{Auth, CascadeListener, Client, Connection, ConnectionGroup, ExitProxy, Fingerprint, NodeExit,
+        SubscriptionHost, TelegramProxy, UriExit};
     use crate::nodes::{CONNECT_TIMEOUT, scripts, testing};
     use crate::transport::{ExecResult, HostKeyPolicy};
 
@@ -325,7 +343,7 @@ mod tests {
             id: id.into(), name: name.into(), ip: "198.51.100.7".into(), port: 22, user: "root".into(), auth,
             identity: (auth == Auth::Key).then(|| id.to_owned()),
             secret_id: (auth == Auth::Password).then(|| format!("node:{id}:ssh-password")),
-            tag: Some("T".into()), aliases: Default::default(),
+            tag: Some("T".into()), aliases: Default::default(), ..Node::default()
         }
     }
 
@@ -410,17 +428,34 @@ mod tests {
         let other = "fedcba9876543210fedcba9876543210";
         let mut twin = node("twin", other, Auth::Key);
         twin.identity = Some("system".into());
+        let mut de = node("de", ID, Auth::Password);
+        de.profile = Some("main".into());
+        twin.profile = Some("main".into());
+        let cascade = |name: &str, entry: &str, exit: &str| Cascade {
+            name: name.into(), entry: entry.into(), listener: CascadeListener::VlessTcp,
+            exit: CascadeExit::Node(NodeExit { node: exit.into(), proxy: ExitProxy::VlessTcp }),
+            uuid: "11111111-2222-4333-8444-555555555555".into(), password: "0123456789abcdef".into(),
+        };
         session.state.save_config(&Config {
-            nodes: vec![node("de", ID, Auth::Password), twin],
+            nodes: vec![de, twin],
+            profiles: vec![crate::model::test_profile("main")],
             connections: vec![
                 Connection { node: "de".into(), groups: vec![] },
                 Connection { node: "twin".into(), groups: vec![] },
             ],
             clients: vec![Client { name: "alice".into(), group: "g".into(), nodes: Some(vec!["de".into(), "twin".into()]), ..Client::default() }],
-            subscription_host: Some(SubscriptionHost { node: "de".into(), base_url: "https://x".into(), sub_dir: "s".into(), nginx_group: "www-data".into() }),
+            cascades: vec![cascade("in", "de", "twin"), cascade("out", "twin", "de"),
+                Cascade { exit: CascadeExit::Uri(UriExit { uri: "vless://x@y:1".into() }), ..cascade("ext", "twin", "de") }],
+            telegram: vec![TelegramProxy { node: "de".into(), hostname: "tg.example".into(), secret_mark: "0123abcd".into(), tag_mark: None },
+                TelegramProxy { node: "twin".into(), hostname: "tg2.example".into(), secret_mark: "0123abcd".into(), tag_mark: None }],
+            subscription_host: Some(SubscriptionHost { node: "de".into(), hostname: "x.example".into(), port: 443,
+                base_url: "https://x.example".into(), sub_dir: "s".into(), nginx_group: "www-data".into() }),
             ..Config::default()
         }).unwrap();
-        session.state.secret_store().set(&format!("node:{ID}:ssh-password"), "pw".to_owned().into()).unwrap();
+        for suffix in ["ssh-password", "reality-key", "awg-key", "warp-key", "telegram-secret", "telegram-tag"] {
+            session.state.secret_store().set(&format!("node:{ID}:{suffix}"), "pw".to_owned().into()).unwrap();
+        }
+        session.state.secret_store().set(&format!("node:{other}:reality-key"), "keep".to_owned().into()).unwrap();
         pin(&session.state, "198.51.100.7", 22, vec![fp()]).unwrap();
         let mut transport = FakeTransport::new([]);
         let data = delete(&mut session, &testing::invocation(&["node", "delete", "--name", "de", "--yes"]), &mut transport).await.unwrap();
@@ -430,7 +465,9 @@ mod tests {
         assert_eq!(config.connections.len(), 1);
         assert_eq!(config.clients[0].nodes.as_deref(), Some(&["twin".to_owned()][..]));
         assert!(config.subscription_host.is_none());
-        assert_eq!(session.state.secret_store().get(&format!("node:{ID}:ssh-password")).unwrap(), None);
+        assert_eq!(config.cascades.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["ext"]);
+        assert_eq!(config.telegram.iter().map(|t| t.node.as_str()).collect::<Vec<_>>(), ["twin"]);
+        assert_eq!(session.state.secret_store().ids().unwrap(), [format!("node:{other}:reality-key")]);
         // "twin" shares the endpoint: its pin stays.
         assert_eq!(pins(&session.state.load_known_hosts().unwrap(), &config.nodes[0]).unwrap(), vec![fp()]);
         assert!(transport.journal().is_empty());

@@ -11,7 +11,7 @@ use crate::confirmation::Plan;
 use crate::dispatch::Session;
 use crate::error::{RcError, Result};
 use crate::log::Level;
-use crate::model::{Auth, Config, Fingerprint, Node, PortabilityReason};
+use crate::model::{Auth, CascadeExit, Config, Fingerprint, Node, PortabilityReason};
 use crate::request_secrets::Secrets;
 use crate::state::State;
 use crate::transport::RemoteTransport;
@@ -141,7 +141,8 @@ pub async fn aliases<T: RemoteTransport>(session: &mut Session, invocation: &Inv
     Ok(json!({"name": name, "aliases": aliases}))
 }
 
-/// Every reference to a node name moves with it, including the subscription host.
+/// Every reference to a node name moves with it, including cascades, Telegram
+/// Proxy and the subscription host.
 fn rename_references(config: &mut Config, old: &str, new: &str) {
     let rename = |value: &mut String| if value == old { *value = new.to_owned() };
     config.nodes.iter_mut().for_each(|node| rename(&mut node.name));
@@ -150,6 +151,13 @@ fn rename_references(config: &mut Config, old: &str, new: &str) {
         client.nodes.iter_mut().flatten().for_each(&rename);
         client.connections.iter_mut().flatten().for_each(|connection| rename(&mut connection.node));
     }
+    for cascade in &mut config.cascades {
+        rename(&mut cascade.entry);
+        if let CascadeExit::Node(exit) = &mut cascade.exit {
+            rename(&mut exit.node);
+        }
+    }
+    config.telegram.iter_mut().for_each(|proxy| rename(&mut proxy.node));
     if let Some(host) = config.subscription_host.as_mut() {
         rename(&mut host.node);
     }
@@ -309,7 +317,8 @@ pub async fn trust_host_key<T: RemoteTransport>(session: &mut Session, invocatio
 mod tests {
     use super::*;
     use crate::fake_transport::{AuthMethod, ConnectExpectation, FakeTransport, Operation, ScriptStep};
-    use crate::model::{Client, ClientConnection, Connection, ConnectionGroup, SubscriptionHost};
+    use crate::model::{Cascade, CascadeListener, Client, ClientConnection, Connection, ConnectionGroup, ExitProxy, NodeExit,
+        SubscriptionHost, TelegramProxy};
     use crate::nodes::testing::{fingerprint, invocation, session};
     use crate::nodes::CONNECT_TIMEOUT;
     use crate::transport::{ExecResult, HostKeyPolicy};
@@ -325,6 +334,7 @@ mod tests {
             secret_id: (auth == Auth::Password).then(|| format!("node:{id}:ssh-password")),
             id, name: name.into(), ip: format!("198.51.100.{index}"), port: 2222, user: "root".into(), auth,
             identity: (auth == Auth::Key).then(|| "system".into()), tag: Some("DE".into()), aliases: Default::default(),
+            ..Node::default()
         }
     }
 
@@ -347,15 +357,25 @@ mod tests {
     #[test]
     fn rename_cascades_every_reference_including_subscription_host() {
         let root = tempfile::tempdir().unwrap();
-        let (a, other) = (node(1, "a", Auth::Key), node(2, "other", Auth::Key));
+        let (mut a, mut other) = (node(1, "a", Auth::Key), node(2, "other", Auth::Key));
+        a.profile = Some("main".into());
+        other.profile = Some("main".into());
         let mut session = setup(root.path(), Config {
             nodes: vec![a, other],
+            profiles: vec![crate::model::test_profile("main")],
             connections: vec![Connection { node: "a".into(), groups: vec![ConnectionGroup { name: "PC".into(), proxies: vec!["p".into()] }] }],
             clients: vec![Client { name: "c".into(), group: "PC".into(), inherit_nodes_from_group: false,
                 nodes: Some(vec!["a".into(), "other".into()]),
                 connections: Some(vec![ClientConnection { node: "a".into(), proxies: vec!["p".into()] }]), ..Client::default() }],
-            subscription_host: Some(SubscriptionHost { node: "a".into(), base_url: "https://s.example".into(),
-                sub_dir: "sub".into(), nginx_group: "www-data".into() }),
+            cascades: vec![Cascade { name: "via-other".into(), entry: "a".into(), listener: CascadeListener::VlessTcp,
+                exit: CascadeExit::Node(NodeExit { node: "other".into(), proxy: ExitProxy::VlessTcp }),
+                uuid: "11111111-2222-4333-8444-555555555555".into(), password: "0123456789abcdef".into() },
+                Cascade { name: "back".into(), entry: "other".into(), listener: CascadeListener::Hysteria2,
+                exit: CascadeExit::Node(NodeExit { node: "a".into(), proxy: ExitProxy::Hysteria2 }),
+                uuid: "11111111-2222-4333-8444-555555555555".into(), password: "0123456789abcdef".into() }],
+            telegram: vec![TelegramProxy { node: "a".into(), hostname: "tg.example".into(), secret_mark: "0123abcd".into(), tag_mark: None }],
+            subscription_host: Some(SubscriptionHost { node: "a".into(), hostname: "s.example".into(), port: 443,
+                base_url: "https://s.example".into(), sub_dir: "sub".into(), nginx_group: "www-data".into() }),
             ..Config::default()
         });
         assert_eq!(rename(&mut session, &invocation(&["node", "rename", "--name", "a", "--new-name", "b"])).unwrap(), json!({"name": "b"}));
@@ -365,6 +385,8 @@ mod tests {
         assert_eq!(config.clients[0].nodes.as_deref().unwrap(), ["b", "other"]);
         assert_eq!(config.clients[0].connections.as_ref().unwrap()[0].node, "b");
         assert_eq!(config.subscription_host.unwrap().node, "b");
+        assert_eq!((config.cascades[0].entry.as_str(), config.telegram[0].node.as_str()), ("b", "b"));
+        assert!(matches!(&config.cascades[1].exit, CascadeExit::Node(exit) if exit.node == "b"));
 
         let before = fingerprint(root.path());
         let conflict = rename(&mut session, &invocation(&["node", "rename", "--name", "b", "--new-name", "other"])).unwrap_err();

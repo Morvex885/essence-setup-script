@@ -24,6 +24,26 @@ fn host_json(config: &Config) -> Value {
     serde_json::to_value(&config.subscription_host).unwrap_or(Value::Null)
 }
 
+/// The host record of a node's hosting settings: hostname and port come from
+/// the server's `https://host[:port]` base URL.
+fn host_record(node: &str, base_url: &str, sub_dir: &str, nginx_group: String) -> Result<SubscriptionHost> {
+    let (hostname, port) = SubscriptionHost::parse_base_url(base_url)
+        .ok_or_else(|| RcError::new("invalid", "Конфигурация хостинга подписок неполна.").with_extra("name", node))?;
+    Ok(SubscriptionHost {
+        node: node.into(), base_url: SubscriptionHost::base_url_for(&hostname, port), hostname, port,
+        sub_dir: sub_dir.into(), nginx_group,
+    })
+}
+
+/// Subscriptions are hosted only on a node with a server profile.
+fn require_profiled(config: &Config, name: &str) -> Result<()> {
+    if nodes::find(config, name)?.profile.is_none() {
+        return Err(RcError::new("invalid", format!("Нода «{name}» без профиля не может размещать подписки."))
+            .with_extra("name", name));
+    }
+    Ok(())
+}
+
 fn with_data(mut error: RcError, data: &Value) -> RcError {
     if let Some(fields) = data.as_object() {
         for (key, value) in fields {
@@ -77,7 +97,7 @@ pub(super) async fn host<T: RemoteTransport>(session: &mut Session, invocation: 
         return Ok(host_json(&config));
     }
     let node = required(invocation, "name")?;
-    nodes::find(&config, node)?;
+    require_profiled(&config, node)?;
     let conflict = |config: &Config| {
         let current = config.subscription_host.as_ref().map_or("", |host| host.node.as_str());
         if !current.is_empty() && current != node && config.clients.iter().any(has_token) {
@@ -95,7 +115,7 @@ pub(super) async fn host<T: RemoteTransport>(session: &mut Session, invocation: 
     let (Some(sub_dir), Some(nginx_group), true) = (conf.sub_dir(), conf.nginx_group(), conf.complete()) else {
         return Err(RcError::new("invalid", "Конфигурация хостинга подписок неполна.").with_extra("name", node));
     };
-    let host = SubscriptionHost { node: node.into(), base_url: conf.base_url.clone(), sub_dir: sub_dir.into(), nginx_group };
+    let host = host_record(node, &conf.base_url, sub_dir, nginx_group)?;
     session.mutate("subscription_set_host", |state| {
         let mut config = state.load_config()?;
         nodes::find(&config, node)?;
@@ -586,7 +606,7 @@ pub(super) async fn migrate<T: RemoteTransport>(session: &mut Session, invocatio
     let old = config.subscription_host.clone().filter(|host| !host.node.is_empty())
         .ok_or_else(not_configured)?;
     let target = required(invocation, "name")?;
-    nodes::find(&config, target)?;
+    require_profiled(&config, target)?;
     if target == old.node {
         return Err(RcError::new("invalid", "Выбрана текущая хост-нода. Перенос не выполнен."));
     }
@@ -618,6 +638,7 @@ pub(super) async fn migrate<T: RemoteTransport>(session: &mut Session, invocatio
         (old_conf.sub_dir(), new_conf.sub_dir(), new_conf.nginx_group(), new_conf.complete()) else {
         return Err(RcError::new("invalid", "Конфигурация хостинга подписок неполна. Перенос отменён."));
     };
+    let host = host_record(target, &new_conf.base_url, new_dir, nginx_group)?;
     let mut lines = vec![format!("Старая хост-нода: {}", old.node), format!("Базовый URL: {}", old.base_url),
         format!("Новая хост-нода: {target}"), format!("Базовый URL: {}", new_conf.base_url)];
     lines.extend(moving.iter().map(|m| m.name.clone()));
@@ -633,7 +654,7 @@ pub(super) async fn migrate<T: RemoteTransport>(session: &mut Session, invocatio
         let items: Vec<Item> = moving.iter().map(|m| Item {
             token: &m.token, yaml: &m.yaml, snippet: render_snippet(&m.token, new_dir, &m.headers),
         }).collect();
-        if let Err(failure) = remote::upload(&new_remote, new_dir, &nginx_group, &items).await {
+        if let Err(failure) = remote::upload(&new_remote, new_dir, &host.nginx_group, &items).await {
             session.log(Level::Warn, batch_warning(failure));
             copied = false;
         }
@@ -643,7 +664,6 @@ pub(super) async fn migrate<T: RemoteTransport>(session: &mut Session, invocatio
         session.log(Level::Warn, "Перенос не завершён: старый хост и старые ссылки сохранены.");
         return Err(RcError::new("remote_failed", "На новой ноде могли остаться копии подписок."));
     }
-    let host = SubscriptionHost { node: target.into(), base_url: new_conf.base_url.clone(), sub_dir: new_dir.into(), nginx_group };
     session.mutate("subscription_migrate", |state| {
         let mut config = state.load_config()?;
         config.subscription_host = Some(host);

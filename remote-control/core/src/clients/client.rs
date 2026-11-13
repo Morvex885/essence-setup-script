@@ -14,7 +14,7 @@ use crate::confirmation::Plan;
 use crate::dispatch::Session;
 use crate::error::{RcError, Result};
 use crate::log::Level;
-use crate::model::{Client, ClientConnection, ClientCredentials, Config};
+use crate::model::{Client, ClientConnection, Config};
 use crate::nodes::required;
 use crate::transport::RemoteTransport;
 use crate::validation as v;
@@ -150,7 +150,7 @@ pub fn connections(session: &mut Session, invocation: &Invocation) -> Result<Val
 }
 
 /// Random RFC 4122 version-4 UUID, lowercase.
-fn uuid_v4() -> String {
+pub(crate) fn uuid_v4() -> String {
     let mut bytes = [0u8; 16];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
@@ -160,22 +160,20 @@ fn uuid_v4() -> String {
 }
 
 /// A client with the group's nodes and fresh credentials (VLESS UUID,
-/// 32-hex Hysteria2 password); credentials never reach argv or the journal.
+/// 32-hex Hysteria2 password, AmneziaWG keys and index); credentials never
+/// reach argv or the journal.
 pub fn add(session: &mut Session, invocation: &Invocation) -> Result<Value> {
     let name = required(invocation, "name")?.to_owned();
     let group = required(invocation, "group")?.to_owned();
     if !v::name_valid(&name) { return Err(name_invalid()); }
-    let credentials = ClientCredentials { vless_uuid: uuid_v4(), hy2_password: crate::github::random_hex(16) };
-    if !v::vless_uuid_valid(&credentials.vless_uuid) || !v::hy2_password_valid(&credentials.hy2_password) {
-        return Err(RcError::new("failed", "Не удалось создать учётные данные клиента."));
-    }
     let nodes = session.mutate("add_client", |state| {
         let mut config = state.load_config()?;
         if config.clients.iter().any(|c| c.name == name) {
             return Err(RcError::new("conflict", format!("Клиент «{name}» уже существует.")).with_extra("name", name.clone()));
         }
         find_group(&config, &group)?;
-        config.clients.push(Client { name: name.clone(), group: group.clone(), credentials: Some(credentials), ..Client::default() });
+        config.clients.push(Client { name: name.clone(), group: group.clone(), ..Client::default() });
+        crate::server::keys::ensure_generated(state, &mut config)?;
         state.save_config(&config)?;
         Ok(group_nodes(&config, &group))
     })?;
@@ -683,8 +681,11 @@ mod tests {
 
     fn published(mut config: Config) -> Config {
         config.clients[0].subscription = Some(Subscription { token: Some("a".repeat(64)), ..Subscription::default() });
+        config.profiles = vec![crate::model::test_profile("main")];
+        config.nodes.iter_mut().filter(|node| node.name == "de-vps").for_each(|node| node.profile = Some("main".into()));
         config.subscription_host = Some(SubscriptionHost {
-            node: "de-vps".into(), base_url: "https://sub.example".into(), sub_dir: "/srv/sub".into(), nginx_group: "www-data".into(),
+            node: "de-vps".into(), hostname: "sub.example".into(), port: 443, base_url: "https://sub.example".into(),
+            sub_dir: "/srv/sub".into(), nginx_group: "www-data".into(),
         });
         config
     }

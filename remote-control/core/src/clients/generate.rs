@@ -886,6 +886,7 @@ mod tests {
         Node {
             id: format!("{index:032x}"), name: name.into(), ip: format!("198.51.100.{index}"), port: 22, user: "root".into(),
             auth: Auth::Key, identity: Some("system".into()), secret_id: None, tag: Some(tag.into()), aliases: Default::default(),
+            ..Node::default()
         }
     }
 
@@ -894,7 +895,7 @@ mod tests {
             name: name.into(), group: group.into(), inherit_nodes_from_group: own.is_none(),
             nodes: own.map(|(node, _)| vec![node.into()]),
             connections: own.map(|(node, proxies)| vec![ClientConnection { node: node.into(), proxies: proxies.iter().map(|p| p.to_string()).collect() }]),
-            credentials: Some(ClientCredentials { vless_uuid: uuid.into(), hy2_password: password.into() }),
+            credentials: Some(ClientCredentials { vless_uuid: uuid.into(), hy2_password: password.into(), ..ClientCredentials::default() }),
             ..Client::default()
         }
     }

@@ -73,7 +73,7 @@ mod tests {
         Node {
             id: "0123456789abcdef0123456789abcdef".into(), name: "alpha".into(), ip: "203.0.113.7".into(),
             port: 2222, user: "root".into(), auth: Auth::Key, identity: None, secret_id: None, tag: None,
-            aliases: Default::default(),
+            aliases: Default::default(), ..Node::default()
         }
     }
 

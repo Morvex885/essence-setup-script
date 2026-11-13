@@ -200,6 +200,7 @@ impl Draft<'_> {
             key.store(state)?;
         }
         config.nodes.push(self.node.clone());
+        crate::server::keys::ensure_generated(state, &mut config)?;
         state.save_config(&config)?;
         if !issues.is_empty() {
             let mut manifest = state.load_manifest()?;
@@ -287,7 +288,7 @@ pub async fn add<T: RemoteTransport>(session: &mut Session, invocation: &Invocat
             id: id.clone(), name: name.to_owned(), ip: ip.to_owned(), port, user: user.to_owned(), auth,
             identity: (auth == Auth::Key).then(|| "system".to_owned()),
             secret_id: (auth == Auth::Password).then(|| format!("node:{id}:ssh-password")),
-            tag: Some(tag.to_owned()), aliases: Default::default(),
+            tag: Some(tag.to_owned()), aliases: Default::default(), ..Node::default()
         },
         password: password.filter(|_| auth == Auth::Password),
         github,
@@ -474,6 +475,7 @@ mod tests {
         assert_eq!(config.nodes, vec![Node {
             id: id.clone(), name: "de".into(), ip: IP.into(), port: 22, user: "root".into(), auth: Auth::Password,
             identity: None, secret_id: Some(format!("node:{id}:ssh-password")), tag: Some("DE".into()), aliases: Default::default(),
+            ..Node::default()
         }]);
         assert_eq!(session.state.secret_store().get(&format!("node:{id}:ssh-password")).unwrap().as_deref().map(String::as_str), Some("s3cret"));
         assert!(session.state.load_manifest().unwrap().portability.issues.is_empty());

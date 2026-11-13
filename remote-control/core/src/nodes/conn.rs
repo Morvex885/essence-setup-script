@@ -406,6 +406,7 @@ mod tests {
             secret_id: (auth == Auth::Password).then(|| format!("node:{id}:ssh-password")),
             id, name: name.into(), ip: format!("198.51.100.{index}"), port: 22, user: "root".into(), auth,
             identity: (auth == Auth::Key).then(|| "system".into()), tag: Some(String::new()), aliases: Default::default(),
+            ..Node::default()
         }
     }
 

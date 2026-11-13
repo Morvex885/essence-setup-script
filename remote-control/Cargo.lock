@@ -3370,6 +3370,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "windows-sys 0.61.2",
+ "x25519-dalek",
  "zeroize",
  "zip",
 ]

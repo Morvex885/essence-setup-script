@@ -117,6 +117,15 @@ fn version_gt(left: &str, right: &str) -> bool {
     }
 }
 
+/// A portable secret belongs to an existing node or profile.
+fn secret_owned(config: &Config, id: &str) -> bool {
+    match v::secret_owner(id) {
+        Some(v::SecretOwner::Node(node)) => config.nodes.iter().any(|candidate| candidate.id == node),
+        Some(v::SecretOwner::Profile(name)) => config.find_profile(name).is_some(),
+        None => false,
+    }
+}
+
 impl Snapshot {
     pub fn counts(&self) -> Value {
         json!({"nodes": self.config.nodes.len(), "clients": self.config.clients.len(), "groups": self.config.groups.len()})
@@ -129,7 +138,7 @@ impl Snapshot {
         check(v::version_valid(&self.minimum_remote_control_version))?;
         self.config.validate().map_err(|_| invalid_format())?;
         for (id, password) in &self.secrets.node_passwords {
-            check(v::secret_id_valid(id) && !password.is_empty() && !password.contains('\0'))?;
+            check(secret_owned(&self.config, id) && !password.is_empty() && !password.contains('\0'))?;
         }
         let issues = &self.portability.issues;
         check(Portability::from_issues(issues.clone()) == self.portability)?;
@@ -206,6 +215,9 @@ pub fn upgrade(mut raw: Value, migrate: bool) -> Result<Snapshot> {
         raw = step.and_then(|step| step(raw.clone())).ok_or_else(|| format_error("invalid", format!(
             "Не удалось преобразовать конфигурацию GitHub из формата v{version}."), Some(version), None))?;
         current += 1;
+    }
+    if let Some(config) = raw.get_mut("config") {
+        Config::upgrade_value(config);
     }
     let snapshot: Snapshot = serde_json::from_value(raw).map_err(|_| invalid_format())?;
     snapshot.validate()?;
@@ -289,6 +301,19 @@ pub fn serialize(state: &State) -> Result<Snapshot> {
             .and_then(|key| known_hosts.0.get(&key)).is_some_and(|fps| !fps.is_empty());
         if !pinned {
             issue(PortabilityReason::MissingHostKey);
+        }
+    }
+    // Every other machine secret of an existing node or profile travels too;
+    // an unreadable one (lost machine key) is left out like a missing password.
+    for id in store.ids()? {
+        if !secret_owned(&config, &id) || id.ends_with(":ssh-password") {
+            continue;
+        }
+        match store.get(&id) {
+            Ok(Some(secret)) => { passwords.insert(id, secret); }
+            Ok(None) => {}
+            Err(error) if error.code == "missing_secret" => {}
+            Err(error) => return Err(error),
         }
     }
     let mut templates = BTreeMap::new();
@@ -1135,6 +1160,50 @@ mod tests {
         let on_disk = fs::read_to_string(runtime.paths().secrets()).unwrap();
         assert!(!on_disk.contains("fixture-secret-xyz"), "runtime passwords stay machine-encrypted");
         assert_eq!(fs::read_to_string(runtime.paths().templates().join("default.yaml")).unwrap(), "proxies: []\n");
+    }
+
+    #[test]
+    fn every_node_and_profile_secret_travels_and_orphans_stay_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = State::new(StatePaths::new(dir.path().join("data")));
+        let id = "c".repeat(32);
+        let mut config = Config::default();
+        config.profiles.push(crate::model::test_profile("main"));
+        config.nodes.push(serde_json::from_value(json!({
+            "id": id, "name": "n1", "ip": "10.0.0.1", "port": 22, "user": "root", "auth": "key",
+            "identity": null, "secret_id": null, "profile": "main"
+        })).unwrap());
+        local.save_config(&config).unwrap();
+        let carried = ["reality-key", "awg-key", "warp-key", "telegram-secret", "telegram-tag"]
+            .map(|suffix| format!("node:{id}:{suffix}")).into_iter()
+            .chain(["profile:main:warp-license".to_owned()]).collect::<Vec<_>>();
+        let store = local.secret_store();
+        for secret in &carried {
+            store.set(secret, Zeroizing::new(format!("value of {secret}"))).unwrap();
+        }
+        store.set(&format!("node:{}:reality-key", "d".repeat(32)), Zeroizing::new("orphan".into())).unwrap();
+        store.set("profile:gone:warp-license", Zeroizing::new("orphan".into())).unwrap();
+        let snapshot = serialize(&local).unwrap();
+        assert_eq!(snapshot.secrets.node_passwords.keys().cloned().collect::<std::collections::BTreeSet<_>>(),
+            carried.iter().cloned().collect());
+
+        let worktree = dir.path().join("worktree");
+        fs::create_dir(&worktree).unwrap();
+        checkpoint(&worktree, Storage::Plain, None, &snapshot).unwrap();
+        assert!(exec::tree_git(&worktree, &["init".as_ref(), "-q".as_ref()]).unwrap().success);
+        let reread = upgrade(read_plain(&worktree).unwrap(), false).unwrap();
+        materialize(local.paths(), local.locks(), &reread).unwrap();
+        let runtime = State::with_locks(local.paths().runtime(), local.locks().clone());
+        for secret in &carried {
+            assert_eq!(runtime.secret_store().get(secret).unwrap().unwrap().as_str(), format!("value of {secret}"));
+        }
+
+        let mut orphaned = serialize(&local).unwrap();
+        orphaned.secrets.node_passwords.insert(format!("node:{}:awg-key", "e".repeat(32)), Zeroizing::new("x".into()));
+        assert!(orphaned.validate().is_err(), "a secret of an unknown node");
+        let mut orphaned = serialize(&local).unwrap();
+        orphaned.secrets.node_passwords.insert("profile:gone:warp-license".into(), Zeroizing::new("x".into()));
+        assert!(orphaned.validate().is_err(), "a license of an unknown profile");
     }
 
     #[test]
