@@ -1,8 +1,8 @@
 // Вкладка «AmneziaWG» карточки ноды (`#/nodes/<нода>/awg`) — перенос
 // `nodes.rs::awg_node`. Команды над нодой — `ctx.nodeRequest`.
 import { html, useEffect, useState } from '../../vendor/preact-htm.js';
-import { Card, DataTable, Badge, Empty } from '../ui.js';
-import { useBusy, useMounted, Action, Actions, ReadFailed } from './kit.js';
+import { Card, DataTable, Badge, Empty, Button } from '../ui.js';
+import { useBusy, useMounted, ReadFailed } from './kit.js';
 import {
   awgStatusArgv, awgSyncArgv, awgRemovePeerArgv, awgOrphansArgv, awgView, AWG_REMOVE_TITLE, AWG_ORPHANS_TITLE,
 } from './nodeops-model.js';
@@ -36,11 +36,11 @@ export function NodeAwg({ ctx, name }) {
     <//>`;
   }
   const view = awgView(reply.data);
-  const actions = html`<${Actions}>
-    ${view.installed && html`<${Action} primary=${view.missing} icon="plus" disabled=${busy} onClick=${sync}>Создать недостающих<//>`}
-    ${view.orphans && html`<${Action} tone="danger" icon="trash-2" disabled=${busy} onClick=${orphans}>Удалить неиспользуемых<//>`}
-    <${Action} icon="refresh-cw" disabled=${busy} onClick=${() => run(load)}>Обновить<//>
-  <//>`;
+  const actions = html`<div class="row">
+    ${view.installed && html`<${Button} kind=${view.missing ? 'primary' : 'neutral'} icon="plus" disabled=${busy} onClick=${sync}>Создать недостающих<//>`}
+    ${view.orphans && html`<${Button} kind="danger" icon="trash-2" disabled=${busy} onClick=${orphans}>Удалить неиспользуемых<//>`}
+    <${Button} icon="refresh-cw" disabled=${busy} onClick=${() => run(load)}>Обновить<//>
+  </div>`;
   if (!view.installed) {
     return html`<${Card} title="AmneziaWG" actions=${actions}>
       <${Empty} icon="shield" title="AmneziaWG на ноде не установлен" />

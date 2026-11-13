@@ -1,5 +1,10 @@
-// Модель экранов клиентов и групп — перенос подписей, строк контекста и argv
-// из `remote-control/tui/src/clients.rs`. Без DOM и вендоренных файлов.
+// Модель экранов клиентов, групп и генерации — перенос подписей, строк
+// контекста, argv и действий из `remote-control/tui/src/clients.rs`. Без DOM:
+// действия (`fetch`, `load`, `generate`, `headers`, добавление и перенос) —
+// формы и диалоги `ctx` (`app.js::makeContext`).
+import { asList, strings } from '../format.js';
+import { isFailure } from '../flows.js';
+import { DEFAULT_TEMPLATE, generateGroup, generateClient, generateScope } from './catalog-model.js';
 
 /** Пустое состояние мультивыбора (`clients.rs::EMPTY`). */
 export const EMPTY = 'Нет вариантов для выбора';
@@ -16,18 +21,9 @@ export function scalar(value) {
   return JSON.stringify(value);
 }
 
-export function rowsOf(value) {
-  return Array.isArray(value) ? value : [];
-}
-
-/** Строковые элементы массива (`clients.rs::strings`). */
-export function strings(value) {
-  return rowsOf(value).filter((item) => typeof item === 'string');
-}
-
 /** Имена строк (`clients.rs::names`). */
 export function names(value) {
-  return rowsOf(value).map((row) => row && row.name).filter((name) => typeof name === 'string');
+  return asList(value).map((row) => row && row.name).filter((name) => typeof name === 'string');
 }
 
 /** Через запятую или «нет» (`clients.rs::joined`). */
@@ -37,7 +33,7 @@ export function joined(value) {
 }
 
 export function findRow(data, name) {
-  return rowsOf(data).find((row) => row && row.name === name) || null;
+  return asList(data).find((row) => row && row.name === name) || null;
 }
 
 /** `name  ip:port` (`clients.rs::node_label`). */
@@ -46,6 +42,13 @@ export function nodeLabel(row) {
 }
 
 // ─── Клиенты ────────────────────────────────────────────────────────────────
+
+export const clientAddArgv = (values) => ['client', 'add', '--name', values.name, '--group', values.group];
+export const clientDeleteArgv = (name) => ['client', 'delete', '--name', name];
+export const clientSetGroupArgv = (name, group) => ['client', 'set-group', '--name', name, '--group', group];
+export const discoverArgv = (node) => ['conn', 'list', '--name', node, '--discover'];
+export const subscriptionRotateArgv = (name) => ['subscription', 'rotate', '--name', name];
+export const subscriptionRevokeArgv = (name) => ['subscription', 'revoke', '--name', name];
 
 export function deleteClientsArgv(selected) {
   const argv = ['client', 'delete'];
@@ -117,7 +120,7 @@ export function clientDataLines(data) {
     `Конфиг: ${str(config.path)} (${config.exists === true ? 'создан' : 'не создан'})`,
     `Подписка: ${link}`,
   ].map((text) => ({ text, tone: null }));
-  const connections = rowsOf(data.connections);
+  const connections = asList(data.connections);
   if (connections.length > 0) {
     lines.push({ text: 'Подключения по нодам:', tone: 'info' });
     for (const row of connections) {
@@ -149,7 +152,7 @@ export function inheritNodesArgv(name) {
 
 /** Прокси клиента на ноде из `client connections --name`. */
 export function assignedProxies(assigned, node) {
-  return rowsOf(assigned).filter((row) => row && row.node === node).flatMap((row) => strings(row.proxies));
+  return asList(assigned).filter((row) => row && row.node === node).flatMap((row) => strings(row.proxies));
 }
 
 /**
@@ -163,7 +166,7 @@ export function ownNodeRows(nodes, nodeList) {
 
 /** Найденные на ноде прокси из `conn list --discover`. */
 export function discoveredProxies(found) {
-  return strings(rowsOf(found)[0] && rowsOf(found)[0].discovered);
+  return strings(asList(found)[0] && asList(found)[0].discovered);
 }
 
 export function clientConnectionsArgv(name, node, proxies) {
@@ -247,7 +250,7 @@ export function shareModel(data) {
     url,
     qr: typeof data.url === 'string' ? data.url : null,
     expires,
-    headers: rowsOf(data.headers).map((row) => `${str(row.name)}: ${str(row.value)}`),
+    headers: asList(data.headers).map((row) => `${str(row.name)}: ${str(row.value)}`),
     curl: curlLine(url),
     json: JSON.stringify({ url }),
   };
@@ -267,14 +270,14 @@ export function headerLine(row, withSource) {
 }
 
 export function headerLines(data, withSource) {
-  const list = rowsOf(data);
+  const list = asList(data);
   if (list.length === 0) return ['Нет заголовков'];
   return list.map((row) => headerLine(row, withSource));
 }
 
 /** Удаляемые заголовки: клиент удаляет только свои. */
 export function removableHeaders(data, client) {
-  return rowsOf(data).filter((row) => !client || row.source === 'client').map((row) => str(row.name));
+  return asList(data).filter((row) => !client || row.source === 'client').map((row) => str(row.name));
 }
 
 export function headersArgv(kind, name, ...tail) {
@@ -322,4 +325,228 @@ export const NEW_TEMPLATE = '/new';
 export function templateChange(current, values) {
   if (values.template === NEW_TEMPLATE) return { kind: 'create', name: values.name };
   return values.template === current ? null : { kind: 'set', template: values.template };
+}
+
+export const groupDeleteArgv = (name) => ['group', 'delete', '--name', name];
+export const groupSetTemplateArgv = (name, template) => ['group', 'set-template', '--name', name, '--template', template];
+/** Новый шаблон группы — копия её текущего (`template create --group`). */
+export const groupTemplateCreateArgv = (template, group) => ['template', 'create', '--name', template, '--group', group];
+
+// ─── Действия поверх ctx ────────────────────────────────────────────────────
+
+/** Команда действия; неуспех — предупреждение (`clients.rs::execute`). */
+export async function execute(ctx, argv, options) {
+  const reply = await ctx.request(argv, options);
+  if (!reply.ok) ctx.failed();
+  return reply;
+}
+
+/** Опасное действие по плану; отказ от плана — не сбой (`clients.rs::confirmed_with`). */
+export async function confirmed(ctx, title, question, argv, options) {
+  const reply = await ctx.runConfirmed(title, question, argv, options);
+  if (isFailure(reply)) ctx.failed();
+  return reply;
+}
+
+/** Чтение внутри действия: `{ data }` или `null` после предупреждения (`fetch`). */
+export async function fetchData(ctx, argv) {
+  const reply = await execute(ctx, argv);
+  return reply.ok ? { data: reply.data } : null;
+}
+
+/**
+ * Чтение подменю (`clients.rs::load`): `not_found` — выход, прочие сбои —
+ * явный «Повторить». Возвращает `{ data }` или `null`.
+ */
+export async function loadData(ctx, title, argv) {
+  for (;;) {
+    const reply = await ctx.request(argv, { expect: 'not_found' });
+    if (reply.ok) return { data: reply.data };
+    if (reply.error && reply.error.code === 'not_found') return null;
+    ctx.failed();
+    const choice = await ctx.choose({
+      title, context: ['Данные недоступны'], options: [{ value: 'retry', label: 'Повторить' }], cancel: 'Назад',
+    });
+    if (choice !== 'retry') return null;
+  }
+}
+
+/** Варианты поля `select` из строк списка: подпись — `label(row)` или имя. */
+export function nameOptions(data, label = null) {
+  return asList(data)
+    .filter((row) => row && typeof row.name === 'string')
+    .map((row) => ({ value: row.name, label: label ? label(row) : row.name }));
+}
+
+/** Имя из ответа команды (`data.name`, ядро может его нормализовать) или `fallback`. */
+export function replyName(reply, fallback) {
+  return reply.ok && reply.data && typeof reply.data.name === 'string' && reply.data.name ? reply.data.name : fallback;
+}
+
+/**
+ * Добавление клиента: имя и группа одной формой → `client add`; успех —
+ * `go(имя)`: экран открывает карточку, только пока смонтирован.
+ */
+export async function addClientFlow(ctx, go) {
+  const read = await fetchData(ctx, ['group', 'list']);
+  if (!read) return;
+  const values = await ctx.form({
+    title: 'Добавить клиента',
+    submit: 'Добавить',
+    fields: [
+      { name: 'name', label: 'Имя клиента', type: 'text', required: 'Имя клиента не указано.', autofocus: true },
+      { name: 'group', label: 'Группа', type: 'select', options: nameOptions(read.data), required: true },
+    ],
+  });
+  if (values === null || values === undefined) return;
+  const reply = await execute(ctx, clientAddArgv(values));
+  if (reply.ok) go(replyName(reply, values.name));
+}
+
+/**
+ * Добавление группы: имя и шаблон одной формой → `group add`, затем
+ * `group set-template` для не встроенного шаблона (по имени из ответа: ядро
+ * нормализует имя группы).
+ */
+export async function addGroupFlow(ctx) {
+  const read = await fetchData(ctx, ['template', 'list']);
+  if (!read) return;
+  const values = await ctx.form({
+    title: 'Добавить группу',
+    submit: 'Добавить',
+    fields: [
+      { name: 'name', label: 'Название группы', type: 'text', required: 'Название не указано.', autofocus: true },
+      { name: 'template', label: 'Шаблон', type: 'select', value: DEFAULT_TEMPLATE, options: nameOptions(read.data) },
+    ],
+  });
+  if (values === null || values === undefined) return;
+  const reply = await execute(ctx, ['group', 'add', '--name', values.name]);
+  if (reply.ok && values.template !== DEFAULT_TEMPLATE) {
+    await execute(ctx, groupSetTemplateArgv(replyName(reply, values.name), values.template));
+  }
+}
+
+/**
+ * Шаблон группы (`clients.rs::group_template`): выбор шаблона или новый
+ * шаблон группы. Возвращает имя созданного шаблона (экран открывает его
+ * редактор) или `null`.
+ */
+export async function groupTemplateFlow(ctx, name, current) {
+  const read = await fetchData(ctx, ['template', 'list']);
+  if (!read) return null;
+  const values = await ctx.form({
+    title: `Шаблон группы: ${name}`,
+    fields: [
+      { name: 'template', label: 'Шаблон', type: 'select', value: current,
+        options: [...nameOptions(read.data), { value: NEW_TEMPLATE, label: 'Создать новый…' }] },
+      { name: 'name', label: 'Имя нового шаблона', type: 'text', required: 'Имя шаблона не указано.',
+        when: (v) => v.template === NEW_TEMPLATE },
+    ],
+  });
+  if (values === null || values === undefined) return null;
+  const plan = templateChange(current, values);
+  if (plan === null) return null;
+  if (plan.kind === 'set') {
+    await execute(ctx, groupSetTemplateArgv(name, plan.template));
+    return null;
+  }
+  const created = await execute(ctx, groupTemplateCreateArgv(plan.name, name));
+  return created.ok ? replyName(created, null) : null;
+}
+
+/** Перенос клиента группы `group` в другую из `groups` (`group list`) по плану. */
+export async function moveClientFlow(ctx, group, groups, client) {
+  const others = nameOptions(groups).filter((option) => option.value !== group);
+  if (others.length === 0) { ctx.notify('warn', EMPTY); return; }
+  const values = await ctx.form({
+    title: `Перенос клиента: ${client}`,
+    submit: 'Перенести',
+    fields: [{ name: 'group', label: 'Новая группа', type: 'select', options: others, required: true }],
+  });
+  if (values === null || values === undefined) return;
+  await confirmed(ctx, 'Смена группы клиента', 'Сменить группу?', clientSetGroupArgv(client, values.group));
+}
+
+/** Окно итога (`clients.rs::summary`): строки `summaryLines` контекстом окна. */
+export function showSummary(ctx, title, data, fields, empty) {
+  return ctx.show({ title, context: summaryLines(data, fields, empty) });
+}
+
+/**
+ * `generate …` (`clients.rs::generate`): итог при успехе и при `partial`
+ * (поля в `error`). `scope` — хвост argv: `['--all']`, `['--group', G]`, `['--client', C]`.
+ */
+export async function runGenerate(ctx, scope) {
+  const reply = await ctx.request(['generate', ...scope]);
+  const data = generateResult(reply);
+  if (data === null) { ctx.failed(); return; }
+  await showSummary(ctx, 'Итог генерации', data, GENERATE_FIELDS, 'Нет результатов');
+}
+
+const GENERATE_SCOPES = [
+  { value: 'all', label: 'Всем клиентам' },
+  { value: 'group', label: 'Группе' },
+  { value: 'client', label: 'Одному клиенту' },
+];
+
+/**
+ * Генерация конфигов (`clients.rs::generation`): `preset` — `{ group }` или
+ * `{ client }` — сразу без формы; иначе списки групп и клиентов читаются до
+ * формы «Кому» (сбой — `ctx.failed`).
+ */
+export async function generateFlow(ctx, preset = null) {
+  if (preset && typeof preset.group === 'string') { await runGenerate(ctx, generateGroup(preset.group)); return; }
+  if (preset && typeof preset.client === 'string') { await runGenerate(ctx, generateClient(preset.client)); return; }
+  const [groups, clients] = await Promise.all([ctx.request(['group', 'list']), ctx.request(['client', 'list'])]);
+  if (!groups.ok || !clients.ok) { ctx.failed(); return; }
+  const values = await ctx.form({
+    title: 'Генерация конфигов',
+    submit: 'Сгенерировать',
+    fields: [
+      { name: 'scope', label: 'Кому', type: 'radio', value: 'all', options: GENERATE_SCOPES },
+      { name: 'group', label: 'Группа', type: 'select', options: nameOptions(groups.data), required: true, when: (v) => v.scope === 'group' },
+      { name: 'client', label: 'Клиент', type: 'select', options: nameOptions(clients.data), required: true, when: (v) => v.scope === 'client' },
+    ],
+  });
+  if (values === null || values === undefined) return;
+  await runGenerate(ctx, generateScope(values));
+}
+
+/** Заголовки подписки клиента или группы (`clients.rs::headers`); `kind`: `client|group`. */
+export async function showHeaders(ctx, kind, name) {
+  const client = kind === 'client';
+  for (;;) {
+    const read = await loadData(ctx, 'Заголовки подписки', headersArgv(kind, name));
+    if (!read) return;
+    const choice = await ctx.choose({
+      title: `Заголовки подписки: ${name}`,
+      context: headerLines(read.data, client),
+      options: [{ value: 'set', label: 'Установить' }, { value: 'unset', label: 'Удалить', tone: 'danger' }],
+      cancel: 'Назад',
+    });
+    if (choice === null || choice === undefined) return;
+    if (choice === 'set') {
+      const values = await ctx.form({
+        title: 'Установить заголовок',
+        fields: [
+          { name: 'header', label: 'Имя заголовка', type: 'text', required: true, autofocus: true },
+          { name: 'value', label: 'Значение', type: 'text', required: true },
+        ],
+        submit: 'Установить',
+      });
+      if (values === null || values === undefined) continue;
+      await execute(ctx, headersArgv(kind, name, '--set', `${values.header}=${values.value}`));
+    } else {
+      const own = removableHeaders(read.data, client);
+      const target = await ctx.choose({ title: 'Удаление заголовка', options: own.map((item) => ({ value: item, label: item, tone: 'danger' })) });
+      if (target !== null && target !== undefined) await execute(ctx, headersArgv(kind, name, '--unset', target));
+    }
+  }
+}
+
+/** Итоговые заголовки клиента с источником (`clients.rs::resolved_headers`). */
+export async function resolvedHeaders(ctx, name) {
+  const read = await fetchData(ctx, ['subscription', 'headers', '--client', name]);
+  if (!read) return;
+  await ctx.show({ title: `Итоговые заголовки: ${name}`, lines: headerLines(read.data, true) });
 }

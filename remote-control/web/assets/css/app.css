@@ -200,9 +200,7 @@ a.link:hover, .cell-link:hover, .page-back:hover { text-decoration: underline; }
 .page-tabs .tab-active { color: var(--color-primary); }
 .toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: .5rem; }
 
-.stack { display: flex; flex-direction: column; gap: 1rem; min-width: 0; }
-/* У daisyUI есть одноимённый компонент «стопка карточек»: его правила для детей сняты. */
-.stack > * { width: auto; height: auto; opacity: 1; z-index: auto; grid-area: auto; }
+.vstack { display: flex; flex-direction: column; gap: 1rem; min-width: 0; }
 .row { display: flex; align-items: center; flex-wrap: wrap; gap: .5rem; }
 .row > .copy { display: contents; }
 

@@ -1,11 +1,14 @@
-// Действия редактора шаблонов (`screens/templates-flow.js`) с поддельным ctx.
+// Действия редактора шаблонов (`screens/templates-model.js`) с поддельным ctx:
+// argv, порядок вызовов и итоги, без текстов окон.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   settleDraft, saveTemplate, importTemplateFile, deleteLabel, deleteTemplate, editTemplateGroups, checkRunner,
   GROUPS_UNCHANGED, DRAFT_REPLACED,
-} from '../assets/js/screens/templates-flow.js';
-import { TEMPLATE_FILE_UNREADABLE, DEFAULT_GROUP_HINT } from '../assets/js/screens/catalog-model.js';
+} from '../assets/js/screens/templates-model.js';
+import { TEMPLATE_FILE_UNREADABLE, DEFAULT_GROUP_HINT, DEFAULT_TEMPLATE } from '../assets/js/screens/catalog-model.js';
+import { isFailure } from '../assets/js/flows.js';
+import { FILE_TOO_LARGE } from '../assets/js/format.js';
 
 const PLAN = { ok: false, error: { code: 'confirmation_required', message: '' } };
 
@@ -15,13 +18,13 @@ function fakeCtx({ replies = [], answers = [] } = {}) {
   const next = () => replies.shift();
   const ctx = {
     calls,
-    runConfirmed: async (title, question, argv, opts = {}) => { calls.push(['run', title, question, argv, opts.input]); return next(); },
+    runConfirmed: async (title, question, argv, opts = {}) => { calls.push(['run', argv, opts.input, title]); return next(); },
     request: async (argv) => { calls.push(['request', argv]); return next(); },
     confirm: async (props) => { calls.push(['confirm', props.question]); return answers.shift(); },
     form: async (props) => { calls.push(['form', props]); return answers.shift(); },
     notify: (level, text) => calls.push(['notify', level, text]),
     failed: () => calls.push(['failed']),
-    isFailure: (reply) => !reply.ok && !['confirmation_required', 'plan_changed'].includes(reply.error && reply.error.code),
+    isFailure,
   };
   return ctx;
 }
@@ -35,7 +38,7 @@ test('черновик после сохранения: сохранённый �
 test('сохранение: import с черновиком; отказ от плана — не сбой, ошибка — failed', async () => {
   const ok = fakeCtx({ replies: [{ ok: true, data: { name: 'm.yaml' } }] });
   assert.equal(await saveTemplate(ok, 'm.yaml', 'proxies:\n'), true);
-  assert.deepEqual(ok.calls, [['run', 'Сохранение шаблона', 'Сохранить шаблон?', ['template', 'import', '--name', 'm.yaml'], { file: 'proxies:\n' }]]);
+  assert.deepEqual(ok.calls.map((call) => call.slice(0, 3)), [['run', ['template', 'import', '--name', 'm.yaml'], { file: 'proxies:\n' }]]);
   const declined = fakeCtx({ replies: [PLAN] });
   assert.equal(await saveTemplate(declined, 'm.yaml', 'x'), false);
   assert.equal(declined.calls.some((call) => call[0] === 'failed'), false);
@@ -49,52 +52,53 @@ test('импорт: нечитаемый файл, вопрос о чернов�
   assert.equal(await importTemplateFile(unreadable, 'm.yaml', null, null, true), false);
   assert.deepEqual(unreadable.calls, [['notify', 'warn', TEMPLATE_FILE_UNREADABLE]]);
   const big = fakeCtx();
-  await importTemplateFile(big, 'm.yaml', null, 'Файл больше 1 МиБ.', false);
-  assert.deepEqual(big.calls, [['notify', 'warn', 'Файл больше 1 МиБ.']]);
+  await importTemplateFile(big, 'm.yaml', null, FILE_TOO_LARGE, false);
+  assert.deepEqual(big.calls, [['notify', 'warn', FILE_TOO_LARGE]]);
 
   const kept = fakeCtx({ answers: [false] });
   assert.equal(await importTemplateFile(kept, 'm.yaml', 'f', null, true), false);
-  assert.deepEqual(kept.calls, [['confirm', `${DRAFT_REPLACED} Продолжить?`]]);
+  assert.deepEqual(kept.calls.map((call) => call[0]), ['confirm'], 'отказ — без команды');
+  assert.ok(kept.calls[0][1].startsWith(DRAFT_REPLACED));
 
   const replaced = fakeCtx({ answers: [true], replies: [{ ok: true, data: {} }] });
   assert.equal(await importTemplateFile(replaced, 'm.yaml', 'f', null, true), true);
   assert.deepEqual(replaced.calls.map((call) => call[0]), ['confirm', 'run']);
-  assert.deepEqual(replaced.calls[1].slice(1), ['Импорт шаблона', 'Перезаписать шаблон?', ['template', 'import', '--name', 'm.yaml'], { file: 'f' }]);
+  assert.deepEqual(replaced.calls[1].slice(1, 3), [['template', 'import', '--name', 'm.yaml'], { file: 'f' }]);
 
   const clean = fakeCtx({ replies: [{ ok: true, data: {} }] });
   assert.equal(await importTemplateFile(clean, 'm.yaml', 'f', null, false), true);
   assert.deepEqual(clean.calls.map((call) => call[0]), ['run']);
 });
 
-test('удаление и сброс к встроенному: подпись и вопрос по виду', async () => {
+test('удаление и сброс к встроенному: одна команда, разные подписи по виду', async () => {
   const custom = { name: 'm.yaml', source: 'custom', overrides: false };
-  const override = { name: 'default.yaml', source: 'custom', overrides: true };
-  assert.equal(deleteLabel(custom), 'Удалить');
-  assert.equal(deleteLabel(override), 'Сбросить к встроенному');
+  const override = { name: DEFAULT_TEMPLATE, source: 'custom', overrides: true };
+  assert.notEqual(deleteLabel(custom), deleteLabel(override));
   const a = fakeCtx({ replies: [{ ok: true, data: {} }] });
   assert.equal(await deleteTemplate(a, custom), true);
-  assert.deepEqual(a.calls[0].slice(1, 4), ['Удаление шаблона', 'Удалить шаблон?', ['template', 'delete', '--name', 'm.yaml']]);
+  assert.deepEqual(a.calls[0][1], ['template', 'delete', '--name', 'm.yaml']);
   const b = fakeCtx({ replies: [PLAN] });
   assert.equal(await deleteTemplate(b, override), false);
-  assert.deepEqual(b.calls[0].slice(1, 4), ['Сброс шаблона', 'Сбросить шаблон к встроенному?', ['template', 'delete', '--name', 'default.yaml']]);
-  assert.equal(b.calls.length, 1);
+  assert.deepEqual(b.calls[0][1], ['template', 'delete', '--name', DEFAULT_TEMPLATE]);
+  assert.notEqual(a.calls[0][3], b.calls[0][3], 'сброс и удаление — разные окна плана');
+  assert.equal(b.calls.length, 1, 'отказ от плана — не сбой');
 });
 
 test('группы: пустой выбор сбрасывает все, без изменений — сообщение, у default.yaml свои группы закреплены', async () => {
-  const groups = { ok: true, data: [{ name: 'PC', template: 'm.yaml' }, { name: 'TV', template: 'default.yaml' }] };
+  const groups = { ok: true, data: [{ name: 'PC', template: 'm.yaml' }, { name: 'TV', template: DEFAULT_TEMPLATE }] };
   const reset = fakeCtx({ replies: [groups, { ok: true, data: { assigned: [], reset: ['PC'] } }], answers: [{ groups: [] }] });
   assert.equal(await editTemplateGroups(reset, 'm.yaml'), true);
-  const form = reset.calls[1][1];
-  assert.deepEqual(form.fields[0].value, ['PC']);
-  assert.deepEqual(form.context, ['Снятые группы вернутся к default.yaml.']);
-  assert.deepEqual(reset.calls[2][3], ['template', 'groups', '--name', 'm.yaml']);
+  assert.deepEqual(reset.calls[0], ['request', ['group', 'list']]);
+  assert.deepEqual(reset.calls[1][1].fields[0].value, ['PC']);
+  assert.deepEqual(reset.calls[2][1], ['template', 'groups', '--name', 'm.yaml']);
 
   const same = fakeCtx({ replies: [groups, { ok: true, data: { assigned: [], reset: [] } }], answers: [{ groups: ['PC'] }] });
   assert.equal(await editTemplateGroups(same, 'm.yaml'), false);
+  assert.deepEqual(same.calls[2][1], ['template', 'groups', '--name', 'm.yaml', '--group', 'PC']);
   assert.deepEqual(same.calls.at(-1), ['notify', 'info', GROUPS_UNCHANGED]);
 
   const fixed = fakeCtx({ replies: [groups], answers: [null] });
-  assert.equal(await editTemplateGroups(fixed, 'default.yaml'), false);
+  assert.equal(await editTemplateGroups(fixed, DEFAULT_TEMPLATE), false);
   const options = fixed.calls[1][1].fields[0].options;
   assert.deepEqual(options.map((o) => [o.value, Boolean(o.disabled), o.hint ?? null]), [['PC', false, null], ['TV', true, DEFAULT_GROUP_HINT]]);
   assert.equal(fixed.calls.length, 2, 'отмена формы — без команды');

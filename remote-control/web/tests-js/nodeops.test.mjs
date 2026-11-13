@@ -123,7 +123,7 @@ function assignCtx(steps, answers) {
     async form(props) { record.forms.push(props); return answers.shift(); },
     notify: (level, text) => record.notices.push(text),
     failed: () => record.notices.push('failed'),
-    isFailure: (reply) => !reply.ok,
+    isFailure,
   };
   return { ctx, record };
 }

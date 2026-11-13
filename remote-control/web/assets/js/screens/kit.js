@@ -1,6 +1,6 @@
 // Общие помощники экранов: чтение данных командой с повтором, занятость на
-// время действия, кнопки действий, строки контекста. Экран получает `ctx`
-// (см. `app.js::makeContext`).
+// время действия, строки контекста, «Загрузка…» и «Не удалось получить
+// данные». Экран получает `ctx` (см. `app.js::makeContext`).
 import { html, useEffect, useState, useRef } from '../../vendor/preact-htm.js';
 import { Button, Card, Page } from '../ui.js';
 
@@ -82,17 +82,6 @@ export function useMounted() {
   return mounted;
 }
 
-/** Кнопка действия: `primary` — главная; `tone: 'danger'` — опасная, иначе обычная. */
-export function Action({ tone = null, primary = false, icon = null, disabled = false, onClick, children }) {
-  const kind = primary ? 'primary' : tone === 'danger' ? 'danger' : 'neutral';
-  return html`<${Button} kind=${kind} icon=${icon} disabled=${disabled} onClick=${onClick}>${children}<//>`;
-}
-
-/** Ряд кнопок. */
-export function Actions({ children }) {
-  return html`<div class="row">${children}</div>`;
-}
-
 /** Строки контекста; `{ text, tone }` или строка. `tone`: `ok|warn|error|dim|info`. */
 export function Context({ lines }) {
   const items = (lines || []).filter((line) => line !== null && line !== undefined && line !== false);
@@ -109,7 +98,7 @@ export function ReadFailed({ reply, loading = false, reload }) {
   return html`<div class="read-failed">
     <p class="t-warn">Не удалось получить данные</p>
     ${reply && reply.error && reply.error.message && html`<p>${reply.error.message}</p>`}
-    <${Actions}><${Action} icon="refresh-cw" disabled=${loading} onClick=${() => reload()}>Повторить чтение<//><//>
+    <div class="row"><${Button} icon="refresh-cw" disabled=${loading} onClick=${() => reload()}>Повторить чтение<//></div>
   </div>`;
 }
 
@@ -127,9 +116,4 @@ export function Loaded({ title = null, back = null, state, actions = null, inlin
     : html`<${ReadFailed} reply=${failed} loading=${state.loading} reload=${state.reload} />`;
   if (inline) return html`<${Card} title=${title}>${body}<//>`;
   return html`<${Page} title=${title} back=${back} actions=${actions}><${Card}>${body}<//><//>`;
-}
-
-/** Строки массива ответа (`rows` в TUI): не массив → пустой список. */
-export function rows(value) {
-  return Array.isArray(value) ? value : [];
 }

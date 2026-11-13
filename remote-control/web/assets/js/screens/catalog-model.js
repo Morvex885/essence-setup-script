@@ -2,9 +2,8 @@
 // подписей, строк контекста и argv из `tui/src/clients.rs` (`templates`,
 // `template_card`, `check_view`, `template_groups`, `generation`,
 // `subscriptions`, `subscription_list`, `summary`). Без DOM и вендоренных модулей.
-import { text } from '../format.js';
+import { text, asList } from '../format.js';
 
-const rowsOf = (value) => (Array.isArray(value) ? value : []);
 const count = (value) => (Number.isInteger(value) && value >= 0 ? value : 0);
 
 // ─── Шаблоны ────────────────────────────────────────────────────────────────
@@ -35,7 +34,7 @@ export function templateGroups(name, groups) {
 
 /** Строка шаблона `name` из `template list` или `null`. */
 export function findTemplate(data, name) {
-  return rowsOf(data).find((row) => row && row.name === name) || null;
+  return asList(data).find((row) => row && row.name === name) || null;
 }
 
 /** Вид шаблона: `builtin`, `custom` или `override` (пользовательский поверх встроенного). */
@@ -66,7 +65,7 @@ export const DEFAULT_GROUP_HINT = '— назначьте группе друг�
  * не изменила.
  */
 export function groupOptions(groupList, name) {
-  const groups = rowsOf(groupList).filter((row) => row && typeof row.name === 'string');
+  const groups = asList(groupList).filter((row) => row && typeof row.name === 'string');
   const fixed = name === DEFAULT_TEMPLATE;
   return {
     options: groups.map((row) => {
@@ -96,7 +95,7 @@ export function inVariant(problem, variant) {
 
 /** Отметки Ace (строки и столбцы с нуля) для выбранного варианта. */
 export function annotations(problems, variant) {
-  return rowsOf(problems).filter((problem) => problem && inVariant(problem, variant)).map((problem) => ({
+  return asList(problems).filter((problem) => problem && inVariant(problem, variant)).map((problem) => ({
     row: Math.max(0, count(problem.line) - 1),
     column: Math.max(0, count(problem.column) - 1),
     text: text(problem.message),
@@ -107,14 +106,14 @@ export function annotations(problems, variant) {
 /** Строки `[от, до]` (с единицы), выпадающие из варианта: `NO_GROUP` — вариант `tag: null`. */
 export function droppedRanges(variants, tag) {
   const wanted = tag === NO_GROUP || tag === null || tag === undefined ? null : tag;
-  const variant = rowsOf(variants).find((item) => item && (item.tag ?? null) === wanted);
-  return variant ? rowsOf(variant.dropped).filter((range) => Array.isArray(range) && range.length === 2) : [];
+  const variant = asList(variants).find((item) => item && (item.tag ?? null) === wanted);
+  return variant ? asList(variant.dropped).filter((range) => Array.isArray(range) && range.length === 2) : [];
 }
 
 /** Варианты для выбора: «без группы» и теги отчёта. */
 export function variantOptions(variants) {
   const options = [{ value: NO_GROUP, label: 'Без группы' }];
-  for (const item of rowsOf(variants)) {
+  for (const item of asList(variants)) {
     if (item && typeof item.tag === 'string' && item.tag !== '') options.push({ value: item.tag, label: item.tag });
   }
   return options;

@@ -5,10 +5,11 @@
 // результатов. «Управление нодой» — `telegram menu` в терминальном оверлее.
 import { html, useState } from '../../vendor/preact-htm.js';
 import { Page, Card, DataTable, Badge, Empty, MoreMenu, Button } from '../ui.js';
-import { interactive, nodeLabel } from './nodes.js';
+import { asList } from '../format.js';
+import { interactive, nodeLabel } from './nodes-model.js';
 import { useBusy, useMounted } from './kit.js';
 import {
-  EMPTY, rows, nodeText, telegramArgv, telegramResults,
+  EMPTY, nodeText, telegramArgv, telegramResults,
   TELEGRAM_TITLE, TELEGRAM_RESULT_TITLE, TELEGRAM_SELECT_TITLE, TELEGRAM_STATUS_ARGV, TELEGRAM_COMPONENTS, TELEGRAM_BATCH,
 } from './nodeops-model.js';
 
@@ -29,7 +30,7 @@ async function listNodes(ctx) {
     if (ctx.isFailure(listed)) ctx.failed();
     return null;
   }
-  const nodes = rows(listed.data).map((row) => ({ value: nodeText(row.name), label: nodeLabel(row) }));
+  const nodes = asList(listed.data).map((row) => ({ value: nodeText(row.name), label: nodeLabel(row) }));
   if (nodes.length === 0) {
     ctx.notify('warn', EMPTY);
     return null;

@@ -1,7 +1,10 @@
-// Тесты theme.js: выбор, тема документа, слежение за системой.
+// Тесты theme.js: выбор, тема документа, слежение за системой; theme-boot.js
+// (классический скрипт до отрисовки) даёт ту же тему, что readChoice + resolve.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { THEME_KEY, readChoice, storeChoice, resolve, apply, watch } from '../assets/js/theme.js';
+import { readFileSync } from 'node:fs';
+import vm from 'node:vm';
+import { THEME_KEY, THEME_OPTIONS, readChoice, storeChoice, resolve, apply, watch } from '../assets/js/theme.js';
 
 const store = (initial = {}) => {
   const data = new Map(Object.entries(initial));
@@ -44,4 +47,25 @@ test('watch: применяет тему и следит за системной
   assert.equal(listeners.size, 0);
   apply(doc, 'essence-light');
   assert.equal(doc.documentElement.dataset.theme, 'essence-light');
+});
+
+/** Тема из `theme-boot.js` в `node:vm` с поддельными окном, хранилищем и matchMedia. */
+function bootTheme(storage, prefersDark, withMatchMedia = true) {
+  const attributes = {};
+  const window = { localStorage: storage };
+  if (withMatchMedia) window.matchMedia = (query) => ({ matches: query === '(prefers-color-scheme: dark)' && prefersDark });
+  const document = { documentElement: { setAttribute: (name, value) => { attributes[name] = value; } } };
+  vm.runInNewContext(readFileSync(new URL('../assets/js/theme-boot.js', import.meta.url), 'utf8'), { window, document });
+  return attributes['data-theme'];
+}
+
+test('theme-boot.js совпадает с readChoice + resolve', () => {
+  const broken = { getItem: () => { throw new Error('denied'); } };
+  const stores = [store(), store({ [THEME_KEY]: 'neon' }), broken, ...THEME_OPTIONS.map((option) => store({ [THEME_KEY]: option.value }))];
+  for (const storage of stores) {
+    for (const dark of [false, true]) {
+      assert.equal(bootTheme(storage, dark), resolve(readChoice(storage), dark), `${readChoice(storage)}, dark=${dark}`);
+    }
+    assert.equal(bootTheme(storage, true, false), resolve(readChoice(storage), false), 'без matchMedia — светлая система');
+  }
 });

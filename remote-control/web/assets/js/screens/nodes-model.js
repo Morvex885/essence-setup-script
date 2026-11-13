@@ -2,6 +2,8 @@
 // (`node_label`, `card_view`, `delete_node`, `add_node_with`, `harden`,
 // `aliases`, `offer_upload`, `interactive`): подписи, состояния, argv команд
 // и потоки добавления и изменения ноды поверх `ctx` (`app.js::makeContext`).
+import { handleNodeCodes, reviewReply, setFlag, decisionFlag } from '../flows.js';
+import { asList, errorMessage } from '../format.js';
 
 /** Строковое значение поля (`nodes.rs::text`): `null`/`undefined` → ''. */
 export function plain(value) {
@@ -10,13 +12,9 @@ export function plain(value) {
   return typeof value === 'object' ? JSON.stringify(value) : String(value);
 }
 
-function list(value) {
-  return Array.isArray(value) ? value : [];
-}
-
 /** Список через запятую (`nodes.rs::joined`); пустой → ''. */
 export function joinedPlain(value) {
-  return list(value).map(plain).join(', ');
+  return asList(value).map(plain).join(', ');
 }
 
 /** «имя  ip:порт» (`nodes.rs::node_label`). */
@@ -69,7 +67,7 @@ export function uploadOffer(name, state) {
 
 /** Варианты удаления из `node show .delete_options[]` (`nodes.rs::delete_node`). */
 export function deleteOptions(node) {
-  return list(node.delete_options).map((option, index) => ({ value: index, label: plain(option.label) }));
+  return asList(node.delete_options).map((option, index) => ({ value: index, label: plain(option.label) }));
 }
 
 /** argv удаления в выбранном объёме; `--revoke-key` — только при `revoke_key: true`. */
@@ -171,7 +169,7 @@ export async function addNode(ctx, base, password) {
     switch (errorCode(reply)) {
       case 'host_key_changed': {
         if (defer) { outcome(ctx, reply); return { status: 'failed' }; }
-        const fingerprint = list(reply.error.fingerprints)[0];
+        const fingerprint = asList(reply.error.fingerprints)[0];
         if (typeof fingerprint !== 'string') { ctx.failed(); return { status: 'failed' }; }
         hostKey = ['--replace-host-key', fingerprint];
         break;
@@ -285,7 +283,7 @@ export async function editNode(ctx, node) {
  * `aliasArgv`: без изменений → `''`, очищенный → `-`, иначе новое значение.
  */
 export function aliasValues(entries, form) {
-  return list(entries).map((entry, index) => {
+  return asList(entries).map((entry, index) => {
     const current = plain(entry.alias);
     const value = plain(form && form[`a${index}`]);
     if (value === current) return '';
@@ -301,7 +299,7 @@ export function aliasValues(entries, form) {
 export function aliasArgv(name, entries, values) {
   const sets = [];
   const unsets = [];
-  list(entries).forEach((entry, index) => {
+  asList(entries).forEach((entry, index) => {
     const proxy = plain(entry.proxy);
     const current = plain(entry.alias);
     const value = values[index] || '';
@@ -313,4 +311,171 @@ export function aliasArgv(name, entries, values) {
   });
   if (sets.length === 0 && unsets.length === 0) return null;
   return ['node', 'aliases', '--name', name, ...sets, ...unsets];
+}
+
+// ─── Действия над нодой ──────────────────────────────────────────────────────
+
+/** Зависимости `flows.js` из контекста экрана. */
+function deps(ctx) {
+  return { request: (words, options) => ctx.request(words, options), confirm: ctx.confirm, askSecret: ctx.askSecret, notify: ctx.notify };
+}
+
+/**
+ * `node shell` / `telegram menu` в оверлее терминала (`nodes.rs::interactive`).
+ * Состояния ноды разрешаются и команда повторяется; устаревшие скрипты —
+ * предложение загрузки; `conflict` — терминал этой ноды уже открыт.
+ */
+export async function interactive(ctx, name, telegram) {
+  const argv = interactiveArgv(name, telegram);
+  const title = telegram ? `Telegram Proxy: ${name}` : `Меню сервера: ${name}`;
+  for (;;) {
+    const reply = await ctx.terminal(argv, title, { expect: ['conflict', 'invalid'] });
+    if (reply.ok) return;
+    if (await handleNodeCodes(reply, name, deps(ctx))) continue;
+    if (errorCode(reply) === 'conflict') {
+      ctx.notify('warn', 'Терминал этой ноды уже открыт');
+      return;
+    }
+    if (errorCode(reply) === 'invalid') {
+      if (typeof reply.error.state === 'string') {
+        await offerUpload(ctx, name, reply.error.state);
+        return;
+      }
+      ctx.notify('error', errorMessage(reply));
+    }
+    outcome(ctx, reply);
+    return;
+  }
+}
+
+/** Явная загрузка скриптов (`nodes.rs::offer_upload`); меню заново не открывается. */
+async function offerUpload(ctx, name, state) {
+  const offer = uploadOffer(name, state);
+  const choice = await ctx.choose({
+    title: offer.title,
+    context: [offer.condition],
+    options: [{ value: 'u', label: offer.label }],
+    cancel: 'Назад',
+  });
+  if (choice !== 'u') return;
+  const reply = await ctx.nodeRequest(name, offer.argv, { title: 'Загрузка скриптов', question: 'Загрузить скрипты?' });
+  if (reply.ok) ctx.notify('success', 'Скрипты загружены. Откройте меню снова.');
+}
+
+/** `node setup-ssh` под планом (`nodes.rs::setup_ssh`). */
+export async function setupSsh(ctx) {
+  const words = ['node', 'setup-ssh'];
+  for (;;) {
+    const reply = await ctx.runConfirmed('Завершение SSH-настройки', 'Выполнить?', words);
+    if (reply.ok) {
+      if (reply.data && reply.data.ready === true) {
+        ctx.notify('success', 'SSH-настройка завершена.');
+      } else {
+        for (const node of asList(reply.data && reply.data.deferred)) {
+          ctx.notify('warn', `Отложено: ${plain(node.name)} — ${plain(node.issue)}`);
+        }
+      }
+      return;
+    }
+    switch (errorCode(reply)) {
+      case 'key_provisioning_required': {
+        const provision = await ctx.confirm({
+          title: 'Переносимый SSH-ключ',
+          context: [`Ноды: ${joinedPlain(reply.error.nodes)}`],
+          question: 'Создать переносимый SSH-ключ для этих нод?',
+        });
+        setFlag(words, decisionFlag(errorCode(reply)), provision ? 'yes' : 'no');
+        break;
+      }
+      case 'onboarding_failed': {
+        const choice = await ctx.choose({
+          title: 'Не удалось настроить переносимый SSH-ключ',
+          options: [
+            { value: 'retry', label: 'Повторить' },
+            { value: 'defer', label: 'Отложить проблемные ноды' },
+          ],
+        });
+        if (choice === null) return;
+        if (choice === 'defer') setFlag(words, '--on-failure', 'defer');
+        break;
+      }
+      // Сообщение ядра уже показано; сбоя нет.
+      case 'nothing_pending':
+        return;
+      default:
+        outcome(ctx, reply);
+        return;
+    }
+  }
+}
+
+/** Объём удаления из `delete_options`; `true`, если ноды больше нет (`nodes.rs::delete_node`). */
+export async function deleteNode(ctx, name, node) {
+  const options = deleteOptions(node);
+  if (options.length === 0) {
+    ctx.notify('warn', 'Нет доступных вариантов удаления.');
+    return false;
+  }
+  const values = await ctx.form({
+    title: `Удаление ноды: ${name}`,
+    fields: [{ name: 'scope', label: 'Объём удаления', type: 'radio', options, required: true }],
+    submit: 'Далее',
+    tone: 'danger',
+  });
+  if (values === null) return false;
+  const argv = deleteArgv(name, node.delete_options[values.scope]);
+  const reply = await ctx.nodeRequest(name, argv, { title: 'Удаление ноды', question: 'Удалить ноду в выбранном объёме?' });
+  return reply.ok || (reply.error && reply.error.deleted === true);
+}
+
+/** Удаление из списка: варианты удаления есть только в `node show`. */
+export async function deleteListed(ctx, name) {
+  const shown = await ctx.request(['node', 'show', '--name', name]);
+  if (!shown.ok) return false;
+  return deleteNode(ctx, name, shown.data);
+}
+
+/** Сохранение пароля SSH: значение — только в `secrets` запроса. */
+export async function setNodePassword(ctx, name) {
+  const values = await ctx.form({
+    title: `Пароль SSH: ${name}`,
+    fields: [{ name: 'password', label: 'Пароль SSH', type: 'secret', required: true }],
+  });
+  if (values === null) return;
+  outcome(ctx, await ctx.request(['node', 'password', '--name', name], { secrets: { password: values.password } }));
+}
+
+/** Порт задаётся явно или подбирается ядром; план подтверждается (`nodes.rs::harden`). */
+export async function harden(ctx, name) {
+  const title = 'Усиление защиты SSH';
+  const ask = async () => {
+    const values = await ctx.form({
+      title,
+      fields: [{ name: 'port', label: 'SSH-порт (пусто — подобрать свободный)', type: 'text' }],
+      submit: 'Далее',
+    });
+    return values === null ? null : values.port;
+  };
+  const port = await ask();
+  if (port === null) return;
+  let words = hardenArgv(name, port);
+  for (;;) {
+    let reply = await ctx.request(words);
+    if (hardenAsksPort(words, reply)) {
+      const again = await ask();
+      if (again === null) return;
+      words = hardenArgv(name, again);
+      continue;
+    }
+    reply = await reviewReply(title, 'Усилить защиту SSH?', words, reply, deps(ctx), 2);
+    if (reply.ok) return;
+    if (errorCode(reply) === 'hardening_failed') {
+      if (reply.error.console_required === true) ctx.notify('warn', 'Проверьте доступ через консоль провайдера.');
+      ctx.failed();
+      return;
+    }
+    if (await handleNodeCodes(reply, name, deps(ctx))) continue;
+    outcome(ctx, reply);
+    return;
+  }
 }

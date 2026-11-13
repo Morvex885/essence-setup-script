@@ -4,17 +4,22 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { runConfirmed } from '../assets/js/flows.js';
+import { joined } from '../assets/js/format.js';
 import {
   dashboardTitle, attentionItems, updateAvailable, settingsAction, uninstallArgv, daemonLines,
   sourceView, sourceAction, importRecoveryKey, recoveryRun, githubWizardFlow, wizardAccounts,
   storageLabel, existingLabel, targetReplaceContext, passwordForm, CANCELLED, FILE_UNREADABLE, PASSWORDS_DIFFER, PASSWORD_EMPTY,
+  OTHER_LOGIN,
 } from '../assets/js/screens/system-model.js';
 
 const ok = (data = null) => ({ ok: true, data });
 const error = (code, extra = {}) => ({ ok: false, error: { code, message: '', ...extra } });
-const plan = (token) => error('confirmation_required', { plan: ['План: X'], plan_token: token });
+const plan = (token) => error('confirmation_required', { plan: ['plan: X'], plan_token: token });
 const yes = (argv, token) => [...argv, '--yes', '--plan-token', token];
-const FAILED = 'Операция завершилась ошибкой';
+/** Отметка `ctx.failed()` в уведомлениях поддельного ctx. */
+const FAILED = Symbol('failed');
+/** Ссылки для ручных действий (`deps.link`): только адреса. */
+const linkSink = (links) => ({ link: (label, url) => links.push(url) });
 
 /**
  * Поддельный `ctx`: `steps` — `[argv, reply]` по порядку, `answers` — ответы
@@ -76,7 +81,7 @@ test('сводка: заголовок — версия из status, без не
 test('сводка: «Требует внимания» из status и hello', () => {
   const items = attentionItems(statusData, { listener: { loopback: false } });
   assert.deepEqual(items.map((item) => item.id), ['password:ru', 'ssh-setup', 'subscription-host', 'sync', 'update', 'open-panel']);
-  assert.deepEqual(items[0].action, { label: 'Задать пароль', type: 'password', node: 'ru' });
+  assert.deepEqual({ type: items[0].action.type, node: items[0].action.node }, { type: 'password', node: 'ru' });
   assert.equal(items[1].action.type, 'ssh-setup');
   assert.deepEqual(items.slice(2).map((item) => item.action.route), ['subscriptions', 'source', 'settings', 'settings']);
   assert.equal(items.find((item) => item.id === 'sync').tone, 'warn');
@@ -156,11 +161,9 @@ test('настройки: блок «Демон» из daemon status, отсут
     version: '2.0.0', clients: [{ origin: 'local', since_s: 3 }, { origin: 'web', since_s: 1 }], terminals: ['de', 'nl'],
     web: { enabled: true, url: 'https://10.0.0.1:8377', fingerprint: 'SHA256:ab' },
   });
-  assert.deepEqual(full.map((l) => `${l.label}: ${l.value}`), [
-    'Версия: v2.0.0', 'Клиенты: 2', 'Открытые терминалы: de, nl', 'Адрес панели: https://10.0.0.1:8377', 'Отпечаток сертификата: SHA256:ab',
-  ]);
+  assert.deepEqual(full.map((l) => l.value), ['v2.0.0', '2', 'de, nl', 'https://10.0.0.1:8377', 'SHA256:ab']);
   const bare = daemonLines({ version: '2.0.0', clients: [], terminals: [], web: null });
-  assert.deepEqual(bare.map((l) => l.value), ['v2.0.0', '0', 'нет', '—', '—']);
+  assert.deepEqual(bare.map((l) => l.value), ['v2.0.0', '0', joined([]), '—', '—']);
   assert.deepEqual(daemonLines({}).map((l) => l.value), ['—', '—', '—', '—', '—']);
   assert.deepEqual(daemonLines(null).map((l) => l.value), ['—', '—', '—', '—', '—']);
 });
@@ -240,13 +243,13 @@ test('источник: замена спрашивает о ключе, уда�
     [remove, plan('T2')],
     [remove, plan('T2')], [yes(remove, 'T2'), error('remote_failed', { settings_url: 'https://github.com/o/r/settings' })],
   ], [true, true, false, true]);
-  const deps = { link: (label, url) => links.push(`${label}: ${url}`) };
+  const deps = linkSink(links);
   await sourceAction(s.ctx, 'l', sourceData('age'), deps);
   await sourceAction(s.ctx, 'd', sourceData('age'), deps);
   await sourceAction(s.ctx, 'd', sourceData('age'), deps);
   s.finished();
-  assert.ok(s.record.dialogs.some((d) => Array.isArray(d.context) && d.context.includes('Ноды: de, nl')));
-  assert.deepEqual(links, ['Удалите репозиторий вручную: https://github.com/o/r/settings']);
+  assert.ok(s.record.dialogs.some((d) => Array.isArray(d.context) && d.context.some((line) => line.includes('de, nl'))));
+  assert.deepEqual(links, ['https://github.com/o/r/settings']);
   assert.deepEqual(s.record.notices.filter((n) => n === FAILED).length, 1);
 });
 
@@ -290,17 +293,14 @@ test('мастер: подписи выбора', () => {
   assert.deepEqual(wizardAccounts({ accounts: ['a', 'glob'], global_login: 'glob' }), ['a', 'glob']);
   assert.deepEqual(wizardAccounts({ accounts: ['test-owner'], global_login: 'glob' }), ['test-owner', 'glob']);
   assert.deepEqual(wizardAccounts({ accounts: [], global_login: '' }), []);
-  assert.equal(storageLabel('age'), 'Зашифровать паролем (age)');
-  assert.equal(storageLabel('none'), 'Без шифрования');
-  assert.equal(existingLabel('remote', { remote_counts: { nodes: 2, clients: 1, groups: 3 } }), 'Использовать конфигурацию из GitHub (ноды 2, клиенты 1)');
-  assert.equal(existingLabel('remote', {}), 'Использовать конфигурацию из GitHub (состав неизвестен)');
-  assert.equal(existingLabel('local'), 'Заменить её конфигурацией с этого устройства');
-  assert.equal(existingLabel('migrate'), 'Преобразовать конфигурацию из GitHub');
-  const lines = targetReplaceContext({ repo: 'o/c', tracked_files: 6, reason: 'путь ssh/known_hosts' });
-  assert.deepEqual(lines, [
-    'Репозиторий o/c не содержит конфигурации Remote Control 2.', 'Причина: путь ssh/known_hosts',
-    'Файлов в репозитории: 6; после замены они останутся только в истории Git.',
-  ]);
+  const labels = [storageLabel('age'), storageLabel('none'), existingLabel('remote', {}), existingLabel('local'), existingLabel('migrate')];
+  assert.equal(new Set(labels).size, labels.length, 'подписи вариантов различаются');
+  const counted = existingLabel('remote', { remote_counts: { nodes: 2, clients: 1, groups: 3 } });
+  assert.notEqual(counted, existingLabel('remote', {}));
+  assert.ok(counted.includes('2') && counted.includes('1'), 'число нод и клиентов');
+  const lines = targetReplaceContext({ repo: 'o/c', tracked_files: 6, reason: 'path ssh/known_hosts' });
+  assert.equal(lines.length, 3);
+  for (const part of ['o/c', 'path ssh/known_hosts', '6']) assert.ok(lines.join('\n').includes(part), part);
 });
 
 test('мастер подключения: каждый код решения → флаг или секрет', async () => {
@@ -319,10 +319,10 @@ test('мастер подключения: каждый код решения �
   ], [0, true, true, 0, { password: 'vp', repeat: 'vp' }, false, true]);
   assert.equal(await githubWizardFlow(s.ctx, 'connect'), true);
   s.finished();
-  assert.deepEqual(s.record.operations, ['Вход в GitHub'], 'код устройства — в окне операции');
+  assert.equal(s.record.operations.length, 1, 'код устройства — в окне операции');
   const chooser = s.record.dialogs[0];
-  assert.deepEqual(chooser.options.map((o) => o.label), ['test-owner', 'glob', 'Указать другой логин']);
-  assert.equal(s.record.dialogs.find((d) => d.title === 'Создание репозитория').question, 'Создать приватный репозиторий test-owner/essence-config?');
+  assert.deepEqual(chooser.options.map((o) => o.label), ['test-owner', 'glob', OTHER_LOGIN]);
+  assert.ok(s.record.dialogs.some((d) => d.kind === 'confirm' && String(d.question).includes('test-owner/essence-config')));
   assert.deepEqual(s.record.secretNames[6], ['new-vault-password']);
   assert.deepEqual(s.record.secretNames[8], ['new-vault-password']);
   assert.ok(!JSON.stringify(s.record.calls).includes('vp'));
@@ -339,8 +339,9 @@ test('мастер подключения: пароль хранилища, вы
   ], [2, 'other-owner', 'vp', true, 1, true]);
   assert.equal(await githubWizardFlow(s.ctx, 'connect'), true);
   s.finished();
-  const chooser = s.record.dialogs.find((d) => d.title === 'Конфигурация в GitHub');
-  assert.equal(chooser.options[0].label, 'Использовать конфигурацию из GitHub (ноды 2, клиенты 1)');
+  const chooser = s.record.dialogs[4];
+  assert.deepEqual(chooser.options.map((o) => o.label),
+    [existingLabel('remote', { remote_counts: { nodes: 2, clients: 1, groups: 3 } }), existingLabel('local')]);
   assert.deepEqual(s.record.secretNames[4], ['vault-password']);
 });
 
@@ -362,7 +363,7 @@ test('мастер: варианты хранения — из ответа', as
   const s = scripted([accounts(), [base, error('storage_mode_required', { choices: ['none'] })], [[...base, '--storage', 'none'], ok()]], [0, 0]);
   assert.equal(await githubWizardFlow(s.ctx, 'connect'), true);
   s.finished();
-  assert.deepEqual(s.record.dialogs[1].options.map((o) => o.label), ['Без шифрования']);
+  assert.deepEqual(s.record.dialogs[1].options.map((o) => o.label), [storageLabel('none')]);
 });
 
 test('мастер смены аккаунта: кэш, чужой репозиторий, приватность, ссылка прежнего', async () => {
@@ -376,9 +377,9 @@ test('мастер смены аккаунта: кэш, чужой репози�
     [target, error('repo_private_required', { repo: 'glob/essence-config' })], [priv, plan('T1')],
     [yes(priv, 'T1'), ok({ repo: 'glob/essence-config', sync: 'clean', old_repo_settings_url: 'https://github.com/test-owner/essence-config/settings' })],
   ], [1, true, true, true]);
-  assert.equal(await githubWizardFlow(s.ctx, 'change', { link: (label, url) => links.push(`${label}: ${url}`) }), true);
+  assert.equal(await githubWizardFlow(s.ctx, 'change', linkSink(links)), true);
   s.finished();
-  assert.deepEqual(links, ['Прежний репозиторий можно удалить вручную: https://github.com/test-owner/essence-config/settings']);
+  assert.deepEqual(links, ['https://github.com/test-owner/essence-config/settings']);
   // Смена аккаунта не предлагает запомнить ключ.
   s = scripted([accounts(), [base, error('vault_password_required')], [base, ok()]], [1, 'vp']);
   assert.equal(await githubWizardFlow(s.ctx, 'change'), true);
@@ -387,14 +388,14 @@ test('мастер смены аккаунта: кэш, чужой репози�
 
 test('мастер: отказ заменить чужой репозиторий — «Отменено.» без вызовов', async () => {
   const base = ['source', 'github-connect', '--login', 'test-owner'];
-  const foreign = error('target_replace_required', { repo: 'test-owner/essence-config', tracked_files: 6, reason: 'недопустимый путь: ssh/known_hosts' });
+  const foreign = error('target_replace_required', { repo: 'test-owner/essence-config', tracked_files: 6, reason: 'bad path: ssh/known_hosts' });
   const s = scripted([accounts(), [base, foreign]], [0, false]);
   assert.equal(await githubWizardFlow(s.ctx, 'connect'), false);
   s.finished();
   assert.deepEqual(s.record.notices, [CANCELLED]);
-  const question = s.record.dialogs.find((d) => d.title === 'Репозиторий GitHub');
+  const question = s.record.dialogs.find((d) => d.kind === 'confirm' && Array.isArray(d.context));
   assert.ok(question.context.join(' ').includes('ssh/known_hosts'));
-  assert.ok(question.context.join(' ').includes('Файлов в репозитории: 6'));
+  assert.ok(question.context.join(' ').includes('6'));
 });
 
 test('мастер: отказ или отмена на любом шаге', async () => {

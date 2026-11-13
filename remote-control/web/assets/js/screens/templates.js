@@ -4,15 +4,15 @@
 // странице; черновик проверяется `template check` (текст — полем
 // `input.file`) через 500 мс после правки; «Сохранить» и «Импорт из файла» —
 // `template import --name T` с содержимым в `input.file` через `runConfirmed`.
-// Действия без DOM — `templates-flow.js`.
+// Действия без DOM — `templates-model.js`.
 import { html, useState, useEffect, useMemo, useRef } from '../../vendor/preact-htm.js';
 import {
   Page, Card, Chips, Badge, Button, DataTable, MoreMenu, Empty, FileText, downloadText,
 } from '../ui.js';
 import { Icon } from '../icons.js';
-import { errorMessage } from '../format.js';
+import { errorMessage, asList } from '../format.js';
 import { AceEditor } from '../template-editor.js';
-import { useCommand, useBusy, useMounted, Loaded, ReadFailed, rows } from './kit.js';
+import { useCommand, useBusy, useMounted, Loaded, ReadFailed } from './kit.js';
 import {
   TEMPLATE_NAME_MISSING, DEFAULT_TEMPLATE, NO_GROUP, TEMPLATE_KINDS,
   templateList, templateCreate, templateShow, templateInput, templateCheck,
@@ -21,7 +21,7 @@ import {
 } from './catalog-model.js';
 import {
   settleDraft, saveTemplate, importTemplateFile, deleteLabel, deleteTemplate, editTemplateGroups, checkRunner,
-} from './templates-flow.js';
+} from './templates-model.js';
 
 /** Задержка проверки черновика после последней правки, мс. */
 const CHECK_DELAY = 500;
@@ -32,7 +32,7 @@ export function TemplatesScreen({ ctx, param }) {
   return html`<${TemplateList} ctx=${ctx} />`;
 }
 
-const groupChips = (ctx, row) => rows(row && row.groups).filter((group) => typeof group === 'string')
+const groupChips = (ctx, row) => asList(row && row.groups).filter((group) => typeof group === 'string')
   .map((group) => ({ label: group, href: ctx.href('groups', group) }));
 
 function KindBadge({ row }) {
@@ -55,7 +55,7 @@ function TemplateList({ ctx }) {
   const state = useCommand(ctx, templateList());
   const [busy, run] = useBusy();
   const create = () => run(async () => {
-    const names = rows(state.data).map((row) => row && row.name).filter((name) => typeof name === 'string');
+    const names = asList(state.data).map((row) => row && row.name).filter((name) => typeof name === 'string');
     const values = await ctx.form({
       title: 'Создать шаблон',
       submit: 'Создать',
@@ -85,9 +85,9 @@ function TemplateList({ ctx }) {
   const actions = html`<${Button} kind="primary" icon="plus" disabled=${busy || !state.data} onClick=${create}>Создать шаблон<//>`;
   return html`<${Loaded} title="Шаблоны" state=${state} actions=${actions}>${(data) => html`
     <${Page} title="Шаблоны" actions=${actions}>
-      ${rows(data).length === 0
+      ${asList(data).length === 0
         ? html`<${Card}><${Empty} icon="file-code" title="Нет шаблонов" /><//>`
-        : html`<${DataTable} rows=${rows(data)} href=${(row) => ctx.href('templates', row.name)} menu=${menu}
+        : html`<${DataTable} rows=${asList(data)} href=${(row) => ctx.href('templates', row.name)} menu=${menu}
             columns=${[
               { key: 'name', label: 'Шаблон', search: true },
               { key: 'source', label: 'Источник', render: (row) => html`<${KindBadge} row=${row} />` },
@@ -210,10 +210,10 @@ function TemplateEditor({ ctx, name }) {
     const onKey = (event) => {
       if (!isSaveKey(event)) return;
       event.preventDefault();
-      if (!document.querySelector('.modal-open')) saveRef.current();
+      if (!ctx.dialogOpen()) saveRef.current();
     };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
+    ctx.win.addEventListener('keydown', onKey);
+    return () => ctx.win.removeEventListener('keydown', onKey);
   }, []);
   const importFile = (fileText, reason) => run(async () => {
     const imported = await importTemplateFile(ctx, name, fileText, reason, dirty);
@@ -294,7 +294,7 @@ function ProblemsPanel({ check, report, current, variant, onPick }) {
     <//>`;
   }
   const counts = problemCounts(report);
-  const problems = rows(report.problems).filter((problem) => problem && typeof problem === 'object');
+  const problems = asList(report.problems).filter((problem) => problem && typeof problem === 'object');
   return html`<${Card} title="Проблемы">
     ${!current && html`<p class="t-dim">Проверка…</p>`}
     ${counts.errors === 0 && counts.warnings === 0

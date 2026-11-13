@@ -3,7 +3,8 @@
 // `default-src 'self'`). Тексты — русские. Чистая логика таблиц —
 // `table-model.js`, форм — `form-model.js`.
 import { html, useEffect, useRef, useState } from '../vendor/preact-htm.js';
-import { readInputFile } from './format.js';
+import { readInputFile, asList } from './format.js';
+import { THEME_OPTIONS } from './theme.js';
 import { filterRows, cellText, allSelected, toggleVisible } from './table-model.js';
 import { Icon } from './icons.js';
 
@@ -43,12 +44,6 @@ export function Segmented({ options, value, onChange, label = null }) {
 }
 
 // ─── Каркас ──────────────────────────────────────────────────────────────────
-
-const THEMES = [
-  { value: 'system', icon: 'monitor', label: 'Системная' },
-  { value: 'light', icon: 'sun', label: 'Светлая' },
-  { value: 'dark', icon: 'moon', label: 'Тёмная' },
-];
 
 /**
  * Каркас: меню разделов (≥1024 — с подписями, 640–1023 — иконки, <640 —
@@ -105,7 +100,7 @@ export function Layout({ menu, activity = null, source = null, linkState = 'open
         </ul>
         <div class="shell-foot">
           <div class="join nav-theme" role="group" aria-label="Тема оформления">
-            ${THEMES.map((theme) => html`<button key=${theme.value} type="button"
+            ${THEME_OPTIONS.map((theme) => html`<button key=${theme.value} type="button"
               class="btn btn-xs btn-ghost btn-square join-item ${theme.value === themeChoice ? 'btn-active nav-theme-on' : ''}"
               aria-pressed=${theme.value === themeChoice} aria-label=${`Тема: ${theme.label}`} title=${`Тема: ${theme.label}`}
               onClick=${() => onTheme(theme.value)}><${Icon} name=${theme.icon} size=${16} /></button>`)}
@@ -156,7 +151,7 @@ export function Page({ title, subtitle = null, back = null, badge = null, action
       ${tabs.map((tab) => html`<a key=${tab.id} class="tab ${tab.active ? 'tab-active' : ''}" href=${tab.href}
         aria-current=${tab.active ? 'page' : undefined}>${tab.label}</a>`)}
     </nav>`}
-    <div class="stack">${children}</div>
+    <div class="vstack">${children}</div>
   `;
 }
 
@@ -180,7 +175,7 @@ function typing(target) {
 export function DataTable({ columns, rows, rowKey = 'name', empty = 'Нет объектов', href = null, menu = null, selection = null }) {
   const [query, setQuery] = useState('');
   const search = useRef(null);
-  const list = Array.isArray(rows) ? rows : [];
+  const list = asList(rows);
   const searchable = list.length > SEARCH_FROM && columns.some((column) => column.search);
   useEffect(() => {
     if (!searchable) return undefined;

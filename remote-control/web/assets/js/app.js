@@ -107,13 +107,11 @@ export function App({ win = window, deps = {} }) {
   const phaseRef = useRef(phase);
   phaseRef.current = phase;
 
-  const record = (level, text) => {
+  /** Запись журнала; `repeat: false` — такая же запись подряд не повторяется. */
+  const record = (level, text, { repeat = true } = {}) => {
     journalId.current += 1;
     const entry = { id: journalId.current, level: level || 'info', text: String(text ?? ''), time: Date.now() };
-    setJournal((current) => {
-      const next = [...current, entry];
-      return next.length > JOURNAL_LIMIT ? next.slice(next.length - JOURNAL_LIMIT) : next;
-    });
+    setJournal((current) => fmt.appendJournal(current, entry, JOURNAL_LIMIT, repeat));
   };
   const notify = (level, text) => {
     record(level, text);
@@ -470,9 +468,11 @@ function silent(reply, expect) {
  * Контекст экранов — аналог `tui::app::Context`:
  * - `request(argv, { secrets, input, onLog, expect, operation, quiet })` → ответ;
  *   текст ошибки показывается здесь ровно один раз (кроме планов, `*_required`
- *   и кодов `expect`); с `quiet` — только записью «warn» в журнале, без
+ *   и кодов `expect`); с `quiet` — только записью «warn» в журнале (такая же
+ *   запись подряд не повторяется: фоновые чтения идут на каждую правку), без
  *   снэкбара; `operation` — заголовок окна операции со строками журнала;
- * - `confirm`, `askSecret`, `ask`, `choose`, `toggle`, `form`, `show`, `operation` — диалоги;
+ * - `confirm`, `askSecret`, `ask`, `choose`, `form`, `show`, `operation` — диалоги;
+ *   `dialogOpen()` — открыто ли окно (горячие клавиши экрана поверх окон молчат);
  * - `runConfirmed(title, question, argv, { secrets, input })`,
  *   `nodeRequest(name, argv, review)` — `flows.js` с этим контекстом;
  * - `failed()` — «Операция завершилась ошибкой…» для отказов без текста ядра;
@@ -481,7 +481,8 @@ function silent(reply, expect) {
  *   `true` при успехе мастера GitHub, `restart('update'|'uninstall')`,
  *   `refreshStatus()`, `hello`, `status`;
  * - `journal`, `clearJournal()`, `theme: { choice, dark, set(choice) }` (`dark` — применённая тема),
- *   `setLeaveGuard(async () => boolean | null)` — вопрос перед уходом с экрана.
+ *   `setLeaveGuard(async () => boolean | null)` — вопрос перед уходом с экрана;
+ * - `win` — окно панели (обработчики клавиш экрана — на нём, не на глобальном `window`).
  */
 function makeContext({ connection, dialogs, notify, record, hello, status, win, refreshStatus, openTerminal, restart, journal, clearJournal, theme, setLeaveGuard }) {
   // Закрытие окон при смене экрана — дело каркаса, не экранов.
@@ -494,6 +495,7 @@ function makeContext({ connection, dialogs, notify, record, hello, status, win, 
     clearJournal,
     theme,
     setLeaveGuard,
+    win,
     ...dialogApi,
     async request(argv, options = {}) {
       const { secrets, input, onLog, expect = null, operation = null, quiet = false } = options;
@@ -509,7 +511,7 @@ function makeContext({ connection, dialogs, notify, record, hello, status, win, 
       if (progress) progress.finish();
       if (!silent(reply, expect)) {
         // Фоновое чтение с `quiet`: экран показывает недоступность сам, причина — в журнале.
-        if (quiet) record('warn', fmt.errorMessage(reply));
+        if (quiet) record('warn', fmt.errorMessage(reply), { repeat: false });
         else notify('error', fmt.errorMessage(reply));
       }
       return reply;

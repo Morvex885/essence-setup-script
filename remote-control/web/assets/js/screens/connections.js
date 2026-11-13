@@ -3,10 +3,11 @@
 // `conn sync --name` идёт по SSH и чистит устаревшее; после действий
 // перечитывается только `conn list --name`.
 import { html, useEffect, useRef, useState } from '../../vendor/preact-htm.js';
-import { Card, DataTable, Chips } from '../ui.js';
+import { Card, DataTable, Chips, Button } from '../ui.js';
 import { Icon } from '../icons.js';
 import { NODE_CODES } from '../flows.js';
-import { useBusy, useMounted, Action, Actions, ReadFailed, rows } from './kit.js';
+import { asList } from '../format.js';
+import { useBusy, useMounted, ReadFailed } from './kit.js';
 import { syncedNode, connectionView, assignConnections, connSyncArgv, connListArgv, nodeCheckArgv } from './nodeops-model.js';
 import { aliasArgv, aliasValues, plain } from './nodes-model.js';
 
@@ -14,7 +15,7 @@ import { aliasArgv, aliasValues, plain } from './nodes-model.js';
 async function editAliases(ctx, name) {
   const reply = await ctx.nodeRequest(name, ['node', 'aliases', '--name', name]);
   if (!reply.ok) return;
-  const entries = rows(reply.data);
+  const entries = asList(reply.data);
   if (entries.length === 0) {
     ctx.notify('info', 'Подключения на ноде не найдены.');
     return;
@@ -117,12 +118,12 @@ export function NodeConnections({ ctx, name }) {
       render: (row) => html`<${Chips} items=${row.groups.map((group) => ({ label: group, href: ctx.href('groups', group) }))} />`,
     },
   ];
-  const actions = html`<${Actions}>
-    <${Action} primary icon="git-branch" disabled=${busy}
+  const actions = html`<div class="row">
+    <${Button} kind="primary" icon="git-branch" disabled=${busy}
       onClick=${() => act(() => assignConnections(ctx, name, view.proxies, view.assigned))}>Назначить группам<//>
-    <${Action} icon="pencil" disabled=${busy} onClick=${() => act(() => editAliases(ctx, name))}>Псевдонимы<//>
-    <${Action} icon="refresh-cw" disabled=${busy} onClick=${() => run(synchronize)}>Синхронизировать<//>
-  <//>`;
+    <${Button} icon="pencil" disabled=${busy} onClick=${() => act(() => editAliases(ctx, name))}>Псевдонимы<//>
+    <${Button} icon="refresh-cw" disabled=${busy} onClick=${() => run(synchronize)}>Синхронизировать<//>
+  </div>`;
   return html`<${Card} title="Подключения" actions=${actions}>
     ${view.problem && html`<div role="alert" class="alert alert-warning alert-soft">
       <${Icon} name="triangle-alert" size=${18} /><span>Нода ${view.problem}</span>

@@ -1,15 +1,15 @@
 // Подписки (`tui/src/clients.rs::subscriptions`, `subscription_list`):
 // `subscription host|list|publish-all|migrate`; заголовки группы — через
-// `shared.js::showHeaders`, подписка клиента — вкладка карточки клиента.
+// `clients-model.js::showHeaders`, подписка клиента — вкладка карточки клиента.
 import { html } from '../../vendor/preact-htm.js';
-import { Page, Card, DataTable, MoreMenu, Facts, Badge, Empty } from '../ui.js';
-import { useCommand, useBusy, Action, Context, Loaded, rows } from './kit.js';
-import { fetchData, nameOptions, showHeaders } from './shared.js';
+import { Page, Card, DataTable, MoreMenu, Facts, Badge, Empty, Button } from '../ui.js';
+import { asList } from '../format.js';
+import { useCommand, useBusy, Loaded } from './kit.js';
 import {
   SUBSCRIPTION_HOST, SUBSCRIPTION_LIST, SUBSCRIPTION_PUBLISH_ALL, PUBLISH_FIELDS, subscriptionSetHost,
   subscriptionMigrate, subscriptionHost, subscriptionRow, publishSummary,
 } from './catalog-model.js';
-import { summaryLines, nodeLabel } from './clients-model.js';
+import { summaryLines, nodeLabel, fetchData, nameOptions, showHeaders } from './clients-model.js';
 
 const BADGE_TONES = { ok: 'ok', warn: 'warn', dim: 'neutral' };
 
@@ -45,10 +45,7 @@ export function SubscriptionsScreen({ ctx }) {
     if (ctx.isFailure(reply)) ctx.failed();
     const data = publishSummary(reply);
     if (data) {
-      await ctx.show({
-        title: 'Итог публикации подписок',
-        body: html`<${Context} lines=${summaryLines(data, PUBLISH_FIELDS, 'Нечего публиковать.')} />`,
-      });
+      await ctx.show({ title: 'Итог публикации подписок', context: summaryLines(data, PUBLISH_FIELDS, 'Нечего публиковать.') });
     }
   });
   const migrate = act(async () => {
@@ -70,9 +67,9 @@ export function SubscriptionsScreen({ ctx }) {
   return html`<${Loaded} title="Подписки" state=${hostState}>${() => {
     // Действия — как в меню, и без хоста: сбой объясняет ядро.
     const actions = html`
-      <${Action} primary=${Boolean(host)} icon="refresh-cw" disabled=${busy} onClick=${publishAll}>Обновить все подписки<//>
-      <${Action} primary=${!host} icon="server" disabled=${busy} onClick=${setHost}>Хост-нода…<//>
-      <${Action} icon="folders" disabled=${busy} onClick=${groupHeaders}>Заголовки группы<//>
+      <${Button} kind=${host ? 'primary' : 'neutral'} icon="refresh-cw" disabled=${busy} onClick=${publishAll}>Обновить все подписки<//>
+      <${Button} kind=${host ? 'neutral' : 'primary'} icon="server" disabled=${busy} onClick=${setHost}>Хост-нода…<//>
+      <${Button} icon="folders" disabled=${busy} onClick=${groupHeaders}>Заголовки группы<//>
       <${MoreMenu} items=${[{ label: 'Перенос на другую ноду', icon: 'send', disabled: busy, onClick: migrate }]} />`;
     return html`<${Page} title="Подписки" actions=${actions}>
       <${Card}>
@@ -85,7 +82,7 @@ export function SubscriptionsScreen({ ctx }) {
       <//>
       <${Loaded} title="Опубликованные подписки" state=${listState} inline>
         ${(data) => html`<${Card} title="Опубликованные подписки">
-          <${DataTable} rows=${rows(data).map(subscriptionRow)} rowKey="client" empty="Нет опубликованных подписок"
+          <${DataTable} rows=${asList(data).map(subscriptionRow)} rowKey="client" empty="Нет опубликованных подписок"
             href=${(row) => ctx.href('clients', row.client, 'subscription')}
             columns=${[
               { key: 'client', label: 'Клиент', search: true },

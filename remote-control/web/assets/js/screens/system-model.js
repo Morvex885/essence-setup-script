@@ -4,7 +4,7 @@
 // `recovery_run`, `provision`, `github_wizard`). Без DOM: диалоги и запросы —
 // через `ctx` (`app.js::makeContext`), ссылки для ручных действий — `deps.link`.
 import { decisionFlag, setFlag, clearFlag, isFailure } from '../flows.js';
-import { versionLabel, syncState, joined, text, openPanel, OPEN_PANEL_WARNING } from '../format.js';
+import { versionLabel, syncState, joined, text, openPanel, OPEN_PANEL_WARNING, strings } from '../format.js';
 import { validate } from '../form-model.js';
 
 export const CANCELLED = 'Отменено.';
@@ -12,7 +12,6 @@ export const FILE_UNREADABLE = 'Файл недоступен или не в UTF
 export const PASSWORDS_DIFFER = 'Пароли не совпадают.';
 export const PASSWORD_EMPTY = 'Пароль не может быть пустым.';
 
-const strings = (value) => (Array.isArray(value) ? value.filter((item) => typeof item === 'string') : []);
 const str = (value) => (typeof value === 'string' ? value : '');
 
 /** Сбой после операции; отказ от плана — не сбой (`source.rs::report`). */

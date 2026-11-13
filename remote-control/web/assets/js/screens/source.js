@@ -31,7 +31,7 @@ function KeyImport({ ctx, onDone }) {
     setState(reply && reply.ok ? 'ok' : 'failed');
     onDone();
   };
-  return html`<div class="stack">
+  return html`<div class="vstack">
     <p>Выберите файл ключа восстановления age. Содержимое уходит демону полем запроса; путь к файлу не передаётся.</p>
     <div class="row"><${FileText} kind="primary" label="Выбрать файл ключа" accept="" disabled=${state === 'busy'} onText=${pick} /></div>
     ${state === 'ok' && html`<p class="t-ok">Ключ импортирован.</p>`}

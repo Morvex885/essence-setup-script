@@ -4,7 +4,13 @@
 // Ранняя установка до отрисовки — классический `theme-boot.js` (та же логика).
 
 export const THEME_KEY = 'essence-rc-theme';
-const CHOICES = ['system', 'light', 'dark'];
+/** Варианты выбора темы для меню и настроек (`value` — сохраняемый выбор). */
+export const THEME_OPTIONS = [
+  { value: 'system', label: 'Системная', icon: 'monitor' },
+  { value: 'light', label: 'Светлая', icon: 'sun' },
+  { value: 'dark', label: 'Тёмная', icon: 'moon' },
+];
+const CHOICES = THEME_OPTIONS.map((option) => option.value);
 const DARK_QUERY = '(prefers-color-scheme: dark)';
 
 /** Сохранённый выбор; неизвестное, пустое или недоступное хранилище — `system`. */

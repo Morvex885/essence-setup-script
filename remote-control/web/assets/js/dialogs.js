@@ -1,4 +1,4 @@
-// Модальные диалоги экранов — аналог `Context::confirm/secret/select/toggle`
+// Модальные диалоги экранов — аналог `Context::confirm/secret/select`
 // TUI и формы `ctx.form`: каждый вызов возвращает `Promise`, окно
 // закрывается ответом. Диалоги складываются стопкой (подтверждение поверх
 // окна операции); фокус — в верхнем окне, Esc закрывает верхнее окно
@@ -7,6 +7,7 @@ import { html, useState, useEffect, useRef } from '../vendor/preact-htm.js';
 import { Button, useModalFocus } from './ui.js';
 import { Icon } from './icons.js';
 import { initialValues, visibleFields, validate, result } from './form-model.js';
+import { asList } from './format.js';
 
 /** Значение отмены окна по виду (как Esc и «Отмена»). */
 const CANCEL = { confirm: false, show: undefined };
@@ -55,8 +56,8 @@ export function useDialogs() {
     ask: (props) => push('text', props),
     /** Один из списка (`options: [{value,label,tone?}]`); отмена → `null`. */
     choose: (props) => push('choose', props),
-    /** Несколько из списка; `selected` — исходные отметки; отмена → `null`. */
-    toggle: (props) => push('toggle', props),
+    /** Открыто ли окно (горячие клавиши экрана не действуют поверх окон). */
+    dialogOpen: () => entries.current.length > 0,
     /**
      * Форма: `{ title, context, fields, submit, tone, wide }` → значения
      * видимых полей или `null` при отмене (`form-model.js`).
@@ -122,11 +123,18 @@ function Shell({ title, context, wide = false, onDismiss = null, children }) {
     <div class="modal modal-open" role="dialog" aria-modal="true" aria-label=${title} onMouseDown=${keepFocus}>
       <div class="modal-box ${wide ? 'modal-wide' : ''}" ref=${modal} tabindex="-1">
         <h3 class="modal-title">${title}</h3>
-        ${lines.length > 0 && html`<div class="modal-context">${lines.map((line, index) => html`<div key=${index}>${line}</div>`)}</div>`}
+        ${lines.length > 0 && html`<div class="modal-context">${lines.map((line, index) => (isToned(line)
+          ? html`<div key=${index} class=${line.tone ? `t-${line.tone}` : ''}>${line.text}</div>`
+          : html`<div key=${index}>${line}</div>`))}</div>`}
         ${children}
       </div>
     </div>
   `;
+}
+
+/** Строка контекста `{ text, tone }` (`tone`: `ok|warn|error|dim|info`), а не текст или разметка. */
+function isToned(line) {
+  return Boolean(line) && typeof line === 'object' && typeof line.text === 'string' && !('props' in line);
 }
 
 function ConfirmDialog({ props, close }) {
@@ -183,28 +191,6 @@ function ChooseDialog({ props, close }) {
   <//>`;
 }
 
-function ToggleDialog({ props, close }) {
-  const { title, context = null, options = [], selected = [], empty = 'Нет объектов для выбора', submit = 'Сохранить' } = props;
-  const [value, setValue] = useState([...selected]);
-  const flip = (item) => setValue(value.includes(item) ? value.filter((v) => v !== item) : [...value, item]);
-  return html`<${Shell} title=${title} context=${context} onDismiss=${() => close(null)}>
-    ${options.length === 0
-      ? html`<p class="t-dim">${empty}</p>`
-      : html`<div class="choice-list">
-          ${options.map((option) => html`
-            <label key=${String(option.value)} class="check-row">
-              <input type="checkbox" class="checkbox checkbox-sm" checked=${value.includes(option.value)} onChange=${() => flip(option.value)} />
-              <span>${option.label}</span>
-            </label>
-          `)}
-        </div>`}
-    <div class="modal-action">
-      <${Button} kind="ghost" onClick=${() => close(null)}>Отмена<//>
-      ${options.length > 0 && html`<${Button} kind="primary" onClick=${() => close(options.map((o) => o.value).filter((v) => value.includes(v)))}>${submit}<//>`}
-    </div>
-  <//>`;
-}
-
 // ─── Форма ───────────────────────────────────────────────────────────────────
 
 const MULTI_FILTER_FROM = 8;
@@ -214,7 +200,7 @@ function MultiField({ field, value, onChange, invalid, ids }) {
   const options = field.options || [];
   const needle = query.trim().toLowerCase();
   const shown = needle ? options.filter((option) => String(option.label).toLowerCase().includes(needle)) : options;
-  const selected = Array.isArray(value) ? value : [];
+  const selected = asList(value);
   const flip = (item) => onChange(selected.includes(item) ? selected.filter((v) => v !== item) : [...selected, item]);
   return html`<div class="choice-box ${invalid ? 'choice-invalid' : ''}">
     ${options.length > MULTI_FILTER_FROM && html`<label class="input input-sm choice-filter">
@@ -384,7 +370,6 @@ const VIEWS = {
   secret: (args) => InputDialog({ ...args, secret: true }),
   text: (args) => InputDialog({ ...args, secret: false }),
   choose: ChooseDialog,
-  toggle: ToggleDialog,
   form: FormDialog,
   show: ShowDialog,
   operation: OperationDialog,

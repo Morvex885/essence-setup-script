@@ -1,5 +1,6 @@
 // Чистая логика таблиц панели (`ui.js::DataTable`): текст ячейки, поиск и
 // отметки строк.
+import { asList } from './format.js';
 
 /** Текст значения строки: массив — через запятую, `null`/`undefined` — пусто. */
 export function cellText(row, key) {
@@ -12,7 +13,7 @@ export function cellText(row, key) {
 
 /** Строки, где хотя бы одна колонка `search: true` содержит запрос (без учёта регистра). */
 export function filterRows(rows, columns, query) {
-  const list = Array.isArray(rows) ? rows : [];
+  const list = asList(rows);
   const needle = String(query || '').trim().toLowerCase();
   if (needle === '') return list;
   const searchable = (columns || []).filter((column) => column.search);

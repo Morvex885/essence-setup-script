@@ -10,8 +10,10 @@ import {
   subscriptionSetHost, SUBSCRIPTION_LIST, SUBSCRIPTION_PUBLISH_ALL, subscriptionMigrate, subscriptionHost,
   subscriptionState, subscriptionRow, publishSummary,
 } from '../assets/js/screens/catalog-model.js';
-import { summaryLines, GENERATE_FIELDS } from '../assets/js/screens/clients-model.js';
-import { generateFlow } from '../assets/js/screens/generate.js';
+import { summaryLines, GENERATE_FIELDS, generateFlow } from '../assets/js/screens/clients-model.js';
+
+/** Строка итога `«подпись»: значение` по таблице полей. */
+const line = (fields, key, value, tone = null) => ({ text: `${new Map(fields).get(key)}: ${value}`, tone });
 
 test('шаблоны: argv команд и input.file', () => {
   assert.deepEqual(templateList(), ['template', 'list']);
@@ -78,20 +80,20 @@ test('шаблоны: отчёт проверки — счётчики, отме
 
 test('итог генерации: пустые поля пропущены, ошибки жёлтые', () => {
   const partial = { ok: ['a'], skipped: ['s'], failed: ['bad'], nodes_ok: ['de'], nodes_failed: ['ru'], dir: '/g' };
-  assert.deepEqual(summaryLines(partial, GENERATE_FIELDS, 'Нет результатов'), [
-    { text: 'Готово: a', tone: null }, { text: 'Пропущено: s', tone: null }, { text: 'Ошибки: bad', tone: 'warn' },
-    { text: 'Ноды с ошибкой: ru', tone: 'warn' }, { text: 'Каталог: /g', tone: null },
+  assert.deepEqual(summaryLines(partial, GENERATE_FIELDS, 'EMPTY'), [
+    line(GENERATE_FIELDS, 'ok', 'a'), line(GENERATE_FIELDS, 'skipped', 's'), line(GENERATE_FIELDS, 'failed', 'bad', 'warn'),
+    line(GENERATE_FIELDS, 'nodes_failed', 'ru', 'warn'), line(GENERATE_FIELDS, 'dir', '/g'),
   ]);
   const single = { ok: ['alice'], skipped: [], failed: [], nodes_ok: [], nodes_failed: [], dir: '/g' };
-  assert.equal(summaryLines(single, GENERATE_FIELDS, 'Нет результатов').length, 2);
-  assert.deepEqual(summaryLines({}, GENERATE_FIELDS, 'Нет результатов'), [{ text: 'Нет результатов', tone: 'dim' }]);
+  assert.equal(summaryLines(single, GENERATE_FIELDS, 'EMPTY').length, 2);
+  assert.deepEqual(summaryLines({}, GENERATE_FIELDS, 'EMPTY'), [{ text: 'EMPTY', tone: 'dim' }]);
 });
 
 test('итог публикации: число 0 пропущено, сводка ошибки из error', () => {
-  assert.deepEqual(summaryLines({ published: ['alice'], skipped: [], failed: [], removed: 0 }, PUBLISH_FIELDS, 'Нечего публиковать.'),
-    [{ text: 'Опубликовано: alice', tone: null }]);
-  assert.deepEqual(summaryLines({ published: [], removed: 2 }, PUBLISH_FIELDS, 'Нечего публиковать.'),
-    [{ text: 'Удалено устаревших: 2', tone: null }]);
+  assert.deepEqual(summaryLines({ published: ['alice'], skipped: [], failed: [], removed: 0 }, PUBLISH_FIELDS, 'EMPTY'),
+    [line(PUBLISH_FIELDS, 'published', 'alice')]);
+  assert.deepEqual(summaryLines({ published: [], removed: 2 }, PUBLISH_FIELDS, 'EMPTY'),
+    [line(PUBLISH_FIELDS, 'removed', '2')]);
   const failed = { code: 'remote_failed', published: [], skipped: [], failed: ['alice'], removed: 0 };
   assert.equal(publishSummary({ ok: false, error: failed }), failed);
   assert.equal(publishSummary({ ok: false, error: { code: 'confirmation_required' } }), null);
@@ -118,19 +120,19 @@ test('генерация: пресет без формы, сбой чтения 
       return lists;
     },
     failed: () => { failed += 1; },
-    form: async (spec) => { calls.push(spec.title); return { scope: 'group', group: 'PC' }; },
-    show: async () => {},
+    form: async () => { calls.push('form'); return { scope: 'group', group: 'PC' }; },
+    show: async (props) => { calls.push(['show', props.context]); },
   };
   await generateFlow(ctx, { client: 'alice' });
-  assert.deepEqual(calls, [['generate', '--client', 'alice']]);
+  assert.deepEqual(calls, [['generate', '--client', 'alice'], ['show', [line(GENERATE_FIELDS, 'ok', 'alice')]]]);
   calls.length = 0;
   await generateFlow(ctx);
   assert.equal(failed, 1);
-  assert.ok(!calls.includes('Генерация конфигов'));
+  assert.ok(!calls.includes('form'), 'без списков форма не открывается');
   calls.length = 0;
   lists = { ok: true, data: [{ name: 'PC' }] };
   await generateFlow(ctx);
-  assert.deepEqual(calls.at(-1), ['generate', '--group', 'PC']);
+  assert.deepEqual(calls.slice(2, 4), ['form', ['generate', '--group', 'PC']]);
 });
 
 test('подписки: argv и хост-нода', () => {

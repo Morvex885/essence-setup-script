@@ -2,6 +2,7 @@
 // `template_groups`, удаление) без DOM: зависимости — объект `ctx` экрана
 // (`runConfirmed`, `isFailure`, `failed`, `notify`, `request`, `confirm`, `form`).
 // Экран `templates.js` только перечитывает данные и обновляет черновик.
+import { asList } from '../format.js';
 import {
   TEMPLATE_FILE_UNREADABLE, DEFAULT_TEMPLATE, templateImport, templateInput, templateDelete, templateGroups,
   templateKind, groupOptions,
@@ -9,8 +10,6 @@ import {
 
 export const GROUPS_UNCHANGED = 'Изменений нет.';
 export const DRAFT_REPLACED = 'Импорт заменит несохранённые изменения в редакторе.';
-
-const rowsOf = (value) => (Array.isArray(value) ? value : []);
 
 /**
  * Черновик после успешного сохранения текста `sent`: тот же текст — сохранён
@@ -81,7 +80,7 @@ export async function editTemplateGroups(ctx, name) {
   const reply = await ctx.runConfirmed('Группы шаблона', 'Применить?', templateGroups(name, values.groups));
   if (ctx.isFailure(reply)) ctx.failed();
   if (!reply.ok) return false;
-  const changed = rowsOf(reply.data && reply.data.assigned).length > 0 || rowsOf(reply.data && reply.data.reset).length > 0;
+  const changed = asList(reply.data && reply.data.assigned).length > 0 || asList(reply.data && reply.data.reset).length > 0;
   if (!changed) ctx.notify('info', GROUPS_UNCHANGED);
   return changed;
 }

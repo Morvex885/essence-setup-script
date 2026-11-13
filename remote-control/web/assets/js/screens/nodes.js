@@ -1,200 +1,16 @@
 // Ноды (`#/nodes`) и карточка ноды (`#/nodes/<имя>/<вкладка>`) — перенос
-// `tui/src/nodes.rs`: `Nodes`, `NodeCard`, `delete_node`, `add_node_with`,
-// `harden`, `setup_ssh`, `offer_upload`, `interactive`. Вкладки карточки:
-// обзор, подключения (`connections.js`), AmneziaWG (`awg.js`), обслуживание.
+// `tui/src/nodes.rs`: `Nodes`, `NodeCard`. Действия (`delete_node`,
+// `add_node_with`, `harden`, `setup_ssh`, `offer_upload`, `interactive`) —
+// `nodes-model.js`. Вкладки карточки: обзор, подключения (`connections.js`),
+// AmneziaWG (`awg.js`), обслуживание.
 import { html, useEffect, useState } from '../../vendor/preact-htm.js';
 import { Page, Card, DataTable, MoreMenu, Facts, Badge, Chips, Empty, Button } from '../ui.js';
-import { handleNodeCodes, reviewReply, setFlag, decisionFlag, isFailure } from '../flows.js';
-import { errorMessage } from '../format.js';
-import { useCommand, useBusy, useMounted, Action, Loaded, rows } from './kit.js';
+import { asList } from '../format.js';
+import { useCommand, useBusy, useMounted, Loaded } from './kit.js';
 import { NodeConnections } from './connections.js';
 import { NodeAwg } from './awg.js';
-import { syncAll } from './nodeops-model.js';
+import { syncAll, nodeCheckArgv } from './nodeops-model.js';
 import * as model from './nodes-model.js';
-
-export const nodeLabel = model.nodeLabel;
-
-/** Зависимости `flows.js` из контекста экрана. */
-function deps(ctx) {
-  return { request: (words, options) => ctx.request(words, options), confirm: ctx.confirm, askSecret: ctx.askSecret, notify: ctx.notify };
-}
-
-function code(reply) {
-  return reply && reply.error ? reply.error.code : null;
-}
-
-/** `nodes.rs::outcome`: текст ядра уже показан; отказ от плана — не сбой. */
-function outcome(ctx, reply) {
-  if (isFailure(reply)) ctx.failed();
-}
-
-const checkArgv = (name) => ['node', 'check', '--name', name];
-
-// ─── Терминал и скрипты ──────────────────────────────────────────────────────
-
-/**
- * `node shell` / `telegram menu` в оверлее терминала (`nodes.rs::interactive`).
- * Состояния ноды разрешаются и команда повторяется; устаревшие скрипты —
- * предложение загрузки; `conflict` — терминал этой ноды уже открыт.
- */
-export async function interactive(ctx, name, telegram) {
-  const argv = model.interactiveArgv(name, telegram);
-  const title = telegram ? `Telegram Proxy: ${name}` : `Меню сервера: ${name}`;
-  for (;;) {
-    const reply = await ctx.terminal(argv, title, { expect: ['conflict', 'invalid'] });
-    if (reply.ok) return;
-    if (await handleNodeCodes(reply, name, deps(ctx))) continue;
-    if (code(reply) === 'conflict') {
-      ctx.notify('warn', 'Терминал этой ноды уже открыт');
-      return;
-    }
-    if (code(reply) === 'invalid') {
-      if (typeof reply.error.state === 'string') {
-        await offerUpload(ctx, name, reply.error.state);
-        return;
-      }
-      ctx.notify('error', errorMessage(reply));
-    }
-    outcome(ctx, reply);
-    return;
-  }
-}
-
-/** Явная загрузка скриптов (`nodes.rs::offer_upload`); меню заново не открывается. */
-async function offerUpload(ctx, name, state) {
-  const offer = model.uploadOffer(name, state);
-  const choice = await ctx.choose({
-    title: offer.title,
-    context: [offer.condition],
-    options: [{ value: 'u', label: offer.label }],
-    cancel: 'Назад',
-  });
-  if (choice !== 'u') return;
-  const reply = await ctx.nodeRequest(name, offer.argv, { title: 'Загрузка скриптов', question: 'Загрузить скрипты?' });
-  if (reply.ok) ctx.notify('success', 'Скрипты загружены. Откройте меню снова.');
-}
-
-// ─── Отложенная SSH-настройка ────────────────────────────────────────────────
-
-/** `node setup-ssh` под планом (`nodes.rs::setup_ssh`). */
-export async function setupSsh(ctx) {
-  const words = ['node', 'setup-ssh'];
-  for (;;) {
-    const reply = await ctx.runConfirmed('Завершение SSH-настройки', 'Выполнить?', words);
-    if (reply.ok) {
-      if (reply.data && reply.data.ready === true) {
-        ctx.notify('success', 'SSH-настройка завершена.');
-      } else {
-        for (const node of rows(reply.data && reply.data.deferred)) {
-          ctx.notify('warn', `Отложено: ${model.plain(node.name)} — ${model.plain(node.issue)}`);
-        }
-      }
-      return;
-    }
-    switch (code(reply)) {
-      case 'key_provisioning_required': {
-        const provision = await ctx.confirm({
-          title: 'Переносимый SSH-ключ',
-          context: [`Ноды: ${model.joinedPlain(reply.error.nodes)}`],
-          question: 'Создать переносимый SSH-ключ для этих нод?',
-        });
-        setFlag(words, decisionFlag(code(reply)), provision ? 'yes' : 'no');
-        break;
-      }
-      case 'onboarding_failed': {
-        const choice = await ctx.choose({
-          title: 'Не удалось настроить переносимый SSH-ключ',
-          options: [
-            { value: 'retry', label: 'Повторить' },
-            { value: 'defer', label: 'Отложить проблемные ноды' },
-          ],
-        });
-        if (choice === null) return;
-        if (choice === 'defer') setFlag(words, '--on-failure', 'defer');
-        break;
-      }
-      // Сообщение ядра уже показано; сбоя нет.
-      case 'nothing_pending':
-        return;
-      default:
-        outcome(ctx, reply);
-        return;
-    }
-  }
-}
-
-// ─── Действия над нодой ──────────────────────────────────────────────────────
-
-/** Объём удаления из `delete_options`; `true`, если ноды больше нет (`nodes.rs::delete_node`). */
-async function deleteNode(ctx, name, node) {
-  const options = model.deleteOptions(node);
-  if (options.length === 0) {
-    ctx.notify('warn', 'Нет доступных вариантов удаления.');
-    return false;
-  }
-  const values = await ctx.form({
-    title: `Удаление ноды: ${name}`,
-    fields: [{ name: 'scope', label: 'Объём удаления', type: 'radio', options, required: true }],
-    submit: 'Далее',
-    tone: 'danger',
-  });
-  if (values === null) return false;
-  const argv = model.deleteArgv(name, node.delete_options[values.scope]);
-  const reply = await ctx.nodeRequest(name, argv, { title: 'Удаление ноды', question: 'Удалить ноду в выбранном объёме?' });
-  return reply.ok || (reply.error && reply.error.deleted === true);
-}
-
-/** Удаление из списка: варианты удаления есть только в `node show`. */
-async function deleteListed(ctx, name) {
-  const shown = await ctx.request(['node', 'show', '--name', name]);
-  if (!shown.ok) return false;
-  return deleteNode(ctx, name, shown.data);
-}
-
-/** Сохранение пароля SSH: значение — только в `secrets` запроса. */
-export async function setNodePassword(ctx, name) {
-  const values = await ctx.form({
-    title: `Пароль SSH: ${name}`,
-    fields: [{ name: 'password', label: 'Пароль SSH', type: 'secret', required: true }],
-  });
-  if (values === null) return;
-  outcome(ctx, await ctx.request(['node', 'password', '--name', name], { secrets: { password: values.password } }));
-}
-
-/** Порт задаётся явно или подбирается ядром; план подтверждается (`nodes.rs::harden`). */
-async function harden(ctx, name) {
-  const title = 'Усиление защиты SSH';
-  const ask = async () => {
-    const values = await ctx.form({
-      title,
-      fields: [{ name: 'port', label: 'SSH-порт (пусто — подобрать свободный)', type: 'text' }],
-      submit: 'Далее',
-    });
-    return values === null ? null : values.port;
-  };
-  const port = await ask();
-  if (port === null) return;
-  let words = model.hardenArgv(name, port);
-  for (;;) {
-    let reply = await ctx.request(words);
-    if (model.hardenAsksPort(words, reply)) {
-      const again = await ask();
-      if (again === null) return;
-      words = model.hardenArgv(name, again);
-      continue;
-    }
-    reply = await reviewReply(title, 'Усилить защиту SSH?', words, reply, deps(ctx), 2);
-    if (reply.ok) return;
-    if (code(reply) === 'hardening_failed') {
-      if (reply.error.console_required === true) ctx.notify('warn', 'Проверьте доступ через консоль провайдера.');
-      ctx.failed();
-      return;
-    }
-    if (await handleNodeCodes(reply, name, deps(ctx))) continue;
-    outcome(ctx, reply);
-    return;
-  }
-}
 
 // ─── Список нод ──────────────────────────────────────────────────────────────
 
@@ -230,7 +46,7 @@ function NodeList({ ctx }) {
   });
   const addButton = html`<${Button} kind="primary" icon="plus" disabled=${busy} onClick=${add}>Добавить ноду<//>`;
   const actions = html`
-    ${pending && html`<${Button} icon="key-round" disabled=${busy} onClick=${() => then(() => setupSsh(ctx))}>Завершить SSH-настройку<//>`}
+    ${pending && html`<${Button} icon="key-round" disabled=${busy} onClick=${() => then(() => model.setupSsh(ctx))}>Завершить SSH-настройку<//>`}
     <${Button} icon="refresh-cw" disabled=${busy} onClick=${syncNodes}>Синхронизировать все<//>
     ${addButton}
   `;
@@ -242,12 +58,12 @@ function NodeList({ ctx }) {
     { key: 'state', label: 'Состояние', render: (row) => html`<${Badge} tone=${row.state.tone}>${row.state.label}<//>` },
   ];
   const menu = (row) => [
-    { label: 'Проверить подключение', icon: 'refresh-cw', disabled: busy, onClick: () => then(() => ctx.nodeRequest(row.name, checkArgv(row.name))) },
+    { label: 'Проверить подключение', icon: 'refresh-cw', disabled: busy, onClick: () => then(() => ctx.nodeRequest(row.name, nodeCheckArgv(row.name))) },
     { label: 'Изменить', icon: 'pencil', disabled: busy, onClick: () => then(() => model.editNode(ctx, row.node)) },
-    { label: 'Удалить', icon: 'trash-2', danger: true, disabled: busy, onClick: () => then(() => deleteListed(ctx, row.name)) },
+    { label: 'Удалить', icon: 'trash-2', danger: true, disabled: busy, onClick: () => then(() => model.deleteListed(ctx, row.name)) },
   ];
   return html`<${Loaded} title="Ноды" state=${list} actions=${actions}>${(data) => {
-    const table = rows(data).map((node) => ({
+    const table = asList(data).map((node) => ({
       node,
       name: model.plain(node.name),
       address: `${model.plain(node.ip)}:${model.plain(node.port)}`,
@@ -293,7 +109,7 @@ function Overview({ ctx, node }) {
       { label: 'Пароль SSH', value: password && html`<${Badge} tone=${password.tone}>${password.label}<//>` },
       { label: 'Тег', value: model.plain(node.tag) || '—' },
       { label: 'Требует настройки', value: issues && html`<${Badge} tone="warn">${issues}<//>` },
-      { label: 'Группы', value: html`<${Chips} items=${rows(node.groups).map((group) => ({ label: model.plain(group), href: ctx.href('groups', model.plain(group)) }))} />` },
+      { label: 'Группы', value: html`<${Chips} items=${asList(node.groups).map((group) => ({ label: model.plain(group), href: ctx.href('groups', model.plain(group)) }))} />` },
       { label: 'Клиентов', value: model.plain(node.clients) },
     ]} />
   <//>`;
@@ -311,23 +127,23 @@ function Maintenance({ busy, act, remove }) {
     <${Card} title="Обслуживание">
       <div class="op-list">
         <${OpRow} title="Проверить подключение" desc="Проверить SSH-подключение к ноде.">
-          <${Action} icon="refresh-cw" disabled=${busy} onClick=${act.check}>Проверить<//>
+          <${Button} icon="refresh-cw" disabled=${busy} onClick=${act.check}>Проверить<//>
         <//>
         <${OpRow} title="Загрузить скрипты принудительно" desc="Заново загрузить скрипты Essence на ноду, даже если версия совпадает.">
-          <${Action} icon="upload" disabled=${busy} onClick=${act.upload}>Загрузить<//>
+          <${Button} icon="upload" disabled=${busy} onClick=${act.upload}>Загрузить<//>
         <//>
         <${OpRow} title="Усилить защиту SSH" desc="Перенести SSH на другой порт и закрыть вход по паролю — по плану ядра.">
-          <${Action} icon="shield" disabled=${busy} onClick=${act.harden}>Усилить<//>
+          <${Button} icon="shield" disabled=${busy} onClick=${act.harden}>Усилить<//>
         <//>
         <${OpRow} title="Telegram Proxy на ноде" desc="Меню Telegram Proxy этой ноды в терминале.">
-          <${Action} icon="send" disabled=${busy} onClick=${act.telegram}>Открыть<//>
+          <${Button} icon="send" disabled=${busy} onClick=${act.telegram}>Открыть<//>
         <//>
       </div>
     <//>
     <${Card} title="Опасная зона" className="danger-zone">
       <div class="danger-row">
         <span>Удалить ноду из remote-control и, по выбору, компоненты Essence на сервере.</span>
-        <${Action} tone="danger" icon="trash-2" disabled=${busy} onClick=${remove}>Удалить ноду<//>
+        <${Button} kind="danger" icon="trash-2" disabled=${busy} onClick=${remove}>Удалить ноду<//>
       </div>
     <//>
   `;
@@ -338,7 +154,7 @@ function NodeCard({ ctx, name, tab }) {
   const [busy, run] = useBusy();
   const mounted = useMounted();
   useEffect(() => {
-    if (show.reply && code(show.reply) === 'not_found') ctx.navigate('nodes');
+    if (show.reply && show.reply.error && show.reply.error.code === 'not_found') ctx.navigate('nodes');
   }, [show.reply]);
   const back = { href: ctx.href('nodes'), label: 'Ноды' };
   const active = TABS.some((item) => item.id === tab) ? tab : TABS[0].id;
@@ -354,14 +170,14 @@ function NodeCard({ ctx, name, tab }) {
     const password = node.auth === 'password';
     const status = model.nodeStatus(node);
     const act = {
-      check: () => then(() => ctx.nodeRequest(name, checkArgv(name))),
+      check: () => then(() => ctx.nodeRequest(name, nodeCheckArgv(name))),
       upload: () => then(() => ctx.nodeRequest(name, ['node', 'upload-scripts', '--name', name, '--force'],
         { title: 'Принудительная загрузка скриптов', question: 'Загрузить скрипты?' })),
-      harden: () => then(() => harden(ctx, name)),
-      telegram: () => then(() => interactive(ctx, name, true)),
+      harden: () => then(() => model.harden(ctx, name)),
+      telegram: () => then(() => model.interactive(ctx, name, true)),
     };
     const remove = () => run(async () => {
-      if (await deleteNode(ctx, name, node)) { go('nodes'); return; }
+      if (await model.deleteNode(ctx, name, node)) { go('nodes'); return; }
       show.reload();
     });
     const edit = () => run(async () => {
@@ -370,9 +186,9 @@ function NodeCard({ ctx, name, tab }) {
       show.reload();
     });
     const actions = active === 'overview' && html`
-      <${Button} kind="primary" icon="terminal" disabled=${busy} onClick=${() => then(() => interactive(ctx, name, false))}>Меню сервера<//>
+      <${Button} kind="primary" icon="terminal" disabled=${busy} onClick=${() => then(() => model.interactive(ctx, name, false))}>Меню сервера<//>
       <${Button} icon="pencil" disabled=${busy} onClick=${edit}>Изменить<//>
-      ${password && html`<${Button} icon="key-round" disabled=${busy} onClick=${() => then(() => setNodePassword(ctx, name))}>Пароль SSH<//>`}
+      ${password && html`<${Button} icon="key-round" disabled=${busy} onClick=${() => then(() => model.setNodePassword(ctx, name))}>Пароль SSH<//>`}
       <${MoreMenu} items=${[
         { label: 'Проверить подключение', icon: 'refresh-cw', disabled: busy, onClick: act.check },
         { label: 'Удалить ноду', icon: 'trash-2', danger: true, disabled: busy, onClick: remove },

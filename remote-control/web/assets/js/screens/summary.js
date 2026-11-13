@@ -3,12 +3,11 @@
 // действия (добавить ноду или клиента, сгенерировать конфиги).
 import { html } from '../../vendor/preact-htm.js';
 import { Page, Card, Stats, Stat, Empty, Badge, Button } from '../ui.js';
-import { useCommand, useBusy, useMounted, Loaded, rows } from './kit.js';
+import { asList } from '../format.js';
+import { useCommand, useBusy, useMounted, Loaded } from './kit.js';
 import { dashboardTitle, attentionItems } from './system-model.js';
-import { setNodePassword, setupSsh } from './nodes.js';
-import { addNodeFlow } from './nodes-model.js';
-import { addClientFlow } from './clients.js';
-import { generateFlow } from './generate.js';
+import { addNodeFlow, setNodePassword, setupSsh } from './nodes-model.js';
+import { addClientFlow, generateFlow } from './clients-model.js';
 
 const count = (value) => (Number.isInteger(value) && value >= 0 ? value : 0);
 
@@ -36,7 +35,7 @@ export function SummaryScreen({ ctx }) {
   return html`<${Loaded} title="Сводка" state=${state}>${(data) => {
     const title = dashboardTitle(data, version);
     const counts = (data && data.counts) || {};
-    const subs = subscriptions.reply === null ? '…' : subscriptions.reply.ok ? String(rows(subscriptions.data).length) : '—';
+    const subs = subscriptions.reply === null ? '…' : subscriptions.reply.ok ? String(asList(subscriptions.data).length) : '—';
     const items = attentionItems(data, ctx.hello);
     return html`<${Page} title="Сводка" subtitle=${title} actions=${actions}>
       <${Stats}>

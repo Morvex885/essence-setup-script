@@ -3,14 +3,10 @@
 // (`Connections::run`, `synced_node`, `sync_problem`, `assign_connections`,
 // `awg_node`, argv команд, таблица `telegram_table`). Без DOM и вендоренных
 // файлов. Тоны: `ok` (GREEN), `warn` (YELLOW), `error` (RED), `neutral` (DIM).
+import { asList } from '../format.js';
 
 /** Пустой выбор (`nodes.rs::EMPTY`). */
 export const EMPTY = 'Нет объектов для выбора';
-
-/** Строки массива (`rows`). */
-export function rows(value) {
-  return Array.isArray(value) ? value : [];
-}
 
 /** Значение как в `nodes.rs::text`: строка, `null` → пусто, прочее — JSON. */
 export function nodeText(value) {
@@ -21,7 +17,7 @@ export function nodeText(value) {
 
 /** Строка ноды в ответе `conn sync` (`synced_node`). */
 export function syncedNode(sync, name) {
-  return rows(sync && sync.nodes).find((row) => row && row.name === name) || null;
+  return asList(sync && sync.nodes).find((row) => row && row.name === name) || null;
 }
 
 /** Состояния строки `conn sync`, кроме `synced` (`sync_problem`). */
@@ -48,14 +44,14 @@ export function syncData(reply) {
  * назначены (`ok`), часть (`warn`), всего неизвестно или 0 (`neutral`).
  */
 export function overviewNodes(list, synced) {
-  return rows(list).map((entry) => {
+  return asList(list).map((entry) => {
     const name = nodeText(entry.node);
     const state = syncedNode(synced, name);
     const problem = state ? syncProblem(state.status) : null;
     if (problem) return { name, problem, groups: [] };
     const total = state && Array.isArray(state.discovered) ? state.discovered.length : null;
-    const groups = rows(entry.groups).map((group) => {
-      const assigned = rows(group.proxies).length;
+    const groups = asList(entry.groups).map((group) => {
+      const assigned = asList(group.proxies).length;
       const tone = total !== null && total > 0 ? (assigned >= total ? 'ok' : 'warn') : 'neutral';
       return { name: nodeText(group.name), count: `${assigned}/${total === null ? '?' : total}`, tone };
     });
@@ -88,11 +84,11 @@ export async function syncAll(ctx) {
  * каждого (`assigned[i]`), строки таблицы и проблема синхронизации ноды.
  */
 export function connectionView(listed, state, name) {
-  const entry = rows(listed).find((row) => row && row.node === name);
-  const groups = entry ? rows(entry.groups) : [];
-  const proxies = rows(state && state.discovered).map(nodeText);
+  const entry = asList(listed).find((row) => row && row.node === name);
+  const groups = entry ? asList(entry.groups) : [];
+  const proxies = asList(state && state.discovered).map(nodeText);
   const assigned = proxies.map((proxy) => groups
-    .filter((group) => rows(group.proxies).includes(proxy))
+    .filter((group) => asList(group.proxies).includes(proxy))
     .map((group) => nodeText(group.name)));
   const problem = syncProblem(state && state.status);
   const table = proxies.map((proxy, index) => ({ proxy, groups: assigned[index] }));
@@ -124,7 +120,7 @@ export async function assignConnections(ctx, name, proxies, assigned) {
     if (ctx.isFailure(listed)) ctx.failed();
     return;
   }
-  const groups = rows(listed.data).map((row) => nodeText(row.name));
+  const groups = asList(listed.data).map((row) => nodeText(row.name));
   if (groups.length === 0) {
     ctx.notify('warn', EMPTY);
     return;
@@ -181,7 +177,7 @@ const AWG_STATES = {
  */
 export function awgView(data) {
   const installed = Boolean(data) && data.installed === true;
-  const peers = installed ? rows(data.peers) : [];
+  const peers = installed ? asList(data.peers) : [];
   const table = peers.map((peer) => {
     const state = AWG_STATES[peer.status] || AWG_STATES.missing;
     return { name: nodeText(peer.name), status: peer.status, tone: state.tone, label: state.label, removable: peer.status !== 'missing' };
@@ -231,7 +227,7 @@ export function telegramArgv(base, names, component = null) {
 /** Строки таблицы `telegram_table` (`results` из данных или ошибки); `null` — таблицы нет. */
 export function telegramResults(reply) {
   const source = reply.ok ? reply.data : reply.error;
-  const results = rows(source && source.results);
+  const results = asList(source && source.results);
   if (results.length === 0) return null;
   return results.map((row) => {
     const [status, tone] = row.status === 'ok' ? ['готово', 'ok']

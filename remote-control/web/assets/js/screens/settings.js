@@ -5,14 +5,9 @@
 import { html } from '../../vendor/preact-htm.js';
 import { Page, Card, Facts, Badge, Button, Segmented } from '../ui.js';
 import { versionLabel } from '../format.js';
+import { THEME_OPTIONS } from '../theme.js';
 import { useCommand, useCommands, useBusy, Loaded, ReadFailed } from './kit.js';
 import { updateAvailable, settingsAction, daemonLines } from './system-model.js';
-
-const THEMES = [
-  { value: 'system', label: 'Системная', icon: 'monitor' },
-  { value: 'light', label: 'Светлая', icon: 'sun' },
-  { value: 'dark', label: 'Тёмная', icon: 'moon' },
-];
 
 export function SettingsScreen({ ctx }) {
   const version = useCommand(ctx, ['self', 'version']);
@@ -53,7 +48,7 @@ export function SettingsScreen({ ctx }) {
         </div>
       <//>
       <${Card} title="Оформление">
-        <${Segmented} label="Тема" options=${THEMES} value=${ctx.theme.choice} onChange=${(choice) => ctx.theme.set(choice)} />
+        <${Segmented} label="Тема" options=${THEME_OPTIONS} value=${ctx.theme.choice} onChange=${(choice) => ctx.theme.set(choice)} />
       <//>
       <${Card} title="Демон">
         ${state.data.daemon

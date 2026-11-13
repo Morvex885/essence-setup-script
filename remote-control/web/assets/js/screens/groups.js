@@ -1,14 +1,11 @@
 // Группы (`#/groups`, `#/groups/<имя>`) — перенос `clients.rs::groups`,
-// `group_card`, `group_template`. Редактор созданного шаблона — экран
-// «Шаблоны» (`#/templates/<имя>`).
+// `group_card`, `group_template`; действия — `clients-model.js`. Редактор
+// созданного шаблона — экран «Шаблоны» (`#/templates/<имя>`).
 import { html, useEffect } from '../../vendor/preact-htm.js';
-import { Page, Card, DataTable, MoreMenu, Facts, Badge, Chips, Empty } from '../ui.js';
-import { useCommand, useBusy, useMounted, Action, Loaded } from './kit.js';
-import { execute, confirmed, fetchData, nameOptions, showHeaders } from './shared.js';
-import { generateFlow } from './generate.js';
+import { Page, Card, DataTable, MoreMenu, Facts, Badge, Chips, Empty, Button } from '../ui.js';
+import { asList, strings } from '../format.js';
+import { useCommand, useBusy, useMounted, Loaded } from './kit.js';
 import * as model from './clients-model.js';
-
-const DEFAULT_TEMPLATE = 'default.yaml';
 
 export function GroupsScreen({ ctx, param }) {
   return param === null || param === undefined
@@ -21,7 +18,7 @@ function TemplateLink({ ctx, template }) {
 }
 
 function NodeChips({ ctx, nodes }) {
-  return html`<${Chips} items=${model.strings(nodes).map((node) => ({ label: node, href: ctx.href('nodes', node) }))} />`;
+  return html`<${Chips} items=${strings(nodes).map((node) => ({ label: node, href: ctx.href('nodes', node) }))} />`;
 }
 
 // ─── Список ─────────────────────────────────────────────────────────────────
@@ -31,34 +28,17 @@ function GroupList({ ctx }) {
   const [busy, run] = useBusy();
   const act = (action) => run(async () => { await action(); await state.reload(); });
 
-  /** Имя и шаблон одной формой: `group add`, затем `group set-template` для не встроенного. */
-  const add = () => act(async () => {
-    const read = await fetchData(ctx, ['template', 'list']);
-    if (!read) return;
-    const values = await ctx.form({
-      title: 'Добавить группу',
-      submit: 'Добавить',
-      fields: [
-        { name: 'name', label: 'Название группы', type: 'text', required: 'Название не указано.', autofocus: true },
-        { name: 'template', label: 'Шаблон', type: 'select', value: DEFAULT_TEMPLATE, options: nameOptions(read.data) },
-      ],
-    });
-    if (values === null || values === undefined) return;
-    const reply = await execute(ctx, ['group', 'add', '--name', values.name]);
-    if (reply.ok && values.template !== DEFAULT_TEMPLATE) {
-      await execute(ctx, ['group', 'set-template', '--name', values.name, '--template', values.template]);
-    }
-  });
-  const remove = (name) => act(() => confirmed(ctx, 'Удаление группы', 'Удалить группу?', ['group', 'delete', '--name', name]));
+  const add = () => act(() => model.addGroupFlow(ctx));
+  const remove = (name) => act(() => model.confirmed(ctx, 'Удаление группы', 'Удалить группу?', model.groupDeleteArgv(name)));
 
-  const actions = html`<${Action} primary icon="plus" disabled=${busy || !state.data} onClick=${add}>Добавить группу<//>`;
+  const actions = html`<${Button} kind="primary" icon="plus" disabled=${busy || !state.data} onClick=${add}>Добавить группу<//>`;
   const menu = (row) => [
-    { label: 'Сгенерировать конфиги', icon: 'file-code', disabled: busy, onClick: () => act(() => generateFlow(ctx, { group: row.name })) },
+    { label: 'Сгенерировать конфиги', icon: 'file-code', disabled: busy, onClick: () => act(() => model.generateFlow(ctx, { group: row.name })) },
     { label: 'Удалить', icon: 'trash-2', danger: true, disabled: busy, onClick: () => remove(row.name) },
   ];
   return html`<${Loaded} title="Группы" state=${state} actions=${actions}>
     ${(data) => {
-      const list = model.rowsOf(data).filter((row) => row && typeof row.name === 'string');
+      const list = asList(data).filter((row) => row && typeof row.name === 'string');
       return html`<${Page} title="Группы" actions=${actions}>
         <${Card}>
           ${list.length === 0
@@ -103,49 +83,19 @@ function GroupCard({ ctx, name }) {
   const template = row ? model.str(row.template) : '—';
 
   const remove = async () => {
-    const result = await confirmed(ctx, 'Удаление группы', 'Удалить группу?', ['group', 'delete', '--name', name]);
+    const result = await model.confirmed(ctx, 'Удаление группы', 'Удалить группу?', model.groupDeleteArgv(name));
     return result.ok ? leave('groups') : undefined;
   };
-  /** `clients.rs::group_template`: выбор шаблона или новый шаблон группы (редактор — «Шаблоны»). */
   const chooseTemplate = async () => {
-    const read = await fetchData(ctx, ['template', 'list']);
-    if (!read) return undefined;
-    const values = await ctx.form({
-      title: `Шаблон группы: ${name}`,
-      fields: [
-        { name: 'template', label: 'Шаблон', type: 'select', value: template,
-          options: [...nameOptions(read.data), { value: model.NEW_TEMPLATE, label: 'Создать новый…' }] },
-        { name: 'name', label: 'Имя нового шаблона', type: 'text', required: 'Имя шаблона не указано.',
-          when: (v) => v.template === model.NEW_TEMPLATE },
-      ],
-    });
-    if (values === null || values === undefined) return undefined;
-    const plan = model.templateChange(template, values);
-    if (plan === null) return undefined;
-    if (plan.kind === 'set') {
-      await execute(ctx, ['group', 'set-template', '--name', name, '--template', plan.template]);
-      return undefined;
-    }
-    const created = await execute(ctx, ['template', 'create', '--name', plan.name, '--group', name]);
-    if (created.ok && created.data && typeof created.data.name === 'string') return leave('templates', created.data.name);
-    return undefined;
+    const created = await model.groupTemplateFlow(ctx, name, template);
+    return created === null ? undefined : leave('templates', created);
   };
-  const move = async (client) => {
-    const others = nameOptions(state.data).filter((option) => option.value !== name);
-    if (others.length === 0) { ctx.notify('warn', model.EMPTY); return; }
-    const values = await ctx.form({
-      title: `Перенос клиента: ${client}`,
-      submit: 'Перенести',
-      fields: [{ name: 'group', label: 'Новая группа', type: 'select', options: others, required: true }],
-    });
-    if (values === null || values === undefined) return;
-    await confirmed(ctx, 'Смена группы клиента', 'Сменить группу?', ['client', 'set-group', '--name', client, '--group', values.group]);
-  };
+  const move = (client) => model.moveClientFlow(ctx, name, state.data, client);
 
   const actions = html`
-    <${Action} primary icon="file-code" disabled=${busy} onClick=${() => act(() => generateFlow(ctx, { group: name }))}>Сгенерировать конфиги группы<//>
-    <${Action} icon="scroll-text" disabled=${busy} onClick=${() => act(chooseTemplate)}>Шаблон…<//>
-    <${Action} icon="rss" disabled=${busy} onClick=${() => act(() => showHeaders(ctx, 'group', name))}>Заголовки подписки<//>
+    <${Button} kind="primary" icon="file-code" disabled=${busy} onClick=${() => act(() => model.generateFlow(ctx, { group: name }))}>Сгенерировать конфиги группы<//>
+    <${Button} icon="scroll-text" disabled=${busy} onClick=${() => act(chooseTemplate)}>Шаблон…<//>
+    <${Button} icon="rss" disabled=${busy} onClick=${() => act(() => model.showHeaders(ctx, 'group', name))}>Заголовки подписки<//>
     <${MoreMenu} items=${[{ label: 'Удалить группу', icon: 'trash-2', danger: true, disabled: busy, onClick: () => act(remove) }]} />`;
 
   return html`<${Loaded} title=${name} back=${back} state=${state}>
@@ -159,7 +109,7 @@ function GroupCard({ ctx, name }) {
       <//>
       <${Loaded} title="Клиенты группы" state=${clients} inline>
         ${(data) => html`<${Card} title="Клиенты группы">
-          <${DataTable} rows=${model.rowsOf(data).filter((item) => item && typeof item.name === 'string')} empty="Нет клиентов"
+          <${DataTable} rows=${asList(data).filter((item) => item && typeof item.name === 'string')} empty="Нет клиентов"
             href=${(item) => ctx.href('clients', item.name)}
             menu=${(item) => [{ label: 'Перенести в группу…', icon: 'folders', disabled: busy, onClick: () => act(() => move(item.name)) }]}
             columns=${[

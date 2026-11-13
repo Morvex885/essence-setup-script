@@ -1,6 +1,16 @@
 // Подписи и форматирование значений ответов ядра — те же слова, что в TUI
 // (`remote-control/tui/src`). Чистые функции: без DOM и вендоренных файлов.
 
+/** Массив из ответа ядра (`rows` в TUI): не массив → пустой список. */
+export function asList(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+/** Строковые элементы массива (`clients.rs::strings`); не массив → пустой список. */
+export function strings(value) {
+  return asList(value).filter((item) => typeof item === 'string');
+}
+
 /** Значение ячейки: `null`/`undefined`/пустая строка → «—», объекты — JSON. */
 export function text(value) {
   if (value === null || value === undefined || value === '') return '—';
@@ -115,7 +125,18 @@ export async function readInputFile(file) {
 
 /** Записи журнала по уровню фильтра: `all` — все, `error`, `warn` — только этот уровень. */
 export function filterJournal(entries, level = 'all') {
-  const list = Array.isArray(entries) ? entries : [];
+  const list = asList(entries);
   if (level !== 'error' && level !== 'warn') return list;
   return list.filter((entry) => entry && entry.level === level);
+}
+
+/**
+ * Журнал с новой записью, не длиннее `limit`. `repeat: false` — запись с тем
+ * же уровнем и текстом, что у последней, не добавляется (фоновые сбои `quiet`).
+ */
+export function appendJournal(entries, entry, limit, repeat = true) {
+  const last = entries.length > 0 ? entries[entries.length - 1] : null;
+  if (!repeat && last && last.level === entry.level && last.text === entry.text) return entries;
+  const next = [...entries, entry];
+  return next.length > limit ? next.slice(next.length - limit) : next;
 }
