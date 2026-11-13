@@ -54,10 +54,12 @@ export function AceEditor({ value, version = 0, onChange, annotations = [], drop
       showPrintMargin: false,
       fontSize: 13,
       enableKeyboardAccessibility: true,
+      // Подпись поля ввода: Ace сам пересобирает `aria-label` (подпись + строка
+      // курсора) при фокусе и смене выделения — прямая установка атрибута теряется.
+      textInputAriaLabel: label,
       theme: dark ? THEME_DARK : THEME_LIGHT,
     });
     instance.commands.removeCommands(UNAVAILABLE_COMMANDS);
-    instance.textInput.getElement().setAttribute('aria-label', label);
     applying.current = true;
     instance.session.setValue(value ?? '');
     applying.current = false;

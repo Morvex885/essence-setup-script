@@ -32,6 +32,15 @@ export function screenKey(route) {
 }
 
 /**
+ * Маршрут экрана: раздел — собственное свойство `screens`, иначе сводка
+ * (`summary`). Имя из адреса не проверяется по цепочке прототипов:
+ * `#/constructor` или `#/__proto__` — тоже сводка.
+ */
+export function screenRoute(route, screens) {
+  return Object.prototype.hasOwnProperty.call(screens, route.name) ? route : { ...route, name: 'summary' };
+}
+
+/**
  * Решение по смене адреса при защите ухода (`ctx.setLeaveGuard`): `wait` —
  * вопрос о прежней смене ещё открыт (новые смены не спрашиваются заново,
  * по итогу берётся последний адрес), `ask` — защита есть и адрес другой,

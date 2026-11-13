@@ -196,3 +196,22 @@ test('assignConnections: группа, удалённая после чтени�
   await assignConnections(ctx, 'n', ['p1'], [['gone', 'g1']]);
   assert.deepEqual(record.calls, [['group', 'list']]);
 });
+
+test('telegramMenu: после открытого сеанса — after() (и при сбое терминала), отмена — без него', async () => {
+  const listed = () => [[['node', 'list'], ok([{ name: 'de' }])]];
+  const run = async (answer, terminal) => {
+    const { ctx } = assignCtx(listed(), [answer]);
+    const opened = [];
+    ctx.terminal = async (argv) => { opened.push(argv); return terminal(); };
+    let after = 0;
+    let thrown = null;
+    try { await telegramMenu(ctx, async () => { after += 1; }); } catch (error) { thrown = error; }
+    return { opened, after, thrown };
+  };
+  let result = await run({ node: 'de' }, () => ok());
+  assert.deepEqual([result.opened.length, result.after, result.thrown], [1, 1, null]);
+  result = await run({ node: 'de' }, () => { throw new Error('обрыв'); });
+  assert.deepEqual([result.opened.length, result.after, result.thrown.message], [1, 1, 'обрыв']);
+  result = await run(null, () => ok());
+  assert.deepEqual([result.opened.length, result.after], [0, 0]);
+});

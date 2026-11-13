@@ -290,8 +290,13 @@ export async function telegramNodes(ctx) {
   return nodes;
 }
 
-/** «Управление нодой…»: выбор ноды → `telegram menu` в терминале (`interactive`). */
-export async function telegramMenu(ctx) {
+/**
+ * «Управление нодой…»: выбор ноды → `telegram menu` в терминале (`interactive`).
+ * Сеанс меняет состояние ноды (перезапуск, секрет, отключение частей), поэтому
+ * после открытого сеанса — и при его сбое — вызывается `after()` (экран
+ * перечитывает статус); отмена выбора ничего не перечитывает.
+ */
+export async function telegramMenu(ctx, after = null) {
   const nodes = await telegramNodes(ctx);
   if (nodes === null) return;
   const values = await ctx.form({
@@ -299,7 +304,12 @@ export async function telegramMenu(ctx) {
     fields: [{ name: 'node', label: 'Нода', type: 'select', options: nodes }],
     submit: 'Открыть',
   });
-  if (values !== null) await interactive(ctx, values.node, true);
+  if (values === null || values === undefined) return;
+  try {
+    await interactive(ctx, values.node, true);
+  } finally {
+    if (after !== null) await after();
+  }
 }
 
 /**

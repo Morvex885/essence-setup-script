@@ -22,8 +22,13 @@ export function nodeLabel(node) {
   return `${plain(node.name)}  ${plain(node.ip)}:${plain(node.port)}`;
 }
 
-/** Состояние ноды для списка: `{ tone, label }` — нет пароля SSH, `issues` или «готова». */
+/**
+ * Состояние ноды для списка: `{ tone, label }` — нет пароля SSH, пароль не
+ * прочитан (`password: error` — хранилище секретов недоступно, это не «нет»),
+ * `issues` или «готова».
+ */
 export function nodeStatus(node) {
+  if (node.auth === 'password' && node.password === 'error') return { tone: 'error', label: 'пароль SSH не прочитан' };
   if (node.auth === 'password' && node.password !== 'ok') return { tone: 'warn', label: 'нет пароля SSH' };
   const issues = joinedPlain(node.issues);
   if (issues) return { tone: 'warn', label: issues };
@@ -35,10 +40,11 @@ export function authLabel(node) {
   return node.auth === 'password' ? 'по паролю' : 'по ключу';
 }
 
-/** Отметка пароля SSH карточки: только при входе по паролю, иначе `null`. */
+/** Отметка пароля SSH карточки (`nodes.rs::card_view`): только при входе по паролю, иначе `null`. */
 export function passwordStatus(node) {
   if (node.auth !== 'password') return null;
-  return node.password === 'ok' ? { tone: 'ok', label: 'сохранён' } : { tone: 'warn', label: 'нет' };
+  if (node.password === 'ok') return { tone: 'ok', label: 'сохранён' };
+  return node.password === 'error' ? { tone: 'error', label: 'не удалось прочитать' } : { tone: 'warn', label: 'нет' };
 }
 
 /** `node shell` / `telegram menu` (`nodes.rs::interactive`). */

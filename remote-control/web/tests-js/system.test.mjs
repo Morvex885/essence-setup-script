@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { runConfirmed } from '../assets/js/flows.js';
 import { joined } from '../assets/js/format.js';
 import {
-  dashboardTitle, attentionItems, assignmentsRead, updateAvailable, settingsAction, uninstallArgv, daemonLines,
+  dashboardTitle, attentionItems, assignmentsRead, updateAvailable, updateState, settingsAction, uninstallArgv, daemonLines,
   sourceView, sourceAction, importRecoveryKey, recoveryRun, githubWizardFlow, wizardAccounts,
   storageLabel, existingLabel, targetReplaceContext, passwordForm, CANCELLED, FILE_UNREADABLE, PASSWORDS_DIFFER, PASSWORD_EMPTY,
   OTHER_LOGIN,
@@ -139,6 +139,11 @@ test('настройки: обновление только при update_availa
   assert.equal(updateAvailable(version(true)), true);
   assert.equal(updateAvailable(error('failed')), false);
   assert.equal(updateAvailable(null), false);
+  assert.equal(updateState(version(true)), 'available');
+  assert.equal(updateState(version(false)), 'unchecked');
+  assert.equal(updateState(ok({ current: '1.1.0', latest: 'v1.1.0', update_available: false, checked: true })), 'none');
+  assert.equal(updateState(error('failed')), 'unchecked');
+  assert.equal(updateState(null), 'unchecked');
   assert.deepEqual(uninstallArgv('keep'), ['self', 'uninstall']);
   assert.deepEqual(uninstallArgv('remove'), ['self', 'uninstall', '--remove-data']);
 });

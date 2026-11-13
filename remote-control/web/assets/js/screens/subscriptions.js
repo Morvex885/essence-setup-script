@@ -26,33 +26,34 @@ export function SubscriptionsScreen({ ctx }) {
   const migrate = act(() => migrateFlow(ctx));
   const groupHeaders = act(() => groupHeadersFlow(ctx));
 
-  return html`<${Loaded} title="Подписки" state=${hostState}>${() => {
-    // Действия — как в меню, и без хоста: сбой объясняет ядро.
-    const actions = html`
-      <${Button} kind=${host ? 'primary' : 'neutral'} icon="refresh-cw" disabled=${busy} onClick=${publishAll}>Обновить все подписки<//>
-      <${Button} kind=${host ? 'neutral' : 'primary'} icon="server" disabled=${busy} onClick=${setHost}>Хост-нода…<//>
-      <${Button} icon="folders" disabled=${busy} onClick=${groupHeaders}>Заголовки группы<//>
-      <${MoreMenu} items=${[{ label: 'Перенос на другую ноду', icon: 'send', disabled: busy, onClick: migrate }]} />`;
-    return html`<${Page} title="Подписки" actions=${actions}>
-      <${Card}>
+  // Действия — как в меню, и без хоста: сбой объясняет ядро. Сбой чтения
+  // хоста ограничен его карточкой: список и действия остаются.
+  const actions = html`
+    <${Button} kind=${host ? 'primary' : 'neutral'} icon="refresh-cw" disabled=${busy} onClick=${publishAll}>Обновить все подписки<//>
+    <${Button} kind=${host ? 'neutral' : 'primary'} icon="server" disabled=${busy} onClick=${setHost}>Хост-нода…<//>
+    <${Button} icon="folders" disabled=${busy} onClick=${groupHeaders}>Заголовки группы<//>
+    <${MoreMenu} items=${[{ label: 'Перенос на другую ноду', icon: 'send', disabled: busy, onClick: migrate }]} />`;
+  return html`<${Page} title="Подписки" actions=${actions}>
+    <${Loaded} title="Хост-нода" state=${hostState} inline>
+      ${() => html`<${Card}>
         ${host
           ? html`<${Facts} items=${[
               { label: 'Хост-нода', value: html`<a class="link" href=${ctx.href('nodes', host.node)}>${host.node}</a>` },
               { label: 'Базовый URL', value: html`<span class="mono">${host.baseUrl}</span>` },
             ]} />`
           : html`<${Empty} icon="rss" title="Хост-нода подписок не задана" hint="Подписки публикуются на хост-ноде: выберите её кнопкой «Хост-нода…»." />`}
-      <//>
-      <${Loaded} title="Опубликованные подписки" state=${listState} inline>
-        ${(data) => html`<${Card} title="Опубликованные подписки">
-          <${DataTable} rows=${asList(data).map(subscriptionRow)} rowKey="client" empty="Нет опубликованных подписок"
-            href=${(row) => ctx.href('clients', row.client, 'subscription')}
-            columns=${[
-              { key: 'client', label: 'Клиент', search: true },
-              { key: 'expires', label: 'Срок' },
-              { key: 'state', label: 'Состояние', render: (row) => html`<${Badge} tone=${BADGE_TONES[row.state.tone] || 'neutral'}>${row.state.label}<//>` },
-            ]} />
-        <//>`}
-      <//>
-    <//>`;
-  }}<//>`;
+      <//>`}
+    <//>
+    <${Loaded} title="Опубликованные подписки" state=${listState} inline>
+      ${(data) => html`<${Card} title="Опубликованные подписки">
+        <${DataTable} rows=${asList(data).map(subscriptionRow)} rowKey="client" empty="Нет опубликованных подписок"
+          href=${(row) => ctx.href('clients', row.client, 'subscription')}
+          columns=${[
+            { key: 'client', label: 'Клиент', search: true },
+            { key: 'expires', label: 'Срок' },
+            { key: 'state', label: 'Состояние', render: (row) => html`<${Badge} tone=${BADGE_TONES[row.state.tone] || 'neutral'}>${row.state.label}<//>` },
+          ]} />
+      <//>`}
+    <//>
+  <//>`;
 }

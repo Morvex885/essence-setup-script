@@ -31,13 +31,15 @@ export function TelegramScreen({ ctx }) {
   };
   const load = () => run(readStatus);
   const present = (rows) => ctx.show({ title: TELEGRAM_RESULT_TITLE, wide: true, body: html`<${ResultTable} table=${rows} />` });
-  // После пакетного действия загруженный статус перечитывается: прежний устарел.
+  // После пакетного действия и сеанса меню загруженный статус перечитывается:
+  // прежний устарел (сеанс меню — и при его сбое).
   const runBatch = (action) => run(async () => {
     if ((await telegramBatch(ctx, action, present)) && table !== null) await readStatus();
   });
+  const openMenu = () => run(() => telegramMenu(ctx, () => (table !== null ? readStatus() : null)));
 
   const actions = html`
-    <${Button} icon="terminal" disabled=${busy} onClick=${() => run(() => telegramMenu(ctx))}>Управление нодой…<//>
+    <${Button} icon="terminal" disabled=${busy} onClick=${openMenu}>Управление нодой…<//>
     <${MoreMenu} label="Действия" items=${TELEGRAM_BATCH.map((action) => ({
       label: action.label,
       danger: action.danger === true,

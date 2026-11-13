@@ -158,6 +158,16 @@ export function updateAvailable(version) {
   return Boolean(version && version.ok && version.data && version.data.update_available === true);
 }
 
+/**
+ * Строка «Обновление» настроек: `available` — есть новая версия, `none` —
+ * проверка прошла, обновлений нет; `unchecked` — проверка не удалась
+ * (`checked !== true`) или ответа нет: «нет» по ней не выводится.
+ */
+export function updateState(version) {
+  if (updateAvailable(version)) return 'available';
+  return version && version.ok && version.data && version.data.checked === true ? 'none' : 'unchecked';
+}
+
 /** Объём удаления → argv `self uninstall` (`Settings`, ключ `x`). */
 export function uninstallArgv(scope) {
   const argv = ['self', 'uninstall'];

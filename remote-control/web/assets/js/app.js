@@ -49,8 +49,8 @@ const SILENT_ACTIVITY = new Set(['template check']);
 /** Хеш маршрута раздела; сводка — `#/`. */
 const href = (name, param = null, tab = null) => router.format(name === 'summary' ? '' : name, param, tab);
 
-/** Маршрут экрана: неизвестный раздел — сводка (ключ экрана — `router.screenKey`). */
-const screenRoute = (route) => (SCREENS[route.name] ? route : { ...route, name: 'summary' });
+/** Маршрут экрана: неизвестный (и унаследованный) раздел — сводка (ключ экрана — `router.screenKey`). */
+const screenRoute = (route) => router.screenRoute(route, SCREENS);
 
 const menuEntries = (active) => MENU.map((item) => (item.divider ? item : {
   ...item,

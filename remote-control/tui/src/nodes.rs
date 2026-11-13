@@ -199,7 +199,12 @@ fn card_view(name: &str, node: &Value, password: bool) -> View {
     view.context.push(plain(format!("Пользователь: {}", text(&node["user"]))));
     if password {
         view.context.push(plain("Вход: по паролю".into()));
-        view.context.push(if node["password"] == "ok" { ui::text("Пароль SSH: сохранён", ui::GREEN) } else { ui::text("Пароль SSH: нет", ui::YELLOW) });
+        // `error` — хранилище секретов не прочитано: это не «нет пароля».
+        view.context.push(match node["password"].as_str() {
+            Some("ok") => ui::text("Пароль SSH: сохранён", ui::GREEN),
+            Some("error") => ui::text("Пароль SSH: не удалось прочитать", ui::RED),
+            _ => ui::text("Пароль SSH: нет", ui::YELLOW),
+        });
     } else {
         view.context.push(plain("Вход: по ключу".into()));
     }
@@ -1104,6 +1109,10 @@ mod tests {
         missing["password"] = json!("missing");
         let (_, ui) = screen(&mut NodeCard("n".into()), &["0"], vec![step(&["node", "show", "--name", "n"], ok(missing))]);
         assert!(ui.views[0].context.iter().any(|l| l.to_string() == "Пароль SSH: нет" && l.style.fg == Some(ui::YELLOW)));
+        let mut unread = node();
+        unread["password"] = json!("error");
+        let (_, ui) = screen(&mut NodeCard("n".into()), &["0"], vec![step(&["node", "show", "--name", "n"], ok(unread))]);
+        assert!(ui.views[0].context.iter().any(|l| l.to_string() == "Пароль SSH: не удалось прочитать" && l.style.fg == Some(ui::RED)));
         for no in ["", "N", "n", "0"] {
             let (_, ui) = screen(&mut NodeCard("n".into()), &["u", no, "0"], vec![
                 show(), step(&["node", "upload-scripts", "--name", "n", "--force"], plan("confirmation_required", "one")), show(),

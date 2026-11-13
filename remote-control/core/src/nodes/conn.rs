@@ -177,12 +177,16 @@ fn assign(config: &mut Config, node: &str, group: &str, proxies: &[String]) {
     config.connections.retain(|connection| connection.node != node || !connection.groups.is_empty());
 }
 
-/// Proxies of `group` on `node` as a set.
-fn assigned(config: &Config, node: &str, group: &str) -> BTreeSet<String> {
-    config.connections.iter().filter(|connection| connection.node == node)
+/// Proxies of `group` on `node` as a set; `None` — the node has no entry
+/// for the group at all (an entry with no proxies is still an assignment:
+/// `group_nodes` counts it, so `G=` must remove it).
+fn assigned(config: &Config, node: &str, group: &str) -> Option<BTreeSet<String>> {
+    let mut entries = config.connections.iter().filter(|connection| connection.node == node)
         .flat_map(|connection| &connection.groups)
         .filter(|existing| existing.name == group)
-        .flat_map(|existing| existing.proxies.iter().cloned()).collect()
+        .peekable();
+    entries.peek()?;
+    Some(entries.flat_map(|existing| existing.proxies.iter().cloned()).collect())
 }
 
 /// `--assign G=P` values, one proxy per flag (a proxy name may hold any
@@ -220,7 +224,7 @@ fn changed_assignments(config: &Config, node: &str, wanted: &[(String, Vec<Strin
         return Err(RcError::new("not_found", format!("Группа «{group}» не найдена.")).with_extra("group", group.clone()));
     }
     Ok(wanted.iter()
-        .filter(|(group, proxies)| assigned(config, node, group) != proxies.iter().cloned().collect())
+        .filter(|(group, proxies)| assigned(config, node, group) != (!proxies.is_empty()).then(|| proxies.iter().cloned().collect()))
         .cloned().collect())
 }
 
@@ -532,6 +536,25 @@ mod tests {
         let connections = session.state.load_config().unwrap().connections;
         assert_eq!(connections[0].groups, vec![group("PC", &["p1", "p2", "p3"])]);
         assert_eq!(connections[1].groups, vec![group("ROUTER", &["r"])]);
+    }
+
+    #[test]
+    fn set_unassign_removes_an_entry_without_proxies() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut session, journal) = session(root.path());
+        let mut config = session.state.load_config().unwrap();
+        config.nodes = vec![node(1, "de", Auth::Key)];
+        config.connections = vec![Connection { node: "de".into(), groups: vec![group("PC", &[]), group("ROUTER", &["r"])] }];
+        session.state.save_config(&config).unwrap();
+        let run = |session: &mut Session, assign: &str| set(session, &invocation(&["conn", "set", "--name", "de", "--assign", assign])).unwrap();
+        // The empty entry still assigns the node to PC: `PC=` removes it.
+        assert_eq!(run(&mut session, "PC=")["changed"], json!([{"group": "PC", "proxies": []}]));
+        assert_eq!(session.state.load_config().unwrap().connections[0].groups, vec![group("ROUTER", &["r"])]);
+        assert_eq!(journal.borrow().last().unwrap().1, "de -> PC: назначение снято");
+        // No entry at all: nothing to change, no write.
+        let before = fingerprint(root.path());
+        assert_eq!(run(&mut session, "PC=")["changed"], json!([]));
+        assert_eq!(fingerprint(root.path()), before);
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -1,7 +1,7 @@
 // Тесты router.js: разбор и сборка `#/раздел/параметр/вкладка`, решение защиты ухода.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parse, format, navigate, consumeTicket, routeDecision, hashUrl, screenKey } from '../assets/js/router.js';
+import { parse, format, navigate, consumeTicket, routeDecision, hashUrl, screenKey, screenRoute } from '../assets/js/router.js';
 
 test('parse: раздел, параметр и вкладка декодируются по отдельности', () => {
   assert.deepEqual(parse('#/nodes/a%2Fb/awg'), { name: 'nodes', param: 'a/b', tab: 'awg' });
@@ -50,4 +50,13 @@ test('hashUrl и screenKey: адрес для replaceState и ключ экра�
   assert.equal(hashUrl(location, ''), '/?x=1');
   assert.equal(screenKey(parse('#/nodes/a/awg')), screenKey(parse('#/nodes/a/connections')));
   assert.notEqual(screenKey(parse('#/nodes/a')), screenKey(parse('#/nodes/b')));
+});
+
+test('screenRoute: только собственные разделы, остальное (и имена прототипа) — сводка', () => {
+  const screens = { summary: () => null, nodes: () => null };
+  const route = { name: 'nodes', param: 'a', tab: 'awg' };
+  assert.equal(screenRoute(route, screens), route);
+  for (const name of ['nope', 'constructor', 'hasOwnProperty', '__proto__', 'toString', '']) {
+    assert.deepEqual(screenRoute({ name, param: 'a', tab: null }, screens), { name: 'summary', param: 'a', tab: null }, name);
+  }
 });

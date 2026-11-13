@@ -54,6 +54,7 @@ async function exportTemplate(ctx, name) {
 function TemplateList({ ctx }) {
   const state = useCommand(ctx, templateList());
   const [busy, run] = useBusy();
+  const mounted = useMounted();
   const create = () => run(async () => {
     const names = asList(state.data).map((row) => row && row.name).filter((name) => typeof name === 'string');
     const values = await ctx.form({
@@ -68,8 +69,9 @@ function TemplateList({ ctx }) {
     if (values === null) return;
     const reply = await ctx.request(templateCreate(values.name, values.from || null));
     if (!reply.ok) { ctx.failed(); await state.reload(); return; }
-    // Как в TUI: созданный шаблон сразу открывается в редакторе.
-    if (reply.data && typeof reply.data.name === 'string') ctx.navigate('templates', reply.data.name);
+    // Как в TUI: созданный шаблон сразу открывается в редакторе — только пока
+    // список открыт, иначе поздний ответ уведёт из выбранного раздела.
+    if (reply.data && typeof reply.data.name === 'string') { if (mounted.current) ctx.navigate('templates', reply.data.name); }
     else await state.reload();
   });
   const menu = (row) => {
@@ -273,8 +275,14 @@ function TemplateEditor({ ctx, name }) {
     <${MoreMenu} items=${more} />
     <${Button} kind="primary" icon="save" disabled=${busy || !dirty} onClick=${save}>Сохранить<//>`;
   const badge = row && html`<${KindBadge} row=${row} />${dirty && html` <${Badge} tone="warn">не сохранено<//>`}`;
-  return html`<${Loaded} title=${name} back=${back} state=${list}>${() => (row ? html`
-    <${Page} title=${name} back=${back} badge=${badge} actions=${actions} subtitle=${kind === 'builtin' ? OVERRIDE_HINT : null}>
+  // Сбой `template list` ограничен карточкой «Группы»: текст шаблона читается
+  // отдельно (`template show`) и редактируется без него; вид шаблона (отметка,
+  // подсказка, удаление) неизвестен — не показывается.
+  const listFailed = Boolean(list.reply && !list.reply.ok);
+  if (!list.reply) return html`<${Loaded} title=${name} back=${back} state=${list}>${() => null}<//>`;
+  if (!row && !listFailed) return null;
+  return html`
+    <${Page} title=${name} back=${back} badge=${badge} actions=${actions} subtitle=${row && kind === 'builtin' ? OVERRIDE_HINT : null}>
       <div class="editor-layout">
         <div class="editor-main">
           ${!shown.reply
@@ -296,12 +304,14 @@ function TemplateEditor({ ctx, name }) {
             <span class="field-hint t-dim">Строки, которых нет в этом варианте, приглушены.</span>
           <//>
           <${Card} title="Группы" actions=${html`<${Button} icon="folders" disabled=${busy} onClick=${editGroups}>Группы…<//>`}>
-            <${Chips} items=${groupChips(ctx, row)} />
+            ${listFailed
+              ? html`<${ReadFailed} reply=${list.reply} loading=${list.loading} reload=${list.reload} />`
+              : html`<${Chips} items=${groupChips(ctx, row)} />`}
             ${name === DEFAULT_TEMPLATE && html`<span class="field-hint t-dim">Группы без своего шаблона используют default.yaml</span>`}
           <//>
         </div>
       </div>
-    <//>` : null)}<//>`;
+    <//>`;
 }
 
 const variantLabel = (variant) => (variant === '' ? 'без группы' : variant);

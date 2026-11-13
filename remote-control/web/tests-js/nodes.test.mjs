@@ -19,6 +19,9 @@ test('nodeLabel и состояние нод в списке (frames_keep_list_s
   assert.equal(model.nodeStatus(node()).tone, 'ok');
   assert.equal(model.nodeStatus(problem).tone, 'warn');
   assert.equal(model.nodeStatus(deferred).tone, 'warn');
+  const unread = model.nodeStatus({ ...problem, password: 'error' });
+  assert.equal(unread.tone, 'error');
+  assert.notEqual(unread.label, model.nodeStatus(problem).label);
 });
 
 test('карточка: способ входа и пароль SSH только при входе по паролю', () => {
@@ -26,7 +29,9 @@ test('карточка: способ входа и пароль SSH только
   assert.equal(model.authLabel({ ...node(), auth: 'key' }), 'по ключу');
   assert.equal(model.passwordStatus(node()).tone, 'ok');
   assert.equal(model.passwordStatus({ ...node(), password: 'missing' }).tone, 'warn');
-  assert.equal(model.passwordStatus({ ...node(), password: 'error' }).tone, 'warn');
+  const unread = model.passwordStatus({ ...node(), password: 'error' });
+  assert.equal(unread.tone, 'error');
+  assert.notEqual(unread.label, model.passwordStatus({ ...node(), password: 'missing' }).label);
   assert.equal(model.passwordStatus({ ...node(), auth: 'key', password: null }), null);
 });
 

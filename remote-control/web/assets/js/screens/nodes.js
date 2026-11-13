@@ -31,9 +31,9 @@ function NodeList({ ctx }) {
   const [overview, setOverview] = useState(null);
   const pending = Boolean(ctx.status && ctx.status.ssh_setup_pending === true);
   const reload = () => { list.reload(); ctx.refreshStatus(); };
+  // Перечитывание и при сбое действия: сеанс терминала мог изменить ноду до обрыва.
   const then = (action) => run(async () => {
-    await action();
-    reload();
+    try { await action(); } finally { reload(); }
   });
   const go = (name) => { if (mounted.current) ctx.navigate('nodes', name); };
   const add = () => run(async () => {
@@ -159,10 +159,9 @@ function NodeCard({ ctx, name, tab }) {
   const back = { href: ctx.href('nodes'), label: 'Ноды' };
   const active = TABS.some((item) => item.id === tab) ? tab : TABS[0].id;
   const tabs = TABS.map((item) => ({ ...item, href: ctx.href('nodes', name, item.id), active: item.id === active }));
-  /** Действие и перечитывание карточки. */
+  /** Действие и перечитывание карточки (и при сбое: терминал мог изменить ноду). */
   const then = (action) => run(async () => {
-    await action();
-    show.reload();
+    try { await action(); } finally { show.reload(); }
   });
   const go = (...route) => { if (mounted.current) ctx.navigate(...route); };
 
