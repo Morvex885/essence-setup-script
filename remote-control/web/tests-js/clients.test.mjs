@@ -18,12 +18,25 @@ test('client delete argv repeats --name in selection order', () => {
   assert.deepEqual(m.deleteClientsArgv(['alice', 'bob']), ['client', 'delete', '--name', 'alice', '--name', 'bob']);
 });
 
-test('subscription state and card context', () => {
+test('subscription state and list badge', () => {
   assert.equal(m.subscriptionState(row('a', true, unpublished)), 'нет');
   assert.equal(m.subscriptionState(row('a', true, { published: true, expires_at: '2026-12-01T00:00:00Z' })), 'опубликована до 2026-12-01T00:00:00Z');
   assert.equal(m.subscriptionState(row('a', true, { published: true, expires_at: null })), 'опубликована, без срока');
-  assert.deepEqual(m.clientContext(row('a', false, unpublished)), ['Группа: PC', 'Ноды: свои (de)', 'Подписка: нет']);
-  assert.equal(m.clientContext({ name: 'a', group: 'PC', nodes: [] })[1], 'Ноды: от группы (нет)');
+  assert.equal(m.subscriptionBadge(row('a', true, unpublished)).tone, 'neutral');
+  assert.deepEqual(m.subscriptionBadge(row('a', true, { published: true, expires_at: 'X' })), { tone: 'ok', label: 'до X' });
+  assert.equal(m.subscriptionBadge(row('a', true, { published: true, expires_at: null })).tone, 'ok');
+});
+
+test('client edit: set-group under the old name, then rename', () => {
+  const r = row('alice', true, unpublished);
+  assert.deepEqual(m.editSteps('alice', r, { name: 'alice', group: 'PC' }), []);
+  const both = m.editSteps('alice', r, { name: 'bob', group: 'LAB' });
+  assert.deepEqual(both.map((s) => s.argv), [
+    ['client', 'set-group', '--name', 'alice', '--group', 'LAB'],
+    ['client', 'rename', '--name', 'alice', '--new-name', 'bob'],
+  ]);
+  assert.deepEqual(both.map((s) => Boolean(s.rename)), [false, true]);
+  assert.deepEqual(m.editSteps('alice', r, { name: 'bob', group: 'PC' }).map((s) => s.argv[1]), ['rename']);
 });
 
 test('rename and delete follow error extras', () => {
@@ -50,17 +63,15 @@ test('client data shows credentials, link state and connections', () => {
   assert.ok(m.clientDataLines({ ...shown, subscription: null }).some((l) => l.text === 'Подписка: нет'));
 });
 
-test('client nodes menu and argv', () => {
-  assert.deepEqual(m.clientNodesMenu('alice', true).options.map((o) => o.label), ['Назначить свои ноды']);
-  const own = m.clientNodesMenu('alice', false);
-  assert.equal(own.title, 'Ноды клиента: alice (сейчас свои)');
-  assert.deepEqual(own.options.map((o) => o.value), ['own', 'inherit']);
+test('client nodes change and argv', () => {
+  assert.equal(m.nodesChange('alice', true, { mode: 'inherit' }), null);
+  assert.deepEqual(m.nodesChange('alice', false, { mode: 'inherit' }), { kind: 'inherit', argv: m.inheritNodesArgv('alice') });
+  assert.deepEqual(m.nodesChange('alice', true, { mode: 'own', nodes: ['de'] }), { kind: 'own', argv: ['client', 'nodes', '--name', 'alice', '--node', 'de'] });
   assert.deepEqual(m.clientNodesArgv('alice', ['de', 'ru']), ['client', 'nodes', '--name', 'alice', '--node', 'de', '--node', 'ru']);
   assert.deepEqual(m.inheritNodesArgv('alice'), ['client', 'nodes', '--name', 'alice', '--inherit']);
 });
 
-test('client connections: available nodes, current proxies, argv', () => {
-  assert.deepEqual(m.availableNodes(nodes, ['de', 'gone']).map((r) => r.name), ['de']);
+test('client connections: current proxies, argv', () => {
   assert.deepEqual(m.assignedProxies([{ node: 'de', mode: 'own', proxies: ['p1'] }, { node: 'ru', proxies: ['x'] }], 'de'), ['p1']);
   assert.deepEqual(m.discoveredProxies([{ node: 'de', groups: [], discovered: ['p1', 'p2'] }]), ['p1', 'p2']);
   assert.deepEqual(m.discoveredProxies(null), []);
@@ -79,6 +90,11 @@ test('ttl menu and publish argv', () => {
   assert.deepEqual(m.publishArgv('alice', '7d'), ['subscription', 'publish', '--name', 'alice', '--ttl', '7d']);
   assert.equal(m.published({ ok: false, error: { code: 'partial' } }), true);
   assert.equal(m.published({ ok: false, error: { code: 'needs_setup' } }), false);
+  assert.equal(m.ttlValue({ ttl: 'keep' }), null);
+  assert.equal(m.ttlValue({ ttl: '30d' }), '30d');
+  assert.equal(m.ttlValue({ ttl: 'custom', custom: '7d' }), '7d');
+  assert.equal(m.ttlError('7d'), null);
+  assert.ok(m.ttlError('7') && m.ttlError('d7') && m.ttlError('7 d'));
 });
 
 test('host line', () => {
@@ -124,11 +140,8 @@ test('generation summary reads partial from error and omits empty lines', () => 
   assert.deepEqual(m.summaryLines({}, m.GENERATE_FIELDS, 'Нет результатов'), [{ text: 'Нет результатов', tone: 'dim' }]);
 });
 
-test('group card context and template menu', () => {
-  assert.deepEqual(m.groupContext({ name: 'PC', template: 'default.yaml', clients: 1, nodes: ['de'] }),
-    ['Шаблон: default.yaml', 'Клиентов: 1', 'Ноды: de']);
-  const menu = m.groupTemplateMenu('PC', 'default.yaml', [{ name: 'default.yaml' }, { name: 'm.yaml' }]);
-  assert.ok(menu.title.includes('текущий: default.yaml'));
-  assert.deepEqual(menu.options.map((o) => o.label), ['default.yaml', 'm.yaml', 'Создать новый шаблон']);
-  assert.equal(menu.options[2].value, m.NEW_TEMPLATE);
+test('group template change', () => {
+  assert.equal(m.templateChange('default.yaml', { template: 'default.yaml' }), null);
+  assert.deepEqual(m.templateChange('default.yaml', { template: m.NEW_TEMPLATE, name: 'lab' }), { kind: 'create', name: 'lab' });
+  assert.deepEqual(m.templateChange('default.yaml', { template: 'm.yaml' }), { kind: 'set', template: 'm.yaml' });
 });

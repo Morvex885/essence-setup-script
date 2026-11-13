@@ -1,37 +1,32 @@
-// Генерация конфигов (`tui/src/clients.rs::generation`): `group list` в
-// контексте, `generate --all|--group|--client` через `shared.js::runGenerate`.
-import { html } from '../../vendor/preact-htm.js';
-import { Card } from '../ui.js';
-import { useCommand, useBusy, Action, Context, Back, Loaded } from './kit.js';
-import { runGenerate } from './shared.js';
-import { GENERATE_ALL, generateGroup, generateClient, generationContext } from './catalog-model.js';
-import { pick } from './clients-model.js';
+// Генерация конфигов (`tui/src/clients.rs::generation`): форма «Кому» и
+// `generate --all|--group|--client` через `shared.js::runGenerate`.
+import { runGenerate, nameOptions } from './shared.js';
+import { generateGroup, generateClient, generateScope } from './catalog-model.js';
 
-export function GenerateScreen({ ctx }) {
-  const state = useCommand(ctx, ['group', 'list']);
-  const [busy, run] = useBusy();
-  const generate = (scope) => run(async () => {
-    const tail = await scope();
-    if (tail === null) return;
-    await runGenerate(ctx, tail);
-    await state.reload();
+const SCOPES = [
+  { value: 'all', label: 'Всем клиентам' },
+  { value: 'group', label: 'Группе' },
+  { value: 'client', label: 'Одному клиенту' },
+];
+
+/**
+ * Генерация конфигов: `preset` — `{ group }` или `{ client }` — сразу без
+ * формы; иначе списки групп и клиентов читаются до формы (сбой — `ctx.failed`).
+ */
+export async function generateFlow(ctx, preset = null) {
+  if (preset && typeof preset.group === 'string') { await runGenerate(ctx, generateGroup(preset.group)); return; }
+  if (preset && typeof preset.client === 'string') { await runGenerate(ctx, generateClient(preset.client)); return; }
+  const [groups, clients] = await Promise.all([ctx.request(['group', 'list']), ctx.request(['client', 'list'])]);
+  if (!groups.ok || !clients.ok) { ctx.failed(); return; }
+  const values = await ctx.form({
+    title: 'Генерация конфигов',
+    submit: 'Сгенерировать',
+    fields: [
+      { name: 'scope', label: 'Кому', type: 'radio', value: 'all', options: SCOPES },
+      { name: 'group', label: 'Группа', type: 'select', options: nameOptions(groups.data), required: true, when: (v) => v.scope === 'group' },
+      { name: 'client', label: 'Клиент', type: 'select', options: nameOptions(clients.data), required: true, when: (v) => v.scope === 'client' },
+    ],
   });
-  const all = () => generate(async () => GENERATE_ALL);
-  const group = () => generate(async () => {
-    const name = await pick(ctx, 'group', 'Генерация по группе');
-    return name === null ? null : generateGroup(name);
-  });
-  const client = () => generate(async () => {
-    const name = await pick(ctx, 'client', 'Генерация для клиента');
-    return name === null ? null : generateClient(name);
-  });
-  const actions = html`
-    <${Action} tone="change" disabled=${busy} onClick=${all}>Всем клиентам<//>
-    <${Action} tone="change" disabled=${busy} onClick=${group}>По группе<//>
-    <${Action} tone="change" disabled=${busy} onClick=${client}>Одному клиенту<//>
-    <${Back} ctx=${ctx} to="summary" />`;
-  return html`<${Loaded} title="Генерация конфигов" state=${state} actions=${html`<${Back} ctx=${ctx} to="summary" />`}>${(data) => html`
-    <${Card} title="Генерация конфигов" actions=${actions}>
-      <${Context} lines=${generationContext(data)} />
-    <//>`}<//>`;
+  if (values === null || values === undefined) return;
+  await runGenerate(ctx, generateScope(values));
 }

@@ -1,7 +1,6 @@
 // Модель экранов нод без DOM — перенос чистой логики `tui/src/nodes.rs`
-// (`node_label`, `node_items`, `card_view`, `delete_node`, `add_node_with`,
-// `harden`, `aliases`, `offer_upload`, `interactive`): подписи, строки
-// контекста, тона действий и argv команд.
+// (`node_label`, `card_view`, `delete_node`, `add_node_with`, `harden`,
+// `aliases`, `offer_upload`, `interactive`): подписи, состояния и argv команд.
 
 /** Строковое значение поля (`nodes.rs::text`): `null`/`undefined` → ''. */
 export function plain(value) {
@@ -24,69 +23,23 @@ export function nodeLabel(node) {
   return `${plain(node.name)}  ${plain(node.ip)}:${plain(node.port)}`;
 }
 
-/** Нода с проблемой: пароль не сохранён при входе по паролю или есть `issues`. */
-export function nodeProblem(node) {
-  return (node.auth === 'password' && node.password !== 'ok') || list(node.issues).length > 0;
-}
-
-/** Пункты списка нод (`nodes.rs::node_items(.., true)`): проблемные — жёлтые. */
-export function nodeItems(data) {
-  return list(data).map((node) => ({
-    name: plain(node.name),
-    label: nodeLabel(node),
-    tone: nodeProblem(node) ? 'change' : 'view',
-  }));
-}
-
-/** Действия списка нод (`Nodes::run`): отложенная настройка — только при `ssh_setup_pending`. */
-export function listActions(status) {
-  const actions = [{ key: 'a', label: 'Добавить ноду', tone: 'create' }];
-  if (status && status.ssh_setup_pending === true) {
-    actions.push({ key: 'h', label: 'Завершить отложенную SSH-настройку', tone: 'change' });
-  }
-  return actions;
-}
-
-/** Строки контекста карточки (`nodes.rs::card_view`): строка или `{ text, tone }`. */
-export function cardContext(node) {
-  const lines = [
-    `Адрес: ${plain(node.ip)}:${plain(node.port)}`,
-    `Пользователь: ${plain(node.user)}`,
-  ];
-  if (node.auth === 'password') {
-    lines.push('Вход: по паролю');
-    lines.push(node.password === 'ok'
-      ? { text: 'Пароль SSH: сохранён', tone: 'ok' }
-      : { text: 'Пароль SSH: нет', tone: 'warn' });
-  } else {
-    lines.push('Вход: по ключу');
-  }
-  lines.push(`Тег: ${plain(node.tag)}`);
+/** Состояние ноды для списка: `{ tone, label }` — нет пароля SSH, `issues` или «готова». */
+export function nodeStatus(node) {
+  if (node.auth === 'password' && node.password !== 'ok') return { tone: 'warn', label: 'нет пароля SSH' };
   const issues = joinedPlain(node.issues);
-  if (issues) lines.push({ text: `Требует настройки: ${issues}`, tone: 'warn' });
-  const groups = joinedPlain(node.groups);
-  lines.push(`Группы: ${groups || 'нет'}`);
-  lines.push(`Клиентов: ${plain(node.clients)}`);
-  return lines;
+  if (issues) return { tone: 'warn', label: issues };
+  return { tone: 'ok', label: 'готова' };
 }
 
-/** Действия карточки в порядке и с цветами `card_view` (без «Назад»). */
-export function cardActions(node) {
-  const actions = [
-    { key: 'o', label: 'Меню сервера', tone: 'view' },
-    { key: 't', label: 'Telegram Proxy на ноде', tone: 'view' },
-    { key: 'p', label: 'Подключения ноды', tone: 'view' },
-    { key: 'a', label: 'Клиенты AmneziaWG', tone: 'view' },
-    { key: 'k', label: 'Проверить подключение', tone: 'view' },
-    { key: 'u', label: 'Загрузить скрипты принудительно', tone: 'change' },
-    { key: 'h', label: 'Усилить защиту SSH', tone: 'change' },
-    { key: 'r', label: 'Переименовать', tone: 'change' },
-    { key: 'e', label: 'Тег', tone: 'change' },
-  ];
-  if (node.auth === 'password') actions.push({ key: 'w', label: 'Пароль SSH', tone: 'change' });
-  actions.push({ key: 'l', label: 'Псевдонимы подключений', tone: 'change' });
-  actions.push({ key: 'd', label: 'Удалить ноду', tone: 'danger' });
-  return actions;
+/** Способ входа (`nodes.rs::card_view`). */
+export function authLabel(node) {
+  return node.auth === 'password' ? 'по паролю' : 'по ключу';
+}
+
+/** Отметка пароля SSH карточки: только при входе по паролю, иначе `null`. */
+export function passwordStatus(node) {
+  if (node.auth !== 'password') return null;
+  return node.password === 'ok' ? { tone: 'ok', label: 'сохранён' } : { tone: 'warn', label: 'нет' };
 }
 
 /** `node shell` / `telegram menu` (`nodes.rs::interactive`). */
@@ -174,9 +127,18 @@ export function addAttemptArgv(base, hostKey, defer) {
 /** Первые флаги ключа сервера при добавлении. */
 export const ACCEPT_HOST_KEY = ['--accept-new-host-key'];
 
-/** Подпись вопроса псевдонима (`nodes.rs::aliases`). */
-export function aliasPrompt(entry) {
-  return `${plain(entry.proxy)} [${plain(entry.alias)}] (- — удалить)`;
+/**
+ * Ответы формы псевдонимов (`a<индекс>` — новое значение) в значения
+ * `aliasArgv`: без изменений → `''`, очищенный → `-`, иначе новое значение.
+ */
+export function aliasValues(entries, form) {
+  return list(entries).map((entry, index) => {
+    const current = plain(entry.alias);
+    const value = plain(form && form[`a${index}`]);
+    if (value === current) return '';
+    if (value === '') return '-';
+    return value;
+  });
 }
 
 /**

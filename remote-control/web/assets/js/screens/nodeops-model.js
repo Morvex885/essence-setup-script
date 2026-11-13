@@ -1,13 +1,11 @@
-// Модель экранов «Подключения», «AmneziaWG», «Telegram Proxy» — перенос
-// чистой логики `tui/src/nodes.rs` (`synced_node`, `sync_problem`, строки
-// контекста, argv команд, таблица `telegram_table`). Без DOM и вендоренных
-// файлов. Тоны строк: `null` — обычный (NC), `ok` (GREEN), `warn` (YELLOW),
-// `error` (RED), `dim` (DIM). Тоны действий — правила скилла essence-menus.
+// Модель вкладок ноды «Подключения», «AmneziaWG» и экрана «Telegram Proxy» —
+// перенос чистой логики `tui/src/nodes.rs` (`synced_node`, `sync_problem`,
+// `assign_connections`, `awg_node`, argv команд, таблица `telegram_table`).
+// Без DOM и вендоренных файлов. Тоны: `ok` (GREEN), `warn` (YELLOW), `error`
+// (RED), `neutral` (DIM).
 
-/** Пустой мультивыбор (`nodes.rs::EMPTY`). */
+/** Пустой выбор (`nodes.rs::EMPTY`). */
 export const EMPTY = 'Нет объектов для выбора';
-export const NOTHING_SELECTED = 'Ничего не выбрано.';
-export const NO_NODES = 'Нет нод';
 
 /** Строки массива (`rows`). */
 export function rows(value) {
@@ -37,52 +35,9 @@ export function syncProblem(status) {
   }
 }
 
-/** Данные синхронизации из ответа `conn sync`: `data`, при `partial` — `error`; иначе `null`. */
-export function syncData(reply) {
-  if (reply.ok) return reply.data;
-  if (reply.error && reply.error.code === 'partial') return reply.error;
-  return null;
-}
-
 /**
- * Обзор подключений (`Connections::run`): ноды `conn list` с состоянием
- * последней синхронизации. Группа: `назначено/всего`, тон — все назначены
- * (`ok`), часть (`warn`), всего неизвестно или 0 (`dim`).
- */
-export function overviewNodes(list, synced) {
-  return rows(list).map((entry) => {
-    const name = nodeText(entry.node);
-    const state = syncedNode(synced, name);
-    const problem = state ? syncProblem(state.status) : null;
-    if (problem) return { name, problem, groups: [] };
-    const total = state && Array.isArray(state.discovered) ? state.discovered.length : null;
-    const groups = rows(entry.groups).map((group) => {
-      const assigned = rows(group.proxies).length;
-      const tone = total !== null && total > 0 ? (assigned >= total ? 'ok' : 'warn') : 'dim';
-      return { text: `  ${nodeText(group.name)}: ${assigned}/${total === null ? '?' : total}`, tone };
-    });
-    return { name, problem: null, groups };
-  });
-}
-
-/** Строки контекста обзора в порядке TUI. */
-export function overviewLines(nodes) {
-  if (nodes.length === 0) return [{ text: NO_NODES, tone: 'dim' }];
-  const lines = [];
-  for (const node of nodes) {
-    if (node.problem) {
-      lines.push({ text: `${node.name}  ${node.problem}`, tone: 'warn' });
-      continue;
-    }
-    lines.push({ text: node.name, tone: null });
-    lines.push(...node.groups);
-  }
-  return lines;
-}
-
-/**
- * Карточка подключений ноды (`connection_node`): обнаруженные подключения,
- * группы каждого и строки контекста.
+ * Подключения ноды (`connection_node`): обнаруженные подключения, группы
+ * каждого (`assigned[i]`), строки таблицы и проблема синхронизации ноды.
  */
 export function connectionView(listed, state, name) {
   const entry = rows(listed).find((row) => row && row.node === name);
@@ -91,12 +46,9 @@ export function connectionView(listed, state, name) {
   const assigned = proxies.map((proxy) => groups
     .filter((group) => rows(group.proxies).includes(proxy))
     .map((group) => nodeText(group.name)));
-  const lines = [];
   const problem = syncProblem(state && state.status);
-  if (problem) lines.push({ text: `Нода ${problem}`, tone: 'warn' });
-  else if (proxies.length === 0) lines.push({ text: 'Подключения не найдены', tone: 'dim' });
-  proxies.forEach((proxy, index) => lines.push({ text: `${proxy}  [${assigned[index].join(', ')}]`, tone: null }));
-  return { proxies, assigned, lines };
+  const table = proxies.map((proxy, index) => ({ proxy, groups: assigned[index] }));
+  return { proxies, assigned, problem, table };
 }
 
 /** Заголовок выбора групп (`assign_connections`). */
@@ -113,55 +65,49 @@ export function assignArgv(name, groups, proxies) {
 }
 
 /**
- * Назначение подключений (`assign_connections`): сначала подключения
- * (отмечены назначенные), затем целевые группы (без отметок). Без
- * обнаруженных подключений их выбор пропускается: пустой набор снимает
- * назначение выбранных групп (`conn set` без `--proxy`). Отмена любого
- * выбора ничего не меняет.
+ * Назначение подключений (`assign_connections`) одной формой: подключения
+ * (отмечены назначенные) и целевые группы (без отметок, хотя бы одна). Без
+ * обнаруженных подключений поля подключений нет: пустой набор снимает
+ * назначение выбранных групп (`conn set` без `--proxy`). Отмена ничего не меняет.
  */
 export async function assignConnections(ctx, name, proxies, assigned) {
-  let selected = [];
-  if (proxies.length > 0) {
-    selected = await ctx.toggle({
-      title: 'Подключения для групп',
-      options: proxies.map((proxy) => ({ value: proxy, label: proxy })),
-      selected: proxies.filter((_, index) => assigned[index].length > 0),
-      empty: EMPTY,
-      submit: 'Далее',
-    });
-    if (selected === null) return;
-  }
   const listed = await ctx.call('group', 'list');
   if (!listed.ok) {
     if (ctx.isFailure(listed)) ctx.failed();
     return;
   }
   const groups = rows(listed.data).map((row) => nodeText(row.name));
-  const targets = await ctx.toggle({
-    title: assignGroupsTitle(selected),
-    options: groups.map((group) => ({ value: group, label: group })),
-    selected: [],
-    empty: EMPTY,
-  });
-  if (targets === null) return;
-  if (targets.length === 0) {
-    ctx.notify('warn', NOTHING_SELECTED);
+  if (groups.length === 0) {
+    ctx.notify('warn', EMPTY);
     return;
   }
-  const saved = await ctx.request(assignArgv(name, targets, selected));
+  const fields = [];
+  if (proxies.length > 0) {
+    fields.push({
+      name: 'proxies',
+      label: 'Подключения',
+      type: 'multi',
+      options: proxies.map((proxy) => ({ value: proxy, label: proxy })),
+      value: proxies.filter((_, index) => assigned[index].length > 0),
+      hint: 'Без отмеченных подключений назначение выбранных групп снимается',
+    });
+  }
+  fields.push({
+    name: 'groups',
+    label: 'Группы',
+    type: 'multi',
+    options: groups.map((group) => ({ value: group, label: group })),
+    required: true,
+  });
+  const values = await ctx.form({ title: assignGroupsTitle(proxies), context: [`Нода: ${name}`], fields, submit: 'Назначить' });
+  if (values === null) return;
+  const saved = await ctx.request(assignArgv(name, values.groups, values.proxies || []));
   if (ctx.isFailure(saved)) ctx.failed();
 }
 
 export const connSyncArgv = (name = null) => (name === null ? ['conn', 'sync'] : ['conn', 'sync', '--name', name]);
 export const connListArgv = (name = null) => (name === null ? ['conn', 'list'] : ['conn', 'list', '--name', name]);
 export const nodeCheckArgv = (name) => ['node', 'check', '--name', name];
-
-/** Действия карточки подключений ноды. */
-export const CONNECTION_ACTIONS = [
-  { id: 'assign', label: 'Назначить подключения группам', tone: 'change' },
-  { id: 'aliases', label: 'Псевдонимы подключений', tone: 'change' },
-  { id: 'sync', label: 'Синхронизировать с нодой', tone: 'change' },
-];
 
 // ─── AmneziaWG ───────────────────────────────────────────────────────────────
 
@@ -173,30 +119,31 @@ export const awgSyncArgv = (name) => ['awg', 'sync', '--name', name];
 export const awgRemovePeerArgv = (name, peer) => ['awg', 'remove', '--name', name, '--peer', peer];
 export const awgOrphansArgv = (name) => ['awg', 'remove', '--name', name, '--orphans'];
 
-/** Карточка AmneziaWG ноды (`awg_node`) по ответу `awg status`. */
+/** Состояния клиентов AmneziaWG (`awg_node`). */
+const AWG_STATES = {
+  used: { tone: 'ok', label: 'используется' },
+  orphan: { tone: 'warn', label: 'не используется' },
+  missing: { tone: 'neutral', label: 'не создан' },
+};
+
+/**
+ * Вкладка AmneziaWG ноды (`awg_node`) по ответу `awg status`: строки
+ * клиентов, признаки недостающих и неиспользуемых. `removable` — клиент
+ * существует на ноде (не `missing`).
+ */
 export function awgView(data) {
   const installed = Boolean(data) && data.installed === true;
-  const peers = rows(data && data.peers);
-  const lines = [];
-  if (!installed) lines.push({ text: 'AmneziaWG на ноде не установлен', tone: 'dim' });
-  else if (peers.length === 0) lines.push({ text: 'Нет клиентов', tone: 'dim' });
-  if (installed) {
-    for (const peer of peers) {
-      const [suffix, tone] = peer.status === 'used' ? ['', 'ok']
-        : peer.status === 'orphan' ? ['  не используется', 'warn'] : ['  не создан', 'dim'];
-      lines.push({ text: `${nodeText(peer.name)}${suffix}`, tone });
-    }
-  }
-  const removable = peers.filter((peer) => peer.status !== 'missing').map((peer) => nodeText(peer.name));
-  const actions = [{ id: 'refresh', label: 'Обновить', tone: 'view' }];
-  if (installed) {
-    actions.push(
-      { id: 'sync', label: 'Создать недостающих', tone: 'create' },
-      { id: 'remove', label: 'Удалить клиента', tone: 'danger' },
-      { id: 'orphans', label: 'Удалить неиспользуемых', tone: 'danger' },
-    );
-  }
-  return { installed, lines, removable, actions };
+  const peers = installed ? rows(data.peers) : [];
+  const table = peers.map((peer) => {
+    const state = AWG_STATES[peer.status] || AWG_STATES.missing;
+    return { name: nodeText(peer.name), status: peer.status, tone: state.tone, label: state.label, removable: peer.status !== 'missing' };
+  });
+  return {
+    installed,
+    table,
+    missing: table.some((row) => row.status === 'missing'),
+    orphans: table.some((row) => row.status === 'orphan'),
+  };
 }
 
 // ─── Telegram ────────────────────────────────────────────────────────────────
@@ -211,16 +158,10 @@ export const TELEGRAM_COMPONENTS = [
   { value: 'mtproto', label: 'MTProto Proxy' },
 ];
 
-/** Просмотр (первая секция меню `Telegram::run`). */
-export const TELEGRAM_VIEW = [
-  { id: 'node', label: 'Управление одной нодой', tone: 'view' },
-  { id: 'status', label: 'Общий статус нод', tone: 'view' },
-];
-
 /**
- * Пакетные действия (вторая секция) в порядке TUI: `title` — заголовок
- * выбора нод и плана, `argv` — команда без `--name`. `component` — сначала
- * выбрать способ доступа (`telegram remove --component`).
+ * Пакетные действия (меню «Действия») в порядке TUI: `title` — заголовок
+ * формы выбора нод и плана, `argv` — команда без `--name`. `component` —
+ * в форме ещё и способ доступа (`telegram remove --component`).
  */
 export const TELEGRAM_BATCH = [
   { id: 'install', label: 'Включить MTProto Proxy', tone: 'create', title: 'Включение MTProto Proxy', argv: ['telegram', 'install'] },

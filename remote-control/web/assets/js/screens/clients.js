@@ -1,16 +1,48 @@
-// Клиенты (`#/clients`, `#/clients/<имя>`) — перенос `clients.rs::clients`,
-// `delete_clients`, `client_card`, `show_client`, `client_nodes`,
-// `client_connections`. Подписка клиента — `shared.js::clientSubscription`.
-import { html, useEffect } from '../../vendor/preact-htm.js';
-import { Card, Table, Button, downloadText } from '../ui.js';
-import { useCommand, useBusy, Action, Actions, Context, Back, Loaded } from './kit.js';
-import { execute, confirmed, fetchData, required, runGenerate, clientSubscription } from './shared.js';
+// Клиенты (`#/clients`, `#/clients/<имя>/<вкладка>`) — перенос
+// `clients.rs::clients`, `delete_clients`, `client_card`, `show_client`,
+// `client_nodes`, `client_connections`, `client_subscription`.
+import { html, useEffect, useState } from '../../vendor/preact-htm.js';
+import { Page, Card, DataTable, MoreMenu, Facts, Badge, Chips, Empty, downloadText } from '../ui.js';
+import { useCommand, useBusy, useMounted, Action, Actions, Context, Loaded } from './kit.js';
+import { execute, confirmed, fetchData, nameOptions, showHeaders, showShare, resolvedHeaders } from './shared.js';
+import { generateFlow } from './generate.js';
 import * as model from './clients-model.js';
 
-export function ClientsScreen({ ctx, param }) {
+export function ClientsScreen({ ctx, param, tab }) {
   return param === null || param === undefined
     ? html`<${ClientList} ctx=${ctx} />`
-    : html`<${ClientCard} ctx=${ctx} name=${param} key=${param} />`;
+    : html`<${ClientCard} ctx=${ctx} name=${param} tab=${tab} key=${param} />`;
+}
+
+/** Отметка подписки клиента (`subscriptionBadge`). */
+function SubscriptionBadge({ row }) {
+  const badge = model.subscriptionBadge(row);
+  return html`<${Badge} tone=${badge.tone}>${badge.label}<//>`;
+}
+
+/** Ссылка на группу клиента. */
+function GroupLink({ ctx, group }) {
+  return typeof group === 'string' ? html`<a class="link" href=${ctx.href('groups', group)}>${group}</a>` : '—';
+}
+
+/**
+ * Добавление клиента: имя и группа одной формой → `client add`; успех —
+ * карточка нового клиента.
+ */
+export async function addClientFlow(ctx) {
+  const read = await fetchData(ctx, ['group', 'list']);
+  if (!read) return;
+  const values = await ctx.form({
+    title: 'Добавить клиента',
+    submit: 'Добавить',
+    fields: [
+      { name: 'name', label: 'Имя клиента', type: 'text', required: 'Имя клиента не указано.', autofocus: true },
+      { name: 'group', label: 'Группа', type: 'select', options: nameOptions(read.data), required: true },
+    ],
+  });
+  if (values === null || values === undefined) return;
+  const reply = await execute(ctx, ['client', 'add', '--name', values.name, '--group', values.group]);
+  if (reply.ok) ctx.navigate('clients', values.name);
 }
 
 // ─── Список ─────────────────────────────────────────────────────────────────
@@ -18,47 +50,66 @@ export function ClientsScreen({ ctx, param }) {
 function ClientList({ ctx }) {
   const state = useCommand(ctx, ['client', 'list']);
   const [busy, run] = useBusy();
+  const [selected, setSelected] = useState([]);
   const act = (action) => run(async () => { await action(); await state.reload(); });
+  const present = model.names(state.data);
+  const chosen = selected.filter((name) => present.includes(name));
 
-  const add = async () => {
-    const name = await required(ctx, 'Добавить клиента', 'Имя клиента', 'Имя клиента не указано.');
-    if (name === null) return;
-    const group = await model.pick(ctx, 'group', 'Группа клиента');
-    if (group === null || group === undefined) return;
-    await execute(ctx, ['client', 'add', '--name', name, '--group', group]);
-  };
-  const remove = async () => {
-    const targets = model.names(state.data);
-    const selected = await ctx.toggle({
-      title: 'Удаление клиентов', options: targets.map((name) => ({ value: name, label: name })), selected: [], empty: model.EMPTY, submit: 'Удалить',
-    });
-    if (selected === null || selected === undefined) return;
-    if (selected.length === 0) { ctx.notify('warn', model.NOTHING_SELECTED); return; }
-    await confirmed(ctx, 'Удаление клиентов', 'Удалить выбранных клиентов?', model.deleteClientsArgv(selected));
-  };
+  const removeSelected = () => act(async () => {
+    const reply = await confirmed(ctx, 'Удаление клиентов', 'Удалить выбранных клиентов?', model.deleteClientsArgv(chosen));
+    if (reply.ok || (reply.error && reply.error.code === 'partial')) setSelected([]);
+  });
+  const remove = (name) => act(() => confirmed(ctx, 'Удаление клиента', 'Удалить клиента?', ['client', 'delete', '--name', name]));
+  const add = () => run(() => addClientFlow(ctx));
 
   const actions = html`
-    <${Action} tone="create" disabled=${busy || !state.data} onClick=${() => act(add)}>Добавить клиента<//>
-    <${Action} tone="danger" disabled=${busy || !state.data} onClick=${() => act(remove)}>Удалить клиентов<//>`;
+    ${chosen.length > 0 && html`<${Action} tone="danger" icon="trash-2" disabled=${busy} onClick=${removeSelected}>
+      Удалить выбранных (${chosen.length})<//>`}
+    <${Action} icon="file-code" disabled=${busy || !state.data} onClick=${() => act(() => generateFlow(ctx))}>Сгенерировать конфиги<//>
+    <${Action} primary icon="plus" disabled=${busy || !state.data} onClick=${add}>Добавить клиента<//>`;
+  const menu = (row) => [
+    { label: 'Подписка', icon: 'rss', onClick: () => ctx.navigate('clients', row.name, 'subscription') },
+    { label: 'Сгенерировать конфиг', icon: 'file-code', disabled: busy, onClick: () => act(() => generateFlow(ctx, { client: row.name })) },
+    { label: 'Удалить', icon: 'trash-2', danger: true, disabled: busy, onClick: () => remove(row.name) },
+  ];
+
   return html`<${Loaded} title="Клиенты" state=${state} actions=${actions}>
-    ${(data) => html`<${Card} title="Клиенты" actions=${actions}>
-      <${Table} empty="Нет клиентов"
-        columns=${[
-          { key: 'name', label: 'Клиент', render: (row) => html`<${Button} kind="view" onClick=${() => ctx.navigate('clients', row.name)}>${model.str(row.name)}<//>` },
-          { key: 'group', label: 'Группа', render: (row) => model.str(row.group) },
-        ]}
-        rows=${model.rowsOf(data)} />
-    <//>`}
+    ${(data) => {
+      const list = model.rowsOf(data).filter((row) => row && typeof row.name === 'string');
+      return html`<${Page} title="Клиенты" actions=${actions}>
+        <${Card}>
+          ${list.length === 0
+            ? html`<${Empty} icon="users" title="Нет клиентов"
+                action=${html`<${Action} primary icon="plus" disabled=${busy} onClick=${add}>Добавить клиента<//>`} />`
+            : html`<${DataTable} rows=${list} empty="Нет клиентов"
+                href=${(row) => ctx.href('clients', row.name)}
+                menu=${menu}
+                selection=${{ selected: chosen, onChange: setSelected }}
+                columns=${[
+                  { key: 'name', label: 'Клиент', search: true },
+                  { key: 'group', label: 'Группа', search: true, render: (row) => html`<${GroupLink} ctx=${ctx} group=${row.group} />` },
+                  { key: 'nodes', label: 'Ноды', render: (row) => (model.inherits(row) ? 'от группы' : `свои: ${model.strings(row.nodes).length}`) },
+                  { key: 'subscription', label: 'Подписка', render: (row) => html`<${SubscriptionBadge} row=${row} />` },
+                ]} />`}
+        <//>
+      <//>`;
+    }}
   <//>`;
 }
 
 // ─── Карточка ───────────────────────────────────────────────────────────────
 
-function ClientCard({ ctx, name }) {
+const TABS = [
+  { id: 'overview', label: 'Обзор' },
+  { id: 'access', label: 'Доступ' },
+  { id: 'subscription', label: 'Подписка' },
+];
+
+function ClientCard({ ctx, name, tab }) {
   const state = useCommand(ctx, ['client', 'list'], [name], { expect: 'not_found' });
   const [busy, run] = useBusy();
+  const mounted = useMounted();
   const reply = state.reply;
-  const back = html`<${Back} ctx=${ctx} to="clients" />`;
   const row = reply && reply.ok ? model.findRow(reply.data, name) : null;
   const vanished = Boolean(reply && (reply.ok ? !row : reply.error && reply.error.code === 'not_found'));
   useEffect(() => {
@@ -67,49 +118,69 @@ function ClientCard({ ctx, name }) {
     ctx.navigate('clients');
   }, [vanished, reply]);
   if (vanished) return null;
-  const act = (action) => run(async () => { if ((await action()) !== 'left') await state.reload(); });
-  const inherit = row ? model.inherits(row) : true;
-  const nodes = row ? model.strings(row.nodes) : [];
 
-  const rename = async () => {
-    const next = await required(ctx, 'Переименование клиента', 'Новое имя клиента', 'Имя клиента не указано.');
-    if (next === null) return undefined;
-    const result = await confirmed(ctx, 'Переименование клиента', 'Переименовать клиента?', ['client', 'rename', '--name', name, '--new-name', next]);
-    const renamed = model.renamedName(result);
-    if (renamed !== null && renamed !== name) { ctx.navigate('clients', renamed); return 'left'; }
+  const current = TABS.some((item) => item.id === tab) ? tab : TABS[0].id;
+  const back = { href: ctx.href('clients'), label: 'Клиенты' };
+  const act = (action) => run(async () => { if ((await action()) !== 'left') await state.reload(); });
+  /** Переход по ответу — только пока карточка открыта. */
+  const leave = (...route) => { if (mounted.current) ctx.navigate(...route); return 'left'; };
+  const tabs = TABS.map((item) => ({ ...item, href: ctx.href('clients', name, item.id), active: item.id === current }));
+  const props = { ctx, name, row, busy, act, leave };
+
+  return html`<${Loaded} title=${name} back=${back} state=${state}>
+    ${() => html`<${Page} title=${name} back=${back} badge=${html`<${SubscriptionBadge} row=${row} />`} tabs=${tabs}>
+      ${current === 'overview' && html`<${ClientOverview} ...${props} />`}
+      ${current === 'access' && html`<${ClientAccess} ...${props} />`}
+      ${current === 'subscription' && html`<${ClientSubscription} ...${props} />`}
+    <//>`}
+  <//>`;
+}
+
+// ─── Обзор ──────────────────────────────────────────────────────────────────
+
+function ClientOverview({ ctx, name, row, busy, act, leave }) {
+  const inherit = model.inherits(row);
+  const nodes = model.strings(row.nodes);
+
+  /** Имя и группа одной формой: `client set-group`, затем `client rename` (по плану). */
+  const edit = async () => {
+    const read = await fetchData(ctx, ['group', 'list']);
+    if (!read) return undefined;
+    const values = await ctx.form({
+      title: `Изменить клиента: ${name}`,
+      fields: [
+        { name: 'name', label: 'Имя клиента', type: 'text', value: name, required: 'Имя клиента не указано.', autofocus: true },
+        { name: 'group', label: 'Группа', type: 'select', value: model.str(row.group), options: nameOptions(read.data), required: true },
+      ],
+    });
+    if (values === null || values === undefined) return undefined;
+    for (const step of model.editSteps(name, row, values)) {
+      const result = await confirmed(ctx, step.title, step.question, step.argv);
+      if (step.rename) {
+        const renamed = model.renamedName(result);
+        if (renamed !== null && renamed !== name) return leave('clients', renamed);
+      } else if (!result.ok) {
+        return undefined;
+      }
+    }
     return undefined;
   };
   const remove = async () => {
     const result = await confirmed(ctx, 'Удаление клиента', 'Удалить клиента?', ['client', 'delete', '--name', name]);
-    if (model.clientDeleted(result, name)) { ctx.navigate('clients'); return 'left'; }
-    return undefined;
-  };
-  const setGroup = async () => {
-    const group = await model.pick(ctx, 'group', 'Новая группа клиента');
-    if (group === null || group === undefined) return;
-    await confirmed(ctx, 'Смена группы клиента', 'Сменить группу?', ['client', 'set-group', '--name', name, '--group', group]);
-  };
-  const connections = async () => {
-    if (inherit) { ctx.notify('warn', 'Подключения настраиваются только для клиента со своими нодами.'); return; }
-    await clientConnections(ctx, name, nodes);
+    return model.clientDeleted(result, name) ? leave('clients') : undefined;
   };
 
-  return html`<${Loaded} title=${`Клиент: ${name}`} state=${state} actions=${back}>
-    ${() => html`<${Card} title=${`Клиент: ${name}`} actions=${back}>
-      <${Context} lines=${model.clientContext(row)} />
-      <${Actions}>
-        <${Action} tone="view" disabled=${busy} onClick=${() => act(() => showClient(ctx, name))}>Показать данные подключения<//>
-        <${Action} tone="view" disabled=${busy} onClick=${() => act(() => clientSubscription(ctx, name))}>Подписка<//>
-      <//>
-      <${Actions}>
-        <${Action} tone="change" disabled=${busy} onClick=${() => act(() => runGenerate(ctx, ['--client', name]))}>Сгенерировать конфиг<//>
-        <${Action} tone="change" disabled=${busy} onClick=${() => act(() => clientNodes(ctx, name, inherit, nodes))}>Ноды клиента<//>
-        <${Action} tone="change" disabled=${busy} onClick=${() => act(connections)}>Подключения по нодам<//>
-        <${Action} tone="change" disabled=${busy} onClick=${() => act(setGroup)}>Сменить группу<//>
-        <${Action} tone="change" disabled=${busy} onClick=${() => act(rename)}>Переименовать<//>
-        <${Action} tone="danger" disabled=${busy} onClick=${() => act(remove)}>Удалить клиента<//>
-      <//>
-    <//>`}
+  const actions = html`
+    <${Action} primary icon="file-code" disabled=${busy} onClick=${() => act(() => generateFlow(ctx, { client: name }))}>Сгенерировать конфиг<//>
+    <${Action} icon="pencil" disabled=${busy} onClick=${() => act(edit)}>Изменить<//>
+    <${Action} icon="key-round" disabled=${busy} onClick=${() => act(() => showClient(ctx, name))}>Данные подключения<//>
+    <${MoreMenu} items=${[{ label: 'Удалить клиента', icon: 'trash-2', danger: true, disabled: busy, onClick: () => act(remove) }]} />`;
+  return html`<${Card} title="Обзор" actions=${actions}>
+    <${Facts} items=${[
+      { label: 'Группа', value: html`<${GroupLink} ctx=${ctx} group=${row.group} />` },
+      { label: 'Ноды', value: html`${inherit ? 'от группы' : 'свои'} <${Chips} items=${nodes.map((node) => ({ label: node, href: ctx.href('nodes', node) }))} />` },
+      { label: 'Подписка', value: model.subscriptionState(row) },
+    ]} />
   <//>`;
 }
 
@@ -142,72 +213,128 @@ async function showClient(ctx, name) {
   const body = html`
     <${Context} lines=${model.clientDataLines(read.data || {})} />
     <${Actions}>
-      <${Action} tone="view" onClick=${() => viewConfig(ctx, name)}>Показать конфиг<//>
-      <${Action} tone="view" onClick=${() => downloadConfig(ctx, name)}>Скачать конфиг<//>
+      <${Action} icon="file-code" onClick=${() => viewConfig(ctx, name)}>Показать конфиг<//>
+      <${Action} icon="download" onClick=${() => downloadConfig(ctx, name)}>Скачать конфиг<//>
     <//>`;
   await ctx.show({ title: `Данные клиента: ${name}`, wide: true, body });
 }
 
-// ─── Ноды и подключения ─────────────────────────────────────────────────────
+// ─── Доступ: ноды и подключения ─────────────────────────────────────────────
 
-/** `clients.rs::client_nodes`: отметки — текущие ноды клиента. */
-async function clientNodes(ctx, name, inherit, current) {
-  const menu = model.clientNodesMenu(name, inherit);
-  const choice = await ctx.choose({ title: menu.title, options: menu.options });
-  if (choice === null || choice === undefined) return;
-  if (choice === 'inherit') {
-    await confirmed(ctx, 'Ноды клиента', 'Вернуть ноды от группы?', model.inheritNodesArgv(name));
-    return;
-  }
-  const read = await fetchData(ctx, ['node', 'list']);
-  if (!read) return;
-  const list = model.rowsOf(read.data);
-  const targets = model.names(list);
-  const selected = await ctx.toggle({
-    title: `Свои ноды клиента: ${name}`,
-    options: list.map((row) => ({ value: model.str(row.name), label: model.nodeLabel(row) })),
-    selected: targets.filter((node) => current.includes(node)),
-    empty: model.EMPTY,
-  });
-  if (selected === null || selected === undefined) return;
-  if (selected.length === 0) { ctx.notify('warn', model.NOTHING_SELECTED); return; }
-  await execute(ctx, model.clientNodesArgv(name, selected));
+function ClientAccess({ ctx, name, row, busy, act }) {
+  const inherit = model.inherits(row);
+  const nodes = model.strings(row.nodes);
+  const assigned = useCommand(ctx, inherit ? null : ['client', 'connections', '--name', name], [nodes.join('\n')]);
+  const change = (action) => act(async () => { await action(); if (!inherit) await assigned.reload(); });
+
+  /** `clients.rs::client_nodes`: режим и свои ноды одной формой. */
+  const editNodes = async () => {
+    const read = await fetchData(ctx, ['node', 'list']);
+    if (!read) return;
+    const options = nameOptions(read.data, model.nodeLabel);
+    const known = options.map((option) => option.value);
+    const values = await ctx.form({
+      title: `Ноды клиента: ${name}`,
+      fields: [
+        { name: 'mode', label: 'Ноды', type: 'radio', value: inherit ? 'inherit' : 'own',
+          options: [{ value: 'inherit', label: 'От группы' }, { value: 'own', label: 'Свои ноды' }] },
+        { name: 'nodes', label: 'Свои ноды', type: 'multi', options, value: inherit ? [] : nodes.filter((node) => known.includes(node)),
+          required: true, when: (v) => v.mode === 'own' },
+      ],
+    });
+    if (values === null || values === undefined) return;
+    const plan = model.nodesChange(name, inherit, values);
+    if (plan === null) return;
+    if (plan.kind === 'inherit') await confirmed(ctx, 'Ноды клиента', 'Вернуть ноды от группы?', plan.argv);
+    else await execute(ctx, plan.argv);
+  };
+  /** `clients.rs::client_connections`: найденные на ноде подключения. */
+  const configure = async (node) => {
+    const found = await ctx.nodeRequest(node, ['conn', 'list', '--name', node, '--discover'], null);
+    if (!found.ok) return;
+    const proxies = model.discoveredProxies(found.data);
+    if (proxies.length === 0) { ctx.notify('warn', model.EMPTY); return; }
+    const current = model.assignedProxies(assigned.data, node);
+    const values = await ctx.form({
+      title: `Подключения клиента на ${node}`,
+      fields: [{ name: 'proxies', label: 'Подключения', type: 'multi', options: proxies.map((proxy) => ({ value: proxy, label: proxy })),
+        value: proxies.filter((proxy) => current.includes(proxy)), required: true }],
+    });
+    if (values === null || values === undefined) return;
+    await execute(ctx, model.clientConnectionsArgv(name, node, values.proxies));
+  };
+  const reset = (node) => confirmed(ctx, 'Сброс подключений', 'Сбросить подключения ноды?', model.resetConnectionsArgv(name, node));
+
+  const actions = html`<${Action} primary icon="pencil" disabled=${busy} onClick=${() => change(editNodes)}>Изменить ноды<//>`;
+  return html`
+    <${Card} title="Доступ" actions=${actions}>
+      <${Facts} items=${[
+        { label: 'Режим', value: inherit ? 'от группы' : 'свои' },
+        { label: 'Ноды', value: html`<${Chips} items=${nodes.map((node) => ({ label: node, href: ctx.href('nodes', node) }))} />` },
+      ]} />
+    <//>
+    ${!inherit && html`<${Loaded} title="Подключения по нодам" state=${assigned} inline>
+      ${(data) => html`<${Card} title="Подключения по нодам">
+        <${DataTable} rows=${nodes.map((node) => ({ name: node }))} empty="Нет своих нод"
+          href=${(item) => ctx.href('nodes', item.name)}
+          menu=${(item) => [
+            { label: 'Настроить', icon: 'settings', disabled: busy, onClick: () => change(() => configure(item.name)) },
+            { label: 'Сбросить', icon: 'refresh-cw', danger: true, disabled: busy, onClick: () => change(() => reset(item.name)) },
+          ]}
+          columns=${[
+            { key: 'name', label: 'Нода' },
+            { key: 'proxies', label: 'Подключения', render: (item) => {
+              const proxies = model.assignedProxies(data, item.name);
+              return proxies.length === 0 ? html`<span class="t-dim">групповые</span>` : proxies.join(', ');
+            } },
+          ]} />
+      <//>`}
+    <//>`}`;
 }
 
-/** `clients.rs::client_connections`: только для своих нод клиента. */
-async function clientConnections(ctx, name, own) {
-  if (own.length === 0) { ctx.notify('warn', 'У клиента нет своих нод.'); return; }
-  const read = await fetchData(ctx, ['node', 'list']);
-  if (!read) return;
-  const available = model.availableNodes(read.data, own);
-  if (available.length === 0) { ctx.notify('warn', 'Назначенные ноды больше недоступны.'); return; }
-  const node = await ctx.choose({
-    title: `Подключения клиента: ${name}`,
-    options: available.map((row) => ({ value: model.str(row.name), label: model.nodeLabel(row), tone: 'view' })),
-  });
-  if (node === null || node === undefined) return;
-  const action = await ctx.choose({
-    title: `Подключения: ${name} на ${node}`,
-    options: [{ value: 'set', label: 'Настроить подключения', tone: 'change' }, { value: 'reset', label: 'Сбросить на групповые', tone: 'danger' }],
-  });
-  if (action === null || action === undefined) return;
-  if (action === 'reset') {
-    await confirmed(ctx, 'Сброс подключений', 'Сбросить подключения ноды?', model.resetConnectionsArgv(name, node));
-    return;
-  }
-  const assigned = await fetchData(ctx, ['client', 'connections', '--name', name]);
-  if (!assigned) return;
-  const current = model.assignedProxies(assigned.data, node);
-  const found = await ctx.nodeRequest(node, ['conn', 'list', '--name', node, '--discover'], null);
-  if (!found.ok) return;
-  const proxies = model.discoveredProxies(found.data);
-  const selected = await ctx.toggle({
-    title: `Подключения клиента на ${node}`,
-    options: proxies.map((proxy) => ({ value: proxy, label: proxy })),
-    selected: proxies.filter((proxy) => current.includes(proxy)),
-    empty: model.EMPTY,
-  });
-  if (selected === null || selected === undefined) return;
-  if (selected.length === 0) { ctx.notify('warn', model.NOTHING_SELECTED); return; }
-  await execute(ctx, model.clientConnectionsArgv(name, node, selected));
+// ─── Подписка ───────────────────────────────────────────────────────────────
+
+function ClientSubscription({ ctx, name, row, busy, act }) {
+  // Нечитаемый хост только скрывает строку (v1 `sub host || true`).
+  const host = useCommand(ctx, ['subscription', 'host'], [], { quiet: true });
+  const isPublished = Boolean(row.subscription && row.subscription.published === true);
+
+  /** Срок публикации (`clients.rs::ttl`) одной формой и `subscription publish`. */
+  const publish = async () => {
+    const values = await ctx.form({
+      title: `Подписка: ${name}`,
+      submit: isPublished ? 'Продлить' : 'Опубликовать',
+      fields: [
+        { name: 'ttl', label: 'Срок', type: 'radio', value: 'keep', options: model.ttlOptions(model.currentExpiry(row)) },
+        { name: 'custom', label: 'Свой срок', type: 'text', placeholder: '7d', required: true, validate: model.ttlError,
+          when: (v) => v.ttl === 'custom' },
+      ],
+    });
+    if (values === null || values === undefined) return;
+    const reply = await ctx.request(model.publishArgv(name, model.ttlValue(values)));
+    if (model.published(reply)) await showShare(ctx, name);
+    else ctx.failed();
+  };
+  const rotate = async () => {
+    const reply = await confirmed(ctx, 'Смена токена подписки', 'Сменить токен?', ['subscription', 'rotate', '--name', name]);
+    if (model.published(reply)) await showShare(ctx, name);
+  };
+  const revoke = () => confirmed(ctx, 'Отзыв подписки', 'Отозвать подписку?', ['subscription', 'revoke', '--name', name]);
+
+  const actions = html`
+    <${Action} primary icon="send" disabled=${busy} onClick=${() => act(publish)}>${isPublished ? 'Продлить' : 'Опубликовать'}<//>
+    ${isPublished && html`<${Action} icon="external-link" disabled=${busy} onClick=${() => act(() => showShare(ctx, name))}>Показать ссылку<//>`}
+    <${Action} disabled=${busy} onClick=${() => act(() => resolvedHeaders(ctx, name))}>Итоговые заголовки<//>
+    <${Action} disabled=${busy} onClick=${() => act(() => showHeaders(ctx, 'client', name))}>Заголовки клиента<//>
+    <${MoreMenu} items=${[
+      { label: 'Сменить токен', icon: 'key-round', danger: true, disabled: busy, onClick: () => act(rotate) },
+      { label: 'Отозвать', icon: 'x', danger: true, disabled: busy, onClick: () => act(revoke) },
+    ]} />`;
+  const line = host.reply ? model.hostLine(host.reply) : null;
+  return html`<${Card} title="Подписка" actions=${actions}>
+    <${Facts} items=${[
+      { label: 'Подписка', value: model.subscriptionState(row) },
+      { label: 'Хост', value: line && html`<span class=${line.tone ? `t-${line.tone}` : ''}>${line.text}</span>` },
+    ]} />
+  <//>`;
 }

@@ -5,11 +5,12 @@ import assert from 'node:assert/strict';
 import {
   templateList, templateCreate, templateShow, templateImport, templateInput, templateLabel, findTemplate,
   templateContext, templatePath, templateContent,
-  PUBLISH_FIELDS, GENERATE_ALL, generateGroup, generateClient, generationContext, SUBSCRIPTION_HOST,
+  PUBLISH_FIELDS, GENERATE_ALL, generateGroup, generateClient, generateScope, SUBSCRIPTION_HOST,
   subscriptionSetHost, SUBSCRIPTION_LIST, SUBSCRIPTION_PUBLISH_ALL, subscriptionMigrate, subscriptionHost,
   subscriptionState, subscriptionRow, publishSummary,
 } from '../assets/js/screens/catalog-model.js';
-import { pickOptions, pick, summaryLines, GENERATE_FIELDS } from '../assets/js/screens/clients-model.js';
+import { summaryLines, GENERATE_FIELDS } from '../assets/js/screens/clients-model.js';
+import { generateFlow } from '../assets/js/screens/generate.js';
 
 test('шаблоны: argv команд и input.file', () => {
   assert.deepEqual(templateList(), ['template', 'list']);
@@ -39,29 +40,6 @@ test('шаблоны: путь и содержимое template show', () => {
   assert.equal(templateContent(null), null);
 });
 
-test('выбор: подписи нод и прочих объектов', () => {
-  assert.equal(pickOptions('node', [{ name: 'ru', ip: '10.0.0.2', port: 2222 }])[0].label, 'ru  10.0.0.2:2222');
-  assert.equal(pickOptions('group', [{ name: 'PC' }])[0].label, 'PC');
-  assert.deepEqual(pickOptions('client', [{ name: 'alice' }]), [{ value: 'alice', label: 'alice', tone: 'view' }]);
-  assert.deepEqual(pickOptions('client', null), []);
-});
-
-test('выбор: читает список, сбой — ctx.failed без окна', async () => {
-  const calls = [];
-  let failed = 0;
-  const ctx = {
-    request: async (argv) => { calls.push(argv); return calls.length === 1 ? { ok: false, error: { code: 'x' } } : { ok: true, data: [{ name: 'PC' }] }; },
-    failed: () => { failed += 1; },
-    choose: async (props) => { calls.push(props); return props.options[0].value; },
-  };
-  assert.equal(await pick(ctx, 'group', 'Генерация по группе'), null);
-  assert.equal(failed, 1);
-  assert.equal(await pick(ctx, 'group', 'Генерация по группе'), 'PC');
-  assert.deepEqual(calls[0], ['group', 'list']);
-  assert.equal(calls[2].title, 'Генерация по группе');
-  assert.equal(calls[2].empty, 'Нет объектов для выбора');
-});
-
 test('итог генерации: пустые поля пропущены, ошибки жёлтые', () => {
   const partial = { ok: ['a'], skipped: ['s'], failed: ['bad'], nodes_ok: ['de'], nodes_failed: ['ru'], dir: '/g' };
   assert.deepEqual(summaryLines(partial, GENERATE_FIELDS, 'Нет результатов'), [
@@ -84,12 +62,39 @@ test('итог публикации: число 0 пропущено, сводк
   assert.deepEqual(publishSummary({ ok: true, data: { published: [] } }), { published: [] });
 });
 
-test('генерация: argv хвостов и контекст групп', () => {
+test('генерация: argv хвостов и выбор формы', () => {
   assert.deepEqual(GENERATE_ALL, ['--all']);
   assert.deepEqual(generateGroup('PC'), ['--group', 'PC']);
   assert.deepEqual(generateClient('alice'), ['--client', 'alice']);
-  assert.deepEqual(generationContext([{ name: 'PC', template: 'default.yaml' }]), ['PC → default.yaml']);
-  assert.deepEqual(generationContext([]), [{ text: 'Нет групп', tone: 'dim' }]);
+  assert.deepEqual(generateScope({ scope: 'all' }), ['--all']);
+  assert.deepEqual(generateScope({ scope: 'group', group: 'PC' }), ['--group', 'PC']);
+  assert.deepEqual(generateScope({ scope: 'client', client: 'alice' }), ['--client', 'alice']);
+});
+
+test('генерация: пресет без формы, сбой чтения списков — без формы', async () => {
+  const calls = [];
+  let failed = 0;
+  let lists = { ok: false, error: { code: 'x' } };
+  const ctx = {
+    request: async (argv) => {
+      calls.push(argv);
+      if (argv[0] === 'generate') return { ok: true, data: { ok: ['alice'] } };
+      return lists;
+    },
+    failed: () => { failed += 1; },
+    form: async (spec) => { calls.push(spec.title); return { scope: 'group', group: 'PC' }; },
+    show: async () => {},
+  };
+  await generateFlow(ctx, { client: 'alice' });
+  assert.deepEqual(calls, [['generate', '--client', 'alice']]);
+  calls.length = 0;
+  await generateFlow(ctx);
+  assert.equal(failed, 1);
+  assert.ok(!calls.includes('Генерация конфигов'));
+  calls.length = 0;
+  lists = { ok: true, data: [{ name: 'PC' }] };
+  await generateFlow(ctx);
+  assert.deepEqual(calls.at(-1), ['generate', '--group', 'PC']);
 });
 
 test('подписки: argv и хост-нода', () => {
@@ -98,7 +103,7 @@ test('подписки: argv и хост-нода', () => {
   assert.deepEqual(SUBSCRIPTION_LIST, ['subscription', 'list']);
   assert.deepEqual(SUBSCRIPTION_PUBLISH_ALL, ['subscription', 'publish-all']);
   assert.deepEqual(subscriptionMigrate('ru'), ['subscription', 'migrate', '--name', 'ru']);
-  assert.deepEqual(subscriptionHost({ node: 'de', base_url: 'https://h' }), { node: 'de', baseUrl: 'Базовый URL: https://h' });
+  assert.deepEqual(subscriptionHost({ node: 'de', base_url: 'https://h' }), { node: 'de', baseUrl: 'https://h' });
   assert.equal(subscriptionHost({ node: '' }), null);
   assert.equal(subscriptionHost(null), null);
 });
@@ -109,5 +114,5 @@ test('подписки: состояния списка', () => {
   assert.deepEqual(subscriptionState('unlimited'), { label: 'без срока', tone: 'dim' });
   assert.deepEqual(subscriptionState('unknown'), { label: 'срок неизвестен', tone: 'dim' });
   assert.deepEqual(subscriptionRow({ client: 'u', expires_at: null, state: 'unlimited' }),
-    { prefix: 'u  —  ', state: { label: 'без срока', tone: 'dim' } });
+    { client: 'u', expires: '—', state: { label: 'без срока', tone: 'dim' } });
 });

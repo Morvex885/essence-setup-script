@@ -1,11 +1,14 @@
-// Ноды (`#/nodes`) и карточка ноды (`#/nodes/<имя>`) — перенос
+// Ноды (`#/nodes`) и карточка ноды (`#/nodes/<имя>/<вкладка>`) — перенос
 // `tui/src/nodes.rs`: `Nodes`, `NodeCard`, `delete_node`, `add_node_with`,
-// `harden`, `setup_ssh`, `aliases`, `offer_upload`, `interactive`.
-import { html, useEffect, useState } from '../../vendor/preact-htm.js';
-import { Card, Picker, SecretField, Field } from '../ui.js';
+// `harden`, `setup_ssh`, `offer_upload`, `interactive`. Вкладки карточки:
+// обзор, подключения (`connections.js`), AmneziaWG (`awg.js`), обслуживание.
+import { html, useEffect } from '../../vendor/preact-htm.js';
+import { Page, Card, DataTable, MoreMenu, Facts, Badge, Chips, Empty, Button } from '../ui.js';
 import { handleNodeCodes, reviewReply, setFlag, decisionFlag, isFailure } from '../flows.js';
 import { errorMessage } from '../format.js';
-import { useCommand, useBusy, Action, Actions, Context, Back, Loaded, rows } from './kit.js';
+import { useCommand, useBusy, useMounted, Action, Actions, Loaded, rows } from './kit.js';
+import { NodeConnections } from './connections.js';
+import { NodeAwg } from './awg.js';
 import * as model from './nodes-model.js';
 
 export const nodeLabel = model.nodeLabel;
@@ -23,6 +26,8 @@ function code(reply) {
 function outcome(ctx, reply) {
   if (isFailure(reply)) ctx.failed();
 }
+
+const checkArgv = (name) => ['node', 'check', '--name', name];
 
 // ─── Терминал и скрипты ──────────────────────────────────────────────────────
 
@@ -89,7 +94,7 @@ async function addNode(ctx, base, password) {
       : await ctx.request(words, { secrets });
     if (reply.ok) {
       if (reply.data && reply.data.needs_setup === true) {
-        ctx.notify('warn', 'Нода сохранена, но требует SSH-настройки: раздел «Ноды» → «Завершить отложенную SSH-настройку».');
+        ctx.notify('warn', 'Нода сохранена, но требует SSH-настройки: раздел «Ноды» → «Завершить SSH-настройку».');
       }
       return true;
     }
@@ -129,53 +134,52 @@ async function addNode(ctx, base, password) {
   }
 }
 
-const EMPTY_FORM = { name: '', ip: '', port: '', user: '', auth: 'key', password: '', tag: '' };
+/** Поля формы добавления (умолчания v1); `values` — прежний ввод без пароля. */
+function addFields(values) {
+  const keep = (name) => (values[name] === undefined ? undefined : values[name]);
+  return [
+    { name: 'name', label: 'Название', type: 'text', placeholder: 'vps-1', value: keep('name') },
+    { name: 'ip', label: 'IP', type: 'text', required: true, value: keep('ip') },
+    { name: 'port', label: 'SSH-порт', type: 'text', placeholder: '22', value: keep('port') },
+    { name: 'user', label: 'Логин', type: 'text', placeholder: 'root', value: keep('user') },
+    { name: 'tag', label: 'Тег', type: 'text', required: true, value: keep('tag') },
+    {
+      name: 'auth',
+      label: 'Способ входа',
+      type: 'radio',
+      value: keep('auth') || 'key',
+      options: [{ value: 'key', label: 'SSH-ключ' }, { value: 'password', label: 'Пароль' }],
+    },
+    { name: 'password', label: 'Пароль', type: 'secret', required: true, when: (current) => current.auth === 'password' },
+  ];
+}
 
-/** Форма добавления: поля и умолчания v1; пароль живёт только в состоянии формы. */
-function AddForm({ ctx, busy, run, onClose }) {
-  const [form, setForm] = useState(EMPTY_FORM);
-  const update = (key) => (event) => setForm({ ...form, [key]: event.target.value });
-  const submit = (event) => {
-    event.preventDefault();
-    const built = model.addNodeArgv(form);
+/**
+ * Добавление ноды одной формой (`nodes.rs::add_node_with`). Замечание
+ * проверки — предупреждение и форма заново с прежним вводом (кроме пароля).
+ * Сохранённая нода открывается; `true` — нода добавлена.
+ */
+export async function addNodeFlow(ctx) {
+  let previous = {};
+  for (;;) {
+    const values = await ctx.form({ title: ADD_TITLE, fields: addFields(previous), submit: 'Добавить' });
+    if (values === null) return false;
+    const built = model.addNodeArgv(values);
     if (built.warning) {
       ctx.notify('warn', built.warning);
-      return;
+      previous = { ...values, password: undefined };
+      continue;
     }
-    run(async () => {
-      // Неудача оставляет форму открытой с введёнными полями для исправления.
-      if (!(await addNode(ctx, built.argv, built.password))) return;
-      setForm(EMPTY_FORM);
-      onClose(true);
-    });
-  };
-  const input = (key, label, placeholder = '') => html`<${Field} label=${label}>
-    <input type="text" autocomplete="off" placeholder=${placeholder} value=${form[key]} onInput=${update(key)} />
-  <//>`;
-  return html`<${Card} title=${ADD_TITLE}>
-    <form class="form" onSubmit=${submit}>
-      ${input('name', 'Название', 'vps-1')}
-      ${input('ip', 'IP')}
-      ${input('port', 'SSH-порт', '22')}
-      ${input('user', 'Логин', 'root')}
-      <${Picker} label="Способ входа" value=${form.auth}
-        options=${[{ value: 'key', label: 'SSH-ключ' }, { value: 'password', label: 'Пароль' }]}
-        onChange=${(auth) => setForm({ ...form, auth, password: '' })} />
-      ${form.auth === 'password' && html`<${SecretField} label="Пароль" value=${form.password}
-        onInput=${(password) => setForm({ ...form, password })} />`}
-      ${input('tag', 'Тег')}
-      <${Actions}>
-        <${Action} tone="create" disabled=${busy} onClick=${submit}>Добавить<//>
-        <${Action} tone="plain" disabled=${busy} onClick=${() => { setForm(EMPTY_FORM); onClose(false); }}>Отмена<//>
-      <//>
-    </form>
-  <//>`;
+    if (!(await addNode(ctx, built.argv, built.password))) return false;
+    ctx.navigate('nodes', values.name || 'vps-1');
+    return true;
+  }
 }
 
 // ─── Отложенная SSH-настройка ────────────────────────────────────────────────
 
 /** `node setup-ssh` под планом (`nodes.rs::setup_ssh`). */
-async function setupSsh(ctx) {
+export async function setupSsh(ctx) {
   const words = ['node', 'setup-ssh'];
   for (;;) {
     const reply = await ctx.runConfirmed('Завершение SSH-настройки', 'Выполнить?', words);
@@ -221,42 +225,7 @@ async function setupSsh(ctx) {
   }
 }
 
-// ─── Список нод ──────────────────────────────────────────────────────────────
-
-function NodeList({ ctx }) {
-  const list = useCommand(ctx, ['node', 'list']);
-  const status = useCommand(ctx, ['status']);
-  const [busy, run] = useBusy();
-  const [adding, setAdding] = useState(false);
-  const back = html`<${Back} ctx=${ctx} to="summary" />`;
-  const reload = () => { list.reload(); status.reload(); };
-  return html`<${Loaded} title="Ноды" state=${list} actions=${back}>${(data) => {
-    const items = model.nodeItems(data);
-    const actions = model.listActions(status.data);
-    const act = (key) => {
-      if (key === 'a') setAdding(true);
-      else if (key === 'h') run(async () => { await setupSsh(ctx); reload(); });
-    };
-    return html`<div>
-      <${Card} title="Ноды" actions=${back}>
-        ${items.length === 0
-          ? html`<${Context} lines=${[{ text: 'Нет нод', tone: 'dim' }]} />`
-          : html`<${Actions} column>
-              ${items.map((item) => html`<${Action} key=${item.name} tone=${item.tone} disabled=${busy}
-                onClick=${() => ctx.navigate('nodes', item.name)}>${item.label}<//>`)}
-            <//>`}
-        <${Actions}>
-          ${actions.map((action) => html`<${Action} key=${action.key} tone=${action.tone} disabled=${busy || (action.key === 'a' && adding)}
-            onClick=${() => act(action.key)}>${action.label}<//>`)}
-        <//>
-      <//>
-      ${adding && html`<${AddForm} ctx=${ctx} busy=${busy} run=${run}
-        onClose=${(done) => { setAdding(false); if (done) reload(); }} />`}
-    </div>`;
-  }}<//>`;
-}
-
-// ─── Карточка ноды ───────────────────────────────────────────────────────────
+// ─── Действия над нодой ──────────────────────────────────────────────────────
 
 /** Объём удаления из `delete_options`; `true`, если ноды больше нет (`nodes.rs::delete_node`). */
 async function deleteNode(ctx, name, node) {
@@ -265,24 +234,82 @@ async function deleteNode(ctx, name, node) {
     ctx.notify('warn', 'Нет доступных вариантов удаления.');
     return false;
   }
-  const index = await ctx.choose({ title: 'Объём удаления ноды', options });
-  if (index === null) return false;
-  const argv = model.deleteArgv(name, node.delete_options[index]);
+  const values = await ctx.form({
+    title: `Удаление ноды: ${name}`,
+    fields: [{ name: 'scope', label: 'Объём удаления', type: 'radio', options, required: true }],
+    submit: 'Далее',
+    tone: 'danger',
+  });
+  if (values === null) return false;
+  const argv = model.deleteArgv(name, node.delete_options[values.scope]);
   const reply = await ctx.nodeRequest(name, argv, { title: 'Удаление ноды', question: 'Удалить ноду в выбранном объёме?' });
   return reply.ok || (reply.error && reply.error.deleted === true);
+}
+
+/** Удаление из списка: варианты удаления есть только в `node show`. */
+async function deleteListed(ctx, name) {
+  const shown = await ctx.request(['node', 'show', '--name', name]);
+  if (!shown.ok) return false;
+  return deleteNode(ctx, name, shown.data);
+}
+
+/**
+ * «Изменить»: название и тег одной формой. Сначала `node rename` (сбой
+ * останавливает), затем `node tag` под новым именем. Итог — текущее имя
+ * ноды или `null` при отмене и сбое переименования.
+ */
+async function editNode(ctx, node) {
+  const name = model.plain(node.name);
+  const tag = model.plain(node.tag);
+  const values = await ctx.form({
+    title: `Изменение ноды: ${name}`,
+    fields: [
+      { name: 'name', label: 'Название', type: 'text', value: name, required: true },
+      { name: 'tag', label: 'Тег', type: 'text', value: tag },
+    ],
+  });
+  if (values === null) return null;
+  let current = name;
+  if (values.name !== name) {
+    const renamed = await ctx.call('node', 'rename', '--name', name, '--new-name', values.name);
+    if (!renamed.ok) {
+      outcome(ctx, renamed);
+      return null;
+    }
+    current = (renamed.data && typeof renamed.data.name === 'string' && renamed.data.name) || values.name;
+  }
+  if (values.tag !== tag) outcome(ctx, await ctx.call('node', 'tag', '--name', current, '--tag', values.tag));
+  return current;
+}
+
+/** Сохранение пароля SSH: значение — только в `secrets` запроса. */
+export async function setNodePassword(ctx, name) {
+  const values = await ctx.form({
+    title: `Пароль SSH: ${name}`,
+    fields: [{ name: 'password', label: 'Пароль SSH', type: 'secret', required: true }],
+  });
+  if (values === null) return;
+  outcome(ctx, await ctx.request(['node', 'password', '--name', name], { secrets: { password: values.password } }));
 }
 
 /** Порт задаётся явно или подбирается ядром; план подтверждается (`nodes.rs::harden`). */
 async function harden(ctx, name) {
   const title = 'Усиление защиты SSH';
-  const label = 'SSH-порт (пусто — подобрать свободный)';
-  const port = await ctx.ask({ title, label });
+  const ask = async () => {
+    const values = await ctx.form({
+      title,
+      fields: [{ name: 'port', label: 'SSH-порт (пусто — подобрать свободный)', type: 'text' }],
+      submit: 'Далее',
+    });
+    return values === null ? null : values.port;
+  };
+  const port = await ask();
   if (port === null) return;
   let words = model.hardenArgv(name, port);
   for (;;) {
     let reply = await ctx.request(words);
     if (model.hardenAsksPort(words, reply)) {
-      const again = await ctx.ask({ title, label });
+      const again = await ask();
       if (again === null) return;
       words = model.hardenArgv(name, again);
       continue;
@@ -300,97 +327,179 @@ async function harden(ctx, name) {
   }
 }
 
-/** Псевдонимы подключений ноды (`nodes.rs::aliases`): `''` — без изменений, `-` — удалить. */
-export async function aliases(ctx, name) {
-  const reply = await ctx.nodeRequest(name, ['node', 'aliases', '--name', name]);
-  if (!reply.ok) return;
-  const entries = rows(reply.data);
-  if (entries.length === 0) {
-    ctx.notify('info', 'Подключения на ноде не найдены.');
-    return;
-  }
-  const title = `Псевдонимы подключений: ${name}`;
-  const values = [];
-  for (const entry of entries) {
-    const value = await ctx.ask({ title, label: model.aliasPrompt(entry) });
-    if (value === null) return;
-    values.push(value);
-  }
-  const argv = model.aliasArgv(name, entries, values);
-  if (!argv) {
-    ctx.notify('info', 'Изменений нет.');
-    return;
-  }
-  outcome(ctx, await ctx.request(argv));
+// ─── Список нод ──────────────────────────────────────────────────────────────
+
+function NodeList({ ctx }) {
+  const list = useCommand(ctx, ['node', 'list']);
+  const [busy, run] = useBusy();
+  const pending = Boolean(ctx.status && ctx.status.ssh_setup_pending === true);
+  const reload = () => { list.reload(); ctx.refreshStatus(); };
+  const then = (action) => run(async () => {
+    await action();
+    reload();
+  });
+  const add = () => run(async () => {
+    if (!(await addNodeFlow(ctx))) reload();
+  });
+  const addButton = html`<${Button} kind="primary" icon="plus" disabled=${busy} onClick=${add}>Добавить ноду<//>`;
+  const actions = html`
+    ${pending && html`<${Button} icon="key-round" disabled=${busy} onClick=${() => then(() => setupSsh(ctx))}>Завершить SSH-настройку<//>`}
+    ${addButton}
+  `;
+  const columns = [
+    { key: 'name', label: 'Название', search: true },
+    { key: 'address', label: 'Адрес', search: true, render: (row) => html`<span class="mono">${row.address}</span>` },
+    { key: 'tag', label: 'Тег', search: true },
+    { key: 'auth', label: 'Вход' },
+    { key: 'state', label: 'Состояние', render: (row) => html`<${Badge} tone=${row.state.tone}>${row.state.label}<//>` },
+  ];
+  const menu = (row) => [
+    { label: 'Проверить подключение', icon: 'refresh-cw', disabled: busy, onClick: () => then(() => ctx.nodeRequest(row.name, checkArgv(row.name))) },
+    { label: 'Изменить', icon: 'pencil', disabled: busy, onClick: () => then(() => editNode(ctx, row.node)) },
+    { label: 'Удалить', icon: 'trash-2', danger: true, disabled: busy, onClick: () => then(() => deleteListed(ctx, row.name)) },
+  ];
+  return html`<${Loaded} title="Ноды" state=${list} actions=${actions}>${(data) => {
+    const table = rows(data).map((node) => ({
+      node,
+      name: model.plain(node.name),
+      address: `${model.plain(node.ip)}:${model.plain(node.port)}`,
+      tag: model.plain(node.tag),
+      auth: model.authLabel(node),
+      state: model.nodeStatus(node),
+    }));
+    return html`<${Page} title="Ноды" actions=${actions}>
+      <${Card}>
+        ${table.length === 0
+          ? html`<${Empty} icon="server" title="Нет нод" action=${addButton} />`
+          : html`<${DataTable} columns=${columns} rows=${table} href=${(row) => ctx.href('nodes', row.name)} menu=${menu} />`}
+      <//>
+    <//>`;
+  }}<//>`;
 }
 
-/** Сохранение пароля SSH: значение — только в `secrets` запроса. */
-async function storePassword(ctx, name) {
-  const password = await ctx.askSecret({ title: `Нода: ${name}`, label: 'Пароль SSH' });
-  if (!password) return;
-  outcome(ctx, await ctx.request(['node', 'password', '--name', name], { secrets: { password } }));
+// ─── Карточка ноды ───────────────────────────────────────────────────────────
+
+const TABS = [
+  { id: 'overview', label: 'Обзор' },
+  { id: 'connections', label: 'Подключения' },
+  { id: 'awg', label: 'AmneziaWG' },
+  { id: 'maintenance', label: 'Обслуживание' },
+];
+
+function Overview({ ctx, node }) {
+  const password = model.passwordStatus(node);
+  const issues = model.joinedPlain(node.issues);
+  return html`<${Card}>
+    <${Facts} items=${[
+      { label: 'Адрес', value: html`<span class="mono">${model.plain(node.ip)}:${model.plain(node.port)}</span>` },
+      { label: 'Пользователь', value: model.plain(node.user) },
+      { label: 'Вход', value: model.authLabel(node) },
+      { label: 'Пароль SSH', value: password && html`<${Badge} tone=${password.tone}>${password.label}<//>` },
+      { label: 'Тег', value: model.plain(node.tag) || '—' },
+      { label: 'Требует настройки', value: issues && html`<${Badge} tone="warn">${issues}<//>` },
+      { label: 'Группы', value: html`<${Chips} items=${rows(node.groups).map((group) => ({ label: model.plain(group), href: ctx.href('groups', model.plain(group)) }))} />` },
+      { label: 'Клиентов', value: model.plain(node.clients) },
+    ]} />
+  <//>`;
 }
 
-function NodeCard({ ctx, name }) {
+function OpRow({ title, desc, children }) {
+  return html`<div class="op-row">
+    <div class="op-text"><div class="op-title">${title}</div><div class="op-desc">${desc}</div></div>
+    ${children}
+  </div>`;
+}
+
+function Maintenance({ busy, act, remove }) {
+  return html`
+    <${Card} title="Обслуживание">
+      <div class="op-list">
+        <${OpRow} title="Проверить подключение" desc="Проверить SSH-подключение к ноде.">
+          <${Action} icon="refresh-cw" disabled=${busy} onClick=${act.check}>Проверить<//>
+        <//>
+        <${OpRow} title="Загрузить скрипты принудительно" desc="Заново загрузить скрипты Essence на ноду, даже если версия совпадает.">
+          <${Action} icon="upload" disabled=${busy} onClick=${act.upload}>Загрузить<//>
+        <//>
+        <${OpRow} title="Усилить защиту SSH" desc="Перенести SSH на другой порт и закрыть вход по паролю — по плану ядра.">
+          <${Action} icon="shield" disabled=${busy} onClick=${act.harden}>Усилить<//>
+        <//>
+        <${OpRow} title="Telegram Proxy на ноде" desc="Меню Telegram Proxy этой ноды в терминале.">
+          <${Action} icon="send" disabled=${busy} onClick=${act.telegram}>Открыть<//>
+        <//>
+      </div>
+    <//>
+    <${Card} title="Опасная зона" className="danger-zone">
+      <div class="danger-row">
+        <span>Удалить ноду из remote-control и, по выбору, компоненты Essence на сервере.</span>
+        <${Action} tone="danger" icon="trash-2" disabled=${busy} onClick=${remove}>Удалить ноду<//>
+      </div>
+    <//>
+  `;
+}
+
+function NodeCard({ ctx, name, tab }) {
   const show = useCommand(ctx, ['node', 'show', '--name', name], [], { expect: 'not_found' });
   const [busy, run] = useBusy();
+  const mounted = useMounted();
   useEffect(() => {
     if (show.reply && code(show.reply) === 'not_found') ctx.navigate('nodes');
   }, [show.reply]);
-  const title = `Нода: ${name}`;
-  const back = html`<${Back} ctx=${ctx} to="nodes" />`;
-  const act = (key, node) => run(async () => {
-    switch (key) {
-      case 'o': await interactive(ctx, name, false); break;
-      case 't': await interactive(ctx, name, true); break;
-      case 'p': ctx.navigate('connections', name); return;
-      case 'a': ctx.navigate('awg', name); return;
-      case 'k': await ctx.nodeRequest(name, ['node', 'check', '--name', name]); break;
-      case 'u':
-        await ctx.nodeRequest(name, ['node', 'upload-scripts', '--name', name, '--force'],
-          { title: 'Принудительная загрузка скриптов', question: 'Загрузить скрипты?' });
-        break;
-      case 'h': await harden(ctx, name); break;
-      case 'r': {
-        const next = await ctx.ask({ title: 'Переименование ноды', label: 'Новое имя ноды' });
-        if (!next) return;
-        const renamed = await ctx.call('node', 'rename', '--name', name, '--new-name', next);
-        if (renamed.ok) {
-          ctx.navigate('nodes', (renamed.data && typeof renamed.data.name === 'string' && renamed.data.name) || next);
-          return;
-        }
-        outcome(ctx, renamed);
-        break;
-      }
-      case 'e': {
-        const tag = await ctx.ask({ title: 'Тег ноды', label: 'Тег' });
-        if (tag === null) return;
-        outcome(ctx, await ctx.call('node', 'tag', '--name', name, '--tag', tag));
-        break;
-      }
-      case 'w': await storePassword(ctx, name); break;
-      case 'l': await aliases(ctx, name); break;
-      case 'd':
-        if (await deleteNode(ctx, name, node)) { ctx.navigate('nodes'); return; }
-        break;
-      default: return;
-    }
+  const back = { href: ctx.href('nodes'), label: 'Ноды' };
+  const active = TABS.some((item) => item.id === tab) ? tab : TABS[0].id;
+  const tabs = TABS.map((item) => ({ ...item, href: ctx.href('nodes', name, item.id), active: item.id === active }));
+  /** Действие и перечитывание карточки. */
+  const then = (action) => run(async () => {
+    await action();
     show.reload();
   });
-  return html`<${Loaded} title=${title} state=${show} actions=${back}>${(node) => html`
-    <${Card} title=${title} actions=${back}>
-      <${Context} lines=${model.cardContext(node)} />
-      <${Actions}>
-        ${model.cardActions(node).map((action) => html`<${Action} key=${action.key} tone=${action.tone} disabled=${busy}
-          onClick=${() => act(action.key, node)}>${action.label}<//>`)}
-      <//>
-    <//>
-  `}<//>`;
+  const go = (...route) => { if (mounted.current) ctx.navigate(...route); };
+
+  return html`<${Loaded} title=${name} back=${back} state=${show}>${(node) => {
+    const password = node.auth === 'password';
+    const status = model.nodeStatus(node);
+    const act = {
+      check: () => then(() => ctx.nodeRequest(name, checkArgv(name))),
+      upload: () => then(() => ctx.nodeRequest(name, ['node', 'upload-scripts', '--name', name, '--force'],
+        { title: 'Принудительная загрузка скриптов', question: 'Загрузить скрипты?' })),
+      harden: () => then(() => harden(ctx, name)),
+      telegram: () => then(() => interactive(ctx, name, true)),
+    };
+    const remove = () => run(async () => {
+      if (await deleteNode(ctx, name, node)) { go('nodes'); return; }
+      show.reload();
+    });
+    const edit = () => run(async () => {
+      const current = await editNode(ctx, node);
+      if (current !== null && current !== name) { go('nodes', current, active); return; }
+      show.reload();
+    });
+    const actions = active === 'overview' && html`
+      <${Button} kind="primary" icon="terminal" disabled=${busy} onClick=${() => then(() => interactive(ctx, name, false))}>Меню сервера<//>
+      <${Button} icon="pencil" disabled=${busy} onClick=${edit}>Изменить<//>
+      ${password && html`<${Button} icon="key-round" disabled=${busy} onClick=${() => then(() => setNodePassword(ctx, name))}>Пароль SSH<//>`}
+      <${MoreMenu} items=${[
+        { label: 'Проверить подключение', icon: 'refresh-cw', disabled: busy, onClick: act.check },
+        { label: 'Удалить ноду', icon: 'trash-2', danger: true, disabled: busy, onClick: remove },
+      ]} />
+    `;
+    let body;
+    switch (active) {
+      case 'connections': body = html`<${NodeConnections} ctx=${ctx} name=${name} />`; break;
+      case 'awg': body = html`<${NodeAwg} ctx=${ctx} name=${name} />`; break;
+      case 'maintenance': body = html`<${Maintenance} busy=${busy} act=${act} remove=${remove} />`; break;
+      default: body = html`<${Overview} ctx=${ctx} node=${node} />`;
+    }
+    return html`<${Page} title=${name} back=${back} tabs=${tabs} actions=${actions}
+      subtitle=${`${model.plain(node.ip)}:${model.plain(node.port)}`}
+      badge=${html`<${Badge} tone=${status.tone}>${status.label}<//>`}>
+      ${body}
+    <//>`;
+  }}<//>`;
 }
 
-/** `#/nodes` — список, `#/nodes/<имя>` — карточка. */
-export function NodesScreen({ ctx, param }) {
+/** `#/nodes` — список, `#/nodes/<имя>/<вкладка>` — карточка. */
+export function NodesScreen({ ctx, param, tab }) {
   return param
-    ? html`<${NodeCard} key=${param} ctx=${ctx} name=${param} />`
+    ? html`<${NodeCard} key=${param} ctx=${ctx} name=${param} tab=${tab} />`
     : html`<${NodeList} ctx=${ctx} />`;
 }

@@ -5,9 +5,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { runConfirmed } from '../assets/js/flows.js';
 import {
-  dashboardView, DASHBOARD_SECTIONS, settingsView, settingsAction, uninstallArgv, daemonLines,
+  dashboardView, attentionItems, settingsView, settingsAction, uninstallArgv, daemonLines,
   sourceView, sourceAction, importRecoveryKey, recoveryRun, githubWizardFlow, wizardAccounts,
-  storageLabel, existingLabel, targetReplaceContext, newPassword, CANCELLED, FILE_UNREADABLE, PASSWORDS_DIFFER,
+  storageLabel, existingLabel, targetReplaceContext, passwordForm, CANCELLED, FILE_UNREADABLE, PASSWORDS_DIFFER, PASSWORD_EMPTY,
 } from '../assets/js/screens/system-model.js';
 
 const ok = (data = null) => ({ ok: true, data });
@@ -44,6 +44,7 @@ function scripted(steps, answers = []) {
     askSecret: dialog('secret'),
     ask: dialog('ask'),
     choose: dialog('choose'),
+    form: dialog('form'),
     notify: (level, text) => record.notices.push(text),
     failed: () => record.notices.push(FAILED),
     runConfirmed: (title, question, argv, { secrets, input } = {}) => runConfirmed(title, question, argv, {
@@ -91,15 +92,21 @@ test('сводка: заголовок и контекст только из sta
   assert.equal(dashboardView({}, 'test').title, 'Remote Control vtest');
 });
 
-test('сводка: разделы в порядке и цветах TUI', () => {
-  const routes = DASHBOARD_SECTIONS.flat().map((item) => item.route);
-  assert.deepEqual(routes, ['nodes', 'clients', 'groups', 'templates', 'connections', 'generate', 'subscriptions', 'awg', 'telegram', 'source', 'settings']);
-  assert.equal(DASHBOARD_SECTIONS.length, 2);
-  for (const item of DASHBOARD_SECTIONS.flat()) {
-    const expected = ['nodes', 'clients', 'groups', 'templates'].includes(item.route) ? 'create'
-      : ['connections', 'generate', 'subscriptions', 'settings'].includes(item.route) ? 'change' : 'view';
-    assert.equal(item.tone, expected, item.route);
-  }
+test('сводка: «Требует внимания» из status и hello', () => {
+  const items = attentionItems(statusData, { listener: { loopback: false } });
+  assert.deepEqual(items.map((item) => item.id), ['password:ru', 'ssh-setup', 'subscription-host', 'sync', 'update', 'open-panel']);
+  assert.deepEqual(items[0].action, { label: 'Задать пароль', type: 'password', node: 'ru' });
+  assert.equal(items[1].action.type, 'ssh-setup');
+  assert.deepEqual(items.slice(2).map((item) => item.action.route), ['subscriptions', 'source', 'settings', 'settings']);
+  assert.equal(items.find((item) => item.id === 'sync').tone, 'warn');
+  // Всё в порядке: синхронизировано, хост задан, пароль запуска есть, loopback.
+  const calm = attentionItems({
+    update: { available: false }, script_password: false, source: { type: 'github', repo: 'o/r', sync: 'clean' },
+    password_missing: [], ssh_setup_pending: false, subscription_host: 'de',
+  }, { listener: { loopback: true } });
+  assert.deepEqual(calm, []);
+  assert.deepEqual(attentionItems({ source: { type: 'local' }, subscription_host: 'de' }, null), []);
+  assert.deepEqual(attentionItems(null, null).map((item) => item.id), ['subscription-host']);
 });
 
 // ─── Настройки ─────────────────────────────────────────────────────────────
@@ -127,11 +134,11 @@ test('настройки: действия и контекст (settings_view)',
 test('настройки: пароль запуска передаётся только секретами', async () => {
   const set = ['self', 'password-set'];
   const remove = ['self', 'password-remove'];
-  let s = scripted([[set, ok({ password_set: true })]], ['new-pw', 'new-pw']);
+  let s = scripted([[set, ok({ password_set: true })]], [{ password: 'new-pw', repeat: 'new-pw' }]);
   assert.equal(await settingsAction(s.ctx, 'l', { password: false }), null);
   s.finished();
   assert.deepEqual(s.record.secretNames, [['password']]);
-  s = scripted([[set, ok()]], ['cur-pw', 'next-pw', 'next-pw']);
+  s = scripted([[set, ok()]], [{ current: 'cur-pw', password: 'next-pw', repeat: 'next-pw' }]);
   await settingsAction(s.ctx, 'l', { password: true });
   s.finished();
   assert.deepEqual(s.record.secretNames, [['current-password', 'password']]);
@@ -141,7 +148,7 @@ test('настройки: пароль запуска передаётся то�
   assert.deepEqual(s.record.secretNames, [['current-password'], ['current-password']]);
   for (const secret of ['new-pw', 'cur-pw', 'next-pw']) assert.ok(!JSON.stringify(s.record.calls).includes(secret));
   // Несовпадающие пароли — ничего не отправляется.
-  s = scripted([], ['a', 'b']);
+  s = scripted([], [{ password: 'a', repeat: 'b' }]);
   await settingsAction(s.ctx, 'l', { password: false });
   s.finished();
   assert.deepEqual(s.record.notices, [PASSWORDS_DIFFER]);
@@ -164,7 +171,7 @@ test('настройки: обновление только при наличи�
   assert.equal(await settingsAction(s.ctx, 'u', { password: false, available: true }), 'update');
   s.finished();
   const uninstall = ['self', 'uninstall', '--remove-data'];
-  s = scripted([[uninstall, plan('T1')], [yes(uninstall, 'T1'), ok({ removed: true })]], ['remove', true]);
+  s = scripted([[uninstall, plan('T1')], [yes(uninstall, 'T1'), ok({ removed: true })]], [{ scope: 'remove' }, true]);
   assert.equal(await settingsAction(s.ctx, 'x', { password: false }), 'uninstall');
   s.finished();
   s = scripted([], [null]);
@@ -242,7 +249,10 @@ test('источник: смена пароля и новый ключ — па�
     [rewrap, ok({ sync: 'clean' })],
     [rotate, plan('T1')],
     [rotate, plan('T1')], [yes(rotate, 'T1'), ok()],
-  ], ['old-pass', 'new-pass', 'new-pass', 'old-pass', 'new-pass', 'other', 'n1', 'n1', false, 'n1', 'n1', true]);
+  ], [
+    { current: 'old-pass', password: 'new-pass', repeat: 'new-pass' }, { current: 'old-pass', password: 'new-pass', repeat: 'other' },
+    { password: 'n1', repeat: 'n1' }, false, { password: 'n1', repeat: 'n1' }, true,
+  ]);
   const data = sourceData('age');
   await sourceAction(s.ctx, 'r', data);
   await sourceAction(s.ctx, 'r', data);
@@ -290,14 +300,22 @@ test('recovery_run: свой пароль запуска и пароль хра�
   cancel.finished();
 });
 
-test('new_password: несовпадение и пустой ввод отменяют', async () => {
-  let s = scripted([], ['a', 'a']);
-  assert.equal(await newPassword(s.ctx, 'T'), 'a');
+test('passwordForm: одна форма, отмена и повторная проверка значений', async () => {
+  let s = scripted([], [{ password: 'a', repeat: 'a' }]);
+  assert.deepEqual(await passwordForm(s.ctx, 'T'), { current: null, password: 'a' });
+  assert.deepEqual(s.record.dialogs[0].fields.map((field) => field.name), ['password', 'repeat']);
+  s = scripted([], [{ current: 'c', password: 'a', repeat: 'a' }]);
+  assert.deepEqual(await passwordForm(s.ctx, 'T', { current: true }), { current: 'c', password: 'a' });
+  assert.deepEqual(s.record.dialogs[0].fields.map((field) => [field.name, field.type]),
+    [['current', 'secret'], ['password', 'secret'], ['repeat', 'secret']]);
   s = scripted([], [null]);
-  assert.equal(await newPassword(s.ctx, 'T'), null);
-  s = scripted([], ['', ]);
-  assert.equal(await newPassword(s.ctx, 'T'), null);
-  assert.deepEqual(s.record.notices, ['Пароль не может быть пустым.']);
+  assert.equal(await passwordForm(s.ctx, 'T'), null);
+  s = scripted([], [{ password: '', repeat: '' }]);
+  assert.equal(await passwordForm(s.ctx, 'T'), null);
+  assert.deepEqual(s.record.notices, [PASSWORD_EMPTY]);
+  s = scripted([], [{ password: 'a', repeat: 'b' }]);
+  assert.equal(await passwordForm(s.ctx, 'T'), null);
+  assert.deepEqual(s.record.notices, [PASSWORDS_DIFFER]);
 });
 
 // ─── Мастер GitHub ─────────────────────────────────────────────────────────
@@ -334,7 +352,7 @@ test('мастер подключения: каждый код решения �
     [storage, error('new_vault_password_required', { secret: 'new-vault-password' })],
     [storage, error('key_provisioning_required', { nodes: ['de'] })],
     [keysNo, plan('T1')], [yes(keysNo, 'T1'), ok({ repo: 'test-owner/essence-config', storage: 'age', sync: 'clean' })],
-  ], [0, true, true, 0, 'vp', 'vp', false, true]);
+  ], [0, true, true, 0, { password: 'vp', repeat: 'vp' }, false, true]);
   assert.equal(await githubWizardFlow(s.ctx, 'connect'), true);
   s.finished();
   assert.deepEqual(s.record.operations, ['Вход в GitHub'], 'код устройства — в окне операции');

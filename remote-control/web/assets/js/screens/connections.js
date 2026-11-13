@@ -1,91 +1,58 @@
-// Подключения нод: `#/connections` (`nodes.rs::Connections`) и
-// `#/connections/<нода>` (`connection_node`, `assign_connections`).
-// `conn sync` идёт по SSH и чистит устаревшее: обзор синхронизирует при входе
-// и по кнопке, возврат из карточки ноды перечитывает только `conn list`.
+// Вкладка «Подключения» карточки ноды (`#/nodes/<нода>/connections`) —
+// перенос `nodes.rs::connection_node`, `assign_connections`, `aliases`.
+// `conn sync --name` идёт по SSH и чистит устаревшее; после действий
+// перечитывается только `conn list --name`.
 import { html, useEffect, useRef, useState } from '../../vendor/preact-htm.js';
-import { Card } from '../ui.js';
+import { Card, DataTable, Chips } from '../ui.js';
+import { Icon } from '../icons.js';
 import { NODE_CODES } from '../flows.js';
-import { aliases } from './nodes.js';
-import { useBusy, useMounted, Action, Actions, Context, Back, Loaded } from './kit.js';
-import {
-  NO_NODES, syncedNode, syncData, overviewNodes, connectionView, assignConnections,
-  connSyncArgv, connListArgv, nodeCheckArgv, CONNECTION_ACTIONS,
-} from './nodeops-model.js';
+import { useBusy, useMounted, Action, Actions, ReadFailed, rows } from './kit.js';
+import { syncedNode, connectionView, assignConnections, connSyncArgv, connListArgv, nodeCheckArgv } from './nodeops-model.js';
+import { aliasArgv, aliasValues, plain } from './nodes-model.js';
 
-const TITLE = 'Подключения нод';
-
-/** Данные последнего `conn sync` обзора и признак возврата из карточки ноды. */
-const memory = { synced: undefined, resume: false };
-
-export function ConnectionsScreen({ ctx, param }) {
-  return param === null || param === undefined
-    ? html`<${Overview} ctx=${ctx} />`
-    : html`<${NodeConnections} ctx=${ctx} name=${param} />`;
+/** Псевдонимы подключений ноды одной формой (`nodes.rs::aliases`). */
+async function editAliases(ctx, name) {
+  const reply = await ctx.nodeRequest(name, ['node', 'aliases', '--name', name]);
+  if (!reply.ok) return;
+  const entries = rows(reply.data);
+  if (entries.length === 0) {
+    ctx.notify('info', 'Подключения на ноде не найдены.');
+    return;
+  }
+  const form = await ctx.form({
+    title: `Псевдонимы подключений: ${name}`,
+    fields: entries.map((entry, index) => ({
+      name: `a${index}`,
+      label: plain(entry.proxy),
+      type: 'text',
+      value: plain(entry.alias),
+      hint: 'пусто — без псевдонима',
+    })),
+  });
+  if (form === null) return;
+  const argv = aliasArgv(name, entries, aliasValues(entries, form));
+  if (!argv) {
+    ctx.notify('info', 'Изменений нет.');
+    return;
+  }
+  const saved = await ctx.request(argv);
+  if (ctx.isFailure(saved)) ctx.failed();
 }
 
-/** Возврат к обзору без новой синхронизации (TUI: цикл обзора без `s`). */
-function backToOverview(ctx) {
-  memory.resume = true;
-  ctx.navigate('connections');
-}
-
-function Overview({ ctx }) {
-  const [state, setState] = useState({ synced: null, listed: null });
-  const [busy, run] = useBusy();
-  const mounted = useMounted();
-
-  /** `resync` — сначала `conn sync`; список показывается с последним снимком синхронизации. */
-  const load = async (resync) => {
-    if (resync) {
-      const reply = await ctx.call(...connSyncArgv());
-      const synced = syncData(reply);
-      if (synced === null) {
-        // `Connections::run`: сбой синхронизации — итог и выход из раздела.
-        if (ctx.isFailure(reply)) ctx.failed();
-        if (mounted.current) ctx.navigate('summary');
-        return;
-      }
-      memory.synced = synced;
-    }
-    const listed = await ctx.call(...connListArgv());
-    setState({ synced: memory.synced === undefined ? null : memory.synced, listed });
-  };
-
-  useEffect(() => {
-    const resume = memory.resume && memory.synced !== undefined;
-    memory.resume = false;
-    run(() => load(!resume));
-  }, []);
-
-  const loaded = {
-    reply: state.listed,
-    data: state.listed && state.listed.ok ? state.listed.data : null,
-    loading: busy,
-    reload: () => run(() => load(false)),
-  };
-  return html`<${Loaded} title=${TITLE} state=${loaded}>${(data) => {
-    const nodes = overviewNodes(data, state.synced);
-    return html`<${Card} title=${TITLE}>
-      ${nodes.length === 0 && html`<${Context} lines=${[{ text: NO_NODES, tone: 'dim' }]} />`}
-      ${nodes.map((node) => html`<div key=${node.name} class="node-block">
-        <${Action} tone="view" disabled=${busy} onClick=${() => ctx.navigate('connections', node.name)}>${node.name}<//>
-        <${Context} lines=${node.problem ? [{ text: `${node.name}  ${node.problem}`, tone: 'warn' }] : node.groups} />
-      </div>`)}
-      <${Actions}>
-        <${Action} tone="change" disabled=${busy} onClick=${() => run(() => load(true))}>Синхронизировать с нодами<//>
-        <${Back} ctx=${ctx} to="summary" />
-      <//>
-    <//>`;
-  }}<//>`;
-}
-
-function NodeConnections({ ctx, name }) {
-  const [view, setView] = useState(null);
+export function NodeConnections({ ctx, name }) {
+  const [state, setState] = useState({ view: null, failed: null });
   const [busy, run] = useBusy();
   const synced = useRef(null);
   const mounted = useMounted();
-  /** Поздний отказ ушедшей карточки не уводит из выбранного раздела. */
-  const leave = () => { if (mounted.current) backToOverview(ctx); };
+  /** Исчезнувшая нода возвращает к списку — только пока вкладка открыта. */
+  const gone = () => { if (mounted.current) ctx.navigate('nodes'); };
+  const fail = (reply) => { if (mounted.current) setState((current) => ({ ...current, failed: reply })); };
+  /** Сбой чтения: `not_found` — к списку нод, иначе итог сбоя и «Повторить чтение». */
+  const failure = (reply) => {
+    if (reply.error && reply.error.code === 'not_found') { gone(); return; }
+    if (ctx.isFailure(reply)) ctx.failed();
+    fail(reply);
+  };
 
   /** `conn sync --name`; при `partial` с кодом ноды — один раз `node check`. */
   const refresh = async () => {
@@ -109,8 +76,7 @@ function NodeConnections({ ctx, name }) {
         }
         return true;
       }
-      if (reply.error && reply.error.code !== 'not_found' && ctx.isFailure(reply)) ctx.failed();
-      leave();
+      failure(reply);
       return false;
     }
   };
@@ -118,11 +84,10 @@ function NodeConnections({ ctx, name }) {
   const list = async () => {
     const listed = await ctx.request(connListArgv(name), { expect: 'not_found' });
     if (!listed.ok) {
-      if (listed.error && listed.error.code !== 'not_found' && ctx.isFailure(listed)) ctx.failed();
-      leave();
+      failure(listed);
       return;
     }
-    setView(connectionView(listed.data, synced.current, name));
+    if (mounted.current) setState({ view: connectionView(listed.data, synced.current, name), failed: null });
   };
 
   const synchronize = async () => {
@@ -131,26 +96,37 @@ function NodeConnections({ ctx, name }) {
 
   useEffect(() => { run(synchronize); }, [name]);
 
-  const actions = {
-    assign: async () => {
-      await assignConnections(ctx, name, view.proxies, view.assigned);
-      await list();
-    },
-    aliases: async () => {
-      await aliases(ctx, name);
-      await list();
-    },
-    sync: synchronize,
-  };
+  const act = (action) => run(async () => {
+    await action();
+    await list();
+  });
 
-  const title = `Подключения ноды: ${name}`;
-  if (!view) return html`<${Card} title=${title}><p class="dim">Загрузка…</p><//>`;
-  return html`<${Card} title=${title}>
-    <${Context} lines=${view.lines} />
-    <${Actions} column>
-      ${CONNECTION_ACTIONS.map((action) => html`<${Action} key=${action.id} tone=${action.tone} disabled=${busy}
-        onClick=${() => run(actions[action.id])}>${action.label}<//>`)}
-      <${Action} tone="plain" disabled=${busy} onClick=${() => backToOverview(ctx)}>Назад<//>
-    <//>
+  const { view, failed } = state;
+  if (!view) {
+    return html`<${Card} title="Подключения">
+      ${failed
+        ? html`<${ReadFailed} reply=${failed} loading=${busy} reload=${() => run(synchronize)} />`
+        : html`<p class="t-dim">Загрузка…</p>`}
+    <//>`;
+  }
+  const columns = [
+    { key: 'proxy', label: 'Подключение', search: true },
+    {
+      key: 'groups',
+      label: 'Группы',
+      render: (row) => html`<${Chips} items=${row.groups.map((group) => ({ label: group, href: ctx.href('groups', group) }))} />`,
+    },
+  ];
+  const actions = html`<${Actions}>
+    <${Action} primary icon="git-branch" disabled=${busy}
+      onClick=${() => act(() => assignConnections(ctx, name, view.proxies, view.assigned))}>Назначить группам<//>
+    <${Action} icon="pencil" disabled=${busy} onClick=${() => act(() => editAliases(ctx, name))}>Псевдонимы<//>
+    <${Action} icon="refresh-cw" disabled=${busy} onClick=${() => run(synchronize)}>Синхронизировать<//>
+  <//>`;
+  return html`<${Card} title="Подключения" actions=${actions}>
+    ${view.problem && html`<div role="alert" class="alert alert-warning alert-soft">
+      <${Icon} name="triangle-alert" size=${18} /><span>Нода ${view.problem}</span>
+    </div>`}
+    <${DataTable} columns=${columns} rows=${view.table} rowKey="proxy" empty="Подключения не найдены" />
   <//>`;
 }

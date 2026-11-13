@@ -3,7 +3,6 @@
 
 /** Пустое состояние мультивыбора (`clients.rs::EMPTY`). */
 export const EMPTY = 'Нет вариантов для выбора';
-export const NOTHING_SELECTED = 'Ничего не выбрано.';
 
 /** Строка или «—» (`clients.rs::text`). */
 export function str(value) {
@@ -46,21 +45,6 @@ export function nodeLabel(row) {
   return `${str(row.name)}  ${str(row.ip)}:${scalar(row.port)}`;
 }
 
-/** Варианты выбора `<kind> list`: нода — `name  ip:port`, прочее — имя. */
-export function pickOptions(kind, data) {
-  return rowsOf(data).map((row) => ({ value: str(row.name), label: kind === 'node' ? nodeLabel(row) : str(row.name), tone: 'view' }));
-}
-
-/**
- * Имя выбранной строки `<kind> list` (`clients.rs::pick`): сбой чтения —
- * `ctx.failed()` и `null` (`fetch`); пустой список — «Нет объектов для выбора».
- */
-export async function pick(ctx, kind, title) {
-  const reply = await ctx.request([kind, 'list']);
-  if (!reply.ok) { ctx.failed(); return null; }
-  return ctx.choose({ title, options: pickOptions(kind, reply.data), empty: 'Нет объектов для выбора' });
-}
-
 // ─── Клиенты ────────────────────────────────────────────────────────────────
 
 /** Подпись клиента в списке: `name  (group)`. */
@@ -87,13 +71,27 @@ export function inherits(row) {
   return row.inherit_nodes !== false;
 }
 
-/** Контекст карточки клиента (`clients.rs::client_card`). */
-export function clientContext(row) {
-  return [
-    `Группа: ${str(row.group)}`,
-    `Ноды: ${inherits(row) ? 'от группы' : 'свои'} (${joined(row.nodes)})`,
-    `Подписка: ${subscriptionState(row)}`,
-  ];
+/** Отметка подписки в списках: `{ tone, label }`. */
+export function subscriptionBadge(row) {
+  const sub = (row && row.subscription) || {};
+  if (sub.published !== true) return { tone: 'neutral', label: 'нет' };
+  const until = currentExpiry(row);
+  return { tone: 'ok', label: until === null ? 'без срока' : `до ${until}` };
+}
+
+/**
+ * Шаги формы «Изменить клиента» (`client set-group`, затем `client rename`):
+ * смена группы идёт под старым именем, переименование — последним.
+ */
+export function editSteps(name, row, values) {
+  const steps = [];
+  if (values.group !== str(row.group)) {
+    steps.push({ title: 'Смена группы клиента', question: 'Сменить группу?', argv: ['client', 'set-group', '--name', name, '--group', values.group] });
+  }
+  if (values.name !== name) {
+    steps.push({ title: 'Переименование клиента', question: 'Переименовать клиента?', argv: ['client', 'rename', '--name', name, '--new-name', values.name], rename: true });
+  }
+  return steps;
 }
 
 /** Имя после `client rename`: из `data` при успехе, из `error` при `partial`. */
@@ -135,13 +133,13 @@ export function clientDataLines(data) {
   return lines;
 }
 
-/** Выбор действия «Ноды клиента» (`clients.rs::client_nodes`). */
-export function clientNodesMenu(name, inherit) {
-  const state = inherit ? 'от группы' : 'свои';
-  const options = inherit
-    ? [{ value: 'own', label: 'Назначить свои ноды', tone: 'change' }]
-    : [{ value: 'own', label: 'Изменить свои ноды', tone: 'change' }, { value: 'inherit', label: 'Вернуть ноды от группы', tone: 'change' }];
-  return { title: `Ноды клиента: ${name} (сейчас ${state})`, options };
+/**
+ * Изменение нод из формы (`mode`: `inherit|own`, `nodes`): `null` — нечего
+ * делать (наследование уже включено), иначе `{ kind, argv }`; `inherit` — по плану.
+ */
+export function nodesChange(name, inherit, values) {
+  if (values.mode === 'inherit') return inherit ? null : { kind: 'inherit', argv: inheritNodesArgv(name) };
+  return { kind: 'own', argv: clientNodesArgv(name, values.nodes) };
 }
 
 export function clientNodesArgv(name, nodes) {
@@ -152,11 +150,6 @@ export function clientNodesArgv(name, nodes) {
 
 export function inheritNodesArgv(name) {
   return ['client', 'nodes', '--name', name, '--inherit'];
-}
-
-/** Свои ноды клиента, ещё существующие в `node list`, в порядке назначения. */
-export function availableNodes(nodeList, own) {
-  return own.map((name) => rowsOf(nodeList).find((row) => row && row.name === name)).filter(Boolean);
 }
 
 /** Прокси клиента на ноде из `client connections --name`. */
@@ -202,8 +195,16 @@ export function ttlOptions(current) {
   ];
 }
 
-export const TTL_TITLE = 'Срок действия подписки';
-export const TTL_PROMPT = 'Срок действия (число и h, d или w, например 7d)';
+/** Значение `--ttl` из формы публикации: `keep` — `null` (без `--ttl`), `custom` — свой срок. */
+export function ttlValue(values) {
+  if (values.ttl === 'keep') return null;
+  return values.ttl === 'custom' ? values.custom : values.ttl;
+}
+
+/** Проверка своего срока: число и `h`, `d` или `w`. */
+export function ttlError(value) {
+  return /^[0-9]+[hdw]$/.test(value) ? null : 'Срок: число и h, d или w, например 7d';
+}
 
 /** `ttl === null` — без `--ttl` (ядро сохраняет текущий срок). */
 export function publishArgv(name, ttl) {
@@ -304,20 +305,14 @@ export function summaryLines(data, fields, empty) {
 
 // ─── Группы ─────────────────────────────────────────────────────────────────
 
-/** Контекст карточки группы (`clients.rs::group_card`). */
-export function groupContext(row) {
-  return [
-    `Шаблон: ${str(row.template)}`,
-    `Клиентов: ${scalar(row.clients)}`,
-    `Ноды: ${joined(row.nodes)}`,
-  ];
-}
+/** Пункт «Создать новый…»: `/` не бывает в имени файла шаблона. */
+export const NEW_TEMPLATE = '/new';
 
-export const NEW_TEMPLATE = '\u0000new';
-
-/** Выбор шаблона группы (`clients.rs::group_template`). */
-export function groupTemplateMenu(name, current, templates) {
-  const options = names(templates).map((template) => ({ value: template, label: template, tone: 'view' }));
-  options.push({ value: NEW_TEMPLATE, label: 'Создать новый шаблон', tone: 'create' });
-  return { title: `Шаблон группы: ${name} (текущий: ${current})`, options };
+/**
+ * Выбор шаблона группы (`clients.rs::group_template`): `null` — без изменений,
+ * `{ kind: 'set', template }` или `{ kind: 'create', name }`.
+ */
+export function templateChange(current, values) {
+  if (values.template === NEW_TEMPLATE) return { kind: 'create', name: values.name };
+  return values.template === current ? null : { kind: 'set', template: values.template };
 }

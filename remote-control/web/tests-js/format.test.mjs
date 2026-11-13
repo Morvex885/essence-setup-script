@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import {
   text, joined, versionLabel, syncState, sourceLabel, scriptsState,
   templateSource, activity, activityIndicator, openPanel, OPEN_PANEL_WARNING,
-  errorMessage, readInputFile, MAX_INPUT, FILE_TOO_LARGE,
+  errorMessage, readInputFile, MAX_INPUT, FILE_TOO_LARGE, filterJournal,
 } from '../assets/js/format.js';
 
 test('text: null, undefined и пустая строка — тире', () => {
@@ -108,4 +108,16 @@ test('readInputFile: UTF-8 не больше 1 МиБ, как у меню', asyn
   assert.equal((await readInputFile(new Blob(['a'.repeat(MAX_INPUT)]))).text.length, MAX_INPUT);
   assert.deepEqual(await readInputFile(new Blob(['a'.repeat(MAX_INPUT + 1)])), { error: FILE_TOO_LARGE });
   assert.deepEqual(await readInputFile(new Blob([new Uint8Array([0xff, 0x00])])), { error: null }, 'не UTF-8');
+});
+
+test('filterJournal: все, только ошибки, только предупреждения', () => {
+  const entries = [
+    { id: 1, level: 'info', text: 'a' }, { id: 2, level: 'error', text: 'b' },
+    { id: 3, level: 'warn', text: 'c' }, { id: 4, level: 'success', text: 'd' }, { id: 5, level: 'error', text: 'e' },
+  ];
+  assert.equal(filterJournal(entries, 'all'), entries);
+  assert.deepEqual(filterJournal(entries, 'error').map((entry) => entry.id), [2, 5]);
+  assert.deepEqual(filterJournal(entries, 'warn').map((entry) => entry.id), [3]);
+  assert.equal(filterJournal(entries, 'other'), entries);
+  assert.deepEqual(filterJournal(null, 'error'), []);
 });

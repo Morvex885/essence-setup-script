@@ -4,7 +4,8 @@
 // `recovery_run`, `provision`, `github_wizard`). Без DOM: диалоги и запросы —
 // через `ctx` (`app.js::makeContext`), ссылки для ручных действий — `deps.link`.
 import { decisionFlag, setFlag, clearFlag, isFailure } from '../flows.js';
-import { versionLabel, syncState, joined, text } from '../format.js';
+import { versionLabel, syncState, joined, text, openPanel, OPEN_PANEL_WARNING } from '../format.js';
+import { validate } from '../form-model.js';
 
 export const CANCELLED = 'Отменено.';
 export const FILE_UNREADABLE = 'Файл недоступен или не в UTF-8.';
@@ -24,40 +25,80 @@ function cancelled(ctx) {
   ctx.notify('info', CANCELLED);
 }
 
-/** Новый пароль дважды (`system.rs::new_password`); `null` — отмена. */
-export async function newPassword(ctx, title) {
-  const first = await ctx.askSecret({ title, label: 'Новый пароль', allowEmpty: true });
-  if (first === null || first === undefined) return null;
-  if (first === '') { ctx.notify('warn', PASSWORD_EMPTY); return null; }
-  const second = await ctx.askSecret({ title, label: 'Повторите пароль' });
-  if (second === null || second === undefined) return null;
-  if (first !== second) { ctx.notify('warn', PASSWORDS_DIFFER); return null; }
-  return first;
+/**
+ * Новый пароль дважды одной формой (`system.rs::new_password`); с
+ * `current` — ещё и текущий пароль. `{ current, password }` или `null` при
+ * отмене. Значения уходят только в `secrets` вызывающего.
+ */
+export async function passwordForm(ctx, title, { current = false, currentLabel = 'Текущий пароль' } = {}) {
+  const fields = [
+    ...(current ? [{ name: 'current', label: currentLabel, type: 'secret', required: true }] : []),
+    { name: 'password', label: 'Новый пароль', type: 'secret', required: PASSWORD_EMPTY },
+    {
+      name: 'repeat', label: 'Повторите пароль', type: 'secret',
+      validate: (value, values) => (value === values.password ? null : PASSWORDS_DIFFER),
+    },
+  ];
+  const values = await ctx.form({ title, fields, submit: 'Сохранить' });
+  if (values === null || values === undefined) return null;
+  // Форма проверяет поля сама; повторная проверка не пропускает неверный ввод.
+  const errors = Object.values(validate(fields, values));
+  if (errors.length > 0) { ctx.notify('warn', errors[0]); return null; }
+  return { current: current ? values.current : null, password: values.password };
 }
 
 // ─── Сводка ────────────────────────────────────────────────────────────────
 
 /**
- * Разделы сводки в порядке и цветах TUI (`dashboard_view`): создание —
- * `create`, операции над конфигурацией — `change`, просмотр — `view`.
+ * «Требует внимания» на сводке из `status` и `hello`: `[{ id, tone, text,
+ * action }]`; `action` — `{ label, type: 'password'|'ssh-setup'|'route',
+ * node?, route? }` (экран выполняет действие по `type`).
  */
-export const DASHBOARD_SECTIONS = [
-  [
-    { route: 'nodes', label: 'Ноды', tone: 'create' },
-    { route: 'clients', label: 'Клиенты', tone: 'create' },
-    { route: 'groups', label: 'Группы', tone: 'create' },
-    { route: 'templates', label: 'Шаблоны', tone: 'create' },
-    { route: 'connections', label: 'Подключения', tone: 'change' },
-    { route: 'generate', label: 'Генерация конфигов', tone: 'change' },
-    { route: 'subscriptions', label: 'Подписки', tone: 'change' },
-    { route: 'awg', label: 'AmneziaWG', tone: 'view' },
-    { route: 'telegram', label: 'Telegram Proxy', tone: 'view' },
-  ],
-  [
-    { route: 'source', label: 'Источник конфигурации', tone: 'view' },
-    { route: 'settings', label: 'Настройки', tone: 'change' },
-  ],
-];
+export function attentionItems(status, hello) {
+  const data = status && typeof status === 'object' ? status : {};
+  const items = [];
+  for (const node of strings(data.password_missing)) {
+    items.push({
+      id: `password:${node}`, tone: 'warn', text: `Нода «${node}»: пароль SSH не сохранён`,
+      action: { label: 'Задать пароль', type: 'password', node },
+    });
+  }
+  if (data.ssh_setup_pending === true) {
+    items.push({
+      id: 'ssh-setup', tone: 'warn', text: 'Отложена SSH-настройка нод',
+      action: { label: 'Завершить настройку', type: 'ssh-setup' },
+    });
+  }
+  if (!str(data.subscription_host)) {
+    items.push({
+      id: 'subscription-host', tone: 'info', text: 'Хост-нода подписок не задана',
+      action: { label: 'Выбрать хост', type: 'route', route: 'subscriptions' },
+    });
+  }
+  const source = data.source || {};
+  if (source.type === 'github') {
+    const sync = syncState(source.sync);
+    if (sync.tone === 'warn' || sync.tone === 'error') {
+      items.push({
+        id: 'sync', tone: sync.tone, text: `Источник GitHub: ${sync.label}`,
+        action: { label: 'Источник', type: 'route', route: 'source' },
+      });
+    }
+  }
+  if (data.update && data.update.available === true) {
+    items.push({
+      id: 'update', tone: 'info', text: `Доступно обновление ${versionLabel(str(data.update.latest))}`,
+      action: { label: 'Настройки', type: 'route', route: 'settings' },
+    });
+  }
+  if (openPanel(hello, data, null)) {
+    items.push({
+      id: 'open-panel', tone: 'warn', text: OPEN_PANEL_WARNING,
+      action: { label: 'Настройки', type: 'route', route: 'settings' },
+    });
+  }
+  return items;
+}
 
 const count = (value) => (Number.isInteger(value) && value >= 0 ? value : 0);
 
@@ -89,7 +130,7 @@ export function dashboardView(data, helloVersion = '') {
   if (status.ssh_setup_pending === true) {
     context.push({ text: 'Отложена SSH-настройка нод — раздел «Ноды» → «Завершить отложенную SSH-настройку»', tone: 'warn' });
   }
-  return { title: `Remote Control ${versionLabel(version)}`, update, context, sections: DASHBOARD_SECTIONS };
+  return { title: `Remote Control ${versionLabel(version)}`, update, context };
 }
 
 // ─── Настройки ─────────────────────────────────────────────────────────────
@@ -143,15 +184,11 @@ export async function settingsAction(ctx, key, { password, available }) {
       return null;
     }
     case 'l': {
+      const form = await passwordForm(ctx, 'Пароль запуска', { current: Boolean(password), currentLabel: 'Текущий пароль запуска' });
+      if (form === null) return null;
       const secrets = {};
-      if (password) {
-        const current = await ctx.askSecret({ title: 'Пароль запуска', label: 'Текущий пароль запуска' });
-        if (current === null || current === undefined) return null;
-        secrets['current-password'] = current;
-      }
-      const next = await newPassword(ctx, 'Пароль запуска');
-      if (next === null) return null;
-      secrets.password = next;
+      if (password) secrets['current-password'] = form.current;
+      secrets.password = form.password;
       report(ctx, await ctx.request(['self', 'password-set'], { secrets }));
       return null;
     }
@@ -165,14 +202,20 @@ export async function settingsAction(ctx, key, { password, available }) {
       return null;
     }
     case 'x': {
-      const scope = await ctx.choose({
+      const values = await ctx.form({
         title: 'Удаление remote-control',
-        options: [
-          { value: 'keep', label: 'Сохранить локальные данные', tone: 'view' },
-          { value: 'remove', label: 'Удалить локальные данные', tone: 'view' },
-        ],
+        fields: [{
+          name: 'scope', label: 'Локальные данные', type: 'radio', required: 'Выберите объём удаления.',
+          options: [
+            { value: 'keep', label: 'Сохранить локальные данные' },
+            { value: 'remove', label: 'Удалить локальные данные' },
+          ],
+        }],
+        submit: 'Далее',
+        tone: 'danger',
       });
-      if (scope === null || scope === undefined) return null;
+      if (values === null || values === undefined || !values.scope) return null;
+      const scope = values.scope;
       const reply = await ctx.runConfirmed('Удаление remote-control', 'Удалить remote-control в выбранном объёме?', uninstallArgv(scope));
       if (reply.ok) return 'uninstall';
       report(ctx, reply);
@@ -313,20 +356,18 @@ export async function sourceAction(ctx, key, data, deps = {}) {
     case 'c': await ctx.wizard('change'); return;
     case 'r': {
       if (!encrypted) return;
-      const current = await ctx.askSecret({ title: 'Смена пароля доступа', label: 'Текущий пароль доступа' });
-      if (current === null || current === undefined) return;
-      const next = await newPassword(ctx, 'Смена пароля доступа');
-      if (next === null) return;
-      const secrets = { 'vault-password': current, 'new-vault-password': next };
+      const form = await passwordForm(ctx, 'Смена пароля доступа', { current: true, currentLabel: 'Текущий пароль доступа' });
+      if (form === null) return;
+      const secrets = { 'vault-password': form.current, 'new-vault-password': form.password };
       report(ctx, await ctx.request(['source', 'github-rewrap-password'], { secrets }));
       return;
     }
     case 'v': {
       if (!encrypted) return;
-      const next = await newPassword(ctx, 'Новый ключ шифрования');
-      if (next === null) return;
+      const form = await passwordForm(ctx, 'Новый ключ шифрования');
+      if (form === null) return;
       const reply = await ctx.runConfirmed('Новый ключ шифрования', 'Создать новый ключ?', ['source', 'github-rotate-key'],
-        { secrets: { 'new-vault-password': next } });
+        { secrets: { 'new-vault-password': form.password } });
       report(ctx, reply);
       return;
     }
@@ -480,9 +521,9 @@ export async function githubWizardFlow(ctx, mode, deps = {}) {
         break;
       }
       case 'new_vault_password_required': {
-        const password = await newPassword(ctx, title);
-        decided = password !== null;
-        if (decided) secrets['new-vault-password'] = password;
+        const form = await passwordForm(ctx, title);
+        decided = form !== null;
+        if (decided) secrets['new-vault-password'] = form.password;
         break;
       }
       case 'existing_config_action_required': {

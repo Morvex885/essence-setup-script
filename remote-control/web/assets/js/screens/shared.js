@@ -1,7 +1,6 @@
-// Общие действия клиентов, групп, шаблонов, генерации и подписок — перенос
-// помощников `remote-control/tui/src/clients.rs` (`fetch`, `load`, `pick`,
-// `generate`, `headers`, `share`, `client_subscription`). Подменю TUI здесь —
-// цепочки диалогов `ctx`; функции завершаются, когда пользователь вышел.
+// Общие действия клиентов, групп, генерации и подписок — перенос помощников
+// `remote-control/tui/src/clients.rs` (`fetch`, `load`, `generate`, `headers`,
+// `share`, `resolved_headers`). Вопросы TUI здесь — формы и диалоги `ctx`.
 import { html, useEffect, useRef, useState } from '../../vendor/preact-htm.js';
 import { CopyButton } from '../ui.js';
 import { Context } from './kit.js';
@@ -46,12 +45,11 @@ export async function loadData(ctx, title, argv) {
   }
 }
 
-/** Обязательный ответ: отмена — `null`, пустой — предупреждение и `null`. */
-export async function required(ctx, title, label, missing) {
-  const answer = await ctx.ask({ title, label });
-  if (answer === null || answer === undefined) return null;
-  if (answer === '') { ctx.notify('warn', missing); return null; }
-  return answer;
+/** Варианты поля `select` из строк списка: подпись — `label(row)` или имя. */
+export function nameOptions(data, label = null) {
+  return model.rowsOf(data)
+    .filter((row) => row && typeof row.name === 'string')
+    .map((row) => ({ value: row.name, label: label ? label(row) : row.name }));
 }
 
 /** Окно итога (`clients.rs::summary`). */
@@ -84,12 +82,16 @@ export async function showHeaders(ctx, kind, name) {
     });
     if (choice === null || choice === undefined) return;
     if (choice === 'set') {
-      const header = await ctx.ask({ title: 'Установить заголовок', label: 'Имя заголовка' });
-      if (header === null || header === undefined) continue;
-      const value = await ctx.ask({ title: 'Установить заголовок', label: 'Значение', context: [header] });
-      if (value === null || value === undefined) continue;
-      if (header === '' || value === '') { ctx.notify('warn', 'Имя и значение заголовка обязательны.'); continue; }
-      await execute(ctx, model.headersArgv(kind, name, '--set', `${header}=${value}`));
+      const values = await ctx.form({
+        title: 'Установить заголовок',
+        fields: [
+          { name: 'header', label: 'Имя заголовка', type: 'text', required: true, autofocus: true },
+          { name: 'value', label: 'Значение', type: 'text', required: true },
+        ],
+        submit: 'Установить',
+      });
+      if (values === null || values === undefined) continue;
+      await execute(ctx, model.headersArgv(kind, name, '--set', `${values.header}=${values.value}`));
     } else {
       const own = model.removableHeaders(read.data, client);
       const target = await ctx.choose({ title: 'Удаление заголовка', options: own.map((item) => ({ value: item, label: item, tone: 'danger' })) });
@@ -133,18 +135,21 @@ function QrCode({ text }) {
 /** Окно ссылки (`clients.rs::share_view`): URL, срок, заголовки, curl, JSON, QR. */
 function ShareView({ share }) {
   return html`<div class="share">
-    <div class="field-label tone-ok">URL</div>
-    <div class="mono">${share.url}</div>
-    <${CopyButton} text=${share.url} label="Копировать ссылку" />
-    ${share.expires && html`<p><span class="tone-warn">Срок действия: </span>${share.expires}</p>`}
+    <div class="share-label">Ссылка</div>
+    <div class="share-value mono">${share.url}</div>
+    <div class="row">
+      <${CopyButton} text=${share.url} label="Копировать ссылку" kind="primary" />
+      <${CopyButton} text=${share.curl} label="Копировать curl" />
+      <${CopyButton} text=${share.json} label="Копировать JSON" />
+    </div>
+    ${share.expires && html`<div class="share-label">Срок действия</div><div class="t-warn">${share.expires}</div>`}
     ${share.headers.length > 0 && html`
-      <div class="section-title">Сервер отдаст эти заголовки:</div>
-      <${Context} lines=${share.headers.map((line) => `  ${line}`)} />`}
-    <div class="section-title">curl</div>
-    <div class="mono">${share.curl}</div>
-    <${CopyButton} text=${share.curl} label="Копировать curl" />
-    <div class="section-title">JSON</div>
-    <div class="mono">${share.json}</div>
+      <div class="share-label">Сервер отдаст эти заголовки</div>
+      <div class="share-value mono">${share.headers.map((line, index) => html`<div key=${index}>${line}</div>`)}</div>`}
+    <div class="share-label">curl</div>
+    <div class="share-value mono">${share.curl}</div>
+    <div class="share-label">JSON</div>
+    <div class="share-value mono">${share.json}</div>
     ${share.qr !== null && html`<${QrCode} text=${share.qr} />`}
   </div>`;
 }
@@ -158,64 +163,8 @@ export async function showShare(ctx, name) {
 }
 
 /** Итоговые заголовки клиента с источником (`clients.rs::resolved_headers`). */
-async function resolvedHeaders(ctx, name) {
+export async function resolvedHeaders(ctx, name) {
   const read = await fetchData(ctx, ['subscription', 'headers', '--client', name]);
   if (!read) return;
   await ctx.show({ title: `Итоговые заголовки: ${name}`, lines: model.headerLines(read.data, true) });
-}
-
-/** Срок публикации (`clients.rs::ttl`): `undefined` — отмена, `null` — без `--ttl`. */
-async function askTtl(ctx, current) {
-  const choice = await ctx.choose({ title: model.TTL_TITLE, options: model.ttlOptions(current).map((o) => ({ ...o, tone: 'view' })) });
-  if (choice === null || choice === undefined) return undefined;
-  if (choice === 'keep') return null;
-  if (choice !== 'custom') return choice;
-  const custom = await required(ctx, model.TTL_TITLE, model.TTL_PROMPT, 'Срок не указан.');
-  return custom === null ? undefined : custom;
-}
-
-const SUBSCRIPTION_ACTIONS = [
-  { value: 'publish', label: 'Опубликовать', tone: 'create' },
-  { value: 'share', label: 'Показать ссылку', tone: 'view' },
-  { value: 'resolved', label: 'Итоговые заголовки', tone: 'view' },
-  { value: 'headers', label: 'Заголовки клиента', tone: 'change' },
-  { value: 'rotate', label: 'Сменить токен', tone: 'danger' },
-  { value: 'revoke', label: 'Отозвать подписку', tone: 'danger' },
-];
-
-/** Подменю «Подписка клиента» (`clients.rs::client_subscription`). */
-export async function clientSubscription(ctx, name) {
-  for (;;) {
-    const read = await loadData(ctx, 'Подписка клиента', ['client', 'list']);
-    if (!read) return;
-    const row = model.findRow(read.data, name);
-    if (!row) { ctx.notify('warn', `Клиент «${name}» не найден.`); return; }
-    // Нечитаемый хост только скрывает строку (v1 `sub host || true`).
-    const host = await ctx.request(['subscription', 'host']);
-    const choice = await ctx.choose({
-      title: `Подписка клиента: ${name}`,
-      context: [model.hostLine(host).text, `Подписка: ${model.subscriptionState(row)}`],
-      options: SUBSCRIPTION_ACTIONS,
-      cancel: 'Назад',
-    });
-    if (choice === null || choice === undefined) return;
-    if (choice === 'publish') {
-      const ttl = await askTtl(ctx, model.currentExpiry(row));
-      if (ttl === undefined) continue;
-      const reply = await ctx.request(model.publishArgv(name, ttl));
-      if (model.published(reply)) await showShare(ctx, name);
-      else ctx.failed();
-    } else if (choice === 'share') {
-      await showShare(ctx, name);
-    } else if (choice === 'resolved') {
-      await resolvedHeaders(ctx, name);
-    } else if (choice === 'headers') {
-      await showHeaders(ctx, 'client', name);
-    } else if (choice === 'rotate') {
-      const reply = await confirmed(ctx, 'Смена токена подписки', 'Сменить токен?', ['subscription', 'rotate', '--name', name]);
-      if (model.published(reply)) await showShare(ctx, name);
-    } else if (choice === 'revoke') {
-      await confirmed(ctx, 'Отзыв подписки', 'Отозвать подписку?', ['subscription', 'revoke', '--name', name]);
-    }
-  }
 }

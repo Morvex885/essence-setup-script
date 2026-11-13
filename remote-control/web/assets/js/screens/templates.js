@@ -4,43 +4,50 @@
 // с содержимым в `input.file` через `runConfirmed`; «Экспорт в файл» —
 // `template show` и скачивание файла `<имя>`.
 import { html, useState, useEffect } from '../../vendor/preact-htm.js';
-import { Card, FileText, downloadText } from '../ui.js';
-import { useCommand, useBusy, Action, Actions, Context, Back, Loaded, rows } from './kit.js';
+import { Page, Card, Facts, Chips, Badge, Button, DataTable, Empty, FileText, downloadText } from '../ui.js';
+import { useCommand, useBusy, Loaded, rows } from './kit.js';
 import {
   TEMPLATE_NAME_MISSING, TEMPLATE_FILE_UNREADABLE, templateList, templateCreate, templateShow, templateImport,
-  templateInput, templateLabel, findTemplate, templateContext, templatePath, templateContent,
+  templateInput, findTemplate, templatePath, templateContent,
 } from './catalog-model.js';
+import { templateSource } from '../format.js';
 
 export function TemplatesScreen({ ctx, param }) {
   if (param) return html`<${TemplateCard} key=${param} ctx=${ctx} name=${param} />`;
   return html`<${TemplateList} ctx=${ctx} />`;
 }
 
+const groupChips = (ctx, row) => rows(row && row.groups).filter((group) => typeof group === 'string')
+  .map((group) => ({ label: group, href: ctx.href('groups', group) }));
+
 /** `clients.rs::templates`: список и «Создать шаблон». */
 function TemplateList({ ctx }) {
   const state = useCommand(ctx, templateList());
   const [busy, run] = useBusy();
   const create = () => run(async () => {
-    const name = await ctx.ask({ title: 'Создать шаблон', label: 'Имя шаблона' });
-    if (name === null) return;
-    if (name === '') { ctx.notify('warn', TEMPLATE_NAME_MISSING); return; }
-    const reply = await ctx.request(templateCreate(name));
+    const values = await ctx.form({
+      title: 'Создать шаблон',
+      fields: [{ name: 'name', label: 'Имя шаблона', type: 'text', placeholder: 'my.yaml', required: TEMPLATE_NAME_MISSING }],
+      submit: 'Создать',
+    });
+    if (values === null) return;
+    const reply = await ctx.request(templateCreate(values.name));
     if (!reply.ok) { ctx.failed(); await state.reload(); return; }
     // Как в TUI: созданный шаблон сразу открывается в редакторе.
     if (reply.data && typeof reply.data.name === 'string') ctx.navigate('templates', reply.data.name);
     else await state.reload();
   });
-  const actions = html`
-    <${Action} tone="create" disabled=${busy} onClick=${create}>Создать шаблон<//>
-    <${Back} ctx=${ctx} to="summary" />`;
+  const actions = html`<${Button} kind="primary" icon="plus" disabled=${busy} onClick=${create}>Создать шаблон<//>`;
   return html`<${Loaded} title="Шаблоны" state=${state} actions=${actions}>${(data) => html`
-    <${Card} title="Шаблоны" actions=${actions}>
+    <${Page} title="Шаблоны" actions=${actions}>
       ${rows(data).length === 0
-        ? html`<${Context} lines=${[{ text: 'Нет шаблонов', tone: 'dim' }]} />`
-        : html`<${Actions} column>
-            ${rows(data).map((row) => html`
-              <${Action} key=${row.name} tone="view" disabled=${busy} onClick=${() => ctx.navigate('templates', row.name)}>${templateLabel(row)}<//>`)}
-          <//>`}
+        ? html`<${Card}><${Empty} icon="file-code" title="Нет шаблонов" /><//>`
+        : html`<${DataTable} rows=${rows(data)} href=${(row) => ctx.href('templates', row.name)}
+            columns=${[
+              { key: 'name', label: 'Шаблон', search: true },
+              { key: 'source', label: 'Источник', render: (row) => html`<${Badge} tone=${row.source === 'builtin' ? 'neutral' : 'info'}>${templateSource(row)}<//>` },
+              { key: 'groups', label: 'Группы', search: true, render: (row) => html`<${Chips} items=${groupChips(ctx, row)} />` },
+            ]} />`}
     <//>`}<//>`;
 }
 
@@ -55,6 +62,7 @@ function TemplateCard({ ctx, name }) {
   const [rejected, setRejected] = useState(false);
   const row = list.data ? findTemplate(list.data, name) : null;
   const content = templateContent(shown.data);
+  const dirty = draft !== null && draft !== content;
 
   useEffect(() => {
     if (!list.data) return;
@@ -69,6 +77,13 @@ function TemplateCard({ ctx, name }) {
     if (reply.error && reply.error.code === 'not_found') ctx.navigate('templates');
     else ctx.failed();
   }, [shown.reply]);
+  // Несохранённые изменения: уход с экрана — только после вопроса.
+  useEffect(() => {
+    ctx.setLeaveGuard(dirty
+      ? () => ctx.confirm({ title: 'Несохранённые изменения', question: 'Уйти без сохранения изменений шаблона?', yes: 'Уйти', tone: 'danger' })
+      : null);
+  }, [dirty]);
+  useEffect(() => () => ctx.setLeaveGuard(null), []);
 
   const reload = async () => { await Promise.all([list.reload(), shown.reload()]); };
   const discard = () => { setDraft(null); setRejected(false); };
@@ -104,30 +119,37 @@ function TemplateCard({ ctx, name }) {
     ctx.notify('success', `Шаблон ${name} сохранён в файл ${name}`);
   });
 
-  const title = `Шаблон: ${name}`;
-  const back = html`<${Back} ctx=${ctx} to="templates" />`;
-  const dirty = draft !== null && draft !== content;
+  const back = { href: ctx.href('templates'), label: 'Шаблоны' };
   const actions = html`
-    <${Action} tone="view" disabled=${busy || content === null} onClick=${exportFile}>Экспорт в файл<//>
-    <${Action} tone="change" disabled=${busy || content === null || !dirty} onClick=${save}>Сохранить<//>
-    <${FileText} tone="change" label="Импорт из файла" accept=".yaml,.yml,text/*" disabled=${busy || content === null} onText=${importFile} />
-    ${dirty && html`<${Action} tone="danger" disabled=${busy} onClick=${discard}>Отменить изменения<//>`}
-    ${back}`;
-  return html`<${Loaded} title=${title} state=${list} actions=${back}>${() => (row ? html`
-    <${Card} title=${title} actions=${actions}>
-      <${Context} lines=${templateContext(row)} />
-      ${!shown.reply
-        ? html`<p class="dim">Загрузка…</p>`
-        : !shown.reply.ok || content === null
-          ? html`<p class="tone-warn">Содержимое недоступно</p>
-            <${Actions}><${Action} tone="view" disabled=${shown.loading} onClick=${() => shown.reload()}>Повторить чтение<//><//>`
-          : html`
-            <${Context} lines=${[
-              { text: templatePath(shown.data), tone: 'dim' },
-              rejected && dirty && { text: 'Изменения шаблона не сохранены. Рабочая копия сохранена до решения.', tone: 'warn' },
+    ${dirty && html`<${Button} kind="ghost" disabled=${busy} onClick=${discard}>Отменить изменения<//>`}
+    <${Button} icon="download" disabled=${busy || content === null} onClick=${exportFile}>Экспорт в файл<//>
+    <${FileText} label="Импорт из файла" accept=".yaml,.yml,text/*" disabled=${busy || content === null} onText=${importFile} />
+    <${Button} kind="primary" icon="save" disabled=${busy || content === null || !dirty} onClick=${save}>Сохранить<//>`;
+  return html`<${Loaded} title=${name} back=${back} state=${list}>${() => (row ? html`
+    <${Page} title=${name} back=${back} actions=${actions}
+      badge=${html`<${Badge} tone=${row.source === 'builtin' ? 'neutral' : 'info'}>${templateSource(row)}<//>`}>
+      <div class="editor-layout">
+        <${Card}>
+          ${!shown.reply
+            ? html`<p class="t-dim">Загрузка…</p>`
+            : !shown.reply.ok || content === null
+              ? html`<p class="t-warn">Содержимое недоступно</p>
+                <div class="row"><${Button} icon="refresh-cw" disabled=${shown.loading} onClick=${() => shown.reload()}>Повторить чтение<//></div>`
+              : html`
+                ${rejected && dirty && html`<div role="alert" class="alert alert-warning alert-soft">Изменения шаблона не сохранены. Рабочая копия сохранена до решения.</div>`}
+                <textarea class="textarea code editor" rows="24" spellcheck=${false} aria-label=${`Содержимое: ${name}`}
+                  value=${draft !== null ? draft : content} disabled=${busy}
+                  onInput=${(event) => setDraft(event.target.value)}></textarea>`}
+        <//>
+        <div class="editor-side">
+          <${Card} title="Сведения">
+            <${Facts} items=${[
+              { label: 'Источник', value: templateSource(row) },
+              { label: 'Путь', value: shown.data ? templatePath(shown.data).replace(/^Путь: /, '') : '—' },
+              { label: 'Группы', value: html`<${Chips} items=${groupChips(ctx, row)} />` },
             ]} />
-            <textarea class="code editor" rows="24" spellcheck=${false} aria-label=${`Содержимое: ${name}`}
-              value=${draft !== null ? draft : content} disabled=${busy}
-              onInput=${(event) => setDraft(event.target.value)}></textarea>`}
+          <//>
+        </div>
+      </div>
     <//>` : null)}<//>`;
 }

@@ -1,12 +1,12 @@
-// Тесты модели экранов «Подключения», «AmneziaWG», «Telegram Proxy»
+// Тесты модели вкладок ноды «Подключения», «AmneziaWG» и экрана «Telegram Proxy»
 // (эталон — `#[cfg(test)]` в `remote-control/tui/src/nodes.rs`).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  EMPTY, nodeText, syncedNode, syncProblem, syncData, overviewNodes, overviewLines,
+  EMPTY, nodeText, syncedNode, syncProblem,
   connectionView, assignGroupsTitle, assignArgv, assignConnections, connSyncArgv, connListArgv, nodeCheckArgv,
-  CONNECTION_ACTIONS, awgStatusArgv, awgSyncArgv, awgRemovePeerArgv, awgOrphansArgv, awgView,
-  TELEGRAM_VIEW, TELEGRAM_BATCH, TELEGRAM_COMPONENTS, TELEGRAM_STATUS_ARGV, telegramArgv, telegramResults,
+  awgStatusArgv, awgSyncArgv, awgRemovePeerArgv, awgOrphansArgv, awgView,
+  TELEGRAM_BATCH, TELEGRAM_COMPONENTS, TELEGRAM_STATUS_ARGV, telegramArgv, telegramResults,
 } from '../assets/js/screens/nodeops-model.js';
 
 const ok = (data) => ({ ok: true, data, error: null });
@@ -33,39 +33,18 @@ test('syncProblem и syncedNode', () => {
   assert.equal(syncedNode(null, 'a'), null);
 });
 
-test('syncData: data, partial → error, иначе null', () => {
-  assert.deepEqual(syncData(ok({ nodes: [] })), { nodes: [] });
-  assert.equal(syncData(err('partial', { nodes: [1] })).nodes.length, 1);
-  assert.equal(syncData(err('locked')), null);
-});
-
-test('обзор подключений: строки и тоны как в TUI', () => {
-  const sync = syncData(err('partial', { nodes: [
-    { name: 'a', status: 'synced', discovered: ['p1', 'p2'], removed: [], groups: [], error: null },
-    { name: 'b', status: 'unreachable', discovered: null, removed: [], groups: [], error: 'remote_failed' }] }));
-  const list = [
-    { node: 'a', groups: [{ name: 'PC', proxies: ['p1'] }, { name: 'ALL', proxies: ['p1', 'p2'] }] },
-    { node: 'b', groups: [{ name: 'PC', proxies: ['x'] }] }, { node: 'c', groups: [{ name: 'X', proxies: ['p'] }] }];
-  const lines = overviewLines(overviewNodes(list, sync));
-  assert.deepEqual(lines.map((l) => l.tone), [null, 'warn', 'ok', 'warn', null, 'dim']);
-  assert.deepEqual(lines.map((l) => l.text), ['a', '  PC: 1/2', '  ALL: 2/2', 'b  недоступна', 'c', '  X: 1/?']);
-  assert.deepEqual(overviewLines(overviewNodes([], null)), [{ text: 'Нет нод', tone: 'dim' }]);
-  // Ноль обнаруженных — DIM, не GREEN.
-  const zero = overviewNodes([{ node: 'z', groups: [{ name: 'G', proxies: [] }] }], { nodes: [{ name: 'z', status: 'synced', discovered: [] }] });
-  assert.deepEqual(zero[0].groups, [{ text: '  G: 0/0', tone: 'dim' }]);
-});
-
-test('карточка подключений ноды', () => {
+test('подключения ноды: группы подключений и проблема синхронизации', () => {
   const listed = [{ node: 'n', groups: [{ name: 'old', proxies: ['p1'] }, { name: 'x', proxies: ['p1'] }] }];
   const view = connectionView(listed, { name: 'n', status: 'synced', discovered: ['p1', 'p2'] }, 'n');
   assert.deepEqual(view.proxies, ['p1', 'p2']);
   assert.deepEqual(view.assigned, [['old', 'x'], []]);
-  assert.deepEqual(view.lines, [{ text: 'p1  [old, x]', tone: null }, { text: 'p2  []', tone: null }]);
+  assert.deepEqual(view.table, [{ proxy: 'p1', groups: ['old', 'x'] }, { proxy: 'p2', groups: [] }]);
+  assert.equal(view.problem, null);
   const problem = connectionView(listed, { name: 'n', status: 'unreachable', discovered: null }, 'n');
-  assert.deepEqual(problem.lines, [{ text: 'Нода недоступна', tone: 'warn' }]);
+  assert.equal(problem.problem, 'недоступна');
+  assert.deepEqual(problem.table, []);
   const empty = connectionView([], null, 'n');
-  assert.deepEqual(empty.lines, [{ text: 'Подключения не найдены', tone: 'dim' }]);
-  assert.deepEqual(CONNECTION_ACTIONS.map((a) => a.tone), ['change', 'change', 'change']);
+  assert.deepEqual([empty.problem, empty.table], [null, []]);
 });
 
 test('argv подключений', () => {
@@ -80,9 +59,9 @@ test('argv подключений', () => {
   assert.equal(assignGroupsTitle(['p1']), 'Группы для подключений');
 });
 
-/** Поддельный `ctx` назначения: `steps` — `[argv, reply]`, `answers` — ответы `toggle`. */
+/** Поддельный `ctx` назначения: `steps` — `[argv, reply]`, `answers` — ответы `form`. */
 function assignCtx(steps, answers) {
-  const record = { calls: [], toggles: [], notices: [] };
+  const record = { calls: [], forms: [], notices: [] };
   const ctx = {
     async request(argv) {
       assert.ok(steps.length > 0, `лишний запрос ${argv.join(' ')}`);
@@ -92,7 +71,7 @@ function assignCtx(steps, answers) {
       return reply;
     },
     call: (...words) => ctx.request(words),
-    async toggle(props) { record.toggles.push(props); return answers.shift(); },
+    async form(props) { record.forms.push(props); return answers.shift(); },
     notify: (level, text) => record.notices.push(text),
     failed: () => record.notices.push('failed'),
     isFailure: (reply) => !reply.ok,
@@ -100,49 +79,62 @@ function assignCtx(steps, answers) {
   return { ctx, record };
 }
 
-test('assignConnections: выбор подключений, затем групп (как assign_connections)', async () => {
+const field = (form, name) => form.fields.find((item) => item.name === name);
+
+test('assignConnections: одна форма — подключения (назначенные отмечены) и группы', async () => {
   const steps = [[['group', 'list'], ok([{ name: 'g1' }, { name: 'g2' }])], [assignArgv('n', ['g2'], ['p2']), ok()]];
-  const { ctx, record } = assignCtx(steps, [['p2'], ['g2']]);
+  const { ctx, record } = assignCtx(steps, [{ proxies: ['p2'], groups: ['g2'] }]);
   await assignConnections(ctx, 'n', ['p1', 'p2'], [['g1'], []]);
-  assert.deepEqual(record.toggles.map((t) => [t.title, t.selected]), [['Подключения для групп', ['p1']], ['Группы для подключений', []]]);
+  assert.equal(record.forms.length, 1);
+  const [form] = record.forms;
+  assert.deepEqual(field(form, 'proxies').options.map((o) => o.value), ['p1', 'p2']);
+  assert.deepEqual(field(form, 'proxies').value, ['p1']);
+  assert.equal(field(form, 'groups').type, 'multi');
+  assert.ok(field(form, 'groups').required);
+  assert.deepEqual(field(form, 'groups').options.map((o) => o.value), ['g1', 'g2']);
+  assert.ok(!field(form, 'groups').value || field(form, 'groups').value.length === 0);
   assert.equal(steps.length, 0);
+  assert.deepEqual(record.notices, []);
 });
 
-test('assignConnections: без подключений сразу выбор групп и снятие назначения', async () => {
+test('assignConnections: без подключений поля подключений нет, назначение снимается', async () => {
   const steps = [[['group', 'list'], ok([{ name: 'old' }])], [['conn', 'set', '--name', 'n', '--group', 'old'], ok()]];
-  const { ctx, record } = assignCtx(steps, [['old']]);
+  const { ctx, record } = assignCtx(steps, [{ groups: ['old'] }]);
   await assignConnections(ctx, 'n', [], []);
-  assert.deepEqual(record.toggles.map((t) => t.title), ['Группы: снять назначение подключений']);
+  assert.equal(field(record.forms[0], 'proxies'), undefined);
   assert.equal(steps.length, 0);
 });
 
-test('assignConnections: отмена выбора и пустой выбор групп ничего не меняют', async () => {
-  let { ctx, record } = assignCtx([], [null]);
+test('assignConnections: отмена ничего не меняет, сбои — failed', async () => {
+  let { ctx, record } = assignCtx([[['group', 'list'], ok([{ name: 'g' }])]], [null]);
   await assignConnections(ctx, 'n', ['p1'], [[]]);
-  assert.deepEqual(record.calls, []);
-  ({ ctx, record } = assignCtx([[['group', 'list'], ok([{ name: 'g' }])]], [[]]));
-  await assignConnections(ctx, 'n', [], []);
-  assert.deepEqual(record.notices, ['Ничего не выбрано.']);
+  assert.deepEqual(record.calls, [['group', 'list']]);
+  assert.deepEqual(record.notices, []);
+  ({ ctx, record } = assignCtx([[['group', 'list'], err('locked')]], []));
+  await assignConnections(ctx, 'n', ['p1'], [[]]);
+  assert.deepEqual([record.forms.length, record.notices], [0, ['failed']]);
+  ({ ctx, record } = assignCtx([[['group', 'list'], ok([{ name: 'g' }])], [assignArgv('n', ['g'], []), err('locked')]], [{ proxies: [], groups: ['g'] }]));
+  await assignConnections(ctx, 'n', ['p1'], [['g']]);
+  assert.deepEqual(record.notices, ['failed']);
 });
 
-test('AmneziaWG: строки, удаляемые и действия', () => {
+test('AmneziaWG: argv, состояния клиентов и признаки действий', () => {
   assert.deepEqual(awgStatusArgv('n'), ['awg', 'status', '--name', 'n']);
   assert.deepEqual(awgSyncArgv('n'), ['awg', 'sync', '--name', 'n']);
   assert.deepEqual(awgRemovePeerArgv('n', 'orphan'), ['awg', 'remove', '--name', 'n', '--peer', 'orphan']);
   assert.deepEqual(awgOrphansArgv('n'), ['awg', 'remove', '--name', 'n', '--orphans']);
   const view = awgView({ installed: true, peers: [{ name: 'used', status: 'used' }, { name: 'orphan', status: 'orphan' }, { name: 'missing', status: 'missing' }] });
-  assert.deepEqual(view.lines.map((l) => l.tone), ['ok', 'warn', 'dim']);
-  assert.deepEqual(view.lines.map((l) => l.text), ['used', 'orphan  не используется', 'missing  не создан']);
-  assert.deepEqual(view.removable, ['used', 'orphan']);
-  assert.deepEqual(view.actions.map((a) => [a.id, a.tone]), [['refresh', 'view'], ['sync', 'create'], ['remove', 'danger'], ['orphans', 'danger']]);
-  const absent = awgView({ installed: false, peers: [] });
-  assert.deepEqual(absent.lines, [{ text: 'AmneziaWG на ноде не установлен', tone: 'dim' }]);
-  assert.deepEqual(absent.actions.map((a) => a.id), ['refresh']);
-  assert.deepEqual(awgView({ installed: true, peers: [] }).lines, [{ text: 'Нет клиентов', tone: 'dim' }]);
+  assert.deepEqual(view.table.map((r) => [r.name, r.tone, r.removable]), [['used', 'ok', true], ['orphan', 'warn', true], ['missing', 'neutral', false]]);
+  assert.deepEqual([view.installed, view.missing, view.orphans], [true, true, true]);
+  const clean = awgView({ installed: true, peers: [{ name: 'used', status: 'used' }] });
+  assert.deepEqual([clean.missing, clean.orphans], [false, false]);
+  const absent = awgView({ installed: false, peers: [{ name: 'x', status: 'orphan' }] });
+  assert.deepEqual([absent.installed, absent.table, absent.orphans], [false, [], false]);
+  assert.deepEqual(awgView({ installed: true, peers: [] }).table, []);
 });
 
 test('Telegram: порядок, тоны и argv пакетов', () => {
-  assert.deepEqual(TELEGRAM_VIEW.map((a) => a.tone), ['view', 'view']);
+  assert.ok(TELEGRAM_BATCH.every((a) => a.title && Array.isArray(a.argv)));
   assert.deepEqual(TELEGRAM_BATCH.map((a) => a.tone), ['create', 'change', 'change', 'change', 'change', 'danger', 'danger']);
   const verbs = TELEGRAM_BATCH.map((a) => a.argv[1]);
   assert.deepEqual(verbs, ['install', 'refresh-ip', 'web-update', 'web-restart', 'backend-restart', 'remove', 'remove-all']);

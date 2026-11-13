@@ -1,45 +1,55 @@
 // Входная точка панели: подключение к демону, вход (план 2.5 «Вход», порядок
-// П4), каркас Layout с боковым меню всех разделов 2.6, шапка с индикаторами.
-// Экраны разделов (2.6) — `screens/`; каждый получает `ctx` (`makeContext`).
+// П4), каркас Layout с меню разделов, шапка с индикаторами, журнал и
+// всплывающие сообщения. Экраны разделов — `screens/`; каждый получает `ctx`
+// (`makeContext`), параметр и вкладку маршрута.
 import { html, render, useEffect, useState, useRef } from '../vendor/preact-htm.js';
 import { connect } from './protocol.js';
 import * as session from './session.js';
 import * as router from './router.js';
 import * as fmt from './format.js';
+import * as theme from './theme.js';
 import { runConfirmed, nodeRequest, isFailure } from './flows.js';
-import { Layout, Card, Button, SecretField, Checkbox, Toast } from './ui.js';
+import { Layout, Card, Button, SecretField, Checkbox, Snackbars } from './ui.js';
 import { useDialogs, DialogHost } from './dialogs.js';
 import { TerminalOverlay } from './terminal.js';
 import { SCREENS } from './screens/index.js';
 import { githubWizard } from './screens/source.js';
 import { recoveryRun } from './screens/system-model.js';
 
-/** Разделы шага 2.6: пункт меню и маршрут. Цвет — по правилам скилла. */
+/** Разделы меню: `name` — маршрут (`summary` — `#/`), `divider` — разделитель. */
 const MENU = [
-  { route: null, name: 'summary', label: 'Сводка', tone: 'view' },
-  { route: 'nodes', name: 'nodes', label: 'Ноды', tone: 'create' },
-  { route: 'clients', name: 'clients', label: 'Клиенты', tone: 'create' },
-  { route: 'groups', name: 'groups', label: 'Группы', tone: 'create' },
-  { route: 'templates', name: 'templates', label: 'Шаблоны', tone: 'create' },
-  { route: 'connections', name: 'connections', label: 'Подключения', tone: 'change' },
-  { route: 'generate', name: 'generate', label: 'Генерация конфигов', tone: 'change' },
-  { route: 'subscriptions', name: 'subscriptions', label: 'Подписки', tone: 'change' },
-  { route: 'awg', name: 'awg', label: 'AmneziaWG', tone: 'view' },
-  { route: 'telegram', name: 'telegram', label: 'Telegram Proxy', tone: 'view' },
-  { route: 'source', name: 'source', label: 'Источник конфигурации', tone: 'view' },
-  { route: 'settings', name: 'settings', label: 'Настройки', tone: 'change' },
+  { name: 'summary', route: null, label: 'Сводка', icon: 'layout-dashboard' },
+  { name: 'nodes', label: 'Ноды', icon: 'server' },
+  { name: 'clients', label: 'Клиенты', icon: 'users' },
+  { name: 'groups', label: 'Группы', icon: 'folders' },
+  { name: 'templates', label: 'Шаблоны', icon: 'file-code' },
+  { name: 'subscriptions', label: 'Подписки', icon: 'rss' },
+  { name: 'telegram', label: 'Telegram Proxy', icon: 'send' },
+  { divider: true },
+  { name: 'source', label: 'Источник', icon: 'git-branch' },
+  { name: 'settings', label: 'Настройки', icon: 'settings' },
+  { name: 'journal', label: 'Журнал', icon: 'scroll-text' },
 ];
 
+/** Наибольшее число записей журнала (старые отбрасываются). */
+const JOURNAL_LIMIT = 2000;
+
 /** Команда могла изменить состояние: шапка перечитывает `status`. */
-const READ_VERBS = new Set(['status', 'list', 'show', 'accounts', 'version', 'headers', 'aliases']);
+const READ_VERBS = new Set(['status', 'list', 'show', 'accounts', 'version', 'headers', 'aliases', 'check']);
 function changes(command) {
   const [noun = '', verb = ''] = String(command || '').split(' ');
   return noun !== 'status' && !READ_VERBS.has(verb);
 }
 
-const menuEntries = (active) => MENU.map((item) => ({
+/** Фоновая проверка шаблона в редакторе не показывается в шапке. */
+const SILENT_ACTIVITY = new Set(['template check']);
+
+/** Хеш маршрута раздела; сводка — `#/`. */
+const href = (name, param = null, tab = null) => router.format(name === 'summary' ? '' : name, param, tab);
+
+const menuEntries = (active) => MENU.map((item) => (item.divider ? item : {
   ...item,
-  href: router.format(item.route || ''),
+  href: href(item.name),
   active: active === item.name,
 }));
 
@@ -48,8 +58,14 @@ const WAITING = /^Ожидание: выполняется «(.+)»\.$/;
 
 const ACCESS_CODE_HINT = "Откройте панель ссылкой из «essence-rc web open».";
 
+/** Локальное хранилище темы; недоступное (режим приватности) — `null`. */
+function localStore(win) {
+  try { return win.localStorage || null; } catch { return null; }
+}
+
 export function App({ win = window, deps = {} }) {
   const storage = deps.storage || (win.sessionStorage || new Map());
+  const themeStore = localStore(win);
   const connectionRef = useRef(null);
   const [phase, setPhase] = useState('connecting'); // connecting | gate | app
   const [gate, setGate] = useState(null);           // view текущего шага входа
@@ -59,15 +75,21 @@ export function App({ win = window, deps = {} }) {
   const [linkState, setLinkState] = useState('connecting');
   const [failure, setFailure] = useState(null);
   const [busy, setBusy] = useState(false);
-  const [route, setRoute] = useState({ name: 'summary', param: null });
+  const [route, setRoute] = useState({ name: 'summary', param: null, tab: null });
   const [journal, setJournal] = useState([]);
-  const [journalOpen, setJournalOpen] = useState(false);
+  const [journalSeen, setJournalSeen] = useState(0); // id последней просмотренной записи
+  const journalId = useRef(0);
   const [activity, setActivity] = useState(null);
-  const [toasts, setToasts] = useState([]);
-  const toastId = useRef(0);
+  const [snacks, setSnacks] = useState([]);
+  const snackId = useRef(0);
+  const [themeChoice, setThemeChoice] = useState(() => theme.readChoice(themeStore));
   const [terminalState, setTerminalState] = useState(null);
   const [restart, setRestart] = useState(null); // null | 'update' | 'uninstall'
   const dialogs = useDialogs();
+  // Защита ухода со страницы с несохранёнными изменениями (`ctx.setLeaveGuard`).
+  const leaveGuard = useRef(null);
+  const currentHash = useRef(String(win.location.hash || ''));
+  const skipHash = useRef(false);
 
   // Одноразовый код из `#ticket=…`: фрагмент стирается сразу, код уходит
   // только с первым `session open` и до отправки ждёт в `ticketRef`.
@@ -80,13 +102,21 @@ export function App({ win = window, deps = {} }) {
   const phaseRef = useRef(phase);
   phaseRef.current = phase;
 
+  const record = (level, text) => {
+    journalId.current += 1;
+    const entry = { id: journalId.current, level: level || 'info', text: String(text ?? ''), time: Date.now() };
+    setJournal((current) => {
+      const next = [...current, entry];
+      return next.length > JOURNAL_LIMIT ? next.slice(next.length - JOURNAL_LIMIT) : next;
+    });
+  };
   const notify = (level, text) => {
-    setJournal((current) => [...current, { level, text }]);
+    record(level, text);
     if (level !== 'info') {
-      toastId.current += 1;
-      const id = toastId.current;
+      snackId.current += 1;
+      const id = snackId.current;
       // Сообщение ядра и итог «Операция завершилась ошибкой…» видны вместе.
-      setToasts((current) => [...current.slice(-2), { id, level, text }]);
+      setSnacks((current) => [...current.slice(-2), { id, level, text }]);
     }
   };
   const log = (entry) => {
@@ -94,7 +124,54 @@ export function App({ win = window, deps = {} }) {
     // шапки) — не новость; ожидание чужой команды остаётся в журнале.
     const waiting = entry.level === 'info' && WAITING.exec(entry.text || '');
     if (waiting && entry.id !== undefined && connection.runs(waiting[1], entry.id)) return;
-    setJournal((current) => [...current, { level: entry.level, text: entry.text }]);
+    record(entry.level, entry.text);
+  };
+
+  // Тема: выбор пользователя и системная настройка.
+  useEffect(() => theme.watch(win, themeStore, (choice) => setThemeChoice(choice)), []);
+  const setTheme = (choice) => {
+    theme.storeChoice(themeStore, choice);
+    setThemeChoice(choice);
+    theme.apply(win.document, theme.resolve(choice, theme.prefersDark(win)));
+  };
+
+  // Уход со страницы с защитой — вопрос браузера.
+  useEffect(() => {
+    const onUnload = (event) => {
+      if (!leaveGuard.current) return;
+      event.preventDefault();
+      event.returnValue = '';
+    };
+    win.addEventListener('beforeunload', onUnload);
+    return () => win.removeEventListener('beforeunload', onUnload);
+  }, []);
+
+  /** Смена маршрута с учётом защиты ухода: отказ возвращает прежний адрес. */
+  const onRoute = (next) => {
+    const hash = String(win.location.hash || '');
+    if (skipHash.current) {
+      skipHash.current = false;
+      if (hash === currentHash.current) return;
+    }
+    const guard = leaveGuard.current;
+    if (guard && hash !== currentHash.current) {
+      const previous = currentHash.current;
+      (async () => {
+        let leave = false;
+        try { leave = Boolean(await guard()); } catch { leave = false; }
+        if (!leave) {
+          skipHash.current = true;
+          win.location.hash = previous;
+          return;
+        }
+        leaveGuard.current = null;
+        currentHash.current = String(win.location.hash || '');
+        setRoute(router.parse(win.location.hash));
+      })();
+      return;
+    }
+    currentHash.current = hash;
+    setRoute(next);
   };
 
   useEffect(() => {
@@ -141,11 +218,12 @@ export function App({ win = window, deps = {} }) {
       open();
     };
     win.addEventListener('hashchange', onTicket);
-    const stopRouter = router.start(win, setRoute);
+    const stopRouter = router.start(win, onRoute);
     const unwatch = connection.watch((event) => {
-      if (event.state === 'start') setActivity(event.command || '');
+      const silentActivity = SILENT_ACTIVITY.has(event.command);
+      if (event.state === 'start' && !silentActivity) setActivity(event.command || '');
       if (event.state === 'end') {
-        setActivity(null);
+        if (!silentActivity) setActivity(null);
         if (phaseRef.current === 'app' && changes(event.command)) loadStatus();
       }
       // Свои запросы приходят и событиями `log` по `id`, и `activity`-журналом:
@@ -158,6 +236,11 @@ export function App({ win = window, deps = {} }) {
     };
   }, [connection]);
 
+  // Журнал открыт — его записи просмотрены.
+  useEffect(() => {
+    if (route.name === 'journal') setJournalSeen(journalId.current);
+  }, [route.name, journal]);
+
   const ctx = makeContext({
     connection, dialogs: dialogs.api, notify, hello, status, win,
     refreshStatus: () => loadStatus(),
@@ -166,6 +249,10 @@ export function App({ win = window, deps = {} }) {
       setRestart(kind);
       if (kind === 'uninstall') connection.close();
     },
+    journal,
+    clearJournal: () => { setJournal([]); setJournalSeen(journalId.current); },
+    theme: { choice: themeChoice, set: setTheme },
+    setLeaveGuard: (guard) => { leaveGuard.current = typeof guard === 'function' ? guard : null; },
   });
 
   /** Шапка: источник, синхронизация и пароль запуска — из `status`. */
@@ -227,7 +314,7 @@ export function App({ win = window, deps = {} }) {
   // ── Экраны входа ─────────────────────────────────────────────────────────
   const gateView = () => {
     if (phase === 'connecting') {
-      return html`<div class="gate"><${Card} title="Remote Control"><p>Подключение к демону…</p><//></div>`;
+      return html`<div class="gate"><${Card} title="Remote Control"><p class="t-dim">Подключение к демону…</p><//></div>`;
     }
     switch (gate) {
       case 'script-password':
@@ -249,27 +336,27 @@ export function App({ win = window, deps = {} }) {
       }
       case 'access-code':
         return html`<div class="gate"><${Card} title="Вход">
-          ${gateReply && gateReply.error && gateReply.error.code === 'auth_failed' && html`<p class="tone-warn">${fmt.errorMessage(gateReply)}</p>`}
+          ${gateReply && gateReply.error && gateReply.error.code === 'auth_failed' && html`<p class="t-warn">${fmt.errorMessage(gateReply)}</p>`}
           <p>${ACCESS_CODE_HINT}</p>
         <//></div>`;
       case 'incompatible':
         return html`<div class="gate"><${Card} title="Не удалось подключиться к демону">
-          <p class="tone-error">${failure}</p>
+          <p class="t-error">${failure}</p>
           <p>Перезагрузите страницу, чтобы получить панель работающего демона.</p>
-          <div class="modal-buttons"><${Button} kind="view" onClick=${() => win.location.reload()}>Перезагрузить страницу<//></div>
+          <div class="row"><${Button} kind="primary" icon="refresh-cw" onClick=${() => win.location.reload()}>Перезагрузить страницу<//></div>
         <//></div>`;
       case 'first-run':
         return html`<div class="gate"><${Card} title="Первый запуск">
-          <p>Выберите источник:</p>
-          <div class="modal-buttons">
-            <${Button} kind="create" disabled=${busy} onClick=${async () => {
+          <p>Выберите источник конфигурации:</p>
+          <div class="gate-column">
+            <${Button} kind="primary" disabled=${busy} onClick=${async () => {
               setBusy(true);
               const reply = await session.initLocal(connection);
               setBusy(false);
               if (reply.ok) open();
               else notify('error', fmt.errorMessage(reply));
             }}>Создать локальную конфигурацию<//>
-            <${Button} kind="create" disabled=${busy} onClick=${async () => {
+            <${Button} icon="git-branch" disabled=${busy} onClick=${async () => {
               setBusy(true);
               const done = await githubWizard(ctx, 'connect');
               setBusy(false);
@@ -281,12 +368,12 @@ export function App({ win = window, deps = {} }) {
         const error = gateReply && gateReply.error ? gateReply.error : {};
         const options = session.recoveryOptions(error.code || '');
         return html`<div class="gate"><${Card} title="Конфигурация GitHub требует восстановления">
-          ${error.message && html`<p class="tone-warn">${error.message}</p>`}
+          ${error.message && html`<p class="t-warn">${error.message}</p>`}
           ${error.version && html`<p>Формат конфигурации: v${error.version}</p>`}
           ${error.required && html`<p>Требуется remote-control: ${fmt.versionLabel(error.required)}</p>`}
-          <div class="modal-buttons column">
-            ${options.map((option) => html`
-              <${Button} key=${option.id} kind=${option.tone} disabled=${busy} onClick=${async () => {
+          <div class="gate-column">
+            ${options.map((option, index) => html`
+              <${Button} key=${option.id} kind=${option.tone === 'danger' ? 'danger' : index === 0 ? 'primary' : 'neutral'} disabled=${busy} onClick=${async () => {
                 setBusy(true);
                 const reply = await recoveryRun(ctx, option.title, option.question, option.verb, {});
                 if (reply && isFailure(reply)) ctx.failed();
@@ -301,42 +388,35 @@ export function App({ win = window, deps = {} }) {
       default:
         return html`<div class="gate"><${Card} title="Не удалось открыть сессию">
           <p>${gateReply && gateReply.error ? fmt.errorMessage(gateReply) : 'Повторите позже.'}</p>
-          <div class="modal-buttons"><${Button} kind="view" disabled=${busy} onClick=${() => open()}>Повторить<//></div>
+          <div class="row"><${Button} kind="primary" icon="refresh-cw" disabled=${busy} onClick=${() => open()}>Повторить<//></div>
         <//></div>`;
     }
   };
 
   // ── Каркас приложения ────────────────────────────────────────────────────
-  const menu = menuEntries(route.name);
-  const indicators = [];
-  if (hello) indicators.push({ text: `essence-rc ${fmt.versionLabel(hello.version)}`, tone: 'dim' });
-  if (status) {
-    const source = fmt.sourceLabel(status.source);
-    indicators.push({ text: `Источник: ${source.label}`, tone: 'info' });
-    if (source.sync) indicators.push({ text: source.sync.label, tone: source.sync.tone });
-  }
-  if (linkState === 'reconnecting') indicators.push({ text: 'нет связи', tone: 'warn' });
-  if (activity) indicators.push({ text: fmt.activityIndicator(activity), tone: 'info' });
+  const source = status ? fmt.sourceLabel(status.source) : null;
   const banner = hello && status && fmt.openPanel(hello, status, null) ? fmt.OPEN_PANEL_WARNING : null;
+  const journalErrors = journal.filter((entry) => entry.level === 'error' && entry.id > journalSeen).length;
+  const version = hello ? `essence-rc ${fmt.versionLabel(hello.version)}` : '';
 
   const Screen = SCREENS[route.name] || SCREENS.summary;
+  const screenName = SCREENS[route.name] ? route.name : 'summary';
   const body = restart === 'uninstall'
     ? html`<div class="gate"><${Card} title="essence-rc удалён"><p>Панель больше недоступна. Закройте эту вкладку.</p><//></div>`
     : restart === 'update'
-      ? html`<div class="gate"><${Card} title="Демон перезапускается"><p>Переподключение…</p><//></div>`
+      ? html`<div class="gate"><${Card} title="Демон перезапускается"><p class="t-dim">Переподключение…</p><//></div>`
       : phase === 'app'
-        ? html`<${Layout} menu=${menu} indicators=${indicators} banner=${banner}
-              journal=${journal} journalOpen=${journalOpen} onToggleJournal=${() => setJournalOpen(!journalOpen)}>
-            <${Screen} key=${`${route.name}/${route.param || ''}`} ctx=${ctx} param=${route.param} />
+        ? html`<${Layout} menu=${menuEntries(screenName)} source=${source} linkState=${linkState}
+              activity=${activity ? fmt.activityIndicator(activity) : null} banner=${banner}
+              themeChoice=${themeChoice} onTheme=${setTheme} version=${version} journalErrors=${journalErrors}>
+            <${Screen} key=${`${screenName}/${route.param || ''}`} ctx=${ctx} param=${route.param} tab=${route.tab} />
           <//>`
         : gateView();
 
   return html`
-    <div class="toasts">
-      ${toasts.map((toast) => html`<${Toast} key=${toast.id} toast=${toast}
-        onDone=${() => setToasts((current) => current.filter((item) => item.id !== toast.id))} />`)}
-    </div>
     ${body}
+    <${Snackbars} items=${snacks} journalHref=${phase === 'app' ? href('journal') : null}
+      onDismiss=${(id) => setSnacks((current) => current.filter((item) => item.id !== id))} />
     ${terminalState && html`<${TerminalOverlay}
       title=${terminalState.title}
       argv=${terminalState.argv}
@@ -351,12 +431,12 @@ function GateForm({ title, label, message = null, remember = false, busy = false
   const [value, setValue] = useState('');
   const [keep, setKeep] = useState(false);
   return html`<div class="gate"><${Card} title=${title}>
-    ${message && html`<p class="tone-warn">${message}</p>`}
+    ${message && html`<p class="t-warn">${message}</p>`}
     <form class="form" onSubmit=${(event) => { event.preventDefault(); onSubmit(value, keep); setValue(''); }}>
       <${SecretField} label=${label} value=${value} onInput=${setValue} />
       ${remember && html`<${Checkbox} label="Сохранить ключ расшифровки на этом устройстве" checked=${keep} onChange=${setKeep} />`}
-      <div class="modal-buttons">
-        <${Button} kind="create" type="submit" disabled=${busy || !value}>Открыть<//>
+      <div class="row">
+        <${Button} kind="primary" type="submit" disabled=${busy || !value}>Открыть<//>
       </div>
     </form>
   <//></div>`;
@@ -372,25 +452,32 @@ function silent(reply, expect) {
 
 /**
  * Контекст экранов — аналог `tui::app::Context`:
- * - `request(argv, { secrets, input, onLog, expect, operation })` → ответ; текст
- *   ошибки показывается здесь ровно один раз (кроме планов, `*_required` и
- *   кодов `expect`); `operation` — заголовок окна операции со строками журнала;
- * - `confirm`, `askSecret`, `ask`, `choose`, `toggle`, `show`, `operation` — диалоги;
+ * - `request(argv, { secrets, input, onLog, expect, operation, quiet })` → ответ;
+ *   текст ошибки показывается здесь ровно один раз (кроме планов, `*_required`,
+ *   кодов `expect` и `quiet`); `operation` — заголовок окна операции со строками журнала;
+ * - `confirm`, `askSecret`, `ask`, `choose`, `toggle`, `form`, `show`, `operation` — диалоги;
  * - `runConfirmed(title, question, argv, { secrets, input })`,
  *   `nodeRequest(name, argv, review)` — `flows.js` с этим контекстом;
  * - `failed()` — «Операция завершилась ошибкой…» для отказов без текста ядра;
- * - `navigate(name, param)`, `terminal(argv, title)` → ответ после закрытия
- *   оверлея (`{ expect }` — как у `request`), `wizard(mode)` → `true` при успехе мастера GitHub,
- *   `restart('update'|'uninstall')`, `refreshStatus()`, `hello`, `status`.
+ * - `navigate(name, param, tab)`, `href(name, param, tab)`, `terminal(argv, title)` →
+ *   ответ после закрытия оверлея (`{ expect }` — как у `request`), `wizard(mode)` →
+ *   `true` при успехе мастера GitHub, `restart('update'|'uninstall')`,
+ *   `refreshStatus()`, `hello`, `status`;
+ * - `journal`, `clearJournal()`, `theme: { choice, set(choice) }`,
+ *   `setLeaveGuard(async () => boolean | null)` — вопрос перед уходом с экрана.
  */
-function makeContext({ connection, dialogs, notify, hello, status, win, refreshStatus, openTerminal, restart }) {
+function makeContext({ connection, dialogs, notify, hello, status, win, refreshStatus, openTerminal, restart, journal, clearJournal, theme, setLeaveGuard }) {
   const ctx = {
     hello,
     status,
     notify,
+    journal,
+    clearJournal,
+    theme,
+    setLeaveGuard,
     ...dialogs,
     async request(argv, options = {}) {
-      const { secrets, input, onLog, expect = null, operation = null } = options;
+      const { secrets, input, onLog, expect = null, operation = null, quiet = false } = options;
       const progress = operation ? dialogs.operation(operation) : null;
       const reply = await connection.request(argv, {
         secrets,
@@ -401,7 +488,7 @@ function makeContext({ connection, dialogs, notify, hello, status, win, refreshS
         },
       });
       if (progress) progress.finish();
-      if (!silent(reply, expect)) notify('error', fmt.errorMessage(reply));
+      if (!quiet && !silent(reply, expect)) notify('error', fmt.errorMessage(reply));
       return reply;
     },
     call: (...words) => ctx.request(words),
@@ -413,7 +500,8 @@ function makeContext({ connection, dialogs, notify, hello, status, win, refreshS
     nodeRequest: (name, argv, review = null) => nodeRequest(name, argv, review, {
       request: (words, opts) => ctx.request(words, opts), confirm: dialogs.confirm, askSecret: dialogs.askSecret, notify,
     }),
-    navigate: (name, param = null) => router.navigate(win, name === 'summary' ? '' : name, param),
+    navigate: (name, param = null, tab = null) => router.navigate(win, name === 'summary' ? '' : name, param, tab),
+    href,
     async terminal(argv, title, { expect = null } = {}) {
       const reply = await openTerminal(argv, title);
       if (!silent(reply, expect)) notify('error', fmt.errorMessage(reply));

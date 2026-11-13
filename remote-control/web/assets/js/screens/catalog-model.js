@@ -1,7 +1,7 @@
-// Модель экранов «Шаблоны», «Генерация конфигов», «Подписки» — перенос
+// Модель экранов «Шаблоны», «Подписки» и формы генерации конфигов — перенос
 // подписей, строк контекста и argv из `tui/src/clients.rs` (`templates`,
 // `template_card`, `edit_template`, `generation`, `subscriptions`,
-// `subscription_list`, `summary`, `pick`). Без DOM и вендоренных модулей.
+// `subscription_list`, `summary`). Без DOM и вендоренных модулей.
 import { text, joined, templateSource } from '../format.js';
 
 const rowsOf = (value) => (Array.isArray(value) ? value : []);
@@ -44,8 +44,7 @@ export function templateContent(shown) {
   return shown && typeof shown.content === 'string' ? shown.content : null;
 }
 
-// Выбор объекта (`pick`) и итоги (`summaryLines`, `GENERATE_FIELDS`) —
-// общие с клиентами: `clients-model.js`.
+// Итоги (`summaryLines`, `GENERATE_FIELDS`) — общие с клиентами: `clients-model.js`.
 
 export const PUBLISH_FIELDS = [
   ['published', 'Опубликовано'], ['skipped', 'Пропущено'], ['failed', 'Ошибки'], ['removed', 'Удалено устаревших'],
@@ -57,11 +56,11 @@ export const GENERATE_ALL = ['--all'];
 export const generateGroup = (group) => ['--group', group];
 export const generateClient = (client) => ['--client', client];
 
-/** Контекст экрана генерации: `группа → шаблон` либо «Нет групп». */
-export function generationContext(groups) {
-  const list = rowsOf(groups);
-  if (list.length === 0) return [{ text: 'Нет групп', tone: 'dim' }];
-  return list.map((row) => `${text(row.name)} → ${text(row.template)}`);
+/** Хвост argv `generate` из формы: `scope` — `all|group|client`. */
+export function generateScope(values) {
+  if (values.scope === 'group') return generateGroup(values.group);
+  if (values.scope === 'client') return generateClient(values.client);
+  return GENERATE_ALL;
 }
 
 // ─── Подписки ───────────────────────────────────────────────────────────────
@@ -72,13 +71,10 @@ export const SUBSCRIPTION_LIST = ['subscription', 'list'];
 export const SUBSCRIPTION_PUBLISH_ALL = ['subscription', 'publish-all'];
 export const subscriptionMigrate = (node) => ['subscription', 'migrate', '--name', node];
 
-/**
- * Хост-нода: `{ node, baseUrl }` при заданной ноде, иначе `null`
- * (экран пишет «Хост-нода подписок не задана»).
- */
+/** Хост-нода: `{ node, baseUrl }` при заданной ноде, иначе `null` (хост не задан). */
 export function subscriptionHost(host) {
   const node = host && typeof host.node === 'string' && host.node !== '' ? host.node : null;
-  return node ? { node, baseUrl: `Базовый URL: ${text(host.base_url)}` } : null;
+  return node ? { node, baseUrl: text(host.base_url) } : null;
 }
 
 /** Состояние подписки из `subscription list`. */
@@ -91,9 +87,9 @@ export function subscriptionState(state) {
   }
 }
 
-/** Строка списка подписок: `{ prefix: "client  expires  ", state }`. */
+/** Строка списка подписок: `{ client, expires, state }`. */
 export function subscriptionRow(row) {
-  return { prefix: `${text(row.client)}  ${text(row.expires_at)}  `, state: subscriptionState(row.state) };
+  return { client: text(row.client), expires: text(row.expires_at), state: subscriptionState(row.state) };
 }
 
 /** Итог `publish-all`: при неуспехе после загрузки сводка приходит в `error`. */

@@ -127,3 +127,10 @@ export async function readInputFile(file) {
     return { error: null };
   }
 }
+
+/** Записи журнала по уровню фильтра: `all` — все, `error`, `warn` — только этот уровень. */
+export function filterJournal(entries, level = 'all') {
+  const list = Array.isArray(entries) ? entries : [];
+  if (level !== 'error' && level !== 'warn') return list;
+  return list.filter((entry) => entry && entry.level === level);
+}

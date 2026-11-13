@@ -11,43 +11,22 @@ const node = () => ({
   ],
 });
 
-test('nodeLabel и подсветка проблемных нод (frames_keep_list_sections_colours)', () => {
-  const problem = { name: 'problem', ip: '192.0.2.2', port: 22, auth: 'password', password: 'missing', issues: [] };
-  const deferred = { name: 'deferred', ip: '192.0.2.3', port: 22, auth: 'key', password: null, issues: ['missing_identity'] };
-  const items = model.nodeItems([node(), problem, deferred]);
-  assert.deepEqual(items.map((i) => i.tone), ['view', 'change', 'change']);
-  assert.equal(items[0].label, 'n  192.0.2.1:22');
-  assert.equal(items[0].name, 'n');
-  assert.deepEqual(model.nodeItems(null), []);
+test('nodeLabel и состояние нод в списке (frames_keep_list_sections_colours)', () => {
+  const problem = { name: 'problem', ip: '192.0.2.2', port: 22, auth: 'password', password: 'missing', issues: ['missing_identity'] };
+  const deferred = { name: 'deferred', ip: '192.0.2.3', port: 22, auth: 'key', password: null, issues: ['missing_identity', 'missing_host_key'] };
+  assert.equal(model.nodeLabel(node()), 'n  192.0.2.1:22');
+  assert.equal(model.nodeStatus(node()).tone, 'ok');
+  assert.deepEqual(model.nodeStatus(problem), { tone: 'warn', label: 'нет пароля SSH' });
+  assert.deepEqual(model.nodeStatus(deferred), { tone: 'warn', label: 'missing_identity, missing_host_key' });
 });
 
-test('действия списка: «Добавить» всегда, отложенная настройка — по status', () => {
-  assert.deepEqual(model.listActions({ ssh_setup_pending: true }).map((a) => [a.key, a.tone]), [['a', 'create'], ['h', 'change']]);
-  assert.deepEqual(model.listActions({}).map((a) => a.key), ['a']);
-  assert.deepEqual(model.listActions(null).map((a) => a.key), ['a']);
-});
-
-test('контекст карточки: пароль, ключ, группы, требования', () => {
-  assert.deepEqual(model.cardContext(node()), [
-    'Адрес: 192.0.2.1:22', 'Пользователь: root', 'Вход: по паролю', { text: 'Пароль SSH: сохранён', tone: 'ok' },
-    'Тег: tag', 'Группы: g', 'Клиентов: 1',
-  ]);
-  const missing = { ...node(), password: 'missing' };
-  assert.ok(model.cardContext(missing).some((l) => l.text === 'Пароль SSH: нет' && l.tone === 'warn'));
-  const key = { ...node(), auth: 'key', password: null, groups: [], issues: ['missing_host_key'] };
-  const lines = model.cardContext(key);
-  assert.ok(lines.includes('Вход: по ключу'));
-  assert.ok(lines.includes('Группы: нет'));
-  assert.ok(lines.some((l) => l.text === 'Требует настройки: missing_host_key' && l.tone === 'warn'));
-});
-
-test('действия карточки: порядок и цвета card_view, «Пароль SSH» только при входе по паролю', () => {
-  assert.deepEqual(model.cardActions(node()).map((a) => [a.key, a.tone]), [
-    ['o', 'view'], ['t', 'view'], ['p', 'view'], ['a', 'view'], ['k', 'view'],
-    ['u', 'change'], ['h', 'change'], ['r', 'change'], ['e', 'change'], ['w', 'change'], ['l', 'change'], ['d', 'danger'],
-  ]);
-  assert.ok(!model.cardActions({ ...node(), auth: 'key' }).some((a) => a.key === 'w'));
-  assert.equal(model.cardActions(node()).find((a) => a.key === 'u').label, 'Загрузить скрипты принудительно');
+test('карточка: способ входа и пароль SSH только при входе по паролю', () => {
+  assert.equal(model.authLabel(node()), 'по паролю');
+  assert.equal(model.authLabel({ ...node(), auth: 'key' }), 'по ключу');
+  assert.equal(model.passwordStatus(node()).tone, 'ok');
+  assert.equal(model.passwordStatus({ ...node(), password: 'missing' }).tone, 'warn');
+  assert.equal(model.passwordStatus({ ...node(), password: 'error' }).tone, 'warn');
+  assert.equal(model.passwordStatus({ ...node(), auth: 'key', password: null }), null);
 });
 
 test('терминальные команды', () => {
@@ -129,6 +108,13 @@ test('псевдонимы: --set, --unset и «Изменений нет»', ()
   const two = entries.slice(0, 2);
   assert.equal(model.aliasArgv('n', two, ['old', '-']), null);
   assert.deepEqual(model.aliasArgv('n', two, ['', 'Fast']), ['node', 'aliases', '--name', 'n', '--set', 'p2=Fast']);
-  assert.equal(model.aliasPrompt(entries[0]), 'p1 [old] (- — удалить)');
-  assert.equal(model.aliasPrompt(entries[1]), 'p2 [] (- — удалить)');
+});
+
+test('псевдонимы из формы: без изменений → пусто, очищенный → -, иначе новое значение', () => {
+  const entries = [{ proxy: 'p1', alias: 'old' }, { proxy: 'p2', alias: null }, { proxy: 'p3', alias: 'gone' }, { proxy: 'p4', alias: 'x' }];
+  const values = model.aliasValues(entries, { a0: 'old', a1: '', a2: '', a3: 'y' });
+  assert.deepEqual(values, ['', '', '-', 'y']);
+  assert.deepEqual(model.aliasArgv('n', entries, values), ['node', 'aliases', '--name', 'n', '--set', 'p4=y', '--unset', 'p3']);
+  assert.deepEqual(model.aliasValues(entries.slice(0, 2), { a0: 'old', a1: 'Fast' }), ['', 'Fast']);
+  assert.equal(model.aliasArgv('n', entries, model.aliasValues(entries, { a0: 'old', a1: '', a2: 'gone', a3: 'x' })), null);
 });

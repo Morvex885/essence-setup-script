@@ -1,0 +1,70 @@
+// Чистая логика форм `ctx.form` (`dialogs.js`): начальные значения, видимые
+// поля, проверка и итог. Поле: `{ name, label, type, value?, options?,
+// required?, validate?, when? }`; `type` — `text|secret|select|radio|multi|
+// checkbox|textarea`.
+
+export const REQUIRED = 'Заполните поле.';
+export const REQUIRED_MULTI = 'Выберите хотя бы один вариант.';
+
+const list = (value) => (Array.isArray(value) ? value : []);
+
+/** Пустое значение по типу поля. */
+function blank(field) {
+  if (field.type === 'multi') return [];
+  if (field.type === 'checkbox') return false;
+  if (field.type === 'select') {
+    const first = list(field.options).find((option) => !option.disabled);
+    return first ? first.value : '';
+  }
+  return '';
+}
+
+/** Значения формы: `value` поля (секреты — пусто) или пустое значение типа. */
+export function initialValues(fields) {
+  const values = {};
+  for (const field of list(fields)) {
+    if (field.value === undefined || field.value === null) values[field.name] = blank(field);
+    else if (field.type === 'multi') values[field.name] = [...list(field.value)];
+    else values[field.name] = field.value;
+  }
+  return values;
+}
+
+/** Поля, видимые при текущих значениях (`when(values) === false` — скрыто). */
+export function visibleFields(fields, values) {
+  return list(fields).filter((field) => typeof field.when !== 'function' || field.when(values) !== false);
+}
+
+function empty(field, value) {
+  if (field.type === 'multi') return list(value).length === 0;
+  if (field.type === 'checkbox') return value !== true;
+  return value === undefined || value === null || value === '';
+}
+
+/** Ошибки видимых полей: `{ name: текст }`; пустой объект — форма верна. */
+export function validate(fields, values) {
+  const errors = {};
+  for (const field of visibleFields(fields, values)) {
+    const value = values[field.name];
+    if (field.required && empty(field, value)) {
+      errors[field.name] = typeof field.required === 'string' ? field.required
+        : field.type === 'multi' ? REQUIRED_MULTI : REQUIRED;
+      continue;
+    }
+    if (typeof field.validate === 'function') {
+      const message = field.validate(value, values);
+      if (message) errors[field.name] = message;
+    }
+  }
+  return errors;
+}
+
+/** Итог формы: значения только видимых полей. */
+export function result(fields, values) {
+  const out = {};
+  for (const field of visibleFields(fields, values)) {
+    const value = values[field.name];
+    out[field.name] = field.type === 'multi' ? [...list(value)] : value;
+  }
+  return out;
+}
