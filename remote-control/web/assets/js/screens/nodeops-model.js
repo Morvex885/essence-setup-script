@@ -5,7 +5,7 @@
 // (`telegram_batch`) поверх `ctx`. Без DOM и вендоренных файлов: окно
 // результатов экран передаёт функцией. Тоны: `ok` (GREEN), `warn` (YELLOW),
 // `error` (RED), `neutral` (DIM).
-import { asList, proxyLabel } from '../format.js';
+import { asList, proxyLabel, unlisted } from '../format.js';
 import { interactive, nodeLabel } from './nodes-model.js';
 
 /** Пустой выбор (`nodes.rs::EMPTY`). */
@@ -84,21 +84,17 @@ export async function syncAll(ctx) {
 
 /**
  * Подключения ноды (`connection_node`): обнаруженные подключения и
- * назначенные группам, но на ноде больше не найденные (`stale`, в конце —
- * их можно снять и при недоступной ноде), группы каждого (`assigned[i]`),
+ * назначенные группам, но не найденные (в конце: клиенты AmneziaWG
+ * `awg-<клиент>` и устаревшие `stale` — их можно снять и при недоступной
+ * ноде; при изменении группы они сохраняются, если отмечены), группы каждого (`assigned[i]`),
  * строки таблицы и проблема синхронизации ноды.
  */
 export function connectionView(listed, state, name) {
   const entry = asList(listed).find((row) => row && row.node === name);
   const groups = entry ? asList(entry.groups) : [];
   const discovered = asList(state && state.discovered).map(nodeText);
-  const stale = [];
-  for (const group of groups) {
-    for (const proxy of asList(group.proxies).map(nodeText)) {
-      if (!discovered.includes(proxy) && !stale.includes(proxy)) stale.push(proxy);
-    }
-  }
-  const proxies = [...discovered, ...stale];
+  const { extra, stale } = unlisted(groups.flatMap((group) => asList(group.proxies).map(nodeText)), discovered);
+  const proxies = [...discovered, ...extra];
   const assigned = proxies.map((proxy) => groups
     .filter((group) => asList(group.proxies).includes(proxy))
     .map((group) => nodeText(group.name)));

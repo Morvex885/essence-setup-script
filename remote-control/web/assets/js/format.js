@@ -141,5 +141,19 @@ export function appendJournal(entries, entry, limit, repeat = true) {
   return next.length > limit ? next.slice(next.length - limit) : next;
 }
 
+/**
+ * Назначенные подключения, которых нет среди найденных на ноде (`conn.rs::purge`):
+ * клиенты AmneziaWG `awg-<клиент>` при найденном `AWG` не отмечаются — поиск их не перечисляет.
+ */
+export function unlisted(assignedProxies, discovered) {
+  const awg = discovered.includes('AWG');
+  const result = [];
+  for (const proxy of assignedProxies) {
+    if (discovered.includes(proxy) || result.includes(proxy)) continue;
+    result.push(proxy);
+  }
+  return { extra: result, stale: result.filter((proxy) => !(awg && proxy.startsWith('awg-'))) };
+}
+
 /** Подпись подключения в формах: не найденное на ноде отмечено. */
 export const proxyLabel = (proxy, stale) => (stale.includes(proxy) ? `${proxy} (не найдено на ноде)` : proxy);

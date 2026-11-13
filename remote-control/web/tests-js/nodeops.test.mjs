@@ -94,6 +94,12 @@ test('подключения ноды: группы подключений и п
   const problem = connectionView(listed, { name: 'n', status: 'unreachable', discovered: null }, 'n');
   assert.equal(problem.problem, 'недоступна');
   assert.deepEqual([problem.proxies, problem.stale, problem.assigned], [['p1'], ['p1'], [['old', 'x']]]);
+  // Клиент AmneziaWG при найденном AWG — не «не найдено», но в списке и отмечен: смена p1 его сохраняет.
+  const awg = connectionView([{ node: 'n', groups: [{ name: 'PC', proxies: ['AWG', 'awg-alice'] }] }],
+    { status: 'synced', discovered: ['AWG', 'p1'] }, 'n');
+  assert.deepEqual([awg.proxies, awg.stale, awg.assigned], [['AWG', 'p1', 'awg-alice'], [], [['PC'], [], ['PC']]]);
+  const values = { 'proxy-0': ['PC'], 'proxy-1': ['PC'], 'proxy-2': ['PC'] };
+  assert.deepEqual(assignmentChanges(awg.proxies, awg.assigned, values), [['PC', ['AWG', 'p1', 'awg-alice']]]);
   const empty = connectionView([], null, 'n');
   assert.deepEqual([empty.problem, empty.table], [null, []]);
 });

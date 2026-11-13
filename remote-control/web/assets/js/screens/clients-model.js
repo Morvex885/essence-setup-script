@@ -3,7 +3,7 @@
 // Без DOM: действия (`fetch`, `load`, `generate`, `headers`, добавление,
 // перенос, карточка клиента, подписки) — формы и диалоги `ctx`
 // (`app.js::makeContext`); окна с разметкой экран передаёт функцией.
-import { asList, strings, proxyLabel } from '../format.js';
+import { asList, strings, proxyLabel, unlisted } from '../format.js';
 import { isFailure } from '../flows.js';
 import {
   DEFAULT_TEMPLATE, generateGroup, generateClient, generateScope,
@@ -499,9 +499,9 @@ export async function groupConnectionsFlow(ctx, group) {
   if (!found.ok) return;
   const discovered = discoveredProxies(found.data);
   const current = groupProxies(found.data, group);
-  // Назначенные группе, но не найденные на ноде — в конце, чтобы их можно было снять.
-  const stale = current.filter((proxy) => !discovered.includes(proxy));
-  const proxies = [...discovered, ...stale];
+  // Назначенные группе, но не найденные (клиенты AmneziaWG, устаревшие) — в конце, отмечены.
+  const { extra, stale } = unlisted(current, discovered);
+  const proxies = [...discovered, ...extra];
   if (proxies.length === 0) { ctx.notify('warn', `На ноде «${node}» подключений не найдено.`); return; }
   const values = await ctx.form({
     title: `Подключения группы ${group}`, context: [`Нода: ${node}`], submit: 'Назначить',
