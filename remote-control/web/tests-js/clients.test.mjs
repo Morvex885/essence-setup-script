@@ -358,7 +358,7 @@ test('подключения группы: нода по выбору (одна 
   const ctx = fakeCtx({ replies: [two, found, okReply()], answers: [{ node: 'nl' }, { proxies: ['p1', 'p2'] }] });
   await m.groupConnectionsFlow(ctx, 'PC');
   assert.deepEqual(commands(ctx), [['node', 'list'], m.discoverArgv('nl'),
-    ['conn', 'set', '--name', 'nl', '--assign', 'PC=p1,p2']]);
+    ['conn', 'set', '--name', 'nl', '--assign', 'PC=p1', '--assign', 'PC=p2']]);
   assert.deepEqual(ctx.calls.filter((c) => c[0] === 'form')[1][1].fields[0].value, ['p2']);
 
   const one = fakeCtx({ replies: [okReply([{ name: 'de', ip: '1.1.1.1', port: 22 }]), okReply([{ node: 'de', discovered: ['p1'] }]), okReply()],

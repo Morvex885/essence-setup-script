@@ -111,7 +111,9 @@ test('argv подключений', () => {
   assert.deepEqual(connListArgv('n'), ['conn', 'list', '--name', 'n']);
   assert.deepEqual(nodeCheckArgv('n'), ['node', 'check', '--name', 'n']);
   assert.deepEqual(assignArgv('n', [['g2', ['p1', 'p2']], ['old', []]]),
-    ['conn', 'set', '--name', 'n', '--assign', 'g2=p1,p2', '--assign', 'old=']);
+    ['conn', 'set', '--name', 'n', '--assign', 'g2=p1', '--assign', 'g2=p2', '--assign', 'old=']);
+  // Имя подключения с запятой — одно значение флага.
+  assert.deepEqual(assignArgv('n', [['PC', ['a,b']]]), ['conn', 'set', '--name', 'n', '--assign', 'PC=a,b']);
   // Снятая отметка одной группы из десяти — меняется только она.
   const groups = Array.from({ length: 10 }, (_, i) => `g${i}`);
   assert.deepEqual(assignmentChanges(['p1'], [groups], { 'proxy-0': groups.slice(1) }), [['g0', []]]);

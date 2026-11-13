@@ -104,13 +104,17 @@ export function connectionView(listed, state, name) {
 }
 
 /**
- * `conn set --name N --assign G=P1,P2 …`: полный набор подключений каждой
+ * `conn set --name N --assign G=P1 --assign G=P2 …` (по флагу на подключение —
+ * имя с запятой остаётся целым): полный набор подключений каждой
  * перечисленной группы на ноде (`G=` снимает назначение); какие группы
  * изменились, решает ядро. `assignments` — `[[группа, [подключения]]]`.
  */
 export function assignArgv(name, assignments) {
   const argv = ['conn', 'set', '--name', name];
-  for (const [group, proxies] of assignments) argv.push('--assign', `${group}=${proxies.join(',')}`);
+  for (const [group, proxies] of assignments) {
+    if (proxies.length === 0) argv.push('--assign', `${group}=`);
+    for (const proxy of proxies) argv.push('--assign', `${group}=${proxy}`);
+  }
   return argv;
 }
 

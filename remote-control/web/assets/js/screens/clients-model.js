@@ -5,6 +5,7 @@
 // (`app.js::makeContext`); окна с разметкой экран передаёт функцией.
 import { asList, strings, proxyLabel, unlisted } from '../format.js';
 import { isFailure } from '../flows.js';
+import { assignArgv } from './nodeops-model.js';
 import {
   DEFAULT_TEMPLATE, generateGroup, generateClient, generateScope,
   PUBLISH_FIELDS, SUBSCRIPTION_PUBLISH_ALL, subscriptionSetHost, subscriptionMigrate, publishSummary,
@@ -464,7 +465,7 @@ export async function groupTemplateFlow(ctx, name, current) {
 
 /** `conn set` группы на ноде: только эта группа, полный набор подключений (пустой снимает назначение). */
 export function groupConnectionsArgv(group, node, proxies) {
-  return ['conn', 'set', '--name', node, '--assign', `${group}=${proxies.join(',')}`];
+  return assignArgv(node, [[group, proxies]]);
 }
 
 /** Подключения группы на ноде из ответа `conn list --name N --discover`. */
