@@ -766,9 +766,15 @@ fn install_with(launch: &Launch, kind: Kind) -> Result<Value> {
                 let _ = fs::remove_file(&startup);
                 return Ok(json!({"service": "schtasks", "unit": TASK_NAME, "started": true}));
             }
-            // Планировщик недоступен (политика, права): папка автозагрузки;
-            // прежняя задача, если осталась, удаляется, чтобы не было двух запусков.
-            let _ = run("schtasks", &words(&["/Delete", "/TN", TASK_NAME, "/F"]));
+            // Планировщик недоступен (политика, права): папка автозагрузки.
+            // Прежняя задача обязана исчезнуть до записи .cmd: иначе запись
+            // `startup` скрыла бы её от удаления, а панель запускалась бы дважды.
+            // Не удалось проверить или удалить — установка прерывается без изменений.
+            if task_exists()? {
+                run("schtasks", &words(&["/Delete", "/TN", TASK_NAME, "/F"])).map_err(|error| {
+                    RcError::new("failed", format!("Не удалось удалить прежнюю задачу планировщика {TASK_NAME}: {}", error.message))
+                })?;
+            }
             write_service_file(&startup, &startup_script(launch))?;
             let _ = Command::new(&launch.exe).args(&launch.argv("start")[1..]).output();
             Ok(json!({"service": "startup", "unit": startup.to_string_lossy(), "started": true}))
@@ -1049,5 +1055,19 @@ mod tests {
         // Once the damaged record is deleted, the default location is checked.
         remove_record(data.path()).unwrap();
         assert_eq!(read_record(data.path()).unwrap(), None);
+    }
+
+    /// Without a working `schtasks` (here: not installed) the old task cannot
+    /// be ruled out: the startup-folder fallback writes nothing.
+    #[test]
+    fn startup_fallback_is_refused_when_the_old_task_cannot_be_checked() {
+        if Command::new("schtasks").arg("/?").output().is_ok() {
+            return; // a real scheduler: covered on Windows only by reading
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let startup = dir.path().join(STARTUP_FILE);
+        let error = install_with(&launch("/bin/rc", "/data", None), Kind::Windows { task: true, startup: Some(startup.clone()) }).unwrap_err();
+        assert_eq!(error.code, "failed");
+        assert!(!startup.exists(), "no startup file next to a possibly remaining task");
     }
 }
