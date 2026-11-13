@@ -1,5 +1,5 @@
 //! The front-end view of the daemon: screens and the CLI use [`Client`] exclusively.
-use std::{collections::BTreeMap, io, path::Path};
+use std::{collections::BTreeMap, ffi::OsString, io, path::{Path, PathBuf}};
 use zeroize::Zeroizing;
 use crate::protocol::{Hello, Input, Log, Reply, Secrets};
 
@@ -14,6 +14,20 @@ pub struct Request<'a> {
 }
 impl<'a> Request<'a> {
     pub fn new(argv: &'a [String], secrets: &'a Secrets, input: &'a Input) -> Self { Self { argv, secrets, input, env: None } }
+}
+
+/// The daemon's limit for the agent path in `env`.
+pub const MAX_AGENT_PATH: usize = 4096;
+
+/// `{"SSH_AUTH_SOCK": path}` for a local daemon from the value of the
+/// operator's variable: only an absolute UTF-8 path within the daemon's limit.
+/// On Windows the OpenSSH agent pipe is used when the variable is unset.
+pub fn agent_env(value: Option<OsString>) -> Option<BTreeMap<String, String>> {
+    let path = value.filter(|value| !value.is_empty()).map(PathBuf::from);
+    #[cfg(windows)]
+    let path = path.or_else(|| Some(PathBuf::from(r"\\.\pipe\openssh-ssh-agent")));
+    let path = path.filter(|path| path.is_absolute())?.into_os_string().into_string().ok()?;
+    (path.len() <= MAX_AGENT_PATH).then(|| BTreeMap::from([("SSH_AUTH_SOCK".to_owned(), path)]))
 }
 
 /// Progress of a request in flight: a journal event of the core, or a timer

@@ -24,6 +24,22 @@ fn send(client: &mut dyn Client, words: &[&str], progress: &mut dyn FnMut(Progre
 }
 
 #[test]
+fn agent_env_is_an_absolute_path_within_the_limit() {
+    let env = |value: &str| agent_env(Some(value.into()));
+    #[cfg(unix)] {
+        assert_eq!(env("/run/agent.sock"), Some(BTreeMap::from([("SSH_AUTH_SOCK".to_owned(), "/run/agent.sock".to_owned())])));
+        assert_eq!(env("relative/agent"), None);
+        assert_eq!(env(""), None);
+        assert_eq!(agent_env(None), None);
+        assert_eq!(env(&format!("/{}", "a".repeat(MAX_AGENT_PATH))), None);
+    }
+    #[cfg(windows)] {
+        assert_eq!(agent_env(None), Some(BTreeMap::from([("SSH_AUTH_SOCK".to_owned(), r"\\.\pipe\openssh-ssh-agent".to_owned())])));
+        assert_eq!(env(r"C:\agent"), Some(BTreeMap::from([("SSH_AUTH_SOCK".to_owned(), r"C:\agent".to_owned())])));
+    }
+}
+
+#[test]
 fn logs_ids_secrets_input_env_and_exit() {
     let (mut client, script) = fake(|to_client, from_client| {
         assert_eq!(next(&from_client), json!({"id":1,"argv":["status"],"secrets":{"password":"p"},"input":{"file":"x"},"env":{"SSH_AUTH_SOCK":"/agent"}}));

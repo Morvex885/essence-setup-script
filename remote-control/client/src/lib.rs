@@ -11,7 +11,7 @@ pub mod remote;
 pub mod scripted;
 pub mod spawn;
 
-pub use client::{Client, Progress, Request, TermEvent, TerminalIo, argv};
+pub use client::{Client, MAX_AGENT_PATH, Progress, Request, TermEvent, TerminalIo, agent_env, argv};
 pub use daemon::DaemonClient;
 pub use endpoint::{Endpoint, endpoint_for, endpoint_in, prepare_runtime_dir, runtime_dir, verify_runtime_dir};
 pub use remote::{ConnectError, RemoteUrl, Trust, certificate_fingerprint, valid_fingerprint};
