@@ -4,6 +4,7 @@
 // странице; черновик проверяется `template check` (текст — полем
 // `input.file`) через 500 мс после правки; «Сохранить» и «Импорт из файла» —
 // `template import --name T` с содержимым в `input.file` через `runConfirmed`.
+// Действия без DOM — `templates-flow.js`.
 import { html, useState, useEffect, useMemo, useRef } from '../../vendor/preact-htm.js';
 import {
   Page, Card, Chips, Badge, Button, DataTable, MoreMenu, Empty, FileText, downloadText,
@@ -13,11 +14,14 @@ import { errorMessage } from '../format.js';
 import { AceEditor } from '../template-editor.js';
 import { useCommand, useBusy, useMounted, Loaded, ReadFailed, rows } from './kit.js';
 import {
-  TEMPLATE_NAME_MISSING, TEMPLATE_FILE_UNREADABLE, DEFAULT_TEMPLATE, NO_GROUP, TEMPLATE_KINDS,
-  templateList, templateCreate, templateShow, templateImport, templateInput, templateCheck, templateDelete,
-  templateGroups, templateKind, findTemplate, templateContent, groupOptions, problemCounts, annotations,
-  droppedRanges, variantOptions,
+  TEMPLATE_NAME_MISSING, DEFAULT_TEMPLATE, NO_GROUP, TEMPLATE_KINDS,
+  templateList, templateCreate, templateShow, templateInput, templateCheck,
+  templateKind, findTemplate, templateContent, problemCounts, annotations,
+  droppedRanges, variantOptions, effectiveVariant, problemVariant, inVariant,
 } from './catalog-model.js';
+import {
+  settleDraft, saveTemplate, importTemplateFile, deleteLabel, deleteTemplate, editTemplateGroups, checkRunner,
+} from './templates-flow.js';
 
 /** Задержка проверки черновика после последней правки, мс. */
 const CHECK_DELAY = 500;
@@ -36,19 +40,7 @@ function KindBadge({ row }) {
   return html`<${Badge} tone=${kind.tone}>${kind.label}<//>`;
 }
 
-/** Пункт удаления: пользовательский — «Удалить», перекрывающий встроенный — «Сбросить к встроенному». */
-function deleteLabel(row) {
-  return templateKind(row) === 'override' ? 'Сбросить к встроенному' : 'Удалить';
-}
-
-/** `template delete` по плану; `true` — удалено. */
-async function deleteTemplate(ctx, name) {
-  const reply = await ctx.runConfirmed('Удаление шаблона', 'Удалить шаблон?', templateDelete(name));
-  if (ctx.isFailure(reply)) ctx.failed();
-  return reply.ok;
-}
-
-/** `template show` → файл `<имя>` (`clients.rs::export_template`). */
+/** `template show` → файл `<имя>` (`clients.rs::export_template`): сохранённый текст. */
 async function exportTemplate(ctx, name) {
   const reply = await ctx.request(templateShow(name));
   const content = reply.ok ? templateContent(reply.data) : null;
@@ -85,7 +77,7 @@ function TemplateList({ ctx }) {
     if (templateKind(row) !== 'builtin') {
       items.push({
         label: deleteLabel(row), icon: 'trash-2', danger: true, disabled: busy,
-        onClick: () => run(async () => { await deleteTemplate(ctx, row.name); await state.reload(); }),
+        onClick: () => run(async () => { await deleteTemplate(ctx, row); await state.reload(); }),
       });
     }
     return items;
@@ -106,25 +98,38 @@ function TemplateList({ ctx }) {
 
 // ─── Редактор ───────────────────────────────────────────────────────────────
 
-/** Проверка черновика: при открытии сразу, после правок — через `CHECK_DELAY`; поздние ответы отбрасываются. */
-function useCheck(ctx, name, text) {
-  const [check, setCheck] = useState(null); // null | ответ `template check`
-  const generation = useRef(0);
+/**
+ * Проверка черновика: при открытии сразу, после правок и смены `revision`
+ * (группы изменились) — через `CHECK_DELAY`; одновременно один запрос, отчёт
+ * принимается только для текущего текста. `current` — отчёт относится к `text`.
+ */
+function useCheck(ctx, name, text, revision) {
+  const [result, setResult] = useState(null); // null | { reply, text }
+  const latest = useRef(text);
+  latest.current = text;
+  const ctxRef = useRef(ctx);
+  ctxRef.current = ctx;
+  const runner = useRef(null);
+  if (runner.current === null) {
+    runner.current = checkRunner(
+      (draft) => ctxRef.current.request(templateCheck(name), { input: templateInput(draft), quiet: true }),
+      (reply, draft) => { if (draft === latest.current) setResult({ reply, text: draft }); },
+    );
+  }
+  useEffect(() => () => runner.current.close(), []);
   const first = useRef(true);
   useEffect(() => {
     if (text === null) return undefined;
-    generation.current += 1;
-    const mine = generation.current;
     const delay = first.current ? 0 : CHECK_DELAY;
     first.current = false;
-    const timer = setTimeout(async () => {
-      const reply = await ctx.request(templateCheck(name), { input: templateInput(text), quiet: true });
-      if (mine === generation.current) setCheck(reply);
-    }, delay);
+    const timer = setTimeout(() => runner.current.submit(text), delay);
     return () => clearTimeout(timer);
-  }, [text]);
-  return check;
+  }, [text, revision]);
+  return { check: result && result.reply, current: result !== null && result.text === text };
 }
+
+const isSaveKey = (event) => (event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey
+  && (event.code === 'KeyS' || event.key === 's' || event.key === 'S');
 
 function TemplateEditor({ ctx, name }) {
   const list = useCommand(ctx, templateList());
@@ -133,84 +138,109 @@ function TemplateEditor({ ctx, name }) {
   const mounted = useMounted();
   // Черновик редактора; `null` — без изменений.
   const [draft, setDraft] = useState(null);
-  const [variant, setVariant] = useState(NO_GROUP);
+  // Замена текста редактора снаружи (сброс, импорт, новый текст с сервера).
+  const [version, setVersion] = useState(0);
+  // Повтор проверки при неизменном тексте (группы изменились).
+  const [revision, setRevision] = useState(0);
+  const [chosen, setVariant] = useState(NO_GROUP);
   const editor = useRef(null);
   const row = list.data ? findTemplate(list.data, name) : null;
   const content = templateContent(shown.data);
   const text = draft !== null ? draft : content;
   const dirty = draft !== null && draft !== content;
-  const check = useCheck(ctx, name, text);
+  const { check, current } = useCheck(ctx, name, text, revision);
   const report = check && check.ok ? check.data || {} : null;
+  const variant = effectiveVariant(report && report.variants, chosen);
+
+  const replaceText = () => { setDraft(null); setVersion((value) => value + 1); };
+  // Новый текст с сервера без черновика — в редактор.
+  useEffect(() => { if (draft === null) setVersion((value) => value + 1); }, [content]);
 
   const leave = (...route) => { if (mounted.current) ctx.navigate(...route); };
-  useEffect(() => {
-    if (!list.data || findTemplate(list.data, name)) return;
+  // Шаблон исчез (удалён другим клиентом): несохранённые правки можно скачать, затем — к списку.
+  const unsaved = useRef(null);
+  unsaved.current = dirty ? draft : null;
+  const gone = useRef(false);
+  const leaveGone = async () => {
+    if (gone.current || !mounted.current) return;
+    gone.current = true;
+    ctx.setLeaveGuard(null);
     ctx.notify('warn', `Шаблон «${name}» не найден.`);
+    const lost = unsaved.current;
+    if (lost !== null && await ctx.confirm({
+      title: 'Шаблон не найден', plan: [], question: `Скачать несохранённые изменения в файл ${name}?`, yes: 'Скачать',
+    })) downloadText(name, lost);
     leave('templates');
+  };
+  useEffect(() => {
+    if (list.data && !findTemplate(list.data, name)) leaveGone();
   }, [list.data]);
   useEffect(() => {
-    if (shown.reply && !shown.reply.ok && shown.reply.error && shown.reply.error.code === 'not_found') leave('templates');
+    if (shown.reply && !shown.reply.ok && shown.reply.error && shown.reply.error.code === 'not_found') leaveGone();
   }, [shown.reply]);
   // Несохранённые изменения: уход с экрана — только после вопроса.
   useEffect(() => {
+    if (gone.current) return;
     ctx.setLeaveGuard(dirty
       ? () => ctx.confirm({ title: 'Несохранённые изменения', question: 'Уйти без сохранения?', yes: 'Уйти', tone: 'danger' })
       : null);
   }, [dirty]);
   useEffect(() => () => ctx.setLeaveGuard(null), []);
 
-  const marks = useMemo(() => annotations(report && report.problems, variant), [check, variant]);
-  const dropped = useMemo(() => droppedRanges(report && report.variants, variant), [check, variant]);
+  // Отметки — только по отчёту для текущего текста.
+  const marks = useMemo(() => (current ? annotations(report && report.problems, variant) : []), [check, current, variant]);
+  const dropped = useMemo(() => (current ? droppedRanges(report && report.variants, variant) : []), [check, current, variant]);
 
   const reload = async () => { await Promise.all([list.reload(), shown.reload()]); };
-  const discard = () => setDraft(null);
   const kind = templateKind(row);
 
   const save = () => run(async () => {
     if (!dirty) return;
-    const reply = await ctx.runConfirmed('Сохранение шаблона', 'Сохранить шаблон?', templateImport(name), { input: templateInput(draft) });
-    // Отказ от плана оставляет черновик.
-    if (ctx.isFailure(reply)) ctx.failed();
-    if (!reply.ok) return;
-    discard();
+    const sent = draft;
+    if (!(await saveTemplate(ctx, name, sent))) return;
+    // Сначала новый текст с сервера, потом черновик: правки, набранные во
+    // время сохранения, остаются, а редактор не показывает прежний текст.
     await reload();
+    setDraft((now) => settleDraft(now, sent));
   });
+  // Ctrl/Cmd+S на всей странице редактора (и в Ace), кроме открытых окон.
+  const saveRef = useRef(save);
+  saveRef.current = save;
+  useEffect(() => {
+    const onKey = (event) => {
+      if (!isSaveKey(event)) return;
+      event.preventDefault();
+      if (!document.querySelector('.modal-open')) saveRef.current();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
   const importFile = (fileText, reason) => run(async () => {
-    if (fileText === null) { ctx.notify('warn', reason || TEMPLATE_FILE_UNREADABLE); return; }
-    const reply = await ctx.runConfirmed('Импорт шаблона', 'Перезаписать шаблон?', templateImport(name), { input: templateInput(fileText) });
-    if (ctx.isFailure(reply)) ctx.failed();
-    if (reply.ok) discard();
+    const imported = await importTemplateFile(ctx, name, fileText, reason, dirty);
+    if (fileText === null) return;
     await reload();
+    if (imported) replaceText();
   });
   const remove = () => run(async () => {
-    if (!(await deleteTemplate(ctx, name))) return;
-    if (kind === 'override') { discard(); await reload(); return; }
+    if (!(await deleteTemplate(ctx, row))) return;
+    if (kind === 'override') { await reload(); replaceText(); return; }
     ctx.setLeaveGuard(null);
     leave('templates');
   });
   const editGroups = () => run(async () => {
-    const groups = await ctx.request(['group', 'list']);
-    if (!groups.ok) { ctx.failed(); return; }
-    const { options, selected } = groupOptions(groups.data, name);
-    const values = await ctx.form({
-      title: `Группы шаблона: ${name}`,
-      submit: 'Далее',
-      context: name === DEFAULT_TEMPLATE ? ['Группы без своего шаблона используют default.yaml.'] : ['Снятые группы вернутся к default.yaml.'],
-      fields: [{ name: 'groups', label: 'Группы', type: 'multi', options, value: selected }],
-    });
-    if (values === null) return;
-    const reply = await ctx.runConfirmed('Группы шаблона', 'Применить?', templateGroups(name, values.groups));
-    if (ctx.isFailure(reply)) ctx.failed();
-    if (reply.ok && rows(reply.data && reply.data.assigned).length === 0 && rows(reply.data && reply.data.reset).length === 0) {
-      ctx.notify('info', 'Изменений нет.');
-    }
+    if (await editTemplateGroups(ctx, name)) setRevision((value) => value + 1);
     await list.reload();
   });
+  const pick = (problem) => {
+    const own = problemVariant(problem);
+    if (own !== null && own !== variant) setVariant(own);
+    if (editor.current) editor.current.goto(problem.line, problem.column);
+  };
 
   const back = { href: ctx.href('templates'), label: 'Шаблоны' };
   const more = [
-    { label: 'Экспорт в файл', icon: 'download', disabled: busy || content === null, onClick: () => run(() => exportTemplate(ctx, name)) },
-    ...(dirty ? [{ label: 'Сбросить изменения', icon: 'x', disabled: busy, onClick: discard }] : []),
+    { label: 'Экспорт сохранённого', icon: 'download', disabled: busy || content === null, onClick: () => run(() => exportTemplate(ctx, name)) },
+    ...(dirty ? [{ label: 'Сбросить изменения', icon: 'x', disabled: busy, onClick: replaceText }] : []),
     ...(row && kind !== 'builtin' ? [{ label: deleteLabel(row), icon: 'trash-2', danger: true, disabled: busy, onClick: remove }] : []),
   ];
   const actions = html`
@@ -226,11 +256,11 @@ function TemplateEditor({ ctx, name }) {
             ? html`<${Card}><p class="t-dim">Загрузка…</p><//>`
             : !shown.reply.ok || content === null
               ? html`<${Card}><${ReadFailed} reply=${shown.reply} loading=${shown.loading} reload=${shown.reload} /><//>`
-              : html`<${AceEditor} value=${text} onChange=${setDraft} annotations=${marks} dropped=${dropped}
-                  dark=${Boolean(ctx.theme && ctx.theme.dark)} onSave=${save} api=${editor} label=${`Содержимое: ${name}`} />`}
+              : html`<${AceEditor} value=${text} version=${version} onChange=${setDraft} annotations=${marks} dropped=${dropped}
+                  dark=${Boolean(ctx.theme && ctx.theme.dark)} api=${editor} label=${`Содержимое: ${name}`} />`}
         </div>
         <div class="editor-side">
-          <${ProblemsPanel} check=${check} report=${report} onGoto=${(line, column) => editor.current && editor.current.goto(line, column)} />
+          <${ProblemsPanel} check=${check} report=${report} current=${current} variant=${variant} onPick=${pick} />
           <${Card} title="Вариант">
             <label class="field">
               <span class="field-label">Группа, для которой показан шаблон</span>
@@ -251,8 +281,11 @@ function TemplateEditor({ ctx, name }) {
 
 const variantLabel = (variant) => (variant === '' ? 'без группы' : variant);
 
-/** Итог `template check`: счётчики и список проблем со ссылками на строки. */
-function ProblemsPanel({ check, report, onGoto }) {
+/**
+ * Итог `template check`: счётчики и список проблем со ссылками на строки.
+ * Проблемы других вариантов приглушены; щелчок по ним переключает вариант.
+ */
+function ProblemsPanel({ check, report, current, variant, onPick }) {
   if (check === null) return html`<${Card} title="Проблемы"><p class="t-dim">Проверка…</p><//>`;
   if (!report) {
     return html`<${Card} title="Проблемы">
@@ -261,23 +294,27 @@ function ProblemsPanel({ check, report, onGoto }) {
     <//>`;
   }
   const counts = problemCounts(report);
-  const problems = rows(report.problems);
+  const problems = rows(report.problems).filter((problem) => problem && typeof problem === 'object');
   return html`<${Card} title="Проблемы">
+    ${!current && html`<p class="t-dim">Проверка…</p>`}
     ${counts.errors === 0 && counts.warnings === 0
       ? html`<p class="t-ok row"><${Icon} name="circle-check" size=${16} />Проблем нет</p>`
       : html`<p class=${counts.errors > 0 ? 't-error' : 't-warn'}>ошибок: ${counts.errors}, предупреждений: ${counts.warnings}</p>`}
     ${problems.length > 0 && html`<ul class="problems">
-      ${problems.map((problem, index) => html`<li key=${index}>
-        <button type="button" class="problem" onClick=${() => onGoto(problem.line, problem.column)}>
-          <span class=${problem.level === 'error' ? 't-error' : 't-warn'}>
-            <${Icon} name=${problem.level === 'error' ? 'circle-alert' : 'triangle-alert'} size=${16} />
-          </span>
-          <span class="problem-text">
-            <span class="problem-line t-dim">строка ${problem.line}${typeof problem.variant === 'string' && html` · ${variantLabel(problem.variant)}`}</span>
-            <span>${problem.message}</span>
-          </span>
-        </button>
-      </li>`)}
+      ${problems.map((problem, index) => {
+        const here = inVariant(problem, variant);
+        return html`<li key=${index}>
+          <button type="button" class="problem ${here ? '' : 'problem-other'}" onClick=${() => onPick(problem)}>
+            <span class=${problem.level === 'error' ? 't-error' : 't-warn'}>
+              <${Icon} name=${problem.level === 'error' ? 'circle-alert' : 'triangle-alert'} size=${16} />
+            </span>
+            <span class="problem-text">
+              <span class="problem-line t-dim">строка ${problem.line}${typeof problem.variant === 'string' && html` · ${variantLabel(problem.variant)}`}${!here && ' (другой вариант)'}</span>
+              <span>${problem.message}</span>
+            </span>
+          </button>
+        </li>`;
+      })}
     </ul>`}
     ${report.truncated === true && html`<p class="t-dim">Показаны первые 200</p>`}
   <//>`;

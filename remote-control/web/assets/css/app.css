@@ -380,6 +380,7 @@ a.chip:hover { border-color: var(--color-primary); color: var(--color-primary); 
 .problem:hover { background: var(--color-base-200); }
 .problem-text { display: flex; flex-direction: column; min-width: 0; overflow-wrap: anywhere; }
 .problem-line { font-size: 12px; }
+.problem-other { opacity: .6; }
 @media (max-width: 1023.98px) {
   .editor-layout { grid-template-columns: minmax(0, 1fr); }
   .template-ace { height: 60vh; }

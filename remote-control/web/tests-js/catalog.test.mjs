@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import {
   templateList, templateCreate, templateShow, templateImport, templateInput, findTemplate, templateContent,
   templateCheck, templateDelete, templateGroups, templateKind, groupOptions, problemCounts, annotations,
-  droppedRanges, variantOptions, NO_GROUP,
+  droppedRanges, variantOptions, effectiveVariant, problemVariant, inVariant, NO_GROUP,
   PUBLISH_FIELDS, GENERATE_ALL, generateGroup, generateClient, generateScope, SUBSCRIPTION_HOST,
   subscriptionSetHost, SUBSCRIPTION_LIST, SUBSCRIPTION_PUBLISH_ALL, subscriptionMigrate, subscriptionHost,
   subscriptionState, subscriptionRow, publishSummary,
@@ -68,6 +68,12 @@ test('шаблоны: отчёт проверки — счётчики, отме
   assert.deepEqual(droppedRanges(variants, 'PC'), [[5, 6], [8, 8]]);
   assert.deepEqual(droppedRanges(variants, 'TV'), []);
   assert.deepEqual(variantOptions(variants).map((o) => o.value), [NO_GROUP, 'PC']);
+  // Выбранный тег исчез из отчёта — показывается «без группы».
+  assert.equal(effectiveVariant(variants, 'PC'), 'PC');
+  assert.equal(effectiveVariant(variants, 'TV'), NO_GROUP);
+  assert.equal(effectiveVariant(null, 'PC'), NO_GROUP);
+  assert.deepEqual(problems.map(problemVariant), [null, NO_GROUP, 'PC']);
+  assert.deepEqual(problems.map((p) => inVariant(p, 'PC')), [true, false, true]);
 });
 
 test('итог генерации: пустые поля пропущены, ошибки жёлтые', () => {

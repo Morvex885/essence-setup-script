@@ -220,7 +220,7 @@ Host-key callback сравнивает SHA256-отпечаток с явным �
 
 Сертификат, флаги слушателя, `web link` и коды доступа ведёт демон (`daemon/commands.rs`, `daemon/access.rs`); `web run|open` — `bin/src/webcmd.rs` (ссылка входа открывается через временный файл-переадресацию в каталоге времени выполнения, чтобы не попасть в argv).
 
-**Фронтенд** (`web/assets/`) — Preact + htm и daisyUI 5 без сборки и npm (`web/package.json` — только `{"private":true,"type":"module"}`). `index.html` первым в `<head>` подключает `js/theme-boot.js` (тема до отрисовки), затем стили `vendor/xterm.css`, `vendor/daisyui.css`, `css/app.css`; в `<body>` — классические скрипты вендора `xterm.js`, `xterm-addon-fit.js`, `qrcode.js`, `ace/ace.js`, `ace/mode-yaml.js`, `ace/ext-searchbox.js`, `ace/theme-github_light_default.js`, `ace/theme-github_dark.js` и модуль `js/app.js`; `vendor/preact-htm.js` — ES-модуль (`html`, `render`, хуки). `daisyui.css` содержит только компоненты (без утилит Tailwind), темы `essence-light`/`essence-dark` и раскладка — в `css/app.css`. Иконки Lucide скопированы в `js/icons.js`. Ace работает без воркера и ничего не догружает (CSP запрещает воркеры и внешние источники). Вендоренные файлы не правятся; версии и SHA-256 — в `assets/vendor/VENDOR.md`, тексты лицензий — `assets/vendor/LICENSE-*` (вшиваются, но не отдаются слушателем).
+**Фронтенд** (`web/assets/`) — Preact + htm и daisyUI 5 без сборки и npm (`web/package.json` — только `{"private":true,"type":"module"}`). `index.html` первым в `<head>` подключает `js/theme-boot.js` (тема до отрисовки), затем стили `vendor/xterm.css`, `vendor/daisyui.css`, `css/app.css`; в `<body>` — классические скрипты вендора `xterm.js`, `xterm-addon-fit.js`, `qrcode.js`, `ace/ace.js`, `ace/mode-yaml.js`, `ace/ext-searchbox.js`, `ace/theme-github_light_default.js`, `ace/theme-github_dark.js` и модуль `js/app.js`; `vendor/preact-htm.js` — ES-модуль (`html`, `render`, хуки). `daisyui.css` содержит только компоненты (без утилит Tailwind), темы `essence-light`/`essence-dark` и раскладка — в `css/app.css`. Иконки Lucide скопированы в `js/icons.js`. Ace работает без воркера (CSP запрещает воркеры из `blob:`) и ничего не догружает: команды, которым нужны невендоренные расширения, удалены. Вендоренные файлы не правятся; версии и SHA-256 — в `assets/vendor/VENDOR.md`, тексты лицензий — `assets/vendor/LICENSE-*` (вшиваются, но не отдаются слушателем).
 
 | Модуль `assets/js/` | Назначение |
 |---|---|
@@ -234,9 +234,9 @@ Host-key callback сравнивает SHA256-отпечаток с явным �
 | `dialogs.js` | Модальные окна (`confirm`, `askSecret`, `ask`, `choose`, `toggle`, `form`, `show`, окно операции) |
 | `form-model.js`, `table-model.js` | Чистая логика форм `ctx.form` (значения, видимость, проверка) и поиска в таблицах |
 | `ui.js`, `icons.js` | Компоненты (`Layout`, `Page`, `DataTable`, `MoreMenu`, `Card`, `Facts`, `Badge`, `Chips`, `Empty`, `Snackbars`, …) и иконки |
-| `template-editor.js` | Редактор YAML на Ace: отметки проблем `template check`, приглушение строк варианта, Ctrl/Cmd+S |
+| `template-editor.js` | Редактор YAML на Ace: текст задаётся при создании и при смене `version` (замена снаружи), отметки проблем `template check`, приглушение строк варианта |
 | `terminal.js` | Терминал нод на xterm |
-| `screens/*` | Экраны разделов (`screens/index.js` — `SCREENS`, включая журнал `journal.js`), чистые модели `*-model.js`, общие хуки `kit.js`, общие действия `shared.js` |
+| `screens/*` | Экраны разделов (`screens/index.js` — `SCREENS`, включая журнал `journal.js`), чистые модели `*-model.js`, действия редактора шаблонов `templates-flow.js`, общие хуки `kit.js`, общие действия `shared.js` |
 
 ## Автозапуск
 

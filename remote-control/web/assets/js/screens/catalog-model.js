@@ -56,14 +56,23 @@ export function templateContent(shown) {
   return shown && typeof shown.content === 'string' ? shown.content : null;
 }
 
+/** Подсказка у групп `default.yaml`: снять их здесь нельзя (`template groups` ничего не сбрасывает с `default.yaml`). */
+export const DEFAULT_GROUP_HINT = '— назначьте группе другой шаблон';
+
 /**
  * Выбор групп шаблона (`clients.rs::template_groups`) из `group list`:
  * `options` — «группа — сейчас: шаблон», `selected` — группы этого шаблона.
+ * У `default.yaml` его группы отмечены и недоступны: снятая отметка ничего бы
+ * не изменила.
  */
 export function groupOptions(groupList, name) {
   const groups = rowsOf(groupList).filter((row) => row && typeof row.name === 'string');
+  const fixed = name === DEFAULT_TEMPLATE;
   return {
-    options: groups.map((row) => ({ value: row.name, label: `${row.name} — сейчас: ${text(row.template)}` })),
+    options: groups.map((row) => {
+      const option = { value: row.name, label: `${row.name} — сейчас: ${text(row.template)}` };
+      return fixed && row.template === name ? { ...option, disabled: true, hint: DEFAULT_GROUP_HINT } : option;
+    }),
     selected: groups.filter((row) => row.template === name).map((row) => row.name),
   };
 }
@@ -73,10 +82,16 @@ export function problemCounts(data) {
   return { errors: count(data && data.errors), warnings: count(data && data.warnings) };
 }
 
+/** Вариант проблемы для выбора: `null` — общая, `''` → `NO_GROUP`, иначе тег. */
+export function problemVariant(problem) {
+  if (!problem || problem.variant === null || problem.variant === undefined) return null;
+  return problem.variant === '' ? NO_GROUP : problem.variant;
+}
+
 /** Проблема относится к выбранному варианту: общая (`null`) или того же варианта. */
-function inVariant(problem, variant) {
-  if (problem.variant === null || problem.variant === undefined) return true;
-  return problem.variant === (variant === NO_GROUP ? '' : variant);
+export function inVariant(problem, variant) {
+  const own = problemVariant(problem);
+  return own === null || own === variant;
 }
 
 /** Отметки Ace (строки и столбцы с нуля) для выбранного варианта. */
@@ -103,6 +118,11 @@ export function variantOptions(variants) {
     if (item && typeof item.tag === 'string' && item.tag !== '') options.push({ value: item.tag, label: item.tag });
   }
   return options;
+}
+
+/** Выбранный вариант, если он ещё есть в отчёте; иначе «без группы». */
+export function effectiveVariant(variants, variant) {
+  return variantOptions(variants).some((option) => option.value === variant) ? variant : NO_GROUP;
 }
 
 // Итоги (`summaryLines`, `GENERATE_FIELDS`) — общие с клиентами: `clients-model.js`.

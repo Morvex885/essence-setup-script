@@ -1,36 +1,47 @@
 // Редактор YAML на Ace (вендоренный классический скрипт, глобальный `ace`;
-// `mode-yaml`, `ext-searchbox` и обе темы подключены в index.html — Ace
-// ничего не догружает сам). Без воркера (`useWorker: false`); проверка
-// шаблона — командой ядра `template check`, её итог приходит отметками.
+// `mode-yaml`, `ext-searchbox` и обе темы подключены в index.html, модуль
+// `ext/error_marker` встроен в `ace.js` — Ace ничего не догружает сам). Без
+// воркера (`useWorker: false`); проверка шаблона — командой ядра
+// `template check`, её итог приходит отметками.
 import { html, useEffect, useRef } from '../vendor/preact-htm.js';
 
 /**
  * Команды Ace, которые догружают невендоренные расширения (`ext/prompt`,
- * `ext/error_marker`, `ext/settings_menu`): убираются, чтобы редактор не
- * запрашивал отсутствующие файлы.
+ * `ext/settings_menu`): убираются, чтобы редактор не запрашивал отсутствующие
+ * файлы. Переход к ошибкам (`goToNextError`: Alt+E, на macOS F4) работает: его модуль в `ace.js`.
  */
-const UNAVAILABLE_COMMANDS = [
-  'gotoline', 'goToNextError', 'goToPreviousError', 'showSettingsMenu',
-  'openCommandPallete', 'openCommandPalette', 'modeSelect',
-];
+const UNAVAILABLE_COMMANDS = ['gotoline', 'showSettingsMenu', 'openCommandPallete', 'openCommandPalette', 'modeSelect'];
 
 const THEME_DARK = 'ace/theme/github_dark';
 const THEME_LIGHT = 'ace/theme/github_light_default';
 
 /**
- * `value` — текст снаружи (ставится только если отличается от текста
- * редактора), `onChange(text)` — правка пользователя, `annotations` — отметки
- * Ace (`{row,column,text,type}`), `dropped` — строки `[от, до]` (с единицы),
- * выпадающие из выбранного варианта, `dark` — тема, `onSave` — Ctrl/Cmd+S.
+ * Редактор без обратной связи по тексту: `value` ставится при создании и
+ * затем только при смене `version` (замена снаружи: сброс, импорт, новый
+ * текст с сервера без черновика) — с сохранением позиции курсора. Иначе
+ * поздняя отрисовка с устаревшим `value` откатывала бы набранное.
+ * `onChange(text)` — правка пользователя (при ней устаревшие отметки
+ * снимаются до нового отчёта), `annotations` — отметки Ace
+ * (`{row,column,text,type}`), `dropped` — строки `[от, до]` (с единицы),
+ * выпадающие из выбранного варианта, `dark` — тема, `label` — подпись поля.
  * `api.current = { goto(line, column) }` — переход к строке и столбцу (с единицы).
+ * Клавиатура: Tab в тексте — отступ; Esc выводит фокус на рамку редактора,
+ * откуда Tab идёт дальше по странице, Enter возвращает в текст.
  */
-export function AceEditor({ value, onChange, annotations = [], dropped = [], dark = false, onSave = null, api = null, label = 'Редактор' }) {
+export function AceEditor({ value, version = 0, onChange, annotations = [], dropped = [], dark = false, api = null, label = 'Редактор' }) {
   const host = useRef(null);
   const editor = useRef(null);
   const markers = useRef([]);
   const applying = useRef(false);
-  const latest = useRef({ onChange, onSave });
-  latest.current = { onChange, onSave };
+  const applied = useRef(version);
+  const latest = useRef(onChange);
+  latest.current = onChange;
+
+  const clearMarks = (instance) => {
+    for (const id of markers.current) instance.session.removeMarker(id);
+    markers.current = [];
+    instance.session.clearAnnotations();
+  };
 
   useEffect(() => {
     const ace = window.ace;
@@ -42,20 +53,18 @@ export function AceEditor({ value, onChange, annotations = [], dropped = [], dar
       useSoftTabs: true,
       showPrintMargin: false,
       fontSize: 13,
+      enableKeyboardAccessibility: true,
       theme: dark ? THEME_DARK : THEME_LIGHT,
     });
     instance.commands.removeCommands(UNAVAILABLE_COMMANDS);
-    instance.commands.addCommand({
-      name: 'save',
-      bindKey: { win: 'Ctrl-S', mac: 'Command-S' },
-      exec: () => { if (latest.current.onSave) latest.current.onSave(); },
-    });
     instance.textInput.getElement().setAttribute('aria-label', label);
     applying.current = true;
     instance.session.setValue(value ?? '');
     applying.current = false;
     instance.session.on('change', () => {
-      if (!applying.current) latest.current.onChange(instance.getValue());
+      if (applying.current) return;
+      if (markers.current.length > 0 || instance.session.getAnnotations().length > 0) clearMarks(instance);
+      latest.current(instance.getValue());
     });
     editor.current = instance;
     if (api) {
@@ -75,12 +84,16 @@ export function AceEditor({ value, onChange, annotations = [], dropped = [], dar
 
   useEffect(() => {
     const instance = editor.current;
-    if (!instance || value === null || value === undefined || value === instance.getValue()) return;
-    // Замена снаружи (импорт, сброс, сохранение) — не правка пользователя.
+    if (!instance || version === applied.current) return;
+    applied.current = version;
+    if (value === null || value === undefined || value === instance.getValue()) return;
+    const cursor = instance.getCursorPosition();
     applying.current = true;
     instance.setValue(value, -1);
     applying.current = false;
-  }, [value]);
+    instance.moveCursorToPosition(cursor);
+    instance.clearSelection();
+  }, [version]);
 
   useEffect(() => {
     if (editor.current) editor.current.setTheme(dark ? THEME_DARK : THEME_LIGHT);
