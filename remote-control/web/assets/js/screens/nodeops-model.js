@@ -5,7 +5,7 @@
 // (`telegram_batch`) поверх `ctx`. Без DOM и вендоренных файлов: окно
 // результатов экран передаёт функцией. Тоны: `ok` (GREEN), `warn` (YELLOW),
 // `error` (RED), `neutral` (DIM).
-import { asList } from '../format.js';
+import { asList, proxyLabel } from '../format.js';
 import { interactive, nodeLabel } from './nodes-model.js';
 
 /** Пустой выбор (`nodes.rs::EMPTY`). */
@@ -83,19 +83,28 @@ export async function syncAll(ctx) {
 }
 
 /**
- * Подключения ноды (`connection_node`): обнаруженные подключения, группы
- * каждого (`assigned[i]`), строки таблицы и проблема синхронизации ноды.
+ * Подключения ноды (`connection_node`): обнаруженные подключения и
+ * назначенные группам, но на ноде больше не найденные (`stale`, в конце —
+ * их можно снять и при недоступной ноде), группы каждого (`assigned[i]`),
+ * строки таблицы и проблема синхронизации ноды.
  */
 export function connectionView(listed, state, name) {
   const entry = asList(listed).find((row) => row && row.node === name);
   const groups = entry ? asList(entry.groups) : [];
-  const proxies = asList(state && state.discovered).map(nodeText);
+  const discovered = asList(state && state.discovered).map(nodeText);
+  const stale = [];
+  for (const group of groups) {
+    for (const proxy of asList(group.proxies).map(nodeText)) {
+      if (!discovered.includes(proxy) && !stale.includes(proxy)) stale.push(proxy);
+    }
+  }
+  const proxies = [...discovered, ...stale];
   const assigned = proxies.map((proxy) => groups
     .filter((group) => asList(group.proxies).includes(proxy))
     .map((group) => nodeText(group.name)));
   const problem = syncProblem(state && state.status);
-  const table = proxies.map((proxy, index) => ({ proxy, groups: assigned[index] }));
-  return { proxies, assigned, problem, table };
+  const table = proxies.map((proxy, index) => ({ proxy, groups: assigned[index], stale: stale.includes(proxy) }));
+  return { proxies, assigned, stale, problem, table };
 }
 
 /**
@@ -145,7 +154,7 @@ export function assignmentChanges(proxies, assigned, values) {
  * снятая отметка снимает назначение. Изменённые группы уходят одной
  * `conn set`; без изменений команды нет. Отмена ничего не меняет.
  */
-export async function assignConnections(ctx, name, proxies, assigned) {
+export async function assignConnections(ctx, name, proxies, assigned, stale = []) {
   if (proxies.length === 0) {
     ctx.notify('warn', `На ноде «${name}» подключений не найдено.`);
     return;
@@ -162,7 +171,7 @@ export async function assignConnections(ctx, name, proxies, assigned) {
   }
   const options = groups.map((group) => ({ value: group, label: group }));
   const fields = proxies.map((proxy, index) => ({
-    name: proxyField(index), label: proxy, type: 'multi', options,
+    name: proxyField(index), label: proxyLabel(proxy, stale), type: 'multi', options,
     value: asList(assigned[index]).filter((group) => groups.includes(group)),
   }));
   const values = await ctx.form({

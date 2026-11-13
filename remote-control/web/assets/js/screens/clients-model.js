@@ -3,7 +3,7 @@
 // Без DOM: действия (`fetch`, `load`, `generate`, `headers`, добавление,
 // перенос, карточка клиента, подписки) — формы и диалоги `ctx`
 // (`app.js::makeContext`); окна с разметкой экран передаёт функцией.
-import { asList, strings } from '../format.js';
+import { asList, strings, proxyLabel } from '../format.js';
 import { isFailure } from '../flows.js';
 import {
   DEFAULT_TEMPLATE, generateGroup, generateClient, generateScope,
@@ -497,19 +497,21 @@ export async function groupConnectionsFlow(ctx, group) {
   }
   const found = await ctx.nodeRequest(node, discoverArgv(node), null);
   if (!found.ok) return;
-  const proxies = discoveredProxies(found.data);
-  if (proxies.length === 0) { ctx.notify('warn', `На ноде «${node}» подключений не найдено.`); return; }
+  const discovered = discoveredProxies(found.data);
   const current = groupProxies(found.data, group);
+  // Назначенные группе, но не найденные на ноде — в конце, чтобы их можно было снять.
+  const stale = current.filter((proxy) => !discovered.includes(proxy));
+  const proxies = [...discovered, ...stale];
+  if (proxies.length === 0) { ctx.notify('warn', `На ноде «${node}» подключений не найдено.`); return; }
   const values = await ctx.form({
     title: `Подключения группы ${group}`, context: [`Нода: ${node}`], submit: 'Назначить',
     fields: [{ name: 'proxies', label: 'Подключения', type: 'multi', hint: 'Без отметок назначение группы на этой ноде снимается',
-      options: proxies.map((proxy) => ({ value: proxy, label: proxy })),
-      value: proxies.filter((proxy) => current.includes(proxy)) }],
+      options: proxies.map((proxy) => ({ value: proxy, label: proxyLabel(proxy, stale) })),
+      value: current }],
   });
   if (values === null || values === undefined) return;
   const chosen = asList(values.proxies);
-  const known = current.filter((proxy) => proxies.includes(proxy));
-  if (chosen.length === known.length && chosen.every((proxy) => known.includes(proxy))) return;
+  if (chosen.length === current.length && chosen.every((proxy) => current.includes(proxy))) return;
   await execute(ctx, groupConnectionsArgv(group, node, chosen));
 }
 

@@ -140,3 +140,6 @@ export function appendJournal(entries, entry, limit, repeat = true) {
   const next = [...entries, entry];
   return next.length > limit ? next.slice(next.length - limit) : next;
 }
+
+/** Подпись подключения в формах: не найденное на ноде отмечено. */
+export const proxyLabel = (proxy, stale) => (stale.includes(proxy) ? `${proxy} (не найдено на ноде)` : proxy);

@@ -88,11 +88,12 @@ test('подключения ноды: группы подключений и п
   const view = connectionView(listed, { name: 'n', status: 'synced', discovered: ['p1', 'p2'] }, 'n');
   assert.deepEqual(view.proxies, ['p1', 'p2']);
   assert.deepEqual(view.assigned, [['old', 'x'], []]);
-  assert.deepEqual(view.table, [{ proxy: 'p1', groups: ['old', 'x'] }, { proxy: 'p2', groups: [] }]);
+  assert.deepEqual(view.table.map((row) => [row.proxy, row.groups, row.stale]), [['p1', ['old', 'x'], false], ['p2', [], false]]);
   assert.equal(view.problem, null);
+  // Нода недоступна: назначенные подключения остаются в списке как не найденные — их можно снять.
   const problem = connectionView(listed, { name: 'n', status: 'unreachable', discovered: null }, 'n');
   assert.equal(problem.problem, 'недоступна');
-  assert.deepEqual(problem.table, []);
+  assert.deepEqual([problem.proxies, problem.stale, problem.assigned], [['p1'], ['p1'], [['old', 'x']]]);
   const empty = connectionView([], null, 'n');
   assert.deepEqual([empty.problem, empty.table], [null, []]);
 });

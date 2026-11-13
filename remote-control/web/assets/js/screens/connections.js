@@ -3,7 +3,7 @@
 // `conn sync --name` идёт по SSH и чистит устаревшее; после действий
 // перечитывается только `conn list --name`.
 import { html, useEffect, useRef, useState } from '../../vendor/preact-htm.js';
-import { Card, DataTable, Chips, Button } from '../ui.js';
+import { Card, DataTable, Chips, Button, Badge } from '../ui.js';
 import { Icon } from '../icons.js';
 import { NODE_CODES } from '../flows.js';
 import { useBusy, useMounted, ReadFailed } from './kit.js';
@@ -81,7 +81,8 @@ export function NodeConnections({ ctx, name }) {
     <//>`;
   }
   const columns = [
-    { key: 'proxy', label: 'Подключение', search: true },
+    { key: 'proxy', label: 'Подключение', search: true,
+      render: (row) => (row.stale ? html`${row.proxy} <${Badge} tone="warn">не найдено на ноде<//>` : row.proxy) },
     {
       key: 'groups',
       label: 'Группы',
@@ -90,7 +91,7 @@ export function NodeConnections({ ctx, name }) {
   ];
   const actions = html`<div class="row">
     <${Button} kind="primary" icon="git-branch" disabled=${busy}
-      onClick=${() => act(() => assignConnections(ctx, name, view.proxies, view.assigned))}>Назначить группам<//>
+      onClick=${() => act(() => assignConnections(ctx, name, view.proxies, view.assigned, view.stale))}>Назначить группам<//>
     <${Button} icon="pencil" disabled=${busy} onClick=${() => act(() => editAliases(ctx, name))}>Псевдонимы<//>
     <${Button} icon="refresh-cw" disabled=${busy} onClick=${() => run(synchronize)}>Синхронизировать<//>
   </div>`;

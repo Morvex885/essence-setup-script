@@ -379,6 +379,13 @@ test('подключения группы: нода по выбору (одна 
   await m.groupConnectionsFlow(same, 'PC');
   assert.deepEqual(kinds(same), ['request', 'node', 'form'], 'без изменений команды нет');
 
+  // Назначенное, но не найденное на ноде подключение показано отмеченным и снимается.
+  const stale = fakeCtx({ replies: [okReply([{ name: 'de' }]), okReply([{ node: 'de', groups: [{ name: 'PC', proxies: ['gone'] }], discovered: [] }]), okReply()],
+    answers: [{ proxies: [] }] });
+  await m.groupConnectionsFlow(stale, 'PC');
+  assert.deepEqual(stale.calls.find((c) => c[0] === 'form')[1].fields[0].value, ['gone']);
+  assert.deepEqual(commands(stale).at(-1), ['conn', 'set', '--name', 'de', '--assign', 'PC=']);
+
   const cancelled = fakeCtx({ replies: [two], answers: [null] });
   await m.groupConnectionsFlow(cancelled, 'PC');
   assert.deepEqual(kinds(cancelled), ['request', 'form']);
