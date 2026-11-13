@@ -31,8 +31,6 @@ const MAX_SECRET_ATTEMPTS: u8 = 3;
 /// доступа сетевого демона (одноразовый: после принятия не повторяется).
 const SESSION_SECRETS: [&str; 3] = ["script-password", "vault-password", "access-token"];
 const ACCESS_TOKEN: &str = "access-token";
-/// Предел пути сокета агента, принимаемый демоном.
-const MAX_AGENT_SOCKET: usize = 4096;
 
 // ─── Сигналы: SIGINT не рвёт команду и ответ; SIGPIPE уже игнорируется ───────
 
@@ -255,20 +253,6 @@ fn connect_spawning_in(root: std::path::PathBuf, args: Vec<String>) -> Result<(D
     Ok((client, endpoint))
 }
 
-/// `SSH_AUTH_SOCK` из окружения CLI (только абсолютный путь); на Windows без
-/// переменной — канал агента OpenSSH.
-fn agent_env() -> Option<BTreeMap<String, String>> {
-    let socket = match std::env::var("SSH_AUTH_SOCK") {
-        Ok(socket) if !socket.is_empty() => socket,
-        #[cfg(windows)]
-        _ => r"\\.\pipe\openssh-ssh-agent".to_owned(),
-        #[cfg(not(windows))]
-        _ => return None,
-    };
-    (Path::new(&socket).is_absolute() && socket.len() <= MAX_AGENT_SOCKET)
-        .then(|| BTreeMap::from([("SSH_AUTH_SOCK".to_owned(), socket)]))
-}
-
 /// Копии переданных секретов с именами из `names`.
 fn wire_secrets(secrets: &Secrets, names: &[&str]) -> client::Secrets {
     let mut wire = client::Secrets::default();
@@ -293,11 +277,18 @@ fn print_log(entry: &client::Log) {
 
 // ─── Разовый CLI ─────────────────────────────────────────────────────────────
 
-/// Перед этими командами неявный `session open` не отправляется.
-fn opens_session(invocation: &Invocation) -> bool {
-    !(invocation.help
-        || matches!((invocation.noun.as_str(), invocation.verb.as_str()),
-            ("session", "status" | "open") | ("self", "version"))
+/// Перед этими командами неявный `session open` не отправляется. Локальный
+/// демон отвечает без авторизации ещё на `self version`, `daemon *` и `web *`;
+/// сетевой (`--connect`) — только на команды, которые отклоняет сразу
+/// (`local_only`).
+fn opens_session(invocation: &Invocation, remote: bool) -> bool {
+    if invocation.help || matches!((invocation.noun.as_str(), invocation.verb.as_str()), ("session", "status" | "open")) {
+        return false;
+    }
+    if remote {
+        return !invocation.local_only();
+    }
+    !(matches!((invocation.noun.as_str(), invocation.verb.as_str()), ("self", "version"))
         || matches!(invocation.noun.as_str(), "daemon" | "web"))
 }
 
@@ -324,7 +315,7 @@ pub(crate) fn local(error: RcError) -> Box<Output> {
 }
 
 fn execute(argv: &[String], invocation: &Invocation, target: Option<&Target>) -> Outcome<Output> {
-    let session = opens_session(invocation);
+    let session = opens_session(invocation, target.is_some());
     let mut secrets = Secrets::default();
     if invocation.secrets_stdin {
         secrets = read_stdin_secrets().map_err(local)?;
@@ -353,7 +344,7 @@ fn execute(argv: &[String], invocation: &Invocation, target: Option<&Target>) ->
     // Агент SSH передаётся только локальному демону (сетевому `env` запрещён).
     let (mut client, env) = match target {
         Some(target) => (remote::connect(target).map_err(local)?, None),
-        None => (connect().map_err(local)?.0, agent_env()),
+        None => (connect().map_err(local)?.0, client::agent_env(std::env::var_os("SSH_AUTH_SOCK"))),
     };
     if let Err(error) = refuse_key_in_data_dir(invocation, client.local_data_dir()) {
         let _ = client.close();
@@ -923,13 +914,26 @@ mod tests {
     }
 
     #[test]
-    fn implicit_session_open_skips_status_and_daemon_commands() {
-        let opens = |words: &[&str]| opens_session(&cli::parse_client(&args(words)).unwrap());
-        assert!(opens(&["group", "list"]));
-        assert!(opens(&["source", "github-connect"]));
-        assert!(opens(&["status"]));
-        for words in [&["session", "status"][..], &["session", "open"], &["self", "version"], &["daemon", "status"], &["help"]] {
-            assert!(!opens(words), "{words:?}");
+    fn implicit_session_open_depends_on_the_daemon_origin() {
+        let opens = |words: &[&str], remote: bool| opens_session(&cli::parse_client(&args(words)).unwrap(), remote);
+        for remote in [false, true] {
+            assert!(opens(&["group", "list"], remote));
+            assert!(opens(&["source", "github-connect"], remote));
+            assert!(opens(&["status"], remote));
+            for words in [&["session", "status"][..], &["session", "open"], &["help"]] {
+                assert!(!opens(words, remote), "{words:?}");
+            }
+        }
+        // Локальный демон отвечает на них без авторизации.
+        for words in [&["self", "version"][..], &["daemon", "status"], &["web", "status"], &["web", "link"]] {
+            assert!(!opens(words, false), "{words:?}");
+        }
+        // Сетевой — только после неё; `local_only` он отклоняет сразу.
+        for words in [&["self", "version"][..], &["daemon", "status"], &["web", "status"]] {
+            assert!(opens(words, true), "{words:?}");
+        }
+        for words in [&["daemon", "stop"][..], &["web", "stop"]] {
+            assert!(!opens(words, true), "{words:?}");
         }
     }
 

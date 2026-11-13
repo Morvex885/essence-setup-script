@@ -236,6 +236,12 @@ fn the_one_shot_cli_works_against_a_remote_daemon() {
     assert!(ok(&groups), "{groups}");
     let (exit, wrong) = remote_cli(&ctx, &["--connect", url, "group", "list", "--json", "--secrets-stdin"], br#"{"script-password":"bad"}"#);
     assert_eq!((exit, code(&wrong)), (Some(1), "auth_failed"), "{wrong}");
+    // Commands a local daemon answers before authorization need it over the network.
+    for words in [&["self", "version"][..], &["daemon", "status"], &["web", "status"]] {
+        let argv: Vec<&str> = ["--connect", url].iter().chain(words).chain(&["--json", "--secrets-stdin"]).copied().collect();
+        let (exit, reply) = remote_cli(&ctx, &argv, secrets);
+        assert_eq!(exit, Some(0), "{words:?}: {reply}");
+    }
     // Local-only commands stay local.
     let (_, stop) = remote_cli(&ctx, &["--connect", url, "daemon", "stop", "--json"], b"");
     assert_eq!(code(&stop), "local_only", "{stop}");

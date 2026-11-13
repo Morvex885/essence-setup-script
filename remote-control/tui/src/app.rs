@@ -2,9 +2,9 @@
 //! a `Registration` in `registrations()`. Screens receive only `Context` (daemon
 //! client + UI); no state/SSH imports. Register a real factory, never an unfinished route.
 //! The source screen also supplies `Registry::github_wizard` for first-run entry.
-use std::{collections::{BTreeMap, VecDeque}, ffi::OsString, io::{self, IsTerminal, Write}, path::PathBuf, process::{Command, ExitCode}, time::Duration};
+use std::{collections::{BTreeMap, VecDeque}, io::{self, IsTerminal, Write}, process::{Command, ExitCode}, time::Duration};
 use crossterm::{event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers}, execute, terminal::{self, EnterAlternateScreen, LeaveAlternateScreen}};
-use essence_rc_client::{Client, Input, Log, Origin, Progress, Reply, Request, Secrets, TermEvent, TerminalIo};
+use essence_rc_client::{Client, Input, Log, Origin, Progress, Reply, Request, Secrets, TermEvent, TerminalIo, agent_env};
 use ratatui::{Terminal, backend::CrosstermBackend, text::Line};
 use zeroize::Zeroizing;
 use crate::ui::{self, Item, View};
@@ -70,18 +70,6 @@ pub struct Context<'a> {
     pub terminal: Option<TerminalFactory<'a>>,
     /// `env` of every request: the operator's SSH agent for node connections.
     env: Option<BTreeMap<String, String>>,
-}
-/// The daemon's limit for the agent path.
-const MAX_AGENT_PATH: usize = 4096;
-/// `{"SSH_AUTH_SOCK": path}` from the value of the operator's variable: only
-/// an absolute UTF-8 path within the daemon's limit. On Windows the OpenSSH
-/// agent pipe is used when the variable is unset.
-fn agent_env(value: Option<OsString>) -> Option<BTreeMap<String, String>> {
-    let path = value.filter(|value| !value.is_empty()).map(PathBuf::from);
-    #[cfg(windows)]
-    let path = path.or_else(|| Some(PathBuf::from(r"\\.\pipe\openssh-ssh-agent")));
-    let path = path.filter(|path| path.is_absolute())?.into_os_string().into_string().ok()?;
-    (path.len() <= MAX_AGENT_PATH).then(|| BTreeMap::from([("SSH_AUTH_SOCK".to_owned(), path)]))
 }
 /// The single place where a request is assembled: every request carries the agent `env`.
 fn request<'r>(env: &'r Option<BTreeMap<String, String>>, words: &'r [String], secrets: &'r Secrets, input: &'r Input) -> Request<'r> {
@@ -792,25 +780,6 @@ mod tests {
         assert_eq!((ui.inner.suspensions,ui.inner.suspended_now),(1,false));
         assert_eq!(ui.inner.notices.len(),1);
         client.inner.assert_finished();
-    }
-    #[test]
-    fn agent_env_is_an_absolute_path_within_the_limit() {
-        let env=|value:&str| agent_env(Some(value.into()));
-        #[cfg(unix)] {
-            assert_eq!(env("/run/agent.sock"),Some(BTreeMap::from([("SSH_AUTH_SOCK".to_owned(),"/run/agent.sock".to_owned())])));
-            assert_eq!(env("relative/agent"),None);
-            assert_eq!(env(""),None);
-            assert_eq!(agent_env(None),None);
-            assert_eq!(env(&format!("/{}","a".repeat(MAX_AGENT_PATH))),None);
-        }
-        #[cfg(windows)] {
-            assert_eq!(agent_env(None),Some(BTreeMap::from([("SSH_AUTH_SOCK".to_owned(),r"\\.\pipe\openssh-ssh-agent".to_owned())])));
-            assert_eq!(env(r"C:\agent"),Some(BTreeMap::from([("SSH_AUTH_SOCK".to_owned(),r"C:\agent".to_owned())])));
-        }
-        let (words,secrets,input)=(argv(&["status"]),Secrets::default(),Input::default());
-        let with=Some(BTreeMap::from([("SSH_AUTH_SOCK".to_owned(),"/a".to_owned())]));
-        assert_eq!(request(&with,&words,&secrets,&input).env,with.as_ref());
-        assert_eq!(request(&None,&words,&secrets,&input).env,None);
     }
     #[test]
     fn decisions_and_plans_are_not_journaled_as_errors() {
