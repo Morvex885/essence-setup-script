@@ -277,7 +277,7 @@ static HELP: &[(&str, &[(&str, &str)])] = &[
         ("template import --name T --file PATH [--yes]", "Загрузить шаблон из файла"),
         ("template delete --name T [--yes]", "Удалить пользовательский шаблон"),
         ("template groups --name T [--group G…] [--yes]", "Задать группы шаблона (остальные его группы — на default.yaml)"),
-        ("template check (--name T | --file PATH)", "Проверить шаблон: YAML, маркеры, схема mihomo"),
+        ("template check [--name T] [--file PATH]", "Проверить шаблон (YAML, маркеры, схема mihomo): файл, если указан, иначе шаблон T"),
     ]),
     ("web", &[
         ("web status", "Состояние веб-панели: адрес, TLS, отпечаток сертификата, подключения"),

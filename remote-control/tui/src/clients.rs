@@ -635,7 +635,7 @@ fn template_card(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
                 if choice == "x" {
                     export_template(ctx, name, &path)?;
                 } else if let Some(input) = file_input(ctx, &path) {
-                    confirmed_with(ctx, "Импорт шаблона", "Перезаписать шаблон?", &["template", "import", "--name", name], &input)?;
+                    confirmed_with(ctx, "Импорт шаблона", "Импортировать шаблон?", &["template", "import", "--name", name], &input)?;
                 }
             },
             "c" => if let Some(report) = fetch(ctx, &["template", "check", "--name", name])? {
@@ -667,12 +667,16 @@ fn check_view(name: &str, report: &Value) -> View {
     view
 }
 /// Multi-select of the groups that use the template; the rest of its groups
-/// fall back to `default.yaml` (the core plans both).
+/// fall back to `default.yaml` (the core plans both). Nothing falls back
+/// from `default.yaml` itself, so for it only the other groups are offered.
 fn template_groups(ctx: &mut Context<'_>, name: &str, current: &[String]) -> io::Result<()> {
     let Some(data) = fetch(ctx, &["group", "list"])? else { return Ok(()); };
-    let groups = names(&data);
+    let mut groups = names(&data);
+    let default = name == "default.yaml";
+    if default { groups.retain(|g| !current.contains(g)); }
     let flags = groups.iter().map(|g| current.contains(g)).collect();
-    let Some(selected) = ctx.toggle(&format!("Группы шаблона: {name}"), &groups, flags, EMPTY)? else { return Ok(()); };
+    let title = if default { format!("Назначить шаблон {name} группам") } else { format!("Группы шаблона: {name}") };
+    let Some(selected) = ctx.toggle(&title, &groups, flags, EMPTY)? else { return Ok(()); };
     let mut words = vec!["template", "groups", "--name", name];
     for i in selected { words.extend(["--group", groups[i].as_str()]); }
     let reply = confirmed(ctx, "Группы шаблона", "Применить?", &words)?;
@@ -773,8 +777,9 @@ fn edit_file(ctx: &mut Context<'_>, name: &str, editor: &[String], path: &Path, 
             if let Some(input) = file_input(ctx, path) {
                 let reply = confirmed_with(ctx, "Импорт изменений шаблона", "Сохранить изменения шаблона?",
                     &["template", "import", "--name", name], &input)?;
-                // Success, or the plan was refused: the user's decision is final.
-                if reply.ok || matches!(reply.code(), "confirmation_required" | "plan_changed") { return Ok(()); }
+                // Saved; a refused plan (overwrite or problems) keeps the
+                // working copy like a rejected import.
+                if reply.ok { return Ok(()); }
             }
         } else {
             ctx.ui.notice(ui::warn("Редактор завершился с ошибкой."));
@@ -1336,10 +1341,10 @@ mod tests {
         assert_eq!(keys(card), ["v", "x", "e", "i", "c", "g", "d", "0"].iter().map(|k| (k.to_string(), match *k {
             "v" | "x" | "c" => ui::CYAN, "e" | "i" | "g" => ui::YELLOW, "d" => ui::RED, _ => ui::NC,
         })).collect::<Vec<_>>());
-        assert_eq!(card.sections.iter().flatten().find(|i| i.key == "d").unwrap().label, "Удалить шаблон");
-        let checked = content(view(&ui, "Проверка шаблона: m.yaml"));
-        assert!(checked.contains("строка 1: ошибка — Нет строки «proxies:»") && checked.contains("строка 7: предупреждение — bad mode (PC)"), "{checked}");
-        let toggle = view(&ui, "Группы шаблона: m.yaml");
+        let check = &ui.views[1];
+        assert_eq!(check.context.iter().map(|line| line.style.fg).collect::<Vec<_>>(), [Some(ui::RED), Some(ui::YELLOW)], "a row per problem by level");
+        assert!(check.context[1].to_string().contains("bad mode") && check.context[1].to_string().contains("PC"), "message and variant tag");
+        let toggle = ui.views.iter().find(|v| v.mode == ui::Mode::Toggle).unwrap();
         assert!(toggle.sections[0][0].label.starts_with("[x]") && toggle.sections[0][1].label.starts_with("[ ]"), "current groups are checked");
         assert!(sent(&core, &groups) && sent(&core, &delete));
         assert_eq!(ui.views.iter().filter(|v| v.prompt.contains("(y/N)")).count(), 2);
@@ -1357,10 +1362,30 @@ mod tests {
         ], &["d", "c", "", "0"], |ctx| template_card(ctx, "default.yaml"));
         assert!(keys(&ui.views[0]).iter().all(|(key, _)| key != "d"));
         assert!(!core.calls.iter().any(|call| call[1] == "delete"));
-        assert!(content(view(&ui, "Проверка шаблона: default.yaml")).contains("Проблем нет"));
-        let shadow = json!([{"name":"default.yaml","source":"custom","overrides":true,"groups":[]}]);
-        let (_, ui) = drive(vec![ok(&["template", "list"], shadow)], &["0"], |ctx| template_card(ctx, "default.yaml"));
-        assert_eq!(ui.views[0].sections.iter().flatten().find(|i| i.key == "d").unwrap().label, "Сбросить к встроенному");
+        let clean = ui.views.iter().any(|v| v.context.len() == 1 && v.context[0].style.fg == Some(ui::GREEN));
+        assert!(clean, "a clean check is one green row");
+        let label = |row: Value| {
+            let (_, ui) = drive(vec![ok(&["template", "list"], json!([row]))], &["0"], |ctx| template_card(ctx, "default.yaml"));
+            ui.views[0].sections.iter().flatten().find(|i| i.key == "d").unwrap().label.clone()
+        };
+        let (reset, delete) = (label(json!({"name":"default.yaml","source":"custom","overrides":true,"groups":[]})),
+            label(json!({"name":"default.yaml","source":"custom","overrides":false,"groups":[]})));
+        assert_ne!(reset, delete, "an override is reset, not deleted");
+    }
+    #[test]
+    fn default_template_groups_offer_only_the_other_groups() {
+        let list = json!([{"name":"default.yaml","source":"builtin","overrides":false,"groups":["PC"]}]);
+        let assign = ["template", "groups", "--name", "default.yaml", "--group", "ROUTER"];
+        let (core, ui) = drive(vec![
+            ok(&["template", "list"], list.clone()),
+            ok(&["group", "list"], json!([{"name":"PC","template":"default.yaml"},{"name":"ROUTER","template":"r.yaml"}])),
+            step(&assign, plan()), yes(&assign, json!({"name":"default.yaml","assigned":["ROUTER"],"reset":[]})),
+            ok(&["template", "list"], list),
+        ], &["g", "1", "", "y", "0"], |ctx| template_card(ctx, "default.yaml"));
+        let toggle = ui.views.iter().find(|v| v.mode == ui::Mode::Toggle).unwrap();
+        let offered: Vec<_> = toggle.sections.iter().flatten().filter(|i| i.key != "0").map(|i| i.label.clone()).collect();
+        assert_eq!(offered, ["[ ] ROUTER"], "groups already on default.yaml are not offered");
+        assert!(sent(&core, &assign));
     }
     #[test]
     fn file_input_refuses_large_files_and_links() {
@@ -1553,6 +1578,23 @@ mod tests {
             assert_eq!(keys(decision), [("r".into(), ui::YELLOW), ("d".into(), ui::RED)]);
             frames(&ui.inner);
         }
+    }
+    /// A refused plan (overwrite or template problems) is not a discard: the
+    /// working copy stays and can be reopened with the edits.
+    #[test]
+    fn refused_import_plan_keeps_the_working_copy() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(file.path(), b"original").unwrap();
+        let import = ["template", "import", "--name", "m.yaml"];
+        let steps = vec![step(&import, plan()), step(&import, plan()), yes(&import, json!({"name":"m.yaml"}))];
+        let registry = Registry { screens: vec![], github_wizard: None };
+        let mut core = ScriptedClient::new(steps);
+        let mut ui = EditorUi { inner: ScriptedUi::new(&["n", "r", "y"]), replacement: Some(b"changed"), succeeds: true, suspended: 0, seen: vec![] };
+        edit_file(&mut Context::for_test(&mut core, &mut ui, &registry), "m.yaml", &["editor".into()], file.path(), b"original").unwrap();
+        core.assert_finished();
+        assert!(ui.inner.inputs.is_empty());
+        assert_eq!(ui.suspended, 2);
+        assert_eq!(ui.seen[1], b"changed", "the editor reopens the edited copy");
     }
     #[test]
     fn vanished_template_never_opens_the_editor() {

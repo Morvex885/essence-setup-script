@@ -1,13 +1,16 @@
 //! `template check`: a template is checked as every client config it can
-//! produce. Each variant (no group, then every marker tag) is the template
-//! filtered like `process`; a variant must keep a `proxies:` anchor, parse as
-//! YAML and match the mihomo config schema (MetaCubeX meta-json-schema,
-//! `core/schemas`). Problems carry source line numbers; a problem found in
-//! every variant is reported once without a variant.
+//! produce. Each variant (no group, then every marker tag naming an existing
+//! group) is the template filtered like `process`; a variant must keep a
+//! `proxies:` anchor, parse as YAML and match the mihomo config schema
+//! (MetaCubeX meta-json-schema, `core/schemas`). Problems carry source line
+//! numbers; a problem found in every variant is reported once without a
+//! variant. Tags without a group are never generated and only warned about.
 
-use std::collections::BTreeSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
+use jsonschema::error::{TypeKind, ValidationErrorKind};
+use jsonschema::types::JsonType;
 use saphyr::{LoadableYamlNode, MarkedYaml, Marker, Scalar, YamlData};
 use serde_json::{Map, Number, Value, json};
 
@@ -20,7 +23,11 @@ use super::templates::{self, file_name, marker_blocks, process_lines};
 
 /// Problems beyond this many are dropped (`truncated`).
 const LIMIT: usize = 200;
-/// Schema messages are cut to this many characters.
+/// Variants checked at most, the one without groups included.
+const MAX_VARIANTS: usize = 64;
+/// Schema problems kept per variant; more set `truncated`.
+const VARIANT_PROBLEMS: usize = 1000;
+/// Messages are cut to this many characters.
 const MESSAGE_CHARS: usize = 200;
 
 static SCHEMA: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/schemas/meta-json-schema.json"));
@@ -59,8 +66,11 @@ pub struct Variant {
 pub struct Report {
     /// Sorted by position, at most `LIMIT`.
     pub problems: Vec<Problem>,
+    /// Problems were dropped: over `LIMIT`, or a variant had more than
+    /// `VARIANT_PROBLEMS` schema problems (the counts are then lower bounds).
     pub truncated: bool,
-    /// Counts of every problem, including the truncated ones.
+    /// Distinct problems (line, column, code, message): a problem of several
+    /// variants counts once.
     pub errors: usize,
     pub warnings: usize,
     pub variants: Vec<Variant>,
@@ -70,39 +80,71 @@ fn problem(line: usize, column: usize, level: &'static str, code: &'static str, 
     Problem { line, column, level, code, message, path: None, variant: None }
 }
 
+type Key = (usize, usize, &'static str, String);
+
+fn key(problem: &Problem) -> Key {
+    (problem.line, problem.column, problem.code, problem.message.clone())
+}
+
 /// Check a template against the groups that exist (names of marker tags).
 pub fn check(content: &str, groups: &[String]) -> Report {
     let mut problems = Vec::new();
     let mut tags: Vec<String> = Vec::new();
     for block in marker_blocks(content) {
+        let label = block.tags.join("/");
         if block.close.is_none() {
-            problems.push(problem(block.open, 1, "error", "marker_unclosed",
-                format!("Блок маркера {} не закрыт.", block.tags.join("/"))));
+            problems.push(problem(block.open, 1, "error", "marker_unclosed", format!("Блок маркера «{label}» не закрыт.")));
         }
-        for tag in block.tags {
+        if block.tags.iter().any(String::is_empty) {
+            problems.push(problem(block.open, 1, "warning", "marker_invalid",
+                format!("Маркер «{label}»: пустое имя группы между «/».")));
+        }
+        for tag in block.tags.into_iter().filter(|tag| !tag.is_empty()) {
             if !groups.contains(&tag) {
                 problems.push(problem(block.open, 1, "warning", "marker_unknown_group",
-                    format!("Маркер {tag}: группы с таким именем нет.")));
-            }
-            if !tags.contains(&tag) {
+                    format!("Маркер «{tag}»: группы с таким именем нет.")));
+            } else if !tags.contains(&tag) {
                 tags.push(tag);
             }
         }
     }
+    if tags.len() >= MAX_VARIANTS {
+        problems.push(problem(1, 1, "warning", "variants_limit", format!(
+            "Проверены {MAX_VARIANTS} вариантов из {}: остальные группы маркеров не проверены.", tags.len() + 1)));
+        tags.truncate(MAX_VARIANTS - 1);
+    }
     let total = content.split_inclusive('\n').count();
-    let names: Vec<Option<String>> = std::iter::once(None).chain(tags.into_iter().map(Some)).collect();
-    let mut variants = Vec::with_capacity(names.len());
-    let mut found: Vec<Vec<Problem>> = Vec::with_capacity(names.len());
-    for tag in names {
+    let mut variants = Vec::with_capacity(tags.len() + 1);
+    let mut found: Vec<Vec<Problem>> = Vec::with_capacity(tags.len() + 1);
+    let mut checked: HashMap<Vec<usize>, usize> = HashMap::new();
+    let mut truncated = false;
+    // The variant without groups: no group is named "", so no block is kept.
+    for tag in std::iter::once(None).chain(tags.into_iter().map(Some)) {
         let kept = process_lines(content, tag.as_deref().unwrap_or(""));
-        variants.push(Variant { tag: tag.clone(), dropped: dropped(&kept, total) });
-        found.push(check_variant(&kept));
+        let numbers: Vec<usize> = kept.iter().map(|(line, _)| *line).collect();
+        let list = match checked.get(&numbers) {
+            // The same lines as a checked variant: the same problems.
+            Some(&index) => found[index].clone(),
+            None => {
+                let (list, capped) = check_variant(&kept);
+                truncated |= capped;
+                checked.insert(numbers, found.len());
+                list
+            }
+        };
+        variants.push(Variant { tag, dropped: dropped(&kept, total) });
+        found.push(list);
     }
     merge(&mut problems, &variants, found);
     problems.sort_by(|a, b| (a.line, a.column, a.level).cmp(&(b.line, b.column, b.level)));
-    let errors = problems.iter().filter(|p| p.level == "error").count();
-    let warnings = problems.len() - errors;
-    let truncated = problems.len() > LIMIT;
+    let mut distinct = HashSet::new();
+    let (mut errors, mut warnings) = (0, 0);
+    for problem in &problems {
+        if distinct.insert(key(problem)) {
+            if problem.level == "error" { errors += 1 } else { warnings += 1 }
+        }
+    }
+    truncated |= problems.len() > LIMIT;
     problems.truncate(LIMIT);
     Report { problems, truncated, errors, warnings, variants }
 }
@@ -122,15 +164,23 @@ fn dropped(kept: &[(usize, &str)], total: usize) -> Vec<(usize, usize)> {
 
 /// A problem of every variant is reported once; others once per variant.
 fn merge(problems: &mut Vec<Problem>, variants: &[Variant], found: Vec<Vec<Problem>>) {
-    let key = |p: &Problem| (p.line, p.column, p.code, p.message.clone());
-    let shared: BTreeSet<_> = found.first().map(|first| first.iter().map(key)
-        .filter(|k| found.iter().all(|list| list.iter().any(|p| key(p) == *k)))
-        .collect()).unwrap_or_default();
-    let mut reported = BTreeSet::new();
+    // Variants each problem occurs in.
+    let mut presence: HashMap<Key, usize> = HashMap::new();
+    for list in &found {
+        let mut seen = HashSet::new();
+        for problem in list {
+            let k = key(problem);
+            if !seen.contains(&k) {
+                seen.insert(k.clone());
+                *presence.entry(k).or_default() += 1;
+            }
+        }
+    }
+    let mut reported = HashSet::new();
     for (variant, list) in variants.iter().zip(found) {
         for mut problem in list {
             let k = key(&problem);
-            if shared.contains(&k) {
+            if presence.get(&k) == Some(&variants.len()) {
                 if reported.insert(k) {
                     problems.push(problem);
                 }
@@ -151,7 +201,8 @@ fn source_position(kept: &[(usize, &str)], marker: &Marker) -> (usize, usize) {
     (line, marker.col() + 1)
 }
 
-fn check_variant(kept: &[(usize, &str)]) -> Vec<Problem> {
+/// Problems of one variant; `true` — schema problems were cut at `VARIANT_PROBLEMS`.
+fn check_variant(kept: &[(usize, &str)]) -> (Vec<Problem>, bool) {
     let mut problems = Vec::new();
     if !kept.iter().any(|(_, line)| *line == "proxies:") {
         problems.push(problem(1, 1, "error", "proxies",
@@ -166,8 +217,9 @@ fn check_variant(kept: &[(usize, &str)]) -> Vec<Problem> {
         Ok(documents) => documents,
         Err(error) => {
             let (line, column) = source_position(kept, error.marker());
-            problems.push(problem(line, column, "error", "yaml", format!("Ошибка YAML: {}.", error.info())));
-            return problems;
+            let message: String = format!("Ошибка YAML: {}.", error.info()).chars().take(MESSAGE_CHARS).collect();
+            problems.push(problem(line, column, "error", "yaml", message));
+            return (problems, false);
         }
     };
     let root = documents.first();
@@ -175,14 +227,82 @@ fn check_variant(kept: &[(usize, &str)]) -> Vec<Problem> {
     if let Some(proxies) = instance.get_mut("proxies") && proxies.is_null() {
         *proxies = Value::Array(Vec::new());
     }
-    for error in VALIDATOR.iter_errors(&instance) {
+    let mut errors = VALIDATOR.iter_errors(&instance);
+    for error in errors.by_ref().take(VARIANT_PROBLEMS) {
         let path = error.instance_path().as_str().to_owned();
         let marker = root.map_or_else(Marker::default, |root| locate(root, &path));
         let (line, column) = source_position(kept, &marker);
-        let message: String = error.to_string().chars().take(MESSAGE_CHARS).collect();
+        let message = schema_message(error.kind(), &path);
         problems.push(Problem { path: Some(path), ..problem(line, column.max(1), "warning", "schema", message) });
     }
-    problems
+    let capped = errors.next().is_some();
+    (problems, capped)
+}
+
+/// A Russian schema message from the error kind and the JSON pointer; the
+/// checked value itself is never quoted (a template may hold secrets).
+fn schema_message(kind: &ValidationErrorKind, path: &str) -> String {
+    let place = if path.is_empty() {
+        "Конфиг".to_owned()
+    } else {
+        format!("«{}»", path[1..].replace("~1", "/").replace("~0", "~"))
+    };
+    let what = match kind {
+        ValidationErrorKind::Type { kind } => format!("ожидается {}", match kind {
+            TypeKind::Single(single) => type_name(*single).to_owned(),
+            TypeKind::Multiple(set) => set.iter().map(type_name).collect::<Vec<_>>().join(" или "),
+        }),
+        ValidationErrorKind::Enum { options } => format!("допустимые значения: {}", values(options)),
+        ValidationErrorKind::Constant { expected_value } => format!("ожидается {}", values(expected_value)),
+        ValidationErrorKind::Required { property } => format!("нет обязательного ключа «{}»", property.as_str().unwrap_or("?")),
+        ValidationErrorKind::AdditionalProperties { unexpected } | ValidationErrorKind::UnevaluatedProperties { unexpected } =>
+            format!("неизвестные ключи: {}", unexpected.iter().map(|key| format!("«{key}»")).collect::<Vec<_>>().join(", ")),
+        ValidationErrorKind::AnyOf { .. } | ValidationErrorKind::OneOfNotValid { .. } =>
+            "значение не подходит ни под один допустимый вариант".to_owned(),
+        ValidationErrorKind::OneOfMultipleValid { .. } => "значение подходит сразу под несколько вариантов".to_owned(),
+        ValidationErrorKind::Minimum { limit } => format!("значение меньше {limit}"),
+        ValidationErrorKind::Maximum { limit } => format!("значение больше {limit}"),
+        ValidationErrorKind::ExclusiveMinimum { limit } => format!("значение должно быть больше {limit}"),
+        ValidationErrorKind::ExclusiveMaximum { limit } => format!("значение должно быть меньше {limit}"),
+        ValidationErrorKind::MinLength { limit } => format!("строка короче {limit} символов"),
+        ValidationErrorKind::MaxLength { limit } => format!("строка длиннее {limit} символов"),
+        ValidationErrorKind::MinItems { limit } => format!("в списке меньше {limit} элементов"),
+        ValidationErrorKind::MaxItems { limit } => format!("в списке больше {limit} элементов"),
+        ValidationErrorKind::MinProperties { limit } => format!("ключей меньше {limit}"),
+        ValidationErrorKind::MaxProperties { limit } => format!("ключей больше {limit}"),
+        ValidationErrorKind::Pattern { .. } | ValidationErrorKind::Format { .. } => "значение не соответствует формату".to_owned(),
+        ValidationErrorKind::UniqueItems => "элементы списка повторяются".to_owned(),
+        ValidationErrorKind::PropertyNames { .. } => "недопустимое имя ключа".to_owned(),
+        ValidationErrorKind::FalseSchema => "ключ не допускается".to_owned(),
+        _ => "значение не соответствует схеме mihomo".to_owned(),
+    };
+    format!("{place}: {what}.").chars().take(MESSAGE_CHARS).collect()
+}
+
+fn type_name(kind: JsonType) -> &'static str {
+    match kind {
+        JsonType::Null => "пустое значение",
+        JsonType::Boolean => "true или false",
+        JsonType::Integer => "целое число",
+        JsonType::Number => "число",
+        JsonType::String => "строка",
+        JsonType::Array => "список",
+        JsonType::Object => "словарь",
+    }
+}
+
+/// Allowed schema values (not the checked ones): at most eight.
+fn values(value: &Value) -> String {
+    const SHOWN: usize = 8;
+    let shown = |value: &Value| value.as_str().map_or_else(|| value.to_string(), |text| format!("«{text}»"));
+    match value {
+        Value::Array(items) => {
+            let mut text = items.iter().take(SHOWN).map(shown).collect::<Vec<_>>().join(", ");
+            if items.len() > SHOWN { text.push_str(", …"); }
+            text
+        }
+        other => shown(other),
+    }
 }
 
 fn untagged<'a, 'n>(mut node: &'a MarkedYaml<'n>) -> &'a MarkedYaml<'n> {
@@ -282,7 +402,8 @@ fn locate(root: &MarkedYaml<'_>, pointer: &str) -> Marker {
     node.span.start
 }
 
-/// `template check (--name T | --file PATH)`: read-only.
+/// `template check [--name T] [--file PATH]`: read-only. At least one is
+/// given; with both the file content is checked and the name labels it.
 pub fn command(session: &mut Session, invocation: &Invocation, input: &Input) -> Result<Value> {
     let name = invocation.value("name").filter(|name| !name.is_empty()).map(file_name);
     let stored;
@@ -371,11 +492,61 @@ mod tests {
     fn markers_unclosed_and_unknown_groups() {
         let report = check("proxies:\n# --- GHOST/PC ---\nx: 1\n# --- GHOST/PC ---\n# --- ROUTER ---\ny: 2\n", &groups());
         assert_eq!(codes(&report), [(2, "marker_unknown_group", None), (5, "marker_unclosed", None)]);
-        assert_eq!(report.problems[0].message, "Маркер GHOST: группы с таким именем нет.");
-        assert_eq!(report.problems[1].message, "Блок маркера ROUTER не закрыт.");
+        assert_eq!(report.problems[0].message, "Маркер «GHOST»: группы с таким именем нет.");
         assert_eq!((report.errors, report.warnings), (1, 1));
+        // A tag without a group is never generated: no variant for it.
         let tags: Vec<_> = report.variants.iter().map(|v| v.tag.as_deref()).collect();
-        assert_eq!(tags, [None, Some("GHOST"), Some("PC"), Some("ROUTER")]);
+        assert_eq!(tags, [None, Some("PC"), Some("ROUTER")]);
+    }
+
+    #[test]
+    fn empty_tag_segments_are_invalid_and_never_a_variant() {
+        for marker in ["PC//X", "PC/", "/PC"] {
+            let content = format!("proxies:\n# --- {marker} ---\nmode: [\n# --- {marker} ---\n");
+            let report = check(&content, &groups());
+            let tags: Vec<_> = report.variants.iter().map(|v| v.tag.as_deref()).collect();
+            assert_eq!(tags, [None, Some("PC")], "{marker}");
+            // The variant without groups drops the block like any other.
+            assert_eq!(report.variants[0].dropped, [(2, 4)], "{marker}");
+            assert!(codes(&report).contains(&(2, "marker_invalid", None)), "{marker}: {:?}", report.problems);
+            assert!(codes(&report).contains(&(3, "yaml", Some("PC"))), "{marker}: {:?}", report.problems);
+        }
+    }
+
+    #[test]
+    fn a_problem_of_several_variants_counts_once() {
+        let report = check("proxies:\n# --- PC/MOBILE ---\nmode: [\n# --- PC/MOBILE ---\n", &groups());
+        assert_eq!(codes(&report), [(3, "yaml", Some("PC")), (3, "yaml", Some("MOBILE"))]);
+        assert_eq!((report.errors, report.warnings), (1, 0));
+    }
+
+    #[test]
+    fn variants_are_limited() {
+        let groups: Vec<String> = (0..100).map(|i| format!("G{i}")).collect();
+        let content: String = std::iter::once("proxies:\n".to_owned())
+            .chain(groups.iter().map(|g| format!("# --- {g} ---\nx{g}: 1\n# --- {g} ---\n"))).collect();
+        let report = check(&content, &groups);
+        assert_eq!(report.variants.len(), MAX_VARIANTS);
+        assert_eq!(codes(&report).iter().filter(|(_, code, _)| *code == "variants_limit").count(), 1);
+    }
+
+    #[test]
+    fn schema_messages_name_the_rule_not_the_value() {
+        let secret = "s3cr3t-value";
+        let content = format!("proxies:\nmode: {secret}\nallow-lan: {secret}\nproxy-groups:\n  - name: g\n    type: {secret}\n");
+        let report = check(&content, &groups());
+        assert_eq!(report.problems.len(), 3, "{:?}", report.problems);
+        assert!(report.problems.iter().all(|p| p.code == "schema" && !p.message.contains(secret)), "{:?}", report.problems);
+        assert!(report.problems.iter().all(|p| p.message.starts_with(&format!("«{}»", &p.path.as_deref().unwrap()[1..]))));
+    }
+
+    #[test]
+    fn many_schema_problems_are_capped_per_variant() {
+        let content: String = std::iter::once("proxies:\nproxy-groups:\n".to_owned())
+            .chain((0..VARIANT_PROBLEMS + 5).map(|i| format!("  - {{name: g{i}, type: bogus}}\n"))).collect();
+        let report = check(&content, &groups());
+        assert!(report.truncated);
+        assert_eq!((report.problems.len(), report.warnings), (LIMIT, VARIANT_PROBLEMS));
     }
 
     #[test]
@@ -419,6 +590,9 @@ mod tests {
         let usage = command(&mut session, &invocation(&["template", "check"]), &Input::default()).unwrap_err();
         assert_eq!((usage.code, usage.message.as_str()), ("usage", "Укажите шаблон: --name T или --file PATH."));
         assert_eq!(command(&mut session, &invocation(&["template", "check", "--name", "ghost"]), &Input::default()).unwrap_err().code, "not_found");
+        // With both, the input is checked and the name only labels the result.
+        let both = command(&mut session, &invocation(&["template", "check", "--name", "default"]), &input).unwrap();
+        assert_eq!((both["name"].clone(), both["errors"].clone()), (json!("default.yaml"), json!(1)));
         assert_eq!(fingerprint(root.path()), before);
     }
 }

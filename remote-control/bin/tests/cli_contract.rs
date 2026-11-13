@@ -1077,7 +1077,7 @@ fn template_import_reads_the_file_in_the_client() {
     let path = file.to_str().unwrap();
     let planned = run_json(BIN, &env, &["template", "import", "--name", "t1", "--file", path], None);
     let plan = assert_error(&planned, "confirmation_required", 2);
-    assert_eq!(plan["error"]["plan"], json!(["Шаблон t1.yaml будет перезаписан."]));
+    assert_eq!(plan["error"]["plan"], json!(["Шаблон «t1.yaml» будет перезаписан."]));
     let imported = run_json(BIN, &env, &["template", "import", "--name", "t1", "--file", path, "--yes"], None);
     assert_eq!(assert_ok(&imported)["data"], json!({"name": "t1.yaml"}));
     let journal = fs::read_to_string(env.ctx().endpoint().log).unwrap_or_default();
@@ -1129,7 +1129,7 @@ fn template_groups_and_delete_go_through_confirmation() {
     assert_ok(&run_json(BIN, &env, &["source", "init-local"], None));
     assert_ok(&run_json(BIN, &env, &["template", "create", "--name", "y"], None));
     let planned = run_json(BIN, &env, &["template", "groups", "--name", "y", "--group", "PC"], None);
-    assert_eq!(assert_error(&planned, "confirmation_required", 2)["error"]["plan"], json!(["Группа PC: шаблон — y.yaml"]));
+    assert_eq!(assert_error(&planned, "confirmation_required", 2)["error"]["plan"], json!(["Группа «PC»: шаблон — «y.yaml»"]));
     let assigned = assert_ok(&run_json(BIN, &env, &["template", "groups", "--name", "y", "--group", "PC", "--yes"], None));
     assert_eq!(assigned["data"], json!({"name": "y.yaml", "assigned": ["PC"], "reset": []}));
     let groups = assert_ok(&run_json(BIN, &env, &["group", "list"], None));

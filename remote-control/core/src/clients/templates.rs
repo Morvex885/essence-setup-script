@@ -257,77 +257,114 @@ pub fn show(session: &mut Session, invocation: &Invocation) -> Result<Value> {
         "path": path, "content": template.content}))
 }
 
+/// Plan of `template delete` from the current state: the plan and the groups
+/// that fall back to `default.yaml`.
+fn delete_plan(state: &State, name: &str) -> Result<(Plan, Vec<String>)> {
+    let shadow = builtin(name).is_some();
+    if !custom_exists(state, name)? {
+        return Err(if shadow {
+            RcError::new("invalid", format!("Встроенный шаблон «{name}» удалить нельзя.")).with_extra("name", name)
+        } else {
+            not_found(name)
+        });
+    }
+    let groups = if shadow { Vec::new() } else { groups_using(&state.load_config()?, name) };
+    let mut lines = vec![if shadow {
+        format!("Пользовательский шаблон «{name}» будет удалён; останется встроенный «{name}».")
+    } else {
+        format!("Шаблон «{name}» будет удалён.")
+    }];
+    lines.extend(groups.iter().map(|group| format!("Группа «{group}»: шаблон — «{DEFAULT}»")));
+    Ok((Plan::new(lines, String::new()), groups))
+}
+
 /// Removes a custom template. A custom file shadowing a built-in reverts to
 /// the built-in (groups keep the name); otherwise its groups fall back to
 /// `default.yaml`.
 pub fn delete(session: &mut Session, invocation: &Invocation) -> Result<Value> {
     let name = file_name(required(invocation, "name")?);
     if !v::template_filename_valid(&name) { return Err(name_invalid()); }
-    let shadow = builtin(&name).is_some();
-    if !custom_exists(&session.state, &name)? {
-        return Err(if shadow {
-            RcError::new("invalid", format!("Встроенный шаблон «{name}» удалить нельзя.")).with_extra("name", name.clone())
-        } else {
-            not_found(&name)
-        });
-    }
-    let groups = if shadow { Vec::new() } else { groups_using(&session.state.load_config()?, &name) };
-    let mut lines = vec![if shadow {
-        format!("Пользовательский шаблон {name} будет удалён; останется встроенный {name}.")
-    } else {
-        format!("Шаблон {name} будет удалён.")
-    }];
-    lines.extend(groups.iter().map(|group| format!("Группа {group}: шаблон — {DEFAULT}")));
-    Plan::new(lines, String::new()).confirm(invocation)?;
-    session.mutate("template_delete", |state| {
-        if !groups.is_empty() {
-            let mut config = state.load_config()?;
-            config.groups.iter_mut().filter(|g| groups.contains(&g.name)).for_each(|g| g.template = DEFAULT.to_owned());
-            state.save_config(&config)?;
-        }
-        fs::remove_file(custom_path(state, &name))
-            .map_err(|_| RcError::new("failed", format!("Не удалось удалить шаблон {name}.")))
-    })?;
-    session.log(Level::Success, &format!("Шаблон {name} удалён"));
-    Ok(json!({"name": name, "groups": groups, "builtin": shadow}))
+    let (plan, _) = delete_plan(&session.state, &name)?;
+    plan.confirm(invocation)?;
+    let groups = session.mutate("template_delete", |state| delete_planned(state, &name, &plan, invocation))?;
+    session.log(Level::Success, &format!("Шаблон «{name}» удалён"));
+    Ok(json!({"name": name, "groups": groups, "builtin": builtin(&name).is_some()}))
 }
 
-/// Sets the groups of a template: listed groups get it, its other groups
-/// fall back to `default.yaml` (nothing falls back from `default.yaml` itself).
-pub fn groups(session: &mut Session, invocation: &Invocation) -> Result<Value> {
-    let name = file_name(required(invocation, "name")?);
-    require(&session.state, &name)?;
-    let listed = super::unique_values(invocation, "group");
-    let config = session.state.load_config()?;
-    for group in &listed {
+/// The confirmed deletion under the mutation lock: the plan is rebuilt from
+/// the state and must not have changed. A failure leaves the configuration
+/// and the file as they were (or reports `partial`).
+fn delete_planned(state: &State, name: &str, planned: &Plan, invocation: &Invocation) -> Result<Vec<String>> {
+    let (plan, groups) = delete_plan(state, name)?;
+    if plan.lines != planned.lines { return Err(plan.changed(invocation)); }
+    let previous = if groups.is_empty() { None } else { Some(state.load_config()?) };
+    if let Some(previous) = &previous {
+        let mut config = previous.clone();
+        config.groups.iter_mut().filter(|g| groups.contains(&g.name)).for_each(|g| g.template = DEFAULT.to_owned());
+        state.save_config(&config)?;
+    }
+    if let Err(error) = fs::remove_file(custom_path(state, name)) {
+        if let Some(previous) = &previous && let Err(restore) = state.save_config(previous) {
+            return Err(RcError::new("partial", format!(
+                "Не удалось удалить шаблон «{name}»: {error}; группы уже переведены на «{DEFAULT}», вернуть их не удалось: {}",
+                restore.message)));
+        }
+        return Err(RcError::new("failed", format!("Не удалось удалить шаблон «{name}»: {error}")));
+    }
+    Ok(groups)
+}
+
+/// Plan of `template groups` from the current state: the plan, the listed
+/// groups that get the template and its unlisted groups that fall back to
+/// `default.yaml` (nothing falls back from `default.yaml` itself).
+fn groups_plan(state: &State, name: &str, listed: &[String]) -> Result<(Plan, Vec<String>, Vec<String>)> {
+    require(state, name)?;
+    let config = state.load_config()?;
+    for group in listed {
         super::find_group(&config, group)?;
     }
     let assigned: Vec<String> = listed.iter().filter(|g| group_template(&config, g) != name).cloned().collect();
     let reset: Vec<String> = if name == DEFAULT {
         Vec::new()
     } else {
-        groups_using(&config, &name).into_iter().filter(|g| !listed.contains(g)).collect()
+        groups_using(&config, name).into_iter().filter(|g| !listed.contains(g)).collect()
     };
-    if assigned.is_empty() && reset.is_empty() {
+    let lines = assigned.iter().map(|g| format!("Группа «{g}»: шаблон — «{name}»"))
+        .chain(reset.iter().map(|g| format!("Группа «{g}»: шаблон — «{DEFAULT}»")))
+        .collect();
+    Ok((Plan::new(lines, String::new()), assigned, reset))
+}
+
+/// Sets the groups of a template: listed groups get it, its other groups
+/// fall back to `default.yaml` (nothing falls back from `default.yaml` itself).
+pub fn groups(session: &mut Session, invocation: &Invocation) -> Result<Value> {
+    let name = file_name(required(invocation, "name")?);
+    if !v::template_filename_valid(&name) { return Err(name_invalid()); }
+    let listed = super::unique_values(invocation, "group");
+    let (plan, assigned, reset) = groups_plan(&session.state, &name, &listed)?;
+    if plan.lines.is_empty() {
         return Ok(json!({"name": name, "assigned": [], "reset": []}));
     }
-    let lines = assigned.iter().map(|g| format!("Группа {g}: шаблон — {name}"))
-        .chain(reset.iter().map(|g| format!("Группа {g}: шаблон — {DEFAULT}")))
-        .collect();
-    Plan::new(lines, String::new()).confirm(invocation)?;
-    session.mutate("template_groups", |state| {
-        let mut config = state.load_config()?;
-        for group in &mut config.groups {
-            if assigned.contains(&group.name) {
-                group.template = name.clone();
-            } else if reset.contains(&group.name) {
-                group.template = DEFAULT.to_owned();
-            }
-        }
-        state.save_config(&config)
-    })?;
-    session.log(Level::Success, &format!("Шаблон {name}: группы обновлены"));
+    plan.confirm(invocation)?;
+    session.mutate("template_groups", |state| groups_planned(state, &name, &listed, &plan, invocation))?;
+    session.log(Level::Success, &format!("Шаблон «{name}»: группы обновлены"));
     Ok(json!({"name": name, "assigned": assigned, "reset": reset}))
+}
+
+/// The confirmed assignment under the mutation lock: the plan is rebuilt
+/// from the state and must not have changed.
+fn groups_planned(state: &State, name: &str, listed: &[String], planned: &Plan, invocation: &Invocation) -> Result<()> {
+    let (plan, assigned, reset) = groups_plan(state, name, listed)?;
+    if plan.lines != planned.lines { return Err(plan.changed(invocation)); }
+    let mut config = state.load_config()?;
+    for group in &mut config.groups {
+        if assigned.contains(&group.name) {
+            group.template = name.to_owned();
+        } else if reset.contains(&group.name) {
+            group.template = DEFAULT.to_owned();
+        }
+    }
+    state.save_config(&config)
 }
 
 pub fn create(session: &mut Session, invocation: &Invocation) -> Result<Value> {
@@ -357,7 +394,7 @@ pub fn create(session: &mut Session, invocation: &Invocation) -> Result<Value> {
         });
         if let Err(error) = written {
             let _ = fs::remove_file(&path);
-            return Err(RcError::new("failed", format!("Не удалось создать шаблон {name}: {error}")));
+            return Err(RcError::new("failed", format!("Не удалось создать шаблон «{name}»: {error}")));
         }
         if group.is_some() && let Err(error) = state.save_config(&config) {
             let _ = fs::remove_file(&path);
@@ -365,7 +402,7 @@ pub fn create(session: &mut Session, invocation: &Invocation) -> Result<Value> {
         }
         Ok(json!({"name": name, "based_on": base, "group": group}))
     })?;
-    session.log(Level::Success, &format!("Шаблон {name} создан"));
+    session.log(Level::Success, &format!("Шаблон «{name}» создан"));
     Ok(data)
 }
 
@@ -378,7 +415,7 @@ pub fn import(session: &mut Session, invocation: &Invocation, input: &Input) -> 
     let content = input.get("file").ok_or_else(|| RcError::new("usage", "Передайте содержимое полем input.file."))?;
     let mut lines = Vec::new();
     if custom_exists(&session.state, &name)? {
-        lines.push(format!("Шаблон {name} будет перезаписан."));
+        lines.push(format!("Шаблон «{name}» будет перезаписан."));
     }
     let group_names: Vec<String> = session.state.load_config()?.groups.into_iter().map(|g| g.name).collect();
     lines.extend(problem_lines(&super::template_check::check(content, &group_names)));
@@ -389,21 +426,25 @@ pub fn import(session: &mut Session, invocation: &Invocation, input: &Input) -> 
     session.mutate("template_import", |state| {
         secure_fs::create_dir_all(state.paths().templates())?;
         secure_fs::atomic_write(&custom_path(state, &name), content.as_bytes())
-            .map_err(|_| RcError::new("failed", format!("Не удалось сохранить шаблон {name}.")))
+            .map_err(|error| RcError::new("failed", format!("Не удалось сохранить шаблон «{name}»: {error}")))
     })?;
-    session.log(Level::Success, &format!("Шаблон {name} импортирован"));
+    session.log(Level::Success, &format!("Шаблон «{name}» импортирован"));
     Ok(json!({"name": name}))
 }
 
-/// Plan lines of `template import` for the problems of a template.
+/// Plan lines of `template import` for the problems of a template: a problem
+/// of several variants is shown once.
 fn problem_lines(report: &super::template_check::Report) -> Vec<String> {
     const SHOWN: usize = 10;
     let total = report.errors + report.warnings;
     if total == 0 { return Vec::new(); }
     let mut lines = vec![format!("Проблемы шаблона: ошибок — {}, предупреждений — {}.", report.errors, report.warnings)];
-    lines.extend(report.problems.iter().take(SHOWN).map(|p| format!("  строка {}: {}", p.line, p.message)));
-    if total > SHOWN {
-        lines.push(format!("  … ещё {}", total - SHOWN));
+    let mut seen = std::collections::HashSet::new();
+    let distinct = report.problems.iter().filter(|p| seen.insert((p.line, p.column, p.code, p.message.as_str())));
+    lines.extend(distinct.take(SHOWN).map(|p| format!("  строка {}: {}", p.line, p.message)));
+    let shown = lines.len() - 1;
+    if total > shown {
+        lines.push(format!("  … ещё {}", total - shown));
     }
     lines
 }
@@ -586,11 +627,11 @@ mod tests {
             json!({"name": "lab.yaml"}));
         let stored = session.state.paths().templates().join("lab.yaml");
         assert_eq!(fs::read_to_string(&stored).unwrap(), first);
-        assert_eq!(journal.borrow().last().unwrap().1, "Шаблон lab.yaml импортирован");
+        assert_eq!(journal.borrow().last().unwrap().1, "Шаблон «lab.yaml» импортирован");
         let before = fingerprint(root.path());
         let error = import_text(&mut session, &["template", "import", "--name", "lab"], Some(&second)).unwrap_err();
         assert_eq!(error.code, "confirmation_required");
-        assert_eq!(error.extra["plan"], json!(["Шаблон lab.yaml будет перезаписан."]));
+        assert_eq!(error.extra["plan"], json!(["Шаблон «lab.yaml» будет перезаписан."]));
         for (argv, content, code) in [
             (&["template", "import", "--name", "../x"][..], Some("x"), "invalid"),
             (&["template", "import", "--name", "a b"], Some("x"), "invalid"),
@@ -627,7 +668,7 @@ mod tests {
         assert_eq!(error.extra["plan"], json!([
             "Проблемы шаблона: ошибок — 1, предупреждений — 1.",
             "  строка 1: Нет строки «proxies:» — конфиг клиента не будет сгенерирован.",
-            "  строка 2: Маркер GHOST: группы с таким именем нет.",
+            "  строка 2: Маркер «GHOST»: группы с таким именем нет.",
         ]));
         assert_eq!(fingerprint(root.path()), before);
         let many: String = (0..12).map(|i| format!("# --- G{i} ---\n# --- G{i} ---\n")).collect();
@@ -654,13 +695,13 @@ mod tests {
         let planned = run(&mut session, &["template", "delete", "--name", "lab"]).unwrap_err();
         assert_eq!(planned.code, "confirmation_required");
         assert_eq!(planned.extra["plan"], json!([
-            "Шаблон lab.yaml будет удалён.", "Группа PC: шаблон — default.yaml", "Группа MOBILE: шаблон — default.yaml"]));
+            "Шаблон «lab.yaml» будет удалён.", "Группа «PC»: шаблон — «default.yaml»", "Группа «MOBILE»: шаблон — «default.yaml»"]));
         assert_eq!(fingerprint(root.path()), before);
         assert_eq!(run(&mut session, &["template", "delete", "--name", "lab", "--yes"]).unwrap(),
             json!({"name": "lab.yaml", "groups": ["PC", "MOBILE"], "builtin": false}));
         assert!(!path.exists());
         assert!(templates_of(&session).iter().all(|(_, template)| template == DEFAULT));
-        assert_eq!(journal.borrow().last().unwrap().1, "Шаблон lab.yaml удалён");
+        assert_eq!(journal.borrow().last().unwrap().1, "Шаблон «lab.yaml» удалён");
 
         let before = fingerprint(root.path());
         let builtin_error = run(&mut session, &["template", "delete", "--name", "default", "--yes"]).unwrap_err();
@@ -683,7 +724,7 @@ mod tests {
         let groups = templates_of(&session);
         let planned = run(&mut session, &["template", "delete", "--name", "default.yaml"]).unwrap_err();
         assert_eq!(planned.extra["plan"],
-            json!(["Пользовательский шаблон default.yaml будет удалён; останется встроенный default.yaml."]));
+            json!(["Пользовательский шаблон «default.yaml» будет удалён; останется встроенный «default.yaml»."]));
         assert_eq!(run(&mut session, &["template", "delete", "--name", "default.yaml", "--yes"]).unwrap(),
             json!({"name": "default.yaml", "groups": [], "builtin": true}));
         assert!(!path.exists());
@@ -703,11 +744,12 @@ mod tests {
         let planned = run(&mut session, &["template", "groups", "--name", "lab", "--group", "PC", "--group", "MOBILE", "--group", "PC"]).unwrap_err();
         assert_eq!(planned.code, "confirmation_required");
         assert_eq!(planned.extra["plan"], json!([
-            "Группа PC: шаблон — lab.yaml", "Группа MOBILE: шаблон — lab.yaml", "Группа ROUTER: шаблон — default.yaml"]));
+            "Группа «PC»: шаблон — «lab.yaml»", "Группа «MOBILE»: шаблон — «lab.yaml»", "Группа «ROUTER»: шаблон — «default.yaml»"]));
         assert_eq!(fingerprint(root.path()), before);
         for (argv, code) in [
             (&["template", "groups", "--name", "lab", "--group", "NOPE", "--yes"][..], "not_found"),
             (&["template", "groups", "--name", "ghost", "--group", "PC", "--yes"], "not_found"),
+            (&["template", "groups", "--name", "../x", "--group", "PC", "--yes"], "invalid"),
             (&["template", "groups", "--group", "PC"], "usage"),
         ] {
             assert_eq!(run(&mut session, argv).unwrap_err().code, code, "{argv:?}");
@@ -716,7 +758,7 @@ mod tests {
         assert_eq!(run(&mut session, &["template", "groups", "--name", "lab", "--group", "PC", "--group", "MOBILE", "--yes"]).unwrap(),
             json!({"name": "lab.yaml", "assigned": ["PC", "MOBILE"], "reset": ["ROUTER"]}));
         assert_eq!(templates_of(&session), [("ROUTER".into(), DEFAULT.into()), ("PC".into(), "lab.yaml".into()), ("MOBILE".into(), "lab.yaml".into())]);
-        assert_eq!(journal.borrow().last().unwrap().1, "Шаблон lab.yaml: группы обновлены");
+        assert_eq!(journal.borrow().last().unwrap().1, "Шаблон «lab.yaml»: группы обновлены");
 
         // Nothing to change: no plan, no write.
         let before = fingerprint(root.path());
@@ -730,6 +772,58 @@ mod tests {
         assert_eq!(run(&mut session, &["template", "groups", "--name", "lab", "--yes"]).unwrap(),
             json!({"name": "lab.yaml", "assigned": [], "reset": ["PC", "MOBILE"]}));
         assert!(templates_of(&session).iter().all(|(_, template)| template == DEFAULT));
+    }
+
+    #[test]
+    fn delete_failure_leaves_the_configuration_and_the_file() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut session, _) = session(root.path());
+        // A directory in place of the file: the plan sees it, remove_file fails.
+        let path = session.state.paths().templates().join("lab.yaml");
+        fs::create_dir_all(&path).unwrap();
+        let mut config = session.state.load_config().unwrap();
+        config.groups[1].template = "lab.yaml".into();
+        session.state.save_config(&config).unwrap();
+        let before = fingerprint(root.path());
+        let error = run(&mut session, &["template", "delete", "--name", "lab", "--yes"]).unwrap_err();
+        assert_eq!(error.code, "failed");
+        assert!(error.message.len() > "Не удалось удалить шаблон «lab.yaml»: ".len(), "the io error is reported: {}", error.message);
+        assert_eq!(fingerprint(root.path()), before);
+        assert!(path.is_dir());
+        assert_eq!(templates_of(&session)[1].1, "lab.yaml");
+    }
+
+    #[test]
+    fn delete_and_groups_recheck_the_plan_under_the_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut session, _) = session(root.path());
+        let path = custom(&session, "lab.yaml", "proxies:\n");
+        let delete = invocation(&["template", "delete", "--name", "lab", "--yes"]);
+        let (planned, _) = delete_plan(&session.state, "lab.yaml").unwrap();
+        // A group switches to the template between the plan and the mutation.
+        let mut config = session.state.load_config().unwrap();
+        config.groups[0].template = "lab.yaml".into();
+        session.state.save_config(&config).unwrap();
+        let before = fingerprint(root.path());
+        let changed = session.mutate("t", |state| delete_planned(state, "lab.yaml", &planned, &delete)).unwrap_err();
+        assert_eq!(changed.code, "plan_changed");
+        assert_eq!(changed.extra["plan"].as_array().unwrap().len(), 2, "the current plan: the file and one group");
+        assert!(changed.extra["plan_token"].is_string());
+        assert_eq!(fingerprint(root.path()), before);
+        assert!(path.exists());
+
+        let listed = ["PC".to_owned()];
+        let assign = invocation(&["template", "groups", "--name", "lab", "--group", "PC", "--yes"]);
+        let (planned, ..) = groups_plan(&session.state, "lab.yaml", &listed).unwrap();
+        assert_eq!(planned.lines.len(), 2, "PC gets it, ROUTER falls back");
+        let mut config = session.state.load_config().unwrap();
+        config.groups[0].template = DEFAULT.into();
+        session.state.save_config(&config).unwrap();
+        let before = fingerprint(root.path());
+        let changed = session.mutate("t", |state| groups_planned(state, "lab.yaml", &listed, &planned, &assign)).unwrap_err();
+        assert_eq!(changed.code, "plan_changed");
+        assert_eq!(changed.extra["plan"].as_array().unwrap().len(), 1, "only PC is left in the current plan");
+        assert_eq!(fingerprint(root.path()), before);
     }
 
     #[test]
