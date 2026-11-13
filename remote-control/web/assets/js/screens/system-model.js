@@ -51,9 +51,11 @@ export async function passwordForm(ctx, title, { current = false, currentLabel =
 /**
  * «Требует внимания» на сводке из `status` и `hello`: `[{ id, tone, text,
  * action }]`; `action` — `{ label, type: 'password'|'ssh-setup'|'route',
- * node?, route? }` (экран выполняет действие по `type`).
+ * node?, route?, param?, tab? }` (экран выполняет действие по `type`).
+ * Третий аргумент — ответы `group list` и `node list` (`null`, если не
+ * прочитаны): группы без нод и ноды, чьи подключения не назначены ни одной группе.
  */
-export function attentionItems(status, hello) {
+export function attentionItems(status, hello, { groups = null, nodes = null } = {}) {
   const data = status && typeof status === 'object' ? status : {};
   const items = [];
   for (const node of strings(data.password_missing)) {
@@ -95,6 +97,35 @@ export function attentionItems(status, hello) {
       id: 'open-panel', tone: 'warn', text: OPEN_PANEL_WARNING,
       action: { label: 'Настройки', type: 'route', route: 'settings' },
     });
+  }
+  if (Array.isArray(groups)) {
+    const nodeNames = Array.isArray(nodes) ? nodes.map((node) => str(node && node.name)).filter(Boolean) : [];
+    for (const group of groups) {
+      const name = str(group && group.name);
+      if (!name || strings(group.nodes).length > 0) continue;
+      const clients = Number.isInteger(group.clients) ? group.clients : 0;
+      // Назначение — на вкладке подключений ноды; единственная нода открывается сразу.
+      const only = nodeNames.length === 1 ? nodeNames[0] : null;
+      items.push({
+        id: `group-nodes:${name}`, tone: clients > 0 ? 'warn' : 'info',
+        text: clients > 0
+          ? `Группа «${name}»: нет нод — клиенты группы (${clients}) получат конфиг без подключений`
+          : `Группа «${name}»: нет нод`,
+        action: only
+          ? { label: 'Назначить подключения', type: 'route', route: 'nodes', param: only, tab: 'connections' }
+          : { label: 'Ноды', type: 'route', route: 'nodes' },
+      });
+    }
+    if (Array.isArray(nodes)) {
+      const used = new Set(groups.flatMap((group) => strings(group && group.nodes)));
+      for (const name of nodeNames) {
+        if (used.has(name)) continue;
+        items.push({
+          id: `node-groups:${name}`, tone: 'info', text: `Нода «${name}»: подключения не назначены ни одной группе`,
+          action: { label: 'Назначить подключения', type: 'route', route: 'nodes', param: name, tab: 'connections' },
+        });
+      }
+    }
   }
   return items;
 }

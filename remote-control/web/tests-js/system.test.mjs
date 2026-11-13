@@ -95,6 +95,28 @@ test('сводка: «Требует внимания» из status и hello', (
   assert.deepEqual(attentionItems(null, null).map((item) => item.id), ['subscription-host']);
 });
 
+test('сводка: группы без нод и ноды без назначенных подключений', () => {
+  const calm = { source: { type: 'local' }, subscription_host: 'de' };
+  const groups = [
+    { name: 'PC', clients: 2, nodes: [] },
+    { name: 'EMPTY', clients: 0, nodes: [] },
+    { name: 'ROUTER', clients: 1, nodes: ['de'] },
+  ];
+  const nodes = [{ name: 'de' }, { name: 'nl' }];
+  const items = attentionItems(calm, null, { groups, nodes });
+  assert.deepEqual(items.map((item) => [item.id, item.tone]), [
+    ['group-nodes:PC', 'warn'], ['group-nodes:EMPTY', 'info'], ['node-groups:nl', 'info'],
+  ]);
+  // Нода без назначений ведёт на свою вкладку подключений.
+  assert.deepEqual(items[2].action, { label: items[2].action.label, type: 'route', route: 'nodes', param: 'nl', tab: 'connections' });
+  // Единственная нода — группа без нод сразу ведёт к её подключениям.
+  const single = attentionItems(calm, null, { groups: [{ name: 'PC', clients: 1, nodes: [] }], nodes: [{ name: 'de' }] });
+  assert.deepEqual([single[0].action.param, single[0].action.tab], ['de', 'connections']);
+  // Списки не прочитаны — пунктов нет.
+  assert.deepEqual(attentionItems(calm, null, { groups: null, nodes }), []);
+  assert.deepEqual(attentionItems(calm, null, { groups: [{ name: 'PC', clients: 0, nodes: ['de'] }], nodes: null }), []);
+});
+
 // ─── Настройки ─────────────────────────────────────────────────────────────
 
 const version = (available) => ok({ current: '1.1.0', latest: available ? 'v1.2.0' : null, update_available: available, checked: available });
