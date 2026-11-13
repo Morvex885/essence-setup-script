@@ -1,13 +1,14 @@
-// Тесты модели вкладок ноды «Подключения», «AmneziaWG» и экрана «Telegram Proxy»
-// (эталон — `#[cfg(test)]` в `remote-control/tui/src/nodes.rs`).
+// Тесты модели обзора подключений, вкладок ноды «Подключения», «AmneziaWG» и
+// экрана «Telegram Proxy» (эталон — `#[cfg(test)]` в `remote-control/tui/src/nodes.rs`).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  EMPTY, nodeText, syncedNode, syncProblem,
+  EMPTY, nodeText, syncedNode, syncProblem, syncData, overviewNodes, syncAll,
   connectionView, assignGroupsTitle, assignArgv, assignConnections, connSyncArgv, connListArgv, nodeCheckArgv,
   awgStatusArgv, awgSyncArgv, awgRemovePeerArgv, awgOrphansArgv, awgView,
   TELEGRAM_BATCH, TELEGRAM_COMPONENTS, TELEGRAM_STATUS_ARGV, telegramArgv, telegramResults,
 } from '../assets/js/screens/nodeops-model.js';
+import { isFailure } from '../assets/js/flows.js';
 
 const ok = (data) => ({ ok: true, data, error: null });
 const err = (code, extra = {}) => ({ ok: false, data: null, error: { code, ...extra } });
@@ -31,6 +32,54 @@ test('syncProblem и syncedNode', () => {
   assert.equal(syncedNode(sync, 'b').name, 'b');
   assert.equal(syncedNode(sync, 'c'), null);
   assert.equal(syncedNode(null, 'a'), null);
+});
+
+test('syncData: data, partial → error, иначе null', () => {
+  assert.deepEqual(syncData(ok({ nodes: [] })), { nodes: [] });
+  assert.equal(syncData(err('partial', { nodes: [1] })).nodes.length, 1);
+  assert.equal(syncData(err('locked')), null);
+});
+
+test('обзор подключений (Connections::run): назначено/всего и тоны как в TUI', () => {
+  const sync = syncData(err('partial', { nodes: [
+    { name: 'a', status: 'synced', discovered: ['p1', 'p2'], removed: [], groups: [], error: null },
+    { name: 'b', status: 'unreachable', discovered: null, removed: [], groups: [], error: 'remote_failed' }] }));
+  const list = [
+    { node: 'a', groups: [{ name: 'PC', proxies: ['p1'] }, { name: 'ALL', proxies: ['p1', 'p2'] }] },
+    { node: 'b', groups: [{ name: 'PC', proxies: ['x'] }] }, { node: 'c', groups: [{ name: 'X', proxies: ['p'] }] }];
+  assert.deepEqual(overviewNodes(list, sync), [
+    { name: 'a', problem: null, groups: [{ name: 'PC', count: '1/2', tone: 'warn' }, { name: 'ALL', count: '2/2', tone: 'ok' }] },
+    { name: 'b', problem: 'недоступна', groups: [] },
+    { name: 'c', problem: null, groups: [{ name: 'X', count: '1/?', tone: 'neutral' }] },
+  ]);
+  assert.deepEqual(overviewNodes([], null), []);
+  // Ноль обнаруженных — нейтральный тон, не «все назначены».
+  const zero = overviewNodes([{ node: 'z', groups: [{ name: 'G', proxies: [] }] }], { nodes: [{ name: 'z', status: 'synced', discovered: [] }] });
+  assert.deepEqual(zero[0].groups, [{ name: 'G', count: '0/0', tone: 'neutral' }]);
+});
+
+/** `ctx` с ответами по порядку (`call`) и счётчиком `failed`. */
+function syncCtx(replies) {
+  const calls = [];
+  const state = { failed: 0 };
+  const ctx = {
+    call: async (...words) => { calls.push(words); return replies.shift(); },
+    failed: () => { state.failed += 1; },
+    isFailure,
+  };
+  return { ctx, calls, state };
+}
+
+test('«Синхронизировать все»: conn sync по всем нодам, затем conn list; сбой — null и итог сбоя', async () => {
+  let s = syncCtx([err('partial', { nodes: [{ name: 'a', status: 'synced', discovered: ['p'] }] }), ok([{ node: 'a', groups: [{ name: 'G', proxies: ['p'] }] }])]);
+  assert.deepEqual(await syncAll(s.ctx), [{ name: 'a', problem: null, groups: [{ name: 'G', count: '1/1', tone: 'ok' }] }]);
+  assert.deepEqual(s.calls, [['conn', 'sync'], ['conn', 'list']]);
+  s = syncCtx([err('locked')]);
+  assert.equal(await syncAll(s.ctx), null);
+  assert.deepEqual([s.calls, s.state.failed], [[['conn', 'sync']], 1]);
+  s = syncCtx([ok({ nodes: [] }), err('locked')]);
+  assert.equal(await syncAll(s.ctx), null);
+  assert.equal(s.state.failed, 1);
 });
 
 test('подключения ноды: группы подключений и проблема синхронизации', () => {
@@ -133,9 +182,9 @@ test('AmneziaWG: argv, состояния клиентов и признаки �
   assert.deepEqual(awgView({ installed: true, peers: [] }).table, []);
 });
 
-test('Telegram: порядок, тоны и argv пакетов', () => {
+test('Telegram: порядок, опасные действия и argv пакетов', () => {
   assert.ok(TELEGRAM_BATCH.every((a) => a.title && Array.isArray(a.argv)));
-  assert.deepEqual(TELEGRAM_BATCH.map((a) => a.tone), ['create', 'change', 'change', 'change', 'change', 'danger', 'danger']);
+  assert.deepEqual(TELEGRAM_BATCH.filter((a) => a.danger).map((a) => a.id), ['remove', 'remove-all']);
   const verbs = TELEGRAM_BATCH.map((a) => a.argv[1]);
   assert.deepEqual(verbs, ['install', 'refresh-ip', 'web-update', 'web-restart', 'backend-restart', 'remove', 'remove-all']);
   for (const action of TELEGRAM_BATCH.filter((a) => !a.component)) {

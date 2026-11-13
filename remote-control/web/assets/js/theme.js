@@ -25,12 +25,6 @@ export function resolve(choice, prefersDark) {
   return dark ? 'essence-dark' : 'essence-light';
 }
 
-/** Следующий выбор кнопки темы: system → light → dark → system. */
-export function nextChoice(choice) {
-  const index = CHOICES.indexOf(choice);
-  return CHOICES[(index + 1) % CHOICES.length];
-}
-
 export function apply(doc, theme) {
   doc.documentElement.dataset.theme = theme;
 }

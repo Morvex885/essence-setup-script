@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  text, joined, versionLabel, syncState, sourceLabel, scriptsState,
+  text, joined, versionLabel, syncState, sourceLabel,
   activity, activityIndicator, openPanel, OPEN_PANEL_WARNING,
   errorMessage, readInputFile, MAX_INPUT, FILE_TOO_LARGE, filterJournal,
 } from '../assets/js/format.js';
@@ -46,14 +46,6 @@ test('sourceLabel: GitHub и локальная', () => {
   const local = sourceLabel({ type: 'local' });
   assert.equal(local.label, 'локальная');
   assert.equal(local.sync, null);
-});
-
-test('scriptsState: состояния скриптов ноды', () => {
-  assert.equal(scriptsState('missing'), 'скрипты отсутствуют');
-  assert.equal(scriptsState('outdated'), 'скрипты устарели');
-  assert.equal(scriptsState('broken'), 'установка повреждена');
-  assert.equal(scriptsState('unknown'), 'версия скриптов неизвестна');
-  assert.equal(scriptsState(''), 'версия скриптов неизвестна');
 });
 
 test('activity: подписи как в app.rs::activity', () => {

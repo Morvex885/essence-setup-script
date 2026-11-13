@@ -83,7 +83,7 @@ export function useMounted() {
 }
 
 /** Кнопка действия: `primary` — главная; `tone: 'danger'` — опасная, иначе обычная. */
-export function Action({ tone = 'view', primary = false, icon = null, disabled = false, onClick, children }) {
+export function Action({ tone = null, primary = false, icon = null, disabled = false, onClick, children }) {
   const kind = primary ? 'primary' : tone === 'danger' ? 'danger' : 'neutral';
   return html`<${Button} kind=${kind} icon=${icon} disabled=${disabled} onClick=${onClick}>${children}<//>`;
 }

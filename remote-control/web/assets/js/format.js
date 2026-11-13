@@ -40,16 +40,6 @@ export function sourceLabel(source) {
   return { label: 'локальная', sync: null };
 }
 
-/** Состояние скриптов на ноде (`nodes.rs::offer_upload`). */
-export function scriptsState(state) {
-  switch (state) {
-    case 'missing': return 'скрипты отсутствуют';
-    case 'outdated': return 'скрипты устарели';
-    case 'broken': return 'установка повреждена';
-    default: return 'версия скриптов неизвестна';
-  }
-}
-
 /** Строка выполняющейся операции по argv (`app.rs::activity`). */
 export function activity(argv) {
   const [noun = '', verb = ''] = Array.isArray(argv) ? argv : [];

@@ -49,16 +49,16 @@ async function singleNode(ctx) {
   if (values !== null) await interactive(ctx, values.node, true);
 }
 
-/** Пакетное действие (`telegram_batch`): ноды и способ доступа одной формой. */
+/** Пакетное действие (`telegram_batch`): ноды и способ доступа одной формой; `true` — команда отправлена. */
 async function batch(ctx, action) {
   const nodes = await listNodes(ctx);
-  if (nodes === null) return;
+  if (nodes === null) return false;
   const fields = [{ name: 'nodes', label: 'Ноды', type: 'multi', options: nodes, required: true }];
   if (action.component) {
     fields.push({ name: 'component', label: 'Способ доступа', type: 'radio', options: TELEGRAM_COMPONENTS, required: true });
   }
-  const values = await ctx.form({ title: action.title, fields, submit: 'Далее', tone: action.tone === 'danger' ? 'danger' : 'primary' });
-  if (values === null) return;
+  const values = await ctx.form({ title: action.title, fields, submit: 'Далее', tone: action.danger ? 'danger' : 'primary' });
+  if (values === null) return false;
   const argv = telegramArgv(action.argv, values.nodes, action.component ? values.component : null);
   const reply = await ctx.runConfirmed(action.title, 'Выполнить?', argv);
   const table = telegramResults(reply);
@@ -67,6 +67,8 @@ async function batch(ctx, action) {
   } else if (ctx.isFailure(reply)) {
     ctx.failed();
   }
+  // Отказ от плана ничего не менял.
+  return reply.ok || ctx.isFailure(reply);
 }
 
 export function TelegramScreen({ ctx }) {
@@ -74,7 +76,8 @@ export function TelegramScreen({ ctx }) {
   const [table, setTable] = useState(null);
   const mounted = useMounted();
 
-  const load = () => run(async () => {
+  /** `telegram status --all`; сбой без таблицы — итог сбоя, прежняя таблица остаётся. */
+  const readStatus = async () => {
     const reply = await ctx.call(...TELEGRAM_STATUS_ARGV);
     const result = telegramResults(reply);
     if (result === null && !reply.ok) {
@@ -82,15 +85,20 @@ export function TelegramScreen({ ctx }) {
       return;
     }
     if (mounted.current) setTable(result || []);
+  };
+  const load = () => run(readStatus);
+  // После пакетного действия загруженный статус перечитывается: прежний устарел.
+  const runBatch = (action) => run(async () => {
+    if ((await batch(ctx, action)) && table !== null) await readStatus();
   });
 
   const actions = html`
     <${Button} icon="terminal" disabled=${busy} onClick=${() => run(() => singleNode(ctx))}>Управление нодой…<//>
     <${MoreMenu} label="Действия" items=${TELEGRAM_BATCH.map((action) => ({
       label: action.label,
-      danger: action.tone === 'danger',
+      danger: action.danger === true,
       disabled: busy,
-      onClick: () => run(() => batch(ctx, action)),
+      onClick: () => runBatch(action),
     }))} />
   `;
   return html`<${Page} title=${TELEGRAM_TITLE} actions=${actions}>

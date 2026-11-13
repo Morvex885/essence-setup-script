@@ -7,9 +7,8 @@ const row = (name, inherit, subscription) => ({ name, group: 'PC', inherit_nodes
 const unpublished = { published: false, expires_at: null };
 const nodes = [{ name: 'de', ip: '127.0.0.1', port: 22 }, { name: 'ru', ip: '10.0.0.2', port: 2222 }];
 
-test('labels of nodes and clients', () => {
+test('node labels and joined lists', () => {
   assert.equal(m.nodeLabel(nodes[0]), 'de  127.0.0.1:22');
-  assert.equal(m.clientLabel(row('bob', true, unpublished)), 'bob  (PC)');
   assert.equal(m.joined([]), 'нет');
   assert.equal(m.joined(['a', 1, 'b']), 'a, b');
 });
@@ -93,14 +92,22 @@ test('ttl menu and publish argv', () => {
   assert.equal(m.ttlValue({ ttl: 'keep' }), null);
   assert.equal(m.ttlValue({ ttl: '30d' }), '30d');
   assert.equal(m.ttlValue({ ttl: 'custom', custom: '7d' }), '7d');
-  assert.equal(m.ttlError('7d'), null);
-  assert.ok(m.ttlError('7') && m.ttlError('d7') && m.ttlError('7 d'));
+  // Правило ядра (`ttl_expiry`): 1–6 цифр без ведущего нуля и h|d|w.
+  for (const ok of ['7d', '12h', '2w', '999999d']) assert.equal(m.ttlError(ok), null, ok);
+  for (const bad of ['7', 'd7', '7 d', '0d', '07d', '1234567h', '7m', '', null]) assert.ok(m.ttlError(bad), String(bad));
 });
 
-test('host line', () => {
+test('host line: set, unset and unreadable are different states', () => {
   assert.equal(m.hostLine({ ok: true, data: { node: 'de' } }).text, 'Хост подписок: de');
   assert.ok(m.hostLine({ ok: true, data: null }).text.startsWith('Хост подписок не задан'));
-  assert.ok(m.hostLine({ ok: false, error: { code: 'x' } }).text.startsWith('Хост подписок не задан'));
+  const failed = m.hostLine({ ok: false, error: { code: 'locked' } });
+  assert.equal(failed.tone, 'warn');
+  assert.ok(!failed.text.includes('не задан'));
+});
+
+test('own nodes: missing ones are marked only once the node list is known', () => {
+  assert.deepEqual(m.ownNodeRows(['de', 'gone'], null), [{ name: 'de', missing: false }, { name: 'gone', missing: false }]);
+  assert.deepEqual(m.ownNodeRows(['de', 'gone'], nodes), [{ name: 'de', missing: false }, { name: 'gone', missing: true }]);
 });
 
 test('share bundle: link, expiry, headers, curl, json', () => {

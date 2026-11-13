@@ -4,16 +4,8 @@
 // `table-model.js`, форм — `form-model.js`.
 import { html, useEffect, useRef, useState } from '../vendor/preact-htm.js';
 import { readInputFile } from './format.js';
-import { filterRows, cellText } from './table-model.js';
+import { filterRows, cellText, allSelected, toggleVisible } from './table-model.js';
 import { Icon } from './icons.js';
-import { nextChoice } from './theme.js';
-
-const TONE_CLASS = { ok: 't-ok', warn: 't-warn', error: 't-error', dim: 't-dim', info: 't-info' };
-
-/** Строка с классом тона (`ok|warn|error|dim|info`). */
-export function Tone({ tone = 'info', children }) {
-  return html`<span class=${TONE_CLASS[tone] || TONE_CLASS.info}>${children}</span>`;
-}
 
 // ─── Кнопки ──────────────────────────────────────────────────────────────────
 
@@ -52,33 +44,48 @@ export function Segmented({ options, value, onChange, label = null }) {
 
 // ─── Каркас ──────────────────────────────────────────────────────────────────
 
-const THEME_VIEW = {
-  system: { icon: 'monitor', label: 'Системная' },
-  light: { icon: 'sun', label: 'Светлая' },
-  dark: { icon: 'moon', label: 'Тёмная' },
-};
+const THEMES = [
+  { value: 'system', icon: 'monitor', label: 'Системная' },
+  { value: 'light', icon: 'sun', label: 'Светлая' },
+  { value: 'dark', icon: 'moon', label: 'Тёмная' },
+];
 
 /**
  * Каркас: меню разделов (≥1024 — с подписями, 640–1023 — иконки, <640 —
- * выезжающее по кнопке в шапке), шапка с источником, связью и текущей
- * командой, предупреждение об открытой панели, область страницы.
+ * выезжающее по кнопке в шапке: фокус переходит в меню, Tab не выходит из
+ * него, Esc и фон закрывают, фокус возвращается кнопке), выбор темы из трёх
+ * вариантов, шапка с источником, связью и текущей командой, предупреждение
+ * об открытой панели, область страницы.
  * `menu` — `[{name,label,icon,href,active}|{divider:true}]`, `source` —
  * `{ label, sync: {label,tone}|null }|null`, `activity` — текст или `null`.
  */
 export function Layout({ menu, activity = null, source = null, linkState = 'open', banner = null, themeChoice = 'system',
   onTheme = () => {}, version = '', journalErrors = 0, children }) {
   const [open, setOpen] = useState(false);
+  const nav = useRef(null);
+  const burger = useRef(null);
   useEffect(() => {
     if (!open) return undefined;
-    const onKey = (event) => { if (event.key === 'Escape') setOpen(false); };
+    const root = nav.current;
+    const first = root && root.querySelector('a[href]');
+    if (first) first.focus();
+    const onKey = (event) => {
+      if (event.defaultPrevented) return;
+      if (event.key === 'Escape') setOpen(false);
+      else if (event.key === 'Tab' && root) trapTab(root, event);
+    };
     document.addEventListener('keydown', onKey);
-    return () => document.removeEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('keydown', onKey);
+      // Скрытое меню уже могло сбросить фокус на `body`: возвращаем его кнопке.
+      const active = document.activeElement;
+      const lost = !active || active === document.body || (root && root.contains(active));
+      if (lost && burger.current) burger.current.focus();
+    };
   }, [open]);
-  const theme = THEME_VIEW[themeChoice] || THEME_VIEW.system;
-  const next = nextChoice(themeChoice);
   return html`
     <div class="shell ${open ? 'nav-open' : ''}">
-      <aside class="shell-nav" aria-label="Разделы">
+      <aside class="shell-nav" aria-label="Разделы" ref=${nav}>
         <div class="shell-brand" title="Remote Control">
           <span class="shell-logo"><${Icon} name="terminal" size=${18} /></span>
           <span class="nav-label">Remote Control</span>
@@ -97,17 +104,19 @@ export function Layout({ menu, activity = null, source = null, linkState = 'open
               </li>`))}
         </ul>
         <div class="shell-foot">
-          <button type="button" class="btn btn-sm btn-ghost nav-theme" title=${`Тема: ${theme.label}`}
-            aria-label=${`Тема: ${theme.label}. Переключить на «${THEME_VIEW[next].label}»`} onClick=${() => onTheme(next)}>
-            <${Icon} name=${theme.icon} size=${16} /><span class="nav-label">${theme.label}</span>
-          </button>
+          <div class="join nav-theme" role="group" aria-label="Тема оформления">
+            ${THEMES.map((theme) => html`<button key=${theme.value} type="button"
+              class="btn btn-xs btn-ghost btn-square join-item ${theme.value === themeChoice ? 'btn-active nav-theme-on' : ''}"
+              aria-pressed=${theme.value === themeChoice} aria-label=${`Тема: ${theme.label}`} title=${`Тема: ${theme.label}`}
+              onClick=${() => onTheme(theme.value)}><${Icon} name=${theme.icon} size=${16} /></button>`)}
+          </div>
           ${version && html`<span class="nav-label nav-version t-dim">${version}</span>`}
         </div>
       </aside>
       <div class="shell-backdrop" onClick=${() => setOpen(false)}></div>
       <div class="shell-main">
         <header class="topbar">
-          <button type="button" class="btn btn-sm btn-ghost btn-square topbar-burger" aria-label="Меню разделов"
+          <button type="button" class="btn btn-sm btn-ghost btn-square topbar-burger" aria-label="Меню разделов" ref=${burger}
             aria-expanded=${open} onClick=${() => setOpen(!open)}><${Icon} name="menu" size=${20} /></button>
           ${source && html`<span class="topbar-source">
             <${Icon} name="git-branch" size=${16} /><span class="topbar-text">${source.label}</span>
@@ -129,7 +138,8 @@ export function Layout({ menu, activity = null, source = null, linkState = 'open
 
 /**
  * Страница раздела: «Назад» (`back: {href,label}`), заголовок с отметкой,
- * действия, вкладки (`tabs: [{id,label,href,active}]`) и содержимое.
+ * действия, вкладки (`tabs: [{id,label,href,active}]` — ссылки маршрута,
+ * текущая — `aria-current`) и содержимое.
  */
 export function Page({ title, subtitle = null, back = null, badge = null, actions = null, tabs = null, children }) {
   return html`
@@ -142,10 +152,10 @@ export function Page({ title, subtitle = null, back = null, badge = null, action
       </div>
       ${subtitle && html`<p class="page-subtitle t-dim">${subtitle}</p>`}
     </div>
-    ${tabs && html`<div role="tablist" class="tabs tabs-border page-tabs">
-      ${tabs.map((tab) => html`<a key=${tab.id} role="tab" class="tab ${tab.active ? 'tab-active' : ''}" href=${tab.href}
-        aria-selected=${tab.active ? 'true' : 'false'}>${tab.label}</a>`)}
-    </div>`}
+    ${tabs && html`<nav class="tabs tabs-border page-tabs" aria-label="Вкладки">
+      ${tabs.map((tab) => html`<a key=${tab.id} class="tab ${tab.active ? 'tab-active' : ''}" href=${tab.href}
+        aria-current=${tab.active ? 'page' : undefined}>${tab.label}</a>`)}
+    </nav>`}
     <div class="stack">${children}</div>
   `;
 }
@@ -163,7 +173,8 @@ function typing(target) {
 /**
  * Таблица: `columns` — `[{key,label,render?,search?}]`; первая колонка —
  * ссылка `href(row)`; `menu(row)` — пункты `MoreMenu`; `selection` —
- * `{ selected: [ключи], onChange }`; поиск — при `rows.length > 8` («/»).
+ * `{ selected: [ключи], onChange }` («Выбрать все» — только видимые после
+ * поиска строки); поиск — при `rows.length > 8` («/»).
  * На узком экране строки — карточки (подпись ячейки — `data-label`).
  */
 export function DataTable({ columns, rows, rowKey = 'name', empty = 'Нет объектов', href = null, menu = null, selection = null }) {
@@ -186,8 +197,8 @@ export function DataTable({ columns, rows, rowKey = 'name', empty = 'Нет об
   const keyOf = (row) => (typeof rowKey === 'function' ? rowKey(row) : row[rowKey]);
   const shown = searchable ? filterRows(list, columns, query) : list;
   const selected = selection ? selection.selected : [];
-  const allKeys = list.map(keyOf);
-  const all = selection && allKeys.length > 0 && allKeys.every((key) => selected.includes(key));
+  const visibleKeys = shown.map(keyOf);
+  const all = Boolean(selection) && allSelected(selected, visibleKeys);
   const flip = (key) => selection.onChange(selected.includes(key) ? selected.filter((item) => item !== key) : [...selected, key]);
   const cell = (column, row, index) => {
     const content = column.render ? column.render(row) : (cellText(row, column.key) || '—');
@@ -205,8 +216,9 @@ export function DataTable({ columns, rows, rowKey = 'name', empty = 'Нет об
       ? html`<div class="table-empty t-dim">Ничего не найдено</div>`
       : html`<div class="table-wrap"><table class="table data-table">
         <thead><tr>
-          ${selection && html`<th class="col-check"><input type="checkbox" class="checkbox checkbox-sm" aria-label="Выбрать все"
-            checked=${all} onChange=${() => selection.onChange(all ? [] : allKeys)} /></th>`}
+          ${selection && html`<th class="col-check"><input type="checkbox" class="checkbox checkbox-sm"
+            aria-label=${query ? 'Выбрать все найденные' : 'Выбрать все'}
+            checked=${all} onChange=${() => selection.onChange(toggleVisible(selected, visibleKeys))} /></th>`}
           ${columns.map((column) => html`<th key=${column.key}>${column.label}</th>`)}
           ${menu && html`<th class="col-menu"><span class="sr-only">Действия</span></th>`}
         </tr></thead>
@@ -230,8 +242,8 @@ export function DataTable({ columns, rows, rowKey = 'name', empty = 'Нет об
 
 /**
  * Меню «⋮»: `items` — `[{label,icon?,danger?,disabled?,onClick}]`. С явной
- * `label` — текстовая кнопка «label ▾». Закрывается выбором, Esc и нажатием
- * вне меню; ↑/↓ — переход между пунктами.
+ * `label` — текстовая кнопка «label ▾». Закрывается выбором, Esc, нажатием
+ * вне меню и уходом фокуса из меню (Tab); ↑/↓ — переход между пунктами.
  */
 export function MoreMenu({ items, label }) {
   const [place, setPlace] = useState(null);
@@ -281,13 +293,17 @@ export function MoreMenu({ items, label }) {
     buttons[(index + step + buttons.length) % buttons.length].focus();
   };
   const style = place ? Object.entries(place).map(([key, value]) => `${key}:${value}px`).join(';') : '';
-  return html`<div class="more" ref=${root} onKeyDown=${onKey}>
+  // Фокус ушёл за пределы меню (Tab, щелчок по другому полю) — меню закрывается.
+  // Свойство в нижнем регистре: Preact подписывается на `focusout` как есть.
+  const onFocusOut = (event) => { if (open && root.current && !root.current.contains(event.relatedTarget)) close(); };
+  return html`<div class="more" ref=${root} onKeyDown=${onKey} onfocusout=${onFocusOut}>
     ${textual
       ? html`<button ref=${button} type="button" class="btn btn-sm" aria-haspopup="menu" aria-expanded=${open}
           onClick=${toggle}>${name}<${Icon} name="chevron-down" size=${16} /></button>`
       : html`<button ref=${button} type="button" class="btn btn-sm btn-ghost btn-square" aria-haspopup="menu"
           aria-expanded=${open} aria-label=${name} title=${name} onClick=${toggle}><${Icon} name="ellipsis-vertical" size=${18} /></button>`}
-    ${open && html`<ul ref=${list} class="menu more-list" role="menu" style=${style}>
+    ${open && html`<ul ref=${list} class="menu more-list" role="menu" style=${style}
+      onMouseDown=${(event) => event.preventDefault()}>
       ${items.map((item, index) => html`<li key=${index} role="none">
         <button type="button" role="menuitem" class=${item.danger ? 't-error' : ''} disabled=${item.disabled}
           onClick=${() => { close(true); item.onClick(); }}>
@@ -375,7 +391,7 @@ function Snackbar({ item, onDismiss, journalHref }) {
     role=${item.level === 'error' ? 'alert' : 'status'}>
     <${Icon} name=${SNACK_ICON[item.level] || 'info'} size=${18} />
     <span class="snack-text">${item.text}</span>
-    ${journalHref && html`<a class="link snack-link" href=${journalHref}>Журнал</a>`}
+    ${journalHref && html`<a class="link snack-link" href=${journalHref} onClick=${() => onDismiss(item.id)}>Журнал</a>`}
     <${IconButton} icon="x" label="Закрыть" onClick=${() => onDismiss(item.id)} />
   </div>`;
 }
@@ -393,29 +409,40 @@ export function Snackbars({ items, onDismiss, journalHref = null }) {
 const FOCUSABLE = 'button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
 /**
+ * Tab и Shift+Tab по кругу внутри `root`; фокус снаружи (щелчок по фону)
+ * возвращается на первый или последний элемент слоя.
+ */
+function trapTab(root, event) {
+  const items = [...root.querySelectorAll(FOCUSABLE)].filter((item) => item.getClientRects().length > 0);
+  const active = document.activeElement;
+  const first = items[0];
+  const last = items[items.length - 1];
+  if (!first) { event.preventDefault(); root.focus(); return; }
+  if (!root.contains(active)) { event.preventDefault(); (event.shiftKey ? last : first).focus(); return; }
+  if (event.shiftKey && (active === first || active === root)) { event.preventDefault(); last.focus(); }
+  else if (!event.shiftKey && active === last) { event.preventDefault(); first.focus(); }
+}
+
+/**
  * Фокус модального слоя `ref`: при открытии переходит в слой (`initial()` или
  * сам слой, если фокус ещё снаружи), Tab и Shift+Tab не выходят из слоя, при
- * закрытии фокус возвращается элементу, с которого слой открыт. Слой должен
- * принимать фокус (`tabindex="-1"`).
+ * закрытии фокус возвращается элементу, с которого слой открыт. Обработчик
+ * стоит на документе, поэтому работает и после щелчка мимо слоя; `isActive()`
+ * — слой верхний (у стопки диалогов Tab ловит только верхнее окно). Слой
+ * должен принимать фокус (`tabindex="-1"`).
  */
-export function useModalFocus(ref, initial = null) {
+export function useModalFocus(ref, initial = null, isActive = null) {
   const opener = useRef(document.activeElement);
   useEffect(() => {
     const root = ref.current;
     if (!root.contains(document.activeElement)) ((initial && initial(root)) || root).focus();
     const trap = (event) => {
-      if (event.key !== 'Tab') return;
-      const items = [...root.querySelectorAll(FOCUSABLE)].filter((item) => item.getClientRects().length > 0);
-      const active = document.activeElement;
-      const first = items[0];
-      const last = items[items.length - 1];
-      if (!first) { event.preventDefault(); return; }
-      if (event.shiftKey && (active === first || active === root)) { event.preventDefault(); last.focus(); }
-      else if (!event.shiftKey && active === last) { event.preventDefault(); first.focus(); }
+      if (event.key !== 'Tab' || event.defaultPrevented || (isActive && !isActive())) return;
+      trapTab(root, event);
     };
-    root.addEventListener('keydown', trap);
+    document.addEventListener('keydown', trap);
     return () => {
-      root.removeEventListener('keydown', trap);
+      document.removeEventListener('keydown', trap);
       const target = opener.current;
       if (target && target.isConnected && typeof target.focus === 'function') target.focus();
     };
@@ -494,11 +521,6 @@ export function downloadText(name, text, type = 'text/plain;charset=utf-8') {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-/** Кнопка скачивания текстового файла. */
-export function Download({ name, text, label = 'Скачать' }) {
-  return html`<${Button} icon="download" onClick=${() => downloadText(name, text)}>${label}<//>`;
-}
-
 /**
  * Чтение локального текстового файла: `onText(text)`, при отказе
  * `onText(null, причина)` (причина `null` — файл не читается или не в UTF-8).
@@ -515,15 +537,4 @@ export function FileText({ onText, label = 'Выбрать файл', accept = '
     <${Icon} name="upload" size=${16} />${label}
     <input type="file" accept=${accept} disabled=${disabled} onChange=${pick} />
   </label>`;
-}
-
-/** Свёрнутый/развёрнутый блок моноширинного текста. */
-export function Pre({ text, openLabel = 'Показать' }) {
-  const [open, setOpen] = useState(false);
-  return html`
-    <div class="pre">
-      <${Button} kind="ghost" icon="chevron-down" onClick=${() => setOpen(!open)}>${open ? 'Скрыть' : openLabel}<//>
-      ${open && html`<pre class="plan">${text}</pre>`}
-    </div>
-  `;
 }

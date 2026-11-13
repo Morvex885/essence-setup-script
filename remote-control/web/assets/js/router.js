@@ -26,6 +26,31 @@ export function format(name, param = null, tab = null) {
   return hash;
 }
 
+/** Ключ экрана: раздел и параметр (смена вкладки экран не пересоздаёт). */
+export function screenKey(route) {
+  return `${route.name}/${route.param || ''}`;
+}
+
+/**
+ * Решение по смене адреса при защите ухода (`ctx.setLeaveGuard`): `wait` —
+ * вопрос о прежней смене ещё открыт (новые смены не спрашиваются заново,
+ * по итогу берётся последний адрес), `ask` — защита есть и адрес другой,
+ * `apply` — сменить экран.
+ */
+export function routeDecision({ hash, current, guarded, pending }) {
+  if (pending) return 'wait';
+  return guarded && hash !== current ? 'ask' : 'apply';
+}
+
+/**
+ * Адрес страницы с фрагментом `hash` (`''` — без фрагмента) для
+ * `history.replaceState`: отказ от ухода возвращает прежний адрес, не
+ * добавляя записей в историю и не вызывая `hashchange`.
+ */
+export function hashUrl(location, hash) {
+  return `${location.pathname}${location.search}${hash || ''}`;
+}
+
 /**
  * Подписка на смену маршрута; вызывает `handler(route)` сразу и при каждом
  * изменении хеша. Возвращает функцию отписки.

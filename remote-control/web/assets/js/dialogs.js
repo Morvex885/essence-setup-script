@@ -2,19 +2,26 @@
 // TUI и формы `ctx.form`: каждый вызов возвращает `Promise`, окно
 // закрывается ответом. Диалоги складываются стопкой (подтверждение поверх
 // окна операции); фокус — в верхнем окне, Esc закрывает верхнее окно
-// значением отмены, щелчок по фону окно не закрывает.
+// значением отмены, щелчок по фону окно не закрывает и фокус из окна не уводит.
 import { html, useState, useEffect, useRef } from '../vendor/preact-htm.js';
 import { Button, useModalFocus } from './ui.js';
 import { Icon } from './icons.js';
 import { initialValues, visibleFields, validate, result } from './form-model.js';
 
+/** Значение отмены окна по виду (как Esc и «Отмена»). */
+const CANCEL = { confirm: false, show: undefined };
+const cancelValue = (kind) => (kind in CANCEL ? CANCEL[kind] : null);
+
 /**
  * Хранилище стопки диалогов. `push(kind, props)` → `Promise` ответа.
- * Возвращает `{ stack, api }`; `api` — функции для `ctx`.
+ * Возвращает `{ stack, api }`; `api` — функции для `ctx` и `cancelAll()`.
  */
 export function useDialogs() {
   const [stack, setStack] = useState([]);
   const counter = useRef(0);
+  // Текущая стопка вне состояния: `cancelAll` вызывается и из старых замыканий.
+  const entries = useRef([]);
+  const sync = () => setStack([...entries.current]);
   /** Открыть окно: `{ promise, close }`; `close` доступен сразу, до отрисовки. */
   const open = (kind, props) => {
     counter.current += 1;
@@ -22,14 +29,24 @@ export function useDialogs() {
     let resolve;
     const promise = new Promise((done) => { resolve = done; });
     const close = (value) => {
-      setStack((current) => current.filter((entry) => entry.id !== id));
+      if (!entries.current.some((entry) => entry.id === id)) return;
+      entries.current = entries.current.filter((entry) => entry.id !== id);
+      sync();
       resolve(value);
     };
-    setStack((current) => [...current, { id, kind, props, close }]);
+    entries.current = [...entries.current, { id, kind, props, close }];
+    sync();
     return { promise, close };
   };
   const push = (kind, props) => open(kind, props).promise;
   const api = {
+    /**
+     * Закрыть окна ушедшего экрана значением отмены (смена раздела или
+     * объекта); окна операций остаются — их закрывает сама команда.
+     */
+    cancelAll: () => {
+      for (const entry of [...entries.current]) if (entry.kind !== 'operation') entry.close(cancelValue(entry.kind));
+    },
     /** План/вопрос → `true` только по «Да»; отмена — `false`. */
     confirm: (props) => push('confirm', props),
     /** Скрытый ввод; отмена → `null`; пустое значение → `null`, с `allowEmpty` → `''`. */
@@ -73,24 +90,37 @@ export function useDialogs() {
   return { stack, api };
 }
 
+/** Окно — верхнее в стопке (последнее открытое `.modal-open` в документе). */
+function isTop(box) {
+  const all = document.querySelectorAll('.modal.modal-open');
+  return Boolean(box) && all.length > 0 && all[all.length - 1].contains(box);
+}
+
 /**
  * Рамка окна. Фокус при открытии — на самом окне (Enter не подтверждает
- * план случайно), поля ввода ставят его на себя. Esc — `onDismiss()`
- * (обработчик стоит на окне: срабатывает только в верхнем окне с фокусом).
+ * план случайно), поля ввода ставят его на себя. Esc и Tab обрабатываются на
+ * документе и только верхним окном: щелчок по фону не ломает ни Esc, ни
+ * удержание фокуса (нажатие по фону фокус не забирает).
  */
 function Shell({ title, context, wide = false, onDismiss = null, children }) {
   const lines = Array.isArray(context) ? context : context ? [context] : [];
   const modal = useRef(null);
-  useModalFocus(modal);
-  const onKey = (event) => {
-    if (event.key !== 'Escape' || event.defaultPrevented) return;
-    event.preventDefault();
-    event.stopPropagation();
-    if (onDismiss) onDismiss();
-  };
+  const dismiss = useRef(onDismiss);
+  dismiss.current = onDismiss;
+  useModalFocus(modal, null, () => isTop(modal.current));
+  useEffect(() => {
+    const onKey = (event) => {
+      if (event.key !== 'Escape' || event.defaultPrevented || !isTop(modal.current)) return;
+      event.preventDefault();
+      if (dismiss.current) dismiss.current();
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, []);
+  const keepFocus = (event) => { if (event.target === event.currentTarget) event.preventDefault(); };
   return html`
-    <div class="modal modal-open" role="dialog" aria-modal="true" aria-label=${title}>
-      <div class="modal-box ${wide ? 'modal-wide' : ''}" ref=${modal} tabindex="-1" onKeyDown=${onKey}>
+    <div class="modal modal-open" role="dialog" aria-modal="true" aria-label=${title} onMouseDown=${keepFocus}>
+      <div class="modal-box ${wide ? 'modal-wide' : ''}" ref=${modal} tabindex="-1">
         <h3 class="modal-title">${title}</h3>
         ${lines.length > 0 && html`<div class="modal-context">${lines.map((line, index) => html`<div key=${index}>${line}</div>`)}</div>`}
         ${children}
@@ -179,7 +209,7 @@ function ToggleDialog({ props, close }) {
 
 const MULTI_FILTER_FROM = 8;
 
-function MultiField({ field, value, onChange, invalid }) {
+function MultiField({ field, value, onChange, invalid, ids }) {
   const [query, setQuery] = useState('');
   const options = field.options || [];
   const needle = query.trim().toLowerCase();
@@ -194,7 +224,8 @@ function MultiField({ field, value, onChange, invalid }) {
         onKeyDown=${(event) => { if (event.key === 'Enter') event.preventDefault(); }} />
     </label>`}
     ${options.length === 0 && html`<p class="t-dim">Нет вариантов для выбора</p>`}
-    <div class="choice-list" role="group" aria-label=${field.label}>
+    <div class="choice-list" role="group" aria-labelledby=${ids.label} aria-describedby=${ids.desc}
+      aria-invalid=${invalid ? 'true' : undefined}>
       ${shown.map((option) => html`<label key=${String(option.value)} class="check-row">
         <input type="checkbox" class="checkbox checkbox-sm" name=${field.name} disabled=${option.disabled}
           checked=${selected.includes(option.value)} onChange=${() => flip(option.value)} />
@@ -204,8 +235,16 @@ function MultiField({ field, value, onChange, invalid }) {
   </div>`;
 }
 
-function FormControl({ field, value, onChange, invalid }) {
-  const common = { id: `f-${field.name}`, name: field.name, 'aria-invalid': invalid ? 'true' : undefined, autofocus: field.autofocus || undefined };
+/**
+ * Поле формы. `ids` — `{ control, label, desc }`: подпись `label for` у полей
+ * ввода и `aria-labelledby` у групп (radio, multi), подсказка или ошибка —
+ * `aria-describedby`.
+ */
+function FormControl({ field, value, onChange, invalid, ids }) {
+  const common = {
+    id: ids.control, name: field.name, 'aria-invalid': invalid ? 'true' : undefined,
+    'aria-describedby': ids.desc, autofocus: field.autofocus || undefined,
+  };
   switch (field.type) {
     case 'select':
       return html`<select ...${common} class="select select-sm ${invalid ? 'select-error' : ''}" value=${value}
@@ -214,7 +253,8 @@ function FormControl({ field, value, onChange, invalid }) {
           disabled=${option.disabled}>${option.label}</option>`)}
       </select>`;
     case 'radio':
-      return html`<div class="choice-list ${invalid ? 'choice-invalid' : ''}" role="radiogroup" aria-label=${field.label}>
+      return html`<div class="choice-list ${invalid ? 'choice-invalid' : ''}" role="radiogroup" aria-labelledby=${ids.label}
+        aria-describedby=${ids.desc} aria-invalid=${invalid ? 'true' : undefined}>
         ${(field.options || []).map((option) => html`<label key=${String(option.value)} class="check-row">
           <input type="radio" class="radio radio-sm" name=${field.name} disabled=${option.disabled}
             checked=${value === option.value} onChange=${() => onChange(option.value)} />
@@ -222,10 +262,11 @@ function FormControl({ field, value, onChange, invalid }) {
         </label>`)}
       </div>`;
     case 'multi':
-      return html`<${MultiField} field=${field} value=${value} onChange=${onChange} invalid=${invalid} />`;
+      return html`<${MultiField} field=${field} value=${value} onChange=${onChange} invalid=${invalid} ids=${ids} />`;
     case 'checkbox':
       return html`<label class="check-row">
         <input type="checkbox" class="checkbox checkbox-sm" name=${field.name} checked=${value === true}
+          aria-describedby=${ids.desc} aria-invalid=${invalid ? 'true' : undefined}
           onChange=${(event) => onChange(event.target.checked)} />
         <span>${field.label}</span>
       </label>`;
@@ -239,10 +280,16 @@ function FormControl({ field, value, onChange, invalid }) {
   }
 }
 
+/** Номер формы для уникальных `id` полей (формы бывают в стопке одновременно). */
+let formCount = 0;
+
+const GROUP_TYPES = new Set(['radio', 'multi']);
+
 function FormDialog({ props, close }) {
   const { title, context = null, fields = [], submit = 'Сохранить', tone = 'primary', wide = false } = props;
   const [values, setValues] = useState(() => initialValues(fields));
   const [errors, setErrors] = useState({});
+  const [prefix] = useState(() => { formCount += 1; return `form${formCount}`; });
   const body = useRef(null);
   const visible = visibleFields(fields, values);
   useEffect(() => {
@@ -270,13 +317,18 @@ function FormDialog({ props, close }) {
     <form class="form" ref=${body} onSubmit=${send} novalidate>
       ${visible.map((field) => {
         const error = errors[field.name];
-        const id = `f-${field.name}`;
+        const base = `${prefix}-${field.name}`;
+        const described = Boolean(error || field.hint);
+        const ids = { control: base, label: `${base}-label`, desc: described ? `${base}-desc` : undefined };
+        const mark = field.required && html`<span class="t-dim" aria-hidden="true"> *</span>`;
         return html`<div key=${field.name} class="field">
-          ${field.type !== 'checkbox' && html`<label class="field-label" for=${id}>${field.label}${field.required && html`<span class="t-dim"> *</span>`}</label>`}
-          <${FormControl} field=${{ ...field, name: field.name }} value=${values[field.name]} invalid=${Boolean(error)}
+          ${field.type === 'checkbox' ? null : GROUP_TYPES.has(field.type)
+            ? html`<span class="field-label" id=${ids.label}>${field.label}${mark}</span>`
+            : html`<label class="field-label" id=${ids.label} for=${ids.control}>${field.label}${mark}</label>`}
+          <${FormControl} field=${field} value=${values[field.name]} invalid=${Boolean(error)} ids=${ids}
             onChange=${(value) => update(field.name, value)} />
-          ${field.hint && !error && html`<span class="field-hint t-dim">${field.hint}</span>`}
-          ${error && html`<span class="field-error" role="alert">${error}</span>`}
+          ${field.hint && !error && html`<span class="field-hint t-dim" id=${ids.desc}>${field.hint}</span>`}
+          ${error && html`<span class="field-error" id=${ids.desc} role="alert">${error}</span>`}
         </div>`;
       })}
       <div class="modal-action">

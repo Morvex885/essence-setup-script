@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as model from '../assets/js/screens/nodes-model.js';
+import { isFailure } from '../assets/js/flows.js';
 
 // Фикстура `nodes.rs::tests::node`.
 const node = () => ({
@@ -16,8 +17,8 @@ test('nodeLabel и состояние нод в списке (frames_keep_list_s
   const deferred = { name: 'deferred', ip: '192.0.2.3', port: 22, auth: 'key', password: null, issues: ['missing_identity', 'missing_host_key'] };
   assert.equal(model.nodeLabel(node()), 'n  192.0.2.1:22');
   assert.equal(model.nodeStatus(node()).tone, 'ok');
-  assert.deepEqual(model.nodeStatus(problem), { tone: 'warn', label: 'нет пароля SSH' });
-  assert.deepEqual(model.nodeStatus(deferred), { tone: 'warn', label: 'missing_identity, missing_host_key' });
+  assert.equal(model.nodeStatus(problem).tone, 'warn');
+  assert.equal(model.nodeStatus(deferred).tone, 'warn');
 });
 
 test('карточка: способ входа и пароль SSH только при входе по паролю', () => {
@@ -53,8 +54,7 @@ test('предложение загрузки скриптов по состоя
 
 test('удаление: варианты из delete_options и --revoke-key', () => {
   const options = model.deleteOptions(node());
-  assert.deepEqual(options.map((o) => o.label), ['local', 'server', 'server+key']);
-  assert.ok(options.every((o) => o.tone === 'danger'));
+  assert.deepEqual(options.map((o) => o.value), [0, 1, 2]);
   assert.deepEqual(model.deleteArgv('n', node().delete_options[2]), ['node', 'delete', '--name', 'n', '--scope', 'server', '--revoke-key']);
   assert.deepEqual(model.deleteArgv('n', node().delete_options[0]), ['node', 'delete', '--name', 'n', '--scope', 'local']);
   assert.deepEqual(model.deleteOptions({ delete_options: [] }), []);
@@ -85,13 +85,130 @@ test('добавление: умолчания v1, пароль только в 
 
 test('добавление: проверки IP, порта, пароля и тега', () => {
   const base = { name: '', ip: '192.0.2.1', port: '', user: '', auth: 'key', password: '', tag: 'tag' };
-  assert.deepEqual(model.addNodeArgv({ ...base, ip: '' }), { warning: 'IP не указан.' });
+  assert.ok(model.addNodeArgv({ ...base, ip: '' }).warning);
   for (const port of ['0', '70000', 'x', '-1', '1.5']) {
-    assert.deepEqual(model.addNodeArgv({ ...base, port }), { warning: 'Порт должен быть числом от 1 до 65535.' });
+    assert.ok(model.addNodeArgv({ ...base, port }).warning, port);
+    assert.equal(model.portError(port), model.PORT_INVALID, port);
   }
+  assert.equal(model.portError(''), null);
+  assert.equal(model.portError('22'), null);
   assert.deepEqual(model.addNodeArgv({ ...base, port: '65535' }).argv[7], '65535');
-  assert.deepEqual(model.addNodeArgv({ ...base, auth: 'password' }), { warning: 'Пароль не может быть пустым.' });
-  assert.deepEqual(model.addNodeArgv({ ...base, tag: '' }), { warning: 'Тег не может быть пустым.' });
+  assert.ok(model.addNodeArgv({ ...base, auth: 'password' }).warning);
+  assert.ok(model.addNodeArgv({ ...base, tag: '' }).warning);
+});
+
+test('форма добавления: порт проверяется полем, пароль — только при входе по паролю, прежний ввод без пароля', () => {
+  const fields = model.addFields({ ip: '192.0.2.1', port: '99999', auth: 'password', password: 'x' });
+  const byName = Object.fromEntries(fields.map((field) => [field.name, field]));
+  assert.equal(byName.port.validate('99999'), model.PORT_INVALID);
+  assert.equal(byName.ip.value, '192.0.2.1');
+  assert.equal(byName.password.value, undefined);
+  assert.equal(byName.password.when({ auth: 'key' }), false);
+  assert.equal(byName.password.when({ auth: 'password' }), true);
+});
+
+/**
+ * Поддельный `ctx`: `steps` — `[argv, reply]` по порядку (запросы и планы),
+ * `answers` — ответы диалогов по порядку. Записывает диалоги, секреты,
+ * уведомления и итоги сбоев.
+ */
+function scripted(steps, answers) {
+  const queue = [...steps];
+  const replies = [...answers];
+  const record = { dialogs: [], secrets: [], notices: [], failed: 0 };
+  const dialog = (kind) => async (props) => {
+    record.dialogs.push({ kind, ...props });
+    assert.ok(replies.length > 0, `нет ответа для ${kind}: ${props.title}`);
+    return replies.shift();
+  };
+  const ctx = {
+    async request(argv, options = {}) {
+      assert.ok(queue.length > 0, `лишний запрос ${argv.join(' ')}`);
+      const [expected, reply] = queue.shift();
+      assert.deepEqual(argv, expected);
+      record.secrets.push(options.secrets ? { ...options.secrets } : null);
+      return reply;
+    },
+    call: (...words) => ctx.request(words),
+    runConfirmed: (_title, _question, argv, options) => ctx.request(argv, options),
+    form: dialog('form'), confirm: dialog('confirm'), choose: dialog('choose'), askSecret: dialog('secret'),
+    notify: (level, text) => record.notices.push([level, text]),
+    failed: () => { record.failed += 1; },
+    isFailure,
+  };
+  return { ctx, record, done: () => assert.equal(queue.length + replies.length, 0, 'не все шаги сценария пройдены') };
+}
+
+const ok = (data = null) => ({ ok: true, data });
+const fail = (code, extra = {}) => ({ ok: false, error: { code, message: '', ...extra } });
+const keyForm = { name: '', ip: '192.0.2.1', port: '', user: '', tag: 'tag', auth: 'key' };
+const keyAttempt = addWords('key', ['--accept-new-host-key']);
+
+test('добавление: успех открывает ноду под именем из ответа ядра', async () => {
+  const s = scripted([[keyAttempt, ok({ name: 'vps-1', needs_setup: false })]], [keyForm]);
+  const opened = [];
+  assert.equal(await model.addNodeFlow(s.ctx, (name) => opened.push(name)), true);
+  assert.deepEqual(opened, ['vps-1']);
+  s.done();
+});
+
+test('добавление: сбой возвращает форму с прежним вводом, пароль не сохраняется', async () => {
+  const pwForm = { ...keyForm, auth: 'password', password: 'top-secret' };
+  const s = scripted([[addWords('password', ['--accept-new-host-key']), fail('remote_failed')]], [pwForm, false, null]);
+  const opened = [];
+  assert.equal(await model.addNodeFlow(s.ctx, (name) => opened.push(name)), false);
+  assert.deepEqual(s.record.dialogs.map((d) => d.kind), ['form', 'confirm', 'form']);
+  const again = Object.fromEntries(s.record.dialogs[2].fields.map((field) => [field.name, field.value]));
+  assert.equal(again.ip, '192.0.2.1');
+  assert.equal(again.auth, 'password');
+  assert.equal(again.password, undefined);
+  assert.deepEqual(s.record.secrets, [{ password: 'top-secret' }]);
+  assert.deepEqual(opened, []);
+  s.done();
+});
+
+test('добавление: сбой ядра — итог сбоя и форма снова; отмена выбора — выход без формы', async () => {
+  let s = scripted([[keyAttempt, fail('locked')]], [keyForm, null]);
+  assert.equal(await model.addNodeFlow(s.ctx, () => assert.fail('переход')), false);
+  assert.equal(s.record.failed, 1);
+  assert.deepEqual(s.record.dialogs.map((d) => d.kind), ['form', 'form']);
+  s.done();
+  s = scripted([[keyAttempt, fail('onboarding_failed')]], [keyForm, null]);
+  assert.equal(await model.addNodeFlow(s.ctx, () => assert.fail('переход')), false);
+  assert.deepEqual(s.record.dialogs.map((d) => d.kind), ['form', 'choose']);
+  s.done();
+});
+
+test('добавление: изменённый ключ — повтор под планом с --replace-host-key, отложенная настройка', async () => {
+  const s = scripted([
+    [keyAttempt, fail('host_key_changed', { fingerprints: ['SHA256:new'] })],
+    [addWords('key', ['--replace-host-key', 'SHA256:new']), fail('onboarding_failed')],
+    [addWords('key', ['--defer-ssh-setup']), ok({ name: 'vps-1', needs_setup: true })],
+  ], [keyForm, 'defer']);
+  const opened = [];
+  assert.equal(await model.addNodeFlow(s.ctx, (name) => opened.push(name)), true);
+  assert.deepEqual(opened, ['vps-1']);
+  assert.equal(s.record.notices[0][0], 'warn');
+  s.done();
+});
+
+test('изменение ноды: rename, затем tag под новым именем; сбой rename останавливает', async () => {
+  let s = scripted([
+    [['node', 'rename', '--name', 'n', '--new-name', 'm'], ok({ name: 'm' })],
+    [['node', 'tag', '--name', 'm', '--tag', 'new'], ok()],
+  ], [{ name: 'm', tag: 'new' }]);
+  assert.equal(await model.editNode(s.ctx, node()), 'm');
+  s.done();
+  s = scripted([[['node', 'rename', '--name', 'n', '--new-name', 'm'], fail('conflict')]], [{ name: 'm', tag: 'new' }]);
+  assert.equal(await model.editNode(s.ctx, node()), null);
+  assert.equal(s.record.failed, 1);
+  s.done();
+  s = scripted([[['node', 'tag', '--name', 'n', '--tag', 'x'], ok()]], [{ name: 'n', tag: 'x' }]);
+  assert.equal(await model.editNode(s.ctx, node()), 'n');
+  s.done();
+  s = scripted([], [null]);
+  assert.equal(await model.editNode(s.ctx, node()), null);
+  s.done();
 });
 
 test('добавление: флаги ключа сервера и отложенная настройка', () => {

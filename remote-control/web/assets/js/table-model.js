@@ -1,4 +1,5 @@
-// Чистая логика таблиц панели (`ui.js::DataTable`): текст ячейки и поиск.
+// Чистая логика таблиц панели (`ui.js::DataTable`): текст ячейки, поиск и
+// отметки строк.
 
 /** Текст значения строки: массив — через запятую, `null`/`undefined` — пусто. */
 export function cellText(row, key) {
@@ -16,4 +17,18 @@ export function filterRows(rows, columns, query) {
   if (needle === '') return list;
   const searchable = (columns || []).filter((column) => column.search);
   return list.filter((row) => searchable.some((column) => cellText(row, column.key).toLowerCase().includes(needle)));
+}
+
+/** Все видимые строки отмечены (`visible` — ключи строк после поиска). */
+export function allSelected(selected, visible) {
+  return visible.length > 0 && visible.every((key) => selected.includes(key));
+}
+
+/**
+ * «Выбрать все» действует только на видимые строки: снимает их отметки, если
+ * все видимые отмечены, иначе добавляет; отметки скрытых поиском строк не меняются.
+ */
+export function toggleVisible(selected, visible) {
+  if (allSelected(selected, visible)) return selected.filter((key) => !visible.includes(key));
+  return [...selected, ...visible.filter((key) => !selected.includes(key))];
 }

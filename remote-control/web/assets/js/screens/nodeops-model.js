@@ -1,8 +1,8 @@
-// Модель вкладок ноды «Подключения», «AmneziaWG» и экрана «Telegram Proxy» —
-// перенос чистой логики `tui/src/nodes.rs` (`synced_node`, `sync_problem`,
-// `assign_connections`, `awg_node`, argv команд, таблица `telegram_table`).
-// Без DOM и вендоренных файлов. Тоны: `ok` (GREEN), `warn` (YELLOW), `error`
-// (RED), `neutral` (DIM).
+// Модель обзора подключений нод, вкладок ноды «Подключения», «AmneziaWG» и
+// экрана «Telegram Proxy» — перенос чистой логики `tui/src/nodes.rs`
+// (`Connections::run`, `synced_node`, `sync_problem`, `assign_connections`,
+// `awg_node`, argv команд, таблица `telegram_table`). Без DOM и вендоренных
+// файлов. Тоны: `ok` (GREEN), `warn` (YELLOW), `error` (RED), `neutral` (DIM).
 
 /** Пустой выбор (`nodes.rs::EMPTY`). */
 export const EMPTY = 'Нет объектов для выбора';
@@ -33,6 +33,54 @@ export function syncProblem(status) {
     case 'skipped': return 'пропущена';
     default: return null;
   }
+}
+
+/** Данные синхронизации из ответа `conn sync`: `data`, при `partial` — `error`; иначе `null`. */
+export function syncData(reply) {
+  if (reply.ok) return reply.data;
+  if (reply.error && reply.error.code === 'partial') return reply.error;
+  return null;
+}
+
+/**
+ * Обзор подключений всех нод (`Connections::run`): ноды `conn list` с
+ * состоянием последней синхронизации. Группа: `назначено/всего`, тон — все
+ * назначены (`ok`), часть (`warn`), всего неизвестно или 0 (`neutral`).
+ */
+export function overviewNodes(list, synced) {
+  return rows(list).map((entry) => {
+    const name = nodeText(entry.node);
+    const state = syncedNode(synced, name);
+    const problem = state ? syncProblem(state.status) : null;
+    if (problem) return { name, problem, groups: [] };
+    const total = state && Array.isArray(state.discovered) ? state.discovered.length : null;
+    const groups = rows(entry.groups).map((group) => {
+      const assigned = rows(group.proxies).length;
+      const tone = total !== null && total > 0 ? (assigned >= total ? 'ok' : 'warn') : 'neutral';
+      return { name: nodeText(group.name), count: `${assigned}/${total === null ? '?' : total}`, tone };
+    });
+    return { name, problem: null, groups };
+  });
+}
+
+/**
+ * «Синхронизировать все» (`Connections::run`, клавиша `s`): `conn sync` по
+ * всем нодам, затем `conn list`. Итог — строки обзора или `null` (сбой уже
+ * показан: текст ядра — `ctx.request`, итог — `ctx.failed`).
+ */
+export async function syncAll(ctx) {
+  const reply = await ctx.call(...connSyncArgv());
+  const synced = syncData(reply);
+  if (synced === null) {
+    if (ctx.isFailure(reply)) ctx.failed();
+    return null;
+  }
+  const listed = await ctx.call(...connListArgv());
+  if (!listed.ok) {
+    ctx.failed();
+    return null;
+  }
+  return overviewNodes(listed.data, synced);
 }
 
 /**
@@ -152,7 +200,6 @@ export const TELEGRAM_TITLE = 'Telegram Proxy';
 export const TELEGRAM_RESULT_TITLE = 'Результат Telegram Proxy';
 export const TELEGRAM_SELECT_TITLE = 'Управление Telegram Proxy';
 export const TELEGRAM_STATUS_ARGV = ['telegram', 'status', '--all'];
-export const TELEGRAM_COMPONENT_TITLE = 'Отключение способа доступа';
 export const TELEGRAM_COMPONENTS = [
   { value: 'web', label: 'Web Proxy' },
   { value: 'mtproto', label: 'MTProto Proxy' },
@@ -164,13 +211,13 @@ export const TELEGRAM_COMPONENTS = [
  * в форме ещё и способ доступа (`telegram remove --component`).
  */
 export const TELEGRAM_BATCH = [
-  { id: 'install', label: 'Включить MTProto Proxy', tone: 'create', title: 'Включение MTProto Proxy', argv: ['telegram', 'install'] },
-  { id: 'refresh-ip', label: 'Обновить IP-адрес MTProto', tone: 'change', title: 'Обновление IP-адреса MTProto', argv: ['telegram', 'refresh-ip'] },
-  { id: 'web-update', label: 'Обновить Web Proxy', tone: 'change', title: 'Обновление Web Proxy', argv: ['telegram', 'web-update'] },
-  { id: 'web-restart', label: 'Перезапустить Web Proxy', tone: 'change', title: 'Перезапуск Web Proxy', argv: ['telegram', 'web-restart'] },
-  { id: 'backend-restart', label: 'Перезапустить службу MTProxy', tone: 'change', title: 'Перезапуск службы MTProxy', argv: ['telegram', 'backend-restart'] },
-  { id: 'remove', label: 'Отключить способ доступа', tone: 'danger', title: TELEGRAM_COMPONENT_TITLE, argv: ['telegram', 'remove'], component: true },
-  { id: 'remove-all', label: 'Отключить Telegram Proxy полностью', tone: 'danger', title: 'Полное отключение Telegram Proxy', argv: ['telegram', 'remove-all'] },
+  { id: 'install', label: 'Включить MTProto Proxy', title: 'Включение MTProto Proxy', argv: ['telegram', 'install'] },
+  { id: 'refresh-ip', label: 'Обновить IP-адрес MTProto', title: 'Обновление IP-адреса MTProto', argv: ['telegram', 'refresh-ip'] },
+  { id: 'web-update', label: 'Обновить Web Proxy', title: 'Обновление Web Proxy', argv: ['telegram', 'web-update'] },
+  { id: 'web-restart', label: 'Перезапустить Web Proxy', title: 'Перезапуск Web Proxy', argv: ['telegram', 'web-restart'] },
+  { id: 'backend-restart', label: 'Перезапустить службу MTProxy', title: 'Перезапуск службы MTProxy', argv: ['telegram', 'backend-restart'] },
+  { id: 'remove', label: 'Отключить способ доступа', danger: true, title: 'Отключение способа доступа', argv: ['telegram', 'remove'], component: true },
+  { id: 'remove-all', label: 'Отключить Telegram Proxy полностью', danger: true, title: 'Полное отключение Telegram Proxy', argv: ['telegram', 'remove-all'] },
 ];
 
 /** argv пакета: `telegram remove --component C` и по одному `--name` на ноду. */

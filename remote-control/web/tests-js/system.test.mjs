@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { runConfirmed } from '../assets/js/flows.js';
 import {
-  dashboardView, attentionItems, settingsView, settingsAction, uninstallArgv, daemonLines,
+  dashboardTitle, attentionItems, updateAvailable, settingsAction, uninstallArgv, daemonLines,
   sourceView, sourceAction, importRecoveryKey, recoveryRun, githubWizardFlow, wizardAccounts,
   storageLabel, existingLabel, targetReplaceContext, passwordForm, CANCELLED, FILE_UNREADABLE, PASSWORDS_DIFFER, PASSWORD_EMPTY,
 } from '../assets/js/screens/system-model.js';
@@ -59,8 +59,6 @@ function scripted(steps, answers = []) {
   return { ctx, record, finished };
 }
 
-const flat = (line) => line.text + (line.suffix ? line.suffix.text : '');
-
 // ─── Сводка ────────────────────────────────────────────────────────────────
 
 const statusData = {
@@ -69,27 +67,10 @@ const statusData = {
   password_missing: ['ru'], ssh_setup_pending: true, subscription_host: null,
 };
 
-test('сводка: заголовок и контекст только из status (dashboard_view)', () => {
-  const view = dashboardView(statusData, '0.0.0');
-  assert.equal(view.title, 'Remote Control v1.1.0');
-  assert.equal(view.update.text, 'Доступно обновление v1.2.0 — раздел «Настройки»');
-  assert.equal(view.update.tone, 'warn');
-  assert.deepEqual(view.context.map(flat), [
-    'Источник: GitHub o/r • ожидает отправки', 'Ноды: 2  Клиенты: 1  Группы: 3', 'Хост подписок не задан',
-    'Нет пароля SSH: ru', 'Отложена SSH-настройка нод — раздел «Ноды» → «Завершить отложенную SSH-настройку»',
-  ]);
-  assert.equal(view.context[0].suffix.tone, 'warn');
-  assert.equal(view.context[2].tone, 'dim');
-  assert.equal(view.context[3].tone, 'warn');
-  const local = dashboardView({
-    version: '1.1.0', update: { available: false }, source: { type: 'local' }, counts: { nodes: 0, groups: 3, clients: 0 },
-    password_missing: [], ssh_setup_pending: false, subscription_host: 'de',
-  }, '0.0.0');
-  assert.equal(local.update, null);
-  assert.deepEqual(local.context.map(flat), ['Источник: локальная', 'Ноды: 0  Клиенты: 0  Группы: 3', 'Хост подписок: de']);
-  assert.equal(dashboardView({ source: { type: 'github', repo: 'o/r', sync: 'clean' } }).context[0].suffix.tone, 'ok');
-  // Без `version` в `status` — версия демона из `hello`.
-  assert.equal(dashboardView({}, 'test').title, 'Remote Control vtest');
+test('сводка: заголовок — версия из status, без неё — из hello (dashboard_view)', () => {
+  assert.equal(dashboardTitle(statusData, '0.0.0'), 'Remote Control v1.1.0');
+  assert.equal(dashboardTitle({}, 'test'), 'Remote Control vtest');
+  assert.equal(dashboardTitle(null, '2.0.0'), 'Remote Control v2.0.0');
 });
 
 test('сводка: «Требует внимания» из status и hello', () => {
@@ -113,20 +94,11 @@ test('сводка: «Требует внимания» из status и hello', (
 
 const version = (available) => ok({ current: '1.1.0', latest: available ? 'v1.2.0' : null, update_available: available, checked: available });
 
-test('настройки: действия и контекст (settings_view)', () => {
-  const plain = settingsView(version(false), false);
-  assert.deepEqual(plain.actions.map((a) => a.key), ['l', 'x']);
-  assert.deepEqual(plain.context.map((l) => l.text), ['Версия: v1.1.0', 'Не удалось проверить обновления', 'Пароль запуска: не установлен']);
-  assert.equal(plain.actions[0].label, 'Установить пароль запуска');
-  const full = settingsView(version(true), true);
-  assert.deepEqual(full.actions.map((a) => a.key), ['u', 'l', 'r', 'x']);
-  assert.deepEqual(full.actions.map((a) => a.tone), ['change', 'change', 'danger', 'danger']);
-  assert.ok(full.context.some((l) => l.text === 'Последняя: v1.2.0'));
-  assert.ok(full.available);
-  // `self version` не удался — только строка пароля.
-  const failed = settingsView(error('failed'), true);
-  assert.deepEqual(failed.context.map((l) => l.text), ['Пароль запуска: установлен']);
-  assert.equal(failed.available, false);
+test('настройки: обновление только при update_available, удаление — объём данных (settings_view)', () => {
+  assert.equal(updateAvailable(version(false)), false);
+  assert.equal(updateAvailable(version(true)), true);
+  assert.equal(updateAvailable(error('failed')), false);
+  assert.equal(updateAvailable(null), false);
   assert.deepEqual(uninstallArgv('keep'), ['self', 'uninstall']);
   assert.deepEqual(uninstallArgv('remove'), ['self', 'uninstall', '--remove-data']);
 });
@@ -197,21 +169,13 @@ test('настройки: блок «Демон» из daemon status, отсут
 
 const sourceData = (storage) => ({ type: 'github', repo: 'o/r', branch: 'main', storage, sync: 'clean', key_saved: false });
 const localData = { type: 'local', repo: null, branch: null, storage: null, sync: null, key_saved: null };
-const keys = (view) => view.sections.flat().map((item) => item.key);
-
-test('источник: действия по хранению и цвета (source_view)', () => {
+test('источник: клавиши действий по режиму и хранению (source_view)', () => {
   const age = sourceView(sourceData('age'));
-  assert.deepEqual(keys(age), ['f', 'p', 'c', 'r', 'v', 'k', 'e', 'l', 'd']);
-  for (const item of age.sections.flat()) {
-    assert.equal(item.tone, ['v', 'l', 'd'].includes(item.key) ? 'danger' : 'change', item.key);
-  }
-  assert.deepEqual(age.context.map(flat), ['GitHub: o/r', 'Ветка: main', 'Хранение: зашифровано', 'Синхронизация: синхронизировано']);
-  assert.equal(age.context[3].suffix.tone, 'ok');
-  assert.deepEqual(keys(sourceView(sourceData('none'))), ['f', 'p', 'c', 'e', 'l', 'd']);
-  const local = sourceView(localData);
-  assert.deepEqual(keys(local), ['g']);
-  assert.equal(local.sections[0][0].tone, 'create');
-  assert.deepEqual(local.context.map(flat), ['Источник: локальная']);
+  assert.deepEqual([age.github, age.encrypted], [true, true]);
+  assert.deepEqual(age.keys, ['f', 'p', 'c', 'r', 'v', 'k', 'e', 'l', 'd']);
+  const plain = sourceView(sourceData('none'));
+  assert.deepEqual([plain.encrypted, plain.keys], [false, ['f', 'p', 'c', 'e', 'l', 'd']]);
+  assert.deepEqual(sourceView(localData), { github: false, encrypted: false, keys: ['g'] });
 });
 
 test('источник: синхронизация, переключение и ключ восстановления', async () => {

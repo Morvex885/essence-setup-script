@@ -1,7 +1,7 @@
-// Тесты theme.js: выбор, тема документа, цикл кнопки, слежение за системой.
+// Тесты theme.js: выбор, тема документа, слежение за системой.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { THEME_KEY, readChoice, storeChoice, resolve, nextChoice, apply, watch } from '../assets/js/theme.js';
+import { THEME_KEY, readChoice, storeChoice, resolve, apply, watch } from '../assets/js/theme.js';
 
 const store = (initial = {}) => {
   const data = new Map(Object.entries(initial));
@@ -21,14 +21,11 @@ test('readChoice: неизвестное, пустое и недоступное
   assert.deepEqual([...saved.data.keys()], [THEME_KEY], 'хранится только выбор темы');
 });
 
-test('resolve и nextChoice', () => {
+test('resolve: выбор и системная настройка', () => {
   assert.equal(resolve('system', true), 'essence-dark');
   assert.equal(resolve('system', false), 'essence-light');
   assert.equal(resolve('light', true), 'essence-light');
   assert.equal(resolve('dark', false), 'essence-dark');
-  assert.equal(nextChoice('system'), 'light');
-  assert.equal(nextChoice('light'), 'dark');
-  assert.equal(nextChoice('dark'), 'system');
 });
 
 test('watch: применяет тему и следит за системной настройкой', () => {

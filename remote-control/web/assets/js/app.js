@@ -47,6 +47,9 @@ const SILENT_ACTIVITY = new Set(['template check']);
 /** Хеш маршрута раздела; сводка — `#/`. */
 const href = (name, param = null, tab = null) => router.format(name === 'summary' ? '' : name, param, tab);
 
+/** Маршрут экрана: неизвестный раздел — сводка (ключ экрана — `router.screenKey`). */
+const screenRoute = (route) => (SCREENS[route.name] ? route : { ...route, name: 'summary' });
+
 const menuEntries = (active) => MENU.map((item) => (item.divider ? item : {
   ...item,
   href: href(item.name),
@@ -90,7 +93,8 @@ export function App({ win = window, deps = {} }) {
   // Защита ухода со страницы с несохранёнными изменениями (`ctx.setLeaveGuard`).
   const leaveGuard = useRef(null);
   const currentHash = useRef(String(win.location.hash || ''));
-  const skipHash = useRef(false);
+  const leavePending = useRef(false); // вопрос защиты открыт
+  const routeRef = useRef(route);
 
   // Одноразовый код из `#ticket=…`: фрагмент стирается сразу, код уходит
   // только с первым `session open` и до отправки ждёт в `ticketRef`.
@@ -149,32 +153,40 @@ export function App({ win = window, deps = {} }) {
     return () => win.removeEventListener('beforeunload', onUnload);
   }, []);
 
-  /** Смена маршрута с учётом защиты ухода: отказ возвращает прежний адрес. */
+  /** Применить маршрут; смена экрана закрывает его окна (кроме окон операций). */
+  const applyRoute = (next, hash) => {
+    currentHash.current = hash;
+    if (router.screenKey(screenRoute(next)) !== router.screenKey(screenRoute(routeRef.current))) dialogs.api.cancelAll();
+    routeRef.current = next;
+    setRoute(next);
+  };
+
+  /**
+   * Смена маршрута с учётом защиты ухода (`router.routeDecision`): вопрос
+   * задаётся один раз, пока он открыт, новые смены адреса ждут его итога;
+   * отказ возвращает прежний адрес через `history.replaceState` (без новой
+   * записи истории и без `hashchange`), согласие применяет последний адрес.
+   */
   const onRoute = (next) => {
     const hash = String(win.location.hash || '');
-    if (skipHash.current) {
-      skipHash.current = false;
-      if (hash === currentHash.current) return;
-    }
     const guard = leaveGuard.current;
-    if (guard && hash !== currentHash.current) {
-      const previous = currentHash.current;
-      (async () => {
-        let leave = false;
-        try { leave = Boolean(await guard()); } catch { leave = false; }
-        if (!leave) {
-          skipHash.current = true;
-          win.location.hash = previous;
-          return;
-        }
-        leaveGuard.current = null;
-        currentHash.current = String(win.location.hash || '');
-        setRoute(router.parse(win.location.hash));
-      })();
-      return;
-    }
-    currentHash.current = hash;
-    setRoute(next);
+    const decision = router.routeDecision({ hash, current: currentHash.current, guarded: Boolean(guard), pending: leavePending.current });
+    if (decision === 'wait') return;
+    if (decision === 'apply') { applyRoute(next, hash); return; }
+    leavePending.current = true;
+    const previous = currentHash.current;
+    (async () => {
+      let leave = false;
+      try { leave = Boolean(await guard()); } catch { leave = false; }
+      leavePending.current = false;
+      if (!leave) {
+        win.history.replaceState(win.history.state, '', router.hashUrl(win.location, previous));
+        return;
+      }
+      leaveGuard.current = null;
+      const latest = String(win.location.hash || '');
+      applyRoute(router.parse(latest), latest);
+    })();
   };
 
   useEffect(() => {
@@ -245,7 +257,7 @@ export function App({ win = window, deps = {} }) {
   }, [route.name, journal]);
 
   const ctx = makeContext({
-    connection, dialogs: dialogs.api, notify, hello, status, win,
+    connection, dialogs: dialogs.api, notify, record, hello, status, win,
     refreshStatus: () => loadStatus(),
     openTerminal: (argv, title) => new Promise((resolve) => setTerminalState({ argv, title, resolve })),
     restart: (kind) => {
@@ -402,8 +414,9 @@ export function App({ win = window, deps = {} }) {
   const journalErrors = journal.filter((entry) => entry.level === 'error' && entry.id > journalSeen).length;
   const version = hello ? `essence-rc ${fmt.versionLabel(hello.version)}` : '';
 
-  const Screen = SCREENS[route.name] || SCREENS.summary;
-  const screenName = SCREENS[route.name] ? route.name : 'summary';
+  const screen = screenRoute(route);
+  const Screen = SCREENS[screen.name];
+  const screenName = screen.name;
   const body = restart === 'uninstall'
     ? html`<div class="gate"><${Card} title="essence-rc удалён"><p>Панель больше недоступна. Закройте эту вкладку.</p><//></div>`
     : restart === 'update'
@@ -412,7 +425,7 @@ export function App({ win = window, deps = {} }) {
         ? html`<${Layout} menu=${menuEntries(screenName)} source=${source} linkState=${linkState}
               activity=${activity ? fmt.activityIndicator(activity) : null} banner=${banner}
               themeChoice=${themeChoice} onTheme=${setTheme} version=${version} journalErrors=${journalErrors}>
-            <${Screen} key=${`${screenName}/${route.param || ''}`} ctx=${ctx} param=${route.param} tab=${route.tab} />
+            <${Screen} key=${router.screenKey(screen)} ctx=${ctx} param=${route.param} tab=${route.tab} />
           <//>`
         : gateView();
 
@@ -456,8 +469,9 @@ function silent(reply, expect) {
 /**
  * Контекст экранов — аналог `tui::app::Context`:
  * - `request(argv, { secrets, input, onLog, expect, operation, quiet })` → ответ;
- *   текст ошибки показывается здесь ровно один раз (кроме планов, `*_required`,
- *   кодов `expect` и `quiet`); `operation` — заголовок окна операции со строками журнала;
+ *   текст ошибки показывается здесь ровно один раз (кроме планов, `*_required`
+ *   и кодов `expect`); с `quiet` — только записью «warn» в журнале, без
+ *   снэкбара; `operation` — заголовок окна операции со строками журнала;
  * - `confirm`, `askSecret`, `ask`, `choose`, `toggle`, `form`, `show`, `operation` — диалоги;
  * - `runConfirmed(title, question, argv, { secrets, input })`,
  *   `nodeRequest(name, argv, review)` — `flows.js` с этим контекстом;
@@ -469,7 +483,9 @@ function silent(reply, expect) {
  * - `journal`, `clearJournal()`, `theme: { choice, dark, set(choice) }` (`dark` — применённая тема),
  *   `setLeaveGuard(async () => boolean | null)` — вопрос перед уходом с экрана.
  */
-function makeContext({ connection, dialogs, notify, hello, status, win, refreshStatus, openTerminal, restart, journal, clearJournal, theme, setLeaveGuard }) {
+function makeContext({ connection, dialogs, notify, record, hello, status, win, refreshStatus, openTerminal, restart, journal, clearJournal, theme, setLeaveGuard }) {
+  // Закрытие окон при смене экрана — дело каркаса, не экранов.
+  const { cancelAll, ...dialogApi } = dialogs;
   const ctx = {
     hello,
     status,
@@ -478,7 +494,7 @@ function makeContext({ connection, dialogs, notify, hello, status, win, refreshS
     clearJournal,
     theme,
     setLeaveGuard,
-    ...dialogs,
+    ...dialogApi,
     async request(argv, options = {}) {
       const { secrets, input, onLog, expect = null, operation = null, quiet = false } = options;
       const progress = operation ? dialogs.operation(operation) : null;
@@ -491,7 +507,11 @@ function makeContext({ connection, dialogs, notify, hello, status, win, refreshS
         },
       });
       if (progress) progress.finish();
-      if (!quiet && !silent(reply, expect)) notify('error', fmt.errorMessage(reply));
+      if (!silent(reply, expect)) {
+        // Фоновое чтение с `quiet`: экран показывает недоступность сам, причина — в журнале.
+        if (quiet) record('warn', fmt.errorMessage(reply));
+        else notify('error', fmt.errorMessage(reply));
+      }
       return reply;
     },
     call: (...words) => ctx.request(words),

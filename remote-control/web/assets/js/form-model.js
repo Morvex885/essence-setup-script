@@ -19,11 +19,21 @@ function blank(field) {
   return '';
 }
 
-/** Значения формы: `value` поля (секреты — пусто) или пустое значение типа. */
+/** `value` поля `select` есть среди доступных вариантов. */
+function offered(field) {
+  return list(field.options).some((option) => !option.disabled && option.value === field.value);
+}
+
+/**
+ * Значения формы: `value` поля или пустое значение типа. Секретные поля
+ * всегда начинаются пустыми; `select` со значением не из доступных вариантов
+ * начинается с первого доступного (то, что видно в списке, и уходит в итог).
+ */
 export function initialValues(fields) {
   const values = {};
   for (const field of list(fields)) {
-    if (field.value === undefined || field.value === null) values[field.name] = blank(field);
+    if (field.value === undefined || field.value === null || field.type === 'secret') values[field.name] = blank(field);
+    else if (field.type === 'select' && !offered(field)) values[field.name] = blank(field);
     else if (field.type === 'multi') values[field.name] = [...list(field.value)];
     else values[field.name] = field.value;
   }

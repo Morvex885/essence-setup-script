@@ -54,3 +54,13 @@ test('result: копия значений видимых полей', () => {
   out.groups.push('c');
   assert.deepEqual(values.groups, ['a', 'b']);
 });
+
+test('initialValues: select не из доступных вариантов — первый доступный, секрет — всегда пусто', () => {
+  const options = [{ value: 'x', label: 'x', disabled: true }, { value: 'y', label: 'y' }, { value: 'z', label: 'z' }];
+  assert.deepEqual(initialValues([
+    { name: 'gone', type: 'select', value: 'missing', options },
+    { name: 'off', type: 'select', value: 'x', options },
+    { name: 'kept', type: 'select', value: 'z', options },
+    { name: 'secret', type: 'secret', value: 'leaked' },
+  ]), { gone: 'y', off: 'y', kept: 'z', secret: '' });
+});

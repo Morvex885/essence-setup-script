@@ -20,7 +20,8 @@ export function TerminalOverlay({ title, argv, start, onClosed }) {
   const session = useRef(null);
   const [reply, setReply] = useState(null);
   const [opened, setOpened] = useState(false);
-  useModalFocus(overlay, closeButton);
+  // Окно диалога поверх терминала держит фокус само.
+  useModalFocus(overlay, closeButton, () => !document.querySelector('.modal.modal-open'));
   // Итог (и ошибка до `open`) заменяет кнопку «Закрыть»: фокус — на новую.
   useEffect(() => {
     if (reply !== null) closeButton(overlay.current).focus();

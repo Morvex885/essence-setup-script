@@ -1,7 +1,7 @@
-// Тесты router.js: разбор и сборка `#/раздел/параметр/вкладка`.
+// Тесты router.js: разбор и сборка `#/раздел/параметр/вкладка`, решение защиты ухода.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parse, format, navigate, consumeTicket } from '../assets/js/router.js';
+import { parse, format, navigate, consumeTicket, routeDecision, hashUrl, screenKey } from '../assets/js/router.js';
 
 test('parse: раздел, параметр и вкладка декодируются по отдельности', () => {
   assert.deepEqual(parse('#/nodes/a%2Fb/awg'), { name: 'nodes', param: 'a/b', tab: 'awg' });
@@ -33,4 +33,21 @@ test('navigate и consumeTicket работают с переданным окн�
   navigate(win, 'clients', 'alice', 'access');
   assert.equal(win.location.hash, '#/clients/alice/access');
   assert.equal(consumeTicket(win), null);
+});
+
+test('защита ухода: один вопрос, новые смены ждут его итога, без защиты — сразу', () => {
+  const base = { hash: '#/nodes', current: '#/templates/a', guarded: true, pending: false };
+  assert.equal(routeDecision(base), 'ask');
+  assert.equal(routeDecision({ ...base, pending: true }), 'wait');
+  assert.equal(routeDecision({ ...base, guarded: false }), 'apply');
+  // Тот же адрес (первый вызов `start`, восстановление) — без вопроса.
+  assert.equal(routeDecision({ ...base, hash: '#/templates/a' }), 'apply');
+});
+
+test('hashUrl и screenKey: адрес для replaceState и ключ экрана без вкладки', () => {
+  const location = { pathname: '/', search: '?x=1' };
+  assert.equal(hashUrl(location, '#/templates/a'), '/?x=1#/templates/a');
+  assert.equal(hashUrl(location, ''), '/?x=1');
+  assert.equal(screenKey(parse('#/nodes/a/awg')), screenKey(parse('#/nodes/a/connections')));
+  assert.notEqual(screenKey(parse('#/nodes/a')), screenKey(parse('#/nodes/b')));
 });

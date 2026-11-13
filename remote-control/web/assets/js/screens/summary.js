@@ -3,9 +3,10 @@
 // действия (добавить ноду или клиента, сгенерировать конфиги).
 import { html } from '../../vendor/preact-htm.js';
 import { Page, Card, Stats, Stat, Empty, Badge, Button } from '../ui.js';
-import { useCommand, useBusy, Loaded, rows } from './kit.js';
-import { dashboardView, attentionItems } from './system-model.js';
-import { addNodeFlow, setNodePassword, setupSsh } from './nodes.js';
+import { useCommand, useBusy, useMounted, Loaded, rows } from './kit.js';
+import { dashboardTitle, attentionItems } from './system-model.js';
+import { setNodePassword, setupSsh } from './nodes.js';
+import { addNodeFlow } from './nodes-model.js';
 import { addClientFlow } from './clients.js';
 import { generateFlow } from './generate.js';
 
@@ -15,12 +16,13 @@ export function SummaryScreen({ ctx }) {
   const state = useCommand(ctx, ['status']);
   const subscriptions = useCommand(ctx, ['subscription', 'list'], [], { quiet: true });
   const [busy, run] = useBusy();
+  const mounted = useMounted();
   const version = ctx.hello && typeof ctx.hello.version === 'string' ? ctx.hello.version : '';
-  const reload = async () => {
-    await Promise.all([state.reload(), subscriptions.reload()]);
-    ctx.refreshStatus();
-  };
+  // Шапка перечитывает `status` сама по окончании изменяющей команды.
+  const reload = () => Promise.all([state.reload(), subscriptions.reload()]);
   const act = (action) => run(async () => { await action(); await reload(); });
+  /** Переход к созданному объекту — только пока сводка открыта. */
+  const go = (name) => (param) => { if (mounted.current) ctx.navigate(name, param); };
   const resolve = (item) => {
     const { action } = item;
     if (action.type === 'password') return act(() => setNodePassword(ctx, action.node));
@@ -28,15 +30,15 @@ export function SummaryScreen({ ctx }) {
     return ctx.navigate(action.route);
   };
   const actions = html`
-    <${Button} kind="primary" icon="plus" disabled=${busy} onClick=${() => act(() => addNodeFlow(ctx))}>Добавить ноду<//>
-    <${Button} icon="plus" disabled=${busy} onClick=${() => act(() => addClientFlow(ctx))}>Добавить клиента<//>
+    <${Button} kind="primary" icon="plus" disabled=${busy} onClick=${() => act(() => addNodeFlow(ctx, go('nodes')))}>Добавить ноду<//>
+    <${Button} icon="plus" disabled=${busy} onClick=${() => act(() => addClientFlow(ctx, go('clients')))}>Добавить клиента<//>
     <${Button} icon="wand-sparkles" disabled=${busy} onClick=${() => act(() => generateFlow(ctx))}>Сгенерировать конфиги<//>`;
   return html`<${Loaded} title="Сводка" state=${state}>${(data) => {
-    const view = dashboardView(data, version);
+    const title = dashboardTitle(data, version);
     const counts = (data && data.counts) || {};
     const subs = subscriptions.reply === null ? '…' : subscriptions.reply.ok ? String(rows(subscriptions.data).length) : '—';
     const items = attentionItems(data, ctx.hello);
-    return html`<${Page} title="Сводка" subtitle=${view.title} actions=${actions}>
+    return html`<${Page} title="Сводка" subtitle=${title} actions=${actions}>
       <${Stats}>
         <${Stat} label="Ноды" value=${count(counts.nodes)} href=${ctx.href('nodes')} />
         <${Stat} label="Клиенты" value=${count(counts.clients)} href=${ctx.href('clients')} />

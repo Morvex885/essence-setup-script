@@ -1,7 +1,7 @@
-// Тесты table-model.js: текст ячейки и поиск по колонкам `search: true`.
+// Тесты table-model.js: текст ячейки, поиск по колонкам `search: true` и отметки строк.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { cellText, filterRows } from '../assets/js/table-model.js';
+import { cellText, filterRows, allSelected, toggleVisible } from '../assets/js/table-model.js';
 
 const columns = [
   { key: 'name', label: 'Название', search: true },
@@ -29,4 +29,14 @@ test('filterRows: без учёта регистра и только по кол
   assert.equal(filterRows(rows, columns, '  ').length, 3);
   assert.equal(filterRows(rows, columns, ''), rows);
   assert.deepEqual(filterRows(null, columns, 'x'), []);
+});
+
+test('«Выбрать все» действует только на видимые строки', () => {
+  assert.equal(allSelected(['a'], []), false);
+  assert.equal(allSelected(['a', 'b', 'x'], ['a', 'b']), true);
+  // Поиск показывает a и b: отметка x (скрыта) остаётся, видимые добавляются.
+  assert.deepEqual(toggleVisible(['x'], ['a', 'b']), ['x', 'a', 'b']);
+  assert.deepEqual(toggleVisible(['x', 'a'], ['a', 'b']), ['x', 'a', 'b']);
+  // Все видимые отмечены — снимаются только они.
+  assert.deepEqual(toggleVisible(['x', 'a', 'b'], ['a', 'b']), ['x']);
 });

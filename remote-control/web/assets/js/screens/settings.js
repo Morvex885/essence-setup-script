@@ -6,7 +6,7 @@ import { html } from '../../vendor/preact-htm.js';
 import { Page, Card, Facts, Badge, Button, Segmented } from '../ui.js';
 import { versionLabel } from '../format.js';
 import { useCommand, useCommands, useBusy, Loaded, ReadFailed } from './kit.js';
-import { settingsView, settingsAction, daemonLines } from './system-model.js';
+import { updateAvailable, settingsAction, daemonLines } from './system-model.js';
 
 const THEMES = [
   { value: 'system', label: 'Системная', icon: 'monitor' },
@@ -23,17 +23,16 @@ export function SettingsScreen({ ctx }) {
   const status = { reply: state.replies && state.replies.status, data: state.data && state.data.status, loading: state.loading, reload: state.reload };
   return html`<${Loaded} title="Настройки" state=${status}>${(data) => {
     const password = data.script_password === true;
-    const view = settingsView(version.reply, password);
+    const available = updateAvailable(version.reply);
     const act = (key) => run(async () => {
-      const restart = await settingsAction(ctx, key, { password, available: view.available });
+      const restart = await settingsAction(ctx, key, { password, available });
       if (restart) { ctx.restart(restart); return; }
       await state.reload();
-      ctx.refreshStatus();
     });
     const disabled = busy || state.loading;
     const info = version.reply && version.reply.ok ? (version.reply.data || {}) : null;
     return html`<${Page} title="Настройки">
-      <${Card} title="Версия" actions=${view.available && html`<${Button} kind="primary" icon="download" disabled=${disabled}
+      <${Card} title="Версия" actions=${available && html`<${Button} kind="primary" icon="download" disabled=${disabled}
         onClick=${() => act('u')}>Обновить remote-control<//>`}>
         ${!version.reply
           ? html`<p class="t-dim">Загрузка…</p>`
@@ -42,7 +41,7 @@ export function SettingsScreen({ ctx }) {
             : html`<${Facts} items=${[
                 { label: 'Установлена', value: versionLabel(typeof info.current === 'string' ? info.current : '') },
                 { label: 'Последняя', value: info.checked === true ? versionLabel(typeof info.latest === 'string' ? info.latest : '') : html`<span class="t-dim">не удалось проверить</span>` },
-                { label: 'Обновление', value: view.available ? html`<${Badge} tone="info">доступно<//>` : html`<${Badge} tone="neutral">нет<//>` },
+                { label: 'Обновление', value: available ? html`<${Badge} tone="info">доступно<//>` : html`<${Badge} tone="neutral">нет<//>` },
               ]} />`}
       <//>
       <${Card} title="Пароль запуска" actions=${html`

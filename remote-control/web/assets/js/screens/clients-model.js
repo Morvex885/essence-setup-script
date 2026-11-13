@@ -47,11 +47,6 @@ export function nodeLabel(row) {
 
 // ─── Клиенты ────────────────────────────────────────────────────────────────
 
-/** Подпись клиента в списке: `name  (group)`. */
-export function clientLabel(row) {
-  return `${str(row.name)}  (${str(row.group)})`;
-}
-
 export function deleteClientsArgv(selected) {
   const argv = ['client', 'delete'];
   for (const name of selected) argv.push('--name', name);
@@ -157,6 +152,15 @@ export function assignedProxies(assigned, node) {
   return rowsOf(assigned).filter((row) => row && row.node === node).flatMap((row) => strings(row.proxies));
 }
 
+/**
+ * Свои ноды клиента для таблицы «Подключения по нодам»: `missing` — ноды нет
+ * в `node list` (удалена). Пока список не прочитан (`null`), отметок нет.
+ */
+export function ownNodeRows(nodes, nodeList) {
+  const known = nodeList === null || nodeList === undefined ? null : names(nodeList);
+  return strings(nodes).map((name) => ({ name, missing: known !== null && !known.includes(name) }));
+}
+
 /** Найденные на ноде прокси из `conn list --discover`. */
 export function discoveredProxies(found) {
   return strings(rowsOf(found)[0] && rowsOf(found)[0].discovered);
@@ -201,9 +205,11 @@ export function ttlValue(values) {
   return values.ttl === 'custom' ? values.custom : values.ttl;
 }
 
-/** Проверка своего срока: число и `h`, `d` или `w`. */
+export const TTL_INVALID = 'Срок: число от 1 до 999999 без ведущего нуля и h, d или w, например 7d';
+
+/** Проверка своего срока по правилу ядра (`subscription::ttl_expiry`): 1–6 цифр без ведущего 0 и `h|d|w`. */
 export function ttlError(value) {
-  return /^[0-9]+[hdw]$/.test(value) ? null : 'Срок: число и h, d или w, например 7d';
+  return /^[1-9][0-9]{0,5}[hdw]$/.test(String(value || '')) ? null : TTL_INVALID;
 }
 
 /** `ttl === null` — без `--ttl` (ядро сохраняет текущий срок). */
@@ -218,9 +224,10 @@ export function published(reply) {
   return reply.ok || Boolean(reply.error && reply.error.code === 'partial');
 }
 
-/** Строка хоста подписок; `null` — хост не задан. */
+/** Строка хоста подписок: задан, не задан или не прочитан (сбой чтения — не «не задан»). */
 export function hostLine(reply) {
-  const node = reply && reply.ok && reply.data && typeof reply.data.node === 'string' && reply.data.node !== '' ? reply.data.node : null;
+  if (!reply || !reply.ok) return { text: 'Хост подписок: не удалось прочитать', tone: 'warn' };
+  const node = reply.data && typeof reply.data.node === 'string' && reply.data.node !== '' ? reply.data.node : null;
   return node === null
     ? { text: 'Хост подписок не задан — раздел «Подписки»', tone: 'dim' }
     : { text: `Хост подписок: ${node}`, tone: null };

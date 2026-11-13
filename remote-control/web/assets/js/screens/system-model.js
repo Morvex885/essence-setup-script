@@ -100,66 +100,18 @@ export function attentionItems(status, hello) {
   return items;
 }
 
-const count = (value) => (Number.isInteger(value) && value >= 0 ? value : 0);
-
-/**
- * Заголовок и контекст сводки только из `status` (`dashboard_view`).
- * Строка контекста: `{ text, tone?, suffix?: { text, tone } }`. Вместо
- * клавиш разделов TUI («раздел o», «n → h») — названия разделов панели.
- */
-export function dashboardView(data, helloVersion = '') {
+/** Заголовок сводки (`dashboard_view`): версия из `status`, иначе из `hello`. */
+export function dashboardTitle(data, helloVersion = '') {
   const status = data && typeof data === 'object' ? data : {};
   const version = typeof status.version === 'string' ? status.version : str(helloVersion);
-  const update = status.update && status.update.available === true
-    ? { text: `Доступно обновление ${versionLabel(str(status.update.latest))} — раздел «Настройки»`, tone: 'warn' }
-    : null;
-  const context = [];
-  const source = status.source || {};
-  if (source.type === 'github') {
-    const sync = syncState(source.sync);
-    context.push({ text: `Источник: GitHub ${str(source.repo)} • `, suffix: { text: sync.label, tone: sync.tone } });
-  } else {
-    context.push({ text: 'Источник: локальная' });
-  }
-  const counts = status.counts || {};
-  context.push({ text: `Ноды: ${count(counts.nodes)}  Клиенты: ${count(counts.clients)}  Группы: ${count(counts.groups)}` });
-  const host = str(status.subscription_host);
-  context.push(host ? { text: `Хост подписок: ${host}` } : { text: 'Хост подписок не задан', tone: 'dim' });
-  const missing = strings(status.password_missing);
-  if (missing.length > 0) context.push({ text: `Нет пароля SSH: ${missing.join(', ')}`, tone: 'warn' });
-  if (status.ssh_setup_pending === true) {
-    context.push({ text: 'Отложена SSH-настройка нод — раздел «Ноды» → «Завершить отложенную SSH-настройку»', tone: 'warn' });
-  }
-  return { title: `Remote Control ${versionLabel(version)}`, update, context };
+  return `Remote Control ${versionLabel(version)}`;
 }
 
 // ─── Настройки ─────────────────────────────────────────────────────────────
 
-/**
- * Контекст и действия настроек (`settings_view`): `version` — ответ
- * `self version` (один раз за визит), `password` — `status.script_password`.
- */
-export function settingsView(version, password) {
-  const ok = Boolean(version && version.ok);
-  const data = ok && version.data ? version.data : {};
-  const available = ok && data.update_available === true;
-  const context = [];
-  if (ok) {
-    context.push({ text: `Версия: ${versionLabel(str(data.current))}` });
-    if (data.checked === true) context.push({ text: `Последняя: ${versionLabel(str(data.latest))}` });
-    else context.push({ text: 'Не удалось проверить обновления', tone: 'dim' });
-  }
-  context.push({ text: password ? 'Пароль запуска: установлен' : 'Пароль запуска: не установлен' });
-  const actions = [];
-  if (available) actions.push({ key: 'u', label: 'Обновить remote-control', tone: 'change' });
-  if (password) {
-    actions.push({ key: 'l', label: 'Сменить пароль запуска', tone: 'change' });
-    actions.push({ key: 'r', label: 'Убрать пароль запуска', tone: 'danger' });
-  } else {
-    actions.push({ key: 'l', label: 'Установить пароль запуска', tone: 'change' });
-  }
-  actions.push({ key: 'x', label: 'Удалить remote-control', tone: 'danger' });
-  return { context, actions, available };
+/** Обновление доступно по ответу `self version` (`settings_view`). */
+export function updateAvailable(version) {
+  return Boolean(version && version.ok && version.data && version.data.update_available === true);
 }
 
 /** Объём удаления → argv `self uninstall` (`Settings`, ключ `x`). */
@@ -244,42 +196,17 @@ export function daemonLines(data) {
 
 // ─── Источник конфигурации ─────────────────────────────────────────────────
 
-/** Контекст и группы действий экрана источника (`source_view`). */
+/**
+ * Режим и клавиши действий экрана источника (`source_view`): GitHub —
+ * синхронизация, смена аккаунта, при шифровании пароль, ключ и импорт ключа
+ * восстановления, затем отключение и опасные действия; локальный — только `g`.
+ */
 export function sourceView(data) {
   const status = data && typeof data === 'object' ? data : {};
   const github = status.type === 'github';
   const encrypted = github && status.storage === 'age';
-  const context = [];
-  const sections = [];
-  if (github) {
-    context.push({ text: `GitHub: ${str(status.repo)}` });
-    context.push({ text: `Ветка: ${str(status.branch)}` });
-    context.push({ text: encrypted ? 'Хранение: зашифровано' : 'Хранение: без шифрования' });
-    const sync = syncState(status.sync);
-    context.push({ text: 'Синхронизация: ', suffix: { text: sync.label, tone: sync.tone } });
-    const sync_ = [
-      { key: 'f', label: 'Загрузить из GitHub', tone: 'change' },
-      { key: 'p', label: 'Отправить в GitHub', tone: 'change' },
-      { key: 'c', label: 'Сменить аккаунт', tone: 'change' },
-    ];
-    if (encrypted) {
-      sync_.push(
-        { key: 'r', label: 'Сменить пароль доступа', tone: 'change' },
-        { key: 'v', label: 'Новый ключ шифрования', tone: 'danger' },
-        { key: 'k', label: 'Импортировать ключ восстановления', tone: 'change' },
-      );
-    }
-    sections.push(sync_);
-    sections.push([
-      { key: 'e', label: 'Работать локально без синхронизации', tone: 'change' },
-      { key: 'l', label: 'Заменить GitHub локальной конфигурацией', tone: 'danger' },
-      { key: 'd', label: 'Удалить репозиторий', tone: 'danger' },
-    ]);
-  } else {
-    context.push({ text: 'Источник: локальная' });
-    sections.push([{ key: 'g', label: 'Подключить GitHub', tone: 'create' }]);
-  }
-  return { github, encrypted, context, sections };
+  if (!github) return { github, encrypted, keys: ['g'] };
+  return { github, encrypted, keys: ['f', 'p', 'c', ...(encrypted ? ['r', 'v', 'k'] : []), 'e', 'l', 'd'] };
 }
 
 /** Ссылка для ручного действия (`source.rs::manual_link`). */
@@ -296,7 +223,6 @@ async function provision(ctx, reply, argv) {
     title: 'Переносимый SSH-ключ',
     context: [`Ноды: ${nodes.join(', ')}`],
     question: 'Создать переносимый SSH-ключ для этих нод?',
-    tone: 'create',
   });
   setFlag(argv, decisionFlag('key_provisioning_required'), yes ? 'yes' : 'no');
 }
@@ -440,7 +366,7 @@ export function targetReplaceContext(error = {}) {
 async function chooseChoice(ctx, title, choices, label) {
   const index = await ctx.choose({
     title,
-    options: choices.map((choice, position) => ({ value: position, label: label(choice), tone: 'view' })),
+    options: choices.map((choice, position) => ({ value: position, label: label(choice) })),
     cancel: 'Отмена',
   });
   return index === null || index === undefined ? null : choices[index];
@@ -460,8 +386,8 @@ export async function githubWizardFlow(ctx, mode, deps = {}) {
   const picked = await ctx.choose({
     title: 'Аккаунт GitHub',
     options: [
-      ...accounts.map((account, index) => ({ value: index, label: account, tone: 'view' })),
-      { value: accounts.length, label: OTHER_LOGIN, tone: 'view' },
+      ...accounts.map((account, index) => ({ value: index, label: account })),
+      { value: accounts.length, label: OTHER_LOGIN },
     ],
   });
   if (picked === null || picked === undefined) { cancelled(ctx); return false; }
@@ -488,7 +414,7 @@ export async function githubWizardFlow(ctx, mode, deps = {}) {
     let decided;
     switch (code) {
       case 'github_auth_required': {
-        decided = await ctx.confirm({ title: 'Вход в GitHub', question: 'Войти в GitHub через браузер сейчас?', yes: 'Войти', tone: 'view' });
+        decided = await ctx.confirm({ title: 'Вход в GitHub', question: 'Войти в GitHub через браузер сейчас?', yes: 'Войти' });
         if (decided) {
           const auth = await ctx.request(['source', 'github-login', '--login', login], { operation: 'Вход в GitHub' });
           if (!auth.ok) { ctx.failed(); return false; }
@@ -496,7 +422,7 @@ export async function githubWizardFlow(ctx, mode, deps = {}) {
         break;
       }
       case 'repo_create_required':
-        decided = await ctx.confirm({ title: 'Создание репозитория', question: `Создать приватный репозиторий ${str(error.repo)}?`, tone: 'create' });
+        decided = await ctx.confirm({ title: 'Создание репозитория', question: `Создать приватный репозиторий ${str(error.repo)}?` });
         if (decided) setFlag(argv, decisionFlag(code));
         break;
       // Приватность подтверждается один раз — планом ядра.

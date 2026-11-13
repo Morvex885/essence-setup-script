@@ -27,9 +27,9 @@ function GroupLink({ ctx, group }) {
 
 /**
  * Добавление клиента: имя и группа одной формой → `client add`; успех —
- * карточка нового клиента.
+ * `go(имя)`: экран открывает карточку, только пока смонтирован.
  */
-export async function addClientFlow(ctx) {
+export async function addClientFlow(ctx, go) {
   const read = await fetchData(ctx, ['group', 'list']);
   if (!read) return;
   const values = await ctx.form({
@@ -42,7 +42,7 @@ export async function addClientFlow(ctx) {
   });
   if (values === null || values === undefined) return;
   const reply = await execute(ctx, ['client', 'add', '--name', values.name, '--group', values.group]);
-  if (reply.ok) ctx.navigate('clients', values.name);
+  if (reply.ok) go(reply.data && typeof reply.data.name === 'string' && reply.data.name ? reply.data.name : values.name);
 }
 
 // ─── Список ─────────────────────────────────────────────────────────────────
@@ -50,6 +50,7 @@ export async function addClientFlow(ctx) {
 function ClientList({ ctx }) {
   const state = useCommand(ctx, ['client', 'list']);
   const [busy, run] = useBusy();
+  const mounted = useMounted();
   const [selected, setSelected] = useState([]);
   const act = (action) => run(async () => { await action(); await state.reload(); });
   const present = model.names(state.data);
@@ -60,7 +61,7 @@ function ClientList({ ctx }) {
     if (reply.ok || (reply.error && reply.error.code === 'partial')) setSelected([]);
   });
   const remove = (name) => act(() => confirmed(ctx, 'Удаление клиента', 'Удалить клиента?', ['client', 'delete', '--name', name]));
-  const add = () => run(() => addClientFlow(ctx));
+  const add = () => run(() => addClientFlow(ctx, (name) => { if (mounted.current) ctx.navigate('clients', name); }));
 
   const actions = html`
     ${chosen.length > 0 && html`<${Action} tone="danger" icon="trash-2" disabled=${busy} onClick=${removeSelected}>
@@ -225,6 +226,8 @@ function ClientAccess({ ctx, name, row, busy, act }) {
   const inherit = model.inherits(row);
   const nodes = model.strings(row.nodes);
   const assigned = useCommand(ctx, inherit ? null : ['client', 'connections', '--name', name], [nodes.join('\n')]);
+  // Список нод — только чтобы отметить назначенные ноды, которых больше нет.
+  const known = useCommand(ctx, inherit ? null : ['node', 'list'], [], { quiet: true });
   const change = (action) => act(async () => { await action(); if (!inherit) await assigned.reload(); });
 
   /** `clients.rs::client_nodes`: режим и свои ноды одной формой. */
@@ -275,14 +278,14 @@ function ClientAccess({ ctx, name, row, busy, act }) {
     <//>
     ${!inherit && html`<${Loaded} title="Подключения по нодам" state=${assigned} inline>
       ${(data) => html`<${Card} title="Подключения по нодам">
-        <${DataTable} rows=${nodes.map((node) => ({ name: node }))} empty="Нет своих нод"
+        <${DataTable} rows=${model.ownNodeRows(nodes, known.data)} empty="Нет своих нод"
           href=${(item) => ctx.href('nodes', item.name)}
           menu=${(item) => [
-            { label: 'Настроить', icon: 'settings', disabled: busy, onClick: () => change(() => configure(item.name)) },
+            { label: 'Настроить', icon: 'settings', disabled: busy || item.missing, onClick: () => change(() => configure(item.name)) },
             { label: 'Сбросить', icon: 'refresh-cw', danger: true, disabled: busy, onClick: () => change(() => reset(item.name)) },
           ]}
           columns=${[
-            { key: 'name', label: 'Нода' },
+            { key: 'name', label: 'Нода', render: (item) => html`${item.name}${item.missing && html` <${Badge} tone="warn">ноды больше нет<//>`}` },
             { key: 'proxies', label: 'Подключения', render: (item) => {
               const proxies = model.assignedProxies(data, item.name);
               return proxies.length === 0 ? html`<span class="t-dim">групповые</span>` : proxies.join(', ');
@@ -295,7 +298,7 @@ function ClientAccess({ ctx, name, row, busy, act }) {
 // ─── Подписка ───────────────────────────────────────────────────────────────
 
 function ClientSubscription({ ctx, name, row, busy, act }) {
-  // Нечитаемый хост только скрывает строку (v1 `sub host || true`).
+  // Нечитаемый хост не мешает действиям (v1 `sub host || true`): строка «не удалось прочитать», причина — в журнале.
   const host = useCommand(ctx, ['subscription', 'host'], [], { quiet: true });
   const isPublished = Boolean(row.subscription && row.subscription.published === true);
 

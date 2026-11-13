@@ -60,7 +60,7 @@ export function SourceScreen({ ctx }) {
   const importKey = () => ctx.show({ title: LABELS.k, body: html`<${KeyImport} ctx=${ctx} onDone=${() => state.reload()} />` });
   return html`<${Loaded} title="Источник конфигурации" state=${state}>${(data) => {
     const view = sourceView(data);
-    const keys = view.sections.flat().map((item) => item.key);
+    const { keys } = view;
     const disabled = busy || state.loading;
     if (!view.github) {
       return html`<${Page} title="Источник конфигурации">

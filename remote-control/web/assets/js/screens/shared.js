@@ -39,7 +39,7 @@ export async function loadData(ctx, title, argv) {
     if (reply.error && reply.error.code === 'not_found') return null;
     ctx.failed();
     const choice = await ctx.choose({
-      title, context: ['Данные недоступны'], options: [{ value: 'retry', label: 'Повторить', tone: 'change' }], cancel: 'Назад',
+      title, context: ['Данные недоступны'], options: [{ value: 'retry', label: 'Повторить' }], cancel: 'Назад',
     });
     if (choice !== 'retry') return null;
   }
@@ -77,7 +77,7 @@ export async function showHeaders(ctx, kind, name) {
     const choice = await ctx.choose({
       title: `Заголовки подписки: ${name}`,
       context: model.headerLines(read.data, client),
-      options: [{ value: 'set', label: 'Установить', tone: 'change' }, { value: 'unset', label: 'Удалить', tone: 'danger' }],
+      options: [{ value: 'set', label: 'Установить' }, { value: 'unset', label: 'Удалить', tone: 'danger' }],
       cancel: 'Назад',
     });
     if (choice === null || choice === undefined) return;
