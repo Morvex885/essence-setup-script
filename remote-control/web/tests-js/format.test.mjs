@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   text, joined, versionLabel, syncState, sourceLabel, scriptsState,
-  templateSource, activity, activityIndicator, openPanel, OPEN_PANEL_WARNING,
+  activity, activityIndicator, openPanel, OPEN_PANEL_WARNING,
   errorMessage, readInputFile, MAX_INPUT, FILE_TOO_LARGE, filterJournal,
 } from '../assets/js/format.js';
 
@@ -54,12 +54,6 @@ test('scriptsState: состояния скриптов ноды', () => {
   assert.equal(scriptsState('broken'), 'установка повреждена');
   assert.equal(scriptsState('unknown'), 'версия скриптов неизвестна');
   assert.equal(scriptsState(''), 'версия скриптов неизвестна');
-});
-
-test('templateSource: встроенный и пользовательский', () => {
-  assert.equal(templateSource({ source: 'builtin' }), 'встроенный');
-  assert.equal(templateSource({ source: 'file' }), 'пользовательский');
-  assert.equal(templateSource(null), 'пользовательский');
 });
 
 test('activity: подписи как в app.rs::activity', () => {

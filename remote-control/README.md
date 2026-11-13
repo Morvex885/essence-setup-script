@@ -120,7 +120,7 @@ node --test web/tests-js/*.test.mjs
 - `LOCAL` — принимается только с локального сокета (сетевым соединениям — `local_only`);
 - `CLIENT` — выполняется самим процессом клиента и демону не отправляется (демону — `usage` «Команда выполняется на стороне клиента.»).
 
-Токен `@имя` объявляет входные данные — содержимое файла. `cli::parse` (разбор демона) его не знает; `cli::parse_client` (разбор клиента) читает его как флаг `--имя PATH`, а `Invocation::daemon_argv` убирает такие флаги из argv перед отправкой демону. Содержимое клиент передаёт полем `input` запроса; в ядре это `rc_core::request_input::Input` (JSON-объект строк, значения в `Zeroizing`, без `Debug`/`Clone`/`Serialize`, ошибки не содержат имён и значений).
+Токен `@имя` объявляет входные данные — содержимое файла. `cli::parse` (разбор демона) его не знает; `cli::parse_client` (разбор клиента) читает его как флаг `--имя PATH`, а `Invocation::daemon_argv` убирает такие флаги из argv перед отправкой демону. Разовый CLI требует флаг для `@имя`; `@имя?` — необязательный вход (`Invocation::input_optional`): без флага поле не передаётся (`template check --name T`). Содержимое клиент передаёт полем `input` запроса; в ядре это `rc_core::request_input::Input` (JSON-объект строк, значения в `Zeroizing`, без `Debug`/`Clone`/`Serialize`, ошибки не содержат имён и значений).
 
 **Диспетчер**: `rc_core::dispatch::dispatch(argv, secrets, input, agent_socket, &mut Session)` — единая точка выполнения всех команд демона; `agent_socket` — SSH-агент запросившего клиента (`SSH_AUTH_SOCK` из поля `env` локального запроса, `None` — без агента). Терминальные команды идут через `prepare_terminal` с той же сигнатурой и возвращают `TerminalJob`. Единственный путь изменений состояния — `Session::mutate`.
 
@@ -220,19 +220,23 @@ Host-key callback сравнивает SHA256-отпечаток с явным �
 
 Сертификат, флаги слушателя, `web link` и коды доступа ведёт демон (`daemon/commands.rs`, `daemon/access.rs`); `web run|open` — `bin/src/webcmd.rs` (ссылка входа открывается через временный файл-переадресацию в каталоге времени выполнения, чтобы не попасть в argv).
 
-**Фронтенд** (`web/assets/`) — Preact + htm без сборки и npm (`web/package.json` — только `{"private":true,"type":"module"}`). `index.html` подключает классические скрипты вендора `xterm.js`, `xterm-addon-fit.js`, `qrcode.js` и модуль `js/app.js`; `vendor/preact-htm.js` — ES-модуль (`html`, `render`, хуки). Вендоренные файлы не правятся; версии и SHA-256 — в `assets/vendor/VENDOR.md`, тексты лицензий — `assets/vendor/LICENSE-*` (вшиваются, но не отдаются слушателем).
+**Фронтенд** (`web/assets/`) — Preact + htm и daisyUI 5 без сборки и npm (`web/package.json` — только `{"private":true,"type":"module"}`). `index.html` первым в `<head>` подключает `js/theme-boot.js` (тема до отрисовки), затем стили `vendor/xterm.css`, `vendor/daisyui.css`, `css/app.css`; в `<body>` — классические скрипты вендора `xterm.js`, `xterm-addon-fit.js`, `qrcode.js`, `ace/ace.js`, `ace/mode-yaml.js`, `ace/ext-searchbox.js`, `ace/theme-github_light_default.js`, `ace/theme-github_dark.js` и модуль `js/app.js`; `vendor/preact-htm.js` — ES-модуль (`html`, `render`, хуки). `daisyui.css` содержит только компоненты (без утилит Tailwind), темы `essence-light`/`essence-dark` и раскладка — в `css/app.css`. Иконки Lucide скопированы в `js/icons.js`. Ace работает без воркера и ничего не догружает (CSP запрещает воркеры и внешние источники). Вендоренные файлы не правятся; версии и SHA-256 — в `assets/vendor/VENDOR.md`, тексты лицензий — `assets/vendor/LICENSE-*` (вшиваются, но не отдаются слушателем).
 
 | Модуль `assets/js/` | Назначение |
 |---|---|
 | `protocol.js` | Клиент протокола v3 по WebSocket, переподключение, токен возобновления в `sessionStorage` |
 | `session.js` | Вход: код из ссылки, пароль запуска, токен возобновления |
-| `router.js` | Маршруты `#/раздел/параметр`; `consumeTicket` стирает `#ticket=` из адреса |
-| `app.js` | Каркас: меню разделов (`MENU`), контекст экранов (`makeContext`), шапка и индикаторы |
+| `router.js` | Маршруты `#/раздел/параметр/вкладка` (`parse`, `format`, `navigate`); `consumeTicket` стирает `#ticket=` из адреса |
+| `app.js` | Каркас: меню разделов (`MENU`), шапка и индикаторы, снэкбары, журнал, защита ухода (`setLeaveGuard`), тема, контекст экранов (`makeContext`) |
+| `theme.js`, `theme-boot.js` | Тема: выбор `system\|light\|dark` в `localStorage`, `data-theme` документа, слежение за системной настройкой |
 | `flows.js` | Подтверждение планом и коды решений (тот же алгоритм, что `tui/src/confirm.rs`) |
-| `format.js` | Форматирование и тексты ошибок |
-| `dialogs.js`, `ui.js` | Диалоги и общие компоненты |
+| `format.js` | Форматирование, тексты ошибок, фильтр журнала |
+| `dialogs.js` | Модальные окна (`confirm`, `askSecret`, `ask`, `choose`, `toggle`, `form`, `show`, окно операции) |
+| `form-model.js`, `table-model.js` | Чистая логика форм `ctx.form` (значения, видимость, проверка) и поиска в таблицах |
+| `ui.js`, `icons.js` | Компоненты (`Layout`, `Page`, `DataTable`, `MoreMenu`, `Card`, `Facts`, `Badge`, `Chips`, `Empty`, `Snackbars`, …) и иконки |
+| `template-editor.js` | Редактор YAML на Ace: отметки проблем `template check`, приглушение строк варианта, Ctrl/Cmd+S |
 | `terminal.js` | Терминал нод на xterm |
-| `screens/*` | Экраны разделов (`screens/index.js` — `SCREENS`), чистые модели `*-model.js`, общие хуки `kit.js` |
+| `screens/*` | Экраны разделов (`screens/index.js` — `SCREENS`, включая журнал `journal.js`), чистые модели `*-model.js`, общие хуки `kit.js`, общие действия `shared.js` |
 
 ## Автозапуск
 
@@ -261,7 +265,7 @@ Host-key callback сравнивает SHA256-отпечаток с явным �
 | `web/tests/listener.rs` | Заголовки, Host, Origin, WebSocket, остановка, отпечаток |
 | `tui/tests/boundary.rs`, `tui/src/*` | Границы крейтов; экраны на `ScriptedClient`/`ScriptedUi` (argv по клавишам, подтверждения, код → флаг, пустые и ошибочные состояния, отсутствие секретов в argv и кадрах) |
 | `core/tests/protocols_golden.rs`, `core/tests/ssh_wire.rs`, `core/tests/ssh_e2e.rs` | Golden билдеров; loopback SSH/SFTP на сервере russh; OpenSSH-сценарий |
-| `web/tests-js/*.test.mjs` | Модели экранов, `flows.js`, `format.js`, `protocol.js`, `session.js` (`node --test`, Node 22, без зависимостей) |
+| `web/tests-js/*.test.mjs` | Модели экранов, `flows.js`, `format.js`, `protocol.js`, `session.js`, `router.js`, `theme.js`, `form-model.js`, `table-model.js` (`node --test`, Node 22, без зависимостей) |
 
 CI (`.github/workflows/tests.yml`): `cargo test --workspace --locked` идёт на `ubuntu-latest`, `windows-latest`, `macos-latest` (job `rust-test`); сборка 9 целей релиза — job `rust-build`; OpenSSH-сценарий с Debian sshd (`tests/ci/ssh_e2e.sh`) — job `rust-ssh-e2e`; JS-тесты панели — job `web-js-test`.
 

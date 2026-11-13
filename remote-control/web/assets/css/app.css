@@ -361,11 +361,29 @@ a.chip:hover { border-color: var(--color-primary); color: var(--color-primary); 
 
 /* ─── Шаблоны и редактор ────────────────────────────────────────────────── */
 
-.editor-layout { display: grid; grid-template-columns: minmax(0, 1fr) 280px; gap: 1rem; align-items: start; }
-.editor-side { display: flex; flex-direction: column; gap: 1rem; }
-textarea.editor { display: block; width: 100%; min-height: 60vh; resize: vertical; white-space: pre; overflow-wrap: normal; overflow-x: auto; }
-.ace-dropped { opacity: .35; }
-@media (max-width: 1023.98px) { .editor-layout { grid-template-columns: minmax(0, 1fr); } }
+.editor-layout { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 1rem; align-items: start; }
+.editor-main { min-width: 0; }
+.editor-side { display: flex; flex-direction: column; gap: 1rem; min-width: 0; }
+.template-ace {
+  height: calc(100dvh - 210px); min-height: 360px;
+  border: 1px solid var(--line); border-radius: var(--radius-box); overflow: hidden;
+}
+/* Строки вне выбранного варианта: слой цвета фона редактора поверх текста — текст виден примерно на .35. */
+.ace-dropped { position: absolute; opacity: .65; background: #fff; pointer-events: none; }
+.ace-github-dark .ace-dropped { background: #24292e; }
+.problems { list-style: none; margin: 0; padding: 0; max-height: 45vh; overflow-y: auto; }
+.problem {
+  display: flex; gap: .5rem; width: 100%; padding: .4rem .3rem; text-align: left;
+  background: none; border: 0; border-top: 1px solid var(--line); color: inherit; font: inherit; cursor: pointer;
+}
+.problems li:first-child .problem { border-top: 0; }
+.problem:hover { background: var(--color-base-200); }
+.problem-text { display: flex; flex-direction: column; min-width: 0; overflow-wrap: anywhere; }
+.problem-line { font-size: 12px; }
+@media (max-width: 1023.98px) {
+  .editor-layout { grid-template-columns: minmax(0, 1fr); }
+  .template-ace { height: 60vh; }
+}
 
 /* ─── Вход ──────────────────────────────────────────────────────────────── */
 

@@ -50,11 +50,6 @@ export function scriptsState(state) {
   }
 }
 
-/** Происхождение шаблона (`clients.rs::source_label`). */
-export function templateSource(row) {
-  return row && row.source === 'builtin' ? 'встроенный' : 'пользовательский';
-}
-
 /** Строка выполняющейся операции по argv (`app.rs::activity`). */
 export function activity(argv) {
   const [noun = '', verb = ''] = Array.isArray(argv) ? argv : [];

@@ -83,6 +83,7 @@ export function App({ win = window, deps = {} }) {
   const [snacks, setSnacks] = useState([]);
   const snackId = useRef(0);
   const [themeChoice, setThemeChoice] = useState(() => theme.readChoice(themeStore));
+  const [themeName, setThemeName] = useState(() => theme.resolve(theme.readChoice(themeStore), theme.prefersDark(win)));
   const [terminalState, setTerminalState] = useState(null);
   const [restart, setRestart] = useState(null); // null | 'update' | 'uninstall'
   const dialogs = useDialogs();
@@ -128,11 +129,13 @@ export function App({ win = window, deps = {} }) {
   };
 
   // Тема: выбор пользователя и системная настройка.
-  useEffect(() => theme.watch(win, themeStore, (choice) => setThemeChoice(choice)), []);
+  useEffect(() => theme.watch(win, themeStore, (choice, name) => { setThemeChoice(choice); setThemeName(name); }), []);
   const setTheme = (choice) => {
     theme.storeChoice(themeStore, choice);
     setThemeChoice(choice);
-    theme.apply(win.document, theme.resolve(choice, theme.prefersDark(win)));
+    const name = theme.resolve(choice, theme.prefersDark(win));
+    setThemeName(name);
+    theme.apply(win.document, name);
   };
 
   // Уход со страницы с защитой — вопрос браузера.
@@ -251,7 +254,7 @@ export function App({ win = window, deps = {} }) {
     },
     journal,
     clearJournal: () => { setJournal([]); setJournalSeen(journalId.current); },
-    theme: { choice: themeChoice, set: setTheme },
+    theme: { choice: themeChoice, dark: themeName === 'essence-dark', set: setTheme },
     setLeaveGuard: (guard) => { leaveGuard.current = typeof guard === 'function' ? guard : null; },
   });
 
@@ -463,7 +466,7 @@ function silent(reply, expect) {
  *   ответ после закрытия оверлея (`{ expect }` — как у `request`), `wizard(mode)` →
  *   `true` при успехе мастера GitHub, `restart('update'|'uninstall')`,
  *   `refreshStatus()`, `hello`, `status`;
- * - `journal`, `clearJournal()`, `theme: { choice, set(choice) }`,
+ * - `journal`, `clearJournal()`, `theme: { choice, dark, set(choice) }` (`dark` — применённая тема),
  *   `setLeaveGuard(async () => boolean | null)` — вопрос перед уходом с экрана.
  */
 function makeContext({ connection, dialogs, notify, hello, status, win, refreshStatus, openTerminal, restart, journal, clearJournal, theme, setLeaveGuard }) {

@@ -3,8 +3,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  templateList, templateCreate, templateShow, templateImport, templateInput, templateLabel, findTemplate,
-  templateContext, templatePath, templateContent,
+  templateList, templateCreate, templateShow, templateImport, templateInput, findTemplate, templateContent,
+  templateCheck, templateDelete, templateGroups, templateKind, groupOptions, problemCounts, annotations,
+  droppedRanges, variantOptions, NO_GROUP,
   PUBLISH_FIELDS, GENERATE_ALL, generateGroup, generateClient, generateScope, SUBSCRIPTION_HOST,
   subscriptionSetHost, SUBSCRIPTION_LIST, SUBSCRIPTION_PUBLISH_ALL, subscriptionMigrate, subscriptionHost,
   subscriptionState, subscriptionRow, publishSummary,
@@ -15,29 +16,58 @@ import { generateFlow } from '../assets/js/screens/generate.js';
 test('шаблоны: argv команд и input.file', () => {
   assert.deepEqual(templateList(), ['template', 'list']);
   assert.deepEqual(templateCreate('x'), ['template', 'create', '--name', 'x']);
+  assert.deepEqual(templateCreate('x', 'default.yaml'), ['template', 'create', '--name', 'x', '--from', 'default.yaml']);
+  assert.deepEqual(templateCheck('m.yaml'), ['template', 'check', '--name', 'm.yaml']);
+  assert.deepEqual(templateDelete('m.yaml'), ['template', 'delete', '--name', 'm.yaml']);
+  assert.deepEqual(templateGroups('m.yaml', ['PC', 'TV']), ['template', 'groups', '--name', 'm.yaml', '--group', 'PC', '--group', 'TV']);
+  assert.deepEqual(templateGroups('m.yaml', []), ['template', 'groups', '--name', 'm.yaml']);
   assert.deepEqual(templateShow('m.yaml'), ['template', 'show', '--name', 'm.yaml']);
   assert.deepEqual(templateImport('m.yaml'), ['template', 'import', '--name', 'm.yaml']);
   assert.deepEqual(templateInput('mode: rule\n'), { file: 'mode: rule\n' });
 });
 
-test('шаблоны: подписи списка и карточки', () => {
-  const list = [{ name: 'default.yaml', source: 'builtin', groups: ['PC'] }, { name: 'm.yaml', source: 'custom', groups: [] }];
-  assert.equal(templateLabel(list[0]), 'default.yaml  (встроенный)');
-  assert.equal(templateLabel(list[1]), 'm.yaml  (пользовательский)');
+test('шаблоны: вид, поиск строки и содержимое', () => {
+  const list = [
+    { name: 'default.yaml', source: 'builtin', overrides: false, groups: ['PC'] },
+    { name: 'm.yaml', source: 'custom', overrides: false, groups: [] },
+    { name: 'lab.yaml', source: 'custom', overrides: true, groups: [] },
+  ];
+  assert.deepEqual(list.map(templateKind), ['builtin', 'custom', 'override']);
+  assert.equal(templateKind(null), 'builtin');
   assert.equal(findTemplate(list, 'm.yaml'), list[1]);
   assert.equal(findTemplate(list, 'gone'), null);
   assert.equal(findTemplate(null, 'm.yaml'), null);
-  assert.deepEqual(templateContext(list[0]), ['Источник: встроенный', 'Группы: PC']);
-  assert.deepEqual(templateContext(list[1]), ['Источник: пользовательский', 'Группы: нет']);
-});
-
-test('шаблоны: путь и содержимое template show', () => {
-  const shown = { name: 'm.yaml', source: 'builtin', path: null, content: 'mode: rule\nproxies:\n' };
-  assert.equal(templatePath(shown), 'Путь: встроенный шаблон');
-  assert.equal(templatePath({ path: '/s/templates/m.yaml' }), 'Путь: /s/templates/m.yaml');
-  assert.equal(templateContent(shown), 'mode: rule\nproxies:\n');
+  assert.equal(templateContent({ content: 'mode: rule\n' }), 'mode: rule\n');
   assert.equal(templateContent({ content: null }), null);
   assert.equal(templateContent(null), null);
+});
+
+test('шаблоны: выбор групп с текущим шаблоном и отметками', () => {
+  const groups = [{ name: 'PC', template: 'm.yaml' }, { name: 'TV', template: 'default.yaml' }, { name: null }];
+  const { options, selected } = groupOptions(groups, 'm.yaml');
+  assert.deepEqual(options.map((o) => [o.value, o.label]), [['PC', 'PC — сейчас: m.yaml'], ['TV', 'TV — сейчас: default.yaml']]);
+  assert.deepEqual(selected, ['PC']);
+  assert.deepEqual(groupOptions(null, 'm.yaml'), { options: [], selected: [] });
+});
+
+test('шаблоны: отчёт проверки — счётчики, отметки по варианту, выпавшие строки', () => {
+  assert.deepEqual(problemCounts({ errors: 3, warnings: 250 }), { errors: 3, warnings: 250 });
+  assert.deepEqual(problemCounts(null), { errors: 0, warnings: 0 });
+  const problems = [
+    { line: 4, column: 3, level: 'error', message: 'all', variant: null },
+    { line: 1, column: 1, level: 'warning', message: 'nogroup', variant: '' },
+    { line: 9, column: 2, level: 'error', message: 'pc', variant: 'PC' },
+  ];
+  assert.deepEqual(annotations(problems, NO_GROUP), [
+    { row: 3, column: 2, text: 'all', type: 'error' }, { row: 0, column: 0, text: 'nogroup', type: 'warning' },
+  ]);
+  assert.deepEqual(annotations(problems, 'PC').map((a) => a.text), ['all', 'pc']);
+  assert.deepEqual(annotations(null, NO_GROUP), []);
+  const variants = [{ tag: null, dropped: [[30, 39]] }, { tag: 'PC', dropped: [[5, 6], [8, 8]] }];
+  assert.deepEqual(droppedRanges(variants, NO_GROUP), [[30, 39]]);
+  assert.deepEqual(droppedRanges(variants, 'PC'), [[5, 6], [8, 8]]);
+  assert.deepEqual(droppedRanges(variants, 'TV'), []);
+  assert.deepEqual(variantOptions(variants).map((o) => o.value), [NO_GROUP, 'PC']);
 });
 
 test('итог генерации: пустые поля пропущены, ошибки жёлтые', () => {
