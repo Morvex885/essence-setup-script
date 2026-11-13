@@ -82,6 +82,23 @@ test('импорт: нечитаемый файл, вопрос о чернов�
   assert.deepEqual(clean.calls.map((call) => call[0]), ['run']);
 });
 
+test('импорт: текст файла — идущая запись для защиты ухода, только после вопроса о черновике', async () => {
+  const sent = [];
+  const refused = fakeCtx({ answers: [false] });
+  await importTemplateFile(refused, 'm.yaml', 'B', null, true, (text) => sent.push(text));
+  assert.deepEqual(sent, [], 'отказ от замены черновика — записи нет');
+
+  const order = [];
+  const ctx = fakeCtx({ replies: [{ ok: true, data: {} }] });
+  const run = ctx.runConfirmed;
+  ctx.runConfirmed = (...args) => { order.push('run'); return run(...args); };
+  await importTemplateFile(ctx, 'm.yaml', 'B', null, false, (text) => order.push(['send', text]));
+  assert.deepEqual(order, [['send', 'B'], 'run']);
+  // Сохранён A, идёт импорт B, в редакторе снова A: уход записал бы B.
+  assert.equal(unsavedChanges('A', 'A', 'B'), true);
+  assert.equal(unsavedChanges(null, 'A', 'B'), true);
+});
+
 test('удаление и сброс к встроенному: одна команда, разные подписи по виду', async () => {
   const custom = { name: 'm.yaml', source: 'custom', overrides: false };
   const override = { name: DEFAULT_TEMPLATE, source: 'custom', overrides: true };

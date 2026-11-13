@@ -150,7 +150,7 @@ function TemplateEditor({ ctx, name }) {
   const content = templateContent(shown.data);
   const text = draft !== null ? draft : content;
   const dirty = draft !== null && draft !== content;
-  // Отправленный на сохранение текст (пока команда идёт), иначе `null`.
+  // Текст, который записывает идущая команда (сохранение или импорт), иначе `null`.
   const [saving, setSaving] = useState(null);
   const guarded = unsavedChanges(draft, content, saving);
   const { check, current } = useCheck(ctx, name, text, revision);
@@ -226,12 +226,17 @@ function TemplateEditor({ ctx, name }) {
     return () => ctx.win.removeEventListener('keydown', onKey);
   }, []);
   const importFile = (fileText, reason) => run(async () => {
-    // Правки, набранные пока идёт импорт, не затираются импортированным текстом.
+    // Правки, набранные пока идёт импорт, не затираются импортированным текстом;
+    // до конца импорта его текст — идущая запись для защиты ухода.
     const before = draftRef.current;
-    const imported = await importTemplateFile(ctx, name, fileText, reason, dirty);
-    if (fileText === null) return;
-    await reload();
-    if (imported && settleDraft(draftRef.current, before) === null) replaceText();
+    try {
+      const imported = await importTemplateFile(ctx, name, fileText, reason, dirty, setSaving);
+      if (fileText === null) return;
+      await reload();
+      if (imported && settleDraft(draftRef.current, before) === null) replaceText();
+    } finally {
+      if (mounted.current) setSaving(null);
+    }
   });
   const remove = () => run(async () => {
     // Правки, набранные пока идёт сброс к встроенному, не затираются его текстом.

@@ -33,6 +33,8 @@ const MENU = [
 
 /** Наибольшее число записей журнала (старые отбрасываются). */
 const JOURNAL_LIMIT = 2000;
+/** Наибольшее число снэкбаров успеха и предупреждения (ошибки не считаются). */
+const SNACK_LIMIT = 3;
 
 /** Команда могла изменить состояние: шапка перечитывает `status`. */
 const READ_VERBS = new Set(['status', 'list', 'show', 'accounts', 'version', 'headers', 'aliases', 'check']);
@@ -121,8 +123,9 @@ export function App({ win = window, deps = {} }) {
     if (level !== 'info') {
       snackId.current += 1;
       const id = snackId.current;
-      // Сообщение ядра и итог «Операция завершилась ошибкой…» видны вместе.
-      setSnacks((current) => [...current.slice(-2), { id, level, text }]);
+      // Сообщение ядра и итог «Операция завершилась ошибкой…» видны вместе;
+      // ошибки не вытесняются новыми уведомлениями — только кнопкой закрытия.
+      setSnacks((current) => fmt.pushSnack(current, { id, level, text }, SNACK_LIMIT));
     }
   };
   const log = (entry) => {

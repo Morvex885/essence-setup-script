@@ -142,6 +142,17 @@ export function appendJournal(entries, entry, limit, repeat = true) {
 }
 
 /**
+ * Снэкбары с новым: ошибки остаются до закрытия кнопкой, предел `limit`
+ * действует только на остальные уровни (старые из них уходят первыми); порядок сохраняется.
+ */
+export function pushSnack(snacks, snack, limit) {
+  const next = [...snacks, snack];
+  let extra = next.filter((item) => item.level !== 'error').length - limit;
+  if (extra <= 0) return next;
+  return next.filter((item) => item.level === 'error' || extra-- <= 0);
+}
+
+/**
  * Назначенные подключения, которых нет среди найденных на ноде (`conn.rs::purge`):
  * клиенты AmneziaWG `awg-<клиент>` при найденном `AWG` не отмечаются — поиск их не перечисляет.
  */

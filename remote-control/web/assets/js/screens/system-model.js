@@ -49,13 +49,25 @@ export async function passwordForm(ctx, title, { current = false, currentLabel =
 // ─── Сводка ────────────────────────────────────────────────────────────────
 
 /**
+ * Состояние чтения `group list` и `node list` для проверки назначений на
+ * сводке: `pending` — ответа ещё нет, `failed` — хотя бы одно чтение не
+ * удалось, иначе `ready`. «Всё в порядке» сводка показывает только при `ready`.
+ */
+export function assignmentsRead(groupsReply, nodesReply) {
+  if (!groupsReply || !nodesReply) return 'pending';
+  return groupsReply.ok && nodesReply.ok ? 'ready' : 'failed';
+}
+
+/**
  * «Требует внимания» на сводке из `status` и `hello`: `[{ id, tone, text,
- * action }]`; `action` — `{ label, type: 'password'|'ssh-setup'|'group-connections'|'route',
+ * action }]`; `action` — `{ label, type: 'password'|'ssh-setup'|'group-connections'|'route'|'reload',
  * node?, group?, route?, param?, tab? }` (экран выполняет действие по `type`).
  * Третий аргумент — ответы `group list` и `node list` (`null`, если не
- * прочитаны): группы без нод и ноды, чьи подключения не назначены ни одной группе.
+ * прочитаны): группы без нод и ноды, чьи подключения не назначены ни одной
+ * группе; `read` — `assignmentsRead`: при `failed` — пункт «не удалось
+ * прочитать» с повтором чтения (`reload`).
  */
-export function attentionItems(status, hello, { groups = null, nodes = null } = {}) {
+export function attentionItems(status, hello, { groups = null, nodes = null, read = 'ready' } = {}) {
   const data = status && typeof status === 'object' ? status : {};
   const items = [];
   for (const node of strings(data.password_missing)) {
@@ -96,6 +108,12 @@ export function attentionItems(status, hello, { groups = null, nodes = null } = 
     items.push({
       id: 'open-panel', tone: 'warn', text: OPEN_PANEL_WARNING,
       action: { label: 'Настройки', type: 'route', route: 'settings' },
+    });
+  }
+  if (read === 'failed') {
+    items.push({
+      id: 'assignments-unread', tone: 'warn', text: 'Не удалось прочитать группы и ноды — назначения подключений не проверены',
+      action: { label: 'Повторить', type: 'reload' },
     });
   }
   if (Array.isArray(groups)) {

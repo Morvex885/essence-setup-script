@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { runConfirmed } from '../assets/js/flows.js';
 import { joined } from '../assets/js/format.js';
 import {
-  dashboardTitle, attentionItems, updateAvailable, settingsAction, uninstallArgv, daemonLines,
+  dashboardTitle, attentionItems, assignmentsRead, updateAvailable, settingsAction, uninstallArgv, daemonLines,
   sourceView, sourceAction, importRecoveryKey, recoveryRun, githubWizardFlow, wizardAccounts,
   storageLabel, existingLabel, targetReplaceContext, passwordForm, CANCELLED, FILE_UNREADABLE, PASSWORDS_DIFFER, PASSWORD_EMPTY,
   OTHER_LOGIN,
@@ -114,6 +114,20 @@ test('сводка: группы без нод и ноды без назначе
   // Списки не прочитаны — пунктов нет.
   assert.deepEqual(attentionItems(calm, null, { groups: null, nodes }), []);
   assert.deepEqual(attentionItems(calm, null, { groups: [{ name: 'PC', clients: 0, nodes: ['de'] }], nodes: null }), []);
+});
+
+test('сводка: группы или ноды не прочитаны — пункт с повтором, а не «всё в порядке»', () => {
+  const calm = { source: { type: 'local' }, subscription_host: 'de' };
+  const okReply = { ok: true, data: [] };
+  const failed = { ok: false, error: { code: 'failed', message: 'x' } };
+  assert.equal(assignmentsRead(null, okReply), 'pending');
+  assert.equal(assignmentsRead(okReply, null), 'pending');
+  assert.equal(assignmentsRead(failed, okReply), 'failed');
+  assert.equal(assignmentsRead(okReply, failed), 'failed');
+  assert.equal(assignmentsRead(okReply, okReply), 'ready');
+  const items = attentionItems(calm, null, { groups: null, nodes: [], read: 'failed' });
+  assert.deepEqual(items.map((item) => [item.id, item.action.type]), [['assignments-unread', 'reload']]);
+  assert.deepEqual(attentionItems(calm, null, { groups: [], nodes: [], read: 'ready' }), []);
 });
 
 // ─── Настройки ─────────────────────────────────────────────────────────────

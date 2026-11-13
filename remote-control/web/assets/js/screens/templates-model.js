@@ -21,9 +21,9 @@ export function settleDraft(current, sent) {
 
 /**
  * Нужна ли защита ухода: черновик отличается от сохранённого `content` либо
- * идёт сохранение `saving` (отправленный текст, иначе `null`), а в редакторе
- * уже другой текст — даже совпавший с прежним сохранённым: после ухода
- * команда запишет `saving`, а не последнюю правку.
+ * идёт запись `saving` (текст сохранения или импорта из файла, пока команда
+ * идёт; иначе `null`), а в редакторе уже другой текст — даже совпавший с
+ * прежним сохранённым: после ухода команда запишет `saving`, а не последнюю правку.
  */
 export function unsavedChanges(draft, content, saving) {
   const text = draft !== null ? draft : content;
@@ -45,9 +45,10 @@ export async function saveTemplate(ctx, name, text) {
 /**
  * «Импорт из файла» (`FileText`: текст или `null` и причина). Несохранённый
  * черновик заменяется только после вопроса; затем — импорт (план — по решению ядра).
- * `true` — шаблон перезаписан.
+ * `onSend(text)` вызывается перед командой: экран считает этот текст идущей
+ * записью (`unsavedChanges`) до конца импорта. `true` — шаблон перезаписан.
  */
-export async function importTemplateFile(ctx, name, fileText, reason, dirty) {
+export async function importTemplateFile(ctx, name, fileText, reason, dirty, onSend = () => {}) {
   if (fileText === null) {
     ctx.notify('warn', reason || TEMPLATE_FILE_UNREADABLE);
     return false;
@@ -55,6 +56,7 @@ export async function importTemplateFile(ctx, name, fileText, reason, dirty) {
   if (dirty && !(await ctx.confirm({
     title: 'Несохранённые изменения', plan: [], question: `${DRAFT_REPLACED} Продолжить?`, yes: 'Импортировать', tone: 'danger',
   }))) return false;
+  onSend(fileText);
   const reply = await ctx.runConfirmed('Импорт шаблона', 'Перезаписать шаблон?', templateImport(name), { input: templateInput(fileText) });
   if (ctx.isFailure(reply)) ctx.failed();
   return reply.ok === true;

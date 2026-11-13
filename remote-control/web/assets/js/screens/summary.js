@@ -5,7 +5,7 @@ import { html } from '../../vendor/preact-htm.js';
 import { Page, Card, Stats, Stat, Empty, Badge, Button } from '../ui.js';
 import { asList } from '../format.js';
 import { useCommand, useBusy, useMounted, Loaded } from './kit.js';
-import { dashboardTitle, attentionItems } from './system-model.js';
+import { dashboardTitle, attentionItems, assignmentsRead } from './system-model.js';
 import { addNodeFlow, setNodePassword, setupSsh } from './nodes-model.js';
 import { addClientFlow, generateFlow, groupConnectionsFlow } from './clients-model.js';
 
@@ -29,6 +29,7 @@ export function SummaryScreen({ ctx }) {
     if (action.type === 'password') return act(() => setNodePassword(ctx, action.node));
     if (action.type === 'ssh-setup') return act(() => setupSsh(ctx));
     if (action.type === 'group-connections') return act(() => groupConnectionsFlow(ctx, action.group));
+    if (action.type === 'reload') return run(() => Promise.all([groups.reload(), nodes.reload()]));
     return ctx.navigate(action.route, action.param || null, action.tab || null);
   };
   const actions = html`
@@ -39,7 +40,8 @@ export function SummaryScreen({ ctx }) {
     const title = dashboardTitle(data, version);
     const counts = (data && data.counts) || {};
     const subs = subscriptions.reply === null ? '…' : subscriptions.reply.ok ? String(asList(subscriptions.data).length) : '—';
-    const items = attentionItems(data, ctx.hello, { groups: groups.data, nodes: nodes.data });
+    const read = assignmentsRead(groups.reply, nodes.reply);
+    const items = attentionItems(data, ctx.hello, { groups: groups.data, nodes: nodes.data, read });
     return html`<${Page} title="Сводка" subtitle=${title} actions=${actions}>
       <${Stats}>
         <${Stat} label="Ноды" value=${count(counts.nodes)} href=${ctx.href('nodes')} />
@@ -49,7 +51,9 @@ export function SummaryScreen({ ctx }) {
       <//>
       <${Card} title="Требует внимания">
         ${items.length === 0
-          ? html`<${Empty} icon="circle-check" title="Всё в порядке" />`
+          ? read === 'ready'
+            ? html`<${Empty} icon="circle-check" title="Всё в порядке" />`
+            : html`<p class="t-dim">Проверка…</p>`
           : html`<div class="attention">
               ${items.map((item) => html`<div key=${item.id} class="attention-row">
                 <${Badge} tone=${item.tone}>${item.tone === 'info' ? 'совет' : 'внимание'}<//>

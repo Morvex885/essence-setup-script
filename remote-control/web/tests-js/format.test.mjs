@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import {
   asList, strings, text, joined, versionLabel, syncState, sourceLabel,
   activity, activityIndicator, openPanel, OPEN_PANEL_WARNING,
-  errorMessage, readInputFile, MAX_INPUT, FILE_TOO_LARGE, filterJournal, appendJournal,
+  errorMessage, readInputFile, MAX_INPUT, FILE_TOO_LARGE, filterJournal, appendJournal, pushSnack,
 } from '../assets/js/format.js';
 
 test('asList и strings: не массив — пустой список, строки — только строки', () => {
@@ -130,4 +130,17 @@ test('appendJournal: предел длины; повтор фоновой зап
   assert.deepEqual(journal.map((item) => item.id), [1, 2, 3], 'не подряд — записывается');
   journal = appendJournal(journal, entry(4, 'info', 'z'), 3);
   assert.deepEqual(journal.map((item) => item.id), [2, 3, 4]);
+});
+
+test('pushSnack: ошибки не вытесняются, предел — только для остальных уровней', () => {
+  const snack = (id, level) => ({ id, level, text: String(id) });
+  let snacks = [];
+  snacks = pushSnack(snacks, snack(1, 'error'), 2);
+  snacks = pushSnack(snacks, snack(2, 'success'), 2);
+  snacks = pushSnack(snacks, snack(3, 'warn'), 2);
+  snacks = pushSnack(snacks, snack(4, 'success'), 2);
+  assert.deepEqual(snacks.map((item) => item.id), [1, 3, 4], 'вытесняется самое старое не-ошибочное');
+  snacks = pushSnack(snacks, snack(5, 'error'), 2);
+  snacks = pushSnack(snacks, snack(6, 'error'), 2);
+  assert.deepEqual(snacks.map((item) => item.id), [1, 3, 4, 5, 6], 'ошибки остаются до закрытия');
 });
