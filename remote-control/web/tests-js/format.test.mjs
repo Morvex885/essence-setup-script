@@ -62,7 +62,9 @@ test('activity: группы команд как в app.rs::activity', () => {
   for (const argv of [['node', 'list'], ['group', 'list'], ['node', 'show', '--name', 'de']]) assert.equal(activity(argv), generic, argv.join(' '));
   const remote = activity(['node', 'harden', '--name', 'de']);
   assert.notEqual(remote, generic);
-  assert.equal(activity(['telegram', 'status', '--all']), remote);
+  for (const verb of ['status', 'restart', 'diagnostics']) assert.equal(activity(['telegram', verb]), remote, verb);
+  // Роль Telegram без SSH — правка конфигурации и ссылка.
+  for (const verb of ['set', 'remove', 'link', 'rotate-secret', 'tag']) assert.equal(activity(['telegram', verb]), generic, verb);
   assert.equal(activity(['conn', 'sync']), remote);
   assert.equal(activity(['source', 'github-push']), activity(['source', 'github-rotate-key']));
   const distinct = [

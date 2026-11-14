@@ -6,10 +6,14 @@
 use std::path::{Path, PathBuf};
 
 /// Removed with stage 2 (`node apply` owns the server state), stage 3
-/// (AmneziaWG peers are rendered) and stage 4 (the host moves by `node apply`).
-const REMOVED: [&str; 5] = [
+/// (AmneziaWG peers are rendered), stage 4 (the host moves by `node apply`)
+/// and stage 5 (the Telegram role is rendered; the server menu is gone).
+const REMOVED: [&str; 12] = [
     concat!("upload", "-scripts"), concat!("awg", " status"), concat!("awg", " sync"), concat!("awg", " remove"),
     concat!("subscription", " migrate"),
+    concat!("telegram", " install"), concat!("telegram", " refresh-ip"), concat!("telegram", " web-update"),
+    concat!("telegram", " web-restart"), concat!("telegram", " backend-restart"), concat!("telegram", " remove-all"),
+    concat!("telegram", " menu"),
 ];
 
 fn files(dir: &Path, out: &mut Vec<PathBuf>) {

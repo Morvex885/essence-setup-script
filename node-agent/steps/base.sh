@@ -372,9 +372,11 @@ managed_path() {
             return 0 ;;
         /etc/nginx/conf.d/essence-sub-limit.conf|/usr/local/bin/essence-sub-cleanup|/etc/systemd/system/essence-sub-cleanup.service|/etc/systemd/system/essence-sub-cleanup.timer)
             return 0 ;;
+        /etc/mtproxy/mtproxy.env|/etc/tproxy-server/firewall.nft|/etc/tproxy-server/config.json|/etc/tproxy-server/profiles.json)
+            return 0 ;;
     esac
     [[ "$path" == /etc/nginx/modules-enabled/90-essence-stream.conf ||
-       "$path" =~ ^/etc/nginx/(sites-available|sites-enabled)/[^/]+$ || "$path" =~ ^/var/www/[^/]+/\.essence-sub$ ]]
+       "$path" =~ ^/etc/nginx/(sites-available|sites-enabled)/[^/]+$ || "$path" =~ ^/var/www/[^/]+/\.essence-(sub|telegram)$ ]]
 }
 
 check_path() {
@@ -415,9 +417,9 @@ removable() {
     local path="$1" dest="$R$1"
     [[ -e "$dest" || -L "$dest" ]] || return 1
     case "$path" in
-        /var/www/*/.essence-sub)
-            # Отметка хоста подписок уходит вместе с webroot в cleanup
-            # (RELEASE_CERTS): до этого она подтверждает, что webroot наш.
+        /var/www/*/.essence-sub|/var/www/*/.essence-telegram)
+            # Отметка роли (хост подписок, Telegram) уходит вместе с webroot в
+            # cleanup (RELEASE_CERTS): до этого она подтверждает, что webroot наш.
             return 1 ;;
     esac
     site_owned "$path" && return 0
@@ -587,6 +589,24 @@ wait_active() {
     systemctl is-active --quiet "$unit"
 }
 
+# adopt_feature_leftovers — метки $NODE_DIR/features/<фича> ставит prepare
+# фичи, как только начинает ставить её компоненты; снимает — её remove. Метка
+# фичи, которой нет ни в FEATURES, ни в REMOVE_FEATURES, значит: компоненты
+# остались от операции, не зафиксировавшей роль (сбой prepare или откат), и RC
+# о них не знает. Такая фича добавляется в REMOVE_FEATURES до транзакции и
+# проходит тот же путь: deactivate в config (с откатом), remove в cleanup.
+adopt_feature_leftovers() {
+    local marker feature
+    for marker in "$NODE_DIR"/features/*; do
+        [[ -f "$marker" ]] || continue
+        feature="${marker##*/}"
+        [[ " $FEATURES $REMOVE_FEATURES " == *" $feature "* ]] && continue
+        declare -F "${feature}_remove" >/dev/null || continue
+        info "Снимаю незафиксированные компоненты фичи $feature."
+        REMOVE_FEATURES="${REMOVE_FEATURES:+$REMOVE_FEATURES }$feature"
+    done
+}
+
 # tx_deactivate — снятые фичи останавливаются, пока их файлы на месте
 # (awg-quick down и ExecStop юнитов читают конфиг, disable требует юнит).
 tx_deactivate() {
@@ -600,6 +620,7 @@ tx_deactivate() {
 stage_config() {
     local mode owner group path feature code nginx_action=none
     local entries=() removes=()
+    adopt_feature_leftovers
     while read -r mode owner group path; do
         [[ -n "${mode:-}" ]] || continue
         check_path "$path" && replaceable "$path" || return 1
@@ -807,7 +828,7 @@ cleanup_committed() {
     for entry in "${CERT_ENTRIES[@]}"; do
         name="${entry%%:*}"
         webroot="${entry#*:}"
-        if [[ ! -e "$R$webroot/.essence-site" && ! -e "$R$webroot/.essence-sub" ]]; then
+        if [[ ! -e "$R$webroot/.essence-site" && ! -e "$R$webroot/.essence-sub" && ! -e "$R$webroot/.essence-telegram" ]]; then
             warn "Пропускаю сертификат $name: в $webroot нет отметки Essence."
             continue
         fi

@@ -56,7 +56,7 @@ pub trait UserInterface {
     fn command_finished(&mut self) -> io::Result<()> { Ok(()) }
     /// Run a local child (template editor) on the cooked terminal.
     fn suspended(&mut self, command: &mut Command) -> io::Result<std::process::ExitStatus>;
-    /// Hand the terminal to a terminal command (`node shell`, `telegram menu`).
+    /// Hand the terminal to a terminal command (`node shell`).
     fn suspend(&mut self) -> io::Result<()> { Ok(()) }
     fn resume(&mut self) -> io::Result<()> { Ok(()) }
     fn interrupted(&self) -> bool { false }
@@ -134,7 +134,7 @@ impl Context<'_> {
             self.ui.notice(ui::text(format!("[✗] {message}"), ui::RED));
         }
     }
-    /// Terminal commands (`node shell`, `telegram menu`): the daemon runs the
+    /// Terminal commands (`node shell`): the daemon runs the
     /// remote PTY and this process relays it through a fresh local console.
     /// The UI is suspended (cooked mode, main screen) for the whole request
     /// and never reads the terminal meanwhile; Ctrl+C reaches only the remote.
@@ -235,7 +235,8 @@ pub fn activity(words: &[String]) -> &'static str {
             "Отправка конфигурации в GitHub…",
         ("source", "github-delete-repo") => "Удаление репозитория GitHub…",
         ("source", verb) if verb.starts_with("github-") => "Обмен данными с GitHub…",
-        ("node" | "conn" | "telegram", "list" | "show" | "aliases" | "rename" | "tag" | "profile" | "domain" | "port") => "Выполняется…",
+        ("node" | "conn", "list" | "show" | "aliases" | "rename" | "tag" | "profile" | "domain" | "port") => "Выполняется…",
+        ("telegram", "set" | "remove" | "link" | "rotate-secret" | "tag") => "Выполняется…",
         ("node", "apply") => "Применение на нодах…",
         ("node" | "conn" | "telegram", _) => "Подключение к серверам…",
         ("subscription", "publish" | "publish-all" | "rotate" | "revoke") => "Публикация подписок на серверах…",
@@ -793,6 +794,16 @@ mod tests {
         fn terminal(&mut self, request: Request<'_>, io: &mut dyn TerminalIo, progress: &mut dyn FnMut(Progress<'_>)) -> io::Result<Reply> {
             self.during_terminal = Some(self.suspended.get());
             self.inner.terminal(request, io, progress)
+        }
+    }
+    /// Telegram role changes and the link are local; status, restart and diagnostics go over SSH.
+    #[test]
+    fn telegram_activity_separates_local_verbs_from_ssh() {
+        for verb in ["set", "remove", "link", "rotate-secret", "tag"] {
+            assert_eq!(activity(&argv(&["telegram", verb, "--name", "n"])), "Выполняется…", "{verb}");
+        }
+        for verb in ["status", "restart", "diagnostics"] {
+            assert_eq!(activity(&argv(&["telegram", verb])), "Подключение к серверам…", "{verb}");
         }
     }
     #[test]

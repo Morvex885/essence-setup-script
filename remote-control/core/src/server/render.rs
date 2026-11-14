@@ -14,7 +14,7 @@ use crate::clients::generate::{User, effective_connections, node_users};
 use crate::error::{RcError, Result};
 use crate::model::{
     AmneziaWg, Cascade, CascadeExit, Client, Config, Ipv6, Node, NodeWarp, Profile, RealityMode, SUB_DIR, SiteSource,
-    SubscriptionHost, XhttpTopology,
+    SubscriptionHost, TelegramProxy, XhttpTopology,
 };
 use crate::protocols::uri::parse_exit_uri;
 use crate::protocols::vless_xhttp::NginxListener;
@@ -24,13 +24,14 @@ use super::awg;
 use super::cascade;
 use super::keys::{cascade_password, cascade_uuid};
 use super::paths::{
-    AWG_CONF_PATH, MIHOMO_CONFIG_PATH, MIHOMO_SERVICE_PATH, SITES_AVAILABLE, SITES_ENABLED, STREAM_PATH, SUB_CLEANUP_PATH,
-    SUB_CLEANUP_SERVICE_PATH, SUB_CLEANUP_TIMER_PATH, SUB_LIMIT_PATH, SUB_SITE, SYSCTL_PATH, sub_marker, sub_marker_host,
+    AWG_CONF_PATH, MIHOMO_CONFIG_PATH, MIHOMO_SERVICE_PATH, Role, SITES_AVAILABLE, SITES_ENABLED, STREAM_PATH,
+    SUB_CLEANUP_PATH, SUB_CLEANUP_SERVICE_PATH, SUB_CLEANUP_TIMER_PATH, SUB_LIMIT_PATH, SUB_SITE, SYSCTL_PATH,
+    TG_CONFIG_PATH, TG_ENV_PATH, TG_FIREWALL_PATH, TG_PROFILES_PATH, TG_SITE, marker_host, role_marker,
 };
 use super::ports::{REALITY_INNER_PORT, SITE_PORT, SUB_INNER_PORT, TG_INNER_PORT, XHTTP_NGINX_PORT};
 
 /// Bumped whenever rendered files change for an unchanged configuration.
-pub const RENDER_REVISION: u32 = 5;
+pub const RENDER_REVISION: u32 = 7;
 
 const MIHOMO_CONFIG: &str = include_str!("assets/mihomo-config.yaml");
 const MIHOMO_SERVICE: &str = include_str!("assets/mihomo.service");
@@ -41,6 +42,13 @@ const SYSCTL_IPV6_FORWARDING: &str = "net.ipv6.conf.all.forwarding = 1";
 const NGINX_SITE: &str = include_str!("assets/nginx-site.conf");
 const NGINX_XHTTP: &str = include_str!("assets/nginx-xhttp-location.conf");
 const NGINX_SUB: &str = include_str!("assets/nginx-sub.conf");
+const NGINX_TELEGRAM: &str = include_str!("assets/nginx-telegram.conf");
+/// The relay firewall with MTProto closed from outside (`_telegram_proxy_render_firewall false`).
+const TG_FIREWALL: &str = "table inet tproxy_backend {\n    chain input {\n        type filter hook input priority -10; policy accept;\n\
+    \x20   iifname != \"lo\" tcp dport { 8888, 8080, 8081 } drop\n        iifname != \"lo\" tcp dport 2398 drop\n    }\n}\n";
+/// `_telegram_proxy_render_relay_config`; the profiles come as a systemd credential.
+const TG_CONFIG: &str = "{\n  \"public_hostname\": \"{{hostname}}\",\n  \"listen\": \"127.0.0.1:8080\",\n  \"admin_listen\": \"127.0.0.1:8081\",\n\
+    \x20 \"public_dir\": \"/srv/tproxy-site\",\n  \"profiles_file\": \"/run/credentials/tproxy-server.service/profiles.json\"\n}\n";
 const SUB_CLEANUP: &str = include_str!("assets/essence-sub-cleanup.sh");
 const SUB_CLEANUP_SERVICE: &str = include_str!("assets/essence-sub-cleanup.service");
 const SUB_CLEANUP_TIMER: &str = include_str!("assets/essence-sub-cleanup.timer");
@@ -81,6 +89,8 @@ struct Keys<'a> {
     reality: &'a str,
     awg: &'a str,
     warp: &'a str,
+    telegram_secret: &'a str,
+    telegram_tag: &'a str,
 }
 
 impl<'a> Keys<'a> {
@@ -88,7 +98,10 @@ impl<'a> Keys<'a> {
         let key = |pick: fn(&NodeSecrets) -> &Option<Zeroizing<String>>| {
             secrets.and_then(|s| pick(s).as_deref()).map(String::as_str).unwrap_or_default()
         };
-        Keys { reality: key(|s| &s.reality_key), awg: key(|s| &s.awg_key), warp: key(|s| &s.warp_key) }
+        Keys {
+            reality: key(|s| &s.reality_key), awg: key(|s| &s.awg_key), warp: key(|s| &s.warp_key),
+            telegram_secret: key(|s| &s.telegram_secret), telegram_tag: key(|s| &s.telegram_tag),
+        }
     }
 }
 
@@ -315,6 +328,40 @@ impl Layout<'_> {
     /// The subscription host when this node serves it.
     fn sub_host(&self) -> Option<&SubscriptionHost> {
         self.config.subscription_host.as_ref().filter(|host| host.node == self.node.name)
+    }
+
+    /// The Telegram Web Proxy role of this node.
+    fn telegram(&self) -> Option<&TelegramProxy> {
+        self.config.telegram.iter().find(|proxy| proxy.node == self.node.name)
+    }
+
+    /// The Telegram vhost (`_telegram_proxy_render_nginx_site`) behind the node's front.
+    fn telegram_site(&self, hostname: &str) -> String {
+        let listen = match self.front {
+            Front::SelfSteal => format!("    listen 127.0.0.1:{SITE_PORT} ssl http2;"),
+            Front::Stream => format!("    listen 127.0.0.1:{TG_INNER_PORT} ssl http2;"),
+            _ => "    listen 443 ssl http2;\n    listen [::]:443 ssl http2;".to_owned(),
+        };
+        fill_template(&NGINX_TELEGRAM.replace("{{hostname}}", hostname), &[("{{listen}}", listen)])
+    }
+
+    /// `mtproxy.env` and `profiles.json` contents from the checked secrets.
+    fn telegram_secrets(&self, proxy: &TelegramProxy, keys: &Keys<'_>) -> Result<(String, String)> {
+        let broken = |what: &str| invalid(format!("{what} Telegram Proxy ноды «{}» отсутствует или повреждён.", self.node.name))
+            .with_extra("name", self.node.name.clone());
+        if !crate::validation::telegram_hex_valid(keys.telegram_secret) {
+            return Err(broken("Секрет"));
+        }
+        let tag_args = match proxy.tag_mark {
+            Some(_) if crate::validation::telegram_hex_valid(keys.telegram_tag) => format!("-P {}", keys.telegram_tag.to_ascii_lowercase()),
+            Some(_) => return Err(broken("Спонсорский тег")),
+            None => String::new(),
+        };
+        let secret = keys.telegram_secret;
+        Ok((
+            format!("MTPROXY_SECRET={secret}\nMTPROXY_TAG_ARGS=\"{tag_args}\"\nMTPROXY_WORKERS=1\nMTPROXY_MAX_CONNECTIONS=4096\n"),
+            format!("{{\"profiles\":[{{\"name\":\"default\",\"secret\":\"{secret}\",\"backend\":\"127.0.0.1:2398\",\"carrier_mode\":\"https\"}}]}}\n"),
+        ))
     }
 
     /// `(port, protocol)` rules of the firewall, in listener order.
@@ -628,7 +675,23 @@ impl Layout<'_> {
                 file(SUB_CLEANUP_PATH, "0755", text(&|| Ok(SUB_CLEANUP.replace("{{sub_dir}}", SUB_DIR)))?),
                 file(SUB_CLEANUP_SERVICE_PATH, "0644", text(&|| Ok(SUB_CLEANUP_SERVICE.to_owned()))?),
                 file(SUB_CLEANUP_TIMER_PATH, "0644", text(&|| Ok(SUB_CLEANUP_TIMER.to_owned()))?),
-                file(&sub_marker(&host.hostname), "0644", String::new()),
+                file(&role_marker(Role::Sub, &host.hostname), "0644", String::new()),
+            ]);
+        }
+        if let Some(proxy) = self.telegram() {
+            let (env, profiles) = match keys {
+                Some(keys) => self.telegram_secrets(proxy, keys)?,
+                None => (String::new(), String::new()),
+            };
+            let hostname = proxy.hostname.as_str();
+            files.extend([
+                owned(TG_ENV_PATH, "0640", "mtproxy", env),
+                file(TG_FIREWALL_PATH, "0644", text(&|| Ok(TG_FIREWALL.to_owned()))?),
+                owned(TG_CONFIG_PATH, "0640", "tproxy", text(&|| Ok(TG_CONFIG.replace("{{hostname}}", hostname)))?),
+                owned(TG_PROFILES_PATH, "0400", "tproxy", profiles),
+                file(&format!("{SITES_AVAILABLE}{TG_SITE}"), "0644", text(&|| Ok(self.telegram_site(hostname)))?),
+                file(&format!("{SITES_ENABLED}{TG_SITE}"), "link", text(&|| Ok(format!("{SITES_AVAILABLE}{TG_SITE}")))?),
+                file(&role_marker(Role::Telegram, hostname), "0644", String::new()),
             ]);
         }
         Ok(files)
@@ -668,6 +731,13 @@ impl Layout<'_> {
         }
         if let Some(host) = self.sub_host() {
             ports.insert(self.sub_port(host));
+        }
+        if self.telegram().is_some() {
+            ports.insert(match self.front {
+                Front::SelfSteal => SITE_PORT,
+                Front::Stream => TG_INNER_PORT,
+                _ => 443,
+            });
         }
         ports.into_iter().collect()
     }
@@ -723,7 +793,8 @@ impl Layout<'_> {
         digest_of(&json!({
             "revision": RENDER_REVISION, "profile": profile, "ip": self.node.ip, "port": self.node.port,
             "domain": self.node.domain, "ports": self.node.ports, "params": params, "users": listener_users,
-            "awg_peers": peers, "cascades": cascades, "subscription_host": host, "telegram": telegram, "tg_revision": null,
+            "awg_peers": peers, "cascades": cascades, "subscription_host": host, "telegram": telegram,
+            "tg_revision": telegram.map(|_| [crate::telegram::TPROXY_REPO, crate::telegram::TPROXY_REVISION]),
         }))
     }
 
@@ -806,6 +877,11 @@ fn file(path: &str, mode: &'static str, content: String) -> RenderedFile {
     RenderedFile { path: path.to_owned(), mode, owner: "root", group: "root", content: Zeroizing::new(content) }
 }
 
+/// A file of group `group` (owner root).
+fn owned(path: &str, mode: &'static str, group: &'static str, content: String) -> RenderedFile {
+    RenderedFile { group, ..file(path, mode, content) }
+}
+
 fn digest_of(value: &Value) -> String {
     hex::encode(Sha256::digest(serde_json::to_vec(value).unwrap_or_default()))
 }
@@ -848,10 +924,10 @@ fn site_source(source: SiteSource) -> &'static str {
 fn bool_text(value: bool) -> String { if value { "true" } else { "false" }.to_owned() }
 
 /// Certificate names of an applied file set: sites (`sites-available/<name>`)
-/// and the subscription hostname (its webroot marker).
+/// and the hostnames of the subscription and Telegram roles (webroot markers).
 fn applied_certs(node: &Node) -> Vec<String> {
     node.applied.iter().flat_map(|applied| applied.files.keys()).filter_map(|path| {
-        path.strip_prefix(SITES_AVAILABLE).filter(|site| *site != SUB_SITE).or_else(|| sub_marker_host(path))
+        path.strip_prefix(SITES_AVAILABLE).filter(|site| *site != SUB_SITE && *site != TG_SITE).or_else(|| marker_host(path))
     }).map(str::to_owned).collect()
 }
 
@@ -895,7 +971,8 @@ pub fn desired(config: &Config, node: &Node, secrets: Option<&NodeSecrets>) -> R
     let keep: BTreeSet<&str> = files.iter().map(|f| f.path.as_str()).collect();
     let remove = removed(node, &keep);
     let sub_host = layout.sub_host().map(|host| host.hostname.as_str());
-    let certs: Vec<&str> = layout.site.into_iter().chain(sub_host).collect();
+    let tg_host = layout.telegram().map(|proxy| proxy.hostname.as_str());
+    let certs: Vec<&str> = layout.site.into_iter().chain(sub_host).chain(tg_host).collect();
     let release: Vec<String> = applied_certs(node).into_iter().filter(|name| !certs.contains(&name.as_str())).collect();
     let ports = layout.rules();
     let mut listen = ports.clone();
@@ -909,10 +986,13 @@ pub fn desired(config: &Config, node: &Node, secrets: Option<&NodeSecrets>) -> R
     let applied_has = |path: &str| node.applied.as_ref().is_some_and(|applied| applied.files.contains_key(path));
     let had_awg = applied_has(AWG_CONF_PATH);
     let had_sub = applied_has(&format!("{SITES_AVAILABLE}{SUB_SITE}"));
+    let had_telegram = applied_has(&format!("{SITES_AVAILABLE}{TG_SITE}"));
     let awg_port = layout.awg().map(|(_, port)| port);
-    let features: Vec<&str> = [awg_port.is_some().then_some("awg"), sub_host.map(|_| "sub")].into_iter().flatten().collect();
-    let remove_features: Vec<&str> = [(had_awg && awg_port.is_none()).then_some("awg"), (had_sub && sub_host.is_none()).then_some("sub")]
+    let features: Vec<&str> = [awg_port.is_some().then_some("awg"), sub_host.map(|_| "sub"), tg_host.map(|_| "telegram")]
         .into_iter().flatten().collect();
+    let remove_features: Vec<&str> = [(had_awg && awg_port.is_none()).then_some("awg"), (had_sub && sub_host.is_none()).then_some("sub"),
+        (had_telegram && tg_host.is_none()).then_some("telegram")].into_iter().flatten().collect();
+    let telegram = |value: &str| if tg_host.is_some() { value.to_owned() } else { String::new() };
     let spec = vec![
         ("OP_MODE", "apply".to_owned()),
         ("SSH_PORTS", node.port.to_string()),
@@ -935,6 +1015,11 @@ pub fn desired(config: &Config, node: &Node, secrets: Option<&NodeSecrets>) -> R
         ("AWG_PORT", awg_port.map(|port| port.to_string()).unwrap_or_default()),
         ("WARP", bool_text(profile.warp)),
         ("SUB_HOST", sub_host.unwrap_or_default().to_owned()),
+        ("TG_HOST", tg_host.unwrap_or_default().to_owned()),
+        ("TG_REPO", telegram(crate::telegram::TPROXY_REPO)),
+        ("TG_REVISION", telegram(crate::telegram::TPROXY_REVISION)),
+        ("TG_GO_VERSION", telegram(crate::telegram::GO_VERSION)),
+        ("TG_GO_SHA256", telegram(crate::telegram::GO_SHA256)),
     ];
 
     let mut lines = vec![
@@ -986,6 +1071,9 @@ pub fn desired(config: &Config, node: &Node, secrets: Option<&NodeSecrets>) -> R
     }
     if let Some(host) = layout.sub_host() {
         lines.push(format!("Хост подписок: {}", host.base_url));
+    }
+    if let Some(proxy) = layout.telegram() {
+        lines.push(format!("Telegram Web Proxy: {} (tproxy-server {})", proxy.hostname, &crate::telegram::TPROXY_REVISION[..7]));
     }
     lines.extend(remove.iter().map(|path| format!("Будет удалено: {path}")));
     lines.extend(release.iter().map(|name| format!("Будет удалён сертификат и сайт: {name}")));
@@ -1145,7 +1233,7 @@ pub fn sub_role_applied(config: &Config, node: &Node) -> bool {
     let Some(host) = layout.sub_host() else { return false };
     let site = format!("{SITES_AVAILABLE}{SUB_SITE}");
     let hash = hex::encode(Sha256::digest(layout.sub_site(host).as_bytes()));
-    let marker = sub_marker(&host.hostname);
+    let marker = role_marker(Role::Sub, &host.hostname);
     let installed = |files: &BTreeMap<String, String>| files.get(&site) == Some(&hash) && files.contains_key(&marker);
     node.applied.as_ref().is_some_and(|applied| installed(&applied.files))
         && node.operation.as_ref().is_none_or(|operation| installed(&operation.files))

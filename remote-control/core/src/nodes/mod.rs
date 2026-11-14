@@ -10,7 +10,6 @@ pub mod basic;
 pub mod conn;
 pub mod delete;
 pub mod harden;
-pub mod scripts;
 pub mod setup;
 pub mod shell;
 
@@ -30,7 +29,7 @@ use crate::transport::{Authentication, ConnectOptions, HostKeyPolicy, RemoteTran
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Ordinary remote commands.
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
-/// `setup-essence.sh uninstall --force` and other long server work.
+/// Uploads and other long server work.
 pub const LONG_TIMEOUT: Duration = Duration::from_secs(900);
 
 /// Dispatch of `node *` and `conn *`. Handlers are generic over the transport

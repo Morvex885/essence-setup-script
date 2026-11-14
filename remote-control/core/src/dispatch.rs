@@ -274,7 +274,7 @@ async fn dispatch_inner(argv: &[String], secrets: &Secrets, input: &Input, agent
         return Err(RcError::new("usage", "Команда выполняется на стороне клиента."));
     }
     if invocation.requires_tty() {
-        return Err(tty_required(&invocation.noun));
+        return Err(tty_required());
     }
     if invocation.requires_session() {
         session.ensure_authorized()?;
@@ -282,8 +282,8 @@ async fn dispatch_inner(argv: &[String], secrets: &Secrets, input: &Input, agent
     route(&invocation, secrets, input, agent_socket, session).await
 }
 
-/// The session part of a terminal command (`node shell`, `telegram menu`):
-/// the same checks as `dispatch`, then lookup, connection and script checks.
+/// The session part of a terminal command (`node shell`): the same checks as
+/// `dispatch`, then lookup and connection.
 /// The caller runs the returned job on the requester's console.
 pub async fn prepare_terminal(argv: &[String], secrets: &Secrets, input: &Input, agent_socket: Option<&Path>,
     session: &mut Session) -> Result<TerminalJob<SshTransport>>
@@ -295,7 +295,6 @@ pub async fn prepare_terminal(argv: &[String], secrets: &Secrets, input: &Input,
     let connect = || SshTransport::with_agent(agent_socket);
     match (invocation.noun.as_str(), invocation.verb.as_str()) {
         ("node", "shell") => crate::nodes::shell::prepare(session, &invocation, connect()).await,
-        ("telegram", "menu") => crate::telegram::menu_prepare(session, &invocation, &connect).await,
         _ => Err(RcError::new("usage", "Неизвестная команда.")),
     }
 }
@@ -593,8 +592,7 @@ mod tests {
             assert_eq!((error.code, error.message.as_str()), ("usage", "Неизвестная команда."), "{list:?}");
         }
         for (list, message) in [
-            (&["node", "shell", "--name", "ghost"][..], "Меню сервера требует терминала."),
-            (&["telegram", "menu", "--name", "ghost"], "Меню Telegram Proxy требует терминала."),
+            (&["node", "shell", "--name", "ghost"][..], "Оболочке ноды нужен терминал."),
         ] {
             let error = run(&mut session, list, "{}").await.error.unwrap();
             assert_eq!((error.code, error.message.as_str(), error.exit_code()), ("tty_required", message, 2), "{list:?}");
@@ -613,7 +611,6 @@ mod tests {
         assert_eq!(prepare(&mut session, &["node", "shell", "--name", "ghost"]).await, Some("session_closed"));
         assert!(run(&mut session, &["session", "open"], r#"{"script-password":"first"}"#).await.ok);
         assert_eq!(prepare(&mut session, &["node", "shell", "--name", "ghost"]).await, Some("not_found"));
-        assert_eq!(prepare(&mut session, &["telegram", "menu", "--name", "ghost"]).await, Some("not_found"));
         assert_eq!(prepare(&mut session, &["node", "shell", "--name", "ghost", "--secrets-stdin"]).await, Some("usage"));
         assert_eq!(prepare(&mut session, &["group", "list"]).await, Some("usage"));
         assert_eq!(prepare(&mut session, &["help"]).await, Some("usage"));

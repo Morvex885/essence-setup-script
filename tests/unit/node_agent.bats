@@ -82,6 +82,7 @@ UFW_RULES='${RULES-443/tcp}'
 RELEASE_CERTS='${RELEASE-}'
 FEATURES='${FEATURES_SPEC-}'
 REMOVE_FEATURES='${REMOVE_SPEC-}'
+${SPEC_EXTRA-}
 EOF
 }
 
@@ -1083,4 +1084,111 @@ exit 0'
     run bash "$script"
     assert_failure
     [[ ! -e "$sub/$old.yaml" ]]
+}
+
+@test "отметка .essence-telegram не удаляется в config и подтверждает снятие сертификата Telegram" {
+    mkdir -p "$ROOT/var/www/tg.example" "$ROOT/var/www/shop.example"
+    : >"$ROOT/var/www/tg.example/.essence-telegram"
+    awg_call 'removable /var/www/tg.example/.essence-telegram'
+    assert_failure
+    awg_call 'release_cert() { printf "release %s\n" "$1" >>"$CALLS"; }
+        AGENT_DIR="$3"; NODE_DIR="$R/root/essence-node"; OP_MODE=apply; HY2_CERT=true; WARP=""; REMOVE_FEATURES=""
+        RELEASE_CERTS="tg.example:/var/www/tg.example shop.example:/var/www/shop.example"; stage_cleanup'
+    assert_success
+    grep -qx "release tg.example" "$CALLS"
+    if grep -qx "release shop.example" "$CALLS"; then return 1; fi
+    [[ ! -e "$ROOT/var/www/tg.example" && -d "$ROOT/var/www/shop.example" ]]
+}
+
+# ─── Фича telegram в полном применении ──────────────────────────────────────
+
+TG_SPEC="TG_HOST='tg.example' TG_REPO='https://example.com/t.git' TG_REVISION='rev1' TG_GO_VERSION='1.26.5' TG_GO_SHA256='x'"
+
+# Компоненты ревизии rev1 уже стоят (сборка пропускается) и заглушки шага telegram.
+telegram_node() {
+    local path unit
+    mkdir -p "$ROOT/opt/tproxy-server-source" "$ROOT/opt/MTProxy/objs/bin" "$ROOT/usr/local/sbin" "$ROOT/etc/mtproxy" \
+        "$ROOT/srv/tproxy-site" "$ROOT/etc/systemd/system"
+    echo rev1 >"$ROOT/opt/tproxy-server-source/.essence-revision"
+    for path in usr/local/bin/tproxy-server opt/MTProxy/objs/bin/mtproto-proxy usr/local/sbin/refresh-mtproxy-config; do
+        printf '#!/bin/bash\n' >"$ROOT/$path"; chmod +x "$ROOT/$path"
+    done
+    for unit in mtproxy.service tproxy-server.service tproxy-firewall.service refresh-mtproxy-config.service refresh-mtproxy-config.timer; do
+        : >"$ROOT/etc/systemd/system/$unit"
+    done
+    echo s >"$ROOT/etc/mtproxy/proxy-secret"; echo c >"$ROOT/etc/mtproxy/proxy-multi.conf"
+    echo site >"$ROOT/srv/tproxy-site/index.html"
+    stub uname '[[ "$1" == -m ]] && echo x86_64; exit 0'
+    # id <пользователь> — есть; id -un/-gn (владелец в add_file) — настоящий.
+    stub id '[[ "${1:-}" == -* ]] && exec /usr/bin/id "$@"; exit 0'
+    stub getent '[[ "$1" == passwd ]] && echo "$2:x:990:990::/nonexistent:/usr/sbin/nologin"; exit 0'
+    stub chown 'exit 0'
+    stub nft 'exit 0'
+    stub install 'for a; do last="$a"; done; [[ " $* " == *" -d "* ]] && mkdir -p "$last"; exit 0'
+    stub curl '[[ "$*" == *readyz* ]] && exit 7; exit 0'
+}
+
+@test "telegram: сбой первой активации выключает службы, метка фичи снимает компоненты следующим применением" {
+    telegram_node
+    FEATURES_SPEC=telegram SPEC_EXTRA="$TG_SPEC" write_spec
+    add_file /etc/mtproxy/mtproxy.env "MTPROXY_SECRET=x"
+    TG_READY_ATTEMPTS=1 run bash "$AGENT/apply.sh" "$OPDIR"
+    assert_failure
+    run status
+    assert_line "result=rolled_back"
+    grep -qx "systemctl enable --now tproxy-firewall.service mtproxy.service refresh-mtproxy-config.timer tproxy-server.service" "$CALLS"
+    local enable disable
+    enable=$(line_of "systemctl enable --now tproxy-firewall.service mtproxy.service refresh-mtproxy-config.timer tproxy-server.service")
+    disable=$(line_of "systemctl disable --now refresh-mtproxy-config.timer tproxy-server.service mtproxy.service tproxy-firewall.service")
+    [[ -n "$disable" ]] && ((enable < disable))
+    [[ ! -e "$ROOT/etc/mtproxy/mtproxy.env" && -f "$ROOT/root/essence-node/features/telegram" ]]
+
+    # Роль так и не зафиксирована и из описания ушла: cleanup снимает её по метке.
+    rm -rf "$OPDIR"; mkdir -p "$OPDIR/files"; : >"$CALLS"
+    write_spec
+    add_file /etc/mihomo/config.yaml "new"
+    run_agent
+    assert_success
+    [[ ! -e "$ROOT/root/essence-node/features/telegram" && ! -e "$ROOT/usr/local/bin/tproxy-server" && ! -e "$ROOT/opt/MTProxy" ]]
+    grep -qx "nft delete table inet tproxy_backend" "$CALLS"
+}
+
+@test "telegram: откат не из-за Telegram не трогает его службы" {
+    telegram_node
+    printf 'old\n' >"$ROOT/etc/mihomo/config.yaml"
+    FEATURES_SPEC=telegram SPEC_EXTRA="$TG_SPEC" write_spec
+    add_file /etc/mihomo/config.yaml "new"
+    MIHOMO_T_RC=1 run bash "$AGENT/apply.sh" "$OPDIR"
+    assert_failure
+    run status
+    assert_line "result=rolled_back"
+    if grep -q "mtproxy.service" "$CALLS"; then return 1; fi
+    [[ -f "$ROOT/root/essence-node/features/telegram" ]]
+}
+
+@test "telegram: сборка MTProxy доступна пользователю mtproxy и после сборки под umask 077" {
+    telegram_node
+    chmod 0700 "$ROOT/opt/MTProxy/objs" "$ROOT/opt/MTProxy/objs/bin" "$ROOT/opt/MTProxy/objs/bin/mtproto-proxy"
+    awg_call 'TG_HOST=tg.example TG_REPO=r TG_REVISION=rev1 TG_GO_VERSION=1 TG_GO_SHA256=x; NODE_DIR="$R/root/essence-node"; umask 077; telegram_prepare'
+    assert_success
+    [[ "$(stat -c %a "$ROOT/opt/MTProxy/objs/bin")" == 755 && "$(stat -c %a "$ROOT/opt/MTProxy/objs/bin/mtproto-proxy")" == 755 ]]
+    grep -q "umask 022; bash \"\$backend_source/deploy/install-mtproxy.sh\"" "$AGENT/steps/telegram.sh"
+}
+
+@test "telegram: откат применения, снимавшего незафиксированные остатки, не включает службы снова" {
+    telegram_node
+    mkdir -p "$ROOT/root/essence-node/features" && : >"$ROOT/root/essence-node/features/telegram"
+    printf 'old\n' >"$ROOT/etc/mihomo/config.yaml"
+    write_spec
+    add_file /etc/mihomo/config.yaml "new"
+    MIHOMO_T_RC=1 run bash "$AGENT/apply.sh" "$OPDIR"
+    assert_failure
+    run status
+    assert_line "result=rolled_back"
+    local disable
+    disable=$(grep -nxF "systemctl disable --now refresh-mtproxy-config.timer tproxy-server.service mtproxy.service tproxy-firewall.service" "$CALLS" | tail -n1 | cut -d: -f1)
+    [[ -n "$disable" ]]
+    # Повторного включения нет (`! grep` посреди теста bats не проверяет).
+    if grep -q "enable --now tproxy-firewall.service\|restart mtproxy.service" "$CALLS"; then return 1; fi
+    [[ -f "$ROOT/root/essence-node/features/telegram" ]]
 }

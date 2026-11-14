@@ -56,6 +56,8 @@ export function activity(argv) {
   const nodeNouns = ['node', 'conn', 'telegram'];
   if (noun === 'session' && verb === 'open') return 'Открытие сессии…';
   if (noun === 'status') return 'Загрузка состояния…';
+  // Роль Telegram без SSH: правка конфигурации и ссылка.
+  if (noun === 'telegram' && ['set', 'remove', 'link', 'rotate-secret'].includes(verb)) return 'Выполняется…';
   if (noun === 'source') {
     switch (verb) {
       case 'github-accounts': return 'Проверка аккаунтов GitHub…';

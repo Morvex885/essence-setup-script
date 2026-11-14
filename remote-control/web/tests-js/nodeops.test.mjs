@@ -5,8 +5,10 @@ import assert from 'node:assert/strict';
 import {
   EMPTY, nodeText, syncedNode, syncProblem, syncData, overviewNodes, syncAll,
   connectionView, assignmentChanges, assignArgv, assignConnections, connSyncArgv, connListArgv, nodeCheckArgv, syncConnections,
-  TELEGRAM_BATCH, TELEGRAM_COMPONENTS, TELEGRAM_STATUS_ARGV, telegramArgv, telegramResults,
-  telegramMenu, telegramBatch, telegramStatus,
+  TELEGRAM_STATUS_ARGV, telegramSetArgv, telegramRemoveArgv, telegramLinkArgv, telegramRotateArgv, telegramTagArgv,
+  telegramTagClearArgv, telegramRestartArgv, telegramDiagnosticsArgv, tagError, telegramRows, telegramCandidates,
+  telegramResults, telegramStatus, enableTelegram, telegramDomainFlow, rotateTelegramSecret, removeTelegram,
+  telegramTagFlow, clearTelegramTag, telegramLink, restartTelegram, telegramDiagnostics,
 } from '../assets/js/screens/nodeops-model.js';
 import { isFailure } from '../assets/js/flows.js';
 
@@ -264,21 +266,161 @@ test('assignConnections: группа, удалённая после чтени�
   assert.deepEqual(record.calls, [['group', 'list']]);
 });
 
-test('telegramMenu: после открытого сеанса — after() (и при сбое терминала), отмена — без него', async () => {
-  const listed = () => [[['node', 'list'], ok([{ name: 'de' }])]];
-  const run = async (answer, terminal) => {
-    const { ctx } = assignCtx(listed(), [answer]);
-    const opened = [];
-    ctx.terminal = async (argv) => { opened.push(argv); return terminal(); };
-    let after = 0;
-    let thrown = null;
-    try { await telegramMenu(ctx, async () => { after += 1; }); } catch (error) { thrown = error; }
-    return { opened, after, thrown };
+// ─── Telegram ────────────────────────────────────────────────────────────────
+
+/**
+ * Поддельный `ctx` Telegram: `steps` — `[argv, reply]` по порядку, `answers` —
+ * ответы `form`, `apply` — ответ на предложение применить.
+ */
+function telegramCtx(steps, answers = [], apply = false) {
+  const record = { calls: [], options: [], forms: [], offers: [], planned: [], nodes: [], notices: [], shown: 0 };
+  const ctx = {
+    async request(argv, options = {}) {
+      assert.ok(steps.length > 0, `лишний запрос ${argv.join(' ')}`);
+      const [expected, reply] = steps.shift();
+      assert.deepEqual(argv, expected);
+      record.calls.push(argv);
+      record.options.push(options);
+      return reply;
+    },
+    call: (...words) => ctx.request(words),
+    async form(props) { record.forms.push(props); return answers.shift(); },
+    async confirm(props) { record.offers.push(props.question); return apply; },
+    async show() { record.shown += 1; },
+    async runConfirmed(title, question, argv) { record.planned.push(argv); return ctx.request(argv); },
+    async nodeRequest(name, argv, review, options = {}) { record.nodes.push([name, options.operation ? 'operation' : null]); return ctx.request(argv, options); },
+    notify: (level, text) => record.notices.push(level),
+    failed: () => record.notices.push('failed'),
+    isFailure,
   };
-  let result = await run({ node: 'de' }, () => ok());
-  assert.deepEqual([result.opened.length, result.after, result.thrown], [1, 1, null]);
-  result = await run({ node: 'de' }, () => { throw new Error('обрыв'); });
-  assert.deepEqual([result.opened.length, result.after, result.thrown.message], [1, 1, 'обрыв']);
-  result = await run(null, () => ok());
-  assert.deepEqual([result.opened.length, result.after], [0, 0]);
+  return { ctx, record, done: () => assert.equal(steps.length, 0, 'не все запросы выполнены') };
+}
+
+const NODES = [
+  { name: 'de', ip: '1.1.1.1', port: 22, profile: 'edge', status: 'applied', telegram: { hostname: 'tg.de.example', tag: true } },
+  { name: 'nl', ip: '2.2.2.2', port: 22, profile: 'edge', status: 'pending', telegram: null },
+  { name: 'raw', ip: '3.3.3.3', port: 22, profile: null, status: 'none', telegram: null },
+];
+
+test('telegram: argv команд роли, секрет тега не в argv', () => {
+  assert.deepEqual(TELEGRAM_STATUS_ARGV, ['telegram', 'status']);
+  assert.deepEqual(telegramSetArgv('de', 'tg.example'), ['telegram', 'set', '--name', 'de', '--domain', 'tg.example']);
+  assert.deepEqual(telegramRemoveArgv('de'), ['telegram', 'remove', '--name', 'de']);
+  assert.deepEqual(telegramLinkArgv('de'), ['telegram', 'link', '--name', 'de']);
+  assert.deepEqual(telegramRotateArgv('de'), ['telegram', 'rotate-secret', '--name', 'de']);
+  assert.deepEqual(telegramTagArgv('de'), ['telegram', 'tag', '--name', 'de']);
+  assert.deepEqual(telegramTagClearArgv('de'), ['telegram', 'tag', '--name', 'de', '--clear']);
+  assert.deepEqual(telegramRestartArgv('de'), ['telegram', 'restart', '--name', 'de']);
+  assert.deepEqual(telegramDiagnosticsArgv('de'), ['telegram', 'diagnostics', '--name', 'de']);
+});
+
+test('telegram: тег — ровно 32 шестнадцатеричных символа', () => {
+  assert.equal(tagError('0123456789abcdefABCDEF0123456789'), null);
+  assert.equal(tagError(' 0123456789abcdef0123456789abcdef '), null);
+  for (const bad of ['', '0123', '0123456789abcdef0123456789abcdeg', '0123456789abcdef0123456789abcdef0']) {
+    assert.notEqual(tagError(bad), null, bad);
+  }
+});
+
+test('telegram: список — ноды с ролью, варианты включения — ноды с профилем без роли', () => {
+  const rows = telegramRows(NODES);
+  assert.deepEqual(rows.map((row) => [row.name, row.hostname, row.tag, row.state.tone]), [['de', 'tg.de.example', true, 'ok']]);
+  assert.deepEqual(telegramCandidates(NODES).map((option) => option.value), ['nl']);
+  assert.deepEqual(telegramRows(null), []);
+});
+
+test('telegram status: строки с доменом и сводкой, ошибка с results — таблица, без results — failed', async () => {
+  const row = { node: 'de', hostname: 'tg.de.example', code: 0, status: 'ok', reason: '', summary: ['MTProxy: active', 7] };
+  const bad = { node: 'nl', hostname: 'tg.nl.example', code: 1, status: 'error', reason: 'ssh', summary: [] };
+  let s = telegramCtx([[TELEGRAM_STATUS_ARGV, ok({ results: [row] })]]);
+  const table = await telegramStatus(s.ctx);
+  assert.deepEqual(table.map((item) => [item.node, item.hostname, item.tone, item.summary]), [['de', 'tg.de.example', 'ok', ['MTProxy: active']]]);
+  s = telegramCtx([[TELEGRAM_STATUS_ARGV, err('remote_failed', { results: [row, bad] })]]);
+  assert.deepEqual((await telegramStatus(s.ctx)).map((item) => item.tone), ['ok', 'error']);
+  assert.deepEqual(s.record.notices, []);
+  const partial = telegramResults(err('partial', { results: [{ ...row, status: 'partial' }, { ...row, status: 'not_installed' }] }));
+  assert.deepEqual(partial.map((item) => item.tone), ['warn', 'warn']);
+  assert.notEqual(partial[0].status, partial[1].status);
+  s = telegramCtx([[TELEGRAM_STATUS_ARGV, err('invalid')]]);
+  assert.equal(await telegramStatus(s.ctx), null);
+  assert.deepEqual(s.record.notices, ['failed']);
+});
+
+test('telegram: «Включить на ноде» — форма из нод без роли, set, затем предложение node apply --name', async () => {
+  let s = telegramCtx([[telegramSetArgv('nl', 'tg.nl.example'), ok({ node: 'nl', hostname: 'tg.nl.example', tag: false })]],
+    [{ node: 'nl', domain: ' tg.nl.example ' }]);
+  assert.equal(await enableTelegram(s.ctx, NODES), true);
+  assert.deepEqual(s.record.forms[0].fields.find((f) => f.name === 'node').options.map((o) => o.value), ['nl']);
+  assert.equal(s.record.offers.length, 1);
+  assert.ok(s.record.offers[0].includes('nl'));
+  s.done();
+  // Согласие — node apply --name nl.
+  s = telegramCtx([
+    [telegramSetArgv('nl', 'tg.nl.example'), ok({ node: 'nl', hostname: 'tg.nl.example', tag: false })],
+    [['node', 'apply', '--name', 'nl'], ok({ applied: ['nl'] })],
+  ], [{ node: 'nl', domain: 'tg.nl.example' }], true);
+  await enableTelegram(s.ctx, NODES);
+  assert.equal(s.record.shown, 1);
+  s.done();
+  // Отмена формы и сбой set — без предложения.
+  s = telegramCtx([], [null]);
+  assert.equal(await enableTelegram(s.ctx, NODES), false);
+  s = telegramCtx([[telegramSetArgv('nl', 'x'), err('invalid')]], [{ node: 'nl', domain: 'x' }]);
+  assert.equal(await enableTelegram(s.ctx, NODES), false);
+  assert.deepEqual([s.record.offers, s.record.notices], [[], ['failed']]);
+  // Нет нод без роли — без формы.
+  s = telegramCtx([], []);
+  assert.equal(await enableTelegram(s.ctx, NODES.slice(0, 1)), false);
+  assert.deepEqual([s.record.forms.length, s.record.notices], [0, ['warn']]);
+});
+
+test('telegram: «Сменить домен» — текущий домен в форме, без изменений команды нет', async () => {
+  let s = telegramCtx([], [{ domain: 'tg.de.example' }]);
+  assert.equal(await telegramDomainFlow(s.ctx, 'de', 'tg.de.example'), false);
+  assert.equal(s.record.forms[0].fields[0].value, 'tg.de.example');
+  s = telegramCtx([[telegramSetArgv('de', 'new.example'), ok({ node: 'de', hostname: 'new.example', tag: true })]], [{ domain: 'new.example' }]);
+  assert.equal(await telegramDomainFlow(s.ctx, 'de', 'tg.de.example'), true);
+  assert.equal(s.record.offers.length, 1);
+  s.done();
+});
+
+test('telegram: секрет и удаление — по плану, после успеха предложение применить, отказ — без сбоя', async () => {
+  for (const [flow, argv] of [[rotateTelegramSecret, telegramRotateArgv('de')], [removeTelegram, telegramRemoveArgv('de')]]) {
+    let s = telegramCtx([[argv, ok({ node: 'de' })]]);
+    assert.equal(await flow(s.ctx, 'de'), true);
+    assert.deepEqual([s.record.planned, s.record.offers.length], [[argv], 1]);
+    s = telegramCtx([[argv, err('confirmation_required')]]);
+    assert.equal(await flow(s.ctx, 'de'), false);
+    assert.deepEqual([s.record.offers, s.record.notices], [[], []]);
+  }
+});
+
+test('telegram: тег — скрытое поле с проверкой, секрет password; «Убрать тег» — --clear', async () => {
+  const tag = 'ab'.repeat(16);
+  let s = telegramCtx([[telegramTagArgv('de'), ok({ node: 'de', tag: true })]], [{ password: tag }]);
+  assert.equal(await telegramTagFlow(s.ctx, 'de'), true);
+  const [field] = s.record.forms[0].fields;
+  assert.deepEqual([field.name, field.type, field.validate('short') !== null, field.validate(tag)], ['password', 'secret', true, null]);
+  assert.deepEqual(s.record.options[0].secrets, { password: tag });
+  assert.equal(s.record.offers.length, 1);
+  s = telegramCtx([], [null]);
+  assert.equal(await telegramTagFlow(s.ctx, 'de'), false);
+  s = telegramCtx([[telegramTagClearArgv('de'), ok({ node: 'de', tag: false })]]);
+  assert.equal(await clearTelegramTag(s.ctx, 'de'), true);
+  assert.equal(s.record.offers.length, 1);
+});
+
+test('telegram: ссылка, перезапуск и диагностика (окно операции через nodeRequest)', async () => {
+  const link = 'tg://webproxy?server=tg.de.example&port=443&secret=ee00';
+  let s = telegramCtx([[telegramLinkArgv('de'), ok({ link })]]);
+  assert.equal(await telegramLink(s.ctx, 'de'), link);
+  s = telegramCtx([[telegramLinkArgv('de'), err('not_found')]]);
+  assert.equal(await telegramLink(s.ctx, 'de'), null);
+  assert.deepEqual(s.record.notices, ['failed']);
+  s = telegramCtx([[telegramRestartArgv('de'), ok({ node: 'de' })], [telegramDiagnosticsArgv('de'), ok({ node: 'de' })]]);
+  assert.equal(await restartTelegram(s.ctx, 'de'), true);
+  assert.equal(await telegramDiagnostics(s.ctx, 'de'), true);
+  assert.deepEqual(s.record.nodes, [['de', 'operation'], ['de', 'operation']]);
+  assert.deepEqual(s.record.offers, []);
+  s.done();
 });

@@ -55,8 +55,13 @@ fn config(profile: Profile) -> Config {
 
 use crate::model::CONNECTION_NAMES;
 
+const TG_SECRET: &str = "0123456789abcdef0123456789abcdef";
+
 fn secrets() -> NodeSecrets {
-    NodeSecrets { reality_key: Some(Zeroizing::new("PRIVKEY".into())), ..NodeSecrets::default() }
+    NodeSecrets {
+        reality_key: Some(Zeroizing::new("PRIVKEY".into())), telegram_secret: Some(Zeroizing::new(TG_SECRET.into())),
+        ..NodeSecrets::default()
+    }
 }
 
 fn render(config: &Config) -> Desired {
@@ -857,4 +862,101 @@ fn the_subscription_role_stays_applied_while_other_changes_are_pending() {
     assert!(!sub_role_applied(&config, &config.nodes[0]));
     config.subscription_host = Some(sub_host(2096));
     assert!(!sub_role_applied(&config, &config.nodes[0]));
+}
+
+fn telegram(config: &mut Config, tag: bool) {
+    config.telegram.push(TelegramProxy { node: "de".into(), hostname: "tg.example.com".into(), secret_mark: "0123abcd".into(),
+        tag_mark: tag.then(|| "89abcdef".into()) });
+}
+
+fn tg_listen(desired: &Desired) -> Vec<&str> {
+    content(desired, "/etc/nginx/sites-available/essence-telegram-proxy").lines().filter(|line| line.trim_start().starts_with("listen ")).collect()
+}
+
+#[test]
+fn telegram_behind_self_steal_with_its_files_and_spec() {
+    let mut config = config(profile());
+    telegram(&mut config, false);
+    let desired = render(&config);
+    assert_eq!(tg_listen(&desired), ["    listen 127.0.0.1:8443 ssl http2;"]);
+    let site = content(&desired, "/etc/nginx/sites-available/essence-telegram-proxy");
+    assert!(site.starts_with("# Essence site essence-telegram-proxy\nserver {\n"), "the executor removes only marked sites: {site}");
+    assert!(site.contains("    server_name tg.example.com;\n    ssl_certificate /etc/nginx/ssl/tg.example.com/fullchain.pem;\n"), "{site}");
+    assert!(site.contains("        proxy_pass http://127.0.0.1:8080;\n") && site.contains("proxy_set_header Host $http_host;"));
+    assert_eq!(content(&desired, "/etc/nginx/sites-enabled/essence-telegram-proxy"), "/etc/nginx/sites-available/essence-telegram-proxy");
+    let file = |path: &str| desired.files.iter().find(|file| file.path == path).unwrap();
+    let env = file("/etc/mtproxy/mtproxy.env");
+    assert_eq!((env.mode, env.owner, env.group), ("0640", "root", "mtproxy"));
+    assert_eq!(env.content.as_str(), format!("MTPROXY_SECRET={TG_SECRET}\nMTPROXY_TAG_ARGS=\"\"\nMTPROXY_WORKERS=1\nMTPROXY_MAX_CONNECTIONS=4096\n"));
+    let profiles = file("/etc/tproxy-server/profiles.json");
+    assert_eq!((profiles.mode, profiles.group), ("0400", "tproxy"));
+    assert_eq!(profiles.content.as_str(), format!("{{\"profiles\":[{{\"name\":\"default\",\"secret\":\"{TG_SECRET}\",\"backend\":\"127.0.0.1:2398\",\"carrier_mode\":\"https\"}}]}}\n"));
+    let relay = file("/etc/tproxy-server/config.json");
+    assert_eq!((relay.mode, relay.group), ("0640", "tproxy"));
+    let relay: Value = serde_json::from_str(&relay.content).unwrap();
+    assert_eq!(relay, json!({"public_hostname": "tg.example.com", "listen": "127.0.0.1:8080", "admin_listen": "127.0.0.1:8081",
+        "public_dir": "/srv/tproxy-site", "profiles_file": "/run/credentials/tproxy-server.service/profiles.json"}));
+    assert!(content(&desired, "/etc/tproxy-server/firewall.nft").contains("        iifname != \"lo\" tcp dport 2398 drop\n"));
+    assert_eq!(content(&desired, "/var/www/tg.example.com/.essence-telegram"), "");
+    assert_eq!(spec(&desired, "CERTS"), "de.example.com:/var/www/de.example.com tg.example.com:/var/www/tg.example.com");
+    assert_eq!((spec(&desired, "FEATURES"), spec(&desired, "TG_HOST")), ("telegram", "tg.example.com"));
+    assert_eq!((spec(&desired, "TG_REVISION"), spec(&desired, "TG_GO_VERSION")), (crate::telegram::TPROXY_REVISION, crate::telegram::GO_VERSION));
+    assert_eq!((spec(&desired, "TG_GO_SHA256"), spec(&desired, "TG_REPO")), (crate::telegram::GO_SHA256, crate::telegram::TPROXY_REPO));
+    assert_eq!(spec(&desired, "LISTEN_TCP"), "443 8443");
+    assert!(desired.lines.contains(&"Telegram Web Proxy: tg.example.com (tproxy-server f7a6acc)".to_owned()));
+    for path in desired.files.iter().map(|file| file.path.as_str()) {
+        assert!(crate::server::paths::managed_file(path) || path.starts_with("/etc/nginx/sites-enabled/"), "{path} is managed");
+    }
+
+    // A sponsor tag joins the backend arguments; a damaged secret or tag fails the render.
+    let mut tagged = config.clone();
+    tagged.telegram[0].tag_mark = Some("89abcdef".into());
+    let tag = "ABCDEF0123456789ABCDEF0123456789";
+    let with_tag = NodeSecrets { telegram_tag: Some(Zeroizing::new(tag.into())), ..secrets() };
+    let env = content(&desired_with(&tagged, &with_tag), "/etc/mtproxy/mtproxy.env").to_owned();
+    assert!(env.contains(&format!("MTPROXY_TAG_ARGS=\"-P {}\"\n", tag.to_ascii_lowercase())), "{env}");
+    assert_eq!(self::desired(&tagged, &tagged.nodes[0], Some(&secrets())).err().map(|e| e.code), Some("invalid"));
+    let broken = NodeSecrets { telegram_secret: Some(Zeroizing::new("X".repeat(32))), ..secrets() };
+    assert_eq!(self::desired(&config, &config.nodes[0], Some(&broken)).err().map(|e| e.code), Some("invalid"));
+
+    // The secret changes the digest through its mark.
+    let mut rotated = config.clone();
+    rotated.telegram[0].secret_mark = "fedcba98".into();
+    assert_ne!(render(&rotated).digest, desired.digest);
+}
+
+fn desired_with(config: &Config, secrets: &NodeSecrets) -> Desired {
+    desired(config, &config.nodes[0], Some(secrets)).unwrap()
+}
+
+#[test]
+fn telegram_behind_the_stream_and_on_a_free_443() {
+    let mut config = config(sni(profile()));
+    config.nodes[0].domain = None;
+    telegram(&mut config, false);
+    let stream = render(&config);
+    assert_eq!(tg_listen(&stream), ["    listen 127.0.0.1:8446 ssl http2;"]);
+    assert!(content(&stream, STREAM_PATH).contains("        tg.example.com telegram_proxy;\n"));
+    assert_eq!(spec(&stream, "LISTEN_TCP"), "443 8444 8446");
+
+    config.profiles[0].vless_tcp = false;
+    config.profiles[0].hysteria2 = Some(Hysteria2 { port: 20443, obfs: false });
+    let free = render(&config);
+    assert_eq!(tg_listen(&free), ["    listen 443 ssl http2;", "    listen [::]:443 ssl http2;"]);
+    assert!(spec(&free, "UFW_RULES").starts_with("443/tcp "));
+    assert_eq!(spec(&free, "LISTEN_TCP"), "443");
+}
+
+#[test]
+fn a_removed_telegram_role_releases_its_certificate() {
+    let mut config = config(profile());
+    telegram(&mut config, false);
+    let applied = render(&config);
+    config.nodes[0].applied = Some(Applied { digest: applied.digest.clone(), files: file_hashes(&applied.files), ports: applied.ports.clone(), at: "t".into() });
+    config.telegram.clear();
+    let gone = render(&config);
+    assert_eq!((spec(&gone, "REMOVE_FEATURES"), spec(&gone, "RELEASE_CERTS"), spec(&gone, "TG_HOST"), spec(&gone, "TG_REVISION")),
+        ("telegram", "tg.example.com:/var/www/tg.example.com", "", ""));
+    assert!(gone.remove.contains(&"/etc/mtproxy/mtproxy.env".to_owned()) && gone.remove.contains(&"/etc/nginx/sites-enabled/essence-telegram-proxy".to_owned()));
+    assert_eq!(spec(&teardown(&config.nodes[0]), "RELEASE_CERTS"), "de.example.com:/var/www/de.example.com tg.example.com:/var/www/tg.example.com");
 }

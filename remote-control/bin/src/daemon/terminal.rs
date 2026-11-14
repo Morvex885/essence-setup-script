@@ -1,4 +1,4 @@
-//! Terminal requests (`node shell`, `telegram menu`): the registry of nodes
+//! Terminal requests (`node shell`): the registry of nodes
 //! with an open terminal, the protocol console and the terminal threads.
 //!
 //! `conn.rs` reserves a node (`Preparing`) when it accepts the request; the

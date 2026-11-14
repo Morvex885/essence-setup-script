@@ -2,9 +2,10 @@
 //! `tui/nodes.sh`) over the daemon protocol only.
 //!
 //! Lists keep their own menu section; dangerous actions consume the core's
-//! frozen plan through `confirm`. Terminal commands (`node shell`,
-//! `telegram menu`) are terminal requests while the UI is suspended. Changes
-//! of the desired node state reach a node only through `node apply` (`apply`).
+//! frozen plan through `confirm`. The terminal command `node shell` is a
+//! terminal request while the UI is suspended. Changes of the desired node
+//! state (profile, Telegram Proxy role) reach a node only through `node apply`
+//! (`apply`).
 use std::io;
 use serde_json::Value;
 use ratatui::style::Color;
@@ -121,32 +122,13 @@ fn node_request(ctx: &mut Context<'_>, name: &str, words: &[String], review: Opt
         return Ok(reply);
     }
 }
-/// `node shell` / `telegram menu`: a terminal request; the daemon runs the
-/// remote PTY and the local console relays it while the UI is suspended.
-/// `telegram menu` on a node with missing or stale scripts answers with the
-/// upload plan: it is shown, and on consent the command runs again with
-/// `--yes --plan-token` (a changed plan is shown again, at most twice — as
-/// `confirm::run_confirmed`).
-fn interactive(ctx: &mut Context<'_>, name: &str, telegram: bool) -> io::Result<()> {
-    let base = if telegram { argv(&["telegram", "menu", "--name", name]) } else { argv(&["node", "shell", "--name", name]) };
-    let mut words = base.clone();
-    let mut changes = 0;
+/// `node shell`: a terminal request; the daemon runs the remote PTY and the
+/// local console relays it while the UI is suspended.
+fn shell(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
+    let words = argv(&["node", "shell", "--name", name]);
     loop {
         let reply = ctx.interactive(&words)?;
         if reply.ok { return Ok(()); }
-        if matches!(reply.code(), "confirmation_required" | "plan_changed") {
-            if reply.code() == "plan_changed" {
-                changes += 1;
-                if changes > 2 { ctx.ui.notice(ui::warn("План продолжает меняться. Действие не выполнено; повторите позже.")); return Ok(()); }
-                ctx.ui.notice(ui::warn("План изменился. Проверьте его ещё раз."));
-            }
-            let Some(token) = reply.error["plan_token"].as_str().filter(|s| !s.is_empty()) else { ctx.failed(); return Ok(()); };
-            if !ctx.confirm(View::review(format!("Нода: {name}"), &reply.error["plan"]), "Продолжить?")? { return Ok(()); }
-            words = base.clone();
-            confirm::set_flag(&mut words, "--yes", None);
-            confirm::set_flag(&mut words, "--plan-token", Some(token));
-            continue;
-        }
         if handle_node_codes(ctx, &reply, name)? { continue; }
         outcome(ctx, &reply);
         return Ok(());
@@ -235,7 +217,7 @@ fn card_view(name: &str, node: &Value, password: bool) -> View {
     view.context.push(plain(format!("Клиентов: {}", text(&node["clients"]))));
     view.sections.push(vec![
         Item::new('y', "Применить", ui::GREEN),
-        Item::new('o', "Оболочка", ui::CYAN), Item::new('t', "Telegram Proxy на ноде", ui::CYAN),
+        Item::new('o', "Оболочка", ui::CYAN),
         Item::new('p', "Подключения ноды", ui::CYAN), Item::new('k', "Проверить подключение", ui::CYAN),
     ]);
     let mut actions = vec![
@@ -261,8 +243,7 @@ impl Screen for NodeCard {
             let Some(choice) = ctx.choose(&card_view(&self.0, node, password))? else { return Ok(Navigation::Back); };
             let name = self.0.clone();
             match choice.as_str() {
-                "o" | "O" => interactive(ctx, &name, false)?,
-                "t" | "T" => interactive(ctx, &name, true)?,
+                "o" | "O" => shell(ctx, &name)?,
                 "p" | "P" => connection_node(ctx, &name)?,
                 "g" | "G" if warp_label(node).is_some() => warp_reregister(ctx, &name)?,
                 "k" | "K" => { node_request(ctx, &name, &argv(&["node", "check", "--name", &name]), None)?; }
@@ -780,12 +761,21 @@ pub(crate) fn conn_set_argv(node: &str, assignments: &[(&str, &[String])]) -> Ve
 
 // ─── Telegram ────────────────────────────────────────────────────────────────
 
-/// «нода  статус  причина» from `results` (data on success, error otherwise).
-/// False when the reply carries no results table.
+/// Nodes with the Web Proxy role (`node list .telegram`), in list order.
+fn telegram_nodes(list: &Value) -> Vec<&Value> { rows(list).iter().filter(|node| node["telegram"].is_object()).collect() }
+fn telegram_label(node: &Value) -> String {
+    let role = &node["telegram"];
+    let tag = if role["tag"] == true { "да" } else { "нет" };
+    let mut label = format!("{}  {}  · тег: {tag}", text(&node["name"]), text(&role["hostname"]));
+    if let Some((state, _)) = apply_state(node) { label.push_str(&format!("  · {state}")); }
+    label
+}
+/// «нода  статус  причина» and the summary lines of every `results` row
+/// (data on success, error otherwise). False when the reply has no results.
 fn telegram_table(ctx: &mut Context<'_>, reply: &Reply) -> io::Result<bool> {
     let results = if reply.ok { rows(&reply.data["results"]) } else { rows(&reply.error["results"]) };
     if results.is_empty() { return Ok(false); }
-    let mut view = View::new("Результат Telegram Proxy");
+    let mut view = View::new("Состояние Telegram Proxy");
     view.status.push(ui::text("нода  статус  причина", ui::NC));
     for row in results {
         let (status, color) = match row["status"].as_str() {
@@ -795,74 +785,141 @@ fn telegram_table(ctx: &mut Context<'_>, reply: &Reply) -> io::Result<bool> {
             _ => ("ошибка", ui::RED),
         };
         view.context.push(ui::text(format!("{}  {status}  {}", text(&row["node"]), text(&row["reason"])), color));
+        for line in rows(&row["summary"]) { view.context.push(ui::text(format!("  {}", text(line)), ui::NC)); }
     }
-    // Kept on screen until Enter/0/EOF: the next menu frame would replace it.
-    view.prompt = "Enter — продолжить: ".into();
+    crate::clients::present(ctx, &view)?;
+    Ok(true)
+}
+/// After `telegram set|tag|rotate-secret|remove` the node waits for `node apply`.
+fn telegram_changed(ctx: &mut Context<'_>, name: &str, reply: &Reply) -> io::Result<()> {
+    if reply.ok { return offer_apply_on(ctx, &[name.to_owned()]); }
+    outcome(ctx, reply);
+    Ok(())
+}
+/// The Web Proxy domain (Enter — cancel) → `telegram set`.
+fn telegram_domain(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
+    let title = format!("Telegram Proxy: {name}");
+    let Some(domain) = ask_valid(ctx, &title, "Домен Web Proxy (Enter — отмена)", |d| d.is_empty() || domain_valid(d), DOMAIN_INVALID)? else { return Ok(()); };
+    if domain.is_empty() { return Ok(()); }
+    let reply = ctx.call(&["telegram", "set", "--name", name, "--domain", &domain])?;
+    telegram_changed(ctx, name, &reply)
+}
+/// «Включить на ноде»: a node with a profile and without the role, then its domain.
+fn telegram_enable(ctx: &mut Context<'_>, list: &Value) -> io::Result<()> {
+    let candidates: Vec<&Value> = rows(list).iter().filter(|node| node["telegram"].is_null() && !text(&node["profile"]).is_empty()).collect();
+    // The same answer as the web panel (`enableTelegram`): no empty list.
+    if candidates.is_empty() { ctx.ui.notice(ui::warn("Нет нод с профилем без Telegram Proxy.")); return Ok(()); }
+    let labels: Vec<String> = candidates.iter().map(|node| node_label(node)).collect();
+    let Some(i) = ctx.select("Включение Telegram Proxy", &labels)? else { return Ok(()); };
+    telegram_domain(ctx, &text(&candidates[i]["name"]))
+}
+/// «Ссылка»: shown in a frame with its QR code, never in the journal.
+fn telegram_link(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
+    let reply = ctx.call(&["telegram", "link", "--name", name])?;
+    if !reply.ok { outcome(ctx, &reply); return Ok(()); }
+    let link = text(&reply.data["link"]);
+    let mut view = View::new(format!("Ссылка Telegram Proxy: {name}"));
+    view.context.push(ui::text(link.clone(), ui::GREEN));
+    crate::clients::push_qr(&mut view, &crate::clients::qr_code(&link));
+    crate::clients::present(ctx, &view)
+}
+const TAG_INVALID: &str = "Спонсорский тег — 32 шестнадцатеричных символа.";
+/// «Спонсорский тег»: hidden entry (Enter/EOF — cancel) → `telegram tag` with
+/// the tag only in the `password` secret, wiped on any outcome.
+fn telegram_tag(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
+    let tag = loop {
+        let Some(tag) = ctx.secret(&format!("Telegram Proxy: {name}"), "Спонсорский тег (Enter — отмена)")? else { return Ok(()); };
+        if tag.is_empty() { return Ok(()); }
+        if tag.len() == 32 && tag.bytes().all(|b| b.is_ascii_hexdigit()) { break tag; }
+        ctx.ui.notice(ui::warn(TAG_INVALID));
+    };
+    let mut secrets = Secrets::default();
+    secrets.insert_hidden("password", tag);
+    let reply = ctx.request(&argv(&["telegram", "tag", "--name", name]), &secrets);
+    secrets.clear();
+    telegram_changed(ctx, name, &reply?)
+}
+/// The role of one node; the card returns to the list once the role is gone.
+fn telegram_card(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
+    let title = format!("Telegram Proxy: {name}");
     loop {
-        match ctx.choose(&view)?.as_deref() {
-            None | Some("" | "0") => return Ok(true),
+        let listed = ctx.call(&["node", "list"])?;
+        if !listed.ok {
+            if read_failed(ctx, &title)? { continue; }
+            return Ok(());
+        }
+        let Some(node) = telegram_nodes(&listed.data).into_iter().find(|node| node["name"] == name) else { return Ok(()); };
+        let tagged = node["telegram"]["tag"] == true;
+        let mut view = View::new(title.clone());
+        view.prompt = "Выберите действие: ".into();
+        view.context.push(ui::text(format!("Домен: {}", text(&node["telegram"]["hostname"])), ui::NC));
+        view.context.push(if tagged { ui::text("Спонсорский тег: задан", ui::GREEN) } else { ui::text("Спонсорский тег: нет", ui::DIM) });
+        if let Some((state, color)) = apply_state(node) { view.context.push(ui::text(format!("Применение: {state}"), color)); }
+        view.sections.push(vec![Item::new('l', "Ссылка", ui::CYAN), Item::new('d', "Диагностика", ui::CYAN)]);
+        let mut actions = vec![
+            Item::new('m', "Сменить домен", ui::YELLOW), Item::new('k', "Сменить секрет", ui::YELLOW),
+            Item::new('g', "Спонсорский тег", ui::YELLOW),
+        ];
+        if tagged { actions.push(Item::new('u', "Убрать тег", ui::RED)); }
+        actions.extend([Item::new('r', "Перезапустить", ui::YELLOW), Item::new('x', "Убрать", ui::RED), Item::new(0, "Назад", ui::NC)]);
+        view.sections.push(actions);
+        let Some(choice) = ctx.choose(&view)? else { return Ok(()); };
+        match choice.as_str() {
+            "l" | "L" => telegram_link(ctx, name)?,
+            "d" | "D" => { node_request(ctx, name, &argv(&["telegram", "diagnostics", "--name", name]), None)?; }
+            "m" | "M" => telegram_domain(ctx, name)?,
+            "k" | "K" => {
+                let words = argv(&["telegram", "rotate-secret", "--name", name]);
+                let reply = confirm::run_confirmed(ctx, "Смена секрета Telegram Proxy", "Сменить секрет? Прежняя ссылка перестанет работать.", &words, &Secrets::default())?;
+                telegram_changed(ctx, name, &reply)?;
+            }
+            "g" | "G" => telegram_tag(ctx, name)?,
+            "u" | "U" if tagged => {
+                let reply = ctx.call(&["telegram", "tag", "--name", name, "--clear"])?;
+                telegram_changed(ctx, name, &reply)?;
+            }
+            "r" | "R" => { node_request(ctx, name, &argv(&["telegram", "restart", "--name", name]), None)?; }
+            "x" | "X" => {
+                let words = argv(&["telegram", "remove", "--name", name]);
+                let reply = confirm::run_confirmed(ctx, "Отключение Telegram Proxy", "Убрать Telegram Proxy с ноды?", &words, &Secrets::default())?;
+                telegram_changed(ctx, name, &reply)?;
+            }
+            "0" => return Ok(()),
             _ => ctx.invalid(),
         }
-    }
-}
-/// v1 `_tui_telegram_batch`: unchecked node toggles → one `--name` per node →
-/// the core's frozen plan → results table. A failed command (no results)
-/// reopens the toggle with the same nodes checked.
-fn telegram_batch(ctx: &mut Context<'_>, title: &str, words: Vec<String>) -> io::Result<()> {
-    let listed = ctx.call(&["node", "list"])?;
-    if !listed.ok { outcome(ctx, &listed); return Ok(()); }
-    let nodes = names(&listed.data);
-    let labels: Vec<String> = rows(&listed.data).iter().map(node_label).collect();
-    let mut flags = vec![];
-    loop {
-        let Some(selected) = ctx.toggle(title, &labels, flags, EMPTY)? else { return Ok(()); };
-        if selected.is_empty() { ctx.ui.notice(ui::warn("Ничего не выбрано.")); return Ok(()); }
-        let mut command = words.clone();
-        for &i in &selected { command.extend(argv(&["--name", &nodes[i]])); }
-        let reply = confirm::run_confirmed(ctx, title, "Выполнить?", &command, &Secrets::default())?;
-        if telegram_table(ctx, &reply)? { return Ok(()); }
-        outcome(ctx, &reply);
-        if !confirm::retryable(&reply) { return Ok(()); }
-        flags = (0..labels.len()).map(|i| selected.contains(&i)).collect();
     }
 }
 impl Screen for Telegram {
     fn run(&mut self, ctx: &mut Context<'_>) -> io::Result<Navigation> {
         loop {
+            let reply = ctx.call(&["node", "list"])?;
+            if !reply.ok {
+                if read_failed(ctx, "Telegram Proxy")? { continue; }
+                return Ok(Navigation::Back);
+            }
+            let nodes = telegram_nodes(&reply.data);
             let mut view = View::new("Telegram Proxy");
             view.prompt = "Выберите действие: ".into();
-            view.sections.push(vec![Item::new('o', "Управление одной нодой", ui::CYAN), Item::new('s', "Общий статус нод", ui::CYAN)]);
-            view.sections.push(vec![
-                Item::new('i', "Включить MTProto Proxy", ui::GREEN), Item::new('p', "Обновить IP-адрес MTProto", ui::YELLOW),
-                Item::new('w', "Обновить Web Proxy", ui::YELLOW), Item::new('r', "Перезапустить Web Proxy", ui::YELLOW),
-                Item::new('b', "Перезапустить службу MTProxy", ui::YELLOW), Item::new('d', "Отключить способ доступа", ui::RED),
-                Item::new('x', "Отключить Telegram Proxy полностью", ui::RED), Item::new(0, "Назад", ui::NC),
-            ]);
+            if nodes.is_empty() {
+                view.context.push(ui::text("Нет нод с Telegram Proxy", ui::DIM));
+            } else {
+                view.sections.push(nodes.iter().enumerate()
+                    .map(|(i, node)| Item::new(i + 1, telegram_label(node), if node["status"] == "pending" { ui::YELLOW } else { ui::CYAN }))
+                    .collect());
+            }
+            view.sections.push(vec![Item::new('s', "Статус", ui::CYAN), Item::new('a', "Включить на ноде", ui::GREEN), Item::new(0, "Назад", ui::NC)]);
             let Some(choice) = ctx.choose(&view)? else { return Ok(Navigation::Back); };
             match choice.as_str() {
-                "o" | "O" => {
-                    let listed = ctx.call(&["node", "list"])?;
-                    if !listed.ok { outcome(ctx, &listed); continue; }
-                    let labels: Vec<String> = rows(&listed.data).iter().map(node_label).collect();
-                    if let Some(i) = ctx.select("Управление Telegram Proxy", &labels)? { interactive(ctx, &text(&listed.data[i]["name"]), true)?; }
-                }
                 "s" | "S" => {
-                    let reply = ctx.call(&["telegram", "status", "--all"])?;
-                    if !telegram_table(ctx, &reply)? { outcome(ctx, &reply); }
+                    let status = ctx.call(&["telegram", "status"])?;
+                    if !telegram_table(ctx, &status)? { outcome(ctx, &status); }
                 }
-                "i" | "I" => telegram_batch(ctx, "Включение MTProto Proxy", argv(&["telegram", "install"]))?,
-                "p" | "P" => telegram_batch(ctx, "Обновление IP-адреса MTProto", argv(&["telegram", "refresh-ip"]))?,
-                "w" | "W" => telegram_batch(ctx, "Обновление Web Proxy", argv(&["telegram", "web-update"]))?,
-                "r" | "R" => telegram_batch(ctx, "Перезапуск Web Proxy", argv(&["telegram", "web-restart"]))?,
-                "b" | "B" => telegram_batch(ctx, "Перезапуск службы MTProxy", argv(&["telegram", "backend-restart"]))?,
-                "d" | "D" => {
-                    let Some(i) = ctx.select("Отключение способа доступа", &["Web Proxy".into(), "MTProto Proxy".into()])? else { continue; };
-                    let component = if i == 0 { "web" } else { "mtproto" };
-                    telegram_batch(ctx, "Отключение способа доступа", argv(&["telegram", "remove", "--component", component]))?;
-                }
-                "x" | "X" => telegram_batch(ctx, "Полное отключение Telegram Proxy", argv(&["telegram", "remove-all"]))?,
+                "a" | "A" => telegram_enable(ctx, &reply.data)?,
                 "0" => return Ok(Navigation::Back),
-                _ => ctx.invalid(),
+                _ => match index(&choice, nodes.len()) {
+                    Some(i) => telegram_card(ctx, &text(&nodes[i]["name"]))?,
+                    None => ctx.invalid(),
+                },
             }
         }
     }
@@ -1510,7 +1567,6 @@ mod tests {
     fn colors(view: &View) -> Vec<Option<ratatui::style::Color>> { view.context.iter().map(|l| l.style.fg).collect() }
 
     /// v2 grammar of every command this module sends (remote-control/core/src/cli.rs CATALOG).
-    const TG: &str = "name+ all component=";
     const PROFILE: &str = "name= acme-email= random-acme-email reality= sni-domain= site-source= mihomo-version= vless-tcp= xhttp= xhttp-port= grpc= grpc-port= hysteria2= hysteria2-port= hysteria2-obfs= amneziawg= amneziawg-port= amneziawg-dns= warp= ipv6=";
     const GRAMMAR: &[(&str, &str, &str)] = &[
         ("status", "", ""), ("group", "list", ""),
@@ -1525,9 +1581,9 @@ mod tests {
         ("node", "shell", "name="), ("conn", "list", "name= discover"), ("conn", "set", "name= assign+"), ("conn", "sync", "name="),
         ("node", "warp-reregister", "name="), ("profile", "warp-license", "name= clear"),
         ("cascade", "list", ""), ("cascade", "add", "name= entry= listener= exit-node= exit-proxy="), ("cascade", "delete", "name="),
-        ("telegram", "status", TG), ("telegram", "install", TG), ("telegram", "refresh-ip", TG), ("telegram", "web-update", TG),
-        ("telegram", "web-restart", TG), ("telegram", "backend-restart", TG), ("telegram", "remove", TG), ("telegram", "remove-all", TG),
-        ("telegram", "menu", "name="),
+        ("telegram", "status", "name+ all"), ("telegram", "set", "name= domain="), ("telegram", "remove", "name="),
+        ("telegram", "link", "name="), ("telegram", "rotate-secret", "name="), ("telegram", "tag", "name= clear"),
+        ("telegram", "restart", "name="), ("telegram", "diagnostics", "name="),
     ];
     fn parses(words: &[String]) -> bool {
         let Some((noun, rest)) = words.split_first() else { return false; };
@@ -1554,8 +1610,8 @@ mod tests {
     #[test]
     fn grammar_rejects_v1_selectors() {
         assert!(!parses(&argv(&["conn", "sync", "--node", "n"])));
-        assert!(!parses(&argv(&["telegram", "install", "--node", "n"])));
-        assert!(parses(&argv(&["telegram", "install", "--name", "a", "--name", "b"])));
+        assert!(!parses(&argv(&["telegram", "status", "--node", "n"])));
+        assert!(parses(&argv(&["telegram", "status", "--name", "a", "--name", "b"])));
     }
 
     /// Runs a flow over scripted daemon replies; every request is v2 grammar
@@ -2063,106 +2119,192 @@ mod tests {
 
     // ─── Telegram ────────────────────────────────────────────────────────────
 
-    fn three_nodes() -> (Vec<String>, Reply) {
-        step(&["node", "list"], ok(json!([{"name": "n1", "ip": "192.0.2.1", "port": 22}, {"name": "n2", "ip": "192.0.2.2", "port": 22}, {"name": "n3", "ip": "192.0.2.3", "port": 22}])))
+    /// n1 and n4 have the role (n1 with a tag, n4 waiting for apply); n2 has a
+    /// profile without the role; n3 has no profile.
+    fn tg_nodes(n1: bool) -> Value {
+        json!([
+            {"name": "n1", "ip": "192.0.2.1", "port": 22, "profile": "edge", "status": "applied",
+                "telegram": if n1 { json!({"hostname": "tg.example.com", "tag": true}) } else { Value::Null }},
+            {"name": "n2", "ip": "192.0.2.2", "port": 22, "profile": "edge", "status": "applied", "telegram": null},
+            {"name": "n3", "ip": "192.0.2.3", "port": 22, "profile": null, "telegram": null},
+            {"name": "n4", "ip": "192.0.2.4", "port": 22, "profile": "edge", "status": "pending", "telegram": {"hostname": "t4.example.com", "tag": false}},
+        ])
     }
+    fn tg_list() -> (Vec<String>, Reply) { step(&["node", "list"], ok(tg_nodes(true))) }
+    fn item_keys(view: &View) -> Vec<String> { view.sections.iter().flatten().map(|i| i.key.clone()).collect() }
+    fn applied(name: &str) -> (Vec<String>, Reply) { step(&["node", "apply", "--name", name], ok(json!({"applied": [name], "unchanged": [], "failed": []}))) }
     #[test]
-    fn telegram_batches_send_one_name_per_selected_node_through_the_plan() {
-        for (key, verb) in [("i", "install"), ("p", "refresh-ip"), ("w", "web-update"), ("r", "web-restart"), ("b", "backend-restart"), ("x", "remove-all")] {
-            for key in [key.to_owned(), key.to_ascii_uppercase()] {
-                let words = argv(&["telegram", verb, "--name", "n1", "--name", "n3"]);
-                let results = json!({"results": [{"node": "n1", "code": 0, "status": "ok", "reason": null}, {"node": "n3", "code": 0, "status": "ok", "reason": null}]});
-                let (_, ui) = screen(&mut Telegram, &[&key, "1", "3", "", "y", "", "0"], vec![
-                    three_nodes(), (words.clone(), plan("confirmation_required", "tg")), (with_yes(&words, "tg"), ok(results)),
-                ]);
-                assert!(ui.views[1].sections[0].iter().take(3).all(|i| i.label.starts_with("[ ]")));
-                assert_eq!(confirms(&ui), 1);
-                assert!(ui.views.iter().any(|v| v.title == "Результат Telegram Proxy"));
-            }
-        }
-        for key in ["d", "D"] {
-            for (choice, component) in [("1", "web"), ("2", "mtproto")] {
-                let words = argv(&["telegram", "remove", "--component", component, "--name", "n2"]);
-                screen(&mut Telegram, &[key, choice, "2", "", "y", "0"], vec![
-                    three_nodes(), (words.clone(), plan("confirmation_required", "rm")), (with_yes(&words, "rm"), ok(json!({"results": []}))),
-                ]);
-            }
-        }
-        let (_, ui) = screen(&mut Telegram, &["i", "", "0"], vec![three_nodes()]);
-        assert!(noticed(&ui, "Ничего не выбрано."));
-        screen(&mut Telegram, &["i", "1", "0", "0"], vec![three_nodes()]);
-        screen(&mut Telegram, &["d", "0", "0"], none());
-        let words = argv(&["telegram", "install", "--name", "n1"]);
-        let (_, ui) = screen(&mut Telegram, &["i", "1", "", "n", "0"], vec![three_nodes(), (words.clone(), plan("confirmation_required", "tg"))]);
-        assert!(ui.notices.is_empty());
-        // A failed command (no results) reopens the toggle with the nodes kept.
-        let (_, ui) = screen(&mut Telegram, &["i", "1", "", "y", "0", "0"], vec![
-            three_nodes(), (words.clone(), plan("confirmation_required", "tg")), (with_yes(&words, "tg"), Reply::failure("locked")),
+    fn telegram_lists_role_nodes_with_hostname_tag_and_state() {
+        let (_, ui) = screen(&mut Telegram, &["0"], vec![tg_list()]);
+        let view = &ui.views[0];
+        let labels: Vec<(String, Color)> = view.sections[0].iter().map(|i| (i.label.clone(), i.color)).collect();
+        assert_eq!(labels, [
+            ("n1  tg.example.com  · тег: да  · применено".to_owned(), ui::CYAN),
+            ("n4  t4.example.com  · тег: нет  · ожидает применения".to_owned(), ui::YELLOW),
         ]);
-        // (toggle frames and the plan review share the title; the last one is the reopened toggle)
-        let reopened = ui.views.iter().rev().find(|v| v.title == ui.views[1].title).unwrap();
-        assert!(reopened.sections[0][0].label.starts_with("[x]") && reopened.sections[0][1].label.starts_with("[ ]"), "{reopened:?}");
-        assert_eq!(ui.notices.len(), 1, "the failure is reported once");
+        assert_eq!(item_keys(view), ["1", "2", "s", "a", "0"]);
+        let (_, ui) = screen(&mut Telegram, &["0"], vec![step(&["node", "list"], ok(json!([])))]);
+        assert_eq!(colors(&ui.views[0]), [Some(ui::DIM)]);
+        assert_eq!(item_keys(&ui.views[0]), ["s", "a", "0"]);
     }
     #[test]
-    fn telegram_results_table_labels_and_colours_every_row() {
+    fn telegram_status_table_labels_colours_and_summarises_every_row() {
         for key in ["s", "S"] {
             let results = json!({"results": [
-                {"node": "a", "code": 0, "status": "ok", "reason": null}, {"node": "b", "code": 3, "status": "not_installed", "reason": "не установлен"},
-                {"node": "c", "code": 4, "status": "partial", "reason": "x"}, {"node": "d", "code": 1, "status": "error", "reason": "offline"}]});
-            let (_, ui) = screen(&mut Telegram, &[key, "x", "", "0"], vec![step(&["telegram", "status", "--all"], err("partial", results))]);
+                {"node": "a", "hostname": "a.example.com", "code": 0, "status": "ok", "reason": null, "summary": ["web: active"]},
+                {"node": "b", "code": 3, "status": "not_installed", "reason": "не установлен", "summary": []},
+                {"node": "c", "code": 4, "status": "partial", "reason": "x", "summary": []},
+                {"node": "d", "code": 1, "status": "error", "reason": "offline"}]});
+            let (_, ui) = screen(&mut Telegram, &[key, "x", "", "0"], vec![tg_list(), step(&["telegram", "status"], err("partial", results)), tg_list()]);
             // The table waits for Enter: an unknown key keeps it on screen.
-            let tables: Vec<&View> = ui.views.iter().filter(|v| v.title == "Результат Telegram Proxy").collect();
+            let tables: Vec<&View> = ui.views.iter().filter(|v| v.title == "Состояние Telegram Proxy").collect();
             assert_eq!(tables.len(), 2);
             assert_eq!(ui.views.last().unwrap().title, "Telegram Proxy");
             let table = tables[0];
-            assert_eq!(colors(table), [Some(ui::GREEN), Some(ui::YELLOW), Some(ui::YELLOW), Some(ui::RED)]);
+            assert_eq!(colors(table), [Some(ui::GREEN), Some(ui::NC), Some(ui::YELLOW), Some(ui::YELLOW), Some(ui::RED)]);
             let lines: Vec<String> = table.context.iter().map(|l| l.to_string()).collect();
-            assert_eq!(lines, ["a  готово  ", "b  не установлено  не установлен", "c  частично  x", "d  ошибка  offline"]);
+            assert_eq!(lines, ["a  готово  ", "  web: active", "b  не установлено  не установлен", "c  частично  x", "d  ошибка  offline"]);
             assert!(table.sections.is_empty() && !table.prompt.is_empty());
             assert_eq!(ui.notices.len(), 1, "only the invalid key");
         }
-        let (_, ui) = screen(&mut Telegram, &["s", "0"], vec![step(&["telegram", "status", "--all"], Reply::failure("invalid"))]);
+        let (_, ui) = screen(&mut Telegram, &["s", "0"], vec![tg_list(), step(&["telegram", "status"], Reply::failure("invalid")), tg_list()]);
         assert_eq!(ui.notices.len(), 1);
+    }
+    #[test]
+    fn telegram_enable_offers_profiled_nodes_without_the_role_then_apply() {
+        for key in ["a", "A"] {
+            let (client, ui) = screen(&mut Telegram, &[key, "1", "bad", "t2.example.com", "y", "0"], vec![
+                tg_list(), step(&["telegram", "set", "--name", "n2", "--domain", "t2.example.com"], ok(json!({"node": "n2", "hostname": "t2.example.com", "tag": false}))),
+                applied("n2"), tg_list(),
+            ]);
+            let select = ui.views.iter().find(|v| v.title == "Включение Telegram Proxy").unwrap();
+            assert_eq!(select.sections[0].iter().map(|i| i.label.clone()).collect::<Vec<_>>(), ["n2  192.0.2.2:22", "Отмена"]);
+            assert!(noticed(&ui, DOMAIN_INVALID));
+            assert_eq!(confirms(&ui), 1);
+            assert!(client.secret_names.iter().all(Vec::is_empty));
+        }
+        // Enter cancels the domain; a refused offer applies nothing.
+        screen(&mut Telegram, &["a", "1", "", "0"], vec![tg_list(), tg_list()]);
+        screen(&mut Telegram, &["a", "0", "0"], vec![tg_list(), tg_list()]);
+        screen(&mut Telegram, &["a", "1", "t2.example.com", "n", "0"], vec![
+            tg_list(), step(&["telegram", "set", "--name", "n2", "--domain", "t2.example.com"], ok(json!({"node": "n2", "hostname": "t2.example.com", "tag": false}))), tg_list(),
+        ]);
+    }
+    #[test]
+    fn telegram_enable_without_candidates_warns_like_the_web() {
+        let mut list = tg_nodes(true);
+        list[1]["telegram"] = json!({"hostname": "t2.example.com", "tag": false});
+        let listed = || step(&["node", "list"], ok(list.clone()));
+        let (_, ui) = screen(&mut Telegram, &["a", "0"], vec![listed(), listed()]);
+        assert!(noticed(&ui, "Нет нод с профилем без Telegram Proxy."));
+        assert!(!ui.views.iter().any(|v| v.title == "Включение Telegram Proxy"));
+    }
+    #[test]
+    fn telegram_card_actions_and_the_link_stays_off_the_journal() {
+        const LINK: &str = "tg://webproxy?server=tg.example.com&port=443&secret=ee0123456789abcdef";
+        let link = |name: &str| step(&["telegram", "link", "--name", name], ok(json!({"link": LINK})));
+        for key in ["l", "L"] {
+            let (client, ui) = screen(&mut Telegram, &["1", key, "", "0", "0"], vec![tg_list(), tg_list(), link("n1"), tg_list(), tg_list()]);
+            let card = ui.views.iter().find(|v| v.title == "Telegram Proxy: n1").unwrap();
+            assert_eq!(item_keys(card), ["l", "d", "m", "k", "g", "u", "r", "x", "0"]);
+            let shown = ui.views.iter().find(|v| v.title == "Ссылка Telegram Proxy: n1").unwrap();
+            assert!(shown.context.iter().any(|l| l.to_string() == LINK));
+            assert!(!ui.notices.iter().any(|l| l.to_string().contains("secret=")));
+            assert!(!ui.logs.iter().any(|l| l.text.contains("secret=")));
+            assert!(!client.calls.iter().flatten().any(|w| w.contains("secret=")));
+        }
+        // Without a tag there is nothing to clear.
+        let (_, ui) = screen(&mut Telegram, &["2", "u", "0", "0"], vec![tg_list(), tg_list(), tg_list(), tg_list()]);
+        assert!(!item_keys(ui.views.iter().find(|v| v.title == "Telegram Proxy: n4").unwrap()).contains(&"u".to_owned()));
+        assert!(noticed(&ui, "Неверный выбор."));
+        for key in ["m", "M"] {
+            screen(&mut Telegram, &["1", key, "new.example.com", "y", "0", "0"], vec![
+                tg_list(), tg_list(), step(&["telegram", "set", "--name", "n1", "--domain", "new.example.com"], ok(json!({"node": "n1", "hostname": "new.example.com", "tag": true}))),
+                applied("n1"), tg_list(), tg_list(),
+            ]);
+        }
+        for key in ["u", "U"] {
+            let (_, ui) = screen(&mut Telegram, &["1", key, "n", "0", "0"], vec![
+                tg_list(), tg_list(), step(&["telegram", "tag", "--name", "n1", "--clear"], ok(json!({"node": "n1", "tag": false}))), tg_list(), tg_list(),
+            ]);
+            assert_eq!(confirms(&ui), 1, "the apply offer");
+        }
+        for key in ["r", "R"] {
+            let restart = argv(&["telegram", "restart", "--name", "n1"]);
+            let (client, _) = screen(&mut Telegram, &["1", key, "y", "pw", "0", "0"], vec![
+                tg_list(), tg_list(), (restart.clone(), err("missing_secret", json!({"name": "n1", "secret": "password"}))),
+                step(&["node", "password", "--name", "n1"], ok(json!({"name": "n1"}))), (restart, ok(json!({"node": "n1"}))), tg_list(), tg_list(),
+            ]);
+            assert_eq!(client.secret_names[3], ["password"]);
+        }
+        for key in ["d", "D"] {
+            let journal = Reply { logs: vec![Log { level: "info".into(), text: "telegram-web: started".into() }], ..ok(json!({"node": "n1"})) };
+            let (_, ui) = screen(&mut Telegram, &["1", key, "0", "0"], vec![tg_list(), tg_list(), step(&["telegram", "diagnostics", "--name", "n1"], journal), tg_list(), tg_list()]);
+            assert!(ui.logs.iter().any(|l| l.text == "telegram-web: started"));
+        }
+    }
+    #[test]
+    fn telegram_sponsor_tag_is_sent_only_as_the_password_secret() {
+        const TAG: &str = "0123456789abcdef0123456789ABCDEF";
+        for key in ["g", "G"] {
+            let (client, ui) = screen(&mut Telegram, &["1", key, "not-hex", TAG, "y", "0", "0"], vec![
+                tg_list(), tg_list(), step(&["telegram", "tag", "--name", "n1"], ok(json!({"node": "n1", "tag": true}))), applied("n1"), tg_list(), tg_list(),
+            ]);
+            assert_eq!(client.secret_names[2], ["password"]);
+            assert!(noticed(&ui, TAG_INVALID));
+            assert!(!client.calls.iter().flatten().any(|w| w.contains(TAG) || w.contains("not-hex")));
+            assert!(!ui.views.iter().flat_map(View::lines).any(|l| l.to_string().contains(TAG)));
+            assert!(!ui.notices.iter().any(|l| l.to_string().contains(TAG)));
+        }
+        // Enter cancels without a request.
+        screen(&mut Telegram, &["1", "g", "", "0", "0"], vec![tg_list(), tg_list(), tg_list(), tg_list()]);
+    }
+    #[test]
+    fn telegram_rotate_and_remove_go_through_the_plan_then_offer_apply() {
+        for key in ["k", "K"] {
+            let words = argv(&["telegram", "rotate-secret", "--name", "n1"]);
+            let (_, ui) = screen(&mut Telegram, &["1", key, "y", "y", "0", "0"], vec![
+                tg_list(), tg_list(), (words.clone(), plan("confirmation_required", "rot")), (with_yes(&words, "rot"), ok(json!({"node": "n1"}))),
+                applied("n1"), tg_list(), tg_list(),
+            ]);
+            assert_eq!(confirms(&ui), 2, "the plan, then the apply offer");
+            // A refused plan is no failure and offers nothing.
+            let (_, ui) = screen(&mut Telegram, &["1", key, "n", "0", "0"], vec![tg_list(), tg_list(), (words.clone(), plan("confirmation_required", "rot")), tg_list(), tg_list()]);
+            assert!(ui.notices.is_empty());
+        }
+        for key in ["x", "X"] {
+            let words = argv(&["telegram", "remove", "--name", "n1"]);
+            let gone = || step(&["node", "list"], ok(tg_nodes(false)));
+            let (_, ui) = screen(&mut Telegram, &["1", key, "y", "y", "0"], vec![
+                tg_list(), tg_list(), (words.clone(), plan("confirmation_required", "rm")), (with_yes(&words, "rm"), ok(json!({"node": "n1"}))),
+                applied("n1"), gone(), gone(),
+            ]);
+            assert_eq!(confirms(&ui), 2);
+            assert_eq!(ui.views.last().unwrap().title, "Telegram Proxy", "the card closes once the role is gone");
+        }
     }
 
     // ─── Терминальные команды ────────────────────────────────────────────────
 
-    /// `node shell` / `telegram menu` are terminal requests, never plain sends.
+    /// `node shell` is a terminal request, never a plain send.
     fn term(words: &[String], reply: Reply) -> Step { Step::terminal(words.to_vec(), reply) }
     /// An empty script: no request is expected.
     fn none() -> Vec<Step> { Vec::new() }
     #[test]
     fn terminal_commands_run_suspended_as_terminal_requests_both_cases() {
-        for key in ["o", "O", "t", "T"] {
-            let words = if key.eq_ignore_ascii_case("t") { argv(&["telegram", "menu", "--name", "n"]) } else { argv(&["node", "shell", "--name", "n"]) };
+        let words = argv(&["node", "shell", "--name", "n"]);
+        for key in ["o", "O"] {
             let (_, ui) = screen(&mut NodeCard("n".into()), &[key, "0"], vec![show().into(), term(&words, ok(json!({}))), show().into()]);
             assert_eq!(ui.suspensions, 1);
             assert!(!ui.suspended_now);
+            assert!(!item_keys(&ui.views[0]).contains(&"t".to_owned()), "no Telegram item on the node card");
         }
-        for key in ["o", "O"] {
-            let (_, ui) = screen(&mut Telegram, &[key, "1", "0"], vec![three_nodes().into(), term(&argv(&["telegram", "menu", "--name", "n1"]), ok(json!({})))]);
-            assert_eq!(ui.suspensions, 1);
-        }
-        let shell = argv(&["node", "shell", "--name", "n"]);
         let (_, client, ui) = run(vec![
-            term(&shell, err("missing_secret", json!({"name": "n", "secret": "password"}))),
-            step(&["node", "password", "--name", "n"], ok(json!({"name": "n"}))).into(), term(&shell, ok(json!({}))),
-        ], &["y", "pw"], |ctx| interactive(ctx, "n", false));
+            term(&words, err("missing_secret", json!({"name": "n", "secret": "password"}))),
+            step(&["node", "password", "--name", "n"], ok(json!({"name": "n"}))).into(), term(&words, ok(json!({}))),
+        ], &["y", "pw"], |ctx| shell(ctx, "n"));
         assert_eq!(ui.suspensions, 2);
         assert_eq!(client.secret_names[1], ["password"]);
-        // `telegram menu` with stale scripts: the upload plan, one y/N, then the
-        // menu with `--yes --plan-token`; refusal opens nothing.
-        let menu = argv(&["telegram", "menu", "--name", "n"]);
-        let (_, client, ui) = run(vec![term(&menu, plan("confirmation_required", "m")), term(&with_yes(&menu, "m"), ok(json!({})))],
-            &["y"], |ctx| interactive(ctx, "n", true));
-        assert_eq!((ui.suspensions, confirms(&ui), client.calls.len()), (2, 1, 2));
-        assert!(ui.views.iter().any(|v| v.context.iter().any(|l| l.to_string() == "Operation and consequences")));
-        let (_, client, ui) = run(vec![term(&menu, plan("confirmation_required", "m"))], &["n"], |ctx| interactive(ctx, "n", true));
-        assert_eq!((ui.suspensions, client.calls.len()), (1, 1));
-        assert!(ui.notices.is_empty());
-        let (_, ui) = screen(&mut Telegram, &["o", "0"], vec![step(&["node", "list"], ok(json!([])))]);
-        assert!(ui.views.iter().any(|v| v.context.iter().any(|l| l.style.fg == Some(ui::DIM))));
     }
 
     // ─── Профили, применение ─────────────────────────────────────────────────

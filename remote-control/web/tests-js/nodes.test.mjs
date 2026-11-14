@@ -36,9 +36,8 @@ test('карточка: способ входа и пароль SSH только
   assert.equal(model.passwordStatus({ ...node(), auth: 'key', password: null }), null);
 });
 
-test('терминальные команды', () => {
-  assert.deepEqual(model.interactiveArgv('n', false), ['node', 'shell', '--name', 'n']);
-  assert.deepEqual(model.interactiveArgv('n', true), ['telegram', 'menu', '--name', 'n']);
+test('терминальная команда — только node shell', () => {
+  assert.deepEqual(model.interactiveArgv('n'), ['node', 'shell', '--name', 'n']);
 });
 
 test('удаление: варианты из delete_options и --revoke-key', () => {
@@ -406,7 +405,7 @@ test('оболочка: node shell без загрузки скриптов, con
   const opened = [];
   const s = scripted([], []);
   s.ctx.terminal = async (argv, title, options) => { opened.push([argv, options]); return fail('conflict'); };
-  await model.interactive(s.ctx, 'n', false);
+  await model.interactive(s.ctx, 'n');
   assert.deepEqual(opened, [[['node', 'shell', '--name', 'n'], { expect: ['conflict'] }]]);
   assert.equal(s.record.notices.length, 1);
   assert.equal(typeof model.uploadOffer, 'undefined');

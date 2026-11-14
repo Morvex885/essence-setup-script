@@ -281,7 +281,7 @@ pub enum Route {
     Daemon,
     /// `web *`: answered without the queue.
     Web,
-    /// `node shell`, `telegram menu` with a console: `Job::TerminalPrep`.
+    /// `node shell` with a console: `Job::TerminalPrep`.
     Terminal,
     SessionOpen,
     /// A queued command; `needs_auth` is re-checked by the core thread.
@@ -317,7 +317,7 @@ pub fn decide(invocation: &Invocation, origin: Origin, authorized: bool, termina
         _ => {}
     }
     if invocation.requires_tty() {
-        return if terminal { Route::Terminal } else { Route::Fail(tty_required(&invocation.noun)) };
+        return if terminal { Route::Terminal } else { Route::Fail(tty_required()) };
     }
     if (invocation.noun.as_str(), invocation.verb.as_str()) == ("session", "open") {
         return Route::SessionOpen;
@@ -853,7 +853,6 @@ mod tests {
         assert_eq!(route(&["session", "open"], Local, true, false), "SessionOpen");
         assert_eq!(route(&["node", "shell", "--name", "n"], Local, true, true), "Terminal");
         assert_eq!(route(&["node", "shell", "--name", "n"], Local, true, false), "tty_required");
-        assert_eq!(route(&["telegram", "menu", "--name", "n"], Network, true, false), "tty_required");
         assert_eq!(route(&["daemon", "stop"], Network, true, false), "local_only");
         assert_eq!(route(&["daemon", "run"], Local, true, false), "usage");
         assert_eq!(route(&["template", "export", "--name", "t", "--output", "o"], Local, true, false), "usage");
@@ -868,9 +867,9 @@ mod tests {
     }
 
     #[test]
-    fn tty_required_names_the_menu_and_needs_authorization_first() {
-        let Route::Fail(error) = decide(&parse(&["telegram", "menu", "--name", "n"]), Origin::Local, true, false) else { panic!() };
-        assert_eq!(error.message, "Меню Telegram Proxy требует терминала.");
+    fn tty_required_names_the_node_shell_and_needs_authorization_first() {
+        let Route::Fail(error) = decide(&parse(&["node", "shell", "--name", "n"]), Origin::Local, true, false) else { panic!() };
+        assert_eq!(error.message, "Оболочке ноды нужен терминал.");
         let Route::Fail(error) = decide(&parse(&["node", "shell", "--name", "n"]), Origin::Local, false, false) else { panic!() };
         assert_eq!(error.code, "session_closed");
     }

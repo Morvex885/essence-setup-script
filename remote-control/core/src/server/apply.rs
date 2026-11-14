@@ -309,6 +309,12 @@ fn node_secrets(state: &State, config: &Config, node: &Node) -> Result<NodeSecre
     if profile.is_some_and(|profile| profile.warp) && node.params.warp.is_some() {
         secrets.warp_key = Some(read("warp-key", "Ключ WARP")?);
     }
+    if let Some(proxy) = config.telegram.iter().find(|proxy| proxy.node == node.name) {
+        secrets.telegram_secret = Some(read("telegram-secret", "Секрет Telegram Proxy")?);
+        if proxy.tag_mark.is_some() {
+            secrets.telegram_tag = Some(read("telegram-tag", "Спонсорский тег Telegram Proxy")?);
+        }
+    }
     Ok(secrets)
 }
 
