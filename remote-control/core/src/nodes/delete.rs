@@ -191,13 +191,19 @@ fn with_outcome(error: RcError, name: &str, scope: &str, deleted: bool, remote_r
 
 /// The deletion plan rebuilt from `config` must equal the confirmed one, else
 /// `plan_changed` and nothing changes. After the teardown committed (`torn_down`)
-/// the node's `applied` is gone by design: the confirmed value stands in.
+/// the node's `applied` is gone by design: the confirmed value stands in, but
+/// only once no `node apply` claimed or recorded the node since — its new
+/// components must not be orphaned (`in_use`).
 fn delete_planned(config: &Config, node: &Node, server: bool, revoke: bool, torn_down: bool, planned: &Plan,
     invocation: &Invocation) -> Result<()>
 {
     let mut current = config.nodes.iter().find(|current| current.id == node.id).cloned()
         .ok_or_else(|| super::not_found(&node.name))?;
     if torn_down {
+        if current.operation.is_some() || current.applied.is_some() {
+            return Err(RcError::new("in_use", format!(
+                "После этого на ноду «{}» начато применение новой конфигурации (node apply): нода не удалена.", node.name)));
+        }
         current.applied = node.applied.clone();
     }
     let plan = Plan::new(plan(config, &current, server, revoke), "");
@@ -637,17 +643,25 @@ mod tests {
     }
 
     /// A [`FakeTransport`] whose `trigger` (`"connect"` or an exec command)
-    /// first adds client `bob` through node `de`, as a concurrent command would.
+    /// first applies `change` to the configuration, as a concurrent command would.
     struct Interleaved {
         inner: FakeTransport,
         trigger: String,
         root: PathBuf,
+        change: fn(&mut Config),
         fired: std::cell::Cell<bool>,
     }
 
+    /// Client `bob` now uses node `de`.
+    fn add_bob(config: &mut Config) {
+        config.connections.push(Connection { node: "de".into(),
+            groups: vec![ConnectionGroup { name: "g".into(), proxies: vec!["VLESS TCP".into()] }] });
+        config.clients.push(Client { name: "bob".into(), group: "g".into(), inherit_nodes_from_group: true, ..Client::default() });
+    }
+
     impl Interleaved {
-        fn new(inner: FakeTransport, trigger: impl Into<String>, root: &Path) -> Self {
-            Self { inner, trigger: trigger.into(), root: root.to_path_buf(), fired: Default::default() }
+        fn new(inner: FakeTransport, trigger: impl Into<String>, root: &Path, change: fn(&mut Config)) -> Self {
+            Self { inner, trigger: trigger.into(), root: root.to_path_buf(), change, fired: Default::default() }
         }
 
         fn fire(&self, operation: &str) {
@@ -656,9 +670,7 @@ mod tests {
             }
             let state = State::new(crate::state::StatePaths::new(&self.root));
             let mut config = state.load_config().unwrap();
-            config.connections.push(Connection { node: "de".into(),
-                groups: vec![ConnectionGroup { name: "g".into(), proxies: vec!["VLESS TCP".into()] }] });
-            config.clients.push(Client { name: "bob".into(), group: "g".into(), inherit_nodes_from_group: true, ..Client::default() });
+            (self.change)(&mut config);
             state.save_config(&config).unwrap();
         }
     }
@@ -693,7 +705,7 @@ mod tests {
     async fn a_plan_changed_before_the_teardown_changes_nothing_remote() {
         let root = tempfile::tempdir().unwrap();
         let mut session = applied_session(root.path());
-        let mut transport = Interleaved::new(FakeTransport::new(teardown_steps("").into_iter().take(1)), "connect", root.path());
+        let mut transport = Interleaved::new(FakeTransport::new(teardown_steps("").into_iter().take(1)), "connect", root.path(), add_bob);
         let argv = testing::invocation(&["node", "delete", "--name", "de", "--scope", "server", "--yes"]);
         let error = delete(&mut session, &argv, &mut transport).await.unwrap_err();
         transport.inner.assert_finished();
@@ -710,7 +722,7 @@ mod tests {
         let op = "ab".repeat(16);
         crate::server::apply::tests::NEXT_OP_ID.with(|next| *next.borrow_mut() = Some(op.clone()));
         let mut transport = Interleaved::new(FakeTransport::new(teardown_steps("stage=cleanup\nresult=committed\n")),
-            crate::server::apply::status_command(&op), root.path());
+            crate::server::apply::status_command(&op), root.path(), add_bob);
         let argv = testing::invocation(&["node", "delete", "--name", "de", "--scope", "server", "--yes"]);
         let error = delete(&mut session, &argv, &mut transport).await.unwrap_err();
         transport.inner.assert_finished();
@@ -725,5 +737,27 @@ mod tests {
         // Unchanged since: the node goes with the new plan.
         let data = delete(&mut session, &argv, &mut FakeTransport::new([teardown_steps("").remove(0)])).await.unwrap();
         assert_eq!(data, json!({"name": "de", "scope": "server"}));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_apply_claimed_after_the_teardown_keeps_the_node_as_partial() {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = applied_session(root.path());
+        let op = "ab".repeat(16);
+        crate::server::apply::tests::NEXT_OP_ID.with(|next| *next.borrow_mut() = Some(op.clone()));
+        // A concurrent `node apply` owns the node by the time the teardown is recorded.
+        let mut transport = Interleaved::new(FakeTransport::new(teardown_steps("stage=cleanup\nresult=committed\n")),
+            crate::server::apply::status_command(&op), root.path(),
+            |config| config.nodes[0].operation.as_mut().unwrap().id = "cd".repeat(16));
+        let argv = testing::invocation(&["node", "delete", "--name", "de", "--scope", "server", "--yes"]);
+        let error = delete(&mut session, &argv, &mut transport).await.unwrap_err();
+        transport.inner.assert_finished();
+        assert_eq!((error.code, error.message.as_str()), ("partial",
+            "Компоненты на сервере удалены. После этого на ноду «de» начато применение новой конфигурации (node apply): нода не удалена."));
+        assert_eq!((error.extra["deleted"].clone(), error.extra["remote_removed"].clone()), (json!(false), json!(true)));
+        let config = session.state.load_config().unwrap();
+        assert_eq!(config.nodes.len(), 1);
+        assert_eq!(config.nodes[0].operation.as_ref().map(|operation| operation.id.clone()), Some("cd".repeat(16)));
+        assert!(config.nodes[0].applied.is_some());
     }
 }
