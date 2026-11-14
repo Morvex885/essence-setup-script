@@ -622,3 +622,68 @@ exit 0'
     [[ -f "$ops/bad/backup/etc/mihomo/config.yaml" && ! -e "$ops/old7" ]]
     grep -qF "Оставляю операцию bad" "$OPDIR/log"
 }
+
+@test "сбой до committed не трогает снимаемые сертификат, webroot и фичи" {
+    stub ufw 'case "$1" in
+    status) echo "Status: active" ;;
+    allow) exit 1 ;;
+esac
+exit 0'
+    mkdir -p "$ROOT/var/www/shop.example"
+    : >"$ROOT/var/www/shop.example/.essence-site"
+    RELEASE="shop.example:/var/www/shop.example" write_spec
+    printf '%s\n' "REMOVE_FEATURES='boom'" 'boom_remove() { : >"$ESSENCE_NODE_ROOT/removed"; }' >>"$OPDIR/spec.sh"
+    add_file /etc/mihomo/config.yaml "new"
+    run_agent
+    assert_failure
+    run status
+    assert_line "result=rolled_back"
+    assert_line "error=firewall"
+    [[ -e "$ROOT/var/www/shop.example/.essence-site" && ! -e "$ROOT/removed" ]]
+}
+
+@test "сбой очистки после committed — предупреждение, итог committed" {
+    printf '%s\n' "REMOVE_FEATURES='boom'" 'boom_remove() { return 1; }' >>"$OPDIR/spec.sh"
+    add_file /etc/mihomo/config.yaml "new"
+    run_agent
+    assert_success
+    run status
+    assert_line "result=committed"
+    grep -qF "Не удалось снять фичу boom." "$OPDIR/log"
+}
+
+# systemctl с состоянием mihomo в файле; MIHOMO_START_FAIL — start не поднимает.
+stub_stateful_systemctl() {
+    stub systemctl 'f="$(dirname "$CALLS")/mihomo.on"
+case "$1 ${2:-} ${3:-}" in
+    "is-active --quiet mihomo") [[ -e "$f" ]]; exit ;;
+    "stop mihomo "*) rm -f "$f" ;;
+    "start mihomo "*) [[ -n "${MIHOMO_START_FAIL:-}" ]] || touch "$f" ;;
+esac
+exit 0'
+}
+
+@test "mihomo работал до операции и не поднялся после отката — rollback_failed" {
+    stub_stateful_systemctl
+    : >"$BATS_TEST_TMPDIR/mihomo.on"
+    printf 'old\n' >"$ROOT/etc/mihomo/config.yaml"
+    add_file /etc/mihomo/config.yaml "new"
+    MIHOMO_T_RC=1 MIHOMO_START_FAIL=1 AGENT_ACTIVE_WAIT_SECONDS=1 run bash "$AGENT/apply.sh" "$OPDIR"
+    assert_failure
+    run status
+    assert_line "result=rollback_failed"
+    assert_line "error=config"
+    grep -qF "Служба mihomo работала до операции" "$OPDIR/log"
+    [[ "$(cat "$ROOT/etc/mihomo/config.yaml")" == old ]]
+}
+
+@test "mihomo не работал до операции — откат без него считается завершённым" {
+    stub_stateful_systemctl
+    add_file /etc/mihomo/config.yaml "new"
+    MIHOMO_T_RC=1 MIHOMO_START_FAIL=1 AGENT_ACTIVE_WAIT_SECONDS=1 run bash "$AGENT/apply.sh" "$OPDIR"
+    assert_failure
+    run status
+    assert_line "result=rolled_back"
+    assert_line "error=config"
+    ! grep -qF "Служба mihomo работала до операции" "$OPDIR/log"
+}

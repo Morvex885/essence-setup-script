@@ -448,7 +448,7 @@ port_handover() {
         reload) { nginx -t && systemctl reload nginx; } || rc=1 ;;
     esac
     systemctl start mihomo || rc=1
-    if ! wait_active mihomo 15; then
+    if ! wait_active mihomo "${AGENT_ACTIVE_WAIT_SECONDS:-15}"; then
         warn "mihomo не запустился."
         rc=1
     fi
@@ -478,11 +478,23 @@ listen_ready() {
     return 1
 }
 
-# Откат: вызывается из finish() при открытой транзакции. Код 1 — не все файлы
-# или правила UFW вернулись (тогда finish сохраняет backup/); службы и фичи —
-# по возможности: на новой ноде прежнего mihomo нет, и его запуск не может удаться.
+# tx_open — открыть транзакцию и запомнить службы, работавшие до неё
+# (TX_ACTIVE): откат обязан вернуть их в работу.
+tx_open() {
+    local unit
+    TX_ACTIVE=""
+    for unit in mihomo nginx; do
+        systemctl is-active --quiet "$unit" 2>/dev/null && TX_ACTIVE+="$unit "
+    done
+    TX_OPEN=true
+}
+
+# Откат: вызывается из finish() при открытой транзакции. Код 1 — откат не
+# завершён: не вернулись файлы или правила UFW, не работает служба, которая
+# работала до транзакции, или отказал откат фичи (тогда finish сохраняет
+# backup/). Службы, не работавшие до транзакции (новая нода), не требуются.
 tx_rollback() {
-    local feature nginx_action=none rc=0
+    local feature unit nginx_action=none rc=0
     warn "Откат изменений."
     tx_restore_files || rc=1
     tx_restore_firewall || rc=1
@@ -498,7 +510,16 @@ tx_rollback() {
     port_handover "$nginx_action"
     sysctl --system >/dev/null
     for feature in $FEATURES; do
-        feature_hook "$feature" rollback
+        if ! feature_hook "$feature" rollback; then
+            warn "Откат фичи $feature не удался."
+            rc=1
+        fi
+    done
+    for unit in $TX_ACTIVE; do
+        if ! systemctl is-active --quiet "$unit"; then
+            warn "Служба $unit работала до операции, а после отката не запущена."
+            rc=1
+        fi
     done
     TX_OPEN=false
     return "$rc"
@@ -555,7 +576,7 @@ stage_config() {
         removes+=("$path")
     done < <(read_list "$OP/remove.list")
 
-    TX_OPEN=true
+    tx_open
     for path in "${entries[@]}"; do
         read -r mode owner group path <<<"$path"
         tx_backup "$path" || return 1
@@ -607,7 +628,7 @@ stage_teardown_config() {
         removes+=("$path")
     done < <(read_list "$OP/remove.list")
 
-    TX_OPEN=true
+    tx_open
     for path in "${removes[@]}" "$MIHOMO_BIN_REL"; do
         tx_backup "$path" || return 1
     done
@@ -724,15 +745,24 @@ ledger_save() {
 }
 
 # ─── cleanup ────────────────────────────────────────────────────────────────
+# stage_cleanup — часть внутри транзакции: только проверка RELEASE_CERTS.
+# Необратимое (снятие фич и сертификатов, удаление каталогов) — в
+# cleanup_committed после записи committed: откат после него вернул бы сайт
+# nginx без сертификата и webroot.
+stage_cleanup() {
+    parse_cert_entries "$RELEASE_CERTS"
+}
+
+# cleanup_committed — после committed, по возможности: сбой — предупреждение,
+# итог операции не меняется.
 # apply: пять последних операций и только текущий исполнитель.
 # teardown: все остальные операции и исполнители; свой каталог исполнителя
-# apply.sh удаляет после записи committed, от своей операции остаются status и log.
+# apply.sh удаляет сам, от своей операции остаются status и log.
 # Операция с result=rollback_failed не удаляется: её backup/ — последняя копия.
-stage_cleanup() {
+cleanup_committed() {
     local feature entry name webroot dir self
-    parse_cert_entries "$RELEASE_CERTS" || return 1
     for feature in $REMOVE_FEATURES; do
-        feature_hook "$feature" remove || return 1
+        feature_hook "$feature" remove || warn "Не удалось снять фичу $feature."
     done
     for entry in "${CERT_ENTRIES[@]}"; do
         name="${entry%%:*}"
@@ -741,8 +771,11 @@ stage_cleanup() {
             warn "Пропускаю сертификат $name: в $webroot нет отметки Essence."
             continue
         fi
-        release_cert "$name" "$R$webroot" "$R/etc/nginx/ssl" \
-            "$R/etc/nginx/sites-available" "$R/etc/nginx/sites-enabled" "$R/etc/nginx/nginx.conf" || return 1
+        if ! release_cert "$name" "$R$webroot" "$R/etc/nginx/ssl" \
+            "$R/etc/nginx/sites-available" "$R/etc/nginx/sites-enabled" "$R/etc/nginx/nginx.conf"; then
+            warn "Не удалось снять сертификат $name."
+            continue
+        fi
         rm -rf -- "$R$webroot"
     done
     if [[ "$HY2_CERT" != true ]]; then

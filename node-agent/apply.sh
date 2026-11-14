@@ -28,6 +28,8 @@ RESULT=""
 ERROR=""
 TX_OPEN=false
 TX_PATHS=()
+# Службы, работавшие до открытия транзакции (tx_open).
+TX_ACTIVE=""
 # Свои правила UFW, добавленные и удалённые этой операцией («правило\n»).
 FW_ADDED=""
 FW_DELETED=""
@@ -164,11 +166,13 @@ case "$OP_MODE" in
 esac
 
 # Транзакция, открытая этапом config, закрывается только здесь: сбой firewall
-# или cleanup откатывает конфигурацию.
+# или проверки cleanup откатывает конфигурацию. Необратимая очистка — после
+# записи committed и на итог не влияет.
 TX_OPEN=false
 RESULT=committed
 write_status
 scrub_op
+cleanup_committed
 # Teardown убирает и сам исполнитель: функции уже загружены, а bash
 # дочитывает этот скрипт из открытого дескриптора.
 if [[ "$OP_MODE" == teardown && "$AGENT_DIR" == "$NODE_DIR/agent/"* ]]; then
