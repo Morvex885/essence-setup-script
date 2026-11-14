@@ -6,7 +6,8 @@
 // результатов экран передаёт функцией. Тоны: `ok` (GREEN), `warn` (YELLOW),
 // `error` (RED), `neutral` (DIM).
 import { asList, proxyLabel, unlisted } from '../format.js';
-import { NODE_CODES } from '../flows.js';
+import { refill } from '../form-model.js';
+import { NODE_CODES, retryable } from '../flows.js';
 import { interactive, nodeLabel } from './nodes-model.js';
 
 /** Пустой выбор (`nodes.rs::EMPTY`). */
@@ -88,20 +89,22 @@ export async function syncAll(ctx) {
  * назначенные группам, но не найденные (в конце: клиенты AmneziaWG
  * `awg-<клиент>` и устаревшие `stale` — их можно снять и при недоступной
  * ноде; при изменении группы они сохраняются, если отмечены), группы каждого (`assigned[i]`),
- * строки таблицы и проблема синхронизации ноды.
+ * строки таблицы и проблема синхронизации ноды. `checked` — нода прочитана
+ * (`discovered` есть); без этого «не найдено на ноде» не отмечается.
  */
 export function connectionView(listed, state, name) {
   const entry = asList(listed).find((row) => row && row.node === name);
   const groups = entry ? asList(entry.groups) : [];
-  const discovered = asList(state && state.discovered).map(nodeText);
+  const checked = Boolean(state) && Array.isArray(state.discovered);
+  const discovered = checked ? state.discovered.map(nodeText) : null;
   const { extra, stale } = unlisted(groups.flatMap((group) => asList(group.proxies).map(nodeText)), discovered);
-  const proxies = [...discovered, ...extra];
+  const proxies = [...(discovered || []), ...extra];
   const assigned = proxies.map((proxy) => [...new Set(groups
     .filter((group) => asList(group.proxies).includes(proxy))
     .map((group) => nodeText(group.name)))]);
   const problem = syncProblem(state && state.status);
   const table = proxies.map((proxy, index) => ({ proxy, groups: assigned[index], stale: stale.includes(proxy) }));
-  return { proxies, assigned, stale, problem, table };
+  return { proxies, assigned, stale, problem, checked, table };
 }
 
 /**
@@ -153,11 +156,12 @@ export function assignmentChanges(proxies, assigned, values) {
  * Назначение подключений (`assign_connections`) одной формой: по полю на
  * каждое найденное подключение со списком групп, текущие группы отмечены —
  * снятая отметка снимает назначение. Изменённые группы уходят одной
- * `conn set`; без изменений команды нет. Отмена ничего не меняет.
+ * `conn set`; без изменений команды нет. Отмена ничего не меняет; сбой
+ * `conn set` (например, `locked`) открывает форму снова с отмеченным.
  */
 export async function assignConnections(ctx, name, proxies, assigned, stale = []) {
   if (proxies.length === 0) {
-    ctx.notify('warn', `На ноде «${name}» подключений не найдено.`);
+    ctx.notify('warn', NO_CONNECTIONS);
     return;
   }
   const listed = await ctx.call('group', 'list');
@@ -175,18 +179,26 @@ export async function assignConnections(ctx, name, proxies, assigned, stale = []
     name: proxyField(index), label: proxyLabel(proxy, stale), type: 'multi', options,
     value: asList(assigned[index]).filter((group) => groups.includes(group)),
   }));
-  const values = await ctx.form({
-    title: 'Назначение подключений группам', context: [`Нода: ${name}`, 'Снятая отметка снимает назначение подключения группе.'],
-    fields, submit: 'Сохранить',
-  });
-  if (values === null || values === undefined) return;
-  // Сравнение с начальными значениями формы: группа, удалённая после чтения
-  // подключений (её нет в `group list`), не превращается в `--assign G=`.
-  const changes = assignmentChanges(proxies, fields.map((field) => field.value), values);
-  if (changes.length === 0) return;
-  const saved = await ctx.request(assignArgv(name, changes));
-  if (ctx.isFailure(saved)) ctx.failed();
+  let draft = null;
+  for (;;) {
+    const values = await ctx.form({
+      title: 'Назначение подключений группам', context: [`Нода: ${name}`, 'Снятая отметка снимает назначение подключения группе.'],
+      fields: refill(fields, draft), submit: 'Сохранить',
+    });
+    if (values === null || values === undefined) return;
+    // Сравнение с начальными значениями формы: группа, удалённая после чтения
+    // подключений (её нет в `group list`), не превращается в `--assign G=`.
+    const changes = assignmentChanges(proxies, fields.map((field) => field.value), values);
+    if (changes.length === 0) return;
+    const saved = await ctx.request(assignArgv(name, changes));
+    if (ctx.isFailure(saved)) ctx.failed();
+    if (!retryable(saved)) return;
+    draft = values;
+  }
 }
+
+/** Назначать нечего: нода не прочитана или на ней нет подключений, назначений нет. */
+export const NO_CONNECTIONS = 'Нет подключений для назначения: синхронизируйте ноду.';
 
 export const connSyncArgv = (name = null) => (name === null ? ['conn', 'sync'] : ['conn', 'sync', '--name', name]);
 export const connListArgv = (name = null) => (name === null ? ['conn', 'list'] : ['conn', 'list', '--name', name]);
@@ -197,7 +209,7 @@ export const nodeCheckArgv = (name) => ['node', 'check', '--name', name];
  * --name`; при `partial` с кодом ноды (`NODE_CODES`) — один `node check`
  * через `ctx.nodeRequest` (вопросы о ключе и пароле) и повтор синхронизации,
  * при прочем `partial` — `ctx.failed()`. Итог: `{ synced }` — строка ноды из
- * ответа (`null`, если её нет), либо `{ failed: reply }` — сбой чтения
+ * ответа (`null`, если её нет), либо `{ failed: reply }` — сбой синхронизации
  * (`not_found` — нода исчезла; текст ошибки уже показан `ctx.request`).
  */
 export async function syncConnections(ctx, name) {
@@ -344,6 +356,7 @@ export async function telegramMenu(ctx, after = null) {
 /**
  * Пакетное действие (`telegram_batch`): ноды и способ доступа одной формой,
  * план ядра, таблица результатов — `present(строки)` (экран показывает окно).
+ * Сбой команды без таблицы открывает форму снова с выбранным.
  * `true` — команда отправлена (отказ от плана и отмена формы ничего не меняли).
  */
 export async function telegramBatch(ctx, action, present) {
@@ -353,14 +366,21 @@ export async function telegramBatch(ctx, action, present) {
   if (action.component) {
     fields.push({ name: 'component', label: 'Способ доступа', type: 'radio', options: TELEGRAM_COMPONENTS, required: true });
   }
-  const values = await ctx.form({ title: action.title, fields, submit: 'Далее', tone: action.danger ? 'danger' : 'primary' });
-  if (values === null) return false;
-  const argv = telegramArgv(action.argv, values.nodes, action.component ? values.component : null);
-  const reply = await ctx.runConfirmed(action.title, 'Выполнить?', argv);
-  const table = telegramResults(reply);
-  if (table !== null) await present(table);
-  else if (ctx.isFailure(reply)) ctx.failed();
-  return reply.ok || ctx.isFailure(reply);
+  let draft = null;
+  for (;;) {
+    const values = await ctx.form({ title: action.title, fields: refill(fields, draft), submit: 'Далее', tone: action.danger ? 'danger' : 'primary' });
+    if (values === null || values === undefined) return draft !== null;
+    const argv = telegramArgv(action.argv, values.nodes, action.component ? values.component : null);
+    const reply = await ctx.runConfirmed(action.title, 'Выполнить?', argv);
+    const table = telegramResults(reply);
+    if (table !== null) {
+      await present(table);
+      return true;
+    }
+    if (ctx.isFailure(reply)) ctx.failed();
+    if (!retryable(reply)) return reply.ok || ctx.isFailure(reply) || draft !== null;
+    draft = values;
+  }
 }
 
 /** `telegram status --all`: строки таблицы или `null` — сбой без таблицы (сообщён). */

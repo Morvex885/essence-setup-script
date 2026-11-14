@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   decisionFlag, setFlag, clearFlag, runConfirmed, reviewReply, nodeRequest,
-  handleNodeCodes, PLAN_KEEPS_CHANGING, PLAN_CHANGED, BROKEN_PLAN, NODE_CODES, OPERATION_FAILED, screenDialogs,
+  handleNodeCodes, PLAN_KEEPS_CHANGING, PLAN_CHANGED, BROKEN_PLAN, NODE_CODES, OPERATION_FAILED, screenDialogs, retryable,
 } from '../assets/js/flows.js';
 
 const plan = (code, token, extra = {}) => ({
@@ -310,4 +310,12 @@ test('screenDialogs: цикл заголовков подписки заверш
   };
   await showHeaders(ctx, 'client', 'alice');
   assert.equal(requests.length, 2, 'после ухода — одно перечитывание и выход без окна');
+});
+
+test('retryable: сбой без изменений — да; успех, отказ от плана, partial — нет', () => {
+  const failed = (code) => ({ ok: false, data: null, error: { code, message: '' } });
+  assert.equal(retryable(failed('locked')), true);
+  for (const reply of [{ ok: true, data: null }, failed('confirmation_required'), failed('plan_changed'), failed('partial')]) {
+    assert.equal(retryable(reply), false, JSON.stringify(reply));
+  }
 });

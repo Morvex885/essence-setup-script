@@ -24,12 +24,18 @@ export function NodeConnections({ ctx, name }) {
     fail(reply);
   };
 
-  /** `conn sync --name` (`syncConnections`); `false` — сбой чтения. */
+  /**
+   * `conn sync --name` (`syncConnections`); `false` — нода исчезла. Прочий
+   * сбой сообщается, а вкладка показывает сохранённые назначения без проверки
+   * ноды: их можно изменить без SSH.
+   */
   const refresh = async () => {
     const result = await syncConnections(ctx, name);
     if (result.failed) {
-      failure(result.failed);
-      return false;
+      if (result.failed.error && result.failed.error.code === 'not_found') { gone(); return false; }
+      if (ctx.isFailure(result.failed)) ctx.failed();
+      synced.current = null;
+      return true;
     }
     synced.current = result.synced;
     return true;
@@ -84,6 +90,9 @@ export function NodeConnections({ ctx, name }) {
     ${view.problem && html`<div role="alert" class="alert alert-warning alert-soft">
       <${Icon} name="triangle-alert" size=${18} /><span>Нода ${view.problem}</span>
     </div>`}
-    <${DataTable} columns=${columns} rows=${view.table} rowKey="proxy" empty="Подключения не найдены" />
+    ${!view.problem && !view.checked && html`<div role="alert" class="alert alert-warning alert-soft">
+      <${Icon} name="triangle-alert" size=${18} /><span>Подключения ноды не проверены: показаны сохранённые назначения</span>
+    </div>`}
+    <${DataTable} columns=${columns} rows=${view.table} rowKey="proxy" empty=${view.checked ? 'Подключения не найдены' : 'Нет сохранённых назначений'} />
   <//>`;
 }

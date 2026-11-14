@@ -4,7 +4,8 @@
 // перенос, карточка клиента, подписки) — формы и диалоги `ctx`
 // (`app.js::makeContext`); окна с разметкой экран передаёт функцией.
 import { asList, strings, proxyLabel, unlisted } from '../format.js';
-import { isFailure } from '../flows.js';
+import { isFailure, retryable } from '../flows.js';
+import { refill } from '../form-model.js';
 import { assignArgv } from './nodeops-model.js';
 import {
   DEFAULT_TEMPLATE, generateGroup, generateClient, generateScope,
@@ -492,11 +493,28 @@ export function groupProxies(found, group) {
 }
 
 /**
+ * Подключения ноды для формы (`clients.rs::node_connections`): `conn list
+ * --discover` по SSH; нода, которую прочитать не удалось (сбой показан), —
+ * сохранённые назначения (`conn list --name`, без SSH; их достаточно, чтобы
+ * снять назначение) с `discovered: null` («не найдено» не отмечается).
+ * `null` — не прочитано ни то ни другое либо отказ от вопроса о ноде.
+ */
+export async function nodeConnections(ctx, node) {
+  const found = await ctx.nodeRequest(node, discoverArgv(node), null);
+  if (found.ok) return { found: found.data, discovered: discoveredProxies(found.data) };
+  if (!isFailure(found)) return null;
+  const saved = await fetchData(ctx, ['conn', 'list', '--name', node]);
+  if (!saved) return null;
+  ctx.notify('warn', `Нода «${node}» не проверена: показаны сохранённые назначения.`);
+  return { found: saved.data, discovered: null };
+}
+
+/**
  * Подключения нод для группы: нода (единственная выбирается сама) →
- * найденные на ней подключения (`conn list --discover` по SSH) одной формой,
- * назначенные группе отмечены → `conn set --name N --assign G=P…` (без
- * отметок — назначение группы на ноде снимается). Отмена и выбор без
- * изменений ничего не меняют.
+ * подключения ноды (`nodeConnections`) одной формой, назначенные группе
+ * отмечены → `conn set --name N --assign G=P…` (без отметок — назначение
+ * группы на ноде снимается). Отмена и выбор без изменений ничего не меняют;
+ * сбой записи открывает форму снова с отмеченным.
  */
 export async function groupConnectionsFlow(ctx, group) {
   const read = await fetchData(ctx, ['node', 'list']);
@@ -512,24 +530,31 @@ export async function groupConnectionsFlow(ctx, group) {
     if (picked === null || picked === undefined) return;
     node = picked.node;
   }
-  const found = await ctx.nodeRequest(node, discoverArgv(node), null);
-  if (!found.ok) return;
-  const discovered = discoveredProxies(found.data);
-  const current = groupProxies(found.data, group);
+  const connections = await nodeConnections(ctx, node);
+  if (connections === null) return;
+  const { found, discovered } = connections;
+  const current = groupProxies(found, group);
   // Назначенные группе, но не найденные (клиенты AmneziaWG, устаревшие) — в конце, отмечены.
   const { extra, stale } = unlisted(current, discovered);
-  const proxies = [...discovered, ...extra];
-  if (proxies.length === 0) { ctx.notify('warn', `На ноде «${node}» подключений не найдено.`); return; }
-  const values = await ctx.form({
-    title: `Подключения группы ${group}`, context: [`Нода: ${node}`], submit: 'Назначить',
-    fields: [{ name: 'proxies', label: 'Подключения', type: 'multi', hint: 'Без отметок назначение группы на этой ноде снимается',
-      options: proxies.map((proxy) => ({ value: proxy, label: proxyLabel(proxy, stale) })),
-      value: current }],
-  });
-  if (values === null || values === undefined) return;
-  const chosen = asList(values.proxies);
-  if (chosen.length === current.length && chosen.every((proxy) => current.includes(proxy))) return;
-  await execute(ctx, groupConnectionsArgv(group, node, chosen));
+  const proxies = [...(discovered || []), ...extra];
+  if (proxies.length === 0) {
+    ctx.notify('warn', discovered ? `На ноде «${node}» подключений не найдено.` : `Нода «${node}» не проверена, сохранённых назначений нет.`);
+    return;
+  }
+  const fields = [{ name: 'proxies', label: 'Подключения', type: 'multi', hint: 'Без отметок назначение группы на этой ноде снимается',
+    options: proxies.map((proxy) => ({ value: proxy, label: proxyLabel(proxy, stale) })),
+    value: current }];
+  let draft = null;
+  for (;;) {
+    const values = await ctx.form({
+      title: `Подключения группы ${group}`, context: [`Нода: ${node}`], submit: 'Назначить', fields: refill(fields, draft),
+    });
+    if (values === null || values === undefined) return;
+    const chosen = asList(values.proxies);
+    if (chosen.length === current.length && chosen.every((proxy) => current.includes(proxy))) return;
+    if (!retryable(await execute(ctx, groupConnectionsArgv(group, node, chosen)))) return;
+    draft = values;
+  }
 }
 
 /** Перенос клиента группы `group` в другую из `groups` (`group list`) по плану. */
@@ -658,7 +683,10 @@ export async function editClientFlow(ctx, name, row) {
   return null;
 }
 
-/** `clients.rs::client_nodes`: режим и свои ноды одной формой; наследование — по плану. */
+/**
+ * `clients.rs::client_nodes`: режим и свои ноды одной формой; наследование —
+ * по плану. Сбой команды открывает форму снова с выбранным.
+ */
 export async function clientNodesFlow(ctx, name, row) {
   const inherit = inherits(row);
   const nodes = strings(row.nodes);
@@ -666,45 +694,51 @@ export async function clientNodesFlow(ctx, name, row) {
   if (!read) return;
   const options = nameOptions(read.data, nodeLabel);
   const known = options.map((option) => option.value);
-  const values = await ctx.form({
-    title: `Ноды клиента: ${name}`,
-    fields: [
-      { name: 'mode', label: 'Ноды', type: 'radio', value: inherit ? 'inherit' : 'own',
-        options: [{ value: 'inherit', label: 'От группы' }, { value: 'own', label: 'Свои ноды' }] },
-      { name: 'nodes', label: 'Свои ноды', type: 'multi', options, value: inherit ? [] : nodes.filter((node) => known.includes(node)),
-        required: true, when: (v) => v.mode === 'own' },
-    ],
-  });
-  if (values === null || values === undefined) return;
-  const plan = nodesChange(name, inherit, values);
-  if (plan === null) return;
-  if (plan.kind === 'inherit') await confirmed(ctx, 'Ноды клиента', 'Вернуть ноды от группы?', plan.argv);
-  else await execute(ctx, plan.argv);
+  const fields = [
+    { name: 'mode', label: 'Ноды', type: 'radio', value: inherit ? 'inherit' : 'own',
+      options: [{ value: 'inherit', label: 'От группы' }, { value: 'own', label: 'Свои ноды' }] },
+    { name: 'nodes', label: 'Свои ноды', type: 'multi', options, value: inherit ? [] : nodes.filter((node) => known.includes(node)),
+      required: true, when: (v) => v.mode === 'own' },
+  ];
+  let draft = null;
+  for (;;) {
+    const values = await ctx.form({ title: `Ноды клиента: ${name}`, fields: refill(fields, draft) });
+    if (values === null || values === undefined) return;
+    const plan = nodesChange(name, inherit, values);
+    if (plan === null) return;
+    const reply = plan.kind === 'inherit'
+      ? await confirmed(ctx, 'Ноды клиента', 'Вернуть ноды от группы?', plan.argv)
+      : await execute(ctx, plan.argv);
+    if (!retryable(reply)) return;
+    draft = values;
+  }
 }
 
 /**
- * `clients.rs::client_connections`: найденные на ноде подключения
- * (`nodeRequest … --discover`) одной формой; `assigned` — ответ
- * `client connections --name` (отмечает назначенные). Назначенные, но не
- * найденные (клиенты AmneziaWG `awg-<peer>`, устаревшие) — в конце, отмечены:
- * `client connections` заменяет список, без них отправка их бы сняла.
+ * `clients.rs::client_connections`: подключения ноды (`nodeConnections`)
+ * одной формой; `assigned` — ответ `client connections --name` (отмечает
+ * назначенные). Назначенные, но не найденные (клиенты AmneziaWG
+ * `awg-<peer>`, устаревшие) — в конце, отмечены: `client connections`
+ * заменяет список, без них отправка их бы сняла. Сбой записи открывает
+ * форму снова с отмеченным.
  */
 export async function clientConnectionsFlow(ctx, name, node, assigned) {
-  const found = await ctx.nodeRequest(node, discoverArgv(node), null);
-  if (!found.ok) return;
+  const read = await nodeConnections(ctx, node);
+  if (read === null) return;
   const current = assignedProxies(assigned, node);
-  const discovered = discoveredProxies(found.data);
-  const { extra, stale } = unlisted(current, discovered);
-  const proxies = [...discovered, ...extra];
+  const { extra, stale } = unlisted(current, read.discovered);
+  const proxies = [...(read.discovered || []), ...extra];
   if (proxies.length === 0) { ctx.notify('warn', EMPTY); return; }
-  const values = await ctx.form({
-    title: `Подключения клиента на ${node}`,
-    fields: [{ name: 'proxies', label: 'Подключения', type: 'multi',
-      options: proxies.map((proxy) => ({ value: proxy, label: proxyLabel(proxy, stale) })),
-      value: proxies.filter((proxy) => current.includes(proxy)), required: true }],
-  });
-  if (values === null || values === undefined) return;
-  await execute(ctx, clientConnectionsArgv(name, node, values.proxies));
+  const fields = [{ name: 'proxies', label: 'Подключения', type: 'multi',
+    options: proxies.map((proxy) => ({ value: proxy, label: proxyLabel(proxy, stale) })),
+    value: proxies.filter((proxy) => current.includes(proxy)), required: true }];
+  let draft = null;
+  for (;;) {
+    const values = await ctx.form({ title: `Подключения клиента на ${node}`, fields: refill(fields, draft) });
+    if (values === null || values === undefined) return;
+    if (!retryable(await execute(ctx, clientConnectionsArgv(name, node, values.proxies)))) return;
+    draft = values;
+  }
 }
 
 /**

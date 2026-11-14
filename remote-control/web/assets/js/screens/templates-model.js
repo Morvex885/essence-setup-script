@@ -5,6 +5,8 @@
 // текст)` (в браузере — `downloadText`). Экран `templates.js` только
 // перечитывает данные, переходит по результату и обновляет черновик.
 import { asList } from '../format.js';
+import { refill } from '../form-model.js';
+import { retryable } from '../flows.js';
 import {
   TEMPLATE_FILE_UNREADABLE, TEMPLATE_NAME_MISSING, DEFAULT_TEMPLATE, templateImport, templateInput, templateDelete,
   templateGroups, templateCreate, templateShow, templateContent, templateKind, groupOptions,
@@ -74,6 +76,11 @@ export function settleDraft(current, sent) {
   return current === sent ? null : current;
 }
 
+/** Черновик `draft` (`null` — без правок) отличается от сохранённого `content`. */
+export function draftDirty(draft, content) {
+  return draft !== null && draft !== content;
+}
+
 /**
  * Нужна ли защита ухода: черновик отличается от сохранённого `content` либо
  * идёт запись `saving` (текст сохранения или импорта из файла, пока команда
@@ -82,7 +89,7 @@ export function settleDraft(current, sent) {
  */
 export function unsavedChanges(draft, content, saving) {
   const text = draft !== null ? draft : content;
-  return (draft !== null && draft !== content) || (saving !== null && saving !== text);
+  return draftDirty(draft, content) || (saving !== null && saving !== text);
 }
 
 /**
@@ -134,27 +141,33 @@ export async function deleteTemplate(ctx, row) {
 /**
  * «Группы…» (`clients.rs::template_groups`): мультивыбор из `group list`,
  * затем `template groups` по плану. Пустой выбор возвращает все группы
- * шаблона к `default.yaml`. `true` — группы изменились.
+ * шаблона к `default.yaml`. Сбой команды открывает выбор снова с отмеченным.
+ * `true` — группы изменились.
  */
 export async function editTemplateGroups(ctx, name) {
   const groups = await ctx.request(['group', 'list']);
   if (!groups.ok) { ctx.failed(); return false; }
   const { options, selected } = groupOptions(groups.data, name);
-  const values = await ctx.form({
-    title: `Группы шаблона: ${name}`,
-    submit: 'Далее',
-    context: name === DEFAULT_TEMPLATE
-      ? ['Группы без своего шаблона используют default.yaml. Чтобы убрать группу отсюда, назначьте ей другой шаблон.']
-      : ['Снятые группы вернутся к default.yaml.'],
-    fields: [{ name: 'groups', label: 'Группы', type: 'multi', options, value: selected }],
-  });
-  if (values === null) return false;
-  const reply = await ctx.runConfirmed('Группы шаблона', 'Применить?', templateGroups(name, values.groups));
-  if (ctx.isFailure(reply)) ctx.failed();
-  if (!reply.ok) return false;
-  const changed = asList(reply.data && reply.data.assigned).length > 0 || asList(reply.data && reply.data.reset).length > 0;
-  if (!changed) ctx.notify('info', GROUPS_UNCHANGED);
-  return changed;
+  const fields = [{ name: 'groups', label: 'Группы', type: 'multi', options, value: selected }];
+  let draft = null;
+  for (;;) {
+    const values = await ctx.form({
+      title: `Группы шаблона: ${name}`,
+      submit: 'Далее',
+      context: name === DEFAULT_TEMPLATE
+        ? ['Группы без своего шаблона используют default.yaml. Чтобы убрать группу отсюда, назначьте ей другой шаблон.']
+        : ['Снятые группы вернутся к default.yaml.'],
+      fields: refill(fields, draft),
+    });
+    if (values === null || values === undefined) return false;
+    const reply = await ctx.runConfirmed('Группы шаблона', 'Применить?', templateGroups(name, values.groups));
+    if (ctx.isFailure(reply)) ctx.failed();
+    if (retryable(reply)) { draft = values; continue; }
+    if (!reply.ok) return false;
+    const changed = asList(reply.data && reply.data.assigned).length > 0 || asList(reply.data && reply.data.reset).length > 0;
+    if (!changed) ctx.notify('info', GROUPS_UNCHANGED);
+    return changed;
+  }
 }
 
 /**

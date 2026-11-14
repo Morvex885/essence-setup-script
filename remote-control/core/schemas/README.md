@@ -14,3 +14,4 @@
 
 1. `definitions/proxies/definitions/shadowsocksr/definitions/compatible/{string,integer,number,boolean}/anyOf/1` — ветка с `pattern` без `type` принимает любой не-строковый узел (объект или список в скалярном поле). Ей задаётся тип второй формы: `number` для `string`, `string` для остальных.
 2. `definitions/proxy-groups/definitions/load-balance/definitions/groupbase/allOf/0` — `required: [name, type]` рядом с `$ref` в draft-07 не действует; `$ref` переносится во вложенный `allOf`.
+3. `definitions/listeners/items/anyOf/*/allOf/0` — ветка различает вид по `properties.type.const`, но `type` не требует: элемент без `type` (mihomo: `missing type`) проходит как `socks`. Ей добавляется `required: [type]`.

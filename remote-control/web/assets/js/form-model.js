@@ -77,3 +77,14 @@ export function result(fields, values) {
   }
   return out;
 }
+
+/**
+ * Поля со значениями прежней отправки `draft` (`null` — без изменений):
+ * форма, чья команда не выполнилась, открывается снова с введённым.
+ * Секретные поля остаются пустыми.
+ */
+export function refill(fields, draft) {
+  if (draft === null || draft === undefined) return fields;
+  return asList(fields).map((field) => (field.type !== 'secret' && Object.hasOwn(draft, field.name)
+    ? { ...field, value: draft[field.name] } : field));
+}

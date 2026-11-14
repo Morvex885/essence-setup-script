@@ -113,6 +113,14 @@ export function isFailure(reply) {
 }
 
 /**
+ * Команда не выполнилась и ничего не изменила (`confirm.rs::retryable`): не
+ * отказ от плана и не `partial` — форма, отправившая её, открывается снова с введённым.
+ */
+export function retryable(reply) {
+  return isFailure(reply) && !(reply.error && reply.error.code === 'partial');
+}
+
+/**
  * Разрешение состояния ноды (`nodes.rs::handle_node_codes`): `true`, если
  * условие устранено и исходную команду можно повторить.
  */

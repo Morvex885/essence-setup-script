@@ -349,7 +349,13 @@ test('ноды клиента: свои — client nodes, возврат к гр
 
   const partial = fakeCtx({ replies: [listed, failure('partial')], answers: [{ mode: 'own', nodes: ['de'] }] });
   await m.clientNodesFlow(partial, 'alice', row('alice', true, unpublished));
-  assert.equal(kinds(partial).at(-1), 'failed');
+  assert.equal(kinds(partial).at(-1), 'failed', '`partial` изменил ноды: форма не открывается снова');
+
+  const retried = fakeCtx({ replies: [listed, failure('locked'), okReply()], answers: [{ mode: 'own', nodes: ['ru'] }, { mode: 'own', nodes: ['ru'] }] });
+  await m.clientNodesFlow(retried, 'alice', row('alice', true, unpublished));
+  assert.deepEqual(kinds(retried), ['request', 'form', 'request', 'failed', 'form', 'request']);
+  const again = retried.calls[4][1].fields;
+  assert.deepEqual([again.find((f) => f.name === 'mode').value, again.find((f) => f.name === 'nodes').value], ['own', ['ru']]);
 });
 
 test('подключения группы: записи одной группы объединяются', () => {
@@ -394,6 +400,19 @@ test('подключения группы: нода по выбору (одна 
   const cancelled = fakeCtx({ replies: [two], answers: [null] });
   await m.groupConnectionsFlow(cancelled, 'PC');
   assert.deepEqual(kinds(cancelled), ['request', 'form']);
+
+  // Нода недоступна (сбой сообщает nodeRequest): сохранённые назначения без
+  // SSH, без отметки «не найдено», снятие доступно; сбой записи — форма снова.
+  const saved = okReply([{ node: 'de', groups: [{ name: 'PC', proxies: ['p1'] }] }]);
+  const unset = ['conn', 'set', '--name', 'de', '--assign', 'PC='];
+  const unreachable = fakeCtx({ replies: [okReply([{ name: 'de' }]), failure('remote_failed'), saved, failure('locked'), okReply()],
+    answers: [{ proxies: [] }, { proxies: [] }] });
+  await m.groupConnectionsFlow(unreachable, 'PC');
+  assert.deepEqual(kinds(unreachable), ['request', 'node', 'request', 'notify', 'form', 'request', 'failed', 'form', 'request']);
+  assert.deepEqual(unreachable.calls[2][1], ['conn', 'list', '--name', 'de']);
+  const forms = unreachable.calls.filter((c) => c[0] === 'form').map((c) => c[1].fields[0]);
+  assert.deepEqual([forms[0].options.map((o) => o.label), forms[0].value, forms[1].value], [['p1'], ['p1'], []]);
+  assert.deepEqual(commands(unreachable).at(-1), unset);
 });
 
 test('подключения клиента на ноде: поиск через nodeRequest, отмечены назначенные', async () => {
@@ -410,9 +429,19 @@ test('подключения клиента на ноде: поиск через
   await m.clientConnectionsFlow(none, 'alice', 'de', []);
   assert.deepEqual(kinds(none), ['node', 'notify']);
 
-  const unreachable = fakeCtx({ replies: [failure('remote_failed')] });
+  // Нода недоступна (сбой сообщает nodeRequest): сохранённые назначения без
+  // SSH, без отметки «не найдено»; сбой записи открывает форму снова с выбранным.
+  const saved = okReply([{ node: 'de', groups: [] }]);
+  const unreachable = fakeCtx({ replies: [failure('remote_failed'), saved, failure('locked'), okReply()],
+    answers: [{ proxies: ['p2'] }, { proxies: ['p2'] }] });
   await m.clientConnectionsFlow(unreachable, 'alice', 'de', assigned);
-  assert.deepEqual(kinds(unreachable), ['node'], 'сбой сообщает nodeRequest');
+  assert.deepEqual(kinds(unreachable), ['node', 'request', 'notify', 'form', 'request', 'failed', 'form', 'request']);
+  assert.deepEqual(unreachable.calls[1][1], ['conn', 'list', '--name', 'de']);
+  assert.deepEqual(unreachable.calls[3][1].fields[0].options.map((o) => o.label), ['p2']);
+  assert.deepEqual(unreachable.calls[6][1].fields[0].value, ['p2']);
+  const lost = fakeCtx({ replies: [failure('remote_failed'), failure('locked')] });
+  await m.clientConnectionsFlow(lost, 'alice', 'de', assigned);
+  assert.deepEqual(kinds(lost), ['node', 'request', 'failed']);
 
   const cancelled = fakeCtx({ replies: [found], answers: [null] });
   await m.clientConnectionsFlow(cancelled, 'alice', 'de', assigned);

@@ -1,7 +1,7 @@
 // Тесты form-model.js: начальные значения, `when`, обязательность, проверка, итог.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { initialValues, visibleFields, validate, result, REQUIRED, REQUIRED_MULTI } from '../assets/js/form-model.js';
+import { initialValues, visibleFields, validate, result, refill, REQUIRED, REQUIRED_MULTI } from '../assets/js/form-model.js';
 
 const fields = [
   { name: 'name', label: 'Имя', type: 'text', required: true },
@@ -63,4 +63,18 @@ test('initialValues: select не из доступных вариантов — 
     { name: 'kept', type: 'select', value: 'z', options },
     { name: 'secret', type: 'secret', value: 'leaked' },
   ]), { gone: 'y', off: 'y', kept: 'z', secret: '' });
+});
+
+test('refill: форма после сбоя — с прежним вводом, секреты пустые, без черновика — те же поля', () => {
+  const form = [
+    { name: 'name', type: 'text', value: 'a' },
+    { name: 'nodes', type: 'multi', value: ['x'] },
+    { name: 'password', type: 'secret' },
+    { name: 'mode', type: 'radio', value: 'own' },
+  ];
+  assert.equal(refill(form, null), form);
+  const again = refill(form, { name: 'b', nodes: ['y', 'z'], password: 'pw' });
+  assert.deepEqual(again.map((field) => field.value), ['b', ['y', 'z'], undefined, 'own']);
+  assert.deepEqual(initialValues(again), { name: 'b', nodes: ['y', 'z'], password: '', mode: 'own' });
+  assert.equal(form[0].value, 'a', 'исходные поля не меняются');
 });

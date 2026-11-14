@@ -181,9 +181,14 @@ function ClientAccess({ ctx, name, row, busy, act }) {
   const inherit = model.inherits(row);
   const nodes = strings(row.nodes);
   const assigned = useCommand(ctx, inherit ? null : ['client', 'connections', '--name', name], [nodes.join('\n')]);
-  // Список нод — только чтобы отметить назначенные ноды, которых больше нет.
+  // Список нод — только чтобы отметить назначенные ноды, которых больше нет;
+  // перечитывается вместе с назначениями: нода, добавленная после открытия
+  // вкладки и назначенная клиенту, не считается удалённой.
   const known = useCommand(ctx, inherit ? null : ['node', 'list'], [], { quiet: true });
-  const change = (action) => act(async () => { await action(); if (!inherit) await assigned.reload(); });
+  const change = (action) => act(async () => {
+    await action();
+    if (!inherit) await Promise.all([assigned.reload(), known.reload()]);
+  });
 
   const reset = (node) => confirmed(ctx, 'Сброс подключений', 'Сбросить подключения ноды?', model.resetConnectionsArgv(name, node));
 

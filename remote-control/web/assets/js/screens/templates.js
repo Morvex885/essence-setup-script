@@ -20,7 +20,7 @@ import {
   droppedRanges, variantOptions, effectiveVariant, problemVariant, inVariant,
 } from './catalog-model.js';
 import {
-  settleDraft, unsavedChanges, saveTemplate, importTemplateFile, deleteLabel, deleteTemplate, editTemplateGroups, checkRunner,
+  settleDraft, draftDirty, unsavedChanges, saveTemplate, importTemplateFile, deleteLabel, deleteTemplate, editTemplateGroups, checkRunner,
   createTemplate, exportTemplate, offerLostDraft, confirmLeave,
 } from './templates-model.js';
 
@@ -131,8 +131,10 @@ function TemplateEditor({ ctx, name }) {
   const editor = useRef(null);
   const row = list.data ? findTemplate(list.data, name) : null;
   const content = templateContent(shown.data);
+  const contentRef = useRef(content);
+  contentRef.current = content;
   const text = draft !== null ? draft : content;
-  const dirty = draft !== null && draft !== content;
+  const dirty = draftDirty(draft, content);
   // Текст, который записывает идущая команда (сохранение или импорт), иначе `null`.
   const [saving, setSaving] = useState(null);
   const guarded = unsavedChanges(draft, content, saving);
@@ -205,9 +207,11 @@ function TemplateEditor({ ctx, name }) {
   const importFile = (fileText, reason) => run(async () => {
     // Правки, набранные пока идёт импорт, не затираются импортированным текстом;
     // до конца импорта его текст — идущая запись для защиты ухода.
+    // `FileText` вызывает обработчик, снятый до чтения файла: черновик и
+    // сохранённый текст — из ссылок на момент вызова, не из замыкания.
     const before = draftRef.current;
     try {
-      const imported = await importTemplateFile(ctx, name, fileText, reason, dirty, setSaving);
+      const imported = await importTemplateFile(ctx, name, fileText, reason, draftDirty(before, contentRef.current), setSaving);
       if (fileText === null) return;
       await reload();
       if (imported && settleDraft(draftRef.current, before) === null) replaceText();

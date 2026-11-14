@@ -500,13 +500,15 @@ export async function harden(ctx, name) {
   let words = hardenArgv(name, port);
   for (;;) {
     let reply = await ctx.request(words);
+    // Порт может оказаться занят и до плана, и между планом и подтверждённым
+    // запуском (ядро отказывает до изменений): порт спрашивается снова.
+    if (!hardenAsksPort(words, reply)) reply = await reviewReply(title, 'Усилить защиту SSH?', words, reply, deps(ctx), 2);
     if (hardenAsksPort(words, reply)) {
       const again = await ask();
       if (again === null) return;
       words = hardenArgv(name, again);
       continue;
     }
-    reply = await reviewReply(title, 'Усилить защиту SSH?', words, reply, deps(ctx), 2);
     if (reply.ok) return;
     if (errorCode(reply) === 'hardening_failed') {
       if (reply.error.console_required === true) ctx.notify('warn', 'Проверьте доступ через консоль провайдера.');

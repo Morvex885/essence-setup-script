@@ -130,6 +130,20 @@ fn node_request(ctx: &mut Context<'_>, node: &str, words: &[&str]) -> io::Result
         return Ok(None);
     }
 }
+/// Proxies of a node for a form: `conn list --name N --discover` over SSH;
+/// a node that cannot be read (reported) falls back to its saved
+/// assignments (`conn list --name N`, local) — enough to remove one —
+/// with `None` discovered (nothing is marked «not found»). `None` — neither
+/// read.
+fn node_connections(ctx: &mut Context<'_>, node: &str) -> io::Result<Option<(Value, Option<Vec<String>>)>> {
+    if let Some(found) = node_request(ctx, node, &["conn", "list", "--name", node, "--discover"])? {
+        let discovered = strings(&found[0]["discovered"]);
+        return Ok(Some((found, Some(discovered))));
+    }
+    let Some(saved) = fetch(ctx, &["conn", "list", "--name", node])? else { return Ok(None); };
+    ctx.ui.notice(ui::warn(format!("Нода {node} не проверена: показаны сохранённые назначения.")));
+    Ok(Some((saved, None)))
+}
 /// Result frame: empty fields are omitted; failures YELLOW.
 fn summary(ctx: &mut Context<'_>, title: &str, data: &Value, fields: &[(&str, &str)], empty: &str) -> io::Result<()> {
     let mut view = View::new(title);
@@ -181,13 +195,21 @@ fn clients(ctx: &mut Context<'_>) -> io::Result<()> {
         }
     }
 }
+/// Toggle flags of `selected` among `len` items: a failed command reopens
+/// its toggle with the user's choice.
+fn checked(len: usize, selected: &[usize]) -> Vec<bool> { (0..len).map(|i| selected.contains(&i)).collect() }
 fn delete_clients(ctx: &mut Context<'_>, targets: &[String]) -> io::Result<()> {
-    let Some(selected) = ctx.toggle("Удаление клиентов", targets, vec![false; targets.len()], EMPTY)? else { return Ok(()); };
-    if selected.is_empty() { ctx.ui.notice(ui::warn("Ничего не выбрано.")); return Ok(()); }
-    let mut words = vec!["client", "delete"];
-    for i in selected { words.extend(["--name", targets[i].as_str()]); }
-    confirmed(ctx, "Удаление клиентов", "Удалить выбранных клиентов?", &words)?;
-    Ok(())
+    let mut flags = vec![false; targets.len()];
+    loop {
+        let Some(selected) = ctx.toggle("Удаление клиентов", targets, flags, EMPTY)? else { return Ok(()); };
+        if selected.is_empty() { ctx.ui.notice(ui::warn("Ничего не выбрано.")); return Ok(()); }
+        let mut words = vec!["client", "delete"];
+        for &i in &selected { words.extend(["--name", targets[i].as_str()]); }
+        let reply = confirmed(ctx, "Удаление клиентов", "Удалить выбранных клиентов?", &words)?;
+        // `partial` deleted some: the list is re-read.
+        if !crate::confirm::retryable(&reply) { return Ok(()); }
+        flags = checked(targets.len(), &selected);
+    }
 }
 fn subscription_state(row: &Value) -> String {
     let sub = &row["subscription"];
@@ -276,13 +298,15 @@ fn client_nodes(ctx: &mut Context<'_>, name: &str, inherit: bool, current: &[Str
     let targets = names(&data);
     let labels: Vec<String> = rows(&data).iter().map(node_label).collect();
     // The current (effective) nodes are the starting state, like v1.
-    let flags = targets.iter().map(|n| current.contains(n)).collect();
-    let Some(selected) = ctx.toggle(&format!("Свои ноды клиента: {name}"), &labels, flags, EMPTY)? else { return Ok(()); };
-    if selected.is_empty() { ctx.ui.notice(ui::warn("Ничего не выбрано.")); return Ok(()); }
-    let mut words = vec!["client", "nodes", "--name", name];
-    for i in selected { words.extend(["--node", targets[i].as_str()]); }
-    execute(ctx, &words)?;
-    Ok(())
+    let mut flags = targets.iter().map(|n| current.contains(n)).collect();
+    loop {
+        let Some(selected) = ctx.toggle(&format!("Свои ноды клиента: {name}"), &labels, flags, EMPTY)? else { return Ok(()); };
+        if selected.is_empty() { ctx.ui.notice(ui::warn("Ничего не выбрано.")); return Ok(()); }
+        let mut words = vec!["client", "nodes", "--name", name];
+        for &i in &selected { words.extend(["--node", targets[i].as_str()]); }
+        if !crate::confirm::retryable(&execute(ctx, &words)?) { return Ok(()); }
+        flags = checked(labels.len(), &selected);
+    }
 }
 fn client_connections(ctx: &mut Context<'_>, name: &str, own: &[String]) -> io::Result<()> {
     if own.is_empty() { ctx.ui.notice(ui::warn("У клиента нет своих нод.")); return Ok(()); }
@@ -300,21 +324,22 @@ fn client_connections(ctx: &mut Context<'_>, name: &str, own: &[String]) -> io::
     }
     let Some(assigned) = fetch(ctx, &["client", "connections", "--name", name])? else { return Ok(()); };
     let current: Vec<String> = rows(&assigned).iter().filter(|r| r["node"] == node.as_str()).flat_map(|r| strings(&r["proxies"])).collect();
-    let Some(found) = node_request(ctx, &node, &["conn", "list", "--name", &node, "--discover"])? else { return Ok(()); };
+    let Some((_, discovered)) = node_connections(ctx, &node)? else { return Ok(()); };
     // `client connections` replaces the list: assigned but unreported ones
     // (AmneziaWG peers `awg-<peer>`, stale) are listed checked to survive.
-    let discovered = strings(&found[0]["discovered"]);
-    let (extra, stale) = crate::nodes::unlisted(&current, &discovered);
-    let proxies: Vec<String> = discovered.into_iter().chain(extra).collect();
+    let (extra, stale) = crate::nodes::unlisted(&current, discovered.as_deref());
+    let proxies: Vec<String> = discovered.unwrap_or_default().into_iter().chain(extra).collect();
     if proxies.is_empty() { ctx.ui.notice(ui::warn(EMPTY)); return Ok(()); }
     let labels: Vec<String> = proxies.iter().map(|p| crate::nodes::proxy_label(p, &stale)).collect();
-    let flags = proxies.iter().map(|p| current.contains(p)).collect();
-    let Some(selected) = ctx.toggle(&format!("Подключения клиента на {node}"), &labels, flags, EMPTY)? else { return Ok(()); };
-    if selected.is_empty() { ctx.ui.notice(ui::warn("Ничего не выбрано.")); return Ok(()); }
-    let mut words = vec!["client", "connections", "--name", name, "--node", &node];
-    for i in selected { words.extend(["--proxy", proxies[i].as_str()]); }
-    execute(ctx, &words)?;
-    Ok(())
+    let mut flags = proxies.iter().map(|p| current.contains(p)).collect();
+    loop {
+        let Some(selected) = ctx.toggle(&format!("Подключения клиента на {node}"), &labels, flags, EMPTY)? else { return Ok(()); };
+        if selected.is_empty() { ctx.ui.notice(ui::warn("Ничего не выбрано.")); return Ok(()); }
+        let mut words = vec!["client", "connections", "--name", name, "--node", &node];
+        for &i in &selected { words.extend(["--proxy", proxies[i].as_str()]); }
+        if !crate::confirm::retryable(&execute(ctx, &words)?) { return Ok(()); }
+        flags = checked(labels.len(), &selected);
+    }
 }
 
 // ─── Client subscription and headers ─────────────────────────────────────────
@@ -339,17 +364,18 @@ fn client_subscription(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
             ctx.ui.notice(ui::warn(format!("Клиент «{name}» не найден.")));
             return Ok(());
         };
-        // v1 `tui_call sub host || true`: an unreadable host only hides the line.
+        // An unreadable host does not block the menu; it is not «not set».
         let host = ctx.call(&["subscription", "host"])?;
-        let host = if host.ok { host.data["node"].as_str().filter(|s| !s.is_empty()).map(str::to_owned) } else { None };
+        let host = host.ok.then(|| host.data["node"].as_str().filter(|s| !s.is_empty()).map(str::to_owned));
         let mut view = View::menu(format!("Подписка клиента: {name}"), vec![
             Item::new('p', "Опубликовать", ui::GREEN), Item::new('v', "Показать ссылку", ui::CYAN),
             Item::new('i', "Итоговые заголовки", ui::CYAN), Item::new('h', "Заголовки клиента", ui::YELLOW),
             Item::new('r', "Сменить токен", ui::RED), Item::new('x', "Отозвать подписку", ui::RED), back(),
         ]);
         view.context.push(match &host {
-            Some(node) => ui::text(format!("Хост подписок: {node}"), ui::NC),
-            None => ui::text("Хост подписок не задан — раздел s", ui::DIM),
+            Some(Some(node)) => ui::text(format!("Хост подписок: {node}"), ui::NC),
+            Some(None) => ui::text("Хост подписок не задан — раздел s", ui::DIM),
+            None => ui::text("Хост подписок: не удалось прочитать", ui::YELLOW),
         });
         view.context.push(ui::text(format!("Подписка: {}", subscription_state(&row)), ui::NC));
         let Some(choice) = ctx.choose(&view)? else { return Ok(()); };
@@ -537,20 +563,21 @@ fn group_connections(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
             text(&nodes[i]["name"]).to_owned()
         }
     };
-    let Some(found) = node_request(ctx, &node, &["conn", "list", "--name", &node, "--discover"])? else { return Ok(()); };
+    let Some((found, discovered)) = node_connections(ctx, &node)? else { return Ok(()); };
     let current: Vec<String> = rows(&found[0]["groups"]).iter().filter(|g| g["name"] == name).flat_map(|g| strings(&g["proxies"])).collect();
-    let discovered = strings(&found[0]["discovered"]);
-    let (extra, stale) = crate::nodes::unlisted(&current, &discovered);
-    let proxies: Vec<String> = discovered.into_iter().chain(extra).collect();
+    let (extra, stale) = crate::nodes::unlisted(&current, discovered.as_deref());
+    let proxies: Vec<String> = discovered.unwrap_or_default().into_iter().chain(extra).collect();
     let labels: Vec<String> = proxies.iter().map(|p| crate::nodes::proxy_label(p, &stale)).collect();
-    let flags = proxies.iter().map(|p| current.contains(p)).collect();
-    let Some(selected) = ctx.toggle(&format!("Подключения группы {name} на {node}"), &labels, flags, EMPTY)? else { return Ok(()); };
-    let chosen: Vec<String> = selected.into_iter().map(|i| proxies[i].clone()).collect();
-    if crate::nodes::same_set(&chosen, &current) { ctx.ui.notice(ui::warn("Изменений нет.")); return Ok(()); }
-    let words = crate::nodes::conn_set_argv(&node, &[(name, &chosen)]);
-    let words: Vec<&str> = words.iter().map(String::as_str).collect();
-    execute(ctx, &words)?;
-    Ok(())
+    let mut flags = proxies.iter().map(|p| current.contains(p)).collect();
+    loop {
+        let Some(selected) = ctx.toggle(&format!("Подключения группы {name} на {node}"), &labels, flags, EMPTY)? else { return Ok(()); };
+        let chosen: Vec<String> = selected.iter().map(|&i| proxies[i].clone()).collect();
+        if crate::nodes::same_set(&chosen, &current) { ctx.ui.notice(ui::warn("Изменений нет.")); return Ok(()); }
+        let words = crate::nodes::conn_set_argv(&node, &[(name, &chosen)]);
+        let words: Vec<&str> = words.iter().map(String::as_str).collect();
+        if !crate::confirm::retryable(&execute(ctx, &words)?) { return Ok(()); }
+        flags = checked(labels.len(), &selected);
+    }
 }
 fn group_template(ctx: &mut Context<'_>, name: &str, current: &str) -> io::Result<()> {
     let Some(data) = fetch(ctx, &["template", "list"])? else { return Ok(()); };
@@ -727,16 +754,19 @@ fn template_groups(ctx: &mut Context<'_>, name: &str, current: &[String]) -> io:
     let mut groups = names(&data);
     let default = name == "default.yaml";
     if default { groups.retain(|g| !current.contains(g)); }
-    let flags = groups.iter().map(|g| current.contains(g)).collect();
+    let mut flags = groups.iter().map(|g| current.contains(g)).collect();
     let title = if default { format!("Назначить шаблон {name} группам") } else { format!("Группы шаблона: {name}") };
-    let Some(selected) = ctx.toggle(&title, &groups, flags, EMPTY)? else { return Ok(()); };
-    let mut words = vec!["template", "groups", "--name", name];
-    for i in selected { words.extend(["--group", groups[i].as_str()]); }
-    let reply = confirmed(ctx, "Группы шаблона", "Применить?", &words)?;
-    if reply.ok && strings(&reply.data["assigned"]).is_empty() && strings(&reply.data["reset"]).is_empty() {
-        ctx.ui.notice(ui::text("Изменений нет.", ui::DIM));
+    loop {
+        let Some(selected) = ctx.toggle(&title, &groups, flags, EMPTY)? else { return Ok(()); };
+        let mut words = vec!["template", "groups", "--name", name];
+        for &i in &selected { words.extend(["--group", groups[i].as_str()]); }
+        let reply = confirmed(ctx, "Группы шаблона", "Применить?", &words)?;
+        if reply.ok && strings(&reply.data["assigned"]).is_empty() && strings(&reply.data["reset"]).is_empty() {
+            ctx.ui.notice(ui::text("Изменений нет.", ui::DIM));
+        }
+        if !crate::confirm::retryable(&reply) { return Ok(()); }
+        flags = checked(groups.len(), &selected);
     }
-    Ok(())
 }
 fn executable(name: &str) -> bool {
     env::var_os("PATH").is_some_and(|path| env::split_paths(&path).any(|dir| {
@@ -1207,6 +1237,11 @@ mod tests {
             ok(&["client", "list"], published), ok(&["subscription", "host"], Value::Null)], &["p", "0", "0"], |ctx| client_subscription(ctx, "alice"));
         assert!(view(&ui, "Срок действия подписки").sections[0][0].label.starts_with("Оставить текущий срок"));
         assert!(content(&ui.views[0]).contains("Хост подписок не задан"));
+        // A failed read is not «not set».
+        let (_, ui) = drive(vec![ok(&["client", "list"], alice(true)), step(&["subscription", "host"], Reply::failure("locked"))],
+            &["0"], |ctx| client_subscription(ctx, "alice"));
+        let shown = content(&ui.views[0]);
+        assert!(shown.contains("Хост подписок: не удалось прочитать") && !shown.contains("не задан"), "{shown}");
     }
     #[test]
     fn failed_publish_shows_no_bundle() {
@@ -1356,6 +1391,24 @@ mod tests {
         let (core, ui) = drive(vec![ok(&["node", "list"], json!([]))], &[], |ctx| group_connections(ctx, "PC"));
         core.assert_finished();
         assert!(ui.notices.iter().any(|n| n.to_string().contains("Нет нод")));
+    }
+    #[test]
+    fn group_connections_fall_back_to_saved_assignments_and_keep_the_choice_on_failure() {
+        let node = json!([{"name":"ru","ip":"5.6.7.8","port":22}]);
+        let saved = json!([{"node":"ru","groups":[{"name":"PC","proxies":["p1"]}]}]);
+        let unset = ["conn", "set", "--name", "ru", "--assign", "PC="];
+        // Discovery fails (reported): the saved assignment is listed, not as
+        // «not found», and can be removed; a failed save reopens the toggle
+        // with the choice kept.
+        let (core, ui) = drive(vec![
+            ok(&["node", "list"], node), step(&["conn", "list", "--name", "ru", "--discover"], fail("remote_failed", json!({}))),
+            ok(&["conn", "list", "--name", "ru"], saved),
+            step(&unset, fail("locked", json!({}))), ok(&unset, json!({"node":"ru","changed":[{"group":"PC","proxies":[]}]})),
+        ], &["1", "", ""], |ctx| group_connections(ctx, "PC"));
+        core.assert_finished();
+        assert_eq!(ui.views[0].sections[0][0].label, "[x] p1");
+        assert_eq!(ui.views[1].sections[0][0].label, "[ ] p1");
+        assert!(ui.notices.iter().any(|n| n.to_string().contains("сохранённые назначения")));
     }
     #[test]
     fn group_new_template_choice_creates_bound_template_then_opens_editor() {

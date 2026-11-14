@@ -105,6 +105,10 @@ static COMPILED: LazyLock<std::result::Result<Schema, String>> = LazyLock::new(|
 ///    alternative form: a number for `string`, a string for the others.
 /// 2. `proxy-groups` `groupbase/allOf/0`: `required: [name, type]` next to
 ///    `$ref` is ignored in draft-07; the `$ref` moves into an `allOf`.
+/// 3. `listeners/items/anyOf/*/allOf/0`: the branch tells its kind by
+///    `properties.type.const` without requiring `type`, so an item without
+///    `type` (mihomo: `missing type`) passes as a `socks` one; `type` becomes
+///    required.
 fn patch(schema: &mut Value) -> std::result::Result<(), String> {
     const COMPATIBLE: &str = "/definitions/proxies/definitions/shadowsocksr/definitions/compatible";
     const GROUPBASE: &str = "/definitions/proxy-groups/definitions/load-balance/definitions/groupbase/allOf/0";
@@ -119,6 +123,17 @@ fn patch(schema: &mut Value) -> std::result::Result<(), String> {
         .ok_or_else(|| format!("исправление схемы: нет {GROUPBASE} с $ref и required"))?;
     let reference = base.remove("$ref").unwrap_or_default();
     base.insert("allOf".into(), serde_json::json!([{"$ref": reference}]));
+    const LISTENERS: &str = "/definitions/listeners/items/anyOf";
+    let branches = schema.pointer_mut(LISTENERS).and_then(Value::as_array_mut)
+        .filter(|branches| !branches.is_empty())
+        .ok_or_else(|| format!("исправление схемы: нет {LISTENERS}"))?;
+    for (index, branch) in branches.iter_mut().enumerate() {
+        let kind = branch.pointer_mut("/allOf/0").and_then(Value::as_object_mut)
+            .filter(|kind| kind.get("properties").and_then(|p| p.get("type")).is_some_and(|t| t.get("const").is_some())
+                && !kind.contains_key("required"))
+            .ok_or_else(|| format!("исправление схемы: нет {LISTENERS}/{index}/allOf/0 с properties.type.const без required"))?;
+        kind.insert("required".into(), serde_json::json!(["type"]));
+    }
     Ok(())
 }
 
@@ -234,6 +249,10 @@ pub fn check(content: &str, groups: &[String]) -> Report {
                 list
             }
         };
+        // A problem of a group variant may keep a copy of its tag (`merge`),
+        // as the variant does: charged before they are made.
+        let tag_bytes = tag.as_ref().map_or(0, |tag| tag.len().saturating_mul(list.len().saturating_add(1)));
+        if !budget.charge(0, tag_bytes) { break; }
         variants.push(Variant { tag, dropped });
         found.push(list);
     }
@@ -1048,6 +1067,25 @@ mod tests {
     }
 
     #[test]
+    fn copies_of_a_long_variant_tag_are_charged_to_the_byte_budget() {
+        // Under 1 MiB of text: a 400 KiB group name in two markers around
+        // 200 wrong groups — 200 copies of the name would be ~80 MiB.
+        let wrong = |count: usize| -> String { (0..count).map(|i| format!("  - {{name: g{i}, type: bogus}}\n")).collect() };
+        let tag = "G".repeat(400 * 1024);
+        let content = format!("proxies:\n# --- {tag} ---\nproxy-groups:\n{}# --- {tag} ---\n", wrong(LIMIT));
+        assert!(content.len() < crate::request_input::Input::MAX_VALUE);
+        let report = check(&content, std::slice::from_ref(&tag));
+        assert!(report.truncated && codes(&report).iter().any(|(_, code, _)| *code == "check_limit"), "{:?}", codes(&report));
+        let copies = report.problems.iter().filter(|p| p.variant.as_deref() == Some(tag.as_str())).count()
+            + report.variants.iter().filter(|v| v.tag.as_deref() == Some(tag.as_str())).count();
+        assert!(copies * tag.len() <= BYTE_BUDGET, "{copies}");
+        // A short tag keeps every problem of its variant.
+        let report = check(&format!("proxies:\n# --- PC ---\nproxy-groups:\n{}# --- PC ---\n", wrong(10)), &groups());
+        assert!(!report.truncated && report.problems.len() == 10
+            && report.problems.iter().all(|p| p.variant.as_deref() == Some("PC")), "{:?}", codes(&report));
+    }
+
+    #[test]
     fn a_large_list_is_validated_item_by_item_with_source_positions() {
         let bad = 437;
         let content: String = std::iter::once("proxies:\nproxy-groups:\n".to_owned())
@@ -1171,6 +1209,9 @@ mod tests {
             assert_eq!(schema(&format!("proxies:\nproxy-groups:\n  - {group}\n")), [Some("/proxy-groups/0".to_owned())], "{group}");
         }
         assert!(schema("proxies:\nproxy-groups:\n  - {name: g, type: select, proxies: [DIRECT]}\n").is_empty());
+        // A listener without `type` (mihomo: `missing type`).
+        assert_eq!(schema("proxies:\nlisteners:\n  - name: inbound\n    port: 1080\n"), [Some("/listeners/0".to_owned())]);
+        assert!(schema("proxies:\nlisteners:\n  - {name: inbound, type: socks, port: 1080}\n").is_empty());
     }
 
     #[test]

@@ -3,7 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  settleDraft, unsavedChanges, saveTemplate, importTemplateFile, deleteLabel, deleteTemplate, editTemplateGroups, checkRunner,
+  settleDraft, draftDirty, unsavedChanges, saveTemplate, importTemplateFile, deleteLabel, deleteTemplate, editTemplateGroups, checkRunner,
   createTemplate, exportTemplate, offerLostDraft, confirmLeave, GROUPS_UNCHANGED, DRAFT_REPLACED,
 } from '../assets/js/screens/templates-model.js';
 import { TEMPLATE_FILE_UNREADABLE, DEFAULT_GROUP_HINT, DEFAULT_TEMPLATE } from '../assets/js/screens/catalog-model.js';
@@ -135,6 +135,23 @@ test('группы: пустой выбор сбрасывает все, без 
   const failed = fakeCtx({ replies: [{ ok: false, error: { code: 'failed' } }] });
   assert.equal(await editTemplateGroups(failed, 'm.yaml'), false);
   assert.deepEqual(failed.calls.at(-1), ['failed']);
+
+  // Сбой команды открывает выбор снова с отмеченным; отказ от плана — нет.
+  const retried = fakeCtx({ replies: [groups, { ok: false, error: { code: 'locked' } }, { ok: true, data: { assigned: ['TV'], reset: [] } }],
+    answers: [{ groups: ['PC', 'TV'] }, { groups: ['PC', 'TV'] }] });
+  assert.equal(await editTemplateGroups(retried, 'm.yaml'), true);
+  assert.deepEqual(retried.calls.map((call) => call[0]), ['request', 'form', 'run', 'failed', 'form', 'run']);
+  assert.deepEqual(retried.calls[4][1].fields[0].value, ['PC', 'TV']);
+  const declined = fakeCtx({ replies: [groups, PLAN], answers: [{ groups: ['TV'] }] });
+  assert.equal(await editTemplateGroups(declined, 'm.yaml'), false);
+  assert.deepEqual(declined.calls.map((call) => call[0]), ['request', 'form', 'run']);
+});
+
+test('черновик отличается от сохранённого текста', () => {
+  assert.equal(draftDirty(null, 'A'), false);
+  assert.equal(draftDirty('A', 'A'), false);
+  assert.equal(draftDirty('B', 'A'), true);
+  assert.equal(draftDirty('B', null), true);
 });
 
 test('очередь проверок: один запрос, из ожидающих — последний, устаревший ответ не доставляется', async () => {

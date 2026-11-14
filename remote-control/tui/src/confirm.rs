@@ -19,6 +19,9 @@ pub fn set_flag(argv: &mut Vec<String>, flag: &str, value: Option<&str>) {
 }
 /// Drop a boolean flag set earlier, so a changed answer is not left behind.
 pub fn clear_flag(argv: &mut Vec<String>, flag: &str) { argv.retain(|s| s != flag); }
+/// The command failed without changes (not a declined or unstable plan, not
+/// `partial`): a form that sent it reopens with the user's choice for a retry.
+pub fn retryable(reply: &Reply) -> bool { !reply.ok && !matches!(reply.code(), "confirmation_required" | "plan_changed" | "partial") }
 /// Refusal returns the last (unsuccessful) reply, without sending a mutation.
 /// `--force` is valid only inside this helper: the first call obtains its plan.
 /// Like v1 `tui_run_confirmed`, a plan that changes more than twice stops.

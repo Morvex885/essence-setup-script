@@ -251,6 +251,20 @@ test('усиление SSH: порт проверяется полем форм�
   s.done();
 });
 
+test('усиление SSH: порт, занятый между планом и подтверждением, спрашивается снова', async () => {
+  const chosen = ['node', 'harden', '--name', 'n', '--port', '2222'];
+  const auto = ['node', 'harden', '--name', 'n'];
+  const planned = (token) => fail('confirmation_required', { plan: ['x'], plan_token: token });
+  const s = scripted([
+    [chosen, planned('one')], [[...chosen, '--yes', '--plan-token', 'one'], fail('port_in_use', { port: 2222 })],
+    [auto, planned('two')],
+  ], [{ port: '2222' }, true, { port: '' }, false]);
+  await model.harden(s.ctx, 'n');
+  assert.deepEqual(s.record.dialogs.map((d) => d.kind), ['form', 'confirm', 'form', 'confirm']);
+  assert.equal(s.record.failed, 0);
+  s.done();
+});
+
 test('псевдонимы: чтение через nodeRequest, запись только изменённых, отмена — без записи', async () => {
   const entries = [{ proxy: 'p1', alias: 'old' }, { proxy: 'p2', alias: '' }];
   const read = [['node', 'aliases', '--name', 'n'], ok(entries)];

@@ -155,15 +155,18 @@ export function pushSnack(snacks, snack, limit) {
 /**
  * Назначенные подключения, которых нет среди найденных на ноде (`conn.rs::purge`):
  * клиенты AmneziaWG `awg-<клиент>` при найденном `AWG` не отмечаются — поиск их не перечисляет.
+ * `discovered` `null` — нода не прочитана: «не найдено» не отмечается ни одно.
  */
 export function unlisted(assignedProxies, discovered) {
-  const awg = discovered.includes('AWG');
+  const found = discovered || [];
+  const awg = found.includes('AWG');
   const result = [];
   for (const proxy of assignedProxies) {
-    if (discovered.includes(proxy) || result.includes(proxy)) continue;
+    if (found.includes(proxy) || result.includes(proxy)) continue;
     result.push(proxy);
   }
-  return { extra: result, stale: result.filter((proxy) => !(awg && proxy.startsWith('awg-'))) };
+  const stale = discovered === null || discovered === undefined ? [] : result.filter((proxy) => !(awg && proxy.startsWith('awg-')));
+  return { extra: result, stale };
 }
 
 /** Подпись подключения в формах: не найденное на ноде отмечено. */

@@ -384,14 +384,19 @@ fn harden(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
     let Some(port) = ask(ctx, TITLE, PORT)? else { return Ok(()); };
     let mut words = harden_words(&port);
     loop {
-        let reply = ctx.request(&words, &Secrets::default())?;
         let explicit = words.iter().any(|word| word == "--port");
-        if reply.code() == "port_in_use" || (explicit && reply.code() == "invalid") {
+        let asks_port = |reply: &Reply| reply.code() == "port_in_use" || (explicit && reply.code() == "invalid");
+        let reply = ctx.request(&words, &Secrets::default())?;
+        // The port may be taken before the plan and between the plan and
+        // the confirmed run (the core refuses before any change): asked again.
+        let reply = if asks_port(&reply) { reply } else {
+            confirm::review_reply(ctx, TITLE, "Усилить защиту SSH?", &words, &Secrets::default(), reply, Some(2))?
+        };
+        if asks_port(&reply) {
             let Some(port) = ask(ctx, TITLE, PORT)? else { return Ok(()); };
             words = harden_words(&port);
             continue;
         }
-        let reply = confirm::review_reply(ctx, TITLE, "Усилить защиту SSH?", &words, &Secrets::default(), reply, Some(2))?;
         if reply.ok { return Ok(()); }
         if reply.code() == "hardening_failed" {
             if reply.error["console_required"] == true { ctx.ui.notice(ui::warn("Проверьте доступ через консоль провайдера.")); }
@@ -497,9 +502,11 @@ impl Screen for Connections {
             if refresh {
                 refresh = false;
                 let reply = ctx.call(&["conn", "sync"])?;
+                // A failed sync (reported) still shows the saved assignments:
+                // a node may be opened to edit them without SSH.
                 synced = if reply.ok { reply.data } else if reply.code() == "partial" { reply.error } else {
                     outcome(ctx, &reply);
-                    return Ok(Navigation::Back);
+                    Value::Null
                 };
             }
             let reply = ctx.call(&["conn", "list"])?;
@@ -509,6 +516,7 @@ impl Screen for Connections {
             }
             let mut view = View::new("Подключения нод");
             view.prompt = "Выберите действие: ".into();
+            if synced.is_null() { view.context.push(ui::text("Ноды не синхронизированы: подключения не проверены", ui::YELLOW)); }
             if rows(&reply.data).is_empty() { view.context.push(ui::text("Нет нод", ui::DIM)); }
             let mut items = vec![];
             for (i, entry) in rows(&reply.data).iter().enumerate() {
@@ -563,8 +571,11 @@ fn connection_node(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
                     ctx.failed();
                 }
             } else {
-                if reply.code() != "not_found" { outcome(ctx, &reply); }
-                return Ok(());
+                if reply.code() == "not_found" { return Ok(()); }
+                // A failed sync (reported) still shows the saved assignments,
+                // unchecked: they can be edited without SSH.
+                outcome(ctx, &reply);
+                state = Value::Null;
             }
         }
         let listed = ctx.request(&argv(&["conn", "list", "--name", name]), &Secrets::default())?;
@@ -573,9 +584,11 @@ fn connection_node(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
             return Ok(());
         }
         let groups = rows(&listed.data).iter().find(|entry| entry["node"] == name).map(|entry| rows(&entry["groups"])).unwrap_or(&[]);
-        let proxies: Vec<String> = rows(&state["discovered"]).iter().map(text).collect();
+        // `None` — the node was not read (the sync failed): nothing is «not found».
+        let discovered: Option<Vec<String>> = state["discovered"].as_array().map(|list| list.iter().map(text).collect());
+        let proxies: Vec<String> = discovered.clone().unwrap_or_default();
         let all: Vec<String> = groups.iter().flat_map(|g| rows(&g["proxies"]).iter().map(text)).collect();
-        let (extra, stale) = unlisted(&all, &proxies);
+        let (extra, stale) = unlisted(&all, discovered.as_deref());
         let shown: Vec<String> = proxies.iter().chain(&extra).cloned().collect();
         let assigned: Vec<Vec<String>> = shown.iter()
             .map(|proxy| groups.iter().filter(|g| rows(&g["proxies"]).iter().any(|p| p == proxy)).map(|g| text(&g["name"])).collect())
@@ -586,6 +599,8 @@ fn connection_node(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
         ]);
         if let Some(problem) = sync_problem(&state["status"]) {
             view.context.push(ui::text(format!("Нода {problem}"), ui::YELLOW));
+        } else if discovered.is_none() {
+            view.context.push(ui::text("Подключения ноды не проверены", ui::YELLOW));
         } else if proxies.is_empty() {
             view.context.push(ui::text("Подключения не найдены", ui::DIM));
         }
@@ -594,7 +609,7 @@ fn connection_node(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
         }
         let Some(choice) = ctx.choose(&view)? else { return Ok(()); };
         match choice.as_str() {
-            "b" | "B" => assign_connections(ctx, name, &proxies, groups)?,
+            "b" | "B" => assign_connections(ctx, name, discovered.as_deref(), groups)?,
             "l" | "L" => aliases(ctx, name)?,
             "s" | "S" => { refresh = true; resolve = true; }
             "0" => return Ok(()),
@@ -607,8 +622,9 @@ fn connection_node(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
 /// toggle of every group, preselected with its current groups. Edits stay
 /// local: «Сохранить» sends one `conn set` with an `--assign` for each group
 /// whose proxy set changed (others are not sent: a stale form must not undo
-/// concurrent changes), nothing changed — no command; `0`/EOF discards.
-fn assign_connections(ctx: &mut Context<'_>, name: &str, discovered: &[String], current: &[Value]) -> io::Result<()> {
+/// concurrent changes), nothing changed — no command; a failed `conn set`
+/// (e.g. `locked`) keeps the editor and its edits for a retry; `0`/EOF discards.
+fn assign_connections(ctx: &mut Context<'_>, name: &str, discovered: Option<&[String]>, current: &[Value]) -> io::Result<()> {
     let listed = ctx.call(&["group", "list"])?;
     if !listed.ok { outcome(ctx, &listed); return Ok(()); }
     let groups = names(&listed.data);
@@ -626,9 +642,9 @@ fn assign_connections(ctx: &mut Context<'_>, name: &str, discovered: &[String], 
         .collect();
     let all: Vec<String> = assignment.iter().flatten().cloned().collect();
     let (extra, stale) = unlisted(&all, discovered);
-    let mut proxies = discovered.to_vec();
+    let mut proxies = discovered.unwrap_or_default().to_vec();
     proxies.extend(extra);
-    if proxies.is_empty() { ctx.ui.notice(ui::warn("Подключения не найдены: синхронизируйте ноду.")); return Ok(()); }
+    if proxies.is_empty() { ctx.ui.notice(ui::warn("Нет подключений для назначения: синхронизируйте ноду.")); return Ok(()); }
     let saved = assignment.clone();
     loop {
         let mut view = View::new(format!("Назначение подключений: {name}"));
@@ -651,7 +667,7 @@ fn assign_connections(ctx: &mut Context<'_>, name: &str, discovered: &[String], 
                 if changed.is_empty() { ctx.ui.notice(ui::warn("Изменений нет.")); return Ok(()); }
                 let reply = ctx.request(&conn_set_argv(name, &changed), &Secrets::default())?;
                 outcome(ctx, &reply);
-                return Ok(());
+                if !confirm::retryable(&reply) { return Ok(()); }
             }
             _ => match index(&choice, proxies.len()) {
                 Some(i) => {
@@ -677,15 +693,17 @@ pub(crate) fn same_set(a: &[String], b: &[String]) -> bool {
 }
 /// Assigned proxies the node did not report (unique, in order) and the
 /// stale ones among them: AmneziaWG peers `awg-<peer>` are not stale while
-/// the node reports `AWG` (discovery does not list peers). Forms list the
+/// the node reports `AWG` (discovery does not list peers); `discovered`
+/// `None` — the node was not read: none is stale. Forms list the
 /// unreported ones after the discovered, checked, so sending keeps them.
-pub(crate) fn unlisted(assigned: &[String], discovered: &[String]) -> (Vec<String>, Vec<String>) {
-    let awg = discovered.iter().any(|name| name == "AWG");
+pub(crate) fn unlisted(assigned: &[String], discovered: Option<&[String]>) -> (Vec<String>, Vec<String>) {
+    let found = discovered.unwrap_or_default();
+    let awg = found.iter().any(|name| name == "AWG");
     let mut extra: Vec<String> = Vec::new();
     for proxy in assigned {
-        if !discovered.contains(proxy) && !extra.contains(proxy) { extra.push(proxy.clone()); }
+        if !found.contains(proxy) && !extra.contains(proxy) { extra.push(proxy.clone()); }
     }
-    let stale = extra.iter().filter(|proxy| !(awg && proxy.starts_with("awg-"))).cloned().collect();
+    let stale = if discovered.is_none() { Vec::new() } else { extra.iter().filter(|proxy| !(awg && proxy.starts_with("awg-"))).cloned().collect() };
     (extra, stale)
 }
 /// A proxy in forms: one not found on the node is marked.
@@ -809,18 +827,25 @@ fn telegram_table(ctx: &mut Context<'_>, reply: &Reply) -> io::Result<bool> {
     }
 }
 /// v1 `_tui_telegram_batch`: unchecked node toggles → one `--name` per node →
-/// the core's frozen plan → results table.
-fn telegram_batch(ctx: &mut Context<'_>, title: &str, mut words: Vec<String>) -> io::Result<()> {
+/// the core's frozen plan → results table. A failed command (no results)
+/// reopens the toggle with the same nodes checked.
+fn telegram_batch(ctx: &mut Context<'_>, title: &str, words: Vec<String>) -> io::Result<()> {
     let listed = ctx.call(&["node", "list"])?;
     if !listed.ok { outcome(ctx, &listed); return Ok(()); }
     let nodes = names(&listed.data);
     let labels: Vec<String> = rows(&listed.data).iter().map(node_label).collect();
-    let Some(selected) = ctx.toggle(title, &labels, vec![], EMPTY)? else { return Ok(()); };
-    if selected.is_empty() { ctx.ui.notice(ui::warn("Ничего не выбрано.")); return Ok(()); }
-    for i in selected { words.extend(argv(&["--name", &nodes[i]])); }
-    let reply = confirm::run_confirmed(ctx, title, "Выполнить?", &words, &Secrets::default())?;
-    if !telegram_table(ctx, &reply)? { outcome(ctx, &reply); }
-    Ok(())
+    let mut flags = vec![];
+    loop {
+        let Some(selected) = ctx.toggle(title, &labels, flags, EMPTY)? else { return Ok(()); };
+        if selected.is_empty() { ctx.ui.notice(ui::warn("Ничего не выбрано.")); return Ok(()); }
+        let mut command = words.clone();
+        for &i in &selected { command.extend(argv(&["--name", &nodes[i]])); }
+        let reply = confirm::run_confirmed(ctx, title, "Выполнить?", &command, &Secrets::default())?;
+        if telegram_table(ctx, &reply)? { return Ok(()); }
+        outcome(ctx, &reply);
+        if !confirm::retryable(&reply) { return Ok(()); }
+        flags = (0..labels.len()).map(|i| selected.contains(&i)).collect();
+    }
 }
 impl Screen for Telegram {
     fn run(&mut self, ctx: &mut Context<'_>) -> io::Result<Navigation> {
@@ -1142,6 +1167,14 @@ mod tests {
             (auto.clone(), plan("confirmation_required", "one")),
         ], &["2222", "abc", "", "n"], |ctx| harden(ctx, "n"));
         assert_eq!(confirms(&ui), 1);
+        // The port taken between the plan and the confirmed run: asked again.
+        let chosen = argv(&["node", "harden", "--name", "n", "--port", "2222"]);
+        let (_, _, ui) = run(vec![
+            (chosen.clone(), plan("confirmation_required", "one")), (with_yes(&chosen, "one"), err("port_in_use", json!({"port": 2222}))),
+            (auto.clone(), plan("confirmation_required", "two")),
+        ], &["2222", "y", "", "n"], |ctx| harden(ctx, "n"));
+        assert_eq!(confirms(&ui), 2);
+        assert!(ui.notices.is_empty(), "{:?}", ui.notices);
         // Without an explicit port, `invalid` is the core's verdict, not a port question.
         let (_, _, ui) = run(vec![(auto.clone(), Reply::failure("invalid"))], &[""], |ctx| harden(ctx, "n"));
         assert_eq!(ui.notices.len(), 1);
@@ -1283,8 +1316,12 @@ mod tests {
                 step(&["conn", "sync"], ok(json!({"nodes": []}))), step(&["conn", "list"], ok(json!([]))),
             ]);
         }
-        let (_, ui) = screen(&mut Connections, &[], vec![step(&["conn", "sync"], Reply::failure("locked"))]);
+        // A failed sync is reported; the saved assignments are still shown.
+        let (_, ui) = screen(&mut Connections, &["0"], vec![step(&["conn", "sync"], Reply::failure("locked")),
+            step(&["conn", "list"], ok(json!([{"node": "a", "groups": [{"name": "G", "proxies": ["p"]}]}])))]);
         assert_eq!(ui.notices.len(), 1);
+        assert!(ui.views[0].context.iter().any(|l| l.to_string().contains("не проверены")), "{:?}", ui.views[0].context);
+        assert!(ui.views[0].context.iter().any(|l| l.to_string() == "  G: 1/?"));
     }
     fn node_sync(discovered: Value) -> (Vec<String>, Reply) {
         step(&["conn", "sync", "--name", "n"], ok(json!({"nodes": [{"name": "n", "status": "synced", "discovered": discovered}]})))
@@ -1311,14 +1348,23 @@ mod tests {
             &["b", "1", "2", "", "1", "2", "", "s", "0"], |ctx| connection_node(ctx, "n"));
         assert!(noticed(&ui, "Изменений нет."));
         // Unreachable node: nothing discovered, an assigned proxy can still be removed.
-        let unreachable = step(&["conn", "sync", "--name", "n"], err("partial", json!({"nodes": [{"name": "n", "status": "unreachable", "error": "remote_failed"}]})));
-        run(vec![unreachable, node_list(), groups(),
+        let unreachable = || step(&["conn", "sync", "--name", "n"], err("partial", json!({"nodes": [{"name": "n", "status": "unreachable", "error": "remote_failed"}]})));
+        let (_, _, ui) = run(vec![unreachable(), node_list(), groups(),
             step(&["conn", "set", "--name", "n", "--assign", "old="], ok(json!({"node": "n", "changed": []}))), node_list()],
             &["b", "1", "1", "", "s", "0"], |ctx| connection_node(ctx, "n"));
+        // (not read is not «not found»)
+        assert!(ui.views[0].context.iter().any(|l| l.to_string() == "p1  [old]"), "{:?}", ui.views[0].context);
+        assert_eq!(ui.views[1].sections[0][0].label, "p1  [old]");
+        // A failed save keeps the editor and the edits: «s» again retries them.
+        let set = || argv(&["conn", "set", "--name", "n", "--assign", "old="]);
+        let (_, _, ui) = run(vec![unreachable(), node_list(), groups(), (set(), Reply::failure("locked")),
+            (set(), ok(json!({"node": "n", "changed": []}))), node_list()],
+            &["b", "1", "1", "", "s", "s", "0"], |ctx| connection_node(ctx, "n"));
+        assert_eq!(ui.views[4].sections[0][0].label, "p1  []", "{:?}", ui.views[4]);
         // No proxies at all: nothing to edit.
         let empty = step(&["conn", "list", "--name", "n"], ok(json!([{"node": "n", "groups": []}])));
         let (_, _, ui) = run(vec![node_sync(json!([])), empty.clone(), groups(), empty], &["b", "0"], |ctx| connection_node(ctx, "n"));
-        assert!(noticed(&ui, "Подключения не найдены: синхронизируйте ноду."));
+        assert!(noticed(&ui, "Нет подключений для назначения: синхронизируйте ноду."));
     }
     #[test]
     fn connection_assignment_merges_entries_of_a_group_and_keeps_commas() {
@@ -1343,6 +1389,11 @@ mod tests {
         }
         let (_, _, ui) = run(vec![step(&["conn", "sync", "--name", "n"], Reply::failure("not_found"))], &[], |ctx| connection_node(ctx, "n"));
         assert!(ui.views.is_empty() && ui.notices.is_empty());
+        // A failed sync is reported; the saved assignments stay, unchecked.
+        let (_, _, ui) = run(vec![step(&["conn", "sync", "--name", "n"], Reply::failure("locked")), node_list()], &["0"], |ctx| connection_node(ctx, "n"));
+        assert_eq!(ui.notices.len(), 1);
+        let shown: Vec<String> = ui.views[0].context.iter().map(|l| l.to_string()).collect();
+        assert!(shown.iter().any(|l| l == "Подключения ноды не проверены") && shown.iter().any(|l| l == "p1  [old]"), "{shown:?}");
     }
     #[test]
     fn partial_node_sync_stays_and_resolves_node_codes_through_check() {
@@ -1440,8 +1491,16 @@ mod tests {
         screen(&mut Telegram, &["i", "1", "0", "0"], vec![three_nodes()]);
         screen(&mut Telegram, &["d", "0", "0"], none());
         let words = argv(&["telegram", "install", "--name", "n1"]);
-        let (_, ui) = screen(&mut Telegram, &["i", "1", "", "n", "0"], vec![three_nodes(), (words, plan("confirmation_required", "tg"))]);
+        let (_, ui) = screen(&mut Telegram, &["i", "1", "", "n", "0"], vec![three_nodes(), (words.clone(), plan("confirmation_required", "tg"))]);
         assert!(ui.notices.is_empty());
+        // A failed command (no results) reopens the toggle with the nodes kept.
+        let (_, ui) = screen(&mut Telegram, &["i", "1", "", "y", "0", "0"], vec![
+            three_nodes(), (words.clone(), plan("confirmation_required", "tg")), (with_yes(&words, "tg"), Reply::failure("locked")),
+        ]);
+        // (toggle frames and the plan review share the title; the last one is the reopened toggle)
+        let reopened = ui.views.iter().rev().find(|v| v.title == ui.views[1].title).unwrap();
+        assert!(reopened.sections[0][0].label.starts_with("[x]") && reopened.sections[0][1].label.starts_with("[ ]"), "{reopened:?}");
+        assert_eq!(ui.notices.len(), 1, "the failure is reported once");
     }
     #[test]
     fn telegram_results_table_labels_and_colours_every_row() {

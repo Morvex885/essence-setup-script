@@ -129,10 +129,15 @@ test('подключения ноды: группы подключений и п
   assert.deepEqual(view.assigned, [['old', 'x'], []]);
   assert.deepEqual(view.table.map((row) => [row.proxy, row.groups, row.stale]), [['p1', ['old', 'x'], false], ['p2', [], false]]);
   assert.equal(view.problem, null);
-  // Нода недоступна: назначенные подключения остаются в списке как не найденные — их можно снять.
+  assert.equal(view.checked, true);
+  // Нода недоступна: назначенные подключения остаются в списке — их можно
+  // снять, — но не отмечены «не найдено»: нода не прочитана.
   const problem = connectionView(listed, { name: 'n', status: 'unreachable', discovered: null }, 'n');
   assert.equal(problem.problem, 'недоступна');
-  assert.deepEqual([problem.proxies, problem.stale, problem.assigned], [['p1'], ['p1'], [['old', 'x']]]);
+  assert.deepEqual([problem.proxies, problem.stale, problem.assigned, problem.checked], [['p1'], [], [['old', 'x']], false]);
+  // Синхронизация не удалась целиком (строки ноды нет): то же, без проблемы.
+  const unsynced = connectionView(listed, null, 'n');
+  assert.deepEqual([unsynced.problem, unsynced.proxies, unsynced.stale, unsynced.checked], [null, ['p1'], [], false]);
   // Клиент AmneziaWG при найденном AWG — не «не найдено», но в списке и отмечен: смена p1 его сохраняет.
   const awg = connectionView([{ node: 'n', groups: [{ name: 'PC', proxies: ['AWG', 'awg-alice'] }] }],
     { status: 'synced', discovered: ['AWG', 'p1'] }, 'n');
@@ -217,9 +222,27 @@ test('assignConnections: отмена и форма без изменений н
   ({ ctx, record } = assignCtx([[['group', 'list'], err('locked')]], []));
   await assignConnections(ctx, 'n', ['p1'], [[]]);
   assert.deepEqual([record.forms.length, record.notices], [0, ['failed']]);
-  ({ ctx, record } = assignCtx([[['group', 'list'], ok([{ name: 'g' }])], [assignArgv('n', [['g', []]]), err('locked')]], [{ 'proxy-0': [] }]));
+  // Сбой записи (`locked`) открывает форму снова с отмеченным, сравнение — с исходным.
+  const set = assignArgv('n', [['g', []]]);
+  const steps = [[['group', 'list'], ok([{ name: 'g' }])], [set, err('locked')], [set, ok()]];
+  ({ ctx, record } = assignCtx(steps, [{ 'proxy-0': [] }, { 'proxy-0': [] }]));
   await assignConnections(ctx, 'n', ['p1'], [['g']]);
   assert.deepEqual(record.notices, ['failed']);
+  assert.deepEqual(record.forms.map((form) => field(form, 'proxy-0').value), [['g'], []]);
+  assert.equal(steps.length, 0);
+});
+
+test('telegramBatch: сбой без таблицы открывает форму снова с выбранными нодами', async () => {
+  const action = TELEGRAM_BATCH.find((item) => item.id === 'install');
+  const argv = telegramArgv(action.argv, ['de'], null);
+  const results = ok({ results: [{ node: 'de', code: 0, status: 'ok', reason: null }] });
+  const steps = [[['node', 'list'], ok([{ name: 'de' }, { name: 'nl' }])], [argv, err('locked')], [argv, results]];
+  const { ctx, record } = assignCtx(steps, [{ nodes: ['de'] }, { nodes: ['de'] }]);
+  ctx.runConfirmed = (_title, _question, words) => ctx.request(words);
+  const shown = [];
+  assert.equal(await telegramBatch(ctx, action, async (table) => shown.push(table)), true);
+  assert.deepEqual(record.forms.map((form) => field(form, 'nodes').value ?? null), [null, ['de']]);
+  assert.deepEqual([record.notices, shown.length, steps.length], [['failed'], 1, 0]);
 });
 
 test('assignConnections: группа, удалённая после чтения подключений, не снимается и не роняет запрос', async () => {
