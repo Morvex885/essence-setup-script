@@ -239,6 +239,13 @@ async fn host_requires_migration_with_published_tokens_and_reads_the_node() {
     assert_eq!((error.code, error.message.as_str()), ("not_installed", "На ноде «old» не установлен хостинг подписок."));
     assert_eq!(fingerprint(root.path()), before);
 
+    // A base URL with a path: refused, nothing written.
+    let hosts = Hosts::new(vec![vec![connect_step(1), conf_step(OLD_DIR, "https://old.example/path")]]);
+    let error = run(&mut session, &hosts, &["subscription", "host", "--name", "old"]).await.unwrap_err();
+    hosts.finish(&[]);
+    assert_eq!((error.code, error.message.as_str()), ("invalid", "Некорректный адрес хостинга подписок: https://old.example/path."));
+    assert_eq!(fingerprint(root.path()), before);
+
     // Same host: refreshes the cached settings from the node.
     let hosts = Hosts::new(vec![vec![connect_step(1), conf_step(OLD_DIR, "https://fresh.example")]]);
     let data = run(&mut session, &hosts, &["subscription", "host", "--name", "old"]).await.unwrap();
@@ -667,6 +674,15 @@ async fn migrate_plans_copies_switches_and_then_removes_old_links() {
     hosts.finish(&[&token]);
     assert_eq!((error.code, error.message.as_str()), ("remote_failed", "На новой ноде могли остаться копии подписок."));
     assert!(warned(&journal, "Перенос не завершён: старый хост и старые ссылки сохранены."));
+    assert_eq!(fingerprint(root.path()), before);
+
+    // A base URL with a path is refused before any remote change.
+    let hosts = Hosts::new(vec![vec![connect_step(1), conf_step(OLD_DIR, "https://old.example")],
+        vec![connect_step(2), conf_step(NEW_DIR, "https://new.example/path")]]);
+    let error = run(&mut session, &hosts, &["subscription", "migrate", "--name", "new", "--yes"]).await.unwrap_err();
+    hosts.finish(&[]);
+    assert_eq!((error.code, error.message.as_str(), error.extra["name"].as_str()),
+        ("invalid", "Некорректный адрес хостинга подписок: https://new.example/path.", Some("new")));
     assert_eq!(fingerprint(root.path()), before);
 
     // Local refusals before any connection.

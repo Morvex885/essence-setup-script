@@ -313,7 +313,8 @@ fn proxy_type(block: &str) -> Option<&str> {
 /// Proxies of one client from the nodes' client sections (v1
 /// `_fetch_proxies_for_client`): allowed connections, client credentials,
 /// AmneziaWG display name, aliases and tag. `None` when a node section is
-/// missing, a needed AmneziaWG peer was not created or credentials are invalid.
+/// missing, a selected connection (an AmneziaWG peer included) is not in its
+/// node's section or credentials are invalid.
 fn client_proxies(config: &Config, client: &Client, nodes: &[String], sections: &BTreeMap<String, String>,
     log: &mut dyn FnMut(Level, &str)) -> Option<String>
 {
@@ -335,43 +336,56 @@ fn client_proxies(config: &Config, client: &Client, nodes: &[String], sections: 
                 log(Level::Warn, &format!("{name}: подключение «{proxy}» на {node_name} отсутствует в группе {}", client.group));
             }
         }
-        let allowed = if own.is_empty() { group } else { own };
         let Some(remote) = sections.get(node_name) else {
             complete = false;
             continue;
         };
-        let mut section = proxy_section(remote);
-        if !allowed.is_empty() {
-            let mut filtered = String::new();
-            for connection in &allowed {
-                let awg = connection == "AWG";
-                let target = if awg { format!("awg-{name}") } else { connection.clone() };
-                let mut block = select_blocks(&section, &target);
-                if block.is_empty() {
-                    continue;
+        let section = proxy_section(remote);
+        // Without connections on the node the client takes every proxy of the
+        // section, as the node's listeners accept it on all of them.
+        let selected = !own.is_empty() || !group.is_empty();
+        let allowed = if !own.is_empty() {
+            own
+        } else if selected {
+            group
+        } else {
+            let mut every = Vec::new();
+            push_unique(&mut every, section.split('\n').filter(|line| line.starts_with(NAME_PREFIX)).map(|line| block_name(line).to_owned()));
+            every
+        };
+        let mut filtered = String::new();
+        for connection in &allowed {
+            let awg = connection == "AWG";
+            let target = if awg { format!("awg-{name}") } else { connection.clone() };
+            let mut block = select_blocks(&section, &target);
+            if block.is_empty() {
+                if selected {
+                    log(Level::Warn, &format!("{name}: подключения «{connection}» нет в профиле ноды {node_name} — выполните conn sync или измените назначение"));
+                    complete = false;
                 }
-                let kind = proxy_type(&block).map(str::to_owned);
-                match kind.as_deref() {
-                    Some("vless") => {
-                        if !uuid.is_empty() {
-                            block = set_field(&block, "uuid", uuid);
-                        }
-                        block = trim_newlines(&crate::protocols::vless_xhttp::normalize_proxy_yaml(&block)).to_owned();
-                    }
-                    Some("hysteria2") if !password.is_empty() => block = set_field(&block, "password", password),
-                    _ => {}
-                }
-                if awg {
-                    block = match block.split_once('\n') {
-                        Some((_, rest)) => format!("{AWG_DISPLAY}\n{}", trim_newlines(rest)),
-                        None => format!("{AWG_DISPLAY}\n"),
-                    };
-                }
-                filtered.push_str(&block);
-                filtered.push('\n');
+                continue;
             }
-            section = filtered;
+            let kind = proxy_type(&block).map(str::to_owned);
+            match kind.as_deref() {
+                Some("vless") => {
+                    if !uuid.is_empty() {
+                        block = set_field(&block, "uuid", uuid);
+                    }
+                    block = trim_newlines(&crate::protocols::vless_xhttp::normalize_proxy_yaml(&block)).to_owned();
+                }
+                Some("hysteria2") if !password.is_empty() => block = set_field(&block, "password", password),
+                _ => {}
+            }
+            if awg {
+                block = match block.split_once('\n') {
+                    Some((_, rest)) => format!("{AWG_DISPLAY}\n{}", trim_newlines(rest)),
+                    None => format!("{AWG_DISPLAY}\n"),
+                };
+            }
+            filtered.push_str(&block);
+            filtered.push('\n');
         }
+        let mut section = filtered;
         if section.is_empty() {
             continue;
         }
@@ -709,7 +723,7 @@ mod tests {
 
         // xHTTP blocks get the client uuid and the firefox fingerprint.
         let xhttp = "proxies:\n  - name: \"vless-xhttp\"\n    type: vless\n    uuid: original\n    network: xhttp\n    client-fingerprint: chrome\n---\n";
-        config.connections[0].groups[0].proxies.push("vless-xhttp".into());
+        config.connections[0].groups[0].proxies = vec!["vless-xhttp".into()];
         let (out, _) = proxies(&config, "my-router", &["de"], &fetched(&[("de", xhttp)]));
         let out = out.unwrap();
         assert!(out.contains(&format!("uuid: {ROUTER_UUID}")) && out.contains("client-fingerprint: firefox") && !out.contains("chrome"));
@@ -841,6 +855,51 @@ mod tests {
         let journal = journal.borrow();
         assert!(journal.iter().any(|(_, text)| text == "de: профиль не готов (нет профиля, домена или ключей)"));
         assert!(journal.iter().any(|(_, text)| text == "my-router — не удалось получить все подключения; конфиг сохранён без изменений"));
+    }
+
+    #[test]
+    fn a_selected_connection_missing_from_the_profile_fails_the_client_and_keeps_its_config() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut session, journal) = fixture(root.path());
+        let mut config = session.state.load_config().unwrap();
+        config.clients[1].connections = Some(vec![ClientConnection { node: "de".into(), proxies: vec!["VLESS TCP".into(), "vless-reality".into()] }]);
+        session.state.save_config(&config).unwrap();
+        let previous = generated_dir(session.state.paths()).join("PC/my-pc");
+        std::fs::create_dir_all(&previous).unwrap();
+        std::fs::write(previous.join("config.yaml"), "previous\n").unwrap();
+        let error = generate(&mut session, &invocation(&["generate", "--client", "my-pc"])).unwrap_err();
+        assert_eq!(error.code, "partial");
+        assert_eq!((error.extra["ok"].clone(), error.extra["failed"].clone()), (json!([]), json!(["my-pc"])));
+        assert_eq!(std::fs::read_to_string(previous.join("config.yaml")).unwrap(), "previous\n");
+        assert!(journal.borrow().iter().any(|(_, text)|
+            text == "my-pc: подключения «vless-reality» нет в профиле ноды de — выполните conn sync или измените назначение"));
+
+        // A group-selected connection is checked the same way.
+        config.clients[1].connections = None;
+        config.clients[1].inherit_nodes_from_group = true;
+        config.connections[0].groups[1].proxies = vec!["AWG".into()];
+        let (out, log) = proxies(&config, "my-pc", &["de"], &fetched(&[("de", SAMPLE)]));
+        assert_eq!(out, None);
+        assert_eq!(log, ["my-pc: подключения «AWG» нет в профиле ноды de — выполните conn sync или измените назначение"]);
+    }
+
+    #[test]
+    fn a_node_without_connections_gives_every_proxy_with_the_client_credentials() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut session, _) = fixture(root.path());
+        let mut config = session.state.load_config().unwrap();
+        config.connections.retain(|connection| connection.node != "de");
+        config.clients[1].connections = None;
+        session.state.save_config(&config).unwrap();
+        let data = generate(&mut session, &invocation(&["generate", "--client", "my-pc"])).unwrap();
+        assert_eq!(data["ok"], json!(["my-pc"]));
+        let pc = std::fs::read_to_string(generated_dir(session.state.paths()).join("PC/my-pc/config.yaml")).unwrap();
+        for proxy in ["DE VLESS TCP", "DE VLESS xHTTP", "DE VLESS gRPC", "DE Hysteria2"] {
+            assert!(pc.contains(&format!("  - name: \"{proxy}\"\n")), "{proxy} in {pc}");
+        }
+        assert_eq!(pc.matches(&format!("uuid: {PC_UUID}")).count(), 3);
+        assert!(pc.contains("    password: pc-hy2-pass-0002\n"));
+        assert!(!pc.contains(crate::server::render::PLACEHOLDER_UUID) && !pc.contains(crate::server::render::PLACEHOLDER_PASSWORD));
     }
 
     #[test]

@@ -25,10 +25,14 @@ fn host_json(config: &Config) -> Value {
 }
 
 /// The host record of a node's hosting settings: hostname and port come from
-/// the server's `https://host[:port]` base URL.
+/// the server's `https://host[:port]` base URL, the hostname checked like
+/// [`Config::validate`] does before anything remote changes.
 fn host_record(node: &str, base_url: &str, sub_dir: &str, nginx_group: String) -> Result<SubscriptionHost> {
     let (hostname, port) = SubscriptionHost::parse_base_url(base_url)
         .ok_or_else(|| RcError::new("invalid", "Конфигурация хостинга подписок неполна.").with_extra("name", node))?;
+    if !crate::validation::domain_valid(&hostname) {
+        return Err(RcError::new("invalid", format!("Некорректный адрес хостинга подписок: {base_url}.")).with_extra("name", node));
+    }
     Ok(SubscriptionHost {
         node: node.into(), base_url: SubscriptionHost::base_url_for(&hostname, port), hostname, port,
         sub_dir: sub_dir.into(), nginx_group,

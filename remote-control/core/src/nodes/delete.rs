@@ -1,7 +1,7 @@
 //! `node delete` (v1 `core_node_delete_plan` + `core_node_delete`).
 //!
 //! Remote work runs only after the plan is confirmed. Before the managed key
-//! is revoked or the server components are removed, the authenticated
+//! is revoked, the authenticated
 //! connection is held as a recovery lease (v2's replacement for v1's private
 //! ControlMaster socket): if anything later fails while the node is kept, the
 //! revoked key is put back through that lease and a fresh login verifies it.
@@ -245,14 +245,20 @@ pub async fn delete<T: RemoteTransport>(session: &mut Session, invocation: &Invo
                 session.log(Level::Info, &format!("Essence на ноду «{name}» не применялся — сервер не изменится."));
             }
         }
-        let held = transport.hold().map_err(|_| remote_failed(NO_RECOVERY_LEASE))?;
+        // The lease only serves putting a revoked key back.
         if let Some(public) = public.as_deref() {
             let kept = |error: RcError| if remote_removed {
-                with_outcome(RcError::new("partial", format!("Компоненты на сервере удалены. {}", error.message)), name, scope, false, true)
-                    .with_extra("key_restored", error.extra.get("key_restored").cloned().unwrap_or(Value::Null))
+                let restored = error.extra.get("key_restored").cloned();
+                let partial = with_outcome(RcError::new("partial", format!("Компоненты на сервере удалены. {}", error.message)),
+                    name, scope, false, true);
+                match restored {
+                    Some(restored) => partial.with_extra("key_restored", restored),
+                    None => partial,
+                }
             } else {
                 error
             };
+            let held = transport.hold().map_err(|_| kept(remote_failed(NO_RECOVERY_LEASE)))?;
             match run(&*transport, &key_probe_command(public), COMMAND_TIMEOUT).await.as_deref() {
                 Some("present") => {
                     // Marked before sending: a lost reply may follow a successful revocation.
@@ -266,8 +272,8 @@ pub async fn delete<T: RemoteTransport>(session: &mut Session, invocation: &Invo
                 Some("absent") => {}
                 _ => return Err(kept(remote_failed("Не удалось проверить SSH-ключ. Нода сохранена в remote-control."))),
             }
+            lease = Some(held);
         }
-        lease = Some(held);
     }
 
     let outcome = session.mutate("node delete", |state| {
@@ -312,13 +318,16 @@ pub async fn delete<T: RemoteTransport>(session: &mut Session, invocation: &Invo
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+    use std::time::Duration;
+
     use super::*;
     use crate::fake_transport::{AuthMethod, ConnectExpectation, FakeTransport, ScriptStep};
     use crate::github::{SyncStatus, Storage, Target, commands::GithubSession};
     use crate::model::{Auth, CascadeListener, Client, Connection, ConnectionGroup, ExitProxy, Fingerprint, NodeExit,
         SubscriptionHost, TelegramProxy, UriExit};
     use crate::nodes::{CONNECT_TIMEOUT, testing};
-    use crate::transport::{ExecResult, HostKeyPolicy};
+    use crate::transport::{ConnectOptions, ExecResult, HostKeyPolicy, remote_failure};
 
     const ID: &str = "0123456789abcdef0123456789abcdef";
     const PUBLIC: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample essence:0123";
@@ -550,5 +559,58 @@ mod tests {
         assert_eq!(error.extra["key_restored"], json!(true));
         assert_eq!(session.state.load_config().unwrap().nodes.len(), 1);
         assert!(session.state.paths().identities().join(ID).exists());
+    }
+
+    /// A [`FakeTransport`] whose connection closes before a lease is taken.
+    struct ClosedBeforeHold(FakeTransport);
+
+    impl RemoteSession for ClosedBeforeHold {
+        fn exec<'a>(&'a self, command: &'a str, stdin: &'a [u8], timeout: Duration) -> impl Future<Output = Result<ExecResult>> + 'a {
+            self.0.exec(command, stdin, timeout)
+        }
+        fn upload<'a>(&'a self, local_dir: &'a Path, remote_dir: &'a str, timeout: Duration) -> impl Future<Output = Result<()>> + 'a {
+            self.0.upload(local_dir, remote_dir, timeout)
+        }
+        fn upload_private<'a>(&'a self, local_dir: &'a Path, remote_dir: &'a str, timeout: Duration)
+            -> impl Future<Output = Result<()>> + 'a
+        {
+            self.0.upload_private(local_dir, remote_dir, timeout)
+        }
+    }
+
+    impl RemoteTransport for ClosedBeforeHold {
+        type Held = <FakeTransport as RemoteTransport>::Held;
+        fn connect(&mut self, options: ConnectOptions) -> impl Future<Output = Result<()>> + '_ {
+            self.0.connect(options)
+        }
+        fn hold(&self) -> Result<Self::Held> {
+            Err(remote_failure("connection_closed"))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_closed_connection_after_teardown_does_not_stop_a_server_delete() {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = applied_session(root.path());
+        crate::server::apply::tests::NEXT_OP_ID.with(|next| *next.borrow_mut() = Some("ab".repeat(16)));
+        let mut transport = ClosedBeforeHold(FakeTransport::new(teardown_steps("stage=cleanup\nresult=committed\n")));
+        let argv = testing::invocation(&["node", "delete", "--name", "de", "--scope", "server", "--yes"]);
+        let data = delete(&mut session, &argv, &mut transport).await.unwrap();
+        transport.0.assert_finished();
+        assert_eq!(data, json!({"name": "de", "scope": "server"}));
+        assert!(session.state.load_config().unwrap().nodes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn revocation_without_a_lease_changes_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = github_session(root.path());
+        let before = testing::fingerprint(root.path());
+        let mut transport = ClosedBeforeHold(FakeTransport::new([key_connect()]));
+        let error = delete(&mut session, &testing::invocation(&["node", "delete", "--name", "de", "--revoke-key", "--yes"]), &mut transport)
+            .await.unwrap_err();
+        transport.0.assert_finished();
+        assert_eq!((error.code, error.message.as_str()), ("remote_failed", NO_RECOVERY_LEASE));
+        assert_eq!(testing::fingerprint(root.path()), before);
     }
 }
