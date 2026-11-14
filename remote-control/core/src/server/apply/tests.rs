@@ -641,6 +641,77 @@ async fn a_missing_reality_key_fails_the_node_with_the_way_back() {
     assert!(config(&session).nodes[0].operation.is_none());
 }
 
+fn warp_output(plus: bool) -> String {
+    let key = |seed: char| format!("{}=", seed.to_string().repeat(43));
+    format!("private_key={}\npublic_key={}\nipv4=172.16.0.2\nipv6=\nplus={plus}\n", key('A'), key('B'))
+}
+
+#[tokio::test(start_paused = true)]
+async fn warp_is_registered_before_the_render_and_with_a_new_key_again() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut session, journal) = fixture(root.path());
+    session.mutate("t", |state| {
+        let mut config = state.load_config()?;
+        config.profiles[0].warp = true;
+        state.save_config(&config)
+    }).unwrap();
+    let de = node(1, "de");
+    let hosts = Hosts::new(vec![vec![connect_step(&de, Ok(())), probe_step(&de, DEBIAN)]]);
+    let error = run(&mut session, &hosts, &["node", "apply", "--name", "de"]).await.unwrap_err();
+    assert!(error.extra["plan"].as_array().unwrap().contains(&json!("WARP: будет зарегистрирован аккаунт Cloudflare.")));
+
+    NEXT_OP_ID.with(|next| *next.borrow_mut() = Some(OP.into()));
+    let mut steps = vec![connect_step(&de, Ok(())), probe_step(&de, DEBIAN),
+        ScriptStep::exec(super::super::warp::register_command(false), 1, LONG_TIMEOUT, ok(&warp_output(false)))];
+    steps.extend(start_steps(OP));
+    steps.push(exec(status_command(OP), "stage=cleanup\nresult=committed\n"));
+    let hosts = Hosts::new(vec![steps]);
+    let data = run(&mut session, &hosts, &["node", "apply", "--name", "de", "--yes"]).await.unwrap();
+    hosts.finish();
+    assert_eq!(data["applied"], json!(["de"]));
+    let saved = config(&session);
+    let warp = saved.nodes[0].params.warp.clone().unwrap();
+    assert_eq!((warp.ipv4.as_str(), warp.plus, warp.plus_attempt), ("172.16.0.2", false, None));
+    assert!(session.state.secret_store().get(&format!("node:{}:warp-key", saved.nodes[0].id)).unwrap().is_some());
+    assert_eq!(render::status(&saved, &saved.nodes[0]), "applied");
+
+    // A WARP+ key appears: one re-registration (stdin carries the key), it does not bind.
+    session.mutate("t", |state| {
+        let mut config = state.load_config()?;
+        config.profiles[0].warp_plus = Some("0123abcd".into());
+        state.secret_store().set("profile:main:warp-license", Zeroizing::new("KEY-123".into()))?;
+        state.save_config(&config)
+    }).unwrap();
+    let node = config(&session).nodes[0].clone();
+    NEXT_OP_ID.with(|next| *next.borrow_mut() = Some(OP.into()));
+    let applied: String = node.applied.as_ref().unwrap().files.iter().map(|(path, hash)| format!("{hash}  {path}\n")).collect();
+    let mut steps = vec![connect_step(&node, Ok(())), probe_step(&node, &format!("{DEBIAN}agent=ok\n{applied}")),
+        ScriptStep::exec(super::super::warp::register_command(true), "KEY-123\n".len(), LONG_TIMEOUT, ok(&warp_output(false)))];
+    steps.extend(start_steps(OP).into_iter().skip(2));
+    steps.push(exec(status_command(OP), "stage=cleanup\nresult=committed\n"));
+    let hosts = Hosts::new(vec![steps]);
+    run(&mut session, &hosts, &["node", "apply", "--name", "de", "--yes"]).await.unwrap();
+    hosts.finish();
+    let saved = config(&session);
+    assert_eq!(saved.nodes[0].params.warp.as_ref().unwrap().plus_attempt.as_deref(), Some("0123abcd"));
+    assert!(journal.borrow().iter().any(|(level, text)| *level == Level::Warn && text.contains("ключ WARP+ не привязан")));
+    assert!(super::super::warp::registration(&saved.profiles[0], &saved.nodes[0]).is_none(), "the same key is not retried");
+
+    // A failed registration fails the node at stage `warp`.
+    session.mutate("t", |state| {
+        let mut config = state.load_config()?;
+        config.nodes[0].params.warp = None;
+        state.save_config(&config)
+    }).unwrap();
+    let node = config(&session).nodes[0].clone();
+    let hosts = Hosts::new(vec![vec![connect_step(&node, Ok(())), probe_step(&node, DEBIAN),
+        ScriptStep::exec(super::super::warp::register_command(false), "KEY-123\n".len(), LONG_TIMEOUT,
+            Ok(ExecResult { exit_status: 1, ..ExecResult::default() }))]]);
+    let error = run(&mut session, &hosts, &["node", "apply", "--name", "de", "--yes"]).await.unwrap_err();
+    assert_eq!(error.extra["failed"][0]["stage"], "warp");
+    assert_eq!(hosts.uploads(), 0);
+}
+
 #[test]
 fn probe_output_parses() {
     let probe = parse_probe("os=\"ubuntu\"\r\nsystemd=yes\nsshd=2222\nagent=ok\nlisten udp 0.0.0.0:51820\nlisten tcp [::]:443\n\

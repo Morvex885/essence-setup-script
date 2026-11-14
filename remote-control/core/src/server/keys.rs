@@ -45,6 +45,13 @@ pub fn wg_keypair() -> Result<(Zeroizing<String>, String)> {
     Ok((Zeroizing::new(STANDARD.encode(*private)), STANDARD.encode(public)))
 }
 
+/// The WireGuard public key of a standard-base64 private key (`wg pubkey`).
+pub fn wg_public(private: &str) -> Result<String> {
+    let raw = Zeroizing::new(STANDARD.decode(private.trim()).ok().and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .ok_or_else(|| RcError::new("invalid", "Некорректный ключ WireGuard в конфигурации."))?);
+    Ok(STANDARD.encode(PublicKey::from(&StaticSecret::from(*raw)).as_bytes()))
+}
+
 /// 32 random bytes in standard base64 (`wg genpsk`).
 pub fn wg_key() -> Result<Zeroizing<String>> {
     let mut bytes = Zeroizing::new([0u8; 32]);

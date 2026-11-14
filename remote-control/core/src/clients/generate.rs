@@ -345,7 +345,8 @@ fn client_proxies(config: &Config, client: &Client, nodes: &[String], sections: 
         };
         let section = proxy_section(remote);
         // Without connections on the node the client takes every proxy of the
-        // section, as the node's listeners accept it on all of them.
+        // section, as the node's listeners accept it on all of them: the
+        // listeners and its own AmneziaWG peer, never another client's.
         let selected = !own.is_empty() || !group.is_empty();
         let allowed = if !own.is_empty() {
             own
@@ -353,7 +354,9 @@ fn client_proxies(config: &Config, client: &Client, nodes: &[String], sections: 
             group
         } else {
             let mut every = Vec::new();
-            push_unique(&mut every, section.split('\n').filter(|line| line.starts_with(NAME_PREFIX)).map(|line| block_name(line).to_owned()));
+            push_unique(&mut every, section.split('\n').filter(|line| line.starts_with(NAME_PREFIX))
+                .map(|line| block_name(line).to_owned()).filter(|block| !block.starts_with("awg-")));
+            every.push("AWG".to_owned());
             every
         };
         let mut filtered = String::new();

@@ -234,7 +234,7 @@ fn client_card(ctx: &mut Context<'_>, mut name: String) -> io::Result<()> {
         };
         let inherit = row["inherit_nodes"] != false;
         let mut view = View::menu(format!("Клиент: {name}"),
-            vec![Item::new('v', "Показать данные подключения", ui::CYAN), Item::new('s', "Подписка", ui::CYAN)]);
+            vec![Item::new('v', "Показать данные подключения", ui::CYAN), Item::new('s', "Подписка", ui::CYAN), Item::new('a', "Конфиг AmneziaWG", ui::CYAN)]);
         view.context = vec![
             ui::text(format!("Группа: {}", text(&row["group"])), ui::NC),
             ui::text(format!("Ноды: {} ({})", if inherit { "от группы" } else { "свои" }, joined(&row["nodes"])), ui::NC),
@@ -250,6 +250,7 @@ fn client_card(ctx: &mut Context<'_>, mut name: String) -> io::Result<()> {
             "0" => return Ok(()),
             "v" => show_client(ctx, &name)?,
             "s" => client_subscription(ctx, &name)?,
+            "a" => awg_config(ctx, &name, &strings(&row["nodes"]))?,
             "f" => generate(ctx, &["--client", &name])?,
             "n" => client_nodes(ctx, &name, inherit, &strings(&row["nodes"]))?,
             "p" => if inherit { ctx.ui.notice(ui::warn("Подключения настраиваются только для клиента со своими нодами.")); }
@@ -292,6 +293,24 @@ fn show_client(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
         }
     }
     present(ctx, &view)
+}
+/// «Конфиг AmneziaWG»: a node of the client with AmneziaWG (`node list
+/// .proxies` has `AWG`) → `client awg-config` → a local file (default
+/// `<client>-<node>.conf`). The config holds secrets: it goes only to the file.
+fn awg_config(ctx: &mut Context<'_>, name: &str, nodes: &[String]) -> io::Result<()> {
+    let Some(data) = fetch(ctx, &["node", "list"])? else { return Ok(()); };
+    let available: Vec<&Value> = rows(&data).iter()
+        .filter(|r| nodes.iter().any(|n| r["name"] == n.as_str()) && strings(&r["proxies"]).iter().any(|p| p == "AWG")).collect();
+    if available.is_empty() { ctx.ui.notice(ui::warn("У клиента нет нод с AmneziaWG.")); return Ok(()); }
+    let labels: Vec<String> = available.iter().map(|r| node_label(r)).collect();
+    let Some(i) = ctx.select(&format!("Конфиг AmneziaWG: {name}"), &labels)? else { return Ok(()); };
+    let node = text(&available[i]["name"]).to_owned();
+    let default = format!("{name}-{node}.conf");
+    let Some(path) = ask(ctx, &format!("Путь к файлу (Enter — {default})"))? else { return Ok(()); };
+    let path = expand_home(if path.is_empty() { &default } else { &path });
+    let Some(data) = fetch(ctx, &["client", "awg-config", "--name", name, "--node", &node])? else { return Ok(()); };
+    let Some(config) = data["config"].as_str() else { ctx.failed(); return Ok(()); };
+    save_file(ctx, "Конфиг AmneziaWG", &path, config, &format!("конфигом AmneziaWG {name} ({node})"), &format!("Конфиг AmneziaWG {name} ({node})"))
 }
 fn client_nodes(ctx: &mut Context<'_>, name: &str, inherit: bool, current: &[String]) -> io::Result<()> {
     let (state, choices) = if inherit { ("от группы", vec!["Назначить свои ноды".to_owned()]) }
@@ -656,27 +675,32 @@ pub(crate) fn file_input(ctx: &mut Context<'_>, path: &Path) -> Option<Input> {
     input.insert("file", text);
     Some(input)
 }
-/// `template show` → the local file; an existing entry is replaced only after
-/// consent, by renaming a fresh file over it (a link is replaced, never followed);
-/// an entry that appeared after the check is kept.
+/// `template show` → the local file (`save_file`).
 fn export_template(ctx: &mut Context<'_>, name: &str, path: &Path) -> io::Result<()> {
     let Some(data) = fetch(ctx, &["template", "show", "--name", name])? else { return Ok(()); };
     let Some(content) = data["content"].as_str() else { ctx.failed(); return Ok(()); };
+    save_file(ctx, "Экспорт шаблона", path, content, &format!("шаблоном {name}"), &format!("Шаблон {name}"))
+}
+/// `content` → the local file: an existing entry is replaced only after
+/// consent («будет перезаписан {by}»), by renaming a fresh file over it (a
+/// link is replaced, never followed); an entry that appeared after the check
+/// is kept. Success notice: «{saved} сохранён в …»; the content is never shown.
+fn save_file(ctx: &mut Context<'_>, title: &str, path: &Path, content: &str, by: &str, saved: &str) -> io::Result<()> {
     let replace = match fs::symlink_metadata(path) {
         Ok(meta) if meta.is_dir() => {
             ctx.ui.notice(ui::warn(format!("Не удалось записать {}: это каталог.", path.display())));
             return Ok(());
         }
         Ok(_) => {
-            let mut view = View::new("Экспорт шаблона");
-            view.context.push(ui::text(format!("Файл {} будет перезаписан шаблоном {name}.", path.display()), ui::YELLOW));
+            let mut view = View::new(title);
+            view.context.push(ui::text(format!("Файл {} будет перезаписан {by}.", path.display()), ui::YELLOW));
             if !ctx.confirm(view, "Перезаписать файл?")? { return Ok(()); }
             true
         }
         Err(_) => false,
     };
     match files::write_file_atomic(path, content.as_bytes(), replace) {
-        Ok(()) => ctx.ui.notice(ui::text(format!("Шаблон {name} сохранён в {}", path.display()), ui::GREEN)),
+        Ok(()) => ctx.ui.notice(ui::text(format!("{saved} сохранён в {}", path.display()), ui::GREEN)),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             ctx.ui.notice(ui::warn(format!("Не удалось записать {}: файл появился во время экспорта.", path.display())));
         }
@@ -1108,13 +1132,44 @@ mod tests {
         let card = &ui.views[0];
         assert!(!content(card).contains("UUID-SECRET"));
         assert_eq!(card.sections.len(), 2);
-        assert_eq!(keys(card), [("v".into(), ui::CYAN), ("s".into(), ui::CYAN), ("f".into(), ui::YELLOW), ("n".into(), ui::YELLOW),
+        assert_eq!(keys(card), [("v".into(), ui::CYAN), ("s".into(), ui::CYAN), ("a".into(), ui::CYAN), ("f".into(), ui::YELLOW), ("n".into(), ui::YELLOW),
             ("p".into(), ui::YELLOW), ("g".into(), ui::YELLOW), ("r".into(), ui::YELLOW), ("d".into(), ui::RED), ("0".into(), ui::NC)]);
         let data = view(&ui, "Данные клиента: alice");
         for expected in ["UUID-SECRET", "HY2-SECRET", "https://h/sub/tok", "/g/PC/alice/config.yaml (создан)", "de (свои): p1"] {
             assert!(content(data).contains(expected), "{expected}");
         }
         assert!(data.sections.is_empty());
+    }
+    #[test]
+    fn awg_config_picks_a_client_node_with_awg_and_writes_only_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("alice-de.conf");
+        let target_arg = target.to_str().unwrap().to_owned();
+        let nodes = json!([{"name":"de","ip":"127.0.0.1","port":22,"proxies":["VLESS Reality","AWG"]},
+            {"name":"ru","ip":"10.0.0.2","port":2222,"proxies":["AWG"]}, {"name":"fi","ip":"10.0.0.3","port":22,"proxies":["VLESS Reality"]}]);
+        let config = "[Interface]\nPrivateKey = AWG-SECRET\n";
+        let words = ["client", "awg-config", "--name", "alice", "--node", "de"];
+        // Card key (both cases) → a fresh file; an existing one is kept on refusal;
+        // Enter takes the default name; `invalid` writes nothing.
+        let (core, ui) = drive(vec![
+            ok(&["client", "list"], alice(false)), ok(&["node", "list"], nodes.clone()), ok(&words, json!({"config": config})),
+            ok(&["client", "list"], alice(false)), ok(&["node", "list"], nodes.clone()), ok(&words, json!({"config": "OTHER"})),
+            ok(&["client", "list"], alice(false)), ok(&["node", "list"], nodes.clone()), step(&words, fail("invalid", json!({}))),
+            ok(&["client", "list"], alice(false)),
+        ], &["a", "1", &target_arg, "A", "1", &target_arg, "n", "a", "1", "", "0"], |ctx| client_card(ctx, "alice".into()));
+        assert_eq!(core.calls.iter().filter(|call| **call == argv(&words)).count(), 3);
+        assert_eq!(fs::read_to_string(&target).unwrap(), config, "overwritten only after consent");
+        assert_eq!(view(&ui, "Конфиг AmneziaWG: alice").sections[0].iter().filter(|item| item.key != "0").count(), 1, "only the client's nodes with AWG");
+        assert!(ui.views.iter().any(|v| v.title == "Конфиг AmneziaWG" && v.prompt.contains("(y/N)")));
+        assert!(ui.views.iter().any(|v| v.title.contains("alice-de.conf")), "the default file name is offered");
+        assert_eq!(notices(&ui, "Конфиг AmneziaWG alice (de) сохранён в"), 1);
+        assert!(!Path::new("alice-de.conf").exists());
+        assert!(!ui.views.iter().any(|v| content(v).contains("AWG-SECRET")) && !ui.notices.iter().any(|l| l.to_string().contains("AWG-SECRET")));
+        assert!(!core.calls.iter().flatten().any(|word| word.contains(dir.path().to_str().unwrap())), "no local path reaches the daemon");
+        // No node of the client has AmneziaWG: a warning, no question.
+        let (core, ui) = drive(vec![ok(&["node", "list"], nodes)], &[], |ctx| awg_config(ctx, "alice", &["fi".to_owned()]));
+        assert_eq!(core.calls.len(), 1);
+        assert_eq!(notices(&ui, "нет нод с AmneziaWG"), 1);
     }
     #[test]
     fn client_data_without_connections_or_link_has_no_empty_lines() {

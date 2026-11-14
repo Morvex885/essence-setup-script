@@ -394,10 +394,18 @@ export const nodeProfileArgv = (name, profile) => ['node', 'profile', '--name', 
 export const nodeDomainArgv = (name, domain) => ['node', 'domain', '--name', name, '--domain', domain];
 export const nodePortArgv = (name, protocol, port) => ['node', 'port', '--name', name, '--protocol', protocol, '--port', port];
 
-/** Подпись WARP ноды (`node list .warp`: `none|free|plus`). */
-export function warpLabel(node) {
-  return { free: 'бесплатный', plus: 'WARP+' }[node && node.warp] || 'не зарегистрирован';
+/**
+ * Строка WARP карточки (`node show .warp`: `none|free|plus`): зарегистрированный
+ * WARP — всегда, «не зарегистрирован» — только у ноды профиля с WARP
+ * (`profile show .warp`). `null` — строки нет (WARP ноде не нужен или профиль не прочитан).
+ */
+export function warpLabel(node, profile = null) {
+  const label = { free: 'бесплатный', plus: 'WARP+' }[node && node.warp];
+  if (label) return label;
+  return profile && profile.warp === true ? 'не зарегистрирован' : null;
 }
+
+export const warpReregisterArgv = (name) => ['node', 'warp-reregister', '--name', name];
 
 /**
  * Протоколы профиля с настраиваемым портом: `{ key, label, port }` — ключ
@@ -490,6 +498,18 @@ export async function nodePortsFlow(ctx, name, node) {
 /** «Применить»: `node apply --name N` под планом. */
 export function applyNode(ctx, name) {
   return applyFlow(ctx, applyNamesArgv([name]), name);
+}
+
+/**
+ * «Перерегистрировать WARP»: `node warp-reregister` под планом; нода после
+ * него ожидает применения — вопрос и `node apply --name N`. `true` — выполнено.
+ */
+export async function warpReregister(ctx, name) {
+  const reply = await ctx.nodeRequest(name, warpReregisterArgv(name), { title: 'Перерегистрация WARP', question: 'Перерегистрировать WARP?' });
+  if (!reply.ok) return false;
+  const yes = await ctx.confirm({ title: 'Применение на нодах', plan: [], question: `Применить изменения на ноде ${name}?` });
+  if (yes) await applyNode(ctx, name);
+  return true;
 }
 
 /** `node setup-ssh` под планом (`nodes.rs::setup_ssh`). */

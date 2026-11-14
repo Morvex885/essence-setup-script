@@ -333,8 +333,36 @@ test('argv профиля, домена и портов ноды', () => {
     ['node', 'port', '--name', 'n', '--protocol', 'hysteria2', '--port', ''],
     ['node', 'port', '--name', 'n', '--protocol', 'amneziawg', '--port', '41000'],
   ]);
-  assert.equal(model.warpLabel({ warp: 'plus' }) !== model.warpLabel({ warp: 'free' }), true);
-  assert.equal(model.warpLabel({ warp: 'none' }), model.warpLabel({}));
+});
+
+test('WARP ноды: строка по node.warp и профилю, argv перерегистрации', () => {
+  assert.notEqual(model.warpLabel({ warp: 'plus' }), model.warpLabel({ warp: 'free' }));
+  assert.equal(typeof model.warpLabel({ warp: 'free' }), 'string');
+  // Не зарегистрирован — строка только у ноды профиля с WARP.
+  assert.equal(model.warpLabel({ warp: 'none' }), null);
+  assert.equal(model.warpLabel({ warp: 'none' }, { warp: false }), null);
+  const none = model.warpLabel({ warp: 'none' }, { warp: true });
+  assert.equal(typeof none, 'string');
+  assert.notEqual(none, model.warpLabel({ warp: 'free' }));
+  assert.equal(model.warpLabel({ warp: 'plus' }, { warp: false }), model.warpLabel({ warp: 'plus' }));
+  assert.deepEqual(model.warpReregisterArgv('n'), ['node', 'warp-reregister', '--name', 'n']);
+});
+
+test('перерегистрация WARP: под планом, затем вопрос и node apply --name; отказ — без применения, сбой — без вопроса', async () => {
+  let s = scripted([
+    [['node', 'warp-reregister', '--name', 'n'], ok({ name: 'n' })],
+    [['node', 'apply', '--name', 'n'], ok({ applied: ['n'], failed: [], unchanged: [] })],
+  ], [true, undefined]);
+  assert.equal(await model.warpReregister(s.ctx, 'n'), true);
+  assert.deepEqual(s.record.dialogs.map((d) => d.kind), ['confirm', 'show']);
+  s.done();
+  s = scripted([[['node', 'warp-reregister', '--name', 'n'], ok({ name: 'n' })]], [false]);
+  assert.equal(await model.warpReregister(s.ctx, 'n'), true);
+  s.done();
+  s = scripted([[['node', 'warp-reregister', '--name', 'n'], fail('confirmation_required')]], []);
+  assert.equal(await model.warpReregister(s.ctx, 'n'), false);
+  assert.deepEqual(s.record.dialogs, []);
+  s.done();
 });
 
 test('порты ноды: форма по протоколам профиля, команды только для изменённых', async () => {

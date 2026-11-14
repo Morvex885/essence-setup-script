@@ -1,6 +1,6 @@
 // Маршрут (`router.parse(location.hash).name`) → компонент экрана.
 // Каждый экран: `function XScreen({ ctx, param, tab })`, `param` — второй
-// сегмент маршрута (`#/nodes/<имя>`), `tab` — третий (`#/nodes/<имя>/awg`)
+// сегмент маршрута (`#/nodes/<имя>`), `tab` — третий (`#/nodes/<имя>/connections`)
 // либо `null`. Неизвестный маршрут — сводка.
 import { SummaryScreen } from './summary.js';
 import { NodesScreen } from './nodes.js';

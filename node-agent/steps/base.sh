@@ -368,7 +368,7 @@ managed_path() {
     [[ "$path/" != */../* && "$path/" != */./* ]] || return 1
     [[ ! "$path" =~ [[:space:][:cntrl:]] ]] || return 1
     case "$path" in
-        /etc/mihomo|/etc/mihomo/*|/etc/systemd/system/mihomo.service|/etc/sysctl.d/99-vpn-speedup.conf)
+        /etc/mihomo|/etc/mihomo/*|/etc/systemd/system/mihomo.service|/etc/sysctl.d/99-vpn-speedup.conf|/etc/amnezia/amneziawg/awg0.conf)
             return 0 ;;
     esac
     [[ "$path" == /etc/nginx/modules-enabled/90-essence-stream.conf ||

@@ -487,3 +487,104 @@ fn proxies_list_enabled_protocols_and_cascades() {
     config.nodes[0].profile = None;
     assert!(proxies(&config, &config.nodes[0]).is_empty());
 }
+
+/// A profile with AmneziaWG; clients alpha (index 3) and beta (index 2) are peers.
+fn awg_config() -> Config {
+    let mut profile = profile();
+    profile.amneziawg = Some(AmneziaWg { port: 51820, dns: "1.1.1.1, 1.0.0.1".into() });
+    let mut config = config(profile);
+    config.nodes[0].params.awg = Some(NodeAwg { public_key: "SERVERPUB".into(), header_protection_key: "HPK".into(),
+        tproxy_port: 23456, jc: 5, s1: 20, s2: 30, s3: 40 });
+    config.clients.push(client("beta", "beta-pass"));
+    let keys = [("alpha", 3, [7u8; 32]), ("beta", 2, [9u8; 32])];
+    for (name, index, key) in keys {
+        let credentials = config.clients.iter_mut().find(|c| c.name == name).unwrap().credentials.as_mut().unwrap();
+        credentials.awg_index = index;
+        credentials.awg_private_key = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key);
+        credentials.awg_preshared_key = format!("PSK-{name}");
+    }
+    config
+}
+
+fn awg_secrets() -> NodeSecrets {
+    NodeSecrets { reality_key: Some(Zeroizing::new("PRIVKEY".into())), awg_key: Some(Zeroizing::new("SERVERPRIV".into())), ..NodeSecrets::default() }
+}
+
+#[test]
+fn amneziawg_renders_the_server_config_peers_and_tproxy() {
+    let config = awg_config();
+    let desired = desired(&config, &config.nodes[0], Some(&awg_secrets())).unwrap();
+    let conf = content(&desired, AWG_CONF_PATH);
+    assert!(conf.starts_with("[Interface]\nPrivateKey = SERVERPRIV\nAddress = 10.10.0.1/16\nListenPort = 51820\nJc = 5\nJmin = 10\nJmax = 50\n\
+        S1 = 20\nS2 = 30\nS3 = 40\nS4 = 12\nH1 = 1\nH2 = 2\nH3 = 3\nH4 = 4\nHeaderProtectionKey = HPK\nContentPaddingAddition = 10-100\n\
+        RekeyAfterTime = 100-120\nRekeyTimeout = 3-7\nRejectAfterTime = 150-180\nKeepaliveTimeout = 5-15\nMaxHandshakeAttempts = 15-20\n\
+        RandomTrailers = on\nDisableCookies = on\nPostUp = "), "{conf}");
+    assert!(conf.contains("-d 10.10.0.0/16 -j RETURN") && conf.contains("--on-port 23456 --tproxy-mark 1") && !conf.contains("10.10.8"));
+    let beta = conf.find("# peer: beta").unwrap();
+    let alpha = conf.find("# peer: alpha").unwrap();
+    assert!(beta < alpha, "peers by ascending index");
+    assert!(conf.contains("\n# peer: beta\n[Peer]\nPublicKey = ") && conf.contains("PresharedKey = PSK-beta\nAllowedIPs = 10.10.0.2/32\n"));
+    assert!(conf.contains("AllowedIPs = 10.10.0.3/32\n"));
+    let public = crate::server::keys::wg_public(&config.clients[0].credentials.as_ref().unwrap().awg_private_key).unwrap();
+    assert!(conf.contains(&format!("# peer: alpha\n[Peer]\nPublicKey = {public}\n")));
+    let mihomo = content(&desired, MIHOMO_CONFIG_PATH);
+    assert!(!mihomo.contains("tproxy-port:"), "the top-level tproxy port would bypass the inbound rejects");
+    assert!(mihomo.contains("  - name: awg-tproxy\n    type: tproxy\n    listen: 0.0.0.0\n    port: 23456\n    udp: true\n    rule: essence-in\n"), "{mihomo}");
+    assert_eq!((spec(&desired, "FEATURES"), spec(&desired, "AWG_PORT")), ("awg", "51820"));
+    assert_eq!(spec(&desired, "UFW_RULES"), "443/tcp 51820/udp");
+    assert_eq!(spec(&desired, "LISTEN_TCP"), "443 8443 23456");
+    assert!(desired.lines.contains(&"AWG: порт 51820, клиентов 2".to_owned()));
+    assert_eq!(awg::peer_ip(258), "10.10.1.2");
+
+    // A client without AWG in its connections is no peer.
+    let mut config = config;
+    config.connections[0].groups[0].proxies = vec!["VLESS TCP".into()];
+    assert!(!content(&self::desired(&config, &config.nodes[0], Some(&awg_secrets())).unwrap(), AWG_CONF_PATH).contains("# peer:"));
+}
+
+#[test]
+fn amneziawg_client_blocks_and_native_config() {
+    let config = awg_config();
+    let section = client_section(&config, &config.nodes[0]).unwrap();
+    let alpha_key = config.clients[0].credentials.as_ref().unwrap().awg_private_key.clone();
+    assert!(section.contains(&format!("  - name: awg-alpha\n    type: wireguard\n    private-key: {alpha_key}\n    server: de.example.com\n    port: 51820\n\
+        \x20   ip: 10.10.0.3\n    mtu: 1280\n    dns: ['1.1.1.1', '1.0.0.1']\n    public-key: SERVERPUB\n    pre-shared-key: PSK-alpha\n\
+        \x20   allowed-ips: ['0.0.0.0/0', '::/0']\n    udp: true\n    persistent-keepalive: 25\n    amnezia-wg-option:\n      version: 3\n      jc: 5\n")), "{section}");
+    assert!(section.contains("      random-trailers: true\n      disable-cookies: true\n") && section.ends_with("---\n"));
+    let native = awg_client_config(&config, &config.nodes[0], &config.clients[0]).unwrap();
+    assert!(native.starts_with(&format!("[Interface]\nAddress = 10.10.0.3/32\nDNS = 1.1.1.1, 1.0.0.1\nMTU = 1280\nPrivateKey = {alpha_key}\nJc = 5\n")));
+    assert!(native.ends_with("\n[Peer]\nPublicKey = SERVERPUB\nPresharedKey = PSK-alpha\nAllowedIPs = 0.0.0.0/0, ::/0\nEndpoint = de.example.com:51820\nPersistentKeepalive = 25\n"));
+    let mut other = config.clone();
+    other.connections[0].groups[0].proxies = vec!["VLESS TCP".into()];
+    assert_eq!(awg_client_config(&other, &other.nodes[0], &other.clients[0]).unwrap_err().code, "invalid");
+    let plain = self::config(profile());
+    assert_eq!(awg_client_config(&plain, &plain.nodes[0], &plain.clients[0]).unwrap_err().code, "invalid");
+}
+
+#[test]
+fn warp_adds_the_proxy_and_outbound_member() {
+    let mut config = config(profile());
+    config.profiles[0].warp = true;
+    let pending = render(&config);
+    assert!(pending.lines.contains(&"WARP: будет зарегистрирован аккаунт Cloudflare.".to_owned()));
+    assert!(!content(&pending, MIHOMO_CONFIG_PATH).contains("warp-wg"), "no block before registration");
+    config.nodes[0].params.warp = Some(crate::model::NodeWarp { public_key: "WPUB".into(), ipv4: "172.16.0.2".into(), ipv6: None,
+        plus: false, plus_attempt: None });
+    let secrets = NodeSecrets { reality_key: Some(Zeroizing::new("PRIVKEY".into())), warp_key: Some(Zeroizing::new("WPRIV".into())), ..NodeSecrets::default() };
+    let desired = desired(&config, &config.nodes[0], Some(&secrets)).unwrap();
+    let mihomo = content(&desired, MIHOMO_CONFIG_PATH);
+    assert!(mihomo.contains("proxies:\n  - name: warp-wg\n    type: wireguard\n    private-key: \"WPRIV\"\n"), "{mihomo}");
+    assert!(mihomo.contains("    proxies:\n      - warp-wg\n      - DIRECT\n"));
+    assert_eq!(spec(&desired, "WARP"), "true");
+    let document = yaml(mihomo);
+    assert_eq!(document["proxies"].as_vec().map(Vec::len), Some(1));
+    // Switching WARP off drops the block; the stored account does not count.
+    let digest_on = desired.digest.clone();
+    config.profiles[0].warp = false;
+    let off = render(&config);
+    assert!(!content(&off, MIHOMO_CONFIG_PATH).contains("warp-wg") && spec(&off, "WARP") == "false");
+    let mut forgotten = config.clone();
+    forgotten.nodes[0].params.warp = None;
+    assert_eq!(render(&forgotten).digest, off.digest);
+    assert_ne!(off.digest, digest_on);
+}

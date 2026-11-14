@@ -382,6 +382,43 @@ export async function readClientConfig(ctx, name) {
   return data.content;
 }
 
+// ─── Конфиг AmneziaWG ───────────────────────────────────────────────────────
+
+/** Подключение AmneziaWG в группах нод. */
+export const AWG_PROXY = 'AWG';
+export const awgConfigArgv = (name, node) => ['client', 'awg-config', '--name', name, '--node', node];
+/** Имя файла конфига AmneziaWG: `<клиент>-<нода>.conf`. */
+export const awgConfigFile = (name, node) => `${name}-${node}.conf`;
+
+/** Ноды, где клиент — пир AmneziaWG: строки `client show .connections` с `AWG`. */
+export function awgNodes(data) {
+  const nodes = asList(data && data.connections)
+    .filter((row) => row && typeof row.node === 'string' && strings(row.proxies).includes(AWG_PROXY))
+    .map((row) => row.node);
+  return [...new Set(nodes)];
+}
+
+/**
+ * «Конфиг AmneziaWG»: ноды из `client show`, выбор (одна — без вопроса) и
+ * `client awg-config`. `{ node, config }` или `null` (отмена, нет нод, сбой —
+ * текст ошибки ядра, например `invalid`, показан). Текст конфига — секрет: не логируется.
+ */
+export async function awgConfigFlow(ctx, name) {
+  const read = await fetchData(ctx, ['client', 'show', '--name', name]);
+  if (!read) return null;
+  const nodes = awgNodes(read.data);
+  if (nodes.length === 0) { ctx.notify('info', 'Клиент не подключён к AmneziaWG ни на одной ноде.'); return null; }
+  const node = nodes.length === 1
+    ? nodes[0]
+    : await ctx.choose({ title: `Конфиг AmneziaWG: ${name}`, options: nodes.map((item) => ({ value: item, label: item })) });
+  if (node === null || node === undefined) return null;
+  const got = await fetchData(ctx, awgConfigArgv(name, node));
+  if (!got) return null;
+  const config = got.data && typeof got.data.config === 'string' ? got.data.config : null;
+  if (config === null) { ctx.failed(); return null; }
+  return { node, config };
+}
+
 /**
  * Чтение подменю (`clients.rs::load`): `not_found` — выход, прочие сбои —
  * явный «Повторить». Возвращает `{ data }` или `null`.

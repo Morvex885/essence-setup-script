@@ -295,5 +295,31 @@ export function applyProfile(ctx, name) {
   return applyFlow(ctx, applyProfileArgv(name));
 }
 
+// ─── Ключ WARP+ ─────────────────────────────────────────────────────────────
+
+/** Ключ WARP+ — секретом `password`, в argv его нет. */
+export const warpLicenseArgv = (name) => ['profile', 'warp-license', '--name', name];
+export const warpLicenseClearArgv = (name) => ['profile', 'warp-license', '--name', name, '--clear'];
+
+/** «Ключ WARP+»: скрытый ввод → `profile warp-license` с секретом `password`. `true` — сохранён. */
+export async function warpLicenseFlow(ctx, name) {
+  const values = await ctx.form({
+    title: `Ключ WARP+: ${name}`,
+    fields: [{ name: 'password', label: 'Ключ WARP+', type: 'secret', required: true, autofocus: true }],
+    submit: 'Сохранить',
+  });
+  if (values === null || values === undefined) return false;
+  const reply = await ctx.request(warpLicenseArgv(name), { secrets: { password: values.password } });
+  if (ctx.isFailure(reply)) ctx.failed();
+  return reply.ok;
+}
+
+/** «Убрать ключ WARP+» → `profile warp-license --clear`. `true` — убран. */
+export async function clearWarpLicense(ctx, name) {
+  const reply = await ctx.request(warpLicenseClearArgv(name));
+  if (ctx.isFailure(reply)) ctx.failed();
+  return reply.ok;
+}
+
 /** Ноды профиля из `profile list|show`. */
 export const profileNodes = (profile) => strings(profile && profile.nodes);

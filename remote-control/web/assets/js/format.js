@@ -53,7 +53,7 @@ export function sourceLabel(source) {
 /** Строка выполняющейся операции по argv (`app.rs::activity`). */
 export function activity(argv) {
   const [noun = '', verb = ''] = Array.isArray(argv) ? argv : [];
-  const nodeNouns = ['node', 'conn', 'awg', 'telegram'];
+  const nodeNouns = ['node', 'conn', 'telegram'];
   if (noun === 'session' && verb === 'open') return 'Открытие сессии…';
   if (noun === 'status') return 'Загрузка состояния…';
   if (noun === 'source') {

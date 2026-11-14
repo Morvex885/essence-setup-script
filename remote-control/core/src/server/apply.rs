@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use tokio::time::Instant;
+use zeroize::Zeroizing;
 
 use crate::cli::Invocation;
 use crate::clients::require_one;
@@ -21,7 +22,7 @@ use crate::confirmation::Plan;
 use crate::dispatch::Session;
 use crate::error::{RcError, Result};
 use crate::log::Level;
-use crate::model::{Applied, Config, Node, Operation};
+use crate::model::{Applied, Config, Node, Operation, Profile};
 use crate::nodes::{self, COMMAND_TIMEOUT, LONG_TIMEOUT, required, sh_quote};
 use crate::state::State;
 use crate::transport::RemoteTransport;
@@ -61,6 +62,7 @@ fn stage_label(stage: &str) -> &str {
         "firewall" => "правила UFW",
         "cleanup" => "очистка",
         "init" => "запуск исполнителя",
+        "warp" => "регистрация WARP",
         other => other,
     }
 }
@@ -274,10 +276,14 @@ fn targets(config: &Config, invocation: &Invocation) -> Result<Vec<String>> {
 
 /// Secrets the node's files need; a missing one fails the node.
 fn node_secrets(state: &State, config: &Config, node: &Node) -> Result<NodeSecrets> {
-    let needs_reality = node.profile.as_deref().and_then(|name| config.find_profile(name)).is_some_and(|p| p.has_reality());
+    let profile = node.profile.as_deref().and_then(|name| config.find_profile(name));
     let store = state.secret_store();
+    let read = |suffix: &str, what: &str| -> Result<Zeroizing<String>> {
+        store.get(&format!("node:{}:{suffix}", node.id))?.ok_or_else(|| RcError::new("missing_secret",
+            format!("{what} ноды «{}» не сохранён.", node.name)).with_extra("name", node.name.clone()))
+    };
     let mut secrets = NodeSecrets::default();
-    if needs_reality {
+    if profile.is_some_and(Profile::has_reality) {
         let id = format!("node:{}:reality-key", node.id);
         let missing = || RcError::new("missing_secret", missing_reality_key(&node.name)).with_extra("name", node.name.clone());
         secrets.reality_key = Some(match store.get(&id) {
@@ -286,6 +292,12 @@ fn node_secrets(state: &State, config: &Config, node: &Node) -> Result<NodeSecre
             Err(error) if error.code == "missing_secret" => return Err(missing()),
             Err(error) => return Err(error),
         });
+    }
+    if profile.is_some_and(|profile| profile.amneziawg.is_some()) {
+        secrets.awg_key = Some(read("awg-key", "Ключ AmneziaWG")?);
+    }
+    if profile.is_some_and(|profile| profile.warp) && node.params.warp.is_some() {
+        secrets.warp_key = Some(read("warp-key", "Ключ WARP")?);
     }
     Ok(secrets)
 }
@@ -738,6 +750,31 @@ pub async fn apply<T: RemoteTransport>(session: &mut Session, invocation: &Invoc
     extra.sort();
     let plan = Plan::new(lines, extra.join("\n"));
     plan.confirm(invocation)?;
+
+    // WARP accounts the nodes still need, before anything is recorded: a
+    // registration changes the node's parameters and so its digest. A failed
+    // registration fails only its node.
+    let mut excluded = Vec::new();
+    for item in planned.iter_mut().filter(|item| item.resume.is_none()) {
+        let config = session.state.load_config()?;
+        let node = nodes::find(&config, &item.name)?.clone();
+        if render::desired(&config, &node, None).map(|desired| desired.digest).ok().as_deref() != Some(item.digest.as_str()) {
+            return Err(plan.changed(invocation));
+        }
+        let Some(reregister) = node.profile.as_deref().and_then(|name| config.find_profile(name))
+            .and_then(|profile| super::warp::registration(profile, &node)) else { continue };
+        match super::warp::register(session, &node, &item.transport, reregister).await {
+            Ok(()) => {
+                let config = session.state.load_config()?;
+                item.digest = render::desired(&config, nodes::find(&config, &item.name)?, None)?.digest;
+            }
+            Err(error) => {
+                report.fail(session, &item.name, &Failure::of("warp", error));
+                excluded.push(item.name.clone());
+            }
+        }
+    }
+    planned.retain(|item| !excluded.contains(&item.name));
 
     let mut claims = claim(session, "node apply start", |state, config| {
         let mut claims = Vec::new();

@@ -577,3 +577,37 @@ test('генерация: nodes_pending в итоге и предложение 
   await m.runGenerate(clean, ['--all']);
   assert.deepEqual(clean.offers, []);
 });
+
+test('конфиг AmneziaWG: argv, имя файла и ноды-пиры из client show', () => {
+  assert.deepEqual(m.awgConfigArgv('alice', 'de'), ['client', 'awg-config', '--name', 'alice', '--node', 'de']);
+  assert.equal(m.awgConfigFile('alice', 'de'), 'alice-de.conf');
+  const data = { connections: [
+    { node: 'de', mode: 'group', proxies: ['p1', m.AWG_PROXY] },
+    { node: 'ru', mode: 'own', proxies: ['p1'] },
+    { node: 'nl', mode: 'own', proxies: [m.AWG_PROXY] },
+    { node: 'de', mode: 'own', proxies: [m.AWG_PROXY] },
+    null,
+  ] };
+  assert.deepEqual(m.awgNodes(data), ['de', 'nl']);
+  assert.deepEqual(m.awgNodes({}), []);
+  assert.deepEqual(m.awgNodes(null), []);
+});
+
+test('конфиг AmneziaWG: одна нода — без выбора, несколько — выбор, нет нод и сбой — null', async () => {
+  const show = (nodes) => okReply({ connections: nodes.map((node) => ({ node, proxies: [m.AWG_PROXY] })) });
+  let ctx = fakeCtx({ replies: [show(['de']), okReply({ config: '[Interface]\n' })] });
+  assert.deepEqual(await m.awgConfigFlow(ctx, 'alice'), { node: 'de', config: '[Interface]\n' });
+  assert.deepEqual(commands(ctx), [['client', 'show', '--name', 'alice'], m.awgConfigArgv('alice', 'de')]);
+  ctx = fakeCtx({ replies: [show(['de', 'nl']), okReply({ config: 'x' })], answers: ['nl'] });
+  assert.deepEqual(await m.awgConfigFlow(ctx, 'alice'), { node: 'nl', config: 'x' });
+  assert.deepEqual(kinds(ctx), ['request', 'choose', 'request']);
+  ctx = fakeCtx({ replies: [show(['de', 'nl'])], answers: [null] });
+  assert.equal(await m.awgConfigFlow(ctx, 'alice'), null);
+  assert.deepEqual(kinds(ctx), ['request', 'choose']);
+  ctx = fakeCtx({ replies: [show([])] });
+  assert.equal(await m.awgConfigFlow(ctx, 'alice'), null);
+  assert.deepEqual(kinds(ctx), ['request', 'notify']);
+  ctx = fakeCtx({ replies: [show(['de']), failure('invalid')] });
+  assert.equal(await m.awgConfigFlow(ctx, 'alice'), null);
+  assert.deepEqual(kinds(ctx), ['request', 'request', 'failed']);
+});

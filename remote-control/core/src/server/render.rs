@@ -11,15 +11,18 @@ use zeroize::Zeroizing;
 
 use crate::clients::generate::{User, effective_connections, node_users};
 use crate::error::{RcError, Result};
-use crate::model::{Config, Ipv6, Node, Profile, RealityMode, SiteSource, XhttpTopology};
+use crate::model::{AmneziaWg, Client, Config, Ipv6, Node, NodeWarp, Profile, RealityMode, SiteSource, XhttpTopology};
 use crate::protocols::vless_xhttp::NginxListener;
 use crate::protocols::{Vless, VlessListener, hy2, listener_users, vless_grpc, vless_tcp, vless_xhttp, yaml_escape};
 
-use super::paths::{MIHOMO_CONFIG_PATH, MIHOMO_SERVICE_PATH, SITES_AVAILABLE, SITES_ENABLED, STREAM_PATH, SYSCTL_PATH};
+use super::awg;
+use super::paths::{
+    AWG_CONF_PATH, MIHOMO_CONFIG_PATH, MIHOMO_SERVICE_PATH, SITES_AVAILABLE, SITES_ENABLED, STREAM_PATH, SYSCTL_PATH,
+};
 use super::ports::{REALITY_INNER_PORT, SITE_PORT, SUB_INNER_PORT, TG_INNER_PORT, XHTTP_NGINX_PORT};
 
 /// Bumped whenever rendered files change for an unchanged configuration.
-pub const RENDER_REVISION: u32 = 4;
+pub const RENDER_REVISION: u32 = 5;
 
 const MIHOMO_CONFIG: &str = include_str!("assets/mihomo-config.yaml");
 const MIHOMO_SERVICE: &str = include_str!("assets/mihomo.service");
@@ -57,6 +60,22 @@ pub struct NodeSecrets {
     pub warp_key: Option<Zeroizing<String>>,
     pub telegram_secret: Option<Zeroizing<String>>,
     pub telegram_tag: Option<Zeroizing<String>>,
+}
+
+/// The private keys a render uses (empty without secrets).
+struct Keys<'a> {
+    reality: &'a str,
+    awg: &'a str,
+    warp: &'a str,
+}
+
+impl<'a> Keys<'a> {
+    fn of(secrets: Option<&'a NodeSecrets>) -> Self {
+        let key = |pick: fn(&NodeSecrets) -> &Option<Zeroizing<String>>| {
+            secrets.and_then(|s| pick(s).as_deref()).map(String::as_str).unwrap_or_default()
+        };
+        Keys { reality: key(|s| &s.reality_key), awg: key(|s| &s.awg_key), warp: key(|s| &s.warp_key) }
+    }
 }
 
 /// Everything `node apply` needs for one node.
@@ -248,7 +267,15 @@ impl Layout<'_> {
                 _ => {}
             }
         }
+        if let Some((_, port)) = self.awg() {
+            push(format!("{port}/udp"));
+        }
         rules
+    }
+
+    /// The profile's AmneziaWG and its effective port on this node.
+    fn awg(&self) -> Option<(&AmneziaWg, u16)> {
+        self.profile.amneziawg.as_ref().map(|awg| (awg, effective(self.node, "amneziawg", awg.port)))
     }
 
     /// Listening ports must not collide with SSH or the AmneziaWG tproxy port.
@@ -362,18 +389,34 @@ impl Layout<'_> {
             .ok_or_else(|| RcError::new("failed", format!("Не удалось собрать листенер {}.", listener.name)))
     }
 
-    fn mihomo_config(&self, users: &[User<'_>], private_key: &str) -> Result<String> {
+    /// WARP of the node: enabled in the profile and registered.
+    fn warp(&self) -> Option<&NodeWarp> {
+        self.node.params.warp.as_ref().filter(|_| self.profile.warp)
+    }
+
+    fn mihomo_config(&self, users: &[User<'_>], keys: &Keys<'_>) -> Result<String> {
         let mut listeners = String::new();
         for listener in &self.listeners {
             let listener_users = self.users(users, listener);
             if !listener_users.is_empty() {
-                listeners.push_str(&self.listener_block(listener, &listener_users, private_key)?);
+                listeners.push_str(&self.listener_block(listener, &listener_users, keys.reality)?);
             }
         }
         let ipv6 = if self.profile.ipv6 == Ipv6::Enabled { "ipv6: true" } else { "ipv6: false" };
+        // AmneziaWG traffic arrives through TPROXY: a tproxy listener (not the
+        // top-level `tproxy-port`, which uses `rules:`) so it passes the same
+        // inbound rejects as every other listener.
+        if let (Some(_), Some(awg)) = (self.awg(), &self.node.params.awg) {
+            listeners.push_str(&format!("  - name: awg-tproxy\n    type: tproxy\n    listen: 0.0.0.0\n    port: {}\n    udp: true\n    rule: {INBOUND_RULE}\n",
+                awg.tproxy_port));
+        }
+        let (proxies, outbound) = match self.warp() {
+            Some(warp) => (super::warp::warp_block(warp, keys.warp), "      - warp-wg".to_owned()),
+            None => (String::new(), String::new()),
+        };
         Ok(fill_template(MIHOMO_CONFIG, &[
-            ("#@ipv6", ipv6.to_owned()), ("#@tproxy", String::new()), ("#@proxies", String::new()),
-            ("#@outbound", String::new()), ("#@groups", String::new()), ("#@listeners", listeners),
+            ("#@ipv6", ipv6.to_owned()), ("#@tproxy", String::new()), ("#@proxies", proxies),
+            ("#@outbound", outbound), ("#@groups", String::new()), ("#@listeners", listeners),
             ("#@sub-rules", inbound_sub_rules()),
         ]))
     }
@@ -421,15 +464,12 @@ impl Layout<'_> {
         text
     }
 
-    /// Managed files; contents only with `secrets` (users and the Reality
-    /// key), otherwise just the paths and modes.
-    fn files(&self, secrets: Option<(&[User<'_>], &str)>) -> Result<Vec<RenderedFile>> {
-        let text = |render: &dyn Fn() -> Result<String>| if secrets.is_some() { render() } else { Ok(String::new()) };
+    /// Managed files; contents only with `keys` (users and private keys),
+    /// otherwise just the paths and modes.
+    fn files(&self, users: &[User<'_>], keys: Option<&Keys<'_>>) -> Result<Vec<RenderedFile>> {
+        let text = |render: &dyn Fn() -> Result<String>| if keys.is_some() { render() } else { Ok(String::new()) };
         let mut files = vec![
-            file(MIHOMO_CONFIG_PATH, "0600", text(&|| {
-                let (users, private_key) = secrets.unwrap_or_default();
-                self.mihomo_config(users, private_key)
-            })?),
+            file(MIHOMO_CONFIG_PATH, "0600", keys.map_or(Ok(String::new()), |keys| self.mihomo_config(users, keys))?),
             file(MIHOMO_SERVICE_PATH, "0644", text(&|| Ok(MIHOMO_SERVICE.to_owned()))?),
             file(SYSCTL_PATH, "0644", text(&|| Ok(self.sysctl()))?),
         ];
@@ -439,6 +479,11 @@ impl Layout<'_> {
         }
         if self.front == Front::Stream {
             files.push(file(STREAM_PATH, "0644", text(&|| Ok(self.stream_config()))?));
+        }
+        if let Some((_, port)) = self.awg() {
+            let params = self.node.params.awg.as_ref().ok_or_else(|| self.missing_params())?;
+            let conf = keys.map_or(Ok(String::new()), |keys| awg::server_conf(self.config, &self.node.name, params, port, keys.awg))?;
+            files.push(file(AWG_CONF_PATH, "0600", conf));
         }
         Ok(files)
     }
@@ -471,6 +516,10 @@ impl Layout<'_> {
         if self.front == Front::Stream || self.nginx_on_443() {
             ports.insert(443);
         }
+        // mihomo's TPROXY inlet of AmneziaWG traffic.
+        if let (Some(_), Some(awg)) = (self.awg(), &self.node.params.awg) {
+            ports.insert(awg.tproxy_port);
+        }
         ports.into_iter().collect()
     }
 
@@ -487,12 +536,23 @@ impl Layout<'_> {
                 listener_users.insert(listener.marker.into(), json!(users.iter().map(|(n, c)| [n, c]).collect::<Vec<_>>()));
             }
         }
+        // A WARP account that the profile no longer uses does not count.
+        let mut params = self.node.params.clone();
+        if !self.profile.warp {
+            params.warp = None;
+        }
+        let peers: Vec<Value> = if self.awg().is_some() {
+            awg::expected_peers(self.config, &self.node.name).iter().filter_map(|client| client.credentials.as_ref()
+                .map(|c| json!([client.name, c.awg_index, c.awg_private_key, c.awg_preshared_key]))).collect()
+        } else {
+            Vec::new()
+        };
         let host = self.config.subscription_host.as_ref().filter(|host| host.node == self.node.name);
         let telegram = self.config.telegram.iter().find(|proxy| proxy.node == self.node.name);
         digest_of(&json!({
             "revision": RENDER_REVISION, "profile": profile, "ip": self.node.ip, "port": self.node.port,
-            "domain": self.node.domain, "ports": self.node.ports, "params": self.node.params, "users": listener_users,
-            "awg_peers": [], "cascades": [], "subscription_host": host, "telegram": telegram, "tg_revision": null,
+            "domain": self.node.domain, "ports": self.node.ports, "params": params, "users": listener_users,
+            "awg_peers": peers, "cascades": [], "subscription_host": host, "telegram": telegram, "tg_revision": null,
         }))
     }
 }
@@ -605,8 +665,8 @@ pub fn desired(config: &Config, node: &Node, secrets: Option<&NodeSecrets>) -> R
     };
     let users = layout.node_users()?;
     layout.check_params(&users)?;
-    let contents = secrets.map(|s| (users.as_slice(), s.reality_key.as_deref().map(String::as_str).unwrap_or_default()));
-    let files = layout.files(contents)?;
+    let keys = secrets.map(|secrets| Keys::of(Some(secrets)));
+    let files = layout.files(&users, keys.as_ref())?;
     let keep: BTreeSet<&str> = files.iter().map(|f| f.path.as_str()).collect();
     let remove = removed(node, &keep);
     let release: Vec<String> = applied_sites(node).into_iter().filter(|site| layout.site != Some(site.as_str())).collect();
@@ -615,6 +675,8 @@ pub fn desired(config: &Config, node: &Node, secrets: Option<&NodeSecrets>) -> R
     let (_, _, hy2_cn, hy2_cert) = layout.hy2_tls();
     let hy2_cert = hy2_cert && profile.hysteria2.is_some();
     let site = layout.site.unwrap_or_default();
+    let had_awg = node.applied.as_ref().is_some_and(|applied| applied.files.contains_key(AWG_CONF_PATH));
+    let awg_port = layout.awg().map(|(_, port)| port);
     let spec = vec![
         ("OP_MODE", "apply".to_owned()),
         ("SSH_PORTS", node.port.to_string()),
@@ -632,8 +694,10 @@ pub fn desired(config: &Config, node: &Node, secrets: Option<&NodeSecrets>) -> R
         ("HY2_CN", if hy2_cert { hy2_cn.to_owned() } else { String::new() }),
         ("UFW_RULES", ports.join(" ")),
         ("RELEASE_CERTS", release.iter().map(|name| format!("{name}:/var/www/{name}")).collect::<Vec<_>>().join(" ")),
-        ("FEATURES", String::new()),
-        ("REMOVE_FEATURES", String::new()),
+        ("FEATURES", if awg_port.is_some() { "awg".to_owned() } else { String::new() }),
+        ("REMOVE_FEATURES", if had_awg && awg_port.is_none() { "awg".to_owned() } else { String::new() }),
+        ("AWG_PORT", awg_port.map(|port| port.to_string()).unwrap_or_default()),
+        ("WARP", bool_text(profile.warp)),
     ];
 
     let mut lines = vec![
@@ -653,6 +717,15 @@ pub fn desired(config: &Config, node: &Node, secrets: Option<&NodeSecrets>) -> R
         } else {
             format!("{}: порт {}, клиентов {count}", listener.name, listener.client_port)
         });
+    }
+    if let Some((_, port)) = layout.awg() {
+        let peers = awg::expected_peers(config, &node.name).len();
+        lines.push(format!("AWG: порт {port}, клиентов {peers}"));
+    }
+    match super::warp::registration(profile, node) {
+        Some(reregister) => lines.push(super::warp::plan_line(reregister).to_owned()),
+        None if layout.warp().is_some() => lines.push("WARP: исходящий трафик через Cloudflare.".to_owned()),
+        None => {}
     }
     lines.extend(remove.iter().map(|path| format!("Будет удалено: {path}")));
     lines.extend(release.iter().map(|name| format!("Будет удалён сертификат и сайт: {name}")));
@@ -697,6 +770,7 @@ pub fn teardown(node: &Node) -> Desired {
         ("RELEASE_CERTS", release.iter().map(|name| format!("{name}:/var/www/{name}")).collect::<Vec<_>>().join(" ")),
         ("FEATURES", String::new()),
         ("REMOVE_FEATURES", "awg sub telegram".to_owned()),
+        ("WARP", "false".to_owned()),
     ];
     Desired { teardown: true, files: Vec::new(), remove, spec, ports: Vec::new(), lines, digest: teardown_digest() }
 }
@@ -762,8 +836,27 @@ pub fn client_section(config: &Config, node: &Node) -> Option<String> {
         };
         out.push_str(block.split_once('\n').map_or("", |(_, rest)| rest));
     }
+    if let (Some((profile, port)), Some(params)) = (layout.awg(), node.params.awg.as_ref()) {
+        for client in awg::expected_peers(config, &node.name) {
+            out.push_str(&awg::proxy_block(client, layout.server, port, profile, params)?);
+        }
+    }
     out.push_str("---\n");
     Some(out)
+}
+
+/// `client awg-config`: the native AmneziaWG config of a peer of the node.
+pub fn awg_client_config(config: &Config, node: &Node, client: &Client) -> Result<String> {
+    let layout = layout(config, node)?.ok_or_else(|| invalid(format!("У ноды «{}» нет профиля.", node.name)))?;
+    let (Some((profile, port)), Some(params)) = (layout.awg(), node.params.awg.as_ref()) else {
+        return Err(invalid(format!("На ноде «{}» нет AmneziaWG.", node.name)).with_extra("name", node.name.clone()));
+    };
+    if !awg::expected_peers(config, &node.name).iter().any(|peer| peer.name == client.name) {
+        return Err(invalid(format!("Клиент «{}» не использует AmneziaWG на ноде «{}».", client.name, node.name))
+            .with_extra("name", client.name.clone()).with_extra("node", node.name.clone()));
+    }
+    awg::client_conf(client, layout.server, port, profile, params)
+        .ok_or_else(|| invalid(format!("У клиента «{}» нет учётных данных AmneziaWG.", client.name)))
 }
 
 /// SHA-256 of rendered file contents by path (links are not recorded).

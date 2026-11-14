@@ -1,8 +1,7 @@
 //! Client, group and template domain (plan step 7): port of `groups.sh`,
 //! `templates.sh`, `clients.sh` and their `cmd_clients.sh` handlers. Every
-//! state change goes through `Session::mutate`; server effects (AmneziaWG
-//! clients, listener users, subscriptions) go through the generate, awg and
-//! subscription domains over `RemoteTransport`.
+//! state change goes through `Session::mutate`; subscriptions go through the
+//! subscription domain over `RemoteTransport`, server users through `node apply`.
 
 pub mod client;
 pub mod generate;
@@ -47,7 +46,8 @@ pub async fn route<T: RemoteTransport>(noun: &str, verb: &str, invocation: &Invo
         ("client", "config") => client::config(session, invocation),
         ("client", "connections") => client::connections(session, invocation),
         ("client", "add") => client::add(session, invocation),
-        ("client", "rename") => client::rename(session, invocation, connect).await,
+        ("client", "rename") => client::rename(session, invocation),
+        ("client", "awg-config") => client::awg_config(session, invocation),
         ("client", "nodes") => client::nodes(session, invocation),
         ("client", "set-group") => client::set_group(session, invocation, connect).await,
         ("client", "delete") => client::delete(session, invocation, connect).await,
@@ -88,34 +88,6 @@ pub fn client_nodes(config: &Config, client: &Client) -> Vec<String> {
     } else {
         client.nodes.clone().unwrap_or_default()
     }
-}
-
-fn is_awg(proxy: &str) -> bool {
-    proxy == "AWG" || proxy.starts_with("awg-")
-}
-
-/// v1 `_client_awg_nodes`: the client's nodes (for `group` instead of its
-/// current group) where its own or the group's connections include AmneziaWG.
-pub fn client_awg_nodes(config: &Config, client: &Client, group: Option<&str>) -> Vec<String> {
-    let group = group.unwrap_or(&client.group);
-    let nodes = if client.inherit_nodes_from_group { group_nodes(config, group) } else { client.nodes.clone().unwrap_or_default() };
-    nodes.into_iter().filter(|node| {
-        let own = client.connections.iter().flatten().filter(|c| &c.node == node).flat_map(|c| &c.proxies);
-        let shared = config.connections.iter().filter(|c| &c.node == node)
-            .flat_map(|c| &c.groups).filter(|g| g.name == group).flat_map(|g| &g.proxies);
-        own.chain(shared).any(|proxy| is_awg(proxy))
-    }).collect()
-}
-
-/// v1 `_awg_capable_nodes`: configured nodes (in order) where any group or
-/// client connection includes AmneziaWG.
-pub fn awg_capable_nodes(config: &Config) -> Vec<String> {
-    config.nodes.iter().map(|node| &node.name).filter(|name| {
-        config.connections.iter().filter(|c| &c.node == *name).flat_map(|c| &c.groups).flat_map(|g| &g.proxies)
-            .chain(config.clients.iter().flat_map(|c| c.connections.iter().flatten())
-                .filter(|c| &c.node == *name).flat_map(|c| &c.proxies))
-            .any(|proxy| is_awg(proxy))
-    }).cloned().collect()
 }
 
 /// `<generated>/<group>/<client>`; invalid stored names → `invalid`.
@@ -228,18 +200,11 @@ mod tests {
     use super::testing::config;
 
     #[test]
-    fn effective_and_amneziawg_nodes() {
-        let mut config = config();
+    fn effective_nodes() {
+        let config = config();
         assert_eq!(group_nodes(&config, "ROUTER"), ["ru-vps"]);
         assert_eq!(client_nodes(&config, &config.clients[0]), ["ru-vps"]);
         assert_eq!(client_nodes(&config, &config.clients[1]), ["de-vps"]);
-        assert!(awg_capable_nodes(&config).is_empty());
-        config.connections[1].groups[0].proxies = vec!["AWG".into()];
-        assert_eq!(client_awg_nodes(&config, &config.clients[0], None), ["ru-vps"]);
-        assert!(client_awg_nodes(&config, &config.clients[0], Some("PC")).is_empty());
-        config.clients[1].connections = Some(vec![crate::model::ClientConnection { node: "de-vps".into(), proxies: vec!["awg-x".into()] }]);
-        assert_eq!(awg_capable_nodes(&config), ["de-vps", "ru-vps"]);
-        assert_eq!(client_awg_nodes(&config, &config.clients[1], None), ["de-vps"]);
     }
 
     #[test]

@@ -355,7 +355,7 @@ fn screens_speak_the_real_v2_grammar() {
     assert!(ui.inputs.is_empty(), "walk derailed");
     let rejected: Vec<_> = client.calls.iter().filter(|(_, code)| code == "usage").collect();
     assert!(rejected.is_empty(), "grammar rejected: {rejected:?}");
-    // Node-scoped screens (card, awg, per-node telegram) need a reachable SSH
+    // Node-scoped screens (card, per-node telegram) need a reachable SSH
     // node; their argv are checked against the catalog in nodes.rs tests.
     // Settings is skipped: `self version` would query GitHub (no network).
     for noun in ["session", "source", "status", "group", "client", "template", "generate", "subscription", "node", "conn", "telegram", "profile"] {
@@ -377,7 +377,7 @@ const WALK: &str = "1 \
     g a LAB 1 4 t 1 f _ h 0 0 0 \
     c a alice 4 1 v _ f _ s 0 r bob 0 0 \
     m 1 v _ c _ g x EXPORT 0 0 \
-    n 0 r a edge 1 1 _ 1 _ v1.19.18 0 0 p 0 a 0 t s 0 \
+    n 0 r a edge 1 1 _ 1 _ v1.19.18 0 0 p 0 t s 0 \
     f a _ 0 \
     s l _ 0 \
     i 0 \
