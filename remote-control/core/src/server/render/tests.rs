@@ -966,3 +966,63 @@ fn a_removed_telegram_role_releases_its_certificate() {
     assert!(gone.remove.contains(&"/etc/mtproxy/mtproxy.env".to_owned()) && gone.remove.contains(&"/etc/nginx/sites-enabled/essence-telegram-proxy".to_owned()));
     assert_eq!(spec(&teardown(&config.nodes[0]), "RELEASE_CERTS"), "de.example.com:/var/www/de.example.com tg.example.com:/var/www/tg.example.com");
 }
+
+/// CI only: with `ESSENCE_RENDER_DUMP=<dir>` writes representative node
+/// renders as `<dir>/<topology>/<absolute path>` (links as symlinks), which
+/// `tests/ci/validate_render.sh` checks with the real `mihomo -t` and
+/// `nginx -t`. Without the variable it does nothing.
+#[cfg(unix)]
+#[test]
+fn dump_representative_renders() {
+    use base64::Engine;
+    use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+    let Some(root) = std::env::var_os("ESSENCE_RENDER_DUMP") else { return };
+    let root = std::path::PathBuf::from(root);
+    let secret = |text: String| Some(Zeroizing::new(text));
+    let keys = NodeSecrets {
+        reality_key: secret(URL_SAFE_NO_PAD.encode([1u8; 32])), awg_key: secret(STANDARD.encode([2u8; 32])),
+        warp_key: secret(STANDARD.encode([3u8; 32])), telegram_secret: secret(TG_SECRET.into()), telegram_tag: None,
+    };
+    let subscription = SubscriptionHost { node: "de".into(), hostname: "sub.example.com".into(), port: 443,
+        base_url: "https://sub.example.com".into(), sub_dir: SUB_DIR.into(), nginx_group: "www-data".into() };
+    let telegram = TelegramProxy { node: "de".into(), hostname: "tg.example.com".into(), secret_mark: "0123abcd".into(), tag_mark: None };
+
+    // Self-steal with every protocol, AmneziaWG, WARP and both roles behind the node site.
+    let mut self_steal = awg_config();
+    let full = &mut self_steal.profiles[0];
+    full.vless_xhttp = Some(Xhttp { topology: XhttpTopology::Nginx, port: None });
+    full.vless_grpc = Some(PortOnly { port: 2083 });
+    full.hysteria2 = Some(Hysteria2 { port: 8843, obfs: true });
+    full.warp = true;
+    self_steal.nodes[0].params.warp = Some(crate::model::NodeWarp { public_key: STANDARD.encode([4u8; 32]),
+        ipv4: "172.16.0.2".into(), ipv6: Some("2606:4700:110:8f0a::2".into()), plus: false, plus_attempt: None });
+    self_steal.subscription_host = Some(subscription.clone());
+    self_steal.telegram.push(telegram.clone());
+    // SNI without a node domain: Telegram and subscriptions share 443 through the nginx stream.
+    let mut stream = config(Profile { hysteria2: Some(Hysteria2 { port: 8843, obfs: false }), ..sni(profile()) });
+    stream.nodes[0].domain = None;
+    stream.subscription_host = Some(subscription);
+    stream.telegram.push(telegram);
+    // SNI without roles: mihomo owns 443.
+    let mut bare = config(Profile { vless_grpc: Some(PortOnly { port: 2083 }), ..sni(profile()) });
+    bare.nodes[0].domain = None;
+    // No Reality: xHTTP behind nginx TLS and Hysteria2 with the site certificate.
+    let free = config(Profile { vless_tcp: false, vless_xhttp: Some(Xhttp { topology: XhttpTopology::Nginx, port: None }),
+        hysteria2: Some(Hysteria2 { port: 8843, obfs: false }), ..profile() });
+    // The entry node of a cascade; mihomo checks the exit's Reality public key.
+    let mut cascade = cascade_config(crate::model::ExitProxy::VlessTcp);
+    cascade.nodes[1].params.reality.as_mut().unwrap().public_key = URL_SAFE_NO_PAD.encode([5u8; 32]);
+
+    for (name, config) in [("self-steal", self_steal), ("stream", stream), ("bare", bare), ("free", free), ("cascade", cascade)] {
+        let desired = desired(&config, &config.nodes[0], Some(&keys)).unwrap();
+        for file in &desired.files {
+            let path = root.join(name).join(file.path.trim_start_matches('/'));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            if file.mode == "link" {
+                std::os::unix::fs::symlink(file.content.as_str(), &path).unwrap();
+            } else {
+                std::fs::write(&path, file.content.as_bytes()).unwrap();
+            }
+        }
+    }
+}

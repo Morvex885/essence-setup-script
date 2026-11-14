@@ -1,14 +1,16 @@
-//! Proxy protocol builders and parsers, ported from `common/protocols/*.sh`
-//! and `common/listener-users.sh`.
+//! Proxy protocol builders and parsers, ported from the v1 Bash builders
+//! (`hy2.sh`, `vless-*.sh`, `uri.sh`, `listener-users.sh`).
 //!
 //! Every function is pure: it returns exactly the text the Bash function
 //! printed on stdout (trailing newline included). Ports and other values are
 //! passed through as text, as the YAML and URI forms need them. Empty optional
 //! values select Bash defaults, except explicit empty TCP exit flow omits flow.
-//! Byte parity with Bash is pinned by `tests/protocols_golden.rs`.
+//! The byte format is pinned by the v1 snapshots in `snapshots.rs`.
 
 pub mod hy2;
 pub mod listener_users;
+#[cfg(test)]
+mod snapshots;
 pub mod uri;
 pub mod vless_grpc;
 pub mod vless_tcp;
