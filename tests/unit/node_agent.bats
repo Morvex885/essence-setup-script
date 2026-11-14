@@ -570,3 +570,55 @@ SH
     [[ "$(cat "$ROOT/var/www/shop.example/index.html")" == shop ]]
     ! grep -q "^wget" "$CALLS"
 }
+
+@test "откат возвращает правила UFW: удалённое добавляется, добавленное снимается" {
+    # ufw с правилами в файле; delete отказывает только для UFW_DELETE_FAIL_RULE.
+    stub ufw 'db="$(dirname "$CALLS")/ufw.db"; touch "$db"
+case "$1" in
+    status) echo "Status: active" ;;
+    show) sed "s/^/ufw allow /" "$db" ;;
+    allow) grep -qxF -- "$2" "$db" || printf "%s\n" "$2" >>"$db" ;;
+    delete) [[ "$3" == "${UFW_DELETE_FAIL_RULE:-}" ]] && exit 1
+        grep -vxF -- "$3" "$db" >"$db.tmp"; mv "$db.tmp" "$db" ;;
+esac
+exit 0'
+    local db="$BATS_TEST_TMPDIR/ufw.db" ledger="$ROOT/root/essence-node/ufw-rules"
+    printf '1111/tcp\n2222/tcp\n' >"$db"
+    printf '1111/tcp\n2222/tcp\n' >"$ledger"
+    printf 'old\n' >"$ROOT/etc/mihomo/config.yaml"
+    RULES="3333/tcp" write_spec
+    add_file /etc/mihomo/config.yaml "new"
+    UFW_DELETE_FAIL_RULE=2222/tcp run bash "$AGENT/apply.sh" "$OPDIR"
+    assert_failure
+    run status
+    assert_line "result=rolled_back"
+    assert_line "error=firewall"
+    grep -qx "ufw allow 3333/tcp" "$CALLS"
+    grep -qx "ufw delete allow 1111/tcp" "$CALLS"
+    [[ "$(sort "$db")" == $'1111/tcp\n2222/tcp' ]]
+    [[ "$(cat "$ledger")" == $'1111/tcp\n2222/tcp' ]]
+    [[ "$(cat "$ROOT/etc/mihomo/config.yaml")" == old ]]
+}
+
+@test "cleanup не удаляет операцию с rollback_failed ни в apply, ни в teardown" {
+    local ops="$ROOT/root/essence-node/ops" i
+    for i in 1 2 3 4 5 6 7; do
+        mkdir -p "$ops/old$i"
+        touch -d "2020-01-0$i" "$ops/old$i"
+    done
+    mkdir -p "$ops/bad/backup/etc/mihomo"
+    printf 'stage=config\nresult=rollback_failed\nerror=config\n' >"$ops/bad/status"
+    printf 'old\n' >"$ops/bad/backup/etc/mihomo/config.yaml"
+    touch -d "2019-01-01" "$ops/bad"
+    add_file /etc/mihomo/config.yaml "new"
+    run_agent
+    assert_success
+    [[ -f "$ops/bad/backup/etc/mihomo/config.yaml" && ! -e "$ops/old1" ]]
+
+    MODE=teardown RULES="" write_spec
+    printf '/etc/mihomo\n' >"$OPDIR/remove.list"
+    run_agent
+    assert_success
+    [[ -f "$ops/bad/backup/etc/mihomo/config.yaml" && ! -e "$ops/old7" ]]
+    grep -qF "Оставляю операцию bad" "$OPDIR/log"
+}

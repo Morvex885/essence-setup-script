@@ -479,12 +479,13 @@ listen_ready() {
 }
 
 # Откат: вызывается из finish() при открытой транзакции. Код 1 — не все файлы
-# вернулись (тогда finish сохраняет backup/); службы и фичи — по возможности:
-# на новой ноде прежнего mihomo нет, и его запуск не может удаться.
+# или правила UFW вернулись (тогда finish сохраняет backup/); службы и фичи —
+# по возможности: на новой ноде прежнего mihomo нет, и его запуск не может удаться.
 tx_rollback() {
     local feature nginx_action=none rc=0
     warn "Откат изменений."
     tx_restore_files || rc=1
+    tx_restore_firewall || rc=1
     systemctl daemon-reload
     if [[ "$OP_MODE" == teardown ]]; then
         systemctl enable mihomo
@@ -635,6 +636,8 @@ stage_teardown_config() {
 # которого в UFW больше нет, добавляется заново. Учёт сохраняется после
 # каждого изменения UFW, чтобы сбой посреди этапа не терял свои правила.
 # Списки have/want — строки «правило\n» (без ассоциативных массивов).
+# FW_ADDED/FW_DELETED (из apply.sh) — свои правила, добавленные и удалённые
+# этой операцией: по ним откат возвращает UFW и учёт.
 stage_firewall() {
     local ledger="$NODE_DIR/ufw-rules" rule added="" wanted=() have="" want="" snapshot
     if [[ -f "$ledger" ]]; then
@@ -656,6 +659,7 @@ stage_firewall() {
         ufw allow "$rule" || return 1
         in_list "$have" "$rule" && continue
         have+="$rule"$'\n'
+        FW_ADDED+="$rule"$'\n'
         ledger_save || return 1
     done
     snapshot="$have"
@@ -663,11 +667,49 @@ stage_firewall() {
         [[ -n "$rule" ]] || continue
         in_list "$want" "$rule" && continue
         ufw delete allow "$rule" || return 1
-        have=$(printf '%s' "$have" | grep -vxF -- "$rule")
-        [[ -z "$have" ]] || have+=$'\n'
+        have_remove "$rule"
+        FW_DELETED+="$rule"$'\n'
         ledger_save || return 1
     done 3<<<"$snapshot"
     ledger_save
+}
+
+# tx_restore_firewall — вернуть удалённые этой операцией правила и снять
+# добавленные; учёт меняется только для правил, которые удалось вернуть.
+tx_restore_firewall() {
+    local ledger="$NODE_DIR/ufw-rules" have="" rule rc=0
+    [[ -n "$FW_ADDED$FW_DELETED" ]] || return 0
+    if [[ -f "$ledger" ]]; then
+        have=$(grep -v '^$' "$ledger")
+        [[ -z "$have" ]] || have+=$'\n'
+    fi
+    while IFS= read -r rule <&3; do
+        [[ -n "$rule" ]] || continue
+        if ufw allow "$rule"; then
+            in_list "$have" "$rule" || have+="$rule"$'\n'
+        else
+            warn "Не удалось вернуть правило UFW $rule."
+            rc=1
+        fi
+    done 3<<<"$FW_DELETED"
+    while IFS= read -r rule <&3; do
+        [[ -n "$rule" ]] || continue
+        if ufw delete allow "$rule"; then
+            have_remove "$rule"
+        else
+            warn "Не удалось снять правило UFW $rule."
+            rc=1
+        fi
+    done 3<<<"$FW_ADDED"
+    ledger_save || rc=1
+    FW_ADDED="" FW_DELETED=""
+    return "$rc"
+}
+
+# have_remove <правило> — убрать правило из списка have вызывающей функции.
+have_remove() {
+    have=$(printf '%s' "$have" | grep -vxF -- "$1")
+    [[ -z "$have" ]] || have+=$'\n'
 }
 
 # in_list <список «строка\n»> <строка> — строка есть в списке.
@@ -685,6 +727,7 @@ ledger_save() {
 # apply: пять последних операций и только текущий исполнитель.
 # teardown: все остальные операции и исполнители; свой каталог исполнителя
 # apply.sh удаляет после записи committed, от своей операции остаются status и log.
+# Операция с result=rollback_failed не удаляется: её backup/ — последняя копия.
 stage_cleanup() {
     local feature entry name webroot dir self
     parse_cert_entries "$RELEASE_CERTS" || return 1
@@ -711,6 +754,10 @@ stage_cleanup() {
     if [[ -d "$NODE_DIR/ops" ]]; then
         while IFS= read -r dir; do
             [[ "$(cd "$dir" && pwd -P)" == "$OP" ]] && continue
+            if grep -qx 'result=rollback_failed' "$dir/status" 2>/dev/null; then
+                warn "Оставляю операцию $(basename "$dir"): её откат не завершён."
+                continue
+            fi
             rm -rf -- "${dir%/}"
         done < <(if [[ "$OP_MODE" == teardown ]]; then
                      ls -1d "$NODE_DIR/ops"/*/ 2>/dev/null

@@ -28,6 +28,9 @@ RESULT=""
 ERROR=""
 TX_OPEN=false
 TX_PATHS=()
+# Свои правила UFW, добавленные и удалённые этой операцией («правило\n»).
+FW_ADDED=""
+FW_DELETED=""
 
 # status: запись целиком через tmp + mv.
 write_status() {
