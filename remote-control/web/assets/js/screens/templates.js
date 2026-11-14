@@ -20,7 +20,7 @@ import {
   droppedRanges, variantOptions, effectiveVariant, problemVariant, inVariant,
 } from './catalog-model.js';
 import {
-  settleDraft, draftDirty, unsavedChanges, saveTemplate, importTemplateFile, deleteLabel, deleteTemplate, editTemplateGroups, checkRunner,
+  settleDraft, draftDirty, unsavedChanges, saveTemplate, importTemplateFile, deleteLabel, deleteTemplate, editTemplateGroups, checkRunner, checkFresh,
   createTemplate, exportTemplate, offerLostDraft, confirmLeave,
 } from './templates-model.js';
 
@@ -83,20 +83,21 @@ function TemplateList({ ctx }) {
 
 /**
  * Проверка черновика: при открытии сразу, после правок и смены `revision`
- * (группы изменились) — через `CHECK_DELAY`; одновременно один запрос, отчёт
- * принимается только для текущего текста. `current` — отчёт относится к `text`.
+ * (группы изменились) — через `CHECK_DELAY`; одновременно один запрос. Запрос
+ * и отчёт связаны с парой текст/ревизия: отчёт принимается только для
+ * текущей пары, `current` — отчёт относится к ней (`checkFresh`).
  */
 function useCheck(ctx, name, text, revision) {
-  const [result, setResult] = useState(null); // null | { reply, text }
-  const latest = useRef(text);
-  latest.current = text;
+  const [result, setResult] = useState(null); // null | { reply, text, revision }
+  const latest = useRef({ text, revision });
+  latest.current = { text, revision };
   const ctxRef = useRef(ctx);
   ctxRef.current = ctx;
   const runner = useRef(null);
   if (runner.current === null) {
     runner.current = checkRunner(
-      (draft) => ctxRef.current.request(templateCheck(name), { input: templateInput(draft), quiet: true }),
-      (reply, draft) => { if (draft === latest.current) setResult({ reply, text: draft }); },
+      (job) => ctxRef.current.request(templateCheck(name), { input: templateInput(job.text), quiet: true }),
+      (reply, job) => { if (checkFresh(job, latest.current.text, latest.current.revision)) setResult({ reply, ...job }); },
     );
   }
   useEffect(() => () => runner.current.close(), []);
@@ -105,10 +106,10 @@ function useCheck(ctx, name, text, revision) {
     if (text === null) return undefined;
     const delay = first.current ? 0 : CHECK_DELAY;
     first.current = false;
-    const timer = setTimeout(() => runner.current.submit(text), delay);
+    const timer = setTimeout(() => runner.current.submit({ text, revision }), delay);
     return () => clearTimeout(timer);
   }, [text, revision]);
-  return { check: result && result.reply, current: result !== null && result.text === text };
+  return { check: result && result.reply, current: checkFresh(result, text, revision) };
 }
 
 const isSaveKey = (event) => (event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey

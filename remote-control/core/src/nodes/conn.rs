@@ -117,10 +117,20 @@ fn quoted_scalar(body: &str, quote: char) -> (String, usize) {
     (name, body.len() + 1)
 }
 
+/// The node's groups, each once (in order of first mention) with the union of
+/// its proxies over every entry of the node, each proxy once — the set
+/// `conn set` compares and generation uses.
 fn node_groups(config: &Config, node: &str) -> Value {
-    let groups: Vec<&ConnectionGroup> = config.connections.iter()
-        .filter(|connection| connection.node == node)
-        .flat_map(|connection| &connection.groups).collect();
+    let mut groups: Vec<ConnectionGroup> = Vec::new();
+    for group in config.connections.iter().filter(|connection| connection.node == node).flat_map(|connection| &connection.groups) {
+        let index = match groups.iter().position(|seen| seen.name == group.name) {
+            Some(index) => index,
+            None => { groups.push(ConnectionGroup { name: group.name.clone(), proxies: Vec::new() }); groups.len() - 1 }
+        };
+        for proxy in &group.proxies {
+            if !groups[index].proxies.contains(proxy) { groups[index].proxies.push(proxy.clone()); }
+        }
+    }
     json!(groups)
 }
 
@@ -536,6 +546,27 @@ mod tests {
         let connections = session.state.load_config().unwrap().connections;
         assert_eq!(connections[0].groups, vec![group("PC", &["p1", "p2", "p3"])]);
         assert_eq!(connections[1].groups, vec![group("ROUTER", &["r"])]);
+    }
+
+    #[test]
+    fn a_proxy_repeated_across_entries_is_one_assignment() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut session, _journal) = session(root.path());
+        let mut config = session.state.load_config().unwrap();
+        config.nodes = vec![node(1, "de", Auth::Key)];
+        config.connections = vec![
+            Connection { node: "de".into(), groups: vec![group("PC", &["vless-reality"])] },
+            Connection { node: "de".into(), groups: vec![group("PC", &["vless-reality", "hy2"]), group("ROUTER", &["r"])] },
+        ];
+        config.validate().unwrap();
+        session.state.save_config(&config).unwrap();
+        // Views see each group once with each proxy once.
+        assert_eq!(node_groups(&config, "de"), json!([{"name": "PC", "proxies": ["vless-reality", "hy2"]}, {"name": "ROUTER", "proxies": ["r"]}]));
+        // The same set: nothing to change (generation reads the union once).
+        let before = fingerprint(root.path());
+        let unchanged = set(&mut session, &invocation(&["conn", "set", "--name", "de", "--assign", "PC=hy2", "--assign", "PC=vless-reality"])).unwrap();
+        assert_eq!(unchanged["changed"], json!([]));
+        assert_eq!(fingerprint(root.path()), before);
     }
 
     #[test]

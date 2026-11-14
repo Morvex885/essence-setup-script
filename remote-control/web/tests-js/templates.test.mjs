@@ -3,7 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  settleDraft, draftDirty, unsavedChanges, saveTemplate, importTemplateFile, deleteLabel, deleteTemplate, editTemplateGroups, checkRunner,
+  settleDraft, draftDirty, unsavedChanges, saveTemplate, importTemplateFile, deleteLabel, deleteTemplate, editTemplateGroups, checkRunner, checkFresh,
   createTemplate, exportTemplate, offerLostDraft, confirmLeave, GROUPS_UNCHANGED, DRAFT_REPLACED,
 } from '../assets/js/screens/templates-model.js';
 import { TEMPLATE_FILE_UNREADABLE, DEFAULT_GROUP_HINT, DEFAULT_TEMPLATE } from '../assets/js/screens/catalog-model.js';
@@ -180,6 +180,14 @@ test('очередь проверок: один запрос, из ожидаю�
   assert.deepEqual(delivered, [['r:c', 'c']], 'после close ответы не доставляются');
   runner.submit('e');
   assert.deepEqual(started, ['a', 'c', 'd']);
+});
+
+test('отчёт проверки актуален только для текущих текста и ревизии групп', () => {
+  assert.equal(checkFresh(null, 'a', 0), false);
+  assert.equal(checkFresh({ text: 'a', revision: 0 }, 'a', 0), true);
+  assert.equal(checkFresh({ text: 'a', revision: 0 }, 'b', 0), false);
+  // Группы изменились, текст тот же: прежний отчёт и ответ прежней ревизии устарели.
+  assert.equal(checkFresh({ text: 'a', revision: 0 }, 'a', 1), false);
 });
 
 test('создание: форма → template create; отмена, сбой и имя созданного', async () => {

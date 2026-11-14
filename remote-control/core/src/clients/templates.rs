@@ -705,6 +705,14 @@ mod tests {
             "  строка 2: Маркер «GHOST»: группы с таким именем нет.",
         ]));
         assert_eq!(fingerprint(root.path()), before);
+        // A check stopped by its budget keeps the error of the variant without groups.
+        let flooded: String = std::iter::once("proxy-groups:\n".to_owned())
+            .chain((0..1005).map(|i| format!("  - {{name: g{i}, type: bogus}}\n"))).collect();
+        let error = import_text(&mut session, &["template", "import", "--name", "new"], Some(&flooded)).unwrap_err();
+        assert_eq!(error.code, "confirmation_required");
+        assert!(error.extra["plan"].as_array().unwrap().iter().any(|line| line.as_str().unwrap().contains("«proxies:»")),
+            "{}", error.extra["plan"]);
+        assert_eq!(fingerprint(root.path()), before);
         // Warnings alone need no plan.
         let many: String = (0..12).map(|i| format!("# --- G{i} ---\n# --- G{i} ---\n")).collect();
         let warned = format!("proxies:\n{many}");

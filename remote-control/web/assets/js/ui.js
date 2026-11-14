@@ -6,6 +6,7 @@ import { html, useEffect, useRef, useState } from '../vendor/preact-htm.js';
 import { readInputFile, asList } from './format.js';
 import { THEME_OPTIONS } from './theme.js';
 import { filterRows, cellText, allSelected, toggleVisible } from './table-model.js';
+import { tabEdges } from './focus-model.js';
 import { Icon } from './icons.js';
 
 // ─── Кнопки ──────────────────────────────────────────────────────────────────
@@ -416,17 +417,17 @@ const FOCUSABLE = 'button:not([disabled]), a[href], input:not([disabled]), selec
 
 /**
  * Tab и Shift+Tab по кругу внутри `root`; фокус снаружи (щелчок по фону)
- * возвращается на первый или последний элемент слоя.
+ * возвращается на первый или последний элемент слоя. Края — по настоящей
+ * последовательности Tab (`tabEdges`: radio-группа — одна остановка).
  */
 function trapTab(root, event) {
   const items = [...root.querySelectorAll(FOCUSABLE)].filter((item) => item.getClientRects().length > 0);
   const active = document.activeElement;
-  const first = items[0];
-  const last = items[items.length - 1];
+  const { atFirst, atLast, first, last } = tabEdges(items, active);
   if (!first) { event.preventDefault(); root.focus(); return; }
   if (!root.contains(active)) { event.preventDefault(); (event.shiftKey ? last : first).focus(); return; }
-  if (event.shiftKey && (active === first || active === root)) { event.preventDefault(); last.focus(); }
-  else if (!event.shiftKey && active === last) { event.preventDefault(); first.focus(); }
+  if (event.shiftKey && (atFirst || active === root)) { event.preventDefault(); last.focus(); }
+  else if (!event.shiftKey && atLast) { event.preventDefault(); first.focus(); }
 }
 
 /**

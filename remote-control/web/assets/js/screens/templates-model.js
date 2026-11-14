@@ -171,9 +171,19 @@ export async function editTemplateGroups(ctx, name) {
 }
 
 /**
+ * Отчёт проверки (`{ text, revision }`, с которыми он запрошен) относится к
+ * текущему тексту и текущей ревизии групп: при смене групп прежний отчёт и
+ * ответы запросов прежней ревизии устарели, даже если текст тот же.
+ */
+export function checkFresh(checked, text, revision) {
+  return checked !== null && checked !== undefined && checked.text === text && checked.revision === revision;
+}
+
+/**
  * Очередь проверок черновика: одновременно не больше одного запроса
- * `run(text)`, из ожидающих остаётся только последний текст. `deliver(reply,
- * text)` получает ответ, если за время запроса новый текст не пришёл.
+ * `run(job)` (`job` — текст с ревизией групп), из ожидающих остаётся только
+ * последний. `deliver(reply, job)` получает ответ, если за время запроса
+ * новый `job` не пришёл.
  * `close()` — экран ушёл, ответы больше не доставляются.
  */
 export function checkRunner(run, deliver) {

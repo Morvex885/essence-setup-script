@@ -16,6 +16,28 @@ const THEME_DARK = 'ace/theme/github_dark';
 const THEME_LIGHT = 'ace/theme/github_light_default';
 
 /**
+ * «Поиск в выделении» строки поиска Ace (Ctrl+F) — кнопка без фокуса и без
+ * сочетания клавиш в вендоренном `ext-searchbox`: сочетание добавляется
+ * обработчику клавиш строки поиска (общему для всех редакторов страницы), а
+ * кнопка получает подсказку с ним (`title`, `aria-keyshortcuts`).
+ */
+const SELECTION_SEARCH_KEY = { win: 'Alt-S', mac: 'Ctrl-Alt-S' };
+
+function selectionSearchKey(ace, instance) {
+  const { SearchBox } = ace.require('ace/ext/searchbox');
+  const keys = SearchBox.prototype.$searchBarKb;
+  // Та же команда с сочетанием: обработчик строки поиска вызывает `exec` найденной команды.
+  keys.addCommand({ name: 'searchInSelection', bindKey: SELECTION_SEARCH_KEY, exec: keys.commands.searchInSelection.exec });
+  const shortcut = instance.commands.platform === 'mac' ? 'Control+Alt+S' : 'Alt+S';
+  instance.commands.on('afterExec', (event) => {
+    const button = instance.searchBox && instance.searchBox.searchOption;
+    if (!button || (event.command.name !== 'find' && event.command.name !== 'replace')) return;
+    button.title = `Поиск в выделении (${shortcut.replace('Control', 'Ctrl')})`;
+    button.setAttribute('aria-keyshortcuts', shortcut);
+  });
+}
+
+/**
  * Редактор без обратной связи по тексту: `value` ставится при создании и
  * затем только при смене `version` (замена снаружи: сброс, импорт, новый
  * текст с сервера без черновика) — с сохранением позиции курсора. Иначе
@@ -60,6 +82,7 @@ export function AceEditor({ value, version = 0, onChange, annotations = [], drop
       theme: dark ? THEME_DARK : THEME_LIGHT,
     });
     instance.commands.removeCommands(UNAVAILABLE_COMMANDS);
+    selectionSearchKey(ace, instance);
     applying.current = true;
     instance.session.setValue(value ?? '');
     applying.current = false;

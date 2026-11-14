@@ -250,9 +250,11 @@ pub fn check(content: &str, groups: &[String]) -> Report {
             }
         };
         // A problem of a group variant may keep a copy of its tag (`merge`),
-        // as the variant does: charged before they are made.
-        let tag_bytes = tag.as_ref().map_or(0, |tag| tag.len().saturating_mul(list.len().saturating_add(1)));
-        if !budget.charge(0, tag_bytes) { break; }
+        // as the variant does: charged before they are made. The variant
+        // without groups has no tag to copy and is kept even after the
+        // budget ran out in it (a refused empty charge would drop it with
+        // its errors, and the import would pass without a plan).
+        if let Some(tag) = &tag && !budget.charge(0, tag.len().saturating_mul(list.len().saturating_add(1))) { break; }
         variants.push(Variant { tag, dropped });
         found.push(list);
     }
@@ -1040,6 +1042,16 @@ mod tests {
         assert!(report.truncated);
         assert!(codes(&report).iter().any(|(_, code, _)| *code == "check_limit"));
         assert!(report.warnings <= PROBLEM_BUDGET + 1, "{}", report.warnings);
+    }
+
+    #[test]
+    fn the_first_variant_keeps_its_errors_when_the_budget_runs_out() {
+        let content: String = std::iter::once("proxy-groups:\n".to_owned())
+            .chain((0..PROBLEM_BUDGET + 5).map(|i| format!("  - {{name: g{i}, type: bogus}}\n"))).collect();
+        let report = check(&content, &groups());
+        assert!(report.truncated && report.errors >= 1, "{:?}", codes(&report));
+        assert!(codes(&report).iter().any(|(_, code, variant)| *code == "proxies" && variant.is_none()));
+        assert_eq!(report.variants.len(), 1);
     }
 
     #[test]

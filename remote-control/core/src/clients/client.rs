@@ -52,8 +52,7 @@ fn connections_view(config: &Config, client: &Client) -> Value {
         match client.connections.iter().flatten().find(|c| c.node == node) {
             Some(own) => json!({"node": node, "mode": "own", "proxies": own.proxies}),
             None => {
-                let proxies: Vec<&String> = config.connections.iter().filter(|c| c.node == node)
-                    .flat_map(|c| &c.groups).filter(|g| g.name == client.group).flat_map(|g| &g.proxies).collect();
+                let proxies = super::generate::group_connections(config, &client.group, &node);
                 json!({"node": node, "mode": "group", "proxies": proxies})
             }
         }

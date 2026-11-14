@@ -232,7 +232,7 @@ Host-key callback сравнивает SHA256-отпечаток с явным �
 | `flows.js` | Подтверждение планом и коды решений (тот же алгоритм, что `tui/src/confirm.rs`) |
 | `format.js` | Форматирование, тексты ошибок, фильтр журнала |
 | `dialogs.js` | Модальные окна (`confirm`, `askSecret`, `ask`, `choose`, `toggle`, `form`, `show`, окно операции) |
-| `form-model.js`, `table-model.js` | Чистая логика форм `ctx.form` (значения, видимость, проверка) и поиска в таблицах |
+| `form-model.js`, `table-model.js`, `focus-model.js` | Чистая логика форм `ctx.form` (значения, видимость, проверка), поиска в таблицах и краёв круга Tab модальных слоёв (radio-группа — одна остановка) |
 | `ui.js`, `icons.js` | Компоненты (`Layout`, `Page`, `DataTable`, `MoreMenu`, `Card`, `Facts`, `Badge`, `Chips`, `Empty`, `Snackbars`, …) и иконки |
 | `template-editor.js` | Редактор YAML на Ace: текст задаётся при создании и при смене `version` (замена снаружи), отметки проблем `template check`, приглушение строк варианта |
 | `terminal.js` | Терминал нод на xterm |
@@ -265,7 +265,7 @@ Host-key callback сравнивает SHA256-отпечаток с явным �
 | `web/tests/listener.rs` | Заголовки, Host, Origin, WebSocket, остановка, отпечаток |
 | `tui/tests/boundary.rs`, `tui/src/*` | Границы крейтов; экраны на `ScriptedClient`/`ScriptedUi` (argv по клавишам, подтверждения, код → флаг, пустые и ошибочные состояния, отсутствие секретов в argv и кадрах) |
 | `core/tests/protocols_golden.rs`, `core/tests/ssh_wire.rs`, `core/tests/ssh_e2e.rs` | Golden билдеров; loopback SSH/SFTP на сервере russh; OpenSSH-сценарий |
-| `web/tests-js/*.test.mjs` | Модели экранов, `flows.js`, `format.js`, `protocol.js`, `session.js`, `router.js`, `theme.js`, `form-model.js`, `table-model.js` (`node --test`, Node 22, без зависимостей) |
+| `web/tests-js/*.test.mjs` | Модели экранов, `flows.js`, `format.js`, `protocol.js`, `session.js`, `router.js`, `theme.js`, `form-model.js`, `table-model.js`, `focus-model.js` (`node --test`, Node 22, без зависимостей) |
 
 CI (`.github/workflows/tests.yml`): `cargo test --workspace --locked` идёт на `ubuntu-latest`, `windows-latest`, `macos-latest` (job `rust-test`); сборка 9 целей релиза — job `rust-build`; OpenSSH-сценарий с Debian sshd (`tests/ci/ssh_e2e.sh`) — job `rust-ssh-e2e`; JS-тесты панели — job `web-js-test`.
 

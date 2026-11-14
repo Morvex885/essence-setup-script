@@ -263,14 +263,21 @@ fn group_scope_nodes(config: &Config, group: &str) -> Vec<String> {
     nodes
 }
 
+/// A node may have several entries (client-owned or group connections): the
+/// union of their proxies, each once in order of first mention — a repeat
+/// would put the same proxy block into the client config twice.
 fn own_connections(client: &Client, node: &str) -> Vec<String> {
-    client.connections.iter().flatten().filter(|c| c.node == node).flat_map(|c| c.proxies.iter().cloned()).collect()
+    let mut proxies = Vec::new();
+    push_unique(&mut proxies, client.connections.iter().flatten().filter(|c| c.node == node).flat_map(|c| c.proxies.iter().cloned()));
+    proxies
 }
 
-fn group_connections(config: &Config, group: &str, node: &str) -> Vec<String> {
-    config.connections.iter().filter(|c| c.node == node)
+pub(crate) fn group_connections(config: &Config, group: &str, node: &str) -> Vec<String> {
+    let mut proxies = Vec::new();
+    push_unique(&mut proxies, config.connections.iter().filter(|c| c.node == node)
         .flat_map(|c| c.groups.iter().filter(|g| g.name == group))
-        .flat_map(|g| g.proxies.iter().cloned()).collect()
+        .flat_map(|g| g.proxies.iter().cloned()));
+    proxies
 }
 
 /// Connections a client uses on a node: its own when set, else its group's.
@@ -983,6 +990,23 @@ mod tests {
         let (out, _) = proxies(&config_x, "my-router", &["de"], &fetched(&[("de", xhttp)]));
         let out = out.unwrap();
         assert!(out.contains(&format!("uuid: {ROUTER_UUID}")) && out.contains("client-fingerprint: firefox") && !out.contains("chrome"));
+    }
+
+    #[test]
+    fn a_proxy_repeated_across_entries_of_a_node_is_used_once() {
+        let root = tempfile::tempdir().unwrap();
+        let (session, _) = fixture(root.path());
+        let config = session.state.load_config().unwrap();
+        let cache = fetched(&[("de", SAMPLE)]);
+        let (single, _) = proxies(&config, "my-router", &["de"], &cache);
+        // A second entry of `de` names ROUTER's proxies again (overlapping sets).
+        let mut split = config.clone();
+        split.connections.push(connection("de", &[("ROUTER", &["hy2-main", "vless-reality"])]));
+        split.validate().unwrap();
+        assert_eq!(group_connections(&split, "ROUTER", "de"), ["vless-reality", "hy2-main"]);
+        let (out, _) = proxies(&split, "my-router", &["de"], &cache);
+        assert_eq!(out, single);
+        assert!(duplicate_names(&out.unwrap()).is_empty());
     }
 
     #[test]
