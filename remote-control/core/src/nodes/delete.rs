@@ -481,7 +481,7 @@ mod tests {
             ScriptStep::exec(crate::server::apply::probe_command(&node), 0, COMMAND_TIMEOUT, ok("os=debian\nsystemd=yes\n", 0)),
             ScriptStep::exec(agent_reset_command(), 0, COMMAND_TIMEOUT, ok("", 0)),
             ScriptStep::upload_any_local(crate::server::bundle::agent_dir(), crate::nodes::LONG_TIMEOUT, Ok(())),
-            ScriptStep::upload_any_local(format!("/root/essence-node/ops/{op}"), crate::nodes::LONG_TIMEOUT, Ok(())),
+            ScriptStep::upload_private_any_local(format!("/root/essence-node/ops/{op}"), crate::nodes::LONG_TIMEOUT, Ok(())),
             ScriptStep::exec(start_command(&op), 0, COMMAND_TIMEOUT, ok("", 0)),
             ScriptStep::exec(status_command(&op), 0, COMMAND_TIMEOUT, ok(result, 0)),
         ]

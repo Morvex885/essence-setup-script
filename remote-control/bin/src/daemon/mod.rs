@@ -646,6 +646,9 @@ mod tests {
         async fn upload(&self, _: &std::path::Path, _: &str, _: Duration) -> rc_core::error::Result<()> {
             Err(rc_core::transport::remote_failure("unused"))
         }
+        async fn upload_private(&self, _: &std::path::Path, _: &str, _: Duration) -> rc_core::error::Result<()> {
+            Err(rc_core::transport::remote_failure("unused"))
+        }
     }
 
     impl rc_core::transport::RemoteTransport for Endless {

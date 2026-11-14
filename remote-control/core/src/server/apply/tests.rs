@@ -90,7 +90,7 @@ fn start_steps(op: &str) -> Vec<ScriptStep> {
     vec![
         exec(agent_reset_command(), ""),
         ScriptStep::upload_any_local(agent_dir(), LONG_TIMEOUT, Ok(())),
-        ScriptStep::upload_any_local(ops_dir(op), LONG_TIMEOUT, Ok(())),
+        ScriptStep::upload_private_any_local(ops_dir(op), LONG_TIMEOUT, Ok(())),
         exec(start_command(op), ""),
     ]
 }
