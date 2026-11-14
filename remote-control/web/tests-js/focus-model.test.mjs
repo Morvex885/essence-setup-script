@@ -34,3 +34,14 @@ test('radio-группа в конце: последняя остановка; �
   const other = { ...radio('mode', 'z'), form: {} };
   assert.equal(tabEdges([other, name, x, y], x).atFirst, false);
 });
+
+test('элемент между вариантами группы — своя остановка: края по месту отмеченного варианта', () => {
+  const [r1, r2] = [radio('auth', 'key'), radio('auth', 'password', true)];
+  const [middle, submit] = [button('middle'), button('submit')];
+  const items = [r1, middle, r2, submit];
+  // Остановки: middle, r2, submit — первая middle, r1 пропускается.
+  assert.deepEqual(tabEdges(items, middle), { atFirst: true, atLast: false, first: middle, last: submit });
+  const fromRadio = tabEdges(items, r2);
+  assert.deepEqual([fromRadio.atFirst, fromRadio.atLast], [false, false], 'с r2 Shift+Tab идёт на middle, а не через край');
+  assert.equal(tabEdges(items, submit).atLast, true);
+});

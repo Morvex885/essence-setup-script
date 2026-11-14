@@ -12,7 +12,20 @@ function stopOf(item, items) {
   return items.filter((other) => other.type === 'radio' && other.name === item.name && other.form === item.form);
 }
 
-const entry = (stop, backward) => stop.find((item) => item.checked) || (backward ? stop[stop.length - 1] : stop[0]);
+/**
+ * Остановки Tab в порядке документа: из radio-группы — только её отмеченный
+ * вариант на его месте; без отмеченного — первый вариант (вперёд) или
+ * последний (назад). Элементы между вариантами группы остаются остановками.
+ */
+function stops(items, backward) {
+  return items.filter((item) => {
+    const group = stopOf(item, items);
+    if (group.length === 1) return true;
+    const checked = group.find((other) => other.checked);
+    if (checked) return item === checked;
+    return item === (backward ? group[group.length - 1] : group[0]);
+  });
+}
 
 /**
  * Края круга Tab: `atFirst`/`atLast` — `active` в первой/последней остановке
@@ -21,12 +34,14 @@ const entry = (stop, backward) => stop.find((item) => item.checked) || (backward
  */
 export function tabEdges(items, active) {
   if (items.length === 0) return { atFirst: false, atLast: false, first: null, last: null };
-  const firstStop = stopOf(items[0], items);
-  const lastStop = stopOf(items[items.length - 1], items);
+  const forward = stops(items, false);
+  const backward = stops(items, true);
+  const first = forward[0];
+  const last = backward[backward.length - 1];
   return {
-    atFirst: firstStop.includes(active),
-    atLast: lastStop.includes(active),
-    first: entry(firstStop, false),
-    last: entry(lastStop, true),
+    atFirst: stopOf(backward[0], items).includes(active),
+    atLast: stopOf(forward[forward.length - 1], items).includes(active),
+    first,
+    last,
   };
 }
