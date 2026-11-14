@@ -433,6 +433,23 @@ async fn a_timeout_keeps_the_operation_for_the_next_apply() {
     assert_eq!(config(&session).nodes[0].operation.as_ref().map(|operation| operation.id.as_str()), Some(OP));
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_missing_reality_key_fails_the_node_with_the_way_back() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut session, _journal) = fixture(root.path());
+    let de = node(1, "de");
+    session.state.secret_store().remove(&format!("node:{}:reality-key", de.id)).unwrap();
+    let hosts = Hosts::new(vec![vec![connect_step(&de, Ok(())), probe_step(&de, DEBIAN)]]);
+    let error = run(&mut session, &hosts, &["node", "apply", "--name", "de", "--yes"]).await.unwrap_err();
+    hosts.finish();
+    assert_eq!(hosts.uploads(), 0);
+    let failed = &error.extra["failed"][0];
+    assert_eq!((failed["stage"].as_str(), failed["code"].as_str()), (Some("start"), Some("missing_secret")));
+    let message = failed["message"].as_str().unwrap();
+    assert!(message.contains("source github-fetch") && message.contains("node delete --name de --scope local"), "{message}");
+    assert!(config(&session).nodes[0].operation.is_none());
+}
+
 #[test]
 fn probe_output_parses() {
     let probe = parse_probe("os=\"ubuntu\"\r\nsystemd=yes\nsshd=2222\nagent=ok\nlisten udp 0.0.0.0:51820\nlisten tcp [::]:443\n\

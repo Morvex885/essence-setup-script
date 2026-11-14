@@ -265,10 +265,25 @@ fn node_secrets(state: &State, config: &Config, node: &Node) -> Result<NodeSecre
     let mut secrets = NodeSecrets::default();
     if needs_reality {
         let id = format!("node:{}:reality-key", node.id);
-        secrets.reality_key = Some(store.get(&id)?.ok_or_else(|| RcError::new("missing_secret",
-            format!("Ключ Reality ноды «{}» не сохранён.", node.name)).with_extra("name", node.name.clone()))?);
+        let missing = || RcError::new("missing_secret", missing_reality_key(&node.name)).with_extra("name", node.name.clone());
+        secrets.reality_key = Some(match store.get(&id) {
+            Ok(Some(key)) => key,
+            Ok(None) => return Err(missing()),
+            Err(error) if error.code == "missing_secret" => return Err(missing()),
+            Err(error) => return Err(error),
+        });
     }
     Ok(secrets)
+}
+
+/// A Reality key absent or not decryptable here. The key is generated once
+/// with the node's parameters, so the ways back are the GitHub vault copy or
+/// a node added anew (new keys, clients regenerated).
+fn missing_reality_key(name: &str) -> String {
+    format!("Ключ Reality ноды «{name}» отсутствует или не расшифровывается на этом устройстве. \
+        При хранении в GitHub загрузите конфигурацию заново (source github-fetch) — ключ восстановится из хранилища. \
+        Иначе удалите ноду только из remote-control (node delete --name {name} --scope local), добавьте её снова \
+        с профилем и примените: будут созданы новые ключи, конфигурации клиентов нужно сгенерировать заново.")
 }
 
 /// The local operation directory: `spec.sh`, the lists and `files/<path>`.
