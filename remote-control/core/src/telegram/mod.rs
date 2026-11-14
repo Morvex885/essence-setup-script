@@ -449,10 +449,13 @@ fn report<T>(session: &mut Session, action: Action, targets: &[Target<T>], outco
 }
 
 /// The plan of `telegram menu` on a node whose scripts are missing, older
-/// than the embedded kit or damaged; the bundle SHA-256 and VERSION are part
-/// of the token, as in the batch plan.
-fn menu_upload_plan(node: &str, version: &str) -> Result<Plan> {
-    Ok(Plan::new(vec![format!("На ноду «{node}» будут загружены скрипты v{version}.")], format!("{} {version}", bundle_sha256()?)))
+/// than the embedded kit or damaged. The line names the node with its address
+/// (as the batch plan); the token also binds the node id and address, the
+/// bundle SHA-256 and VERSION: a node re-created under the same name
+/// invalidates an agreed token (`plan_changed`).
+fn menu_upload_plan(node: &Node, version: &str) -> Result<Plan> {
+    let line = format!("На ноду «{}» ({}:{}) будут загружены скрипты v{version}.", node.name, node.ip, node.port);
+    Ok(Plan::new(vec![line], format!("{} {}:{} {} {version}", node.id, node.ip, node.port, bundle_sha256()?)))
 }
 
 /// `telegram menu --name N`: the server Telegram Proxy menu on a remote
@@ -478,7 +481,7 @@ pub async fn menu_prepare<T: RemoteTransport>(session: &mut Session, invocation:
             .with_extra("name", node.name.as_str())),
     };
     if !current {
-        menu_upload_plan(&node.name, &scripts::format_version(local))?.confirm(invocation)?;
+        menu_upload_plan(&node, &scripts::format_version(local))?.confirm(invocation)?;
         if scripts::ensure_current(&transport, &node.name).await? {
             session.log(Level::Info, &format!("Скрипты на ноде «{}» обновлены.", node.name));
         }
@@ -759,10 +762,11 @@ mod tests {
         let error = run_menu(&mut session, &connect, &mut TestConsole::default()).unwrap_err();
         assert_eq!((error.code, error.exit_code()), ("confirmation_required", 2));
         let version = scripts::local_version().unwrap();
-        assert_eq!(error.extra["plan"], json!([format!("На ноду «alpha» будут загружены скрипты v{version}.")]));
+        assert_eq!(error.extra["plan"], json!([format!("На ноду «alpha» (203.0.113.7:2222) будут загружены скрипты v{version}.")]));
         let token = error.extra["plan_token"].as_str().unwrap().to_owned();
         let parsed = invocation(&["telegram", "menu", "--name", "alpha"]);
-        assert_eq!(token, menu_upload_plan("alpha", &version).unwrap().token(&parsed.noun, &parsed.verb, parsed.confirmation_args()));
+        let alpha = session.state.load_config().unwrap().nodes.into_iter().find(|node| node.name == "alpha").unwrap();
+        assert_eq!(token, menu_upload_plan(&alpha, &version).unwrap().token(&parsed.noun, &parsed.verb, parsed.confirmation_args()));
         observers[0].assert_finished();
         assert!(!observers[0].journal().iter().any(|op| matches!(op, Operation::Upload { .. })));
 
@@ -776,6 +780,28 @@ mod tests {
         observers[0].assert_finished();
         assert_eq!(console.0, b"MENU");
         assert!(journal.borrow().contains(&(Level::Info, "Скрипты на ноде «alpha» обновлены.".to_owned())));
+
+        // «alpha» deleted and re-added with another id and address: the old
+        // token no longer matches — `plan_changed`, nothing uploaded, no menu.
+        let mut config = session.state.load_config().unwrap();
+        let readded = config.nodes.iter_mut().find(|node| node.name == "alpha").unwrap();
+        readded.id = format!("{:032x}", 99);
+        readded.ip = "198.51.100.9".into();
+        readded.port = 22;
+        session.state.save_config(&config).unwrap();
+        pin(&session.state, "198.51.100.9", 22, vec![pin_fp()]).unwrap();
+        let connect_new = ScriptStep::connect(
+            ConnectExpectation::new("198.51.100.9", 22, "root", AuthMethod::System, CONNECT_TIMEOUT)
+                .with_host_key(HostKeyPolicy { expected: None, known: vec![pin_fp()] }),
+            Ok(()),
+        );
+        let (connect, observers) = transports(vec![vec![connect_new, missing()]]);
+        let error = run_menu_argv(&mut session, &argv, &connect, &mut TestConsole::default()).unwrap_err();
+        assert_eq!(error.code, "plan_changed");
+        assert_eq!(error.extra["plan"], json!([format!("На ноду «alpha» (198.51.100.9:22) будут загружены скрипты v{version}.")]));
+        assert_ne!(error.extra["plan_token"].as_str().unwrap(), token);
+        observers[0].assert_finished();
+        assert!(!observers[0].journal().iter().any(|op| matches!(op, Operation::Upload { .. })));
     }
 
     #[test]
