@@ -40,9 +40,13 @@ write_status() {
 }
 
 # После записи результата в каталоге операции остаются только status и log:
-# files/ и backup/ содержат ключи и пароли.
+# files/ и backup/ содержат ключи и пароли, mihomo.new — скачанный бинарник.
+# После незавершённого отката backup/ остаётся: это последняя копия прежних файлов.
 scrub_op() {
-    rm -rf -- "$OP/files" "$OP/backup"
+    rm -rf -- "$OP/files" "$OP/mihomo.new"
+    if [[ "$RESULT" != rollback_failed ]]; then
+        rm -rf -- "$OP/backup"
+    fi
 }
 
 stage() {
@@ -65,8 +69,12 @@ finish() {
     if [[ -z "$RESULT" ]]; then
         ERROR="${ERROR:-$STAGE}"
         if [[ "$TX_OPEN" == true ]]; then
-            tx_rollback
-            RESULT=rolled_back
+            if tx_rollback; then
+                RESULT=rolled_back
+            else
+                RESULT=rollback_failed
+                warn "Откат не завершён: резервные копии сохранены в $OP/backup."
+            fi
         else
             RESULT=failed
         fi
@@ -98,7 +106,10 @@ if [[ ! -f "$AGENT_DIR/MANIFEST" ]]; then
     warn "Нет MANIFEST исполнителя."
     exit 1
 fi
-mapfile -t _steps < <(awk '$2 ~ /^steps\/[A-Za-z0-9_.-]+\.sh$/ { print $2 }' "$AGENT_DIR/MANIFEST" | sort -u)
+_steps=()
+while IFS= read -r _step; do
+    _steps+=("$_step")
+done < <(awk '$2 ~ /^steps\/[A-Za-z0-9_.-]+\.sh$/ { print $2 }' "$AGENT_DIR/MANIFEST" | sort -u)
 for _step in "${_steps[@]}"; do
     # shellcheck source=/dev/null
     source "$AGENT_DIR/$_step" || exit 1
@@ -149,6 +160,9 @@ case "$OP_MODE" in
         ;;
 esac
 
+# Транзакция, открытая этапом config, закрывается только здесь: сбой firewall
+# или cleanup откатывает конфигурацию.
+TX_OPEN=false
 RESULT=committed
 write_status
 scrub_op

@@ -67,10 +67,10 @@ OP_ID='op1'
 OP_MODE='${MODE:-apply}'
 SSH_PORTS='${SSH_PORTS_SPEC:-2222}'
 LISTEN_TCP='443 8443'
-MIHOMO_VERSION='v1.19.18'
+MIHOMO_VERSION='${MIHOMO_SPEC:-v1.19.18}'
 NGINX='${NGINX_ON:-false}'
 NGINX_STREAM='false'
-SITE_NAME=''
+SITE_NAME='${SITE-}'
 SITE_SOURCE=''
 SITE_REQUIRE_200=''
 CERTS=''
@@ -168,7 +168,7 @@ assert_scrubbed() {
     printf '8443/tcp\n51820/udp\n' >"$ROOT/root/essence-node/ufw-rules"
     RULES="443/tcp 51820/udp" write_spec
     add_file /etc/mihomo/config.yaml "new"
-    run_agent
+    UFW_ADDED="ufw allow 51820/udp" run bash "$AGENT/apply.sh" "$OPDIR"
     assert_success
     grep -qx "ufw allow 443/tcp" "$CALLS"
     grep -qx "ufw delete allow 8443/tcp" "$CALLS"
@@ -348,7 +348,7 @@ exit 0'
         run_agent
         assert_failure
         run status
-        assert_line "result=failed"
+        assert_line "result=rolled_back"
         assert_line "error=cleanup"
         [[ -d "$ROOT/var/www/a" && -d "$ROOT/var/www/keep" ]]
     done
@@ -465,4 +465,108 @@ exit 0'
     assert_line "result=failed"
     assert_line "error=config"
     [[ -f "$ROOT/etc/nginx/modules-enabled/other.conf" ]]
+}
+
+@test "учтённое правило, которого нет в UFW, добавляется заново" {
+    printf '443/tcp\n' >"$ROOT/root/essence-node/ufw-rules"
+    add_file /etc/mihomo/config.yaml "new"
+    run_agent
+    assert_success
+    grep -qx "ufw allow 443/tcp" "$CALLS"
+    [[ "$(cat "$ROOT/root/essence-node/ufw-rules")" == 443/tcp ]]
+}
+
+@test "сбой ufw allow откатывает конфигурацию" {
+    stub ufw 'case "$1" in
+    status) echo "Status: active" ;;
+    allow) exit 1 ;;
+esac
+exit 0'
+    printf 'old\n' >"$ROOT/etc/mihomo/config.yaml"
+    add_file /etc/mihomo/config.yaml "new"
+    run_agent
+    assert_failure
+    run status
+    assert_line "result=rolled_back"
+    assert_line "error=firewall"
+    [[ "$(cat "$ROOT/etc/mihomo/config.yaml")" == old ]]
+    assert_scrubbed
+}
+
+@test "сбой ufw delete в teardown возвращает mihomo и конфигурацию" {
+    stub ufw 'case "$1" in
+    status) echo "Status: active" ;;
+    delete) exit 1 ;;
+esac
+exit 0'
+    printf '443/tcp\n' >"$ROOT/root/essence-node/ufw-rules"
+    printf 'cfg\n' >"$ROOT/etc/mihomo/config.yaml"
+    MODE=teardown RULES="" write_spec
+    printf '/etc/mihomo\n' >"$OPDIR/remove.list"
+    run_agent
+    assert_failure
+    run status
+    assert_line "result=rolled_back"
+    assert_line "error=firewall"
+    [[ "$(cat "$ROOT/etc/mihomo/config.yaml")" == cfg && -x "$ROOT/usr/local/bin/mihomo" ]]
+    grep -qx "systemctl enable mihomo" "$CALLS"
+}
+
+@test "незавершённый откат пишет rollback_failed и сохраняет backup" {
+    # cp отказывает после sysctl этапа config: восстановление файла не удаётся.
+    local real_cp flag="$BATS_TEST_TMPDIR/cp-fail"
+    real_cp=$(command -v cp)
+    stub cp "[[ -e '$flag' ]] && exit 1
+exec '$real_cp' \"\$@\""
+    stub sysctl ": >'$flag'"
+    printf 'old\n' >"$ROOT/etc/mihomo/config.yaml"
+    add_file /etc/mihomo/config.yaml "new"
+    MIHOMO_T_RC=1 run bash "$AGENT/apply.sh" "$OPDIR"
+    assert_failure
+    run status
+    assert_line "result=rollback_failed"
+    assert_line "error=config"
+    [[ "$(cat "$OPDIR/backup/etc/mihomo/config.yaml")" == old ]]
+    [[ ! -e "$OPDIR/files" ]]
+    grep -qF "Откат не завершён" "$OPDIR/log"
+}
+
+@test "новый бинарник mihomo заменяется в транзакции и возвращается откатом" {
+    # curl отдаёт «новый» mihomo, у которого проверка конфигурации падает.
+    cat >"$STUBS/curl" <<'SH'
+#!/bin/bash
+printf 'curl %s\n' "$*" >>"$CALLS"
+if [[ "$1" == -fLo ]]; then
+    printf '#!/bin/bash\nprintf "new-mihomo %%s\\n" "$*" >>"$CALLS"\n[[ "$1" == -t ]] && exit 1\nexit 0\n' | gzip >"$2"
+fi
+exit 0
+SH
+    chmod +x "$STUBS/curl"
+    local bin="$ROOT/usr/local/bin/mihomo"
+    cp "$bin" "$BATS_TEST_TMPDIR/old-mihomo"
+    MIHOMO_SPEC=v1.20.0 write_spec
+    add_file /etc/mihomo/config.yaml "new"
+    run_agent
+    assert_failure
+    run status
+    assert_line "result=rolled_back"
+    assert_line "error=config"
+    grep -q "^new-mihomo -t" "$CALLS"
+    cmp -s "$bin" "$BATS_TEST_TMPDIR/old-mihomo"
+    [[ ! -e "$bin.new" && ! -e "$OPDIR/mihomo.new" ]]
+    assert_scrubbed
+}
+
+@test "чужой сайт без .essence-site не заменяется" {
+    mkdir -p "$ROOT/var/www/shop.example"
+    printf 'shop\n' >"$ROOT/var/www/shop.example/index.html"
+    SITE=shop.example write_spec
+    add_file /etc/mihomo/config.yaml "new"
+    run_agent
+    assert_failure
+    run status
+    assert_line "result=failed"
+    assert_line "error=site"
+    [[ "$(cat "$ROOT/var/www/shop.example/index.html")" == shop ]]
+    ! grep -q "^wget" "$CALLS"
 }

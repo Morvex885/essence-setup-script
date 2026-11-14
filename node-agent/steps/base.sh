@@ -99,24 +99,36 @@ stage_mihomo() {
             fi
             ;;
     esac
-    local download_dir
+    # Бинарник только скачивается в каталог операции; заменяет его этап config
+    # внутри транзакции, чтобы откат вернул прежнюю версию.
+    local download_dir staged="$OP/mihomo.new"
     download_dir=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/essence-mihomo.XXXXXX") || {
         warn "Не удалось подготовить временный каталог для Mihomo."
         return 1
     }
-    mkdir -p "$(dirname "$bin")" || { rm -rf -- "$download_dir"; return 1; }
     if ! curl -fLo "$download_dir/mihomo.gz" \
         "https://github.com/MetaCubeX/mihomo/releases/download/${latest}/mihomo-linux-${arch}-${latest}.gz" ||
        ! gunzip -f "$download_dir/mihomo.gz" ||
-       ! mv "$download_dir/mihomo" "$bin.new" ||
-       ! chmod 0755 "$bin.new" ||
-       ! mv -f "$bin.new" "$bin"; then
+       ! mv -f "$download_dir/mihomo" "$staged" ||
+       ! chmod 0755 "$staged"; then
         rm -rf -- "$download_dir"
-        rm -f -- "$bin.new"
-        warn "Не удалось скачать или установить бинарник Mihomo."
+        rm -f -- "$staged"
+        warn "Не удалось скачать бинарник Mihomo."
         return 1
     fi
     rm -rf -- "$download_dir"
+}
+
+# install_mihomo — заменить бинарник скачанным этапом mihomo (если есть).
+install_mihomo() {
+    local staged="$OP/mihomo.new" bin="$R$MIHOMO_BIN_REL"
+    [[ -f "$staged" ]] || return 0
+    (umask 022; mkdir -p "$(dirname "$bin")") || return 1
+    if ! mv -f -- "$staged" "$bin.new" || ! chmod 0755 "$bin.new" || ! mv -f -- "$bin.new" "$bin"; then
+        rm -f -- "$bin.new"
+        warn "Не удалось установить бинарник Mihomo."
+        return 1
+    fi
 }
 
 # ─── dns ────────────────────────────────────────────────────────────────────
@@ -285,6 +297,11 @@ stage_site() {
     (umask 022; mkdir -p "$www") || return 1
     mkdir -p "$R/etc/nginx/ssl/$SITE_NAME" || return 1
     [[ -e "$www/.essence-site" ]] && return 0
+    # Каталог без отметки с содержимым — чужой сайт: site_fetch стёр бы его без копии.
+    if [[ -n "$(ls -A -- "$www")" ]]; then
+        warn "В /var/www/$SITE_NAME уже есть сайт без отметки Essence — не заменяю."
+        return 1
+    fi
     site_fetch "$SITE_SOURCE" "$www" || return 1
     (umask 022; : >"$www/.essence-site") || return 1
 }
@@ -402,19 +419,22 @@ tx_backup() {
     TX_PATHS+=("$path")
 }
 
+# tx_restore_files — вернуть все пути транзакции; код 1, если хоть один не вернулся.
 tx_restore_files() {
-    local path dest bak
+    local path dest bak rc=0
     for path in "${TX_PATHS[@]}"; do
         dest="$R$path"
         bak="$OP/backup$path"
         if [[ -e "$bak.absent" ]]; then
-            rm -rf -- "$dest"
+            rm -rf -- "$dest" || rc=1
         elif [[ -e "$bak" || -L "$bak" ]]; then
-            rm -rf -- "$dest"
-            mkdir -p "$(dirname "$dest")"
-            cp -a -- "$bak" "$dest"
+            if ! rm -rf -- "$dest" || ! mkdir -p "$(dirname "$dest")" || ! cp -a -- "$bak" "$dest"; then
+                warn "Не удалось восстановить $path."
+                rc=1
+            fi
         fi
     done
+    return "$rc"
 }
 
 # port_handover <restart|reload|none> — mihomo остановлен, пока nginx занимает
@@ -458,11 +478,13 @@ listen_ready() {
     return 1
 }
 
-# Откат: вызывается из finish() при открытой транзакции.
+# Откат: вызывается из finish() при открытой транзакции. Код 1 — не все файлы
+# вернулись (тогда finish сохраняет backup/); службы и фичи — по возможности:
+# на новой ноде прежнего mihomo нет, и его запуск не может удаться.
 tx_rollback() {
-    local feature nginx_action=none
+    local feature nginx_action=none rc=0
     warn "Откат изменений."
-    tx_restore_files
+    tx_restore_files || rc=1
     systemctl daemon-reload
     if [[ "$OP_MODE" == teardown ]]; then
         systemctl enable mihomo
@@ -478,6 +500,7 @@ tx_rollback() {
         feature_hook "$feature" rollback
     done
     TX_OPEN=false
+    return "$rc"
 }
 
 # read_list <файл> — пути без пустых строк.
@@ -539,6 +562,9 @@ stage_config() {
     for path in "${removes[@]}"; do
         tx_backup "$path" || return 1
     done
+    if [[ -f "$OP/mihomo.new" ]]; then
+        tx_backup "$MIHOMO_BIN_REL" || return 1
+    fi
 
     for path in "${entries[@]}"; do
         read -r mode owner group path <<<"$path"
@@ -547,6 +573,7 @@ stage_config() {
     for path in "${removes[@]}"; do
         rm -rf -- "$R$path" || return 1
     done
+    install_mihomo || return 1
 
     sysctl --system >/dev/null || return 1
     "$R$MIHOMO_BIN_REL" -t -d "$R/etc/mihomo" -f "$R/etc/mihomo/config.yaml" || return 1
@@ -569,7 +596,6 @@ stage_config() {
     for feature in $FEATURES; do
         feature_hook "$feature" activate || return 1
     done
-    TX_OPEN=false
 }
 
 stage_teardown_config() {
@@ -600,20 +626,20 @@ stage_teardown_config() {
             net.ipv6.conf.lo.disable_ipv6=0 >/dev/null || return 1
         sysctl --system >/dev/null || return 1
     fi
-    TX_OPEN=false
 }
 
 # ─── firewall ───────────────────────────────────────────────────────────────
 # stage_firewall "<правила>" — учёт своих правил в $NODE_DIR/ufw-rules.
 # Правило, которое уже было в `ufw show added` до нас, принадлежит
-# администратору: в учёт не попадает и нами не удаляется. Учёт сохраняется
-# после каждого изменения UFW, чтобы сбой посреди этапа не терял свои правила.
+# администратору: в учёт не попадает и нами не удаляется. Учтённое правило,
+# которого в UFW больше нет, добавляется заново. Учёт сохраняется после
+# каждого изменения UFW, чтобы сбой посреди этапа не терял свои правила.
+# Списки have/want — строки «правило\n» (без ассоциативных массивов).
 stage_firewall() {
-    local ledger="$NODE_DIR/ufw-rules" rule added="" wanted=()
-    local -A have=() want=()
+    local ledger="$NODE_DIR/ufw-rules" rule added="" wanted=() have="" want="" snapshot
     if [[ -f "$ledger" ]]; then
         while IFS= read -r rule; do
-            [[ -n "$rule" ]] && have["$rule"]=1
+            [[ -n "$rule" ]] && ! in_list "$have" "$rule" && have+="$rule"$'\n'
         done <"$ledger"
     fi
     read -r -a wanted <<<"$1"
@@ -621,32 +647,37 @@ stage_firewall() {
         added=$(ufw show added 2>/dev/null) || { warn "Не удалось прочитать правила UFW."; return 1; }
     fi
     for rule in "${wanted[@]}"; do
-        want["$rule"]=1
-        [[ -n "${have[$rule]:-}" ]] && continue
+        want+="$rule"$'\n'
         if grep -qxF -- "ufw allow $rule" <<<"$added"; then
-            info "Правило UFW $rule уже было добавлено вручную — не учитываю."
+            in_list "$have" "$rule" ||
+                info "Правило UFW $rule уже было добавлено вручную — не учитываю."
             continue
         fi
         ufw allow "$rule" || return 1
-        have["$rule"]=1
+        in_list "$have" "$rule" && continue
+        have+="$rule"$'\n'
         ledger_save || return 1
     done
-    for rule in "${!have[@]}"; do
-        [[ -n "${want[$rule]:-}" ]] && continue
+    snapshot="$have"
+    while IFS= read -r rule <&3; do
+        [[ -n "$rule" ]] || continue
+        in_list "$want" "$rule" && continue
         ufw delete allow "$rule" || return 1
-        unset 'have[$rule]'
+        have=$(printf '%s' "$have" | grep -vxF -- "$rule")
+        [[ -z "$have" ]] || have+=$'\n'
         ledger_save || return 1
-    done
+    done 3<<<"$snapshot"
     ledger_save
 }
 
-# ledger_save — атомарно записать ключи have (из stage_firewall) в $ledger.
+# in_list <список «строка\n»> <строка> — строка есть в списке.
+in_list() {
+    [[ $'\n'"$1" == *$'\n'"$2"$'\n'* ]]
+}
+
+# ledger_save — атомарно записать список have (из stage_firewall) в $ledger.
 ledger_save() {
-    if ((${#have[@]})); then
-        printf '%s\n' "${!have[@]}" | sort >"$ledger.tmp" || return 1
-    else
-        : >"$ledger.tmp" || return 1
-    fi
+    printf '%s' "$have" | sort >"$ledger.tmp" || return 1
     mv -f -- "$ledger.tmp" "$ledger"
 }
 
