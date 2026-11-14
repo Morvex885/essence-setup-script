@@ -11,7 +11,7 @@ use crate::confirmation::Plan;
 use crate::dispatch::Session;
 use crate::error::{RcError, Result};
 use crate::log::Level;
-use crate::model::{Auth, Config, Fingerprint, Node, PortabilityReason};
+use crate::model::{Auth, CascadeExit, Config, Fingerprint, Node, PortabilityReason};
 use crate::request_secrets::Secrets;
 use crate::state::State;
 use crate::transport::RemoteTransport;
@@ -30,8 +30,17 @@ fn password_state(state: &State, node: &Node) -> Option<&'static str> {
     })
 }
 
+/// WARP state of a node: `none`, `free` or `plus`.
+fn warp_state(node: &Node) -> &'static str {
+    match &node.params.warp {
+        None => "none",
+        Some(warp) if warp.plus => "plus",
+        Some(_) => "free",
+    }
+}
+
 /// Public view of a node (no id); portability issues exist only for GitHub.
-fn node_view(session: &Session, node: &Node, issues: &[crate::model::PortabilityIssue]) -> Value {
+fn node_view(session: &Session, config: &Config, node: &Node, issues: &[crate::model::PortabilityIssue]) -> Value {
     let identity = match node.identity.as_deref() {
         None | Some("") => Value::Null,
         Some("system") => json!("system"),
@@ -42,6 +51,9 @@ fn node_view(session: &Session, node: &Node, issues: &[crate::model::Portability
         "name": node.name, "ip": node.ip, "port": node.port, "user": node.user, "auth": node.auth,
         "tag": node.tag.as_deref().unwrap_or(""), "identity": identity,
         "password": password_state(&session.state, node), "issues": reasons,
+        "profile": node.profile, "domain": node.domain, "ports": node.ports,
+        "status": crate::server::render::status(config, node),
+        "proxies": crate::server::render::proxies(config, node), "warp": warp_state(node),
     })
 }
 
@@ -52,7 +64,7 @@ fn declared_issues(session: &Session) -> Result<Vec<crate::model::PortabilityIss
 pub fn list(session: &mut Session) -> Result<Value> {
     let config = session.state.load_config()?;
     let issues = declared_issues(session)?;
-    Ok(Value::Array(config.nodes.iter().map(|node| node_view(session, node, &issues)).collect()))
+    Ok(Value::Array(config.nodes.iter().map(|node| node_view(session, &config, node, &issues)).collect()))
 }
 
 pub fn delete_scope_label(scope: &str, revoke: bool) -> &'static str {
@@ -78,7 +90,7 @@ pub fn show(session: &mut Session, invocation: &Invocation) -> Result<Value> {
     let name = required(invocation, "name")?;
     let config = session.state.load_config()?;
     let node = find(&config, name)?;
-    let mut view = node_view(session, node, &declared_issues(session)?);
+    let mut view = node_view(session, &config, node, &declared_issues(session)?);
     let mut groups: Vec<&str> = config.connections.iter().filter(|connection| connection.node == name)
         .flat_map(|connection| connection.groups.iter().map(|group| group.name.as_str())).collect();
     groups.sort_unstable();
@@ -100,12 +112,12 @@ enum AliasEdit {
     Unset(String),
 }
 
-pub async fn aliases<T: RemoteTransport>(session: &mut Session, invocation: &Invocation, transport: &mut T) -> Result<Value> {
+pub fn aliases(session: &mut Session, invocation: &Invocation) -> Result<Value> {
     let name = required(invocation, "name")?.to_owned();
-    let node = find(&session.state.load_config()?, &name)?.clone();
+    let config = session.state.load_config()?;
+    let node = find(&config, &name)?;
     if !invocation.has("set") && !invocation.has("unset") {
-        let discovered = super::conn::discover(session, &node, transport).await?;
-        return Ok(Value::Array(discovered.into_iter()
+        return Ok(Value::Array(super::conn::discover(&config, node).into_iter()
             .map(|proxy| json!({"alias": node.aliases.get(&proxy), "proxy": proxy})).collect()));
     }
     let mut edits = Vec::new();
@@ -141,7 +153,8 @@ pub async fn aliases<T: RemoteTransport>(session: &mut Session, invocation: &Inv
     Ok(json!({"name": name, "aliases": aliases}))
 }
 
-/// Every reference to a node name moves with it, including the subscription host.
+/// Every reference to a node name moves with it, including cascades, Telegram
+/// Proxy and the subscription host.
 fn rename_references(config: &mut Config, old: &str, new: &str) {
     let rename = |value: &mut String| if value == old { *value = new.to_owned() };
     config.nodes.iter_mut().for_each(|node| rename(&mut node.name));
@@ -150,6 +163,13 @@ fn rename_references(config: &mut Config, old: &str, new: &str) {
         client.nodes.iter_mut().flatten().for_each(&rename);
         client.connections.iter_mut().flatten().for_each(|connection| rename(&mut connection.node));
     }
+    for cascade in &mut config.cascades {
+        rename(&mut cascade.entry);
+        if let CascadeExit::Node(exit) = &mut cascade.exit {
+            rename(&mut exit.node);
+        }
+    }
+    config.telegram.iter_mut().for_each(|proxy| rename(&mut proxy.node));
     if let Some(host) = config.subscription_host.as_mut() {
         rename(&mut host.node);
     }
@@ -194,6 +214,95 @@ pub fn tag(session: &mut Session, invocation: &Invocation) -> Result<Value> {
     })?;
     session.log(Level::Success, &format!("Тег ноды «{name}» сохранён"));
     Ok(json!({"name": name, "tag": tag}))
+}
+
+/// Roles of a node that need its profile: subscription host, Telegram, cascades.
+fn node_roles(config: &Config, name: &str) -> Vec<String> {
+    let mut roles = Vec::new();
+    if config.subscription_host.as_ref().is_some_and(|host| host.node == name) {
+        roles.push("хост подписок".to_owned());
+    }
+    if config.telegram.iter().any(|proxy| proxy.node == name) {
+        roles.push("Telegram Proxy".to_owned());
+    }
+    for cascade in &config.cascades {
+        if cascade.entry == name || matches!(&cascade.exit, CascadeExit::Node(exit) if exit.node == name) {
+            roles.push(format!("каскад «{}»", cascade.name));
+        }
+    }
+    roles
+}
+
+/// `node profile --name N --profile P`: assign a profile (generating the
+/// node's keys) or, with an empty P, remove it when no role needs it.
+pub fn profile(session: &mut Session, invocation: &Invocation) -> Result<Value> {
+    let name = required(invocation, "name")?.to_owned();
+    let profile = invocation.value("profile").ok_or_else(|| RcError::new("usage", "Укажите --profile."))?.to_owned();
+    let status = session.mutate("node_profile", |state| {
+        let mut config = state.load_config()?;
+        find(&config, &name)?;
+        if profile.is_empty() {
+            let roles = node_roles(&config, &name);
+            if !roles.is_empty() {
+                return Err(RcError::new("in_use", format!("Нода «{name}» обслуживает: {}. Сначала снимите эти роли.", roles.join(", ")))
+                    .with_extra("name", name.clone()).with_extra("roles", roles));
+            }
+        } else if config.find_profile(&profile).is_none() {
+            return Err(RcError::new("not_found", format!("Профиль «{profile}» не найден.")).with_extra("name", profile.clone()));
+        }
+        let node = config.nodes.iter_mut().find(|node| node.name == name).ok_or_else(|| not_found(&name))?;
+        node.profile = (!profile.is_empty()).then(|| profile.clone());
+        crate::server::keys::ensure_generated(state, &mut config)?;
+        state.save_config(&config)?;
+        Ok(crate::server::render::status(&config, find(&config, &name)?))
+    })?;
+    session.log(Level::Success, &if profile.is_empty() {
+        format!("Профиль ноды «{name}» снят; примените изменения: node apply --name {name}")
+    } else {
+        format!("Ноде «{name}» назначен профиль «{profile}»")
+    });
+    Ok(json!({"name": name, "profile": (!profile.is_empty()).then_some(profile), "status": status}))
+}
+
+/// `node domain --name N --domain D` (empty D removes the domain).
+pub fn domain(session: &mut Session, invocation: &Invocation) -> Result<Value> {
+    let name = required(invocation, "name")?.to_owned();
+    let domain = invocation.value("domain").ok_or_else(|| RcError::new("usage", "Укажите --domain."))?.to_owned();
+    if !domain.is_empty() && !v::domain_valid(&domain) {
+        return Err(RcError::new("invalid", format!("Недопустимый домен «{domain}».")).with_extra("domain", domain));
+    }
+    session.mutate("node_domain", |state| {
+        let mut config = state.load_config()?;
+        let node = config.nodes.iter_mut().find(|node| node.name == name).ok_or_else(|| not_found(&name))?;
+        node.domain = (!domain.is_empty()).then(|| domain.clone());
+        state.save_config(&config)
+    })?;
+    session.log(Level::Success, &format!("Домен ноды «{name}» сохранён"));
+    Ok(json!({"name": name, "domain": (!domain.is_empty()).then_some(domain)}))
+}
+
+/// `node port --name N --protocol K --port P` (empty P — the profile's port).
+pub fn port(session: &mut Session, invocation: &Invocation) -> Result<Value> {
+    let name = required(invocation, "name")?.to_owned();
+    let protocol = required(invocation, "protocol")?.to_owned();
+    if !crate::model::NODE_PORT_KEYS.contains(&protocol.as_str()) {
+        return Err(RcError::new("usage", format!("Флаг --protocol принимает {}.", crate::model::NODE_PORT_KEYS.join("|"))));
+    }
+    let value = invocation.value("port").ok_or_else(|| RcError::new("usage", "Укажите --port."))?;
+    let port = if value.is_empty() { None } else { Some(v::parse_ssh_port(value)?) };
+    let ports = session.mutate("node_port", |state| {
+        let mut config = state.load_config()?;
+        let node = config.nodes.iter_mut().find(|node| node.name == name).ok_or_else(|| not_found(&name))?;
+        match port {
+            Some(port) => { node.ports.insert(protocol.clone(), port); }
+            None => { node.ports.remove(&protocol); }
+        }
+        let ports = node.ports.clone();
+        state.save_config(&config)?;
+        Ok(ports)
+    })?;
+    session.log(Level::Success, &format!("Порт {protocol} ноды «{name}» сохранён"));
+    Ok(json!({"name": name, "ports": ports}))
 }
 
 pub fn password(session: &mut Session, invocation: &Invocation, secrets: &Secrets) -> Result<Value> {
@@ -309,7 +418,8 @@ pub async fn trust_host_key<T: RemoteTransport>(session: &mut Session, invocatio
 mod tests {
     use super::*;
     use crate::fake_transport::{AuthMethod, ConnectExpectation, FakeTransport, Operation, ScriptStep};
-    use crate::model::{Client, ClientConnection, Connection, ConnectionGroup, SubscriptionHost};
+    use crate::model::{Cascade, CascadeListener, Client, ClientConnection, Connection, ConnectionGroup, ExitProxy, NodeExit,
+        SubscriptionHost, TelegramProxy};
     use crate::nodes::testing::{fingerprint, invocation, session};
     use crate::nodes::CONNECT_TIMEOUT;
     use crate::transport::{ExecResult, HostKeyPolicy};
@@ -325,6 +435,7 @@ mod tests {
             secret_id: (auth == Auth::Password).then(|| format!("node:{id}:ssh-password")),
             id, name: name.into(), ip: format!("198.51.100.{index}"), port: 2222, user: "root".into(), auth,
             identity: (auth == Auth::Key).then(|| "system".into()), tag: Some("DE".into()), aliases: Default::default(),
+            ..Node::default()
         }
     }
 
@@ -347,15 +458,25 @@ mod tests {
     #[test]
     fn rename_cascades_every_reference_including_subscription_host() {
         let root = tempfile::tempdir().unwrap();
-        let (a, other) = (node(1, "a", Auth::Key), node(2, "other", Auth::Key));
+        let (mut a, mut other) = (node(1, "a", Auth::Key), node(2, "other", Auth::Key));
+        a.profile = Some("main".into());
+        other.profile = Some("main".into());
         let mut session = setup(root.path(), Config {
             nodes: vec![a, other],
+            profiles: vec![crate::model::test_profile("main")],
             connections: vec![Connection { node: "a".into(), groups: vec![ConnectionGroup { name: "PC".into(), proxies: vec!["p".into()] }] }],
             clients: vec![Client { name: "c".into(), group: "PC".into(), inherit_nodes_from_group: false,
                 nodes: Some(vec!["a".into(), "other".into()]),
                 connections: Some(vec![ClientConnection { node: "a".into(), proxies: vec!["p".into()] }]), ..Client::default() }],
-            subscription_host: Some(SubscriptionHost { node: "a".into(), base_url: "https://s.example".into(),
-                sub_dir: "sub".into(), nginx_group: "www-data".into() }),
+            cascades: vec![Cascade { name: "via-other".into(), entry: "a".into(), listener: CascadeListener::VlessTcp,
+                exit: CascadeExit::Node(NodeExit { node: "other".into(), proxy: ExitProxy::VlessTcp }),
+                uuid: "11111111-2222-4333-8444-555555555555".into(), password: "0123456789abcdef".into() },
+                Cascade { name: "back".into(), entry: "other".into(), listener: CascadeListener::Hysteria2,
+                exit: CascadeExit::Node(NodeExit { node: "a".into(), proxy: ExitProxy::Hysteria2 }),
+                uuid: "11111111-2222-4333-8444-555555555555".into(), password: "0123456789abcdef".into() }],
+            telegram: vec![TelegramProxy { node: "a".into(), hostname: "tg.example".into(), secret_mark: "0123abcd".into(), tag_mark: None }],
+            subscription_host: Some(SubscriptionHost { node: "a".into(), hostname: "s.example".into(), port: 443,
+                base_url: "https://s.example".into(), sub_dir: "sub".into(), nginx_group: "www-data".into() }),
             ..Config::default()
         });
         assert_eq!(rename(&mut session, &invocation(&["node", "rename", "--name", "a", "--new-name", "b"])).unwrap(), json!({"name": "b"}));
@@ -365,6 +486,8 @@ mod tests {
         assert_eq!(config.clients[0].nodes.as_deref().unwrap(), ["b", "other"]);
         assert_eq!(config.clients[0].connections.as_ref().unwrap()[0].node, "b");
         assert_eq!(config.subscription_host.unwrap().node, "b");
+        assert_eq!((config.cascades[0].entry.as_str(), config.telegram[0].node.as_str()), ("b", "b"));
+        assert!(matches!(&config.cascades[1].exit, CascadeExit::Node(exit) if exit.node == "b"));
 
         let before = fingerprint(root.path());
         let conflict = rename(&mut session, &invocation(&["node", "rename", "--name", "b", "--new-name", "other"])).unwrap_err();
@@ -487,24 +610,31 @@ mod tests {
         assert_eq!(tag(&mut session, &invocation(&["node", "tag", "--name", "key", "--tag", ""])).unwrap(), json!({"name": "key", "tag": ""}));
         assert_eq!(tag(&mut session, &invocation(&["node", "tag", "--name", "key", "--tag", "a:b"])).unwrap_err().code, "invalid");
 
-        let mut transport = FakeTransport::default();
-        let data = aliases(&mut session, &invocation(&["node", "aliases", "--name", "key", "--set", "vless-r=Fast",
-            "--set", "hy2=Slow", "--unset", "hy2"]), &mut transport).await.unwrap();
-        assert_eq!(data, json!({"name": "key", "aliases": {"vless-r": "Fast"}}));
-        assert!(transport.journal().is_empty());
-        let error = aliases(&mut session, &invocation(&["node", "aliases", "--name", "key", "--set", "=x"]), &mut transport).await.unwrap_err();
+        let data = aliases(&mut session, &invocation(&["node", "aliases", "--name", "key", "--set", "VLESS TCP=Fast",
+            "--set", "hy2=Slow", "--unset", "hy2"])).unwrap();
+        assert_eq!(data, json!({"name": "key", "aliases": {"VLESS TCP": "Fast"}}));
+        let error = aliases(&mut session, &invocation(&["node", "aliases", "--name", "key", "--set", "=x"])).unwrap_err();
         assert_eq!(error.code, "usage");
 
-        let mut transport = FakeTransport::new([expect(&key, None, vec![], Ok(())),
-            ScriptStep::exec(crate::nodes::conn::DISCOVER_COMMAND, 0, COMMAND_TIMEOUT,
-                Ok(ExecResult { stdout: b"  - name: \"vless-r\"\n  - name: \"hy2-x\"\n".to_vec(), ..ExecResult::default() }))]);
-        let data = aliases(&mut session, &invocation(&["node", "aliases", "--name", "key"]), &mut transport).await.unwrap();
-        transport.assert_finished();
-        assert_eq!(data, json!([{"proxy": "hy2-x", "alias": null}, {"proxy": "vless-r", "alias": "Fast"}]));
+        // Discovery lists the profile's connections without SSH.
+        assert_eq!(aliases(&mut session, &invocation(&["node", "aliases", "--name", "key"])).unwrap(), json!([]));
+        session.mutate("t", |state| {
+            let mut config = state.load_config()?;
+            config.profiles.push(crate::model::test_profile("main"));
+            config.nodes[0].profile = Some("main".into());
+            config.nodes[0].domain = Some("key.example.com".into());
+            state.save_config(&config)
+        }).unwrap();
+        let data = aliases(&mut session, &invocation(&["node", "aliases", "--name", "key"])).unwrap();
+        assert_eq!(data, json!([{"proxy": "VLESS TCP", "alias": "Fast"}]));
+        let listed = list(&mut session).unwrap();
+        assert_eq!((listed[0]["profile"].clone(), listed[0]["status"].clone(), listed[0]["proxies"].clone(), listed[0]["warp"].clone()),
+            (json!("main"), json!("pending"), json!(["VLESS TCP"]), json!("none")));
+        assert_eq!((listed[1]["status"].clone(), listed[1]["profile"].clone()), (json!("none"), Value::Null));
 
         let shown = show(&mut session, &invocation(&["node", "show", "--name", "key"])).unwrap();
         assert_eq!(shown["delete_options"].as_array().unwrap().iter().map(|o| o["scope"].as_str().unwrap()).collect::<Vec<_>>(), ["local", "server"]);
-        assert_eq!((shown["clients"].clone(), shown["aliases"]["vless-r"].clone()), (json!(0), json!("Fast")));
+        assert_eq!((shown["clients"].clone(), shown["aliases"]["VLESS TCP"].clone()), (json!(0), json!("Fast")));
         assert!(shown.get("id").is_none());
     }
 }

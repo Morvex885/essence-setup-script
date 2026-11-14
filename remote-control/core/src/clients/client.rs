@@ -14,7 +14,7 @@ use crate::confirmation::Plan;
 use crate::dispatch::Session;
 use crate::error::{RcError, Result};
 use crate::log::Level;
-use crate::model::{Client, ClientConnection, ClientCredentials, Config};
+use crate::model::{Client, ClientConnection, Config};
 use crate::nodes::required;
 use crate::transport::RemoteTransport;
 use crate::validation as v;
@@ -150,7 +150,7 @@ pub fn connections(session: &mut Session, invocation: &Invocation) -> Result<Val
 }
 
 /// Random RFC 4122 version-4 UUID, lowercase.
-fn uuid_v4() -> String {
+pub(crate) fn uuid_v4() -> String {
     let mut bytes = [0u8; 16];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
@@ -160,22 +160,20 @@ fn uuid_v4() -> String {
 }
 
 /// A client with the group's nodes and fresh credentials (VLESS UUID,
-/// 32-hex Hysteria2 password); credentials never reach argv or the journal.
+/// 32-hex Hysteria2 password, AmneziaWG keys and index); credentials never
+/// reach argv or the journal.
 pub fn add(session: &mut Session, invocation: &Invocation) -> Result<Value> {
     let name = required(invocation, "name")?.to_owned();
     let group = required(invocation, "group")?.to_owned();
     if !v::name_valid(&name) { return Err(name_invalid()); }
-    let credentials = ClientCredentials { vless_uuid: uuid_v4(), hy2_password: crate::github::random_hex(16) };
-    if !v::vless_uuid_valid(&credentials.vless_uuid) || !v::hy2_password_valid(&credentials.hy2_password) {
-        return Err(RcError::new("failed", "Не удалось создать учётные данные клиента."));
-    }
     let nodes = session.mutate("add_client", |state| {
         let mut config = state.load_config()?;
         if config.clients.iter().any(|c| c.name == name) {
             return Err(RcError::new("conflict", format!("Клиент «{name}» уже существует.")).with_extra("name", name.clone()));
         }
         find_group(&config, &group)?;
-        config.clients.push(Client { name: name.clone(), group: group.clone(), credentials: Some(credentials), ..Client::default() });
+        config.clients.push(Client { name: name.clone(), group: group.clone(), ..Client::default() });
+        crate::server::keys::ensure_generated(state, &mut config)?;
         state.save_config(&config)?;
         Ok(group_nodes(&config, &group))
     })?;
@@ -348,7 +346,6 @@ pub fn nodes(session: &mut Session, invocation: &Invocation) -> Result<Value> {
 
 struct SetGroupPlan {
     lines: Vec<String>,
-    affected: Vec<String>,
     awg_drop: Vec<String>,
     old_dir: PathBuf,
     published: bool,
@@ -415,9 +412,9 @@ fn set_group_plan(session: &Session, config: &Config, name: &str, group: &str) -
         lines.push(format!("Клиент AmneziaWG «{name}» будет удалён на нодах: {}", awg_drop.join(", ")));
     }
     if !affected.is_empty() {
-        lines.push("Служба mihomo на затронутых нодах может быть перезапущена.".into());
+        lines.push("Пользователи на затронутых нодах обновит node apply.".into());
     }
-    Ok(SetGroupPlan { lines, affected, awg_drop, old_dir, published })
+    Ok(SetGroupPlan { lines, awg_drop, old_dir, published })
 }
 
 /// Effective subscription header differences (default → group → client)
@@ -456,7 +453,7 @@ pub async fn set_group<T: RemoteTransport>(session: &mut Session, invocation: &I
     session.log(Level::Success, &format!("{name}: группа — {group}"));
 
     let mut failed = false;
-    let generated = match generate::regenerate_group(session, &group, &plan.affected, connect).await {
+    let generated = match generate::regenerate_group(session, &group) {
         Ok(report) => {
             if !report.complete() {
                 session.log(Level::Warn, "Генерация завершена с ошибками.");
@@ -556,7 +553,7 @@ fn delete_plan(config: &Config, scan: &DeleteScan) -> Vec<String> {
         "Локальные записи и сгенерированные конфиги будут удалены.".into(),
         "Подписки будут отозваны.".into(),
         "Клиенты AmneziaWG будут удалены; доступ в mihomo будет убран.".into(),
-        "Служба mihomo на затронутых нодах будет перезапущена.".into(),
+        "Пользователи на затронутых нодах обновит node apply.".into(),
     ]);
     lines
 }
@@ -632,9 +629,6 @@ pub async fn delete<T: RemoteTransport>(session: &mut Session, invocation: &Invo
             failed = true;
         }
     }
-    if !generate::sync_listeners(session, &scan.affected, connect).await.is_empty() {
-        failed = true;
-    }
     if failed {
         return Err(delete_outcome(RcError::new("partial", "Локальные клиенты удалены, но очистка завершена не полностью."),
             &scan.targets, &revoked, &awg_done));
@@ -683,8 +677,11 @@ mod tests {
 
     fn published(mut config: Config) -> Config {
         config.clients[0].subscription = Some(Subscription { token: Some("a".repeat(64)), ..Subscription::default() });
+        config.profiles = vec![crate::model::test_profile("main")];
+        config.nodes.iter_mut().filter(|node| node.name == "de-vps").for_each(|node| node.profile = Some("main".into()));
         config.subscription_host = Some(SubscriptionHost {
-            node: "de-vps".into(), base_url: "https://sub.example".into(), sub_dir: "/srv/sub".into(), nginx_group: "www-data".into(),
+            node: "de-vps".into(), hostname: "sub.example".into(), port: 443, base_url: "https://sub.example".into(),
+            sub_dir: "/srv/sub".into(), nginx_group: "www-data".into(),
         });
         config
     }
@@ -901,7 +898,7 @@ mod tests {
             "Клиент: my-router", "Группа: ROUTER → PC", "Ноды клиента: ru-vps → de-vps", "Затронутые ноды:",
             " ru-vps  5.6.7.8:2222", " de-vps  1.2.3.4:22", "Старый каталог конфигов (удаляется после генерации нового):",
             format!(" {}", generated.join("ROUTER").join("my-router").display()),
-            "Служба mihomo на затронутых нодах может быть перезапущена.",
+            "Пользователи на затронутых нодах обновит node apply.",
         ]));
         for (argv, code) in [
             (&["client", "set-group", "--name", "my-router", "--group", "ROUTER"][..], "invalid"),
@@ -965,7 +962,7 @@ mod tests {
             "Клиенты AmneziaWG (my-router, my-pc) удаляются на нодах:", " ru-vps",
             "Подписки: my-router", "Хост подписок: de-vps",
             "Локальные записи и сгенерированные конфиги будут удалены.", "Подписки будут отозваны.",
-            "Клиенты AmneziaWG будут удалены; доступ в mihomo будет убран.", "Служба mihomo на затронутых нодах будет перезапущена.",
+            "Клиенты AmneziaWG будут удалены; доступ в mihomo будет убран.", "Пользователи на затронутых нодах обновит node apply.",
         ]));
         assert!(!serde_json::to_string(&error.extra).unwrap().contains(&"a".repeat(64)));
         assert_eq!(run(&mut session, &["client", "delete", "--name", ""], &no_ssh).await.unwrap_err().code, "usage");

@@ -230,7 +230,7 @@ fn arrow_keys_navigate_menus() {
     session.send("\n");
     session.expect("Remote Control v");
     session.send("\x1b[D");
-    session.send("\x1b[B\x1b[B\x1b[C");
+    session.send("\x1b[B\x1b[B\x1b[B\x1b[C");
     session.send("a\n");
     session.expect("Название группы");
     session.send("ARROWS\n");
@@ -247,7 +247,7 @@ fn arrow_keys_navigate_menus() {
     session.expect("Добавить группу");
     session.send("\x1b[D");
     session.expect("Remote Control v");
-    session.send("\x1b[A\x1b[A\x1b[A\n");
+    session.send("\x1b[A\x1b[A\x1b[A\x1b[A\n");
     session.finish(0);
     let config = std::fs::read_to_string(session.data().join("config.json")).unwrap();
     let config: serde_json::Value = serde_json::from_str(&config).unwrap();
@@ -358,9 +358,11 @@ fn screens_speak_the_real_v2_grammar() {
     // Node-scoped screens (card, awg, per-node telegram) need a reachable SSH
     // node; their argv are checked against the catalog in nodes.rs tests.
     // Settings is skipped: `self version` would query GitHub (no network).
-    for noun in ["session", "source", "status", "group", "client", "template", "generate", "subscription", "node", "conn", "telegram"] {
+    for noun in ["session", "source", "status", "group", "client", "template", "generate", "subscription", "node", "conn", "telegram", "profile"] {
         assert!(client.calls.iter().any(|(argv, _)| argv[0] == noun), "walk never reached {noun}");
     }
+    // The profile wizard: Self-Steal, random site, VLESS TCP, IPv6 as is, random email, pinned mihomo (no GitHub query).
+    assert!(client.calls.iter().any(|(argv, code)| argv.starts_with(&["profile".to_owned(), "add".to_owned()]) && code == "ok"), "profile add");
     assert!(client.calls.iter().any(|(argv, code)| argv.starts_with(&["template".to_owned(), "show".to_owned()]) && code == "ok"));
     // `g` on default.yaml offers only groups on other templates: none here
     // (an empty list reads no key); `template groups` is covered by cli_contract.
@@ -375,7 +377,7 @@ const WALK: &str = "1 \
     g a LAB 1 4 t 1 f _ h 0 0 0 \
     c a alice 4 1 v _ f _ s 0 r bob 0 0 \
     m 1 v _ c _ g x EXPORT 0 0 \
-    n 0 p 0 a 0 t s 0 \
+    n 0 r a edge 1 1 _ 1 _ v1.19.18 0 0 p 0 a 0 t s 0 \
     f a _ 0 \
     s l _ 0 \
     i 0 \

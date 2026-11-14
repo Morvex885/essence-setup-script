@@ -90,11 +90,11 @@ teardown() {
     assert_success
 
     grep -qF 'allow-insecure: true' "$XHTTP_MIHOMO_CONFIG"
-    ! grep -qE 'certificate:|private-key:' "$XHTTP_MIHOMO_CONFIG"
+    ! grep -qE 'certificate:|private-key:' "$XHTTP_MIHOMO_CONFIG" || return 1
     grep -qF 'proxy_pass http://127.0.0.1:18445;' "$XHTTP_NGINX_FILE"
     grep -qF 'proxy_request_buffering off;' "$XHTTP_NGINX_FILE"
     grep -qF 'proxy_buffering off;' "$XHTTP_NGINX_FILE"
-    ! grep -qF 'proxy_ssl_verify' "$XHTTP_NGINX_FILE"
+    ! grep -qF 'proxy_ssl_verify' "$XHTTP_NGINX_FILE" || return 1
     [[ ! -e "$XHTTP_CERT_DIR" ]]
 }
 
@@ -190,7 +190,7 @@ EOF
     grep -qF 'DOMAIN-SUFFIX,example.org,hop' "$XHTTP_MIHOMO_CONFIG"
     grep -qF 'keep-provider:' "$XHTTP_MIHOMO_CONFIG"
     grep -qF 'allow-insecure: true' "$XHTTP_MIHOMO_CONFIG"
-    ! grep -qE 'certificate:|private-key:' "$XHTTP_MIHOMO_CONFIG"
+    ! grep -qE 'certificate:|private-key:' "$XHTTP_MIHOMO_CONFIG" || return 1
     [[ "$(grep -c 'client-fingerprint: firefox' "$XHTTP_CLIENT_CONFIG")" -eq 2 ]]
     [[ "$(grep -o 'fp=firefox' "$XHTTP_CLIENT_CONFIG" | wc -l)" -eq 2 ]]
 }

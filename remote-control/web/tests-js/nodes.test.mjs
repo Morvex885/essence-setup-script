@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as model from '../assets/js/screens/nodes-model.js';
 import { isFailure } from '../assets/js/flows.js';
+import * as apply from '../assets/js/screens/apply-model.js';
 
 // Фикстура `nodes.rs::tests::node`.
 const node = () => ({
@@ -38,23 +39,6 @@ test('карточка: способ входа и пароль SSH только
 test('терминальные команды', () => {
   assert.deepEqual(model.interactiveArgv('n', false), ['node', 'shell', '--name', 'n']);
   assert.deepEqual(model.interactiveArgv('n', true), ['telegram', 'menu', '--name', 'n']);
-});
-
-test('предложение загрузки скриптов по состоянию', () => {
-  for (const [state, condition] of [['missing', 'скрипты отсутствуют'], ['outdated', 'скрипты устарели']]) {
-    const offer = model.uploadOffer('n', state);
-    assert.equal(offer.force, false);
-    assert.equal(offer.condition, `Состояние: ${condition}`);
-    assert.equal(offer.label, 'Загрузить скрипты');
-    assert.deepEqual(offer.argv, ['node', 'upload-scripts', '--name', 'n']);
-  }
-  for (const [state, condition] of [['broken', 'установка повреждена'], ['unknown', 'версия скриптов неизвестна']]) {
-    const offer = model.uploadOffer('n', state);
-    assert.equal(offer.condition, `Состояние: ${condition}`);
-    assert.equal(offer.label, 'Загрузить скрипты принудительно');
-    assert.deepEqual(offer.argv, ['node', 'upload-scripts', '--name', 'n', '--force']);
-  }
-  assert.equal(model.uploadOffer('n', 'missing').title, 'Скрипты на ноде: n');
 });
 
 test('удаление: варианты из delete_options и --revoke-key', () => {
@@ -117,10 +101,10 @@ test('форма добавления: порт проверяется поле�
  * `answers` — ответы диалогов по порядку. Записывает диалоги, секреты,
  * уведомления и итоги сбоев.
  */
-function scripted(steps, answers) {
+function scripted(steps, answers, { profiles = [] } = {}) {
   const queue = [...steps];
   const replies = [...answers];
-  const record = { dialogs: [], secrets: [], notices: [], failed: 0 };
+  const record = { dialogs: [], secrets: [], notices: [], failed: 0, options: [] };
   const dialog = (kind) => async (props) => {
     record.dialogs.push({ kind, ...props });
     assert.ok(replies.length > 0, `нет ответа для ${kind}: ${props.title}`);
@@ -128,15 +112,20 @@ function scripted(steps, answers) {
   };
   const ctx = {
     async request(argv, options = {}) {
+      // Фоновое чтение профилей формы добавления — вне сценария.
+      if (options.quiet && argv.join(' ') === 'profile list') return { ok: true, data: { profiles } };
       assert.ok(queue.length > 0, `лишний запрос ${argv.join(' ')}`);
       const [expected, reply] = queue.shift();
       assert.deepEqual(argv, expected);
       record.secrets.push(options.secrets ? { ...options.secrets } : null);
+      record.options.push(options);
       return reply;
     },
     call: (...words) => ctx.request(words),
     runConfirmed: (_title, _question, argv, options) => ctx.request(argv, options),
+    nodeRequest: (_name, argv, _review, options) => ctx.request(argv, options),
     form: dialog('form'), confirm: dialog('confirm'), choose: dialog('choose'), askSecret: dialog('secret'),
+    ask: dialog('text'), show: dialog('show'),
     notify: (level, text) => record.notices.push([level, text]),
     failed: () => { record.failed += 1; },
     isFailure,
@@ -294,4 +283,208 @@ test('псевдонимы: чтение через nodeRequest, запись т
   await model.editAliases(nodeCtx(refused), 'n');
   assert.equal(refused.record.failed, 1);
   refused.done();
+});
+
+// ─── Профиль, домен, порты и применение ─────────────────────────────────────
+
+const edge = { name: 'edge', reality_mode: 'self-steal', vless_tcp: true, vless_xhttp: { topology: 'nginx', port: null },
+  vless_grpc: { port: 20000 }, hysteria2: { port: 30000, obfs: true }, amneziawg: { port: 40000, dns: '1.1.1.1' }, nodes: [] };
+const sni = { name: 'sni', reality_mode: 'sni', sni_domain: 'www.example.com', vless_tcp: true, vless_xhttp: null,
+  vless_grpc: null, hysteria2: null, amneziawg: null, nodes: [] };
+
+test('добавление с профилем: --profile/--domain, затем node apply --name под планом с окном операции', async () => {
+  const words = addWords('key', ['--profile', 'edge', '--domain', 'de.example.com', '--accept-new-host-key']);
+  const applied = ok({ applied: ['vps-1'], failed: [], unchanged: [] });
+  const s = scripted([[words, ok({ name: 'vps-1' })], [['node', 'apply', '--name', 'vps-1'], applied]],
+    [{ ...keyForm, profile: 'edge', domain: 'de.example.com' }, undefined], { profiles: [edge] });
+  const opened = [];
+  assert.equal(await model.addNodeFlow(s.ctx, (name) => opened.push(name)), true);
+  assert.deepEqual(opened, ['vps-1']);
+  assert.equal(s.record.options[1].operation !== undefined, true);
+  assert.deepEqual(s.record.dialogs.map((d) => d.kind), ['form', 'show']);
+  s.done();
+  // Без профиля — без применения.
+  const plain = scripted([[keyAttempt, ok({ name: 'vps-1' })]], [{ ...keyForm, profile: '' }], { profiles: [edge] });
+  assert.equal(await model.addNodeFlow(plain.ctx, () => {}), true);
+  plain.done();
+});
+
+test('форма добавления: профиль только при наличии профилей, домен — когда профиль его требует', () => {
+  assert.equal(model.addFields({}, []).some((f) => f.name === 'profile'), false);
+  const fields = Object.fromEntries(model.addFields({}, [edge, sni]).map((f) => [f.name, f]));
+  assert.deepEqual(fields.profile.options.map((o) => o.value), ['', 'edge', 'sni']);
+  assert.equal(fields.domain.when({ profile: 'edge' }), true);
+  assert.equal(fields.domain.when({ profile: 'sni' }), false);
+  assert.equal(fields.domain.when({ profile: '' }), false);
+  assert.ok(fields.domain.validate('bad_domain'));
+  assert.equal(fields.domain.validate('de.example.com'), null);
+});
+
+test('argv профиля, домена и портов ноды', () => {
+  assert.deepEqual(model.nodeProfileArgv('n', 'edge'), ['node', 'profile', '--name', 'n', '--profile', 'edge']);
+  assert.deepEqual(model.nodeProfileArgv('n', ''), ['node', 'profile', '--name', 'n', '--profile', '']);
+  assert.deepEqual(model.nodeDomainArgv('n', 'a.example.com'), ['node', 'domain', '--name', 'n', '--domain', 'a.example.com']);
+  // xHTTP через nginx порта не имеет.
+  assert.deepEqual(model.portProtocols(edge).map((p) => [p.key, p.port]), [['vless-grpc', '20000'], ['hysteria2', '30000'], ['amneziawg', '40000']]);
+  assert.deepEqual(model.portProtocols({ ...sni, vless_xhttp: { topology: 'reality', port: 18888 } }).map((p) => p.key), ['vless-xhttp']);
+  const node = { ports: { hysteria2: 31000 } };
+  const changes = model.portChanges('n', node, model.portProtocols(edge), { 'vless-grpc': '', hysteria2: '', amneziawg: '41000' });
+  assert.deepEqual(changes, [
+    ['node', 'port', '--name', 'n', '--protocol', 'hysteria2', '--port', ''],
+    ['node', 'port', '--name', 'n', '--protocol', 'amneziawg', '--port', '41000'],
+  ]);
+  assert.equal(model.warpLabel({ warp: 'plus' }) !== model.warpLabel({ warp: 'free' }), true);
+  assert.equal(model.warpLabel({ warp: 'none' }), model.warpLabel({}));
+});
+
+test('порты ноды: форма по протоколам профиля, команды только для изменённых', async () => {
+  const node = { name: 'n', profile: 'edge', ports: {} };
+  const s = scripted([
+    [['profile', 'show', '--name', 'edge'], ok(edge)],
+    [['node', 'port', '--name', 'n', '--protocol', 'vless-grpc', '--port', '20001'], ok({})],
+  ], [{ 'vless-grpc': '20001', hysteria2: '', amneziawg: '' }]);
+  assert.equal(await model.nodePortsFlow(s.ctx, 'n', node), true);
+  assert.deepEqual(s.record.dialogs[0].fields.map((f) => f.name), ['vless-grpc', 'hysteria2', 'amneziawg']);
+  s.done();
+  const none = scripted([], []);
+  assert.equal(await model.nodePortsFlow(none.ctx, 'n', { name: 'n', profile: null }), false);
+});
+
+test('профиль и домен ноды: без изменений команды нет', async () => {
+  const node = { name: 'n', profile: 'edge', domain: 'a.example.com' };
+  let s = scripted([[['profile', 'list'], ok({ profiles: [edge, sni] })], [['node', 'profile', '--name', 'n', '--profile', 'sni'], ok({})]], [{ profile: 'sni' }]);
+  assert.equal(await model.nodeProfileFlow(s.ctx, 'n', node), true);
+  s.done();
+  s = scripted([[['profile', 'list'], ok({ profiles: [edge] })]], [{ profile: 'edge' }]);
+  assert.equal(await model.nodeProfileFlow(s.ctx, 'n', node), false);
+  s.done();
+  s = scripted([[['node', 'domain', '--name', 'n', '--domain', ''], ok({})]], [{ domain: '' }]);
+  assert.equal(await model.nodeDomainFlow(s.ctx, 'n', node), true);
+  s.done();
+  s = scripted([], [{ domain: 'a.example.com' }]);
+  assert.equal(await model.nodeDomainFlow(s.ctx, 'n', node), false);
+  s.done();
+});
+
+test('оболочка: node shell без загрузки скриптов, conflict — уведомление', async () => {
+  const opened = [];
+  const s = scripted([], []);
+  s.ctx.terminal = async (argv, title, options) => { opened.push([argv, options]); return fail('conflict'); };
+  await model.interactive(s.ctx, 'n', false);
+  assert.deepEqual(opened, [[['node', 'shell', '--name', 'n'], { expect: ['conflict'] }]]);
+  assert.equal(s.record.notices.length, 1);
+  assert.equal(typeof model.uploadOffer, 'undefined');
+});
+
+test('telegram menu: план загрузки скриптов — подтверждение и терминал с --yes --plan-token; отказ — без терминала', async () => {
+  const menu = ['telegram', 'menu', '--name', 'n'];
+  const plan = fail('confirmation_required', { plan: ['На ноду «n» будут загружены скрипты v1.'], plan_token: 'T' });
+  const run = async (answer) => {
+    const opened = [];
+    const replies = [plan, ok({})];
+    const s = scripted([], [answer]);
+    s.ctx.terminal = async (argv) => { opened.push(argv); return replies.shift(); };
+    await model.interactive(s.ctx, 'n', true);
+    return { opened, s };
+  };
+  const yes = await run(true);
+  assert.deepEqual(yes.opened, [menu, [...menu, '--yes', '--plan-token', 'T']]);
+  assert.deepEqual(yes.s.record.dialogs.map((d) => [d.kind, d.plan]), [['confirm', plan.error.plan]]);
+  assert.equal(yes.s.record.failed, 0);
+  yes.s.done();
+  const no = await run(false);
+  assert.deepEqual(no.opened, [menu]);
+  assert.equal(no.s.record.failed, 0);
+  no.s.done();
+});
+
+test('применение: состояние, подписи сбоев, отчёт и argv', async () => {
+  assert.equal(apply.applyState({ status: 'pending' }).tone, 'warn');
+  assert.equal(apply.applyState({ status: 'applied' }).tone, 'ok');
+  assert.notEqual(apply.applyState({ status: 'running' }).label, apply.applyState({ status: 'pending' }).label);
+  assert.deepEqual(apply.applyNamesArgv(['a', 'b']), ['node', 'apply', '--name', 'a', '--name', 'b']);
+  assert.deepEqual(apply.applyProfileArgv('edge'), ['node', 'apply', '--profile', 'edge']);
+  assert.deepEqual(apply.APPLY_PENDING_ARGV, ['node', 'apply', '--pending']);
+  assert.deepEqual(apply.pendingNodes([{ name: 'a', status: 'pending' }, { name: 'b', status: 'running' }, { name: 'c', status: 'applied' }]), ['a']);
+  assert.ok(apply.offersApply(['client', 'set-group', '--name', 'c']));
+  assert.ok(apply.offersApply(['conn', 'set', '--name', 'n']));
+  assert.ok(!apply.offersApply(['conn', 'sync']));
+  assert.ok(!apply.offersApply(['client', 'rename', '--name', 'c']));
+  // partial: отчёт из error, строка сбоя `имя: сообщение` с тоном error.
+  const entries = [
+    {"name":"de","stage":"config","code":"rolled_back","message":"откат на этапе «конфигурация и проверка»"},
+    {"name":"de","stage":"probe","code":"port_busy","message":"порт 443 уже занят","port":443},
+    {"name":"de","stage":"probe","code":"remote_failed","message":"Не удалось подключиться к «de»."},
+    {"name":"de","stage":"probe","code":"unsupported_os","message":"нужна Debian или Ubuntu с systemd"},
+  ];
+  const partial = fail('partial', { message: 'Применение завершено с ошибками.', applied: ['a'], failed: entries, unchanged: ['c'] });
+  const lines = apply.applyLines(apply.applyReport(partial));
+  assert.equal(lines.length, 6);
+  assert.deepEqual(lines.slice(2), entries.map((entry) => ({ text: `de: ${entry.message}`, tone: 'error' })));
+  assert.equal(apply.applyReport(fail('locked')), null);
+  // applyFlow: expect partial и nothing_pending, окно операции; nothing_pending — уведомление без окна итога.
+  const s = scripted([[['node', 'apply', '--pending'], partial], [['node', 'apply', '--pending'], fail('nothing_pending')]], [undefined]);
+  await apply.applyFlow(s.ctx, apply.APPLY_PENDING_ARGV);
+  assert.deepEqual(s.record.options[0].expect, ['partial', 'nothing_pending']);
+  assert.ok(s.record.options[0].operation);
+  await apply.applyFlow(s.ctx, apply.APPLY_PENDING_ARGV);
+  assert.deepEqual(s.record.dialogs.map((d) => d.kind), ['show']);
+  assert.equal(s.record.notices.length, 1);
+  s.done();
+});
+
+test('применение: ноды partial с domain_required — домен, node domain и один повтор', async () => {
+  const entry = {"name":"de","stage":"probe","code":"domain_required","message":"Для ноды «de» нужен домен: node domain --name de --domain D."};
+  const partial = fail('partial', { message: 'Применение завершено с ошибками.', applied: [], unchanged: [], failed: [entry] });
+  const pending = ['node', 'apply', '--pending'];
+  // Повтор с тем же отказом — без второго вопроса домена.
+  const s = scripted([
+    [pending, partial],
+    [['node', 'domain', '--name', 'de', '--domain', 'de.example.com'], ok()],
+    [pending, partial],
+  ], [undefined, ' de.example.com ', undefined]);
+  const reply = await apply.applyFlow(s.ctx, apply.APPLY_PENDING_ARGV);
+  assert.equal(reply.error.code, 'partial');
+  assert.deepEqual(s.record.dialogs.map((d) => d.kind), ['show', 'text', 'show']);
+  assert.deepEqual(s.record.options[2].expect, ['partial', 'nothing_pending'], 'повтор — тем же потоком подтверждения');
+  s.done();
+  // Отказ от ввода домена — итог без повтора; профиль — тот же путь.
+  const profile = apply.applyProfileArgv('edge');
+  const refused = scripted([[profile, partial]], [undefined, null]);
+  await apply.applyFlow(refused.ctx, profile);
+  assert.deepEqual(refused.record.dialogs.map((d) => d.kind), ['show', 'text']);
+  refused.done();
+});
+
+test('применение: прочие коды нод из partial — handleNodeCodes и один повтор', async () => {
+  const entry = { name: 'de', stage: 'probe', code: 'missing_secret', message: 'Пароль SSH для «de» не сохранён.' };
+  const partial = fail('partial', { message: 'Применение завершено с ошибками.', applied: [], unchanged: [], failed: [entry] });
+  const pending = ['node', 'apply', '--pending'];
+  const s = scripted([
+    [pending, partial],
+    [['node', 'password', '--name', 'de'], ok()],
+    [pending, ok({ applied: ['de'], failed: [], unchanged: [] })],
+  ], [undefined, true, 'pw', undefined]);
+  const reply = await apply.applyFlow(s.ctx, apply.APPLY_PENDING_ARGV);
+  assert.equal(reply.ok, true);
+  assert.deepEqual(s.record.dialogs.map((d) => d.kind), ['show', 'confirm', 'secret', 'show']);
+  assert.deepEqual(s.record.secrets[1], { password: 'pw' });
+  s.done();
+  // Отказ сохранить пароль — итог без повтора.
+  const refused = scripted([[pending, partial]], [undefined, false]);
+  assert.equal((await apply.applyFlow(refused.ctx, apply.APPLY_PENDING_ARGV)).error.code, 'partial');
+  refused.done();
+});
+
+test('предложение применить: сразу node apply --pending без своего вопроса, без ожидающих — ничего', async () => {
+  const s = scripted([
+    [['node', 'list'], ok([{ name: 'de', status: 'pending' }])],
+    [['node', 'apply', '--pending'], ok({ applied: ['de'], failed: [], unchanged: [] })],
+  ], [undefined]);
+  await apply.offerApply(s.ctx);
+  assert.deepEqual(s.record.dialogs.map((d) => d.kind), ['show']);
+  s.done();
+  const none = scripted([[['node', 'list'], ok([{ name: 'de', status: 'applied' }])]], []);
+  await apply.offerApply(none.ctx);
+  none.done();
 });

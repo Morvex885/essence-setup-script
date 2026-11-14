@@ -25,6 +25,7 @@ pub mod secrets;
 pub mod secure_fs;
 pub mod request_input;
 pub mod request_secrets;
+pub mod server;
 pub mod state;
 pub mod self_manage;
 pub mod ssh;

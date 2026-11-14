@@ -216,13 +216,13 @@ async fn join_all<F: Future>(futures: Vec<F>) -> Vec<F::Output> {
     outputs.into_iter().map(|output| output.expect("every joined future completed")).collect()
 }
 
-const BROKEN: &str = "версия скриптов неизвестна или установка повреждена — загрузите их принудительно: node upload-scripts --force";
-const STALE: &str = "скрипты на ноде отсутствуют или устарели — загрузите их: node upload-scripts";
+const STALE: &str = "скрипты на ноде отсутствуют или устарели — они загрузятся при установке или другом действии Telegram Proxy";
 
 /// Preflight verdict of one node.
 enum Prep {
     Ready,
-    /// Scripts missing or older than the embedded kit: upload after consent.
+    /// Scripts missing, older than the embedded kit or damaged: uploaded by
+    /// the worker (the batch plan names it: «будут загружены скрипты vX»).
     Upload,
     Excluded(String),
 }
@@ -247,10 +247,8 @@ async fn inspect<T: RemoteTransport>(state: &State, node: &Node, start: std::res
     }
     let prep = match scripts::probe(&transport).await {
         None => Prep::Excluded(format!("не удалось определить состояние скриптов на ноде «{}»", node.name)),
-        Some((ScriptsState::Missing, _)) => Prep::Upload,
         Some((ScriptsState::Ready, Some(remote))) if local <= remote => Prep::Ready,
-        Some((ScriptsState::Ready, Some(_))) => Prep::Upload,
-        Some(_) => Prep::Excluded(BROKEN.into()),
+        Some(_) => Prep::Upload,
     };
     (prep, Some(transport))
 }
@@ -284,7 +282,7 @@ fn last_line(bytes: &[u8]) -> Option<String> {
 /// The server's own explanation of a failure: its last meaningful line.
 fn failure(result: &ExecResult) -> Outcome {
     if result.exit_status == 2 {
-        return Outcome::error("скрипты на ноде не поддерживают эту команду Telegram Proxy — загрузите их принудительно: node upload-scripts --force");
+        return Outcome::error("скрипты на ноде не поддерживают эту команду Telegram Proxy");
     }
     let line = last_line(&result.stderr).or_else(|| last_line(&result.stdout))
         .unwrap_or_else(|| format!("код завершения {}", result.exit_status));
@@ -306,7 +304,7 @@ async fn execute<T: RemoteTransport, R: Reach>(target: &Target<T>, action: Actio
     };
     let _permit = gate.acquire().await.ok();
     if matches!(target.prep, Prep::Upload)
-        && let Err(error) = scripts::ensure_current(transport, &target.node.name, false).await
+        && let Err(error) = scripts::ensure_current(transport, &target.node.name).await
     {
         return Outcome::error(error.message);
     }
@@ -450,10 +448,19 @@ fn report<T>(session: &mut Session, action: Action, targets: &[Target<T>], outco
     }
 }
 
+/// The plan of `telegram menu` on a node whose scripts are missing, older
+/// than the embedded kit or damaged; the bundle SHA-256 and VERSION are part
+/// of the token, as in the batch plan.
+fn menu_upload_plan(node: &str, version: &str) -> Result<Plan> {
+    Ok(Plan::new(vec![format!("На ноду «{node}» будут загружены скрипты v{version}.")], format!("{} {version}", bundle_sha256()?)))
+}
+
 /// `telegram menu --name N`: the server Telegram Proxy menu on a remote
-/// pseudo-terminal. Read-only preflight of the one node; the scripts must
-/// already be current — the menu never uploads them. The returned job runs
-/// on the requester's console.
+/// pseudo-terminal. Until stage 5 moves Telegram into the executor, the menu
+/// needs the scripts at the embedded version: a read-only probe comes first;
+/// missing, stale or damaged scripts are uploaded only under a plan
+/// («будут загружены скрипты vX», `confirmation_required` without `--yes`).
+/// Then the returned job runs on the requester's console.
 pub async fn menu_prepare<T: RemoteTransport>(session: &mut Session, invocation: &Invocation, connect: &dyn Fn() -> T)
     -> Result<TerminalJob<T>>
 {
@@ -464,20 +471,17 @@ pub async fn menu_prepare<T: RemoteTransport>(session: &mut Session, invocation:
     session.log(Level::Info, &format!("Подключаемся к {} ({}@{}:{})...", node.name, node.user, node.ip, node.port));
     let mut transport = connect();
     nodes::connect(&mut transport, &session.state, &node).await?;
-    let upload = |state: &str, message: String| RcError::new("invalid", message)
-        .with_extra("name", node.name.clone()).with_extra("state", state.to_owned());
-    match scripts::probe(&transport).await {
+    let current = match scripts::probe(&transport).await {
+        Some((ScriptsState::Ready, Some(remote))) => local <= remote,
+        Some(_) => false,
         None => return Err(RcError::new("remote_failed", format!("Не удалось определить состояние скриптов на ноде «{}».", node.name))
-            .with_extra("name", node.name.clone())),
-        Some((ScriptsState::Ready, Some(remote))) if local <= remote => {}
-        Some((ScriptsState::Missing, _)) => return Err(upload("missing", format!(
-            "На ноде «{}» нет скриптов: загрузите их командой node upload-scripts --name {}.", node.name, node.name))),
-        Some((ScriptsState::Ready, Some(remote))) => return Err(upload("outdated", format!(
-            "Скрипты на ноде «{}» устарели (v{}, локально v{}): загрузите их командой node upload-scripts --name {}.",
-            node.name, scripts::format_version(remote), scripts::format_version(local), node.name))),
-        Some(_) => return Err(upload("broken", format!(
-            "На ноде «{}» версия скриптов неизвестна или установка повреждена: загрузите их принудительно командой node upload-scripts --name {} --force.",
-            node.name, node.name))),
+            .with_extra("name", node.name.as_str())),
+    };
+    if !current {
+        menu_upload_plan(&node.name, &scripts::format_version(local))?.confirm(invocation)?;
+        if scripts::ensure_current(&transport, &node.name).await? {
+            session.log(Level::Info, &format!("Скрипты на ноде «{}» обновлены.", node.name));
+        }
     }
     session.log(Level::Info, &format!("Открываю меню Telegram Proxy на {} ({})...", node.name, node.ip));
     session.log(Level::Output, "  (введите 0 в меню для выхода)");
@@ -509,7 +513,7 @@ mod tests {
         let (session, journal) = session(root);
         let nodes = NODES.iter().enumerate().map(|(index, (name, ip, port))| Node {
             id: format!("{index:032x}"), name: (*name).into(), ip: (*ip).into(), port: *port, user: "root".into(),
-            auth: Auth::Key, identity: None, secret_id: None, tag: None, aliases: Default::default(),
+            auth: Auth::Key, identity: None, secret_id: None, tag: None, aliases: Default::default(), ..Node::default()
         }).collect();
         session.state.save_config(&Config { nodes, ..Config::default() }).unwrap();
         for (_, ip, port) in NODES {
@@ -724,7 +728,10 @@ mod tests {
 
     /// `menu_prepare` then `run`, as the daemon does.
     fn run_menu(session: &mut Session, connect: &dyn Fn() -> FakeTransport, console: &mut TestConsole) -> Result<Value> {
-        let invocation = invocation(&["telegram", "menu", "--name", "alpha"]);
+        run_menu_argv(session, &["telegram", "menu", "--name", "alpha"], connect, console)
+    }
+    fn run_menu_argv(session: &mut Session, argv: &[&str], connect: &dyn Fn() -> FakeTransport, console: &mut TestConsole) -> Result<Value> {
+        let invocation = invocation(argv);
         tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(async {
             let job = menu_prepare(session, &invocation, connect).await?;
             assert_eq!((job.node.as_str(), job.done_log), ("alpha", "SSH-сессия завершена."));
@@ -733,28 +740,42 @@ mod tests {
     }
 
     #[test]
-    fn menu_opens_the_server_menu_and_never_uploads_scripts() {
+    fn menu_opens_the_server_menu_uploading_scripts_only_under_a_plan() {
         let root = tempfile::tempdir().unwrap();
         let (mut session, journal) = fixture(root.path());
         let command = "bash '/root/essence-setup/setup-essence.sh' telegram-proxy menu";
         let pty = PtyRequest { term: "xterm".into(), size: SIZE };
+        // Current scripts: no plan, the menu opens at once.
         let (connect, observers) = transports(vec![vec![connect_step(0, Ok(())), current(),
-            ScriptStep::interactive(command, pty, b"MENU".to_vec(), Ok(0))]]);
+            ScriptStep::interactive(command, pty.clone(), b"MENU".to_vec(), Ok(0))]]);
         let mut console = TestConsole::default();
         assert_eq!(run_menu(&mut session, &connect, &mut console).unwrap(), json!({}));
         observers[0].assert_finished();
         assert_eq!(console.0, b"MENU");
         assert_eq!(journal.borrow().last().unwrap(), &(Level::Output, "  (введите 0 в меню для выхода)".to_owned()));
 
-        let before = fingerprint(root.path());
+        // A fresh node without --yes: the read-only probe, then the plan; nothing uploaded, no menu.
         let (connect, observers) = transports(vec![vec![connect_step(0, Ok(())), missing()]]);
-        let mut console = TestConsole::default();
-        let error = run_menu(&mut session, &connect, &mut console).unwrap_err();
-        assert_eq!((error.code, error.extra["state"].as_str()), ("invalid", Some("missing")));
-        assert_eq!(error.message, "На ноде «alpha» нет скриптов: загрузите их командой node upload-scripts --name alpha.");
+        let error = run_menu(&mut session, &connect, &mut TestConsole::default()).unwrap_err();
+        assert_eq!((error.code, error.exit_code()), ("confirmation_required", 2));
+        let version = scripts::local_version().unwrap();
+        assert_eq!(error.extra["plan"], json!([format!("На ноду «alpha» будут загружены скрипты v{version}.")]));
+        let token = error.extra["plan_token"].as_str().unwrap().to_owned();
+        let parsed = invocation(&["telegram", "menu", "--name", "alpha"]);
+        assert_eq!(token, menu_upload_plan("alpha", &version).unwrap().token(&parsed.noun, &parsed.verb, parsed.confirmation_args()));
         observers[0].assert_finished();
-        assert!(console.0.is_empty(), "no menu without current scripts");
-        assert_eq!(fingerprint(root.path()), before);
+        assert!(!observers[0].journal().iter().any(|op| matches!(op, Operation::Upload { .. })));
+
+        // Confirmed: probe, upload (`ensure_current`: probe, upload, confirming probe), menu.
+        let (connect, observers) = transports(vec![vec![connect_step(0, Ok(())), missing(), missing(),
+            ScriptStep::upload_any_local(scripts::REMOTE_DIR, LONG_TIMEOUT, Ok(())), current(),
+            ScriptStep::interactive(command, pty, b"MENU".to_vec(), Ok(0))]]);
+        let mut console = TestConsole::default();
+        let argv = ["telegram", "menu", "--name", "alpha", "--yes", "--plan-token", token.as_str()];
+        assert_eq!(run_menu_argv(&mut session, &argv, &connect, &mut console).unwrap(), json!({}));
+        observers[0].assert_finished();
+        assert_eq!(console.0, b"MENU");
+        assert!(journal.borrow().contains(&(Level::Info, "Скрипты на ноде «alpha» обновлены.".to_owned())));
     }
 
     #[test]

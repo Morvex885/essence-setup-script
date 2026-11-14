@@ -1,12 +1,13 @@
-//! Node, SSH, connection, AmneziaWG and Telegram screens (v1 `tui/nodes.sh`)
-//! over the daemon protocol only.
+//! Node, node profile, SSH, connection, AmneziaWG and Telegram screens (v1
+//! `tui/nodes.sh`) over the daemon protocol only.
 //!
 //! Lists keep their own menu section; dangerous actions consume the core's
 //! frozen plan through `confirm`. Terminal commands (`node shell`,
-//! `telegram menu`) are terminal requests while the UI is suspended; they
-//! never upload scripts themselves — stale scripts become an explicit offer.
+//! `telegram menu`) are terminal requests while the UI is suspended. Changes
+//! of the desired node state reach a node only through `node apply` (`apply`).
 use std::io;
 use serde_json::Value;
+use ratatui::style::Color;
 use essence_rc_client::{argv, Reply, Secrets};
 use crate::{app::{Context, Navigation, Screen}, confirm::{self, set_flag}, ui::{self, Item, View}};
 
@@ -14,7 +15,9 @@ pub struct Nodes;
 pub struct Connections;
 pub struct AmneziaWg;
 pub struct Telegram;
+pub struct Profiles;
 struct NodeCard(String);
+struct ProfileCard(String);
 
 /// Conditions of a node the shared handler resolves (`handle_node_codes`).
 const NODE_CODES: [&str; 4] = ["missing_secret", "host_key_changed", "host_key_unknown", "needs_setup"];
@@ -90,8 +93,20 @@ pub fn handle_node_codes(ctx: &mut Context<'_>, reply: &Reply, name: &str) -> io
             ctx.ui.notice(ui::warn("Нода требует SSH-настройки: раздел n → h."));
             Ok(false)
         }
+        "domain_required" => {
+            // `node apply --name N` names the node in `extra.name` too.
+            let target = reply.error["name"].as_str().filter(|s| !s.is_empty()).unwrap_or(name).to_owned();
+            set_domain(ctx, &target)
+        }
         _ => Ok(false),
     }
+}
+/// The domain question of `domain_required` → `node domain`; true when saved.
+fn set_domain(ctx: &mut Context<'_>, name: &str) -> io::Result<bool> {
+    if name.is_empty() { return Ok(false); }
+    let Some(domain) = ask_valid(ctx, &format!("Нода: {name}"), "Домен ноды (Enter — отмена)", |d| d.is_empty() || domain_valid(d), DOMAIN_INVALID)? else { return Ok(false); };
+    if domain.is_empty() { return Ok(false); }
+    Ok(ctx.call(&["node", "domain", "--name", name, "--domain", &domain])?.ok)
 }
 /// v1 `_tui_node_try` / `_tui_node_confirmed` (`review` = plan title and question).
 fn node_request(ctx: &mut Context<'_>, name: &str, words: &[String], review: Option<(&str, &str)>) -> io::Result<Reply> {
@@ -108,53 +123,44 @@ fn node_request(ctx: &mut Context<'_>, name: &str, words: &[String], review: Opt
 }
 /// `node shell` / `telegram menu`: a terminal request; the daemon runs the
 /// remote PTY and the local console relays it while the UI is suspended.
+/// `telegram menu` on a node with missing or stale scripts answers with the
+/// upload plan: it is shown, and on consent the command runs again with
+/// `--yes --plan-token` (a changed plan is shown again, at most twice — as
+/// `confirm::run_confirmed`).
 fn interactive(ctx: &mut Context<'_>, name: &str, telegram: bool) -> io::Result<()> {
-    let words = if telegram { argv(&["telegram", "menu", "--name", name]) } else { argv(&["node", "shell", "--name", name]) };
+    let base = if telegram { argv(&["telegram", "menu", "--name", name]) } else { argv(&["node", "shell", "--name", name]) };
+    let mut words = base.clone();
+    let mut changes = 0;
     loop {
         let reply = ctx.interactive(&words)?;
         if reply.ok { return Ok(()); }
-        if handle_node_codes(ctx, &reply, name)? { continue; }
-        if reply.code() == "invalid" {
-            if let Some(state) = reply.error["state"].as_str() { return offer_upload(ctx, name, state); }
+        if matches!(reply.code(), "confirmation_required" | "plan_changed") {
+            if reply.code() == "plan_changed" {
+                changes += 1;
+                if changes > 2 { ctx.ui.notice(ui::warn("План продолжает меняться. Действие не выполнено; повторите позже.")); return Ok(()); }
+                ctx.ui.notice(ui::warn("План изменился. Проверьте его ещё раз."));
+            }
+            let Some(token) = reply.error["plan_token"].as_str().filter(|s| !s.is_empty()) else { ctx.failed(); return Ok(()); };
+            if !ctx.confirm(View::review(format!("Нода: {name}"), &reply.error["plan"]), "Продолжить?")? { return Ok(()); }
+            words = base.clone();
+            confirm::set_flag(&mut words, "--yes", None);
+            confirm::set_flag(&mut words, "--plan-token", Some(token));
+            continue;
         }
+        if handle_node_codes(ctx, &reply, name)? { continue; }
         outcome(ctx, &reply);
         return Ok(());
     }
 }
-/// Scripts on the node are missing, outdated (Telegram menu) or of unknown
-/// state: offer the explicit upload (`--force` through its plan when the
-/// installation cannot be updated in place). The menu is not reopened.
-fn offer_upload(ctx: &mut Context<'_>, name: &str, state: &str) -> io::Result<()> {
-    let force = matches!(state, "broken" | "unknown");
-    let condition = match state {
-        "missing" => "скрипты отсутствуют",
-        "outdated" => "скрипты устарели",
-        "broken" => "установка повреждена",
-        _ => "версия скриптов неизвестна",
-    };
-    let label = if force { "Загрузить скрипты принудительно" } else { "Загрузить скрипты" };
-    let mut view = View::menu(format!("Скрипты на ноде: {name}"), vec![Item::new('u', label, ui::YELLOW), Item::new(0, "Назад", ui::NC)]);
-    view.context.push(ui::text(format!("Состояние: {condition}"), ui::YELLOW));
-    loop {
-        match ctx.choose(&view)?.as_deref() {
-            Some("u" | "U") => {
-                let mut words = argv(&["node", "upload-scripts", "--name", name]);
-                if force { words.push("--force".into()); }
-                if node_request(ctx, name, &words, Some(("Загрузка скриптов", "Загрузить скрипты?")))?.ok {
-                    ctx.ui.notice(ui::success("Скрипты загружены. Откройте меню снова."));
-                }
-                return Ok(());
-            }
-            Some("0") | None => return Ok(()),
-            _ => ctx.invalid(),
-        }
-    }
-}
 fn node_label(node: &Value) -> String { format!("{}  {}:{}", text(&node["name"]), text(&node["ip"]), text(&node["port"])) }
+/// The list row: label, then the apply state (`node list .status`) when the node has one.
 fn node_items(data: &Value, problems: bool) -> Vec<Item> {
     rows(data).iter().enumerate().map(|(i, node)| {
         let problem = problems && ((node["auth"] == "password" && node["password"] != "ok") || !rows(&node["issues"]).is_empty());
-        Item::new(i + 1, node_label(node), if problem { ui::YELLOW } else { ui::CYAN })
+        let state = if problems { apply_state(node) } else { None };
+        let label = match state { Some((state, _)) => format!("{}  · {state}", node_label(node)), None => node_label(node) };
+        let pending = state.is_some_and(|(_, color)| color == ui::YELLOW);
+        Item::new(i + 1, label, if problem || pending { ui::YELLOW } else { ui::CYAN })
     }).collect()
 }
 
@@ -174,13 +180,16 @@ impl Screen for Nodes {
             view.prompt = "Выберите действие: ".into();
             let list = node_items(&reply.data, true);
             if list.is_empty() { view.context.push(ui::text("Нет нод", ui::DIM)); } else { view.sections.push(list); }
+            let waiting = pending_count(&reply.data);
             let mut actions = vec![Item::new('a', "Добавить ноду", ui::GREEN)];
+            if waiting > 0 { actions.push(Item::new('y', format!("Применить на всех ожидающих ({waiting})"), ui::GREEN)); }
             if pending { actions.push(Item::new('h', "Завершить отложенную SSH-настройку", ui::YELLOW)); }
             actions.push(Item::new(0, "Назад", ui::NC));
             view.sections.push(actions);
             let Some(choice) = ctx.choose(&view)? else { return Ok(Navigation::Back); };
             match choice.as_str() {
                 "a" | "A" => add_node(ctx)?,
+                "y" | "Y" if waiting > 0 => { apply(ctx, &argv(&["node", "apply", "--pending"]), "")?; }
                 "h" | "H" if pending => setup_ssh(ctx)?,
                 "0" => return Ok(Navigation::Back),
                 _ => match index(&choice, rows(&reply.data).len()) {
@@ -209,19 +218,30 @@ fn card_view(name: &str, node: &Value, password: bool) -> View {
         view.context.push(plain("Вход: по ключу".into()));
     }
     view.context.push(plain(format!("Тег: {}", text(&node["tag"]))));
+    let profile = text(&node["profile"]);
+    view.context.push(plain(format!("Профиль: {}", if profile.is_empty() { "нет" } else { &profile })));
+    let domain = text(&node["domain"]);
+    view.context.push(plain(format!("Домен: {}", if domain.is_empty() { "нет" } else { &domain })));
+    if let Some(ports) = node["ports"].as_object().filter(|ports| !ports.is_empty()) {
+        let list: Vec<String> = ports.iter().map(|(key, port)| format!("{key}: {}", text(port))).collect();
+        view.context.push(plain(format!("Порты ноды: {}", list.join(", "))));
+    }
+    if let Some((state, color)) = apply_state(node) { view.context.push(ui::text(format!("Применение: {state}"), color)); }
+    if !profile.is_empty() { view.context.push(plain(format!("WARP: {}", warp_label(node)))); }
     let issues = joined(&node["issues"]);
     if !issues.is_empty() { view.context.push(ui::text(format!("Требует настройки: {issues}"), ui::YELLOW)); }
     let groups = joined(&node["groups"]);
     view.context.push(plain(format!("Группы: {}", if groups.is_empty() { "нет" } else { &groups })));
     view.context.push(plain(format!("Клиентов: {}", text(&node["clients"]))));
     view.sections.push(vec![
-        Item::new('o', "Меню сервера", ui::CYAN), Item::new('t', "Telegram Proxy на ноде", ui::CYAN),
+        Item::new('y', "Применить", ui::GREEN),
+        Item::new('o', "Оболочка", ui::CYAN), Item::new('t', "Telegram Proxy на ноде", ui::CYAN),
         Item::new('p', "Подключения ноды", ui::CYAN), Item::new('a', "Клиенты AmneziaWG", ui::CYAN),
         Item::new('k', "Проверить подключение", ui::CYAN),
     ]);
     let mut actions = vec![
-        Item::new('u', "Загрузить скрипты принудительно", ui::YELLOW), Item::new('h', "Усилить защиту SSH", ui::YELLOW),
-        Item::new('r', "Переименовать", ui::YELLOW), Item::new('e', "Тег", ui::YELLOW),
+        Item::new('f', "Профиль", ui::YELLOW), Item::new('m', "Домен", ui::YELLOW), Item::new('i', "Порты", ui::YELLOW),
+        Item::new('h', "Усилить защиту SSH", ui::YELLOW), Item::new('r', "Переименовать", ui::YELLOW), Item::new('e', "Тег", ui::YELLOW),
     ];
     if password { actions.push(Item::new('w', "Пароль SSH", ui::YELLOW)); }
     actions.extend([Item::new('l', "Псевдонимы подключений", ui::YELLOW), Item::new('d', "Удалить ноду", ui::RED), Item::new(0, "Назад", ui::NC)]);
@@ -246,10 +266,10 @@ impl Screen for NodeCard {
                 "p" | "P" => connection_node(ctx, &name)?,
                 "a" | "A" => awg_node(ctx, &name)?,
                 "k" | "K" => { node_request(ctx, &name, &argv(&["node", "check", "--name", &name]), None)?; }
-                "u" | "U" => {
-                    let words = argv(&["node", "upload-scripts", "--name", &name, "--force"]);
-                    node_request(ctx, &name, &words, Some(("Принудительная загрузка скриптов", "Загрузить скрипты?")))?;
-                }
+                "y" | "Y" => { apply(ctx, &argv(&["node", "apply", "--name", &name]), &name)?; }
+                "f" | "F" => node_profile(ctx, &name, node)?,
+                "m" | "M" => node_domain(ctx, &name, node)?,
+                "i" | "I" => node_ports(ctx, &name, node)?,
                 "h" | "H" => harden(ctx, &name)?,
                 "r" | "R" => {
                     // Esc/Ctrl+D cancel only the rename; Ctrl+C leaves the card.
@@ -326,8 +346,27 @@ fn add_node_with(ctx: &mut Context<'_>, secrets: &mut Secrets) -> io::Result<()>
         if !tag.is_empty() { break tag; }
         ctx.ui.notice(ui::warn("Тег не может быть пустым."));
     };
-    let base = argv(&["node", "add", "--name", &name, "--ip", &ip, "--port", &port, "--user", &user,
+    // Profile (no profiles — no question) and, when its site needs one, the node domain.
+    let profiles = ctx.call(&["profile", "list"])?;
+    let profiles = if profiles.ok { rows(&profiles.data["profiles"]).to_vec() } else { vec![] };
+    let mut profile = String::new();
+    let mut domain = String::new();
+    if !profiles.is_empty() {
+        let mut labels = vec!["Без профиля".to_owned()];
+        labels.extend(profiles.iter().map(|p| text(&p["name"])));
+        let Some(i) = ctx.select("Профиль ноды", &labels)? else { return Ok(()); };
+        if i > 0 {
+            profile = text(&profiles[i - 1]["name"]);
+            if needs_domain(&profiles[i - 1]) {
+                let Some(value) = ask_valid(ctx, TITLE, "Домен ноды", domain_valid, DOMAIN_INVALID)? else { return Ok(()); };
+                domain = value;
+            }
+        }
+    }
+    let mut base = argv(&["node", "add", "--name", &name, "--ip", &ip, "--port", &port, "--user", &user,
         "--auth", if password { "password" } else { "key" }, "--tag", &tag]);
+    if !profile.is_empty() { base.extend(argv(&["--profile", &profile])); }
+    if !domain.is_empty() { base.extend(argv(&["--domain", &domain])); }
     // v1 trusts a first-seen key (logged by the core); a changed one is
     // replaced only through the command's plan. Deferral checks no server key.
     let mut host_key = argv(&["--accept-new-host-key"]);
@@ -342,6 +381,11 @@ fn add_node_with(ctx: &mut Context<'_>, secrets: &mut Secrets) -> io::Result<()>
         };
         if reply.ok {
             if reply.data["needs_setup"] == true { ctx.ui.notice(ui::warn("Нода сохранена, но требует SSH-настройки: раздел n → h.")); }
+            // A node with a profile is applied right away, under the plan.
+            if !profile.is_empty() {
+                let saved = reply.data["name"].as_str().filter(|s| !s.is_empty()).unwrap_or(&name).to_owned();
+                apply(ctx, &argv(&["node", "apply", "--name", &saved]), &saved)?;
+            }
             return Ok(());
         }
         match reply.code() {
@@ -667,6 +711,7 @@ fn assign_connections(ctx: &mut Context<'_>, name: &str, discovered: Option<&[St
                 if changed.is_empty() { ctx.ui.notice(ui::warn("Изменений нет.")); return Ok(()); }
                 let reply = ctx.request(&conn_set_argv(name, &changed), &Secrets::default())?;
                 outcome(ctx, &reply);
+                if reply.ok { offer_apply(ctx)?; }
                 if !confirm::retryable(&reply) { return Ok(()); }
             }
             _ => match index(&choice, proxies.len()) {
@@ -889,6 +934,483 @@ impl Screen for Telegram {
     }
 }
 
+// ─── Применение ──────────────────────────────────────────────────────────────
+
+/// The apply state of a node (`node list|show .status`); none for a node without a profile.
+fn apply_state(node: &Value) -> Option<(&'static str, Color)> {
+    match node["status"].as_str() {
+        Some("pending") => Some(("ожидает применения", ui::YELLOW)),
+        Some("applied") => Some(("применено", ui::GREEN)),
+        Some("running") => Some(("применяется…", ui::CYAN)),
+        _ => None,
+    }
+}
+fn pending_count(list: &Value) -> usize { rows(list).iter().filter(|node| node["status"] == "pending").count() }
+fn warp_label(node: &Value) -> &'static str {
+    match node["warp"].as_str() { Some("free") => "бесплатный", Some("plus") => "WARP+", _ => "не зарегистрирован" }
+}
+/// `node apply …` under its plan; `name` — the node of `--name` (node codes
+/// and the top-level `domain_required` are resolved, then the command is
+/// repeated). The report (success or `partial`) goes to the journal, one
+/// `name: message` line per failure; for bulk nodes failed with
+/// `domain_required` the domain is asked, other node codes go to
+/// `handle_node_codes`, and after a resolved one the command is repeated once.
+pub(crate) fn apply(ctx: &mut Context<'_>, words: &[String], name: &str) -> io::Result<Reply> {
+    let mut repeated = false;
+    loop {
+        let reply = confirm::run_confirmed(ctx, "Применение на нодах", "Применить?", words, &Secrets::default())?;
+        if reply.ok || reply.code() == "partial" {
+            let data = if reply.ok { &reply.data } else { &reply.error };
+            let applied = joined(&data["applied"]);
+            if !applied.is_empty() { ctx.ui.notice(ui::success(format!("Применено: {applied}"))); }
+            let unchanged = joined(&data["unchanged"]);
+            if !unchanged.is_empty() { ctx.ui.notice(ui::text(format!("Без изменений: {unchanged}"), ui::DIM)); }
+            let failed = rows(&data["failed"]);
+            for entry in failed {
+                ctx.ui.notice(ui::warn(format!("{}: {}", text(&entry["name"]), text(&entry["message"]))));
+            }
+            if repeated { return Ok(reply); }
+            let mut resolved = false;
+            for entry in failed.iter().filter(|entry| entry["code"] == "domain_required") {
+                resolved |= set_domain(ctx, &text(&entry["name"]))?;
+            }
+            for entry in failed.iter().filter(|entry| entry["code"] != "domain_required") {
+                let failure = Reply { error: (*entry).clone(), ..Reply::default() };
+                resolved |= handle_node_codes(ctx, &failure, &text(&entry["name"]))?;
+            }
+            if !resolved { return Ok(reply); }
+            repeated = true;
+            continue;
+        }
+        // The core's message is already in the journal.
+        if reply.code() == "nothing_pending" { return Ok(reply); }
+        if handle_node_codes(ctx, &reply, name)? { continue; }
+        outcome(ctx, &reply);
+        return Ok(reply);
+    }
+}
+/// Commands after whose success nodes may wait for `node apply`; the reads
+/// `client nodes|connections --name C` (no change flag) are not among them.
+pub(crate) fn offers_apply(words: &[&str]) -> bool {
+    let changes = || words.iter().any(|w| matches!(*w, "--node" | "--inherit" | "--reset"));
+    match words {
+        ["client", "add" | "delete" | "set-group", ..] => true,
+        ["client", "nodes" | "connections", ..] => changes(),
+        ["conn", "set", ..] => true,
+        _ => false,
+    }
+}
+/// Nodes pending after a change: `node apply --pending` opens the core's plan
+/// at once (its confirmation is the only question).
+pub(crate) fn offer_apply(ctx: &mut Context<'_>) -> io::Result<()> {
+    let listed = ctx.call(&["node", "list"])?;
+    if !listed.ok || pending_count(&listed.data) == 0 { return Ok(()); }
+    apply(ctx, &argv(&["node", "apply", "--pending"]), "")?;
+    Ok(())
+}
+
+// ─── Профиль, домен и порты ноды ─────────────────────────────────────────────
+
+const DOMAIN_INVALID: &str = "Некорректный домен.";
+const PORT_INVALID: &str = "Порт должен быть числом от 1 до 65535.";
+/// `validation::domain_valid` of the core: labels, at least one dot.
+pub(crate) fn domain_valid(value: &str) -> bool {
+    (1..=253).contains(&value.len()) && value.contains('.') && value.split('.').all(|label| {
+        (1..=63).contains(&label.len()) && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            && !label.starts_with('-') && !label.ends_with('-')
+    })
+}
+fn port_valid(value: &str) -> bool { value.is_empty() || (value.bytes().all(|b| b.is_ascii_digit()) && !value.starts_with('0') && value.parse::<u16>().is_ok()) }
+/// A question repeated until `check` accepts the trimmed answer; `None` on cancel.
+fn ask_valid(ctx: &mut Context<'_>, title: &str, prompt: &str, check: impl Fn(&str) -> bool, message: &str) -> io::Result<Option<String>> {
+    loop {
+        let Some(value) = ask(ctx, title, prompt)? else { return Ok(None); };
+        let value = value.trim().to_owned();
+        if check(&value) { return Ok(Some(value)); }
+        ctx.ui.notice(ui::warn(message));
+    }
+}
+/// «Профиль»: a profile or «Без профиля» → `node profile`.
+fn node_profile(ctx: &mut Context<'_>, name: &str, node: &Value) -> io::Result<()> {
+    let listed = ctx.call(&["profile", "list"])?;
+    if !listed.ok { ctx.failed(); return Ok(()); }
+    let mut values = vec![String::new()];
+    values.extend(rows(&listed.data["profiles"]).iter().map(|p| text(&p["name"])));
+    let labels: Vec<String> = values.iter().map(|v| if v.is_empty() { "Без профиля".to_owned() } else { v.clone() }).collect();
+    let Some(i) = ctx.select(&format!("Профиль ноды: {name}"), &labels)? else { return Ok(()); };
+    if values[i] == text(&node["profile"]) { ctx.ui.notice(ui::warn("Изменений нет.")); return Ok(()); }
+    let reply = ctx.call(&["node", "profile", "--name", name, "--profile", &values[i]])?;
+    outcome(ctx, &reply);
+    Ok(())
+}
+/// «Домен»: Enter clears the domain → `node domain`.
+fn node_domain(ctx: &mut Context<'_>, name: &str, node: &Value) -> io::Result<()> {
+    let Some(domain) = ask_valid(ctx, &format!("Домен ноды: {name}"), "Домен (Enter — без домена)", |d| d.is_empty() || domain_valid(d), DOMAIN_INVALID)? else { return Ok(()); };
+    if domain == text(&node["domain"]) { ctx.ui.notice(ui::warn("Изменений нет.")); return Ok(()); }
+    let reply = ctx.call(&["node", "domain", "--name", name, "--domain", &domain])?;
+    outcome(ctx, &reply);
+    Ok(())
+}
+/// Protocols of a profile with a configurable port: (`node port --protocol` key, label, profile port).
+fn port_protocols(profile: &Value) -> Vec<(&'static str, &'static str, String)> {
+    let mut list = vec![];
+    let xhttp = &profile["vless_xhttp"];
+    if xhttp.is_object() && xhttp["topology"] != "nginx" { list.push(("vless-xhttp", "VLESS xHTTP", port_text(xhttp))); }
+    for (field, key, label) in [("vless_grpc", "vless-grpc", "VLESS gRPC"), ("hysteria2", "hysteria2", "Hysteria2"), ("amneziawg", "amneziawg", "AmneziaWG")] {
+        if profile[field].is_object() { list.push((key, label, port_text(&profile[field]))); }
+    }
+    list
+}
+/// «Порты»: a protocol of the profile with its effective port → `node port` (Enter — the profile's port).
+fn node_ports(ctx: &mut Context<'_>, name: &str, node: &Value) -> io::Result<()> {
+    let profile = text(&node["profile"]);
+    if profile.is_empty() { ctx.ui.notice(ui::warn("У ноды нет профиля.")); return Ok(()); }
+    let shown = ctx.call(&["profile", "show", "--name", &profile])?;
+    if !shown.ok { ctx.failed(); return Ok(()); }
+    let protocols = port_protocols(&shown.data);
+    if protocols.is_empty() { ctx.ui.notice(ui::warn("В профиле нет протоколов с настраиваемым портом.")); return Ok(()); }
+    let labels: Vec<String> = protocols.iter().map(|(key, label, port)| {
+        let own = text(&node["ports"][*key]);
+        if own.is_empty() { format!("{label}: {port} (профиль)") } else { format!("{label}: {own} (нода)") }
+    }).collect();
+    let Some(i) = ctx.select(&format!("Порты ноды: {name}"), &labels)? else { return Ok(()); };
+    let Some(port) = ask_valid(ctx, &format!("Порты ноды: {name}"), "Порт (Enter — порт профиля)", port_valid, PORT_INVALID)? else { return Ok(()); };
+    let reply = ctx.call(&["node", "port", "--name", name, "--protocol", protocols[i].0, "--port", &port])?;
+    outcome(ctx, &reply);
+    Ok(())
+}
+
+// ─── Профили нод ─────────────────────────────────────────────────────────────
+
+/// (form value, label, list abbreviation) of the protocols of a profile.
+const PROTOCOLS: [(&str, &str, &str); 6] = [
+    ("vless-tcp", "VLESS TCP", "TCP"), ("xhttp", "VLESS xHTTP", "xHTTP"), ("grpc", "VLESS gRPC", "gRPC"),
+    ("hysteria2", "Hysteria2", "HY2"), ("amneziawg", "AmneziaWG", "AWG"), ("warp", "WARP", "WARP"),
+];
+const SITE_SOURCES: [(&str, &str); 4] = [("random", "Случайный"), ("simple", "simple-web-templates"), ("sni", "sni-templates"), ("nothing", "nothing-sni")];
+const IPV6: [(&str, &str); 3] = [("default", "Как в системе"), ("enabled", "Включить"), ("disabled", "Отключить")];
+
+fn port_text(block: &Value) -> String { if block["port"].is_null() { String::new() } else { text(&block["port"]) } }
+/// The answers of the profile wizard; the same fields as the web form.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ProfileForm {
+    pub name: String, pub reality: String, pub sni_domain: String, pub site_source: String, pub protocols: Vec<String>,
+    pub xhttp: String, pub xhttp_port: String, pub grpc_port: String, pub hysteria2_port: String, pub hysteria2_obfs: bool,
+    pub amneziawg_port: String, pub amneziawg_dns: String, pub ipv6: String, pub acme_email: String, pub mihomo_version: String,
+}
+impl Default for ProfileForm {
+    fn default() -> Self {
+        Self { name: String::new(), reality: "self-steal".into(), sni_domain: String::new(), site_source: "random".into(),
+            protocols: vec!["vless-tcp".into()], xhttp: "reality".into(), xhttp_port: String::new(), grpc_port: String::new(),
+            hysteria2_port: String::new(), hysteria2_obfs: false, amneziawg_port: String::new(), amneziawg_dns: String::new(),
+            ipv6: "default".into(), acme_email: String::new(), mihomo_version: String::new() }
+    }
+}
+impl ProfileForm {
+    fn on(&self, protocol: &str) -> bool { self.protocols.iter().any(|p| p == protocol) }
+    /// The answers that describe an existing profile (`profile show`).
+    pub(crate) fn from_profile(profile: &Value) -> Self {
+        let sni = profile["reality_mode"] == "sni";
+        Self {
+            name: text(&profile["name"]), reality: if sni { "sni" } else { "self-steal" }.into(), sni_domain: text(&profile["sni_domain"]),
+            site_source: Some(text(&profile["site_source"])).filter(|s| !s.is_empty()).unwrap_or_else(|| "random".into()),
+            protocols: enabled_protocols(profile),
+            xhttp: if profile["vless_xhttp"]["topology"] == "nginx" { "nginx" } else { "reality" }.into(),
+            xhttp_port: port_text(&profile["vless_xhttp"]), grpc_port: port_text(&profile["vless_grpc"]),
+            hysteria2_port: port_text(&profile["hysteria2"]), hysteria2_obfs: profile["hysteria2"]["obfs"] == true,
+            amneziawg_port: port_text(&profile["amneziawg"]), amneziawg_dns: text(&profile["amneziawg"]["dns"]),
+            ipv6: Some(text(&profile["ipv6"])).filter(|s| !s.is_empty()).unwrap_or_else(|| "default".into()),
+            acme_email: text(&profile["acme_email"]), mihomo_version: text(&profile["mihomo_version"]),
+        }
+    }
+}
+fn enabled_protocols(profile: &Value) -> Vec<String> {
+    let on = [profile["vless_tcp"] == true, profile["vless_xhttp"].is_object(), profile["vless_grpc"].is_object(),
+        profile["hysteria2"].is_object(), profile["amneziawg"].is_object(), profile["warp"] == true];
+    PROTOCOLS.iter().zip(on).filter(|(_, on)| *on).map(|((value, ..), _)| (*value).to_owned()).collect()
+}
+/// A node of this profile needs a domain: Self-Steal with a Reality transport, xHTTP or Hysteria2.
+pub(crate) fn needs_domain(profile: &Value) -> bool {
+    profile["reality_mode"] == "self-steal" && (profile["vless_tcp"] == true || profile["vless_xhttp"].is_object()
+        || profile["vless_grpc"].is_object() || profile["hysteria2"].is_object())
+}
+fn protocols_label(profile: &Value) -> String {
+    let on = enabled_protocols(profile);
+    let list: Vec<&str> = PROTOCOLS.iter().filter(|(value, ..)| on.iter().any(|p| p == value)).map(|(.., short)| *short).collect();
+    if list.is_empty() { "—".into() } else { list.join(" ") }
+}
+fn reality_label(profile: &Value) -> String {
+    if profile["reality_mode"] == "sni" { format!("SNI {}", text(&profile["sni_domain"])) } else { "Self-Steal".into() }
+}
+/// The desired-profile flags of the answers in grammar order, without email and
+/// mihomo version (add and set treat them differently).
+fn profile_flags(form: &ProfileForm) -> Vec<(&'static str, Option<String>)> {
+    let flag = |protocol: &str| Some(if form.on(protocol) { "on" } else { "off" }.to_owned());
+    let value = |s: &str| Some(s.to_owned());
+    let sni = form.reality == "sni";
+    let mut flags = vec![("--reality", value(if sni { "sni" } else { "self-steal" }))];
+    if sni { flags.push(("--sni-domain", value(&form.sni_domain))); } else { flags.push(("--site-source", value(&form.site_source))); }
+    flags.push(("--vless-tcp", flag("vless-tcp")));
+    // Under SNI the xHTTP topology is always Reality: the nginx one needs the node's site.
+    let topology = if !form.on("xhttp") { "off" } else if sni || form.xhttp != "nginx" { "reality" } else { "nginx" };
+    flags.push(("--xhttp", value(topology)));
+    if topology == "reality" && !form.xhttp_port.is_empty() { flags.push(("--xhttp-port", value(&form.xhttp_port))); }
+    flags.push(("--grpc", flag("grpc")));
+    if form.on("grpc") && !form.grpc_port.is_empty() { flags.push(("--grpc-port", value(&form.grpc_port))); }
+    flags.push(("--hysteria2", flag("hysteria2")));
+    if form.on("hysteria2") {
+        if !form.hysteria2_port.is_empty() { flags.push(("--hysteria2-port", value(&form.hysteria2_port))); }
+        flags.push(("--hysteria2-obfs", value(if form.hysteria2_obfs { "on" } else { "off" })));
+    }
+    flags.push(("--amneziawg", flag("amneziawg")));
+    if form.on("amneziawg") {
+        if !form.amneziawg_port.is_empty() { flags.push(("--amneziawg-port", value(&form.amneziawg_port))); }
+        if !form.amneziawg_dns.is_empty() { flags.push(("--amneziawg-dns", value(&form.amneziawg_dns))); }
+    }
+    flags.push(("--warp", flag("warp")));
+    flags.push(("--ipv6", value(&form.ipv6)));
+    flags
+}
+fn flatten(flags: Vec<(&'static str, Option<String>)>) -> Vec<String> {
+    flags.into_iter().flat_map(|(flag, value)| std::iter::once(flag.to_owned()).chain(value)).collect()
+}
+/// `profile add`: an empty email — `--random-acme-email`, an empty version — the latest.
+pub(crate) fn profile_add_argv(form: &ProfileForm) -> Vec<String> {
+    let mut flags = profile_flags(form);
+    flags.push(if form.acme_email.is_empty() { ("--random-acme-email", None) } else { ("--acme-email", Some(form.acme_email.clone())) });
+    if !form.mihomo_version.is_empty() { flags.push(("--mihomo-version", Some(form.mihomo_version.clone()))); }
+    let mut words = argv(&["profile", "add", "--name", &form.name]);
+    words.extend(flatten(flags));
+    words
+}
+/// `profile set` with the changed flags only; `None` — nothing changed.
+pub(crate) fn profile_set_argv(name: &str, form: &ProfileForm, current: &Value) -> Option<Vec<String>> {
+    let before = ProfileForm::from_profile(current);
+    let previous = profile_flags(&before);
+    let mut changed: Vec<_> = profile_flags(form).into_iter().filter(|(flag, value)| !previous.iter().any(|(f, v)| f == flag && v == value)).collect();
+    if form.acme_email != before.acme_email {
+        changed.push(if form.acme_email.is_empty() { ("--random-acme-email", None) } else { ("--acme-email", Some(form.acme_email.clone())) });
+    }
+    if !form.mihomo_version.is_empty() && form.mihomo_version != before.mihomo_version { changed.push(("--mihomo-version", Some(form.mihomo_version.clone()))); }
+    if changed.is_empty() { return None; }
+    let mut words = argv(&["profile", "set", "--name", name]);
+    words.extend(flatten(changed));
+    Some(words)
+}
+fn email_valid(value: &str) -> bool {
+    let Some((local, domain)) = value.split_once('@') else { return false; };
+    !local.is_empty() && local.bytes().all(|b| b.is_ascii_alphanumeric() || b"._%+-".contains(&b))
+        && domain.split('.').count() >= 2 && domain.split('.').all(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+}
+fn version_valid(value: &str) -> bool {
+    value.strip_prefix('v').is_some_and(|rest| { let parts: Vec<_> = rest.split('.').collect(); parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())) })
+}
+/// One of `options` (value, label) by number; the current value is marked,
+/// highlighted and kept by Enter.
+fn choose_option(ctx: &mut Context<'_>, title: &str, options: &[(&str, &str)], current: Option<&str>) -> io::Result<Option<String>> {
+    let labels: Vec<String> = options.iter().map(|(value, label)| if current == Some(*value) { format!("{label} (сейчас)") } else { (*label).to_owned() }).collect();
+    let at = options.iter().position(|(value, _)| current == Some(*value));
+    Ok(ctx.select_current(title, &labels, at)?.map(|i| options[i].0.to_owned()))
+}
+/// The profile wizard (plan order): name → Reality → masking domain or site
+/// source → protocols → xHTTP topology → ports → obfs → AmneziaWG DNS → IPv6 →
+/// email → mihomo version. `current` — the answers to start from (the profile
+/// being edited or a failed attempt), Enter keeps each of them; `rename` asks
+/// the name (adding), editing skips it. `None` — cancelled.
+fn profile_wizard(ctx: &mut Context<'_>, current: Option<&ProfileForm>, rename: bool) -> io::Result<Option<ProfileForm>> {
+    let editing = current.is_some();
+    let mut form = current.cloned().unwrap_or_default();
+    let title = if rename { "Добавление профиля".to_owned() } else { format!("Профиль: {}", form.name) };
+    let mark = |value: &str| editing.then_some(value.to_owned());
+    if rename {
+        loop {
+            let prompt = if form.name.is_empty() { "Имя профиля".to_owned() } else { format!("Имя профиля [{}]", form.name) };
+            let Some(name) = ask(ctx, &title, &prompt)? else { return Ok(None); };
+            if !name.trim().is_empty() { form.name = name.trim().to_owned(); break; }
+            if !form.name.is_empty() { break; }
+            ctx.ui.notice(ui::warn("Имя профиля не указано."));
+        }
+    }
+    let reality = [("self-steal", "Self-Steal — у ноды свой домен"), ("sni", "SNI — маскировка под чужой домен, нода без домена")];
+    let Some(mode) = choose_option(ctx, "Режим Reality", &reality, mark(&form.reality).as_deref())? else { return Ok(None); };
+    form.reality = mode;
+    if form.reality == "sni" {
+        let keep = editing && !form.sni_domain.is_empty();
+        let prompt = if keep { format!("Домен-маскировка [{}]", form.sni_domain) } else { "Домен-маскировка".to_owned() };
+        let Some(domain) = ask_valid(ctx, &title, &prompt, |d| domain_valid(d) || (keep && d.is_empty()), DOMAIN_INVALID)? else { return Ok(None); };
+        if !domain.is_empty() { form.sni_domain = domain; }
+    } else {
+        let Some(source) = choose_option(ctx, "Сайт-заглушка", &SITE_SOURCES, mark(&form.site_source).as_deref())? else { return Ok(None); };
+        form.site_source = source;
+    }
+    let labels: Vec<String> = PROTOCOLS.iter().map(|(_, label, _)| (*label).to_owned()).collect();
+    loop {
+        let flags = PROTOCOLS.iter().map(|(value, ..)| form.on(value)).collect();
+        let Some(chosen) = ctx.toggle("Протоколы профиля", &labels, flags, EMPTY)? else { return Ok(None); };
+        if chosen.is_empty() { ctx.ui.notice(ui::warn("Выберите хотя бы один протокол.")); continue; }
+        form.protocols = chosen.into_iter().map(|i| PROTOCOLS[i].0.to_owned()).collect();
+        break;
+    }
+    if form.on("xhttp") {
+        if form.reality == "sni" { form.xhttp = "reality".into(); } else {
+            let Some(topology) = choose_option(ctx, "Топология xHTTP", &[("reality", "Reality"), ("nginx", "Через nginx сайта")], mark(&form.xhttp).as_deref())? else { return Ok(None); };
+            form.xhttp = topology;
+        }
+    }
+    let ports: [(&str, &str, bool); 4] = [
+        ("xhttp", "VLESS xHTTP", form.on("xhttp") && form.xhttp == "reality"), ("grpc", "VLESS gRPC", form.on("grpc")),
+        ("hysteria2", "Hysteria2", form.on("hysteria2")), ("amneziawg", "AmneziaWG", form.on("amneziawg")),
+    ];
+    for (key, label, asked) in ports {
+        if !asked { continue; }
+        let field = match key { "xhttp" => &mut form.xhttp_port, "grpc" => &mut form.grpc_port, "hysteria2" => &mut form.hysteria2_port, _ => &mut form.amneziawg_port };
+        let keep = editing && !field.is_empty();
+        let prompt = if keep { format!("Порт {label} [{field}]") } else { format!("Порт {label} (Enter — случайный)") };
+        let Some(port) = ask_valid(ctx, &title, &prompt, port_valid, PORT_INVALID)? else { return Ok(None); };
+        if !port.is_empty() || !keep { *field = port; }
+    }
+    if form.on("hysteria2") {
+        let current = editing.then_some(if form.hysteria2_obfs { "on" } else { "off" });
+        let Some(obfs) = choose_option(ctx, "Hysteria2: обфускация (obfs)", &[("on", "Включить"), ("off", "Выключить")], current)? else { return Ok(None); };
+        form.hysteria2_obfs = obfs == "on";
+    }
+    if form.on("amneziawg") {
+        let prompt = if form.amneziawg_dns.is_empty() { "DNS AmneziaWG (Enter — 1.1.1.1, 1.0.0.1)".to_owned() } else { format!("DNS AmneziaWG [{}]", form.amneziawg_dns) };
+        let Some(dns) = ask(ctx, &title, &prompt)? else { return Ok(None); };
+        if !dns.trim().is_empty() { form.amneziawg_dns = dns.trim().to_owned(); }
+    }
+    let Some(ipv6) = choose_option(ctx, "IPv6", &IPV6, mark(&form.ipv6).as_deref())? else { return Ok(None); };
+    form.ipv6 = ipv6;
+    let keep = editing && !form.acme_email.is_empty();
+    let prompt = if keep { format!("Email ACME [{}]", form.acme_email) } else { "Email ACME (Enter — случайный адрес)".to_owned() };
+    let Some(email) = ask_valid(ctx, &title, &prompt, |e| e.is_empty() || email_valid(e), "Некорректный email.")? else { return Ok(None); };
+    if !email.is_empty() || !keep { form.acme_email = email; }
+    let keep = editing && !form.mihomo_version.is_empty();
+    let prompt = if keep { format!("Версия mihomo [{}]", form.mihomo_version) } else { "Версия mihomo (Enter — последняя)".to_owned() };
+    let Some(version) = ask_valid(ctx, &title, &prompt, |v| v.is_empty() || version_valid(v), "Версия в виде vX.Y.Z.")? else { return Ok(None); };
+    if !version.is_empty() || !keep { form.mihomo_version = version; }
+    Ok(Some(form))
+}
+/// «Добавить профиль»: success opens its card; a failed `profile add`
+/// (`confirm::retryable`) reopens the wizard with the answers, name included.
+fn add_profile(ctx: &mut Context<'_>) -> io::Result<()> {
+    let mut draft = None;
+    loop {
+        let Some(form) = profile_wizard(ctx, draft.as_ref(), true)? else { return Ok(()); };
+        let added = ctx.request(&profile_add_argv(&form), &Secrets::default())?;
+        if added.ok { ProfileCard(added.data["name"].as_str().unwrap_or(&form.name).to_owned()).run(ctx)?; return Ok(()); }
+        outcome(ctx, &added);
+        if !confirm::retryable(&added) { return Ok(()); }
+        draft = Some(form);
+    }
+}
+/// «Изменить»: `profile set` with the changed flags; a failed command reopens
+/// the wizard with the answers.
+fn edit_profile(ctx: &mut Context<'_>, name: &str, profile: &Value) -> io::Result<()> {
+    let mut current = profile.clone();
+    let mut draft = ProfileForm::from_profile(profile);
+    loop {
+        let Some(form) = profile_wizard(ctx, Some(&draft), false)? else { return Ok(()); };
+        let Some(words) = profile_set_argv(name, &form, &current) else { ctx.ui.notice(ui::warn("Изменений нет.")); return Ok(()); };
+        let reply = ctx.request(&words, &Secrets::default())?;
+        outcome(ctx, &reply);
+        if !confirm::retryable(&reply) { return Ok(()); }
+        // A failure after the local write (e.g. the checkpoint) may have saved
+        // part of it: the next command is computed against the saved profile,
+        // the wizard keeps the user's answers.
+        let shown = ctx.call(&["profile", "show", "--name", name])?;
+        if !shown.ok { return Ok(()); }
+        current = shown.data;
+        draft = form;
+    }
+}
+impl Screen for Profiles {
+    fn run(&mut self, ctx: &mut Context<'_>) -> io::Result<Navigation> {
+        loop {
+            let reply = ctx.call(&["profile", "list"])?;
+            if !reply.ok {
+                if read_failed(ctx, "Профили нод")? { continue; }
+                return Ok(Navigation::Back);
+            }
+            let list = rows(&reply.data["profiles"]);
+            let mut view = View::new("Профили нод");
+            view.prompt = "Выберите действие: ".into();
+            if list.is_empty() { view.context.push(ui::text("Нет профилей", ui::DIM)); } else {
+                view.sections.push(list.iter().enumerate().map(|(i, p)| Item::new(i + 1,
+                    format!("{}  {}  {}  нод: {}", text(&p["name"]), reality_label(p), protocols_label(p), rows(&p["nodes"]).len()), ui::CYAN)).collect());
+            }
+            view.sections.push(vec![Item::new('a', "Добавить профиль", ui::GREEN), Item::new(0, "Назад", ui::NC)]);
+            let Some(choice) = ctx.choose(&view)? else { return Ok(Navigation::Back); };
+            match choice.as_str() {
+                "a" | "A" => add_profile(ctx)?,
+                "0" => return Ok(Navigation::Back),
+                _ => match index(&choice, list.len()) {
+                    Some(i) => { ProfileCard(text(&list[i]["name"])).run(ctx)?; }
+                    None => ctx.invalid(),
+                },
+            }
+        }
+    }
+}
+fn profile_view(name: &str, profile: &Value) -> View {
+    let mut view = View::new(format!("Профиль: {name}"));
+    view.prompt = "Выберите действие: ".into();
+    let plain = |line: String| ui::text(line, ui::NC);
+    let off = |block: &Value, on: String| if block.is_object() { on } else { "выкл.".into() };
+    view.context.push(plain(format!("Reality: {}", reality_label(profile))));
+    if profile["reality_mode"] != "sni" { view.context.push(plain(format!("Сайт-заглушка: {}", text(&profile["site_source"])))); }
+    view.context.push(plain(format!("VLESS TCP: {}", if profile["vless_tcp"] == true { "вкл." } else { "выкл." })));
+    let xhttp = &profile["vless_xhttp"];
+    view.context.push(plain(format!("VLESS xHTTP: {}", off(xhttp, if xhttp["topology"] == "nginx" { "через nginx".into() } else { format!("Reality, порт {}", port_text(xhttp)) }))));
+    view.context.push(plain(format!("VLESS gRPC: {}", off(&profile["vless_grpc"], format!("порт {}", port_text(&profile["vless_grpc"]))))));
+    let hy2 = &profile["hysteria2"];
+    view.context.push(plain(format!("Hysteria2: {}", off(hy2, format!("порт {}{}", port_text(hy2), if hy2["obfs"] == true { ", obfs" } else { "" })))));
+    let awg = &profile["amneziawg"];
+    view.context.push(plain(format!("AmneziaWG: {}", off(awg, format!("порт {}, DNS {}", port_text(awg), text(&awg["dns"]))))));
+    view.context.push(plain(format!("WARP: {}", if profile["warp"] != true { "выкл." } else if profile["warp_plus"] == true { "вкл., ключ WARP+ задан" } else { "вкл." })));
+    let ipv6 = text(&profile["ipv6"]);
+    view.context.push(plain(format!("IPv6: {}", IPV6.iter().find(|(v, _)| *v == ipv6).map_or(ipv6.as_str(), |(_, l)| l))));
+    view.context.push(plain(format!("Email ACME: {}", text(&profile["acme_email"]))));
+    view.context.push(plain(format!("Версия mihomo: {}", text(&profile["mihomo_version"]))));
+    let nodes = joined(&profile["nodes"]);
+    view.context.push(plain(format!("Ноды: {}", if nodes.is_empty() { "нет" } else { &nodes })));
+    if needs_domain(profile) { view.context.push(ui::text("Ноде этого профиля нужен домен", ui::YELLOW)); }
+    view.sections.push(vec![
+        Item::new('y', "Применить на нодах профиля", ui::GREEN), Item::new('e', "Изменить", ui::YELLOW),
+        Item::new('d', "Удалить профиль", ui::RED), Item::new(0, "Назад", ui::NC),
+    ]);
+    view
+}
+impl Screen for ProfileCard {
+    fn run(&mut self, ctx: &mut Context<'_>) -> io::Result<Navigation> {
+        loop {
+            let reply = ctx.call(&["profile", "show", "--name", &self.0])?;
+            if !reply.ok {
+                if reply.code() != "not_found" && read_failed(ctx, &format!("Профиль: {}", self.0))? { continue; }
+                return Ok(Navigation::Back);
+            }
+            let profile = &reply.data;
+            let name = self.0.clone();
+            let Some(choice) = ctx.choose(&profile_view(&name, profile))? else { return Ok(Navigation::Back); };
+            match choice.as_str() {
+                "y" | "Y" => {
+                    if rows(&profile["nodes"]).is_empty() { ctx.ui.notice(ui::warn("Профиль не назначен нодам.")); continue; }
+                    apply(ctx, &argv(&["node", "apply", "--profile", &name]), "")?;
+                }
+                "e" | "E" => edit_profile(ctx, &name, profile)?,
+                "d" | "D" => {
+                    let words = argv(&["profile", "delete", "--name", &name]);
+                    let reply = confirm::run_confirmed(ctx, "Удаление профиля", "Удалить профиль?", &words, &Secrets::default())?;
+                    if reply.ok { return Ok(Navigation::Back); }
+                    outcome(ctx, &reply);
+                }
+                "0" => return Ok(Navigation::Back),
+                _ => ctx.invalid(),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -911,13 +1433,17 @@ mod tests {
 
     /// v2 grammar of every command this module sends (remote-control/core/src/cli.rs CATALOG).
     const TG: &str = "name+ all component=";
+    const PROFILE: &str = "name= acme-email= random-acme-email reality= sni-domain= site-source= mihomo-version= vless-tcp= xhttp= xhttp-port= grpc= grpc-port= hysteria2= hysteria2-port= hysteria2-obfs= amneziawg= amneziawg-port= amneziawg-dns= warp= ipv6=";
     const GRAMMAR: &[(&str, &str, &str)] = &[
         ("status", "", ""), ("group", "list", ""),
         ("node", "list", ""), ("node", "show", "name="), ("node", "aliases", "name= set+ unset+"),
         ("node", "rename", "name= new-name="), ("node", "tag", "name= tag="), ("node", "password", "name="),
-        ("node", "add", "name= ip= port= user= auth= tag= host-key= accept-new-host-key replace-host-key= defer-ssh-setup"),
+        ("node", "add", "name= ip= port= user= auth= tag= host-key= accept-new-host-key replace-host-key= defer-ssh-setup profile= domain="),
         ("node", "trust-host-key", "name= host-key="), ("node", "delete", "name= scope= revoke-key"), ("node", "check", "name="),
-        ("node", "upload-scripts", "name= force"), ("node", "harden", "name= port="), ("node", "setup-ssh", "provision-keys= on-failure="),
+        ("node", "harden", "name= port="), ("node", "setup-ssh", "provision-keys= on-failure="),
+        ("node", "profile", "name= profile="), ("node", "domain", "name= domain="), ("node", "port", "name= protocol= port="),
+        ("node", "apply", "name+ profile= pending"),
+        ("profile", "list", ""), ("profile", "show", "name="), ("profile", "add", PROFILE), ("profile", "set", PROFILE), ("profile", "delete", "name="),
         ("node", "shell", "name="), ("conn", "list", "name= discover"), ("conn", "set", "name= assign+"), ("conn", "sync", "name="),
         ("awg", "status", "name="), ("awg", "sync", "name="), ("awg", "remove", "name= peer+ orphans"),
         ("telegram", "status", TG), ("telegram", "install", TG), ("telegram", "refresh-ip", TG), ("telegram", "web-update", TG),
@@ -985,6 +1511,10 @@ mod tests {
     }
     const ACCEPT: &[&str] = &["--accept-new-host-key"];
     fn added(needs_setup: bool) -> Reply { ok(json!({"name": "vps-1", "id": "x", "needs_setup": needs_setup})) }
+    /// The add wizard reads the profiles after the tag; none — no question.
+    fn no_profiles() -> (Vec<String>, Reply) { step(&["profile", "list"], ok(json!({"profiles": []}))) }
+    /// The apply offer reads `node list` after a change; no pending node — no question.
+    fn nothing_pending() -> (Vec<String>, Reply) { step(&["node", "list"], ok(json!([]))) }
 
     // ─── Ноды, добавление ────────────────────────────────────────────────────
 
@@ -996,11 +1526,11 @@ mod tests {
                 if auth == "password" { inputs.push("top-secret"); }
                 inputs.extend(["tag", "0"]);
                 let mut steps = listing();
-                steps.push((add_words(auth, ACCEPT), added(false)));
+                steps.extend([no_profiles(), (add_words(auth, ACCEPT), added(false))]);
                 steps.extend(listing());
                 let (client, ui) = screen(&mut Nodes, &inputs, steps);
                 let expected: Vec<String> = if auth == "password" { vec!["password".into()] } else { vec![] };
-                assert_eq!(client.secret_names[2], expected);
+                assert_eq!(client.secret_names[3], expected);
                 assert!(!client.calls.iter().flatten().any(|s| s.contains("top-secret")));
                 assert!(!ui.views.iter().flat_map(View::lines).any(|l| l.to_string().contains("top-secret")));
                 assert!(ui.notices.is_empty());
@@ -1018,7 +1548,7 @@ mod tests {
     #[test]
     fn passwords_are_read_hidden() {
         let registry = Registry { screens: vec![], github_wizard: None };
-        let mut client = ScriptedClient::new([(add_words("password", ACCEPT), added(false)), step(&["node", "password", "--name", "n"], ok(json!({"name": "n"})))]);
+        let mut client = ScriptedClient::new([no_profiles(), (add_words("password", ACCEPT), added(false)), step(&["node", "password", "--name", "n"], ok(json!({"name": "n"})))]);
         let mut ui = HiddenUi { script: ScriptedUi::new(&["", "192.0.2.1", "", "", "2", "pw", "tag", "pw2"]), hidden: vec![] };
         let mut ctx = Context::for_test(&mut client, &mut ui, &registry);
         add_node(&mut ctx).unwrap();
@@ -1030,7 +1560,7 @@ mod tests {
     fn add_validates_ip_port_password_and_tag_and_cancels() {
         let (_, _, ui) = run(none(), &["", ""], add_node);
         assert!(noticed(&ui, "IP не указан"));
-        let (_, _, ui) = run(vec![(add_words("password", ACCEPT), added(false))],
+        let (_, _, ui) = run(vec![no_profiles(), (add_words("password", ACCEPT), added(false))],
             &["", "192.0.2.1", "0", "70000", "x", "", "", "2", "", "pw", "", "tag"], add_node);
         assert_eq!(ui.notices.len(), 5);
         // EOF at any question sends nothing.
@@ -1042,52 +1572,52 @@ mod tests {
         let changed = err("host_key_changed", json!({"host": "192.0.2.1", "port": 22, "fingerprints": ["SHA256:new", "SHA256:old"], "name": "vps-1"}));
         let replace = add_words("password", &["--replace-host-key", "SHA256:new"]);
         let (_, client, ui) = run(vec![
-            (add_words("password", ACCEPT), changed.clone()), (replace.clone(), plan("confirmation_required", "one")),
+            no_profiles(), (add_words("password", ACCEPT), changed.clone()), (replace.clone(), plan("confirmation_required", "one")),
             (with_yes(&replace, "one"), added(false)),
         ], &["", "192.0.2.1", "", "", "2", "pw", "tag", "y"], add_node);
-        assert!(client.secret_names.iter().all(|n| n == &["password"]));
+        assert!(client.secret_names[1..].iter().all(|n| n == &["password"]));
         assert_eq!(confirms(&ui), 1);
         for no in ["", "n", "N"] {
-            run(vec![(add_words("key", ACCEPT), changed.clone()), (add_words("key", &["--replace-host-key", "SHA256:new"]), plan("confirmation_required", "one"))],
+            run(vec![no_profiles(), (add_words("key", ACCEPT), changed.clone()), (add_words("key", &["--replace-host-key", "SHA256:new"]), plan("confirmation_required", "one"))],
                 &["", "192.0.2.1", "", "", "1", "tag", no], add_node);
         }
     }
     #[test]
     fn add_remote_failure_retries_on_consent_with_optional_new_password() {
         let failed = err("remote_failed", json!({"reason": "auth", "name": "vps-1"}));
-        let (_, client, _) = run(vec![(add_words("password", ACCEPT), failed.clone()), (add_words("password", ACCEPT), added(false))],
+        let (_, client, _) = run(vec![no_profiles(), (add_words("password", ACCEPT), failed.clone()), (add_words("password", ACCEPT), added(false))],
             &["", "192.0.2.1", "", "", "2", "pw", "tag", "", "second"], add_node);
-        assert!(client.secret_names.iter().all(|n| n == &["password"]));
-        let (_, _, ui) = run(vec![(add_words("key", ACCEPT), failed.clone()), (add_words("key", ACCEPT), added(false))],
+        assert!(client.secret_names[1..].iter().all(|n| n == &["password"]));
+        let (_, _, ui) = run(vec![no_profiles(), (add_words("key", ACCEPT), failed.clone()), (add_words("key", ACCEPT), added(false))],
             &["", "192.0.2.1", "", "", "1", "tag", "maybe", "Y"], add_node);
         assert!(noticed(&ui, "Введите y или n."));
-        for no in ["n", "N"] { run(vec![(add_words("key", ACCEPT), failed.clone())], &["", "192.0.2.1", "", "", "1", "tag", no], add_node); }
+        for no in ["n", "N"] { run(vec![no_profiles(), (add_words("key", ACCEPT), failed.clone())], &["", "192.0.2.1", "", "", "1", "tag", no], add_node); }
     }
     #[test]
     fn add_onboarding_failure_retries_or_defers_without_host_key_flags() {
         let failed = err("onboarding_failed", json!({"name": "vps-1", "cause": "x"}));
-        let (_, _, ui) = run(vec![(add_words("key", ACCEPT), failed.clone()), (add_words("key", &["--defer-ssh-setup"]), added(true))],
+        let (_, _, ui) = run(vec![no_profiles(), (add_words("key", ACCEPT), failed.clone()), (add_words("key", &["--defer-ssh-setup"]), added(true))],
             &["", "192.0.2.1", "", "", "1", "tag", "2"], add_node);
         assert!(noticed(&ui, "требует SSH-настройки"));
-        run(vec![(add_words("key", ACCEPT), failed.clone()), (add_words("key", ACCEPT), added(false))], &["", "192.0.2.1", "", "", "1", "tag", "1"], add_node);
-        run(vec![(add_words("key", ACCEPT), failed)], &["", "192.0.2.1", "", "", "1", "tag", "0"], add_node);
+        run(vec![no_profiles(), (add_words("key", ACCEPT), failed.clone()), (add_words("key", ACCEPT), added(false))], &["", "192.0.2.1", "", "", "1", "tag", "1"], add_node);
+        run(vec![no_profiles(), (add_words("key", ACCEPT), failed)], &["", "192.0.2.1", "", "", "1", "tag", "0"], add_node);
     }
 
     // ─── Карточка ────────────────────────────────────────────────────────────
 
     #[test]
     fn card_keys_map_both_cases_to_v2_commands() {
-        for key in ["k", "u", "r", "e", "w", "l", "d"] {
+        for key in ["k", "y", "r", "e", "w", "l", "d"] {
             for key in [key.to_owned(), key.to_ascii_uppercase()] {
                 let mut inputs = vec![key.as_str()];
                 let mut steps = vec![show()];
                 let mut next = "n";
                 match key.to_ascii_lowercase().as_str() {
                     "k" => steps.push(step(&["node", "check", "--name", "n"], ok(json!({"name": "n", "reachable": true})))),
-                    "u" => {
-                        let words = argv(&["node", "upload-scripts", "--name", "n", "--force"]);
+                    "y" => {
+                        let words = argv(&["node", "apply", "--name", "n"]);
                         inputs.push("y");
-                        steps.extend([(words.clone(), plan("confirmation_required", "up")), (with_yes(&words, "up"), ok(json!({"name": "n", "state": "ready", "version": "1.0.0"})))]);
+                        steps.extend([(words.clone(), plan("confirmation_required", "ap")), (with_yes(&words, "ap"), ok(json!({"applied": [], "failed": [], "unchanged": ["n"]})))]);
                     }
                     "r" => { inputs.push("renamed"); next = "renamed"; steps.push(step(&["node", "rename", "--name", "n", "--new-name", "renamed"], ok(json!({"name": "renamed"})))); }
                     "e" => { inputs.push(""); steps.push(step(&["node", "tag", "--name", "n", "--tag", ""], ok(json!({"name": "n", "tag": ""})))); }
@@ -1108,7 +1638,7 @@ mod tests {
                 let (client, ui) = screen(&mut NodeCard("n".into()), &inputs, steps);
                 if key.eq_ignore_ascii_case("w") { assert_eq!(client.secret_names[1], ["password"]); }
                 assert!(!client.calls.iter().flatten().any(|s| s == "private"));
-                assert!(ui.notices.is_empty(), "{key}: {:?}", ui.notices);
+                assert!(ui.notices.iter().all(|l| l.to_string().starts_with("Без изменений")), "{key}: {:?}", ui.notices);
             }
         }
     }
@@ -1139,8 +1669,8 @@ mod tests {
         let (_, ui) = screen(&mut NodeCard("n".into()), &["0"], vec![step(&["node", "show", "--name", "n"], ok(unread))]);
         assert!(ui.views[0].context.iter().any(|l| l.to_string() == "Пароль SSH: не удалось прочитать" && l.style.fg == Some(ui::RED)));
         for no in ["", "N", "n", "0"] {
-            let (_, ui) = screen(&mut NodeCard("n".into()), &["u", no, "0"], vec![
-                show(), step(&["node", "upload-scripts", "--name", "n", "--force"], plan("confirmation_required", "one")), show(),
+            let (_, ui) = screen(&mut NodeCard("n".into()), &["y", no, "0"], vec![
+                show(), step(&["node", "apply", "--name", "n"], plan("confirmation_required", "one")), show(),
             ]);
             assert_eq!(confirms(&ui), 1);
         }
@@ -1150,7 +1680,8 @@ mod tests {
         assert_eq!(confirms(&ui), 1);
         let card = &ui.views[0];
         let colors: Vec<_> = card.sections.iter().flatten().map(|i| (i.key.as_str(), i.color)).collect();
-        assert!(colors.contains(&("d", ui::RED)) && colors.contains(&("o", ui::CYAN)) && colors.contains(&("u", ui::YELLOW)) && colors.contains(&("0", ui::NC)));
+        assert!(colors.contains(&("d", ui::RED)) && colors.contains(&("o", ui::CYAN)) && colors.contains(&("y", ui::GREEN)) && colors.contains(&("0", ui::NC)));
+        assert!(!colors.iter().any(|(key, _)| *key == "u"), "no forced script upload");
     }
 
     // ─── Усиление SSH ────────────────────────────────────────────────────────
@@ -1334,7 +1865,7 @@ mod tests {
             // p2 → g2; p1: off old, on g2. One command with both changed groups.
             let (_, _, ui) = run(vec![
                 node_sync(json!(["p1", "p2"])), node_list(), groups(),
-                step(&["conn", "set", "--name", "n", "--assign", "old=", "--assign", "g2=p2", "--assign", "g2=p1"], ok(json!({"node": "n", "changed": []}))), node_list(),
+                step(&["conn", "set", "--name", "n", "--assign", "old=", "--assign", "g2=p2", "--assign", "g2=p1"], ok(json!({"node": "n", "changed": []}))), nothing_pending(), node_list(),
             ], &[key, "2", "2", "", "1", "1", "2", "", "s", "0"], |ctx| connection_node(ctx, "n"));
             assert!(ui.views[0].context.iter().any(|l| l.to_string() == "p1  [old]"));
             assert_eq!(ui.views[1].sections[0][0].label, "p1  [old]");
@@ -1350,7 +1881,7 @@ mod tests {
         // Unreachable node: nothing discovered, an assigned proxy can still be removed.
         let unreachable = || step(&["conn", "sync", "--name", "n"], err("partial", json!({"nodes": [{"name": "n", "status": "unreachable", "error": "remote_failed"}]})));
         let (_, _, ui) = run(vec![unreachable(), node_list(), groups(),
-            step(&["conn", "set", "--name", "n", "--assign", "old="], ok(json!({"node": "n", "changed": []}))), node_list()],
+            step(&["conn", "set", "--name", "n", "--assign", "old="], ok(json!({"node": "n", "changed": []}))), nothing_pending(), node_list()],
             &["b", "1", "1", "", "s", "0"], |ctx| connection_node(ctx, "n"));
         // (not read is not «not found»)
         assert!(ui.views[0].context.iter().any(|l| l.to_string() == "p1  [old]"), "{:?}", ui.views[0].context);
@@ -1358,7 +1889,7 @@ mod tests {
         // A failed save keeps the editor and the edits: «s» again retries them.
         let set = || argv(&["conn", "set", "--name", "n", "--assign", "old="]);
         let (_, _, ui) = run(vec![unreachable(), node_list(), groups(), (set(), Reply::failure("locked")),
-            (set(), ok(json!({"node": "n", "changed": []}))), node_list()],
+            (set(), ok(json!({"node": "n", "changed": []}))), nothing_pending(), node_list()],
             &["b", "1", "1", "", "s", "s", "0"], |ctx| connection_node(ctx, "n"));
         assert_eq!(ui.views[4].sections[0][0].label, "p1  []", "{:?}", ui.views[4]);
         // No proxies at all: nothing to edit.
@@ -1374,7 +1905,7 @@ mod tests {
             {"name": "old", "proxies": ["p1"]}, {"name": "old", "proxies": ["a,b"]}]}])));
         let (_, _, ui) = run(vec![
             node_sync(json!(["p1", "p3"])), split.clone(), step(&["group", "list"], ok(json!([{"name": "old"}]))),
-            step(&["conn", "set", "--name", "n", "--assign", "old=p1", "--assign", "old=a,b", "--assign", "old=p3"], ok(json!({"node": "n", "changed": []}))), split,
+            step(&["conn", "set", "--name", "n", "--assign", "old=p1", "--assign", "old=a,b", "--assign", "old=p3"], ok(json!({"node": "n", "changed": []}))), nothing_pending(), split,
         ], &["b", "2", "1", "", "s", "0"], |ctx| connection_node(ctx, "n"));
         assert_eq!(ui.views[1].sections[0][2].label, "a,b (не найдено на ноде)  [old]");
         assert!(ui.views[0].context.iter().any(|l| l.to_string() == "a,b (не найдено на ноде)  [old]"));
@@ -1549,31 +2080,247 @@ mod tests {
         ], &["y", "pw"], |ctx| interactive(ctx, "n", false));
         assert_eq!(ui.suspensions, 2);
         assert_eq!(client.secret_names[1], ["password"]);
+        // `telegram menu` with stale scripts: the upload plan, one y/N, then the
+        // menu with `--yes --plan-token`; refusal opens nothing.
+        let menu = argv(&["telegram", "menu", "--name", "n"]);
+        let (_, client, ui) = run(vec![term(&menu, plan("confirmation_required", "m")), term(&with_yes(&menu, "m"), ok(json!({})))],
+            &["y"], |ctx| interactive(ctx, "n", true));
+        assert_eq!((ui.suspensions, confirms(&ui), client.calls.len()), (2, 1, 2));
+        assert!(ui.views.iter().any(|v| v.context.iter().any(|l| l.to_string() == "Operation and consequences")));
+        let (_, client, ui) = run(vec![term(&menu, plan("confirmation_required", "m"))], &["n"], |ctx| interactive(ctx, "n", true));
+        assert_eq!((ui.suspensions, client.calls.len()), (1, 1));
+        assert!(ui.notices.is_empty());
         let (_, ui) = screen(&mut Telegram, &["o", "0"], vec![step(&["node", "list"], ok(json!([])))]);
         assert!(ui.views.iter().any(|v| v.context.iter().any(|l| l.style.fg == Some(ui::DIM))));
     }
+
+    // ─── Профили, применение ─────────────────────────────────────────────────
+
+    fn edge() -> Value {
+        json!({"name": "edge", "reality_mode": "self-steal", "sni_domain": null, "site_source": "random", "vless_tcp": true,
+            "vless_xhttp": {"topology": "nginx", "port": null}, "vless_grpc": {"port": 20000}, "hysteria2": {"port": 30000, "obfs": true},
+            "amneziawg": null, "warp": false, "warp_plus": false, "ipv6": "default", "mihomo_version": "v1.19.18",
+            "acme_email": "a@example.com", "nodes": ["n"]})
+    }
     #[test]
-    fn stale_scripts_become_an_explicit_upload_offer_without_reopening() {
-        let menu = argv(&["telegram", "menu", "--name", "n"]);
-        let stale = |state: &str| err("invalid", json!({"name": "n", "state": state, "message": "core says upload"}));
-        let ready = ok(json!({"name": "n", "state": "ready", "version": "1.0.0"}));
-        for (state, key) in [("missing", "u"), ("outdated", "U")] {
-            let (_, _, ui) = run(vec![term(&menu, stale(state)), step(&["node", "upload-scripts", "--name", "n"], ready.clone()).into()],
-                &[key], |ctx| interactive(ctx, "n", true));
-            assert_eq!(ui.suspensions, 1);
-            assert!(noticed(&ui, "Скрипты загружены"));
-            assert!(!ui.views.iter().flat_map(View::lines).any(|l| l.to_string().contains("core says upload")));
-            assert_eq!(confirms(&ui), 0);
+    fn profile_wizard_builds_the_add_argv_in_plan_order() {
+        // Self-Steal, random site, + xHTTP (nginx), gRPC (port after an invalid one), Hysteria2 (random port, obfs).
+        let (form, _, ui) = run(none(), &["edge", "1", "1", "2", "3", "4", "", "2", "70000", "20000", "", "1", "1", "", ""],
+            |ctx| profile_wizard(ctx, None, true));
+        assert_eq!(profile_add_argv(&form.unwrap()), argv(&["profile", "add", "--name", "edge", "--reality", "self-steal", "--site-source", "random",
+            "--vless-tcp", "on", "--xhttp", "nginx", "--grpc", "on", "--grpc-port", "20000", "--hysteria2", "on", "--hysteria2-obfs", "on",
+            "--amneziawg", "off", "--warp", "off", "--ipv6", "default", "--random-acme-email"]));
+        assert!(noticed(&ui, PORT_INVALID));
+        // SNI: the masking domain is checked; email and version are passed.
+        let (form, _, ui) = run(none(), &["sni", "2", "bad", "www.example.com", "", "3", "me@example.com", "v1.19.20"], |ctx| profile_wizard(ctx, None, true));
+        assert_eq!(profile_add_argv(&form.unwrap()), argv(&["profile", "add", "--name", "sni", "--reality", "sni", "--sni-domain", "www.example.com",
+            "--vless-tcp", "on", "--xhttp", "off", "--grpc", "off", "--hysteria2", "off", "--amneziawg", "off", "--warp", "off", "--ipv6", "disabled",
+            "--acme-email", "me@example.com", "--mihomo-version", "v1.19.20"]));
+        assert!(noticed(&ui, DOMAIN_INVALID));
+        // Cancelled at any question: nothing.
+        let (form, _, _) = run(none(), &["edge", "1"], |ctx| profile_wizard(ctx, None, true));
+        assert!(form.is_none());
+    }
+    #[test]
+    fn profile_set_sends_only_changed_flags() {
+        let current = ProfileForm::from_profile(&edge());
+        assert_eq!(profile_set_argv("edge", &current, &edge()), None);
+        let mut changed = current.clone();
+        changed.protocols.retain(|p| p != "grpc");
+        changed.ipv6 = "enabled".into();
+        assert_eq!(profile_set_argv("edge", &changed, &edge()), Some(argv(&["profile", "set", "--name", "edge", "--grpc", "off", "--ipv6", "enabled"])));
+        let mut sni = current.clone();
+        sni.reality = "sni".into();
+        sni.sni_domain = "www.example.com".into();
+        assert_eq!(profile_set_argv("edge", &sni, &edge()),
+            Some(argv(&["profile", "set", "--name", "edge", "--reality", "sni", "--sni-domain", "www.example.com", "--xhttp", "reality"])));
+        // The edit wizard keeps every answer on Enter (selectors start at the
+        // current item, the nginx topology is not first): no change, no command.
+        let (_, ui) = screen(&mut ProfileCard("edge".into()), &["e", "", "", "", "", "", "", "", "", "", "", "0"], vec![
+            step(&["profile", "show", "--name", "edge"], ok(edge())), step(&["profile", "show", "--name", "edge"], ok(edge())),
+        ]);
+        assert!(noticed(&ui, "Изменений нет."));
+        let topology = ui.views.iter().find(|v| v.title == "Топология xHTTP").unwrap();
+        assert_eq!(topology.cursor, Some(1));
+        let (value, _, _) = run(none(), &[""], |ctx| choose_option(ctx, "IPv6", &IPV6, Some("disabled")));
+        assert_eq!(value.as_deref(), Some("disabled"));
+        assert!(needs_domain(&edge()) && !needs_domain(&json!({"reality_mode": "sni", "vless_tcp": true})));
+    }
+    #[test]
+    fn failed_profile_add_or_set_reopens_the_wizard_with_the_answers() {
+        let list = || step(&["profile", "list"], ok(json!({"profiles": []})));
+        let first = ProfileForm { name: "edge".into(), ..ProfileForm::default() };
+        let second = ProfileForm { name: "edge2".into(), ..first.clone() };
+        let mut renamed = edge();
+        renamed["name"] = json!("edge2");
+        // `exists`: the name is asked again with the old one kept by Enter, the
+        // other answers are kept; the corrected add opens the card.
+        let (client, ui) = screen(&mut Profiles, &["a", "edge", "1", "1", "", "1", "", "", "edge2", "", "", "", "", "", "", "0", "0"], vec![
+            list(), (profile_add_argv(&first), err("exists", json!({}))), (profile_add_argv(&second), ok(json!({"name": "edge2"}))),
+            step(&["profile", "show", "--name", "edge2"], ok(renamed)), list(),
+        ]);
+        assert!(ui.views.iter().any(|v| v.prompt.contains("Имя профиля [edge]")));
+        assert_eq!(client.calls.len(), 5);
+        // A failed `profile set` reopens the edit wizard with the changed IPv6
+        // (now the current item); Enter everywhere repeats the same command.
+        let set = argv(&["profile", "set", "--name", "edge", "--ipv6", "enabled"]);
+        let show = || step(&["profile", "show", "--name", "edge"], ok(edge()));
+        let mut keys = vec!["e", "", "", "", "", "", "", "", "2", "", ""];
+        keys.extend([""; 10]);
+        keys.push("0");
+        let (_, ui) = screen(&mut ProfileCard("edge".into()), &keys, vec![
+            show(), (set.clone(), err("locked", json!({}))), show(), (set, ok(json!({}))), show(),
+        ]);
+        let ipv6: Vec<_> = ui.views.iter().filter(|v| v.title == "IPv6").collect();
+        assert_eq!(ipv6.iter().map(|v| v.cursor).collect::<Vec<_>>(), [Some(0), Some(1)]);
+        // Cancelling the reopened wizard sends nothing more.
+        screen(&mut ProfileCard("edge".into()), &["e", "", "", "", "", "", "", "", "2", "", "", "0", "0"], vec![
+            show(), (argv(&["profile", "set", "--name", "edge", "--ipv6", "enabled"]), err("locked", json!({}))), show(), show(),
+        ]);
+        // The failed set was saved (checkpoint error after the local write):
+        // the retry is computed against the re-read profile, so returning
+        // IPv6 to «default» is sent along with the new email.
+        let mut saved = edge();
+        saved["ipv6"] = json!("disabled");
+        let mut keys = vec!["e", "", "", "", "", "", "", "", "3", "", ""];
+        keys.extend(["", "", "", "", "", "", "", "1", "b@example.com", "", "0"]);
+        let (_, ui) = screen(&mut ProfileCard("edge".into()), &keys, vec![
+            show(), (argv(&["profile", "set", "--name", "edge", "--ipv6", "disabled"]), err("checkpoint_failed", json!({}))),
+            step(&["profile", "show", "--name", "edge"], ok(saved)),
+            (argv(&["profile", "set", "--name", "edge", "--ipv6", "default", "--acme-email", "b@example.com"]), ok(json!({}))), show(),
+        ]);
+        let ipv6: Vec<_> = ui.views.iter().filter(|v| v.title == "IPv6").collect();
+        assert_eq!(ipv6[1].cursor, Some(2), "the reopened wizard shows the user's answer");
+    }
+    #[test]
+    fn bulk_apply_resolves_node_codes_of_failed_nodes_and_repeats_once() {
+        let words = argv(&["node", "apply", "--pending"]);
+        let entry = json!({"name":"de","stage":"probe","code":"missing_secret","message":"Пароль SSH для «de» не сохранён."});
+        let partial = || err("partial", json!({"applied": [], "unchanged": [], "failed": [entry.clone()]}));
+        let (reply, client, _) = run(vec![
+            (words.clone(), plan("confirmation_required", "a")), (with_yes(&words, "a"), partial()),
+            step(&["node", "password", "--name", "de"], ok(json!({"name": "de"}))),
+            (words.clone(), plan("confirmation_required", "b")), (with_yes(&words, "b"), ok(json!({"applied": ["de"], "failed": [], "unchanged": []}))),
+        ], &["y", "y", "pw", "y"], |ctx| apply(ctx, &words, ""));
+        assert!(reply.ok);
+        assert_eq!(client.secret_names[2], ["password"]);
+        // Refusing to save the password keeps the report without repeating.
+        let (reply, client, _) = run(vec![(words.clone(), plan("confirmation_required", "a")), (with_yes(&words, "a"), partial())],
+            &["y", "n"], |ctx| apply(ctx, &words, ""));
+        assert_eq!(reply.code(), "partial");
+        assert_eq!(client.calls.len(), 2);
+    }
+    #[test]
+    fn profiles_list_card_apply_and_refused_delete() {
+        let list = || step(&["profile", "list"], ok(json!({"profiles": [edge()]})));
+        let show = || step(&["profile", "show", "--name", "edge"], ok(edge()));
+        let apply = argv(&["node", "apply", "--profile", "edge"]);
+        let delete = argv(&["profile", "delete", "--name", "edge"]);
+        let (_, ui) = screen(&mut Profiles, &["1", "Y", "y", "d", "", "0", "0"], vec![
+            list(), show(), (apply.clone(), plan("confirmation_required", "a")), (with_yes(&apply, "a"), ok(json!({"applied": ["n"], "failed": [], "unchanged": []}))),
+            show(), (delete, plan("confirmation_required", "d")), show(), list(),
+        ]);
+        assert_eq!(ui.views[0].sections[0][0].label, "edge  Self-Steal  TCP xHTTP gRPC HY2  нод: 1");
+        assert!(noticed(&ui, "Применено: n"));
+        assert_eq!(confirms(&ui), 2);
+        assert!(crate::app::registrations().screens.iter().any(|entry| entry.key == 'r'));
+    }
+    #[test]
+    fn domain_required_asks_the_domain_and_repeats_apply() {
+        let words = argv(&["node", "apply", "--name", "n"]);
+        let (reply, client, ui) = run(vec![
+            (words.clone(), err("domain_required", json!({"name": "n"}))),
+            step(&["node", "domain", "--name", "n", "--domain", "de.example.com"], ok(json!({"name": "n"}))),
+            (words.clone(), plan("confirmation_required", "a")), (with_yes(&words, "a"), ok(json!({"applied": ["n"], "failed": [], "unchanged": []}))),
+        ], &["bad", "de.example.com", "y"], |ctx| apply(ctx, &words, "n"));
+        assert!(reply.ok);
+        assert!(noticed(&ui, DOMAIN_INVALID));
+        assert_eq!(client.calls.len(), 4);
+        // Cancelling the domain question stops without repeating.
+        run(vec![(words.clone(), err("domain_required", json!({"name": "n"})))], &[""], |ctx| apply(ctx, &words, "n"));
+    }
+    #[test]
+    fn bulk_apply_asks_domains_of_failed_nodes_and_repeats_once() {
+        let words = argv(&["node", "apply", "--pending"]);
+        let entry = json!({"name":"de","stage":"probe","code":"domain_required","message":"Для ноды «de» нужен домен: node domain --name de --domain D."});
+        let partial = || err("partial", json!({"message": "Применение завершено с ошибками.", "applied": [], "unchanged": [], "failed": [entry.clone()]}));
+        let (reply, client, ui) = run(vec![
+            (words.clone(), plan("confirmation_required", "a")), (with_yes(&words, "a"), partial()),
+            step(&["node", "domain", "--name", "de", "--domain", "de.example.com"], ok(json!({"name": "de"}))),
+            (words.clone(), plan("confirmation_required", "b")), (with_yes(&words, "b"), partial()),
+        ], &["y", "de.example.com", "y"], |ctx| apply(ctx, &words, ""));
+        // The repeated apply is not followed by another domain question.
+        assert_eq!(reply.code(), "partial");
+        assert_eq!(client.calls.len(), 5);
+        assert_eq!(ui.notices.iter().filter(|l| l.to_string().contains("de: Для ноды «de» нужен домен")).count(), 2);
+        // Cancelling the domain question keeps the report without repeating.
+        let (_, client, _) = run(vec![(words.clone(), plan("confirmation_required", "a")), (with_yes(&words, "a"), partial())],
+            &["y", ""], |ctx| apply(ctx, &words, ""));
+        assert_eq!(client.calls.len(), 2);
+    }
+    #[test]
+    fn apply_partial_reports_one_message_per_failed_node() {
+        let words = argv(&["node", "apply", "--pending"]);
+        let partial = err("partial", json!({"applied": ["a"], "unchanged": [], "failed": [
+            {"name":"de","stage":"config","code":"rolled_back","message":"откат на этапе «конфигурация и проверка»"},
+            {"name":"de","stage":"probe","code":"port_busy","message":"порт 443 уже занят","port":443},
+            {"name":"de","stage":"probe","code":"remote_failed","message":"Не удалось подключиться к «de»."},
+            {"name":"de","stage":"probe","code":"unsupported_os","message":"нужна Debian или Ubuntu с systemd"}]}));
+        let (_, _, ui) = run(vec![(words.clone(), plan("confirmation_required", "a")), (with_yes(&words, "a"), partial)], &["y"], |ctx| apply(ctx, &words, ""));
+        for line in ["Применено: a", "de: откат на этапе «конфигурация и проверка»", "de: порт 443 уже занят",
+            "de: Не удалось подключиться к «de».", "de: нужна Debian или Ubuntu с systemd"] {
+            assert!(noticed(&ui, line), "{line}");
         }
-        let forced = argv(&["node", "upload-scripts", "--name", "n", "--force"]);
-        let (_, _, ui) = run(vec![term(&menu, stale("broken")), (forced.clone(), plan("confirmation_required", "f")).into(), (with_yes(&forced, "f"), ready.clone()).into()],
-            &["z", "", "u", "y"], |ctx| interactive(ctx, "n", true));
-        assert_eq!(confirms(&ui), 1);
-        assert_eq!(ui.notices.iter().filter(|l| l.to_string().contains("Неверный выбор.")).count(), 2);
-        let shell = argv(&["node", "shell", "--name", "n"]);
-        run(vec![term(&shell, stale("unknown")), (forced.clone(), plan("confirmation_required", "f")).into()], &["u", "n"], |ctx| interactive(ctx, "n", false));
-        run(vec![term(&shell, stale("unknown"))], &["0"], |ctx| interactive(ctx, "n", false));
-        run(vec![term(&menu, stale("missing"))], &[], |ctx| interactive(ctx, "n", true));
+        // Nothing pending: the core's message only, no report.
+        let (_, _, ui) = run(vec![(words.clone(), err("nothing_pending", json!({})))], &[], |ctx| apply(ctx, &words, ""));
+        assert!(!noticed(&ui, "Применено"));
+    }
+    #[test]
+    fn node_list_shows_apply_state_and_applies_all_pending() {
+        let mut pending = node();
+        pending["status"] = json!("pending");
+        let words = argv(&["node", "apply", "--pending"]);
+        let (_, ui) = screen(&mut Nodes, &["y", "y", "0"], vec![
+            step(&["node", "list"], ok(json!([pending]))), step(&["status"], ok(json!({}))),
+            (words.clone(), plan("confirmation_required", "a")), (with_yes(&words, "a"), ok(json!({"applied": ["n"], "failed": [], "unchanged": []}))),
+            step(&["node", "list"], ok(json!([node()]))), step(&["status"], ok(json!({}))),
+        ]);
+        let first = &ui.views[0];
+        assert_eq!(first.sections[0][0].label, "n  192.0.2.1:22  · ожидает применения");
+        assert_eq!(first.sections[0][0].color, ui::YELLOW);
+        assert!(first.sections[1].iter().any(|item| item.key == "y"));
+        // Nothing pending: no such action.
+        assert!(!ui.views.last().unwrap().sections.iter().flatten().any(|item| item.key == "y"));
+    }
+    #[test]
+    fn add_with_a_profile_asks_the_domain_and_applies_the_node() {
+        let words = add_words("key", &["--profile", "edge", "--domain", "de.example.com", "--accept-new-host-key"]);
+        let apply = argv(&["node", "apply", "--name", "vps-1"]);
+        let (_, client, _) = run(vec![
+            step(&["profile", "list"], ok(json!({"profiles": [edge()]}))), (words, added(false)),
+            (apply.clone(), plan("confirmation_required", "a")), (with_yes(&apply, "a"), ok(json!({"applied": ["vps-1"], "failed": [], "unchanged": []}))),
+        ], &["", "192.0.2.1", "", "", "1", "tag", "2", "de.example.com", "y"], add_node);
+        assert_eq!(client.calls.len(), 4);
+        // «Без профиля»: no domain, no apply.
+        run(vec![step(&["profile", "list"], ok(json!({"profiles": [edge()]}))), (add_words("key", ACCEPT), added(false))],
+            &["", "192.0.2.1", "", "", "1", "tag", "1"], add_node);
+    }
+    #[test]
+    fn card_profile_domain_and_ports_send_only_changes() {
+        let mut with_profile = node();
+        with_profile["profile"] = json!("edge");
+        with_profile["ports"] = json!({"hysteria2": 31000});
+        run(vec![step(&["profile", "list"], ok(json!({"profiles": [edge()]}))), step(&["node", "profile", "--name", "n", "--profile", "edge"], ok(json!({})))],
+            &["2"], |ctx| node_profile(ctx, "n", &node()));
+        let (_, _, ui) = run(vec![step(&["profile", "list"], ok(json!({"profiles": [edge()]})))], &["2"], |ctx| node_profile(ctx, "n", &with_profile));
+        assert!(noticed(&ui, "Изменений нет."));
+        run(vec![step(&["node", "domain", "--name", "n", "--domain", "de.example.com"], ok(json!({})))], &["de.example.com"], |ctx| node_domain(ctx, "n", &node()));
+        let (_, _, ui) = run(vec![step(&["profile", "show", "--name", "edge"], ok(edge())),
+            step(&["node", "port", "--name", "n", "--protocol", "hysteria2", "--port", ""], ok(json!({})))], &["2", ""], |ctx| node_ports(ctx, "n", &with_profile));
+        let labels: Vec<&str> = ui.views[0].sections[0].iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(&labels[..2], ["VLESS gRPC: 20000 (профиль)", "Hysteria2: 31000 (нода)"]);
+        let (_, _, ui) = run(none(), &[], |ctx| node_ports(ctx, "n", &node()));
+        assert!(noticed(&ui, "У ноды нет профиля."));
     }
 
     // ─── Пустые и ошибочные состояния, кадры ─────────────────────────────────

@@ -63,7 +63,10 @@ const quiet = () => {};
  * `maxChanges` — сколько раз показывается `plan_changed` (`null` — без предела).
  */
 export async function reviewReply(title, question, argv, reply, deps, maxChanges = 2) {
-  const { request, confirm, notify = quiet, secrets, input } = deps;
+  const { request, confirm, notify = quiet, secrets, input, expect = null, operation = null } = deps;
+  // Окно операции — только у подтверждённого запуска; первый запрос лишь получает план.
+  const extra = expect === null ? {} : { expect };
+  const final = operation === null ? extra : { ...extra, operation };
   const base = [...argv];
   let changes = 0;
   for (;;) {
@@ -91,7 +94,7 @@ export async function reviewReply(title, question, argv, reply, deps, maxChanges
     const confirmed = [...base];
     setFlag(confirmed, '--yes');
     setFlag(confirmed, '--plan-token', token);
-    reply = await request(confirmed, { secrets, input });
+    reply = await request(confirmed, { secrets, input, ...final });
   }
 }
 
@@ -101,7 +104,8 @@ export async function reviewReply(title, question, argv, reply, deps, maxChanges
  * `deps.input` уходят с каждой попыткой.
  */
 export async function runConfirmed(title, question, argv, deps) {
-  const reply = await deps.request([...argv], { secrets: deps.secrets, input: deps.input });
+  const extra = deps.expect === null || deps.expect === undefined ? {} : { expect: deps.expect };
+  const reply = await deps.request([...argv], { secrets: deps.secrets, input: deps.input, ...extra });
   return reviewReply(title, question, argv, reply, deps, 2);
 }
 
@@ -118,6 +122,18 @@ export function isFailure(reply) {
  */
 export function retryable(reply) {
   return isFailure(reply) && !(reply.error && reply.error.code === 'partial');
+}
+
+/**
+ * Вопрос домена ноды (`nodes.rs::set_domain`) → `node domain --name N
+ * --domain D`; `true`, если домен сохранён. `deps` — `{ request, ask }`.
+ */
+export async function setNodeDomain(name, { request, ask }) {
+  if (!ask || !name) return false;
+  const domain = await ask({ title: `Нода: ${name}`, label: 'Домен ноды', placeholder: 'example.com' });
+  if (!domain || !domain.trim()) return false;
+  const saved = await request(['node', 'domain', '--name', name, '--domain', domain.trim()]);
+  return saved.ok;
 }
 
 /**
@@ -146,6 +162,11 @@ export async function handleNodeCodes(reply, name, deps) {
       const trusted = await runConfirmed('Ключ сервера изменился', 'Доверять новому ключу?', argv, { request, confirm, notify });
       return trusted.ok;
     }
+    case 'domain_required': {
+      // `node apply --name N`: ядро называет ноду и в `extra.name`.
+      const target = typeof reply.error.name === 'string' && reply.error.name ? reply.error.name : name;
+      return setNodeDomain(target, deps);
+    }
     case 'needs_setup':
       notify('warn', NEEDS_SETUP);
       return false;
@@ -163,13 +184,20 @@ export async function handleNodeCodes(reply, name, deps) {
  * (команда без подтверждения) экран обрабатывает сам: `request` их не
  * показывает, `OPERATION_FAILED` нет.
  */
-export async function nodeRequest(name, argv, review, deps, { expect = null } = {}) {
+export async function nodeRequest(name, argv, review, deps, { expect = null, operation = null } = {}) {
+  const expected = (reply) => expect !== null && Boolean(reply.error)
+    && (Array.isArray(expect) ? expect.includes(reply.error.code) : reply.error.code === expect);
   for (;;) {
-    const reply = review
-      ? await runConfirmed(review.title, review.question, argv, { request: deps.request, confirm: deps.confirm, notify: deps.notify })
-      : await deps.request([...argv], expect === null ? {} : { expect });
+    let reply;
+    if (review) {
+      reply = await runConfirmed(review.title, review.question, argv,
+        { request: deps.request, confirm: deps.confirm, notify: deps.notify, expect, operation });
+    } else {
+      const options = { ...(expect === null ? {} : { expect }), ...(operation === null ? {} : { operation }) };
+      reply = await deps.request([...argv], options);
+    }
     if (reply.ok) return reply;
-    if (!review && expect !== null && reply.error && reply.error.code === expect) return reply;
+    if (expected(reply)) return reply;
     if (await handleNodeCodes(reply, name, deps)) continue;
     if (isFailure(reply) && deps.notify) deps.notify('warn', OPERATION_FAILED);
     return reply;

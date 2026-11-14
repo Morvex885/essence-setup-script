@@ -267,8 +267,8 @@ web}`. `daemon stop` останавливает демон после текущ
 **Приветствие.** Первое сообщение демона:
 
 ```json
-{"event":"hello","protocol":3,"version":"2.0.0","origin":"local","exe":"/usr/local/bin/essence-rc","persistent":false}
-{"event":"hello","protocol":3,"version":"2.0.0","origin":"network","listener":{"loopback":true,"tls":false}}
+{"event":"hello","protocol":3,"version":"2.1.0","origin":"local","exe":"/usr/local/bin/essence-rc","persistent":false}
+{"event":"hello","protocol":3,"version":"2.1.0","origin":"network","listener":{"loopback":true,"tls":false}}
 ```
 
 Локальные соединения получают ещё `exe` и `persistent`, сетевые — `listener`.
@@ -662,7 +662,7 @@ essence-rc client --help       # команды одной сущности (т�
 ### Каталог команд
 
 Таблицы повторяют вывод `essence-rc help` и `essence-rc <сущность> --help`
-версии 2.0.0 (справка генерируется из каталога `remote-control/core/src/cli.rs`).
+версии 2.1.0 (справка генерируется из каталога `remote-control/core/src/cli.rs`).
 `[--yes]` — ключ `--yes [--plan-token T]` у команды с подтверждением;
 `help [СУЩНОСТЬ]` описан выше.
 
@@ -714,26 +714,40 @@ GitHub и пароль доступа; при недоступной сети �
 |---|---|
 | `node list` | Список нод |
 | `node show --name N` | Подробности ноды и варианты удаления |
-| `node aliases --name N [--set ORIG=ALIAS…] [--unset ORIG…]` | Псевдонимы подключений (без --set/--unset — обнаружить по SSH) |
+| `node aliases --name N [--set ORIG=ALIAS…] [--unset ORIG…]` | Псевдонимы подключений (без --set/--unset — подключения профиля ноды) |
 | `node rename --name N --new-name M` | Переименовать ноду (имя: латиница, цифры, «.», «_», «-») |
 | `node tag --name N --tag T` | Задать тег ноды (пустой допустим; до 32 символов, без управляющих и служебных символов) |
 | `node password --name N` | Сохранить пароль SSH (секрет password) |
-| `node add --name N --ip IP [--port 22] [--user root] --auth key\|password --tag T [--host-key SHA256:… \| --accept-new-host-key] [--replace-host-key SHA256:… [--yes]] [--defer-ssh-setup]` | Добавить ноду (для --auth password — секрет password) |
+| `node add --name N --ip IP [--port 22] [--user root] --auth key\|password --tag T [--host-key SHA256:… \| --accept-new-host-key] [--replace-host-key SHA256:… [--yes]] [--defer-ssh-setup] [--profile P] [--domain D]` | Добавить ноду (для --auth password — секрет password) |
 | `node trust-host-key --name N --host-key SHA256:… [--yes]` | Доверять новому ключу сервера ноды |
 | `node delete --name N [--scope local\|server] [--revoke-key] [--yes]` | Удалить ноду |
 | `node check --name N` | Проверить SSH-подключение |
-| `node upload-scripts --name N [--force [--yes]]` | Загрузить скрипты на ноду |
+| `node profile --name N --profile P` | Назначить ноде профиль (пустой P — снять профиль) |
+| `node domain --name N --domain D` | Домен ноды для сайта-заглушки и сертификата (пустой D — убрать) |
+| `node port --name N --protocol vless-xhttp\|vless-grpc\|hysteria2\|amneziawg --port P` | Порт протокола на ноде вместо порта профиля (пустой P — как в профиле) |
+| `node apply (--name N… \| --profile P \| --pending) [--yes]` | Применить профиль и роли на нодах |
 | `node harden --name N [--port P] [--yes]` | Усилить защиту SSH: ключ, отключение пароля, новый порт (без --port — детерминированный свободный порт из плана) |
 | `node setup-ssh [--provision-keys yes\|no] [--on-failure rollback\|defer] [--yes]` | Завершить отложенную SSH-настройку нод (GitHub) |
-| `node shell --name N` | Открыть меню сервера по SSH (нужен терминал) |
+| `node shell --name N` | Открыть оболочку на ноде по SSH (нужен терминал) |
+
+### Профили нод (`profile`)
+
+| Команда | Описание |
+|---|---|
+| `profile list` | Профили нод |
+| `profile show --name P` | Подробности профиля и его ноды |
+| `profile add --name P (--acme-email E \| --random-acme-email) [--reality self-steal\|sni] [--sni-domain D] [--site-source simple\|sni\|nothing\|random] [--mihomo-version vX.Y.Z] [--vless-tcp on\|off] [--xhttp off\|reality\|nginx] [--xhttp-port P] [--grpc on\|off] [--grpc-port P] [--hysteria2 on\|off] [--hysteria2-port P] [--hysteria2-obfs on\|off] [--amneziawg on\|off] [--amneziawg-port P] [--amneziawg-dns DNS] [--warp on\|off] [--ipv6 default\|enabled\|disabled]` | Добавить профиль нод (без порта — случайный; без версии — последняя mihomo) |
+| `profile set --name P [флаги profile add]` | Изменить профиль: только переданные поля |
+| `profile delete --name P [--yes]` | Удалить профиль без нод |
+| `profile warp-license --name P [--clear]` | Ключ WARP+ профиля (секрет password) |
 
 ### Подключения (`conn`)
 
 | Команда | Описание |
 |---|---|
-| `conn list [--name N [--discover]]` | Подключения нод по группам |
-| `conn set --name N --assign G=P…` | Задать подключения групп на ноде: `--assign G=P` на каждое подключение, каждой указанной группе — ровно этот список (`G=` — снять назначение); остальные группы не меняются |
-| `conn sync [--name N]` | Обнаружить подключения нод по SSH и убрать устаревшие назначения |
+| `conn list [--name N [--discover]]` | Подключения нод по группам (--discover — подключения, которые даёт профиль ноды) |
+| `conn set --name N --assign G=P…` | Задать подключения групп на ноде: --assign на каждое подключение (G= — снять назначение; другие группы не меняются) |
+| `conn sync [--name N]` | Убрать назначения подключений, которых профили нод больше не дают |
 
 ### AmneziaWG (`awg`)
 
@@ -776,7 +790,7 @@ GitHub и пароль доступа; при недоступной сети �
 | Команда | Описание |
 |---|---|
 | `group list` | Список групп |
-| `group add --name G [--template T]` | Добавить группу (сразу с шаблоном T; без него — `default.yaml`) |
+| `group add --name G [--template T]` | Добавить группу (с шаблоном T; без него — default.yaml) |
 | `group delete --name G [--yes]` | Удалить группу |
 | `group set-template --name G --template T` | Назначить шаблон группе |
 
@@ -791,7 +805,7 @@ GitHub и пароль доступа; при недоступной сети �
 | `template import --name T --file PATH [--yes]` | Загрузить шаблон из файла |
 | `template delete --name T [--yes]` | Удалить пользовательский шаблон |
 | `template groups --name T [--group G…] [--yes]` | Задать группы шаблона (остальные его группы — на default.yaml) |
-| `template check [--name T] [--file PATH]` | Проверить шаблон: YAML, маркеры, схема mihomo |
+| `template check [--name T] [--file PATH]` | Проверить шаблон (YAML, маркеры, схема mihomo): файл, если указан, иначе шаблон T |
 
 `template export` выполняет клиент (`template show` + запись файла); `--file` у
 `template import` и `template check` читает клиент (у `template check` флаг
@@ -1147,7 +1161,6 @@ SSH-настройка нод — раздел n → h». Данные — ко�
 | `p` | Подключения ноды | экран «Подключения ноды» |
 | `a` | Клиенты AmneziaWG | экран «AmneziaWG: N» |
 | `k` | Проверить подключение | `node check --name N` |
-| `u` | Загрузить скрипты принудительно | `node upload-scripts --name N --force` (план и подтверждение) |
 | `h` | Усилить защиту SSH | `node harden --name N [--port P]` |
 | `r` | Переименовать | `node rename --name N --new-name M` |
 | `e` | Тег | `node tag --name N --tag T` |
@@ -1161,11 +1174,10 @@ SSH-настройка нод — раздел n → h». Данные — ко�
 вопрос «Доверять новому ключу?»; `needs_setup` — подсказка «раздел n → h». После
 решения команда повторяется.
 
-Если `telegram menu` отвечает, что скрипты на ноде отсутствуют, устарели или
-повреждены (`invalid` с полем `state`), экран «Скрипты на ноде» предлагает `u`
-«Загрузить скрипты» (`node upload-scripts --name N`, для повреждённой или
-неизвестной установки — `--force`) с планом и подтверждением. Само меню Telegram
-скрипты не загружает и после загрузки заново не открывается.
+Если скрипты на ноде отсутствуют, устарели или повреждены, `telegram menu`
+отвечает `confirmation_required` с планом «На ноду «N» будут загружены скрипты
+vX.». Экран показывает план и после подтверждения повторяет команду с
+`--yes --plan-token`: скрипты загружаются, затем открывается меню.
 
 **Добавление ноды.** Вопросы по порядку: название (по умолчанию `vps-1`), IP,
 SSH-порт (22), логин (`root`), способ входа («SSH-ключ» или «Пароль»), пароль
@@ -1403,7 +1415,7 @@ Bash-версии) и вопрос «Заменить их конфигурац�
 | Восстановление GitHub | `source github-migrate-format`, `source github-replace-with-local [--provision-keys yes\|no]` |
 | Сводка | `status`, `subscription list`, `group list`, `node list` |
 | Ноды | `node list`, `status`; `node add --name N --ip IP --port P --user U --auth key\|password --tag T --accept-new-host-key` / `--replace-host-key SHA256:…` / `--defer-ssh-setup`; `node setup-ssh [--provision-keys yes\|no] [--on-failure defer]` |
-| Карточка ноды | `node show`, `node shell`, `telegram menu`, `node check`, `node upload-scripts [--force]`, `node harden [--port P]`, `node rename`, `node tag`, `node password`, `node aliases [--set …] [--unset …]`, `node delete --scope … [--revoke-key]`, `node trust-host-key --host-key SHA256:…` |
+| Карточка ноды | `node show`, `node shell`, `telegram menu`, `node check`, `node harden [--port P]`, `node rename`, `node tag`, `node password`, `node aliases [--set …] [--unset …]`, `node delete --scope … [--revoke-key]`, `node trust-host-key --host-key SHA256:…` |
 | Подключения | `conn sync [--name N]`, `conn list [--name N]`, `group list`, `conn set --name N --assign G=P…`, `node check` |
 | AmneziaWG | `node list`, `awg status`, `awg sync`, `awg remove --peer P` / `--orphans` |
 | Telegram Proxy | `node list`, `telegram menu --name N`, `telegram status --all`, `telegram install\|refresh-ip\|web-update\|web-restart\|backend-restart\|remove-all --name N…`, `telegram remove --component web\|mtproto --name N…` |
@@ -1721,12 +1733,12 @@ Proxy, затем Источник, Настройки и Журнал. Дейс
 `telegram menu --name N` открывает серверное меню Telegram Proxy одной ноды по
 SSH с терминалом (ссылки, смена секрета, спонсорский тег, диагностика); без
 терминала команда отвечает `tty_required`. Сначала выполняется read-only проверка
-ноды: SSH, ключ сервера, версия скриптов. Скрипты эта команда **не загружает**:
-если их нет или они старше встроенного комплекта, ответ — `invalid` с полем
-`state` (`missing`, `outdated`, `broken`) и подсказкой `node upload-scripts --name N`
-(для повреждённой или неизвестной установки — с `--force`). Меню превращает такой
-ответ в отдельную подтверждённую загрузку и само серверное меню после неё заново не
-открывает.
+ноды: SSH, ключ сервера, версия скриптов. Если скриптов нет, они старше
+встроенного комплекта или повреждены, загрузка идёт только по плану «На ноду «N»
+будут загружены скрипты vX.» (в токен входят VERSION и SHA-256 комплекта): без
+`--yes` ответ — `confirmation_required`, с `--yes --plan-token` скрипты
+загружаются, версия на ноде сверяется, и открывается меню. Меню TUI и веб-панель
+показывают план и повторяют команду после подтверждения.
 
 Пакетные команды `telegram status|install|refresh-ip|web-update|web-restart|backend-restart|remove|remove-all`
 принимают `--name N…` или `--all` и проходят три фазы:
@@ -2004,7 +2016,7 @@ client   (из clients[].subscription.headers)
 
 ```jsonc
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "nodes": [{                          // Список серверов (VPS)
     "id": "32-hex-stable-id",         // Стабильный идентификатор, не меняется при переименовании
     "name": "de-vps",                  // Уникальное имя ноды
@@ -2015,7 +2027,18 @@ client   (из clients[].subscription.headers)
     "identity": "system",              // null, "", "system" либо id ноды (переносимый ключ ssh/identities/<id>)
     "secret_id": null,                 // Обязательный ключ: null для "key", "node:<id>:ssh-password" для "password"
     "tag": "DE",                       // Опциональный тег (без тега ключ отсутствует)
-    "aliases": {}                      // Псевдонимы подключений: {"ИМЯ_НА_НОДЕ": "ПСЕВДОНИМ"} (node aliases)
+    "aliases": {},                     // Псевдонимы подключений: {"ИМЯ_ПОДКЛЮЧЕНИЯ": "ПСЕВДОНИМ"} (node aliases)
+    "profile": "main",                 // Необязательно: профиль сервера (node profile); без него нода — только SSH-цель
+    "domain": "de.example.com",        // Необязательно: домен сайта-заглушки и сертификата (node domain)
+    "ports": { "hysteria2": 8443 },    // Необязательно: порты вместо портов профиля (node port): vless-xhttp, vless-grpc, hysteria2, amneziawg
+    "params": {                        // Значения, сгенерированные один раз для ноды (не меняются)
+      "reality": { "public_key": "...", "short_id": "..." },
+      "xhttp_path": "/...", "grpc_service": "...", "hy2_obfs_password": "..."
+    },
+    "applied": {                       // Последнее применённое состояние (node apply)
+      "digest": "...", "files": { "/etc/mihomo/config.yaml": "sha256" }, "ports": ["443/tcp"], "at": "2026-11-01T12:00:00Z"
+    }
+    // "operation": {…}                — незавершённое применение на ноде (id, digest, files, ports, teardown)
   }],
   "groups": [{                         // Группы устройств
     "name": "ROUTER",                  // Имя группы (верхний регистр)
@@ -2032,7 +2055,7 @@ client   (из clients[].subscription.headers)
     ],
     "credentials": {                   // Учётные данные клиента (генерируются автоматически)
       "vless_uuid": "...",
-      "hy2_password": "..."
+      "hy2_password": "..."            // Также awg_private_key, awg_preshared_key, awg_index (AmneziaWG)
     },
     "subscription": {                  // Подписка (до первой публикации может содержать только headers)
       "token": "...",                  // 64-hex токен
@@ -2044,12 +2067,30 @@ client   (из clients[].subscription.headers)
   "connections": [{                    // Какие прокси ноды доступны каким группам
     "node": "de-vps",
     "groups": [
-      { "name": "ROUTER", "proxies": ["VLESS TCP", "HY2"] },
+      { "name": "ROUTER", "proxies": ["VLESS TCP", "Hysteria2"] },
       { "name": "MOBILE", "proxies": ["VLESS TCP"] }
     ]
   }],
-  "subscription_host": {               // Необязательно: нода-хост подписок
-    "node": "de-vps",
+  "profiles": [{                       // Профили серверов (profile add|set)
+    "name": "main",
+    "mihomo_version": "v1.19.18",
+    "acme_email": "admin@example.com",
+    "site_source": "random",           // simple, sni, nothing, random
+    "reality_mode": "self-steal",      // self-steal или sni (тогда задан "sni_domain")
+    "vless_tcp": true,
+    "vless_xhttp": { "topology": "nginx" },       // Необязательно: reality (с "port") или nginx
+    "vless_grpc": { "port": 2053 },               // Необязательно
+    "hysteria2": { "port": 8443, "obfs": false }, // Необязательно
+    "amneziawg": { "port": 51820, "dns": "..." }, // Необязательно
+    "warp": false,                     // "warp_plus": метка сохранённого ключа WARP+ (сам ключ — в secrets.json)
+    "ipv6": "default"                  // default, enabled, disabled
+  }],
+  "cascades": [],                      // Каскады: имя, входная нода, листенер, выход (нода или URI)
+  "telegram": [],                      // Telegram Proxy: {node, hostname, secret_mark, tag_mark}
+  "subscription_host": {               // Необязательно: нода-хост подписок (subscription host --name N)
+    "node": "de-vps",                  // Нода с профилем
+    "hostname": "sub.example.com",     // Домен и порт — из базового URL хостинга на ноде
+    "port": 2096,
     "base_url": "https://sub.example.com:2096",
     "sub_dir": "/var/lib/essence-sub",
     "nginx_group": "www-data"          // По умолчанию www-data
@@ -2062,11 +2103,23 @@ client   (из clients[].subscription.headers)
 ```
 
 Схема строгая: неизвестные поля ноды (в том числе устаревшее `pass`) отклоняются,
-имена нод, групп и клиентов уникальны и проверяются каноническими валидаторами,
-ссылки на ноды (`connections`, `clients[].nodes`, `clients[].connections`) должны
-указывать на существующие ноды; иначе `invalid`. Миграции старых форматов и
-сохранения неизвестных полей нет. Необязательное поле
-`minimum_remote_control_version` задаёт минимальную версию `essence-rc`.
+имена нод, групп, клиентов и профилей уникальны и проверяются каноническими
+валидаторами, ссылки на ноды и профили (`connections`, `clients[].nodes`,
+`clients[].connections`, `nodes[].profile`, `subscription_host.node`) должны
+указывать на существующие объекты; иначе `invalid`. Сохранения неизвестных полей
+нет. Необязательное поле `minimum_remote_control_version` задаёт минимальную
+версию `essence-rc`.
+
+**Миграция схемы 2 → 3.** `config.json` со `schema_version: 2` обновляется при
+чтении: номер схемы становится `3`, прежний `subscription_host` (без `hostname` и
+`port`) удаляется — хост-ноду подписок задают заново командой
+`subscription host --name N` (токены клиентов и опубликованные на сервере файлы
+сохраняются). Остальные поля (ноды, группы, клиенты с учётными данными и
+подписками, назначения подключений, псевдонимы) переносятся без изменений; новые
+поля пусты: `profiles`, `cascades`, `telegram`, у нод нет профиля, домена,
+параметров и `applied`, пока их не задают `profile add`, `node profile`,
+`node domain` и `node apply`. Файл записывается в схеме 3 при следующем
+изменении. Другие версии схемы отклоняются (`invalid`, «Ожидается schema_version: 3.»).
 
 Пароль ноды с `auth: "password"` хранится не в `config.json`, а в `secrets.json`
 (`schema_version: 1`, карта `node_passwords`) под ключом `node:<id>:ssh-password`.
@@ -2084,7 +2137,7 @@ client   (из clients[].subscription.headers)
 `"[host]:port"` → список отпечатков `SHA256:…` (порт указывается всегда, включая 22).
 
 **Формат снимка GitHub.** Переносимый снимок — `vault_version: 1`,
-`minimum_remote_control_version` (`2.0.0`), `portability`, `access`, `config`,
+`minimum_remote_control_version` (`2.1.0`), `portability`, `access`, `config`,
 `secrets` (`schema_version: 2`, пароли открытым текстом внутри снимка), `templates`
 (`{content, source, sha256}`), `ssh` (`identities`, `known_hosts`). При записи в
 `github-runtime/` пароли шифруются ключом принимающего устройства. Снимок старого

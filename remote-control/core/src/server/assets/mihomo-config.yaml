@@ -1,0 +1,158 @@
+log-level: silent
+mode: rule
+#@ipv6
+tcp-concurrent: true
+unified-delay: true
+allow-lan: false
+bind-address: "*"
+#@tproxy
+keep-alive-interval: 15
+
+dns:
+  enable: false
+
+sniffer:
+  enable: false
+
+proxies:
+#@proxies
+
+proxy-groups:
+  - name: outbound
+    type: fallback
+    proxies:
+#@outbound
+      - DIRECT
+    url: https://www.gstatic.com/generate_204
+    interval: 10
+    timeout: 3000
+    lazy: false
+#@groups
+
+listeners:
+#@listeners
+
+#@sub-rules
+rule-providers:
+  refilter_ipsum:
+    type: http
+    behavior: ipcidr
+    format: mrs
+    url: https://github.com/legiz-ru/mihomo-rule-sets/raw/main/re-filter/ip-rule.mrs
+    path: ./rules/re-filter.mrs
+    interval: 86400
+  discord-voice-ips:
+    type: http
+    behavior: ipcidr
+    format: mrs
+    url: https://github.com/legiz-ru/mihomo-rule-sets/raw/main/other/discord-voice-ip-list.mrs
+    path: ./rules/discord-voice-ips.mrs
+    interval: 86400
+  telegram-ip:
+    type: http
+    behavior: ipcidr
+    format: mrs
+    url: https://github.com/MetaCubeX/meta-rules-dat/raw/meta/geo/geoip/telegram.mrs
+    path: ./rules/telegram-ip.mrs
+    interval: 86400
+  cloudflare-ip:
+    type: http
+    behavior: ipcidr
+    format: mrs
+    url: https://github.com/MetaCubeX/meta-rules-dat/raw/meta/geo/geoip/cloudflare.mrs
+    path: ./rules/cloudflare-ip.mrs
+    interval: 86400
+  geoip-ru:
+    type: http
+    behavior: ipcidr
+    format: text
+    url: https://raw.githubusercontent.com/Davoyan/ipinfo/main/geo/geoip/ru.lst
+    path: ./rules/geoip-ru.lst
+    interval: 86400
+  facebook-asn:
+    type: http
+    behavior: classical
+    format: yaml
+    url: https://raw.githubusercontent.com/Kwisma/ASN-List/refs/heads/main/data/Facebook/Facebook_ASN.yaml
+    path: ./rules/Facebook_ASN.yaml
+    interval: 86400
+  fastly-asn:
+    type: http
+    behavior: classical
+    format: yaml
+    url: https://raw.githubusercontent.com/Kwisma/ASN-List/refs/heads/main/data/Fastly/Fastly_ASN.yaml
+    path: ./rules/Fastly_ASN.yaml
+    interval: 86400
+  netflix-asn:
+    type: http
+    behavior: classical
+    format: yaml
+    url: https://raw.githubusercontent.com/Kwisma/ASN-List/refs/heads/main/data/Netflix/Netflix_ASN.yaml
+    path: ./rules/Netflix_ASN.yaml
+    interval: 86400
+  telegram-asn:
+    type: http
+    behavior: classical
+    format: yaml
+    url: https://raw.githubusercontent.com/Kwisma/ASN-List/refs/heads/main/data/Telegram/Telegram_ASN.yaml
+    path: ./rules/Telegram_ASN.yaml
+    interval: 86400
+  twitter-asn:
+    type: http
+    behavior: classical
+    format: yaml
+    url: https://raw.githubusercontent.com/Kwisma/ASN-List/refs/heads/main/data/Twitter/Twitter_ASN.yaml
+    path: ./rules/Twitter_ASN.yaml
+    interval: 86400
+  google-asn:
+    type: http
+    behavior: classical
+    format: yaml
+    url: https://raw.githubusercontent.com/Kwisma/ASN-List/refs/heads/main/data/Google/Google_ASN.yaml
+    path: ./rules/Google_ASN.yaml
+    interval: 86400
+  amazon-asn:
+    type: http
+    behavior: classical
+    format: yaml
+    url: https://raw.githubusercontent.com/Kwisma/ASN-List/refs/heads/main/data/Amazon/Amazon_ASN.yaml
+    path: ./rules/Amazon_ASN.yaml
+    interval: 86400
+  cloudflare-asn:
+    type: http
+    behavior: classical
+    format: yaml
+    url: https://raw.githubusercontent.com/Kwisma/ASN-List/refs/heads/main/data/Cloudflare/Cloudflare_ASN.yaml
+    path: ./rules/Cloudflare_ASN.yaml
+    interval: 86400
+  microsoft-asn:
+    type: http
+    behavior: classical
+    format: yaml
+    url: https://raw.githubusercontent.com/Kwisma/ASN-List/refs/heads/main/data/Microsoft/Microsoft_ASN.yaml
+    path: ./rules/Microsoft_ASN.yaml
+    interval: 86400
+  leaseweb-asn:
+    type: http
+    behavior: classical
+    format: yaml
+    url: https://raw.githubusercontent.com/Kwisma/ASN-List/refs/heads/main/data/Leaseweb/Leaseweb_ASN.yaml
+    path: ./rules/Leaseweb_ASN.yaml
+    interval: 86400
+
+rules:
+  - RULE-SET,refilter_ipsum,outbound
+  - RULE-SET,discord-voice-ips,outbound
+  - RULE-SET,telegram-ip,outbound
+  - RULE-SET,facebook-asn,outbound
+  - RULE-SET,fastly-asn,outbound
+  - RULE-SET,netflix-asn,outbound
+  - RULE-SET,telegram-asn,outbound
+  - RULE-SET,twitter-asn,outbound
+  - RULE-SET,google-asn,outbound
+  - RULE-SET,amazon-asn,outbound
+  - RULE-SET,cloudflare-asn,outbound
+  - RULE-SET,microsoft-asn,outbound
+  - RULE-SET,leaseweb-asn,outbound
+  - RULE-SET,geoip-ru,outbound
+  - MATCH,DIRECT

@@ -789,11 +789,7 @@ _awg_rollback_install() {
     if [[ "$reinstall" == "1" ]]; then
         _awg_restore_path "$tx_dir" awg_dir "$AWG_DIR"
     elif [[ -f "$stage_dir/awg0.conf" ]]; then
-        rm -rf -- "$AWG_DIR"
-        mkdir -p -- "$AWG_DIR"
-        cp -a -- "$stage_dir/." "$AWG_DIR/" 2>/dev/null || true
-        chmod 600 "$AWG_CONF" "$AWG_DIR"/*.key 2>/dev/null || true
-        warn "Новый конфиг оставлен для диагностики: $AWG_CONF"
+        _awg_keep_staged_config "$stage_dir"
     else
         _awg_restore_path "$tx_dir" awg_dir "$AWG_DIR"
     fi
@@ -811,11 +807,33 @@ _awg_rollback_install() {
     warn "Исходное состояние восстановлено. Установленные пакеты AmneziaWG оставлены в системе."
 }
 
+# Первая установка: новый конфиг остаётся в $AWG_DIR для диагностики.
+_awg_keep_staged_config() {
+    local stage_dir="$1"
+    rm -rf -- "$AWG_DIR"
+    mkdir -p -- "$AWG_DIR"
+    cp -a -- "$stage_dir/." "$AWG_DIR/" 2>/dev/null || true
+    chmod 600 "$AWG_CONF" "$AWG_DIR"/*.key 2>/dev/null || true
+    warn "Новый конфиг оставлен для диагностики: $AWG_CONF"
+}
+
 _awg_abort_install() {
     local tx_dir="$1" reinstall="$2" stage_dir="$3" new_port="$4" old_port="$5" reason="$6"
     _awg_fail "$reason"
     [[ -n "${AWG_MIHOMO_CANDIDATE:-}" ]] && rm -f -- "$AWG_MIHOMO_CANDIDATE"
     _awg_rollback_install "$tx_dir" "$reinstall" "$stage_dir" "$new_port" "$old_port"
+    rm -rf -- "$tx_dir"
+    return 1
+}
+
+# Сбой до шага 3: система ещё не менялась, службы и правила не трогаются.
+_awg_discard_install() {
+    local tx_dir="$1" reinstall="$2" stage_dir="$3" reason="$4"
+    _awg_fail "$reason"
+    [[ -n "${AWG_MIHOMO_CANDIDATE:-}" ]] && rm -f -- "$AWG_MIHOMO_CANDIDATE"
+    if [[ "$reinstall" != "1" && -f "$stage_dir/awg0.conf" ]]; then
+        _awg_keep_staged_config "$stage_dir"
+    fi
     rm -rf -- "$tx_dir"
     return 1
 }
@@ -1243,16 +1261,16 @@ install_awg() {
     echo ""
     info "Шаг 2/4: Подготовка ключей и конфигурации..."
     AWG_TPROXY_PORT=$(_awg_gen_free_port 10000 60000) || {
-        _awg_abort_install "$tx_dir" "$reinstall" "$stage_dir" "$AWG_PORT" "$old_port"             "Не удалось найти свободный TPROXY-порт."
+        _awg_discard_install "$tx_dir" "$reinstall" "$stage_dir" "Не удалось найти свободный TPROXY-порт."
         return 1
     }
     _awg_stage_server_config "$stage_dir" || {
-        _awg_abort_install "$tx_dir" "$reinstall" "$stage_dir" "$AWG_PORT" "$old_port"             "Не удалось сгенерировать ключи или серверный конфиг."
+        _awg_discard_install "$tx_dir" "$reinstall" "$stage_dir" "Не удалось сгенерировать ключи или серверный конфиг."
         return 1
     }
     AWG_MIHOMO_CANDIDATE=""
     _awg_prepare_mihomo_candidate "$AWG_TPROXY_PORT" || {
-        _awg_abort_install "$tx_dir" "$reinstall" "$stage_dir" "$AWG_PORT" "$old_port"             "Конфигурация Mihomo не прошла проверку."
+        _awg_discard_install "$tx_dir" "$reinstall" "$stage_dir" "Конфигурация Mihomo не прошла проверку."
         return 1
     }
     success "Новая конфигурация подготовлена и проверена Mihomo"

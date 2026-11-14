@@ -1257,7 +1257,7 @@ dependencies = [
 
 [[package]]
 name = "essence-rc"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "base64 0.22.1",
  "crossterm",
@@ -1283,7 +1283,7 @@ dependencies = [
 
 [[package]]
 name = "essence-rc-client"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "base64 0.22.1",
  "dirs",
@@ -1307,7 +1307,7 @@ dependencies = [
 
 [[package]]
 name = "essence-rc-tui"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "crossterm",
  "essence-rc-client",
@@ -1323,7 +1323,7 @@ dependencies = [
 
 [[package]]
 name = "essence-rc-web"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "axum",
  "hex",
@@ -3341,7 +3341,7 @@ dependencies = [
 
 [[package]]
 name = "rc-core"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "aes-gcm 0.10.3",
  "age",
@@ -3370,6 +3370,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "windows-sys 0.61.2",
+ "x25519-dalek",
  "zeroize",
  "zip",
 ]

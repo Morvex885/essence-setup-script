@@ -189,13 +189,21 @@ const PLAN = failure('confirmation_required');
 /**
  * ctx по сценарию: `replies` — ответы `request`/`runConfirmed`/`nodeRequest` по порядку,
  * `answers` — ответы `form`/`choose`/`confirm`. `calls` — порядок вызовов.
+ * Фоновое чтение `node list` предложения применить (`quiet`) не входит в
+ * сценарий: отвечает `nodes` (по умолчанию нод нет) и пишется в `offers`.
  */
-function fakeCtx({ replies = [], answers = [] } = {}) {
+function fakeCtx({ replies = [], answers = [], nodes = [] } = {}) {
   const calls = [];
+  const offers = [];
   const answer = (kind) => async (props) => { calls.push([kind, props]); return answers.shift(); };
   return {
     calls,
-    request: async (argv) => { calls.push(['request', argv]); return replies.shift(); },
+    offers,
+    request: async (argv, options = {}) => {
+      if (options.quiet && argv.join(' ') === 'node list') { offers.push(argv); return { ok: true, data: nodes }; }
+      calls.push(['request', argv]);
+      return replies.shift();
+    },
     runConfirmed: async (title, question, argv) => { calls.push(['run', argv]); return replies.shift(); },
     nodeRequest: async (node, argv) => { calls.push(['node', argv]); return replies.shift(); },
     form: answer('form'),
@@ -530,4 +538,42 @@ test('конфиг клиента: client config → текст; не созда
   const broken = fakeCtx({ replies: [failure()] });
   assert.equal(await m.readClientConfig(broken, 'a'), null);
   assert.deepEqual(kinds(broken), ['request', 'failed']);
+});
+
+test('предложение применить: после client add и conn set — node list и сразу node apply --pending под планом', async () => {
+  const pending = [{ name: 'de', status: 'pending' }, { name: 'nl', status: 'applied' }];
+  const report = { ok: true, data: { applied: ['de'], failed: [], unchanged: [] } };
+  // Своего вопроса нет: подтверждение — только план ядра внутри nodeRequest.
+  const yes = fakeCtx({ replies: [{ ok: true, data: { name: 'c' } }, report], nodes: pending });
+  await m.execute(yes, ['client', 'add', '--name', 'c', '--group', 'PC']);
+  assert.deepEqual(yes.offers, [['node', 'list']]);
+  assert.deepEqual(commands(yes), [['client', 'add', '--name', 'c', '--group', 'PC'], ['node', 'apply', '--pending']]);
+  assert.deepEqual(kinds(yes), ['request', 'node', 'show']);
+  // Отказ от плана — без итога; без ожидающих нод — без применения.
+  const no = fakeCtx({ replies: [{ ok: true, data: {} }, PLAN], nodes: pending });
+  await m.execute(no, ['conn', 'set', '--name', 'de', '--assign', 'PC=VLESS TCP']);
+  assert.deepEqual(kinds(no), ['request', 'node']);
+  const none = fakeCtx({ replies: [{ ok: true, data: {} }], nodes: [{ name: 'de', status: 'applied' }] });
+  await m.execute(none, ['client', 'nodes', '--name', 'c', '--inherit']);
+  assert.deepEqual(kinds(none), ['request']);
+  // Прочие команды не предлагают применение; сбой — тоже.
+  const other = fakeCtx({ replies: [{ ok: true, data: {} }, failure()], nodes: pending });
+  await m.execute(other, ['group', 'add', '--name', 'g']);
+  await m.execute(other, ['client', 'add', '--name', 'c', '--group', 'PC']);
+  assert.deepEqual(other.offers, []);
+  // По плану: client delete подтверждён — предложение.
+  const deleted = fakeCtx({ replies: [{ ok: true, data: {} }, PLAN], nodes: pending });
+  await m.confirmed(deleted, 'T', 'Q?', ['client', 'delete', '--name', 'c']);
+  assert.deepEqual(deleted.offers, [['node', 'list']]);
+});
+
+test('генерация: nodes_pending в итоге и предложение применить', async () => {
+  assert.ok(m.GENERATE_FIELDS.some(([field]) => field === 'nodes_pending'));
+  const ctx = fakeCtx({ replies: [{ ok: true, data: { ok: ['c'], nodes_pending: ['de'] } }, PLAN], nodes: [{ name: 'de', status: 'pending' }] });
+  await m.runGenerate(ctx, ['--all']);
+  assert.deepEqual(ctx.offers, [['node', 'list']]);
+  assert.deepEqual(kinds(ctx), ['request', 'show', 'node']);
+  const clean = fakeCtx({ replies: [{ ok: true, data: { ok: ['c'] } }] });
+  await m.runGenerate(clean, ['--all']);
+  assert.deepEqual(clean.offers, []);
 });

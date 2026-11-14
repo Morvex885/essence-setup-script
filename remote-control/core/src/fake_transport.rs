@@ -84,7 +84,8 @@ impl ConnectExpectation {
 pub enum Operation {
     Connect(ConnectExpectation),
     Exec { command: String, stdin_len: usize, timeout: Duration },
-    Upload { local_dir: PathBuf, remote_dir: String, timeout: Duration },
+    /// `private`: `upload_private` (owner-only modes on the node).
+    Upload { local_dir: PathBuf, remote_dir: String, timeout: Duration, private: bool },
     Interactive { command: String, pty: PtyRequest },
     Hold,
 }
@@ -126,7 +127,10 @@ impl ScriptStep {
     }
 
     pub fn upload(local_dir: impl Into<PathBuf>, remote_dir: impl Into<String>, timeout: Duration, outcome: Result<()>) -> Self {
-        Self { expected: Operation::Upload { local_dir: local_dir.into(), remote_dir: remote_dir.into(), timeout }, outcome: Outcome::Unit(outcome), any_local_dir: false }
+        Self {
+            expected: Operation::Upload { local_dir: local_dir.into(), remote_dir: remote_dir.into(), timeout, private: false },
+            outcome: Outcome::Unit(outcome), any_local_dir: false,
+        }
     }
 
     /// A pty-backed command: `output` reaches the console, then `status`.
@@ -142,7 +146,15 @@ impl ScriptStep {
     /// journaled. Prefer `upload` whenever the expected local path is available.
     pub fn upload_any_local(remote_dir: impl Into<String>, timeout: Duration, outcome: Result<()>) -> Self {
         Self {
-            expected: Operation::Upload { local_dir: PathBuf::new(), remote_dir: remote_dir.into(), timeout },
+            expected: Operation::Upload { local_dir: PathBuf::new(), remote_dir: remote_dir.into(), timeout, private: false },
+            outcome: Outcome::Unit(outcome), any_local_dir: true,
+        }
+    }
+
+    /// `upload_any_local` through `upload_private`.
+    pub fn upload_private_any_local(remote_dir: impl Into<String>, timeout: Duration, outcome: Result<()>) -> Self {
+        Self {
+            expected: Operation::Upload { local_dir: PathBuf::new(), remote_dir: remote_dir.into(), timeout, private: true },
             outcome: Outcome::Unit(outcome), any_local_dir: true,
         }
     }
@@ -150,8 +162,9 @@ impl ScriptStep {
     fn matches(&self, operation: &Operation) -> bool {
         if self.any_local_dir {
             match (&self.expected, operation) {
-                (Operation::Upload { remote_dir: expected_remote, timeout: expected_timeout, .. },
-                 Operation::Upload { remote_dir, timeout, .. }) => expected_remote == remote_dir && expected_timeout == timeout,
+                (Operation::Upload { remote_dir: expected_remote, timeout: expected_timeout, private: expected_private, .. },
+                 Operation::Upload { remote_dir, timeout, private, .. }) =>
+                    expected_remote == remote_dir && expected_timeout == timeout && expected_private == private,
                 _ => false,
             }
         } else {
@@ -247,8 +260,8 @@ impl FakeScript {
         }
     }
 
-    fn upload(&self, connected: bool, local_dir: &Path, remote_dir: &str, timeout: Duration) -> Result<()> {
-        let operation = Operation::Upload { local_dir: local_dir.into(), remote_dir: remote_dir.into(), timeout };
+    fn upload(&self, connected: bool, local_dir: &Path, remote_dir: &str, timeout: Duration, private: bool) -> Result<()> {
+        let operation = Operation::Upload { local_dir: local_dir.into(), remote_dir: remote_dir.into(), timeout, private };
         match self.lock().perform(operation, connected)? {
             Outcome::Unit(result) => result,
             _ => Err(remote_failure("fake_script_response_type")),
@@ -345,7 +358,11 @@ impl RemoteSession for FakeTransport {
     }
 
     async fn upload(&self, local_dir: &Path, remote_dir: &str, timeout: Duration) -> Result<()> {
-        self.script.upload(self.connected, local_dir, remote_dir, timeout)
+        self.script.upload(self.connected, local_dir, remote_dir, timeout, false)
+    }
+
+    async fn upload_private(&self, local_dir: &Path, remote_dir: &str, timeout: Duration) -> Result<()> {
+        self.script.upload(self.connected, local_dir, remote_dir, timeout, true)
     }
 }
 
@@ -355,7 +372,11 @@ impl RemoteSession for FakeHeldSession {
     }
 
     async fn upload(&self, local_dir: &Path, remote_dir: &str, timeout: Duration) -> Result<()> {
-        self.script.upload(true, local_dir, remote_dir, timeout)
+        self.script.upload(true, local_dir, remote_dir, timeout, false)
+    }
+
+    async fn upload_private(&self, local_dir: &Path, remote_dir: &str, timeout: Duration) -> Result<()> {
+        self.script.upload(true, local_dir, remote_dir, timeout, true)
     }
 }
 

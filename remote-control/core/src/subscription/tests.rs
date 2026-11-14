@@ -30,6 +30,7 @@ fn node(index: u8, name: &str) -> Node {
     Node {
         id: format!("{index:032x}"), name: name.into(), ip: format!("192.0.2.{index}"), port: 22, user: "root".into(),
         auth: Auth::Key, identity: Some("system".into()), secret_id: None, tag: None, aliases: Default::default(),
+        profile: Some("main".into()), ..Node::default()
     }
 }
 
@@ -43,6 +44,7 @@ fn fixture(root: &std::path::Path, base_url: &str) -> (Session, Journal) {
     }
     let mut config = Config::default();
     config.nodes = nodes;
+    config.profiles = vec![crate::model::test_profile("main")];
     config.clients = vec![
         Client { name: "alpha".into(), group: "MOBILE".into(), subscription: Some(Subscription {
             token: Some(alpha_token()), created_at: Some("2026-01-01T00:00:00Z".into()),
@@ -52,7 +54,8 @@ fn fixture(root: &std::path::Path, base_url: &str) -> (Session, Journal) {
         Client { name: "beta".into(), group: "MOBILE".into(), ..Client::default() },
     ];
     config.subscription_host = Some(SubscriptionHost {
-        node: "old".into(), base_url: base_url.into(), sub_dir: "/stale/cache".into(), nginx_group: "www-data".into(),
+        node: "old".into(), hostname: "old.example".into(), port: 443, base_url: base_url.into(),
+        sub_dir: "/stale/cache".into(), nginx_group: "www-data".into(),
     });
     config.subscription_default_headers = Some(Vec::new());
     session.state.save_config(&config).unwrap();
@@ -236,11 +239,19 @@ async fn host_requires_migration_with_published_tokens_and_reads_the_node() {
     assert_eq!((error.code, error.message.as_str()), ("not_installed", "На ноде «old» не установлен хостинг подписок."));
     assert_eq!(fingerprint(root.path()), before);
 
+    // A base URL with a path: refused, nothing written.
+    let hosts = Hosts::new(vec![vec![connect_step(1), conf_step(OLD_DIR, "https://old.example/path")]]);
+    let error = run(&mut session, &hosts, &["subscription", "host", "--name", "old"]).await.unwrap_err();
+    hosts.finish(&[]);
+    assert_eq!((error.code, error.message.as_str()), ("invalid", "Некорректный адрес хостинга подписок: https://old.example/path."));
+    assert_eq!(fingerprint(root.path()), before);
+
     // Same host: refreshes the cached settings from the node.
     let hosts = Hosts::new(vec![vec![connect_step(1), conf_step(OLD_DIR, "https://fresh.example")]]);
     let data = run(&mut session, &hosts, &["subscription", "host", "--name", "old"]).await.unwrap();
     hosts.finish(&[]);
-    assert_eq!(data, json!({"node": "old", "base_url": "https://fresh.example", "sub_dir": OLD_DIR, "nginx_group": "www-data"}));
+    assert_eq!(data, json!({"node": "old", "hostname": "fresh.example", "port": 443, "base_url": "https://fresh.example",
+        "sub_dir": OLD_DIR, "nginx_group": "www-data"}));
     assert_eq!(journal.borrow().last().unwrap().1, "Хост-нода подписок: old (https://fresh.example)");
 
     // Without published tokens the host may change.
@@ -665,6 +676,15 @@ async fn migrate_plans_copies_switches_and_then_removes_old_links() {
     assert!(warned(&journal, "Перенос не завершён: старый хост и старые ссылки сохранены."));
     assert_eq!(fingerprint(root.path()), before);
 
+    // A base URL with a path is refused before any remote change.
+    let hosts = Hosts::new(vec![vec![connect_step(1), conf_step(OLD_DIR, "https://old.example")],
+        vec![connect_step(2), conf_step(NEW_DIR, "https://new.example/path")]]);
+    let error = run(&mut session, &hosts, &["subscription", "migrate", "--name", "new", "--yes"]).await.unwrap_err();
+    hosts.finish(&[]);
+    assert_eq!((error.code, error.message.as_str(), error.extra["name"].as_str()),
+        ("invalid", "Некорректный адрес хостинга подписок: https://new.example/path.", Some("new")));
+    assert_eq!(fingerprint(root.path()), before);
+
     // Local refusals before any connection.
     let none = Hosts::new(vec![]);
     let error = run(&mut session, &none, &["subscription", "migrate", "--name", "old", "--yes"]).await.unwrap_err();
@@ -688,8 +708,8 @@ async fn migrate_plans_copies_switches_and_then_removes_old_links() {
     assert_eq!(error.code, "partial");
     assert_eq!((error.extra["node"].clone(), error.extra["migrated"].clone()), (json!("new"), json!(1)));
     let saved = config(&session);
-    assert_eq!(saved.subscription_host, Some(SubscriptionHost { node: "new".into(), base_url: "https://new.example".into(),
-        sub_dir: NEW_DIR.into(), nginx_group: "www-data".into() }));
+    assert_eq!(saved.subscription_host, Some(SubscriptionHost { node: "new".into(), hostname: "new.example".into(), port: 443,
+        base_url: "https://new.example".into(), sub_dir: NEW_DIR.into(), nginx_group: "www-data".into() }));
     assert_eq!(client(&saved, "alpha").subscription.as_ref().unwrap().token.as_deref(), Some(token.as_str()));
 
     // Nothing published: no work, no connection.

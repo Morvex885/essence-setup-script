@@ -1,4 +1,4 @@
-//! Embedded server scripts in the same flattened layout as `upload_scripts`.
+//! Embedded server scripts in the flattened layout of `/root/essence-setup`.
 //!
 //! Only the setup entry, its modules, shared scripts and root VERSION are
 //! materialized. Local state, templates and the standalone installer are not
@@ -13,7 +13,7 @@ use tempfile::TempDir;
 use crate::{error::Result, transport::RemoteSession};
 
 static SETUP: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../setup-essence");
-static COMMON: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../common");
+pub(crate) static COMMON: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../common");
 static VERSION: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../VERSION"));
 
 /// Stateless, build-time snapshot of the server installation scripts.
@@ -60,7 +60,7 @@ fn extract_tree(directory: &Dir<'_>, root: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn write_file(path: &Path, contents: &[u8]) -> io::Result<()> {
+pub(crate) fn write_file(path: &Path, contents: &[u8]) -> io::Result<()> {
     fs::write(path, contents)?;
     #[cfg(unix)]
     if path.extension().is_some_and(|extension| extension == "sh") {

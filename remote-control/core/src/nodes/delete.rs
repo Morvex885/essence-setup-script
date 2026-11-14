@@ -1,14 +1,15 @@
 //! `node delete` (v1 `core_node_delete_plan` + `core_node_delete`).
 //!
 //! Remote work runs only after the plan is confirmed. Before the managed key
-//! is revoked or the server components are removed, the authenticated
+//! is revoked, the authenticated
 //! connection is held as a recovery lease (v2's replacement for v1's private
 //! ControlMaster socket): if anything later fails while the node is kept, the
 //! revoked key is put back through that lease and a fresh login verifies it.
 //! The state change is one `Session::mutate` transaction: node, its
-//! connections, client references, `subscription_host` (if it named the node),
-//! password secret, host pins (unless another node shares the endpoint),
-//! portability issues and, last, the managed identity files.
+//! connections, client references, cascades through it, its Telegram Proxy,
+//! `subscription_host` (if it named the node), every `node:<id>:*` secret,
+//! host pins (unless another node shares the endpoint), portability issues
+//! and, last, the managed identity files.
 
 use std::io::ErrorKind;
 use std::path::PathBuf;
@@ -20,14 +21,13 @@ use crate::confirmation::Plan;
 use crate::dispatch::Session;
 use crate::error::{RcError, Result, exit_code_for};
 use crate::log::Level;
-use crate::model::{Config, Node, PortabilityReason};
+use crate::model::{Cascade, CascadeExit, Config, Node, PortabilityReason};
 use crate::state::State;
 use crate::transport::{RemoteSession, RemoteTransport};
 
 use super::add::transaction_files;
 use super::setup::{self, FileBackup};
-use super::scripts::{REMOTE_DIR, ensure_current};
-use super::{COMMAND_TIMEOUT, LONG_TIMEOUT, connect, connect_options, find, is_github, pin, pins, require_portable,
+use super::{COMMAND_TIMEOUT, connect, connect_options, find, is_github, pin, pins, require_portable,
     required, set_issue, sh_quote};
 
 /// v1 `_node_delete_scope_label`.
@@ -61,24 +61,22 @@ fn plan(config: &Config, node: &Node, server: bool, revoke: bool) -> Vec<String>
         format!("Затронутые клиенты: {}", if affected.is_empty() { "нет".to_owned() } else { affected.join(" ") }),
     ];
     if server {
-        lines.extend([
-            "Mihomo: бинарь, служба, конфигурация и клиентские записи.",
-            "AmneziaWG: служба, конфигурация, ключи и все клиенты.",
-            "WARP: /root/wgcf и профиль.",
-            "Сайты nginx Essence, webroot и /etc/nginx/ssl целиком.",
-            "Хостинг подписок, Telegram Proxy и acme.sh.",
-            "/etc/sysctl.d/99-vpn-speedup.conf; IPv6 будет восстановлен.",
-            "Пакеты nginx и AmneziaWG не удаляются.",
-            "Правила UFW будут сброшены. Настройки SSH сохранятся.",
-        ].map(str::to_owned));
-        lines.push(if node.port == 22 {
-            "UFW будет отключён.".to_owned()
-        } else {
-            format!("UFW останется включён: открыт только SSH TCP/{}.", node.port)
-        });
+        match node.applied {
+            Some(_) => lines.extend(crate::server::render::teardown(node).lines.into_iter().skip(1)),
+            None => lines.push("Essence на ноду не применялся: сервер не изменится.".to_owned()),
+        }
+        lines.push("Пакеты, acme.sh и UFW остаются; SSH-доступ сохранится.".to_owned());
     }
     if config.subscription_host.as_ref().is_some_and(|host| host.node == node.name) {
         lines.push("Хостинг подписок размещён на этой ноде: его настройка (subscription_host) будет удалена.".to_owned());
+    }
+    let cascades: Vec<&str> = config.cascades.iter().filter(|cascade| cascade_uses(cascade, &node.name))
+        .map(|cascade| cascade.name.as_str()).collect();
+    if !cascades.is_empty() {
+        lines.push(format!("Каскады через эту ноду будут удалены: {}", cascades.join(" ")));
+    }
+    if config.telegram.iter().any(|proxy| proxy.node == node.name) {
+        lines.push("Telegram Proxy этой ноды будет удалён из конфигурации.".to_owned());
     }
     lines.push(if revoke { "Управляемый SSH-ключ будет отозван на ноде." } else { "SSH-ключ на ноде сохранится." }.to_owned());
     lines
@@ -96,10 +94,6 @@ else exit 1; fi"#, sh_quote(public))
 /// `setup::revoke_command`, succeeding only once the exact line is gone.
 fn key_revoke_command(public: &str) -> String {
     format!("{} && {{ grep -qxF -e {} ~/.ssh/authorized_keys; [ \"$?\" -eq 1 ]; }}", setup::revoke_command(public), sh_quote(public))
-}
-
-fn uninstall_command() -> String {
-    format!("bash {} uninstall --force", sh_quote(&format!("{REMOTE_DIR}/setup-essence.sh")))
 }
 
 async fn run<S: RemoteSession>(session: &S, command: &str, timeout: std::time::Duration) -> Option<String> {
@@ -133,6 +127,10 @@ async fn restore_key<T: RemoteTransport>(session: &mut Session, transport: &mut 
     restored
 }
 
+fn cascade_uses(cascade: &Cascade, name: &str) -> bool {
+    cascade.entry == name || matches!(&cascade.exit, CascadeExit::Node(exit) if exit.node == name)
+}
+
 /// Remove the node and everything that only it referenced.
 fn remove(state: &State, node: &Node) -> Result<()> {
     let mut config = state.load_config()?;
@@ -150,12 +148,16 @@ fn remove(state: &State, node: &Node) -> Result<()> {
             connections.retain(|connection| connection.node != node.name);
         }
     }
+    config.cascades.retain(|cascade| !cascade_uses(cascade, &node.name));
+    config.telegram.retain(|proxy| proxy.node != node.name);
     if config.subscription_host.as_ref().is_some_and(|host| host.node == node.name) {
         config.subscription_host = None;
     }
     state.save_config(&config)?;
-    if let Some(secret_id) = node.secret_id.as_deref() {
-        state.secret_store().remove(secret_id)?;
+    let store = state.secret_store();
+    let prefix = format!("node:{}:", node.id);
+    for secret_id in store.ids()?.iter().filter(|id| id.starts_with(&prefix)) {
+        store.remove(secret_id)?;
     }
     let shared = config.nodes.iter().any(|other| other.ip == node.ip && other.port == node.port);
     if !shared && !pins(&state.load_known_hosts()?, node)?.is_empty() {
@@ -187,6 +189,24 @@ fn with_outcome(error: RcError, name: &str, scope: &str, deleted: bool, remote_r
         .with_extra("deleted", deleted).with_extra("remote_removed", remote_removed)
 }
 
+/// The deletion plan rebuilt from `config` must equal the confirmed one, else
+/// `plan_changed` and nothing changes. After the teardown committed (`torn_down`)
+/// the node's `applied` is gone by design: the confirmed value stands in.
+fn delete_planned(config: &Config, node: &Node, server: bool, revoke: bool, torn_down: bool, planned: &Plan,
+    invocation: &Invocation) -> Result<()>
+{
+    let mut current = config.nodes.iter().find(|current| current.id == node.id).cloned()
+        .ok_or_else(|| super::not_found(&node.name))?;
+    if torn_down {
+        current.applied = node.applied.clone();
+    }
+    let plan = Plan::new(plan(config, &current, server, revoke), "");
+    if plan.lines != planned.lines {
+        return Err(plan.changed(invocation));
+    }
+    Ok(())
+}
+
 /// `node delete --name N [--scope local|server] [--revoke-key]`.
 pub async fn delete<T: RemoteTransport>(session: &mut Session, invocation: &Invocation, transport: &mut T) -> Result<Value> {
     let name = required(invocation, "name")?;
@@ -205,8 +225,13 @@ pub async fn delete<T: RemoteTransport>(session: &mut Session, invocation: &Invo
     }
     if server {
         require_portable(session, &node)?;
+        if node.operation.is_some() {
+            return Err(RcError::new("in_use", format!(
+                "На ноде «{name}» уже выполняется применение: дождитесь его завершения (node apply --name {name}).")).with_extra("name", name));
+        }
     }
-    Plan::new(plan(&config, &node, server, revoke), "").confirm(invocation)?;
+    let planned = Plan::new(plan(&config, &node, server, revoke), "");
+    planned.confirm(invocation)?;
 
     // Every rollback artifact is ready before anything remote changes.
     let public = if revoke {
@@ -229,42 +254,51 @@ pub async fn delete<T: RemoteTransport>(session: &mut Session, invocation: &Invo
                 .with_extra("reason", error.extra.get("reason").cloned().unwrap_or(Value::Null)),
             _ => error,
         })?;
+        // The configuration may have changed while connecting: nothing remote changes against a stale plan.
+        delete_planned(&session.state.load_config()?, &node, server, revoke, false, &planned, invocation)?;
         if server {
-            ensure_current(&*transport, name, false).await
-                .map_err(|error| remote_failed(SERVER_NOT_REMOVED).with_extra("cause", error.message))?;
+            if node.applied.is_some() {
+                session.log(Level::Info, &format!("Удаляем компоненты Essence на ноде «{name}»..."));
+                crate::server::apply::teardown(session, &node, transport).await
+                    .map_err(|error| remote_failed(SERVER_NOT_REMOVED).with_extra("cause", error.message))?;
+                remote_removed = true;
+            } else {
+                session.log(Level::Info, &format!("Essence на ноду «{name}» не применялся — сервер не изменится."));
+            }
         }
-        let held = transport.hold().map_err(|_| remote_failed(NO_RECOVERY_LEASE))?;
+        // The lease only serves putting a revoked key back.
         if let Some(public) = public.as_deref() {
+            let kept = |error: RcError| if remote_removed {
+                let restored = error.extra.get("key_restored").cloned();
+                let partial = with_outcome(RcError::new("partial", format!("Компоненты на сервере удалены. {}", error.message)),
+                    name, scope, false, true);
+                match restored {
+                    Some(restored) => partial.with_extra("key_restored", restored),
+                    None => partial,
+                }
+            } else {
+                error
+            };
+            let held = transport.hold().map_err(|_| kept(remote_failed(NO_RECOVERY_LEASE)))?;
             match run(&*transport, &key_probe_command(public), COMMAND_TIMEOUT).await.as_deref() {
                 Some("present") => {
                     // Marked before sending: a lost reply may follow a successful revocation.
                     revoked = true;
                     if run(&*transport, &key_revoke_command(public), COMMAND_TIMEOUT).await.is_none() {
                         let restored = restore_key(session, transport, &held, &node, public).await;
-                        return Err(remote_failed("SSH-ключ не отозван. Нода сохранена в remote-control.")
-                            .with_extra("key_restored", restored));
+                        return Err(kept(remote_failed("SSH-ключ не отозван. Нода сохранена в remote-control.")
+                            .with_extra("key_restored", restored)));
                     }
                 }
                 Some("absent") => {}
-                _ => return Err(remote_failed("Не удалось проверить SSH-ключ. Нода сохранена в remote-control.")),
+                _ => return Err(kept(remote_failed("Не удалось проверить SSH-ключ. Нода сохранена в remote-control."))),
             }
+            lease = Some(held);
         }
-        if server {
-            session.log(Level::Info, &format!("Удаляем компоненты Essence на ноде «{name}»..."));
-            if run(&*transport, &uninstall_command(), LONG_TIMEOUT).await.is_none() {
-                let mut error = remote_failed(SERVER_NOT_REMOVED);
-                if revoked {
-                    let restored = restore_key(session, transport, &held, &node, public.as_deref().unwrap_or_default()).await;
-                    error = error.with_extra("key_restored", restored);
-                }
-                return Err(error);
-            }
-            remote_removed = true;
-        }
-        lease = Some(held);
     }
 
     let outcome = session.mutate("node delete", |state| {
+        delete_planned(&state.load_config()?, &node, server, revoke, remote_removed, &planned, invocation)?;
         let rollback = FileBackup::take(transaction_files(state, Vec::<PathBuf>::new()))?;
         if let Err(error) = remove(state, &node) {
             let restored = rollback.restore().is_ok();
@@ -306,12 +340,16 @@ pub async fn delete<T: RemoteTransport>(session: &mut Session, invocation: &Invo
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+    use std::time::Duration;
+
     use super::*;
-    use crate::fake_transport::{AuthMethod, ConnectExpectation, FakeTransport, Operation, ScriptStep};
+    use crate::fake_transport::{AuthMethod, ConnectExpectation, FakeTransport, ScriptStep};
     use crate::github::{SyncStatus, Storage, Target, commands::GithubSession};
-    use crate::model::{Auth, Client, Connection, ConnectionGroup, Fingerprint, SubscriptionHost};
-    use crate::nodes::{CONNECT_TIMEOUT, scripts, testing};
-    use crate::transport::{ExecResult, HostKeyPolicy};
+    use crate::model::{Auth, CascadeListener, Client, Connection, ConnectionGroup, ExitProxy, Fingerprint, NodeExit,
+        SubscriptionHost, TelegramProxy, UriExit};
+    use crate::nodes::{CONNECT_TIMEOUT, testing};
+    use crate::transport::{ConnectOptions, ExecResult, HostKeyPolicy, remote_failure};
 
     const ID: &str = "0123456789abcdef0123456789abcdef";
     const PUBLIC: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample essence:0123";
@@ -325,7 +363,7 @@ mod tests {
             id: id.into(), name: name.into(), ip: "198.51.100.7".into(), port: 22, user: "root".into(), auth,
             identity: (auth == Auth::Key).then(|| id.to_owned()),
             secret_id: (auth == Auth::Password).then(|| format!("node:{id}:ssh-password")),
-            tag: Some("T".into()), aliases: Default::default(),
+            tag: Some("T".into()), aliases: Default::default(), ..Node::default()
         }
     }
 
@@ -366,10 +404,6 @@ mod tests {
         ]
     }
 
-    fn position(journal: &[Operation], wanted: &Operation) -> usize {
-        journal.iter().position(|operation| operation == wanted).expect("operation journaled")
-    }
-
     #[tokio::test]
     async fn unconfirmed_delete_changes_nothing_and_contacts_nobody() {
         let root = tempfile::tempdir().unwrap();
@@ -389,7 +423,8 @@ mod tests {
         assert_eq!(plan[0], "Нода: de  198.51.100.7:22");
         assert_eq!(plan[2], format!("Объём: {}", scope_label(true, false)));
         assert_eq!(plan[3], "Затронутые клиенты: alice");
-        assert_eq!(plan[plan.len() - 2], "UFW будет отключён.");
+        assert_eq!(plan[plan.len() - 3], "Essence на ноду не применялся: сервер не изменится.");
+        assert_eq!(plan[plan.len() - 2], "Пакеты, acme.sh и UFW остаются; SSH-доступ сохранится.");
         assert_eq!(plan[plan.len() - 1], "SSH-ключ на ноде сохранится.");
         assert!(transport.journal().is_empty());
         assert_eq!(testing::fingerprint(root.path()), before);
@@ -410,17 +445,34 @@ mod tests {
         let other = "fedcba9876543210fedcba9876543210";
         let mut twin = node("twin", other, Auth::Key);
         twin.identity = Some("system".into());
+        let mut de = node("de", ID, Auth::Password);
+        de.profile = Some("main".into());
+        twin.profile = Some("main".into());
+        let cascade = |name: &str, entry: &str, exit: &str| Cascade {
+            name: name.into(), entry: entry.into(), listener: CascadeListener::VlessTcp,
+            exit: CascadeExit::Node(NodeExit { node: exit.into(), proxy: ExitProxy::VlessTcp }),
+            uuid: "11111111-2222-4333-8444-555555555555".into(), password: "0123456789abcdef".into(),
+        };
         session.state.save_config(&Config {
-            nodes: vec![node("de", ID, Auth::Password), twin],
+            nodes: vec![de, twin],
+            profiles: vec![crate::model::test_profile("main")],
             connections: vec![
                 Connection { node: "de".into(), groups: vec![] },
                 Connection { node: "twin".into(), groups: vec![] },
             ],
             clients: vec![Client { name: "alice".into(), group: "g".into(), nodes: Some(vec!["de".into(), "twin".into()]), ..Client::default() }],
-            subscription_host: Some(SubscriptionHost { node: "de".into(), base_url: "https://x".into(), sub_dir: "s".into(), nginx_group: "www-data".into() }),
+            cascades: vec![cascade("in", "de", "twin"), cascade("out", "twin", "de"),
+                Cascade { exit: CascadeExit::Uri(UriExit { uri: "vless://x@y:1".into() }), ..cascade("ext", "twin", "de") }],
+            telegram: vec![TelegramProxy { node: "de".into(), hostname: "tg.example".into(), secret_mark: "0123abcd".into(), tag_mark: None },
+                TelegramProxy { node: "twin".into(), hostname: "tg2.example".into(), secret_mark: "0123abcd".into(), tag_mark: None }],
+            subscription_host: Some(SubscriptionHost { node: "de".into(), hostname: "x.example".into(), port: 443,
+                base_url: "https://x.example".into(), sub_dir: "s".into(), nginx_group: "www-data".into() }),
             ..Config::default()
         }).unwrap();
-        session.state.secret_store().set(&format!("node:{ID}:ssh-password"), "pw".to_owned().into()).unwrap();
+        for suffix in ["ssh-password", "reality-key", "awg-key", "warp-key", "telegram-secret", "telegram-tag"] {
+            session.state.secret_store().set(&format!("node:{ID}:{suffix}"), "pw".to_owned().into()).unwrap();
+        }
+        session.state.secret_store().set(&format!("node:{other}:reality-key"), "keep".to_owned().into()).unwrap();
         pin(&session.state, "198.51.100.7", 22, vec![fp()]).unwrap();
         let mut transport = FakeTransport::new([]);
         let data = delete(&mut session, &testing::invocation(&["node", "delete", "--name", "de", "--yes"]), &mut transport).await.unwrap();
@@ -430,37 +482,84 @@ mod tests {
         assert_eq!(config.connections.len(), 1);
         assert_eq!(config.clients[0].nodes.as_deref(), Some(&["twin".to_owned()][..]));
         assert!(config.subscription_host.is_none());
-        assert_eq!(session.state.secret_store().get(&format!("node:{ID}:ssh-password")).unwrap(), None);
+        assert_eq!(config.cascades.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["ext"]);
+        assert_eq!(config.telegram.iter().map(|t| t.node.as_str()).collect::<Vec<_>>(), ["twin"]);
+        assert_eq!(session.state.secret_store().ids().unwrap(), [format!("node:{other}:reality-key")]);
         // "twin" shares the endpoint: its pin stays.
         assert_eq!(pins(&session.state.load_known_hosts().unwrap(), &config.nodes[0]).unwrap(), vec![fp()]);
         assert!(transport.journal().is_empty());
     }
 
-    #[tokio::test]
-    async fn server_failure_after_revoke_restores_the_key_through_the_held_session() {
+    /// A local session with an applied key node (system key) and its pin.
+    fn applied_session(root: &std::path::Path) -> Session {
+        let (session, _journal) = testing::session(root);
+        let mut de = node("de", ID, Auth::Key);
+        de.identity = Some("system".into());
+        de.applied = Some(crate::model::Applied { digest: "d".repeat(64),
+            files: [("/etc/mihomo/config.yaml".to_owned(), "a".repeat(64))].into(), ports: vec!["443/tcp".into()], at: "t".into() });
+        session.state.save_config(&Config { nodes: vec![de], ..Config::default() }).unwrap();
+        pin(&session.state, "198.51.100.7", 22, vec![fp()]).unwrap();
+        session
+    }
+
+    fn teardown_steps(result: &str) -> Vec<ScriptStep> {
+        use crate::server::apply::{agent_reset_command, start_command, status_command};
+        let node = Node { applied: None, ..node("de", ID, Auth::Key) };
+        let op = "ab".repeat(16);
+        vec![
+            ScriptStep::connect(ConnectExpectation::new("198.51.100.7", 22, "root", AuthMethod::System, CONNECT_TIMEOUT)
+                .with_host_key(HostKeyPolicy { expected: None, known: vec![fp()] }), Ok(())),
+            ScriptStep::exec(crate::server::apply::probe_command(&node), 0, COMMAND_TIMEOUT, ok("os=debian\nsystemd=yes\n", 0)),
+            ScriptStep::exec(agent_reset_command(), 0, COMMAND_TIMEOUT, ok("", 0)),
+            ScriptStep::upload_any_local(crate::server::bundle::agent_dir(), crate::nodes::LONG_TIMEOUT, Ok(())),
+            ScriptStep::upload_private_any_local(format!("/root/essence-node/ops/{op}"), crate::nodes::LONG_TIMEOUT, Ok(())),
+            ScriptStep::exec(start_command(&op), 0, COMMAND_TIMEOUT, ok("", 0)),
+            ScriptStep::exec(status_command(&op), 0, COMMAND_TIMEOUT, ok(result, 0)),
+        ]
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn server_scope_tears_the_node_down_through_the_executor() {
         let root = tempfile::tempdir().unwrap();
-        let mut session = github_session(root.path());
-        let before = testing::fingerprint(root.path());
-        let local = scripts::local_version().unwrap();
-        let mut steps = vec![
-            key_connect(),
-            ScriptStep::exec(scripts::probe_command(), 0, COMMAND_TIMEOUT, ok(&format!("PRESENT\n{local}\n"), 0)),
-            ScriptStep::exec(key_probe_command(PUBLIC), 0, COMMAND_TIMEOUT, ok("present", 0)),
-            ScriptStep::exec(key_revoke_command(PUBLIC), 0, COMMAND_TIMEOUT, ok("", 0)),
-            ScriptStep::exec(uninstall_command(), 0, LONG_TIMEOUT, ok("", 1)),
-        ];
-        steps.extend(restore_steps());
+        let mut session = applied_session(root.path());
+        let invocation = testing::invocation(&["node", "delete", "--name", "de", "--scope", "server"]);
+        let plan = delete(&mut session, &invocation, &mut FakeTransport::new([])).await.unwrap_err().extra["plan"].clone();
+        assert!(plan.as_array().unwrap().contains(&json!("Будет удалено: /etc/mihomo/config.yaml")), "{plan}");
+
+        crate::server::apply::tests::NEXT_OP_ID.with(|next| *next.borrow_mut() = Some("ab".repeat(16)));
+        let mut steps = teardown_steps("stage=config\nresult=rolled_back\nerror=config\n");
+        steps.push(ScriptStep::exec(crate::server::apply::log_command(&"ab".repeat(16)), 0, COMMAND_TIMEOUT, ok("", 0)));
         let mut transport = FakeTransport::new(steps);
-        let error = delete(&mut session,
-            &testing::invocation(&["node", "delete", "--name", "de", "--scope", "server", "--revoke-key", "--yes"]), &mut transport)
-            .await.unwrap_err();
+        let argv = testing::invocation(&["node", "delete", "--name", "de", "--scope", "server", "--yes"]);
+        let error = delete(&mut session, &argv, &mut transport).await.unwrap_err();
         transport.assert_finished();
         assert_eq!((error.code, error.message.as_str()), ("remote_failed", SERVER_NOT_REMOVED));
-        assert_eq!(error.extra["key_restored"], json!(true));
-        let journal = transport.journal();
-        let restore = Operation::Exec { command: setup::install_command(PUBLIC), stdin_len: 0, timeout: COMMAND_TIMEOUT };
-        assert!(position(&journal, &Operation::Hold) < position(&journal, &restore));
-        assert_eq!(testing::fingerprint(root.path()), before, "node kept byte-identical");
+        let kept = session.state.load_config().unwrap();
+        assert!(kept.nodes[0].applied.is_some() && kept.nodes[0].operation.is_none());
+
+        crate::server::apply::tests::NEXT_OP_ID.with(|next| *next.borrow_mut() = Some("ab".repeat(16)));
+        let mut transport = FakeTransport::new(teardown_steps("stage=cleanup\nresult=committed\n"));
+        let data = delete(&mut session, &argv, &mut transport).await.unwrap();
+        transport.assert_finished();
+        assert_eq!(data, json!({"name": "de", "scope": "server"}));
+        assert!(session.state.load_config().unwrap().nodes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn server_scope_waits_for_a_running_operation() {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = applied_session(root.path());
+        session.mutate("t", |state| {
+            let mut config = state.load_config()?;
+            config.nodes[0].operation = Some(crate::model::Operation { id: "ab".repeat(16), digest: "d".repeat(64), ..Default::default() });
+            state.save_config(&config)
+        }).unwrap();
+        let argv = testing::invocation(&["node", "delete", "--name", "de", "--scope", "server", "--yes"]);
+        let mut transport = FakeTransport::new([]);
+        let error = delete(&mut session, &argv, &mut transport).await.unwrap_err();
+        assert_eq!((error.code, error.extra["name"].as_str()), ("in_use", Some("de")));
+        assert!(transport.journal().is_empty());
+        assert_eq!(session.state.load_config().unwrap().nodes[0].operation.as_ref().map(|op| op.id.clone()), Some("ab".repeat(16)));
     }
 
     #[tokio::test]
@@ -482,5 +581,149 @@ mod tests {
         assert_eq!(error.extra["key_restored"], json!(true));
         assert_eq!(session.state.load_config().unwrap().nodes.len(), 1);
         assert!(session.state.paths().identities().join(ID).exists());
+    }
+
+    /// A [`FakeTransport`] whose connection closes before a lease is taken.
+    struct ClosedBeforeHold(FakeTransport);
+
+    impl RemoteSession for ClosedBeforeHold {
+        fn exec<'a>(&'a self, command: &'a str, stdin: &'a [u8], timeout: Duration) -> impl Future<Output = Result<ExecResult>> + 'a {
+            self.0.exec(command, stdin, timeout)
+        }
+        fn upload<'a>(&'a self, local_dir: &'a Path, remote_dir: &'a str, timeout: Duration) -> impl Future<Output = Result<()>> + 'a {
+            self.0.upload(local_dir, remote_dir, timeout)
+        }
+        fn upload_private<'a>(&'a self, local_dir: &'a Path, remote_dir: &'a str, timeout: Duration)
+            -> impl Future<Output = Result<()>> + 'a
+        {
+            self.0.upload_private(local_dir, remote_dir, timeout)
+        }
+    }
+
+    impl RemoteTransport for ClosedBeforeHold {
+        type Held = <FakeTransport as RemoteTransport>::Held;
+        fn connect(&mut self, options: ConnectOptions) -> impl Future<Output = Result<()>> + '_ {
+            self.0.connect(options)
+        }
+        fn hold(&self) -> Result<Self::Held> {
+            Err(remote_failure("connection_closed"))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_closed_connection_after_teardown_does_not_stop_a_server_delete() {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = applied_session(root.path());
+        crate::server::apply::tests::NEXT_OP_ID.with(|next| *next.borrow_mut() = Some("ab".repeat(16)));
+        let mut transport = ClosedBeforeHold(FakeTransport::new(teardown_steps("stage=cleanup\nresult=committed\n")));
+        let argv = testing::invocation(&["node", "delete", "--name", "de", "--scope", "server", "--yes"]);
+        let data = delete(&mut session, &argv, &mut transport).await.unwrap();
+        transport.0.assert_finished();
+        assert_eq!(data, json!({"name": "de", "scope": "server"}));
+        assert!(session.state.load_config().unwrap().nodes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn revocation_without_a_lease_changes_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = github_session(root.path());
+        let before = testing::fingerprint(root.path());
+        let mut transport = ClosedBeforeHold(FakeTransport::new([key_connect()]));
+        let error = delete(&mut session, &testing::invocation(&["node", "delete", "--name", "de", "--revoke-key", "--yes"]), &mut transport)
+            .await.unwrap_err();
+        transport.0.assert_finished();
+        assert_eq!((error.code, error.message.as_str()), ("remote_failed", NO_RECOVERY_LEASE));
+        assert_eq!(testing::fingerprint(root.path()), before);
+    }
+
+    /// A [`FakeTransport`] whose `trigger` (`"connect"` or an exec command)
+    /// first adds client `bob` through node `de`, as a concurrent command would.
+    struct Interleaved {
+        inner: FakeTransport,
+        trigger: String,
+        root: PathBuf,
+        fired: std::cell::Cell<bool>,
+    }
+
+    impl Interleaved {
+        fn new(inner: FakeTransport, trigger: impl Into<String>, root: &Path) -> Self {
+            Self { inner, trigger: trigger.into(), root: root.to_path_buf(), fired: Default::default() }
+        }
+
+        fn fire(&self, operation: &str) {
+            if operation != self.trigger || self.fired.replace(true) {
+                return;
+            }
+            let state = State::new(crate::state::StatePaths::new(&self.root));
+            let mut config = state.load_config().unwrap();
+            config.connections.push(Connection { node: "de".into(),
+                groups: vec![ConnectionGroup { name: "g".into(), proxies: vec!["VLESS TCP".into()] }] });
+            config.clients.push(Client { name: "bob".into(), group: "g".into(), inherit_nodes_from_group: true, ..Client::default() });
+            state.save_config(&config).unwrap();
+        }
+    }
+
+    impl RemoteSession for Interleaved {
+        fn exec<'a>(&'a self, command: &'a str, stdin: &'a [u8], timeout: Duration) -> impl Future<Output = Result<ExecResult>> + 'a {
+            self.fire(command);
+            self.inner.exec(command, stdin, timeout)
+        }
+        fn upload<'a>(&'a self, local_dir: &'a Path, remote_dir: &'a str, timeout: Duration) -> impl Future<Output = Result<()>> + 'a {
+            self.inner.upload(local_dir, remote_dir, timeout)
+        }
+        fn upload_private<'a>(&'a self, local_dir: &'a Path, remote_dir: &'a str, timeout: Duration)
+            -> impl Future<Output = Result<()>> + 'a
+        {
+            self.inner.upload_private(local_dir, remote_dir, timeout)
+        }
+    }
+
+    impl RemoteTransport for Interleaved {
+        type Held = <FakeTransport as RemoteTransport>::Held;
+        fn connect(&mut self, options: ConnectOptions) -> impl Future<Output = Result<()>> + '_ {
+            self.fire("connect");
+            self.inner.connect(options)
+        }
+        fn hold(&self) -> Result<Self::Held> {
+            self.inner.hold()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_plan_changed_before_the_teardown_changes_nothing_remote() {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = applied_session(root.path());
+        let mut transport = Interleaved::new(FakeTransport::new(teardown_steps("").into_iter().take(1)), "connect", root.path());
+        let argv = testing::invocation(&["node", "delete", "--name", "de", "--scope", "server", "--yes"]);
+        let error = delete(&mut session, &argv, &mut transport).await.unwrap_err();
+        transport.inner.assert_finished();
+        assert_eq!((error.code, error.exit_code()), ("plan_changed", 2));
+        assert!(error.extra["plan"].as_array().unwrap().contains(&json!("Затронутые клиенты: bob")));
+        let config = session.state.load_config().unwrap();
+        assert!(config.nodes[0].applied.is_some() && config.nodes[0].operation.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_plan_changed_during_the_teardown_keeps_the_node_as_partial() {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = applied_session(root.path());
+        let op = "ab".repeat(16);
+        crate::server::apply::tests::NEXT_OP_ID.with(|next| *next.borrow_mut() = Some(op.clone()));
+        let mut transport = Interleaved::new(FakeTransport::new(teardown_steps("stage=cleanup\nresult=committed\n")),
+            crate::server::apply::status_command(&op), root.path());
+        let argv = testing::invocation(&["node", "delete", "--name", "de", "--scope", "server", "--yes"]);
+        let error = delete(&mut session, &argv, &mut transport).await.unwrap_err();
+        transport.inner.assert_finished();
+        assert_eq!(error.code, "partial");
+        assert!(error.message.starts_with("Компоненты на сервере удалены. План изменился"), "{}", error.message);
+        assert_eq!((error.extra["deleted"].clone(), error.extra["remote_removed"].clone()), (json!(false), json!(true)));
+        assert!(error.extra["plan"].as_array().unwrap().contains(&json!("Затронутые клиенты: bob")));
+        let config = session.state.load_config().unwrap();
+        assert_eq!(config.nodes.len(), 1);
+        assert!(config.nodes[0].applied.is_none(), "the teardown is recorded");
+
+        // Unchanged since: the node goes with the new plan.
+        let data = delete(&mut session, &argv, &mut FakeTransport::new([teardown_steps("").remove(0)])).await.unwrap();
+        assert_eq!(data, json!({"name": "de", "scope": "server"}));
     }
 }
