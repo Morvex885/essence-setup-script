@@ -1,5 +1,5 @@
 //! WARP of a profiled node: the Cloudflare account is registered on the node
-//! with wgcf (`_warp_prepare_account`, `setup-essence/modules/warp.sh`), its
+//! with wgcf (v1 `_warp_prepare_account`), its
 //! WireGuard keys and addresses are kept by RC (`params.warp`, secret
 //! `warp-key`) and rendered as the `warp-wg` proxy of the `outbound` group.
 

@@ -2,8 +2,7 @@
 # ─── Фича sub: хост подписок (этап 4 плана) ─────────────────────────────────
 # Хуки исполнителя для ноды-хоста подписок. vhost, limit_req_zone, сценарий
 # очистки и systemd-юниты рендерит RC; здесь — каталоги данных, таймер и
-# снятие роли. Права каталогов — как в `setup_subscription`
-# (`setup-essence/modules/subscription.sh`). Spec: SUB_HOST.
+# снятие роли. Права каталогов — как в v1 `setup_subscription`. Spec: SUB_HOST.
 
 SUB_DIR_PATH="$R/var/lib/essence-sub"
 SUB_SNIPPETS="$R/etc/nginx/snippets/essence-sub"

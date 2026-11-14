@@ -4,7 +4,7 @@
 # config.json, profiles.json и vhost рендерит RC (ставит транзакция `config`);
 # здесь — сборка и установка бэкенда MTProxy и реле tproxy-server по
 # закреплённой ревизии, юниты upstream, ключ токенов, сайт реле, запуск и
-# снятие. Перенос `setup-essence/modules/telegram-proxy.sh` без меню и без
+# снятие. Перенос v1-модуля telegram-proxy.sh без меню и без
 # файла состояния essence.conf. Прямой MTProto (2398 наружу) не открывается.
 # Spec: TG_HOST, TG_REPO, TG_REVISION, TG_GO_VERSION, TG_GO_SHA256.
 #

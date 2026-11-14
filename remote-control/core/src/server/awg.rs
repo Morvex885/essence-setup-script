@@ -1,5 +1,5 @@
 //! AmneziaWG of a profiled node: the server `awg0.conf` (`_awg_stage_server_config`),
-//! its peers and the client configs (`_awg_create_peer`, `setup-essence/modules/amneziawg.sh`).
+//! its peers and the client configs (v1 `_awg_create_peer`).
 //! One key per client serves every node; the client's address comes from its
 //! `awg_index` in `10.10.0.0/16`, so no state lives on the servers.
 

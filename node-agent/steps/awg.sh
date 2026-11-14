@@ -4,7 +4,7 @@
 # awg_deactivate и awg_rollback (внутри транзакции `config`), awg_remove
 # (необратимая очистка после committed при снятии).
 # Конфиг /etc/amnezia/amneziawg/awg0.conf рендерит RC и ставит транзакция.
-# Перенос `setup-essence/modules/amneziawg.sh:55-560` без меню и без
+# Перенос v1-модуля amneziawg.sh без меню и без
 # проверок базовой установки mihomo (её ставят этапы этого же применения).
 # Spec: AWG_PORT, SUPPORTED_OS («ID:VERSION_ID:suite PPA» через пробел — единый
 # список RC, `remote-control/core/src/server/os.rs`).
