@@ -354,13 +354,36 @@ managed_path() {
         /etc/mihomo|/etc/mihomo/*|/etc/systemd/system/mihomo.service|/etc/sysctl.d/99-vpn-speedup.conf)
             return 0 ;;
     esac
-    [[ "$path" =~ ^/etc/nginx/(sites-available|sites-enabled|modules-enabled)/[^/]+$ ]]
+    [[ "$path" == /etc/nginx/modules-enabled/90-essence-stream.conf ||
+       "$path" =~ ^/etc/nginx/(sites-available|sites-enabled)/[^/]+$ ]]
 }
 
 check_path() {
     managed_path "$1" && return 0
     warn "Путь вне управляемого набора: $1"
     return 1
+}
+
+# removable <путь> — удалять ли путь из remove.list (отсутствующий — нечего).
+# Сайты nginx удаляются, только если они наши: файл sites-available/<имя> с
+# первой строкой «# Essence site <имя>», ссылка sites-enabled/<имя> на
+# /etc/nginx/sites-available/<имя>. Чужие пропускаются с предупреждением.
+removable() {
+    local path="$1" dest="$R$1" name="${1##*/}" first=""
+    [[ -e "$dest" || -L "$dest" ]] || return 1
+    case "$path" in
+        /etc/nginx/sites-available/*)
+            if [[ -f "$dest" && ! -L "$dest" ]]; then
+                IFS= read -r first <"$dest" || true
+            fi
+            [[ "$first" == "# Essence site $name" ]] && return 0
+            warn "Пропускаю $path: нет отметки Essence."
+            return 1 ;;
+        /etc/nginx/sites-enabled/*)
+            [[ -L "$dest" && "$(readlink -- "$dest")" == "/etc/nginx/sites-available/$name" ]] && return 0
+            warn "Пропускаю $path: это не ссылка на сайт Essence."
+            return 1 ;;
+    esac
 }
 
 # tx_backup <абсолютный путь> — копия в <op>/backup/<путь> либо отметка .absent.
@@ -504,6 +527,7 @@ stage_config() {
     done < <(read_list "$OP/files.list")
     while IFS= read -r path; do
         check_path "$path" || return 1
+        removable "$path" || continue
         removes+=("$path")
     done < <(read_list "$OP/remove.list")
 
@@ -552,6 +576,7 @@ stage_teardown_config() {
     local path removes=() sysctl_removed=false
     while IFS= read -r path; do
         check_path "$path" || return 1
+        removable "$path" || continue
         removes+=("$path")
     done < <(read_list "$OP/remove.list")
 
@@ -581,9 +606,10 @@ stage_teardown_config() {
 # ─── firewall ───────────────────────────────────────────────────────────────
 # stage_firewall "<правила>" — учёт своих правил в $NODE_DIR/ufw-rules.
 # Правило, которое уже было в `ufw show added` до нас, принадлежит
-# администратору: в учёт не попадает и нами не удаляется.
+# администратору: в учёт не попадает и нами не удаляется. Учёт сохраняется
+# после каждого изменения UFW, чтобы сбой посреди этапа не терял свои правила.
 stage_firewall() {
-    local ledger="$NODE_DIR/ufw-rules" rule added="" kept=() wanted=()
+    local ledger="$NODE_DIR/ufw-rules" rule added="" wanted=()
     local -A have=() want=()
     if [[ -f "$ledger" ]]; then
         while IFS= read -r rule; do
@@ -596,21 +622,28 @@ stage_firewall() {
     fi
     for rule in "${wanted[@]}"; do
         want["$rule"]=1
-        if [[ -n "${have[$rule]:-}" ]]; then
-            kept+=("$rule")
-        elif grep -qxF -- "ufw allow $rule" <<<"$added"; then
+        [[ -n "${have[$rule]:-}" ]] && continue
+        if grep -qxF -- "ufw allow $rule" <<<"$added"; then
             info "Правило UFW $rule уже было добавлено вручную — не учитываю."
-        else
-            ufw allow "$rule" || return 1
-            kept+=("$rule")
+            continue
         fi
+        ufw allow "$rule" || return 1
+        have["$rule"]=1
+        ledger_save || return 1
     done
     for rule in "${!have[@]}"; do
         [[ -n "${want[$rule]:-}" ]] && continue
         ufw delete allow "$rule" || return 1
+        unset 'have[$rule]'
+        ledger_save || return 1
     done
-    if ((${#kept[@]})); then
-        printf '%s\n' "${kept[@]}" >"$ledger.tmp" || return 1
+    ledger_save
+}
+
+# ledger_save — атомарно записать ключи have (из stage_firewall) в $ledger.
+ledger_save() {
+    if ((${#have[@]})); then
+        printf '%s\n' "${!have[@]}" | sort >"$ledger.tmp" || return 1
     else
         : >"$ledger.tmp" || return 1
     fi
@@ -630,6 +663,10 @@ stage_cleanup() {
     for entry in "${CERT_ENTRIES[@]}"; do
         name="${entry%%:*}"
         webroot="${entry#*:}"
+        if [[ ! -e "$R$webroot/.essence-site" ]]; then
+            warn "Пропускаю сертификат $name: в $webroot нет отметки Essence."
+            continue
+        fi
         release_cert "$name" "$R$webroot" "$R/etc/nginx/ssl" \
             "$R/etc/nginx/sites-available" "$R/etc/nginx/sites-enabled" "$R/etc/nginx/nginx.conf" || return 1
         rm -rf -- "$R$webroot"

@@ -231,12 +231,12 @@ assert_scrubbed() {
 
 @test "удаление файла /etc/nginx при NGINX=false перечитывает nginx" {
     mkdir -p "$ROOT/etc/nginx/sites-enabled"
-    printf 'old\n' >"$ROOT/etc/nginx/sites-enabled/stale"
+    ln -s /etc/nginx/sites-available/stale "$ROOT/etc/nginx/sites-enabled/stale"
     printf '/etc/nginx/sites-enabled/stale\n' >"$OPDIR/remove.list"
     add_file /etc/mihomo/config.yaml "new"
     run_agent
     assert_success
-    [[ ! -e "$ROOT/etc/nginx/sites-enabled/stale" ]]
+    [[ ! -e "$ROOT/etc/nginx/sites-enabled/stale" && ! -L "$ROOT/etc/nginx/sites-enabled/stale" ]]
     grep -qx "nginx -t" "$CALLS"
     grep -qx "systemctl reload nginx" "$CALLS"
     ! grep -qx "systemctl restart nginx" "$CALLS"
@@ -380,4 +380,89 @@ exit 0'
     run status
     assert_line "stage=init"
     assert_line "result=failed"
+}
+
+@test "сбой ufw delete не теряет добавленное правило: teardown убирает всё" {
+    # ufw с правилами в файле: show added печатает «ufw allow <правило>».
+    stub ufw 'db="$(dirname "$CALLS")/ufw.db"; touch "$db"
+case "$1" in
+    status) echo "Status: active" ;;
+    show) sed "s/^/ufw allow /" "$db" ;;
+    allow) grep -qxF -- "$2" "$db" || printf "%s\n" "$2" >>"$db" ;;
+    delete) [[ -n "${UFW_DELETE_FAIL:-}" ]] && exit 1
+        grep -vxF -- "$3" "$db" >"$db.tmp"; mv "$db.tmp" "$db" ;;
+esac
+exit 0'
+    local db="$BATS_TEST_TMPDIR/ufw.db" ledger="$ROOT/root/essence-node/ufw-rules"
+    RULES="1111/tcp" write_spec
+    add_file /etc/mihomo/config.yaml "new"
+    run_agent
+    assert_success
+    [[ "$(cat "$ledger")" == 1111/tcp ]]
+
+    RULES="2222/tcp" write_spec
+    add_file /etc/mihomo/config.yaml "new"
+    UFW_DELETE_FAIL=1 run bash "$AGENT/apply.sh" "$OPDIR"
+    assert_failure
+    run status
+    assert_line "error=firewall"
+    [[ "$(cat "$ledger")" == $'1111/tcp\n2222/tcp' ]]
+
+    add_file /etc/mihomo/config.yaml "new"
+    run_agent
+    assert_success
+    [[ "$(cat "$ledger")" == 2222/tcp && "$(cat "$db")" == 2222/tcp ]]
+
+    MODE=teardown RULES="" write_spec
+    printf '/etc/mihomo\n' >"$OPDIR/remove.list"
+    run_agent
+    assert_success
+    [[ ! -s "$ledger" && ! -s "$db" ]]
+}
+
+@test "чужие сайты nginx в remove.list пропускаются, свои удаляются" {
+    local av="$ROOT/etc/nginx/sites-available" en="$ROOT/etc/nginx/sites-enabled"
+    mkdir -p "$av" "$en"
+    printf '# Essence site ours.example\nserver {}\n' >"$av/ours.example"
+    printf 'server {}\n' >"$av/shop.example"
+    printf '# Essence site other.example\n' >"$av/wrong.example"
+    ln -s /etc/nginx/sites-available/ours.example "$en/ours.example"
+    ln -s /etc/nginx/sites-available/other "$en/shop.example"
+    printf '%s\n' /etc/nginx/sites-available/ours.example /etc/nginx/sites-enabled/ours.example \
+        /etc/nginx/sites-available/shop.example /etc/nginx/sites-enabled/shop.example \
+        /etc/nginx/sites-available/wrong.example /etc/nginx/sites-available/absent.example >"$OPDIR/remove.list"
+    add_file /etc/mihomo/config.yaml "new"
+    run_agent
+    assert_success
+    run status
+    assert_line "result=committed"
+    [[ ! -e "$av/ours.example" && ! -L "$en/ours.example" ]]
+    [[ -f "$av/shop.example" && -L "$en/shop.example" && -f "$av/wrong.example" ]]
+    grep -qF "Пропускаю /etc/nginx/sites-available/shop.example" "$OPDIR/log"
+    grep -qF "Пропускаю /etc/nginx/sites-enabled/shop.example" "$OPDIR/log"
+}
+
+@test "RELEASE_CERTS без .essence-site не снимает сертификат и не удаляет webroot" {
+    mkdir -p "$ROOT/var/www/shop.example"
+    RELEASE="shop.example:/var/www/shop.example" write_spec
+    add_file /etc/mihomo/config.yaml "new"
+    run_agent
+    assert_success
+    run status
+    assert_line "result=committed"
+    [[ -d "$ROOT/var/www/shop.example" ]]
+    grep -qF "Пропускаю сертификат shop.example" "$OPDIR/log"
+}
+
+@test "modules-enabled кроме 90-essence-stream.conf отклоняется" {
+    mkdir -p "$ROOT/etc/nginx/modules-enabled"
+    printf 'x\n' >"$ROOT/etc/nginx/modules-enabled/other.conf"
+    printf '/etc/nginx/modules-enabled/other.conf\n' >"$OPDIR/remove.list"
+    add_file /etc/mihomo/config.yaml "new"
+    run_agent
+    assert_failure
+    run status
+    assert_line "result=failed"
+    assert_line "error=config"
+    [[ -f "$ROOT/etc/nginx/modules-enabled/other.conf" ]]
 }

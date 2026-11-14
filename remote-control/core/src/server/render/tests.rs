@@ -92,7 +92,7 @@ fn self_steal_front_serves_reality_on_443_with_the_node_site() {
     assert!(mihomo.contains(&format!("      - username: alpha\n        uuid: {UUID}\n        flow: xtls-rprx-vision\n")));
     assert!(mihomo.contains("ipv6: false\n") && !mihomo.contains("#@"));
     let site = content(&desired, "/etc/nginx/sites-available/de.example.com");
-    assert!(site.starts_with("server {\n    listen 127.0.0.1:8443 ssl http2;\n    server_name de.example.com;\n"), "{site}");
+    assert!(site.starts_with("# Essence site de.example.com\nserver {\n    listen 127.0.0.1:8443 ssl http2;\n    server_name de.example.com;\n"), "{site}");
     assert!(!site.contains("{{") && !site.contains("location /0123"));
     assert_eq!(content(&desired, "/etc/nginx/sites-enabled/de.example.com"), "/etc/nginx/sites-available/de.example.com");
     assert_eq!(paths(&desired), [MIHOMO_CONFIG_PATH, MIHOMO_SERVICE_PATH, SYSCTL_PATH,
@@ -122,7 +122,7 @@ fn self_steal_without_reality_on_443_leaves_443_to_the_site() {
     let config = config(profile);
     let desired = render(&config);
     let site = content(&desired, "/etc/nginx/sites-available/de.example.com");
-    assert!(site.starts_with("server {\n    listen 443 ssl http2;\n    listen [::]:443 ssl http2;\n"), "{site}");
+    assert!(site.starts_with("# Essence site de.example.com\nserver {\n    listen 443 ssl http2;\n    listen [::]:443 ssl http2;\n"), "{site}");
     assert!(site.contains("location /0123456789abcdef"));
     let mihomo = content(&desired, MIHOMO_CONFIG_PATH);
     assert!(mihomo.contains("  - name: VLESS gRPC\n    type: vless\n    listen: 0.0.0.0\n    port: 20000\n"), "{mihomo}");
@@ -147,7 +147,7 @@ fn self_steal_with_reality_on_443_keeps_the_site_behind_it() {
     let profile = Profile { vless_grpc: Some(PortOnly { port: 20000 }), ..profile() };
     let desired = render(&config(profile));
     let site = content(&desired, "/etc/nginx/sites-available/de.example.com");
-    assert!(site.starts_with("server {\n    listen 127.0.0.1:8443 ssl http2;\n"), "{site}");
+    assert!(site.starts_with("# Essence site de.example.com\nserver {\n    listen 127.0.0.1:8443 ssl http2;\n"), "{site}");
     assert!(content(&desired, MIHOMO_CONFIG_PATH).contains("      dest: \"127.0.0.1:8443\"\n"));
     assert_eq!((spec(&desired, "UFW_RULES"), spec(&desired, "LISTEN_TCP")), ("443/tcp 20000/tcp", "443 8443 20000"));
 }
@@ -376,7 +376,8 @@ fn xhttp_through_nginx_adds_the_location_and_the_inner_listener() {
     let mut config = config;
     config.profiles[0].vless_tcp = false;
     let free = render(&config);
-    assert!(content(&free, "/etc/nginx/sites-available/de.example.com").starts_with("server {\n    listen 443 ssl http2;\n    listen [::]:443 ssl http2;\n"));
+    assert!(content(&free, "/etc/nginx/sites-available/de.example.com")
+        .starts_with("# Essence site de.example.com\nserver {\n    listen 443 ssl http2;\n    listen [::]:443 ssl http2;\n"));
     assert_eq!((spec(&free, "UFW_RULES"), spec(&free, "SITE_REQUIRE_200")), ("443/tcp", "false"));
 }
 
