@@ -327,7 +327,7 @@ fn warp_license(session: &mut Session, invocation: &Invocation, secrets: &Secret
             RcError::new("missing_secret", "Не передан ключ WARP+ (секрет password).")
                 .with_extra("name", name.clone()).with_extra("secret", "password")
         })?;
-        if !v::warp_license_valid(&key) {
+        if !v::warp_license_valid(key) {
             return Err(RcError::new("invalid", "Ключ WARP+ состоит из латинских букв, цифр и дефисов (до 64 символов)."));
         }
         Some(Zeroizing::new(key.to_owned()))

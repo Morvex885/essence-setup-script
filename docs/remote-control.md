@@ -267,8 +267,8 @@ web}`. `daemon stop` останавливает демон после текущ
 **Приветствие.** Первое сообщение демона:
 
 ```json
-{"event":"hello","protocol":3,"version":"2.0.0","origin":"local","exe":"/usr/local/bin/essence-rc","persistent":false}
-{"event":"hello","protocol":3,"version":"2.0.0","origin":"network","listener":{"loopback":true,"tls":false}}
+{"event":"hello","protocol":3,"version":"2.1.0","origin":"local","exe":"/usr/local/bin/essence-rc","persistent":false}
+{"event":"hello","protocol":3,"version":"2.1.0","origin":"network","listener":{"loopback":true,"tls":false}}
 ```
 
 Локальные соединения получают ещё `exe` и `persistent`, сетевые — `listener`.
@@ -662,7 +662,7 @@ essence-rc client --help       # команды одной сущности (т�
 ### Каталог команд
 
 Таблицы повторяют вывод `essence-rc help` и `essence-rc <сущность> --help`
-версии 2.0.0 (справка генерируется из каталога `remote-control/core/src/cli.rs`).
+версии 2.1.0 (справка генерируется из каталога `remote-control/core/src/cli.rs`).
 `[--yes]` — ключ `--yes [--plan-token T]` у команды с подтверждением;
 `help [СУЩНОСТЬ]` описан выше.
 
@@ -2084,7 +2084,7 @@ client   (из clients[].subscription.headers)
 `"[host]:port"` → список отпечатков `SHA256:…` (порт указывается всегда, включая 22).
 
 **Формат снимка GitHub.** Переносимый снимок — `vault_version: 1`,
-`minimum_remote_control_version` (`2.0.0`), `portability`, `access`, `config`,
+`minimum_remote_control_version` (`2.1.0`), `portability`, `access`, `config`,
 `secrets` (`schema_version: 2`, пароли открытым текстом внутри снимка), `templates`
 (`{content, source, sha256}`), `ssh` (`identities`, `known_hosts`). При записи в
 `github-runtime/` пароли шифруются ключом принимающего устройства. Снимок старого

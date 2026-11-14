@@ -221,7 +221,8 @@ const STALE: &str = "скрипты на ноде отсутствуют или 
 /// Preflight verdict of one node.
 enum Prep {
     Ready,
-    /// Scripts missing, older than the embedded kit or damaged: upload after consent.
+    /// Scripts missing, older than the embedded kit or damaged: uploaded by
+    /// the worker (the batch plan names it: «будут загружены скрипты vX»).
     Upload,
     Excluded(String),
 }
@@ -448,9 +449,11 @@ fn report<T>(session: &mut Session, action: Action, targets: &[Target<T>], outco
 }
 
 /// `telegram menu --name N`: the server Telegram Proxy menu on a remote
-/// pseudo-terminal. Preflight of the one node brings its scripts to the
-/// embedded version (as the batch actions do), then the returned job runs on
-/// the requester's console.
+/// pseudo-terminal. Until stage 5 moves Telegram into the executor, the
+/// scripts are brought to the embedded version as an implicit part of the
+/// script-driven commands: the menu does it without a plan (it has no
+/// plan step), the batch actions name it in theirs. Then the returned job
+/// runs on the requester's console.
 pub async fn menu_prepare<T: RemoteTransport>(session: &mut Session, invocation: &Invocation, connect: &dyn Fn() -> T)
     -> Result<TerminalJob<T>>
 {
@@ -460,7 +463,7 @@ pub async fn menu_prepare<T: RemoteTransport>(session: &mut Session, invocation:
     session.log(Level::Info, &format!("Подключаемся к {} ({}@{}:{})...", node.name, node.user, node.ip, node.port));
     let mut transport = connect();
     nodes::connect(&mut transport, &session.state, &node).await?;
-    if scripts::ensure_current(&transport, &node.name).await?.uploaded {
+    if scripts::ensure_current(&transport, &node.name).await? {
         session.log(Level::Info, &format!("Скрипты на ноде «{}» обновлены.", node.name));
     }
     session.log(Level::Info, &format!("Открываю меню Telegram Proxy на {} ({})...", node.name, node.ip));

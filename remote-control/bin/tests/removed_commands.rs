@@ -1,4 +1,7 @@
-//! User-facing texts never point at commands that no longer exist.
+//! User-facing texts never point at commands that no longer exist. Lives in
+//! the binary crate, which depends on every crate whose sources it scans
+//! (catalog and help in core, TUI, web assets). `docs/` is rewritten for the
+//! new model in stage 7 and joins the scan then.
 
 use std::path::{Path, PathBuf};
 

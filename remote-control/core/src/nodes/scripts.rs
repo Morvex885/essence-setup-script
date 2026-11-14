@@ -20,25 +20,6 @@ pub enum ScriptsState {
     Unknown,
 }
 
-impl ScriptsState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Missing => "missing",
-            Self::Ready => "ready",
-            Self::Broken => "broken",
-            Self::Unknown => "unknown",
-        }
-    }
-}
-
-/// Server scripts after `ensure_current`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Scripts {
-    pub state: ScriptsState,
-    pub version: Option<String>,
-    pub uploaded: bool,
-}
-
 /// Normalized `X.Y.Z` server kit version.
 pub type Version = (u32, u32, u32);
 
@@ -121,12 +102,13 @@ fn probe_failed(node_name: &str) -> RcError {
 /// v1 `ensure_remote_scripts_current` over an authenticated session: the kit
 /// is uploaded unless the node already has it at the local version or newer;
 /// a missing, older or damaged (unknown version) installation is replaced.
-/// After an upload the server must report the local version.
-pub async fn ensure_current<S: RemoteSession>(session: &S, node_name: &str) -> Result<Scripts> {
+/// After an upload the server must report the local version. `true` when
+/// the kit was uploaded.
+pub async fn ensure_current<S: RemoteSession>(session: &S, node_name: &str) -> Result<bool> {
     let local = local()?;
     let (state, remote) = probe(session).await.ok_or_else(|| probe_failed(node_name))?;
     if state == ScriptsState::Ready && remote.is_some_and(|remote| local <= remote) {
-        return Ok(Scripts { state, version: remote.map(format_version), uploaded: false });
+        return Ok(false);
     }
     ServerBundle.upload(session, REMOTE_DIR, LONG_TIMEOUT).await.map_err(|error| {
         let failure = RcError::new("remote_failed", format!("Не удалось загрузить скрипты на ноду «{node_name}»."))
@@ -137,9 +119,7 @@ pub async fn ensure_current<S: RemoteSession>(session: &S, node_name: &str) -> R
         }
     })?;
     match probe(session).await {
-        Some((ScriptsState::Ready, Some(version))) if version == local => {
-            Ok(Scripts { state: ScriptsState::Ready, version: Some(format_version(local)), uploaded: true })
-        }
+        Some((ScriptsState::Ready, Some(version))) if version == local => Ok(true),
         _ => Err(RcError::new("remote_failed", format!("Версия скриптов на ноде «{node_name}» после загрузки не подтверждена."))
             .with_extra("name", node_name)),
     }
@@ -181,18 +161,18 @@ mod tests {
     async fn current_scripts_stay_and_missing_ones_are_uploaded_once() {
         let local = local_version().unwrap();
         let transport = connected(vec![probe_step(&format!("PRESENT\n{local}\n"))]).await;
-        assert!(!ensure_current(&transport, "de").await.unwrap().uploaded);
+        assert!(!ensure_current(&transport, "de").await.unwrap());
         transport.assert_finished();
 
         let transport = connected(vec![probe_step("MISSING"), ScriptStep::upload_any_local(REMOTE_DIR, LONG_TIMEOUT, Ok(())),
             probe_step(&format!("PRESENT\n{local}\n"))]).await;
-        assert!(ensure_current(&transport, "de").await.unwrap().uploaded);
+        assert!(ensure_current(&transport, "de").await.unwrap());
         transport.assert_finished();
         assert_eq!(transport.journal().iter().filter(|op| matches!(op, Operation::Upload { .. })).count(), 1);
 
         let transport = connected(vec![probe_step("BROKEN"), ScriptStep::upload_any_local(REMOTE_DIR, LONG_TIMEOUT, Ok(())),
             probe_step(&format!("PRESENT\n{local}\n"))]).await;
-        assert!(ensure_current(&transport, "de").await.unwrap().uploaded);
+        assert!(ensure_current(&transport, "de").await.unwrap());
         transport.assert_finished();
     }
 }
