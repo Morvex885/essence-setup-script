@@ -1221,7 +1221,8 @@ mod tests {
         let value = |secret: &str| match secret.rsplit_once(':').map(|(_, suffix)| suffix) {
             Some("reality-key") => "R".repeat(43),
             Some("awg-key" | "warp-key") => format!("{}=", "W".repeat(43)),
-            _ => format!("value of {secret}"),
+            Some("telegram-secret" | "telegram-tag") => "a".repeat(32),
+            _ => "license-1234".to_owned(),
         };
         for secret in &carried {
             store.set(secret, Zeroizing::new(value(secret))).unwrap();
@@ -1250,7 +1251,8 @@ mod tests {
         orphaned.secrets.node_passwords.insert("profile:gone:warp-license".into(), Zeroizing::new("x".into()));
         assert!(orphaned.validate().is_err(), "a license of an unknown profile");
         for (suffix, bad) in [("reality-key", "x\"\n  - name: open".to_owned()), ("reality-key", "R".repeat(44)),
-            ("awg-key", "W".repeat(44)), ("warp-key", format!("{}\n=", "W".repeat(42)))] {
+            ("awg-key", "W".repeat(44)), ("warp-key", format!("{}\n=", "W".repeat(42))),
+            ("telegram-secret", "g".repeat(32)), ("telegram-tag", "a".repeat(31))] {
             let mut forged = serialize(&local).unwrap();
             forged.secrets.node_passwords.insert(format!("node:{id}:{suffix}"), Zeroizing::new(bad.clone()));
             assert!(forged.validate().is_err(), "{suffix} {bad:?}");
@@ -1272,7 +1274,7 @@ mod tests {
         let (reality, tag) = (format!("node:{id}:reality-key"), format!("node:{id}:telegram-tag"));
         let store = local.secret_store();
         store.set(&reality, Zeroizing::new("R".repeat(43))).unwrap();
-        store.set(&tag, Zeroizing::new("tag".into())).unwrap();
+        store.set(&tag, Zeroizing::new("b".repeat(32))).unwrap();
         let worktree = dir.path().join("worktree");
         fs::create_dir(&worktree).unwrap();
         checkpoint(&worktree, Storage::Plain, None, &serialize(&local).unwrap()).unwrap();

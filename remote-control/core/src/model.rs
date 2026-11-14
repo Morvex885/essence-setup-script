@@ -516,6 +516,10 @@ impl Config {
             if !v::name_valid(&client.group) {
                 return Err(invalid("Некорректное имя группы клиента."));
             }
+            if client.credentials.as_ref().is_some_and(|credentials| [&credentials.awg_private_key, &credentials.awg_preshared_key]
+                .iter().any(|key| !key.is_empty() && !v::wg_key_valid(key))) {
+                return Err(invalid("Некорректные ключи AmneziaWG клиента."));
+            }
             if let Some(nodes) = &client.nodes {
                 for node in nodes { require_node(node)?; }
             }
@@ -668,7 +672,7 @@ impl Profile {
                 return Err(invalid("xHTTP через nginx требует режима self-steal."));
             }
         }
-        if self.amneziawg.as_ref().is_some_and(|awg| awg.dns.is_empty() || awg.dns.chars().any(char::is_control)) {
+        if self.amneziawg.as_ref().is_some_and(|awg| !v::dns_list_valid(&awg.dns)) {
             return Err(invalid("Некорректный DNS AmneziaWG."));
         }
         if self.warp_plus.as_deref().is_some_and(|mark| !mark_valid(mark)) {
@@ -735,7 +739,7 @@ fn rules_valid(rules: &[String]) -> bool {
 
 impl NodeParams {
     /// Generated values keep their generated shapes: they are written into
-    /// the mihomo config, the nginx site and client configs.
+    /// the mihomo, AmneziaWG and nginx configs and client configs.
     fn formats_valid(&self) -> bool {
         let base64url = |value: &str| value.len() == 43
             && value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
@@ -748,6 +752,11 @@ impl NodeParams {
             && self.grpc_service.as_deref().is_none_or(|service| token(service, b"._-"))
             && self.hy2_obfs_password.as_deref().is_none_or(|password| (1..=64).contains(&password.len())
                 && password.bytes().all(|b| b.is_ascii_hexdigit()))
+            && self.awg.as_ref().is_none_or(|awg| v::wg_key_valid(&awg.public_key) && v::wg_key_valid(&awg.header_protection_key))
+            && self.warp.as_ref().is_none_or(|warp| v::wg_key_valid(&warp.public_key)
+                && v::ip_with_prefix_valid(&warp.ipv4, false)
+                && warp.ipv6.as_deref().is_none_or(|ipv6| v::ip_with_prefix_valid(ipv6, true))
+                && warp.plus_attempt.as_deref().is_none_or(mark_valid))
     }
 }
 
@@ -975,6 +984,8 @@ mod tests {
         value
     }
 
+    const WG_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
     /// The fixture with a full profile on both nodes, roles and a host.
     fn profiled() -> Value {
         let mut raw = fixture();
@@ -991,8 +1002,8 @@ mod tests {
         raw["nodes"][0]["domain"] = json!("de.example.com");
         raw["nodes"][0]["ports"] = json!({"hysteria2": 9443});
         raw["nodes"][0]["params"] = json!({"reality": {"public_key": "P".repeat(43), "short_id": "0123456789abcdef"},
-            "xhttp_path": "/0123456789abcdef", "awg": {"public_key": "pk", "header_protection_key": "hk", "tproxy_port": 12345,
-            "jc": 4, "s1": 20, "s2": 30, "s3": 40}, "warp": {"public_key": "wk", "ipv4": "172.16.0.2", "plus": false}});
+            "xhttp_path": "/0123456789abcdef", "awg": {"public_key": WG_KEY, "header_protection_key": WG_KEY, "tproxy_port": 12345,
+            "jc": 4, "s1": 20, "s2": 30, "s3": 40}, "warp": {"public_key": WG_KEY, "ipv4": "172.16.0.2", "plus": false}});
         raw["nodes"][0]["applied"] = json!({"digest": "d".repeat(64), "files": {"/etc/mihomo/config.yaml": "a".repeat(64)},
             "ports": ["443/tcp"], "at": "2026-11-14T00:00:00Z"});
         raw["cascades"] = json!([
@@ -1003,8 +1014,8 @@ mod tests {
         raw["telegram"] = json!([{"node": "de-vps", "hostname": "tg.example.com", "secret_mark": "0123abcd"}]);
         raw["subscription_host"] = json!({"node": "ru-vps", "hostname": "sub.example.com", "port": 8444 + 1000,
             "base_url": "https://sub.example.com:9444", "sub_dir": SUB_DIR, "nginx_group": "www-data"});
-        raw["clients"][0]["credentials"]["awg_private_key"] = json!("key");
-        raw["clients"][0]["credentials"]["awg_preshared_key"] = json!("psk");
+        raw["clients"][0]["credentials"]["awg_private_key"] = json!(WG_KEY);
+        raw["clients"][0]["credentials"]["awg_preshared_key"] = json!(WG_KEY);
         raw["clients"][0]["credentials"]["awg_index"] = json!(2);
         raw
     }
@@ -1089,6 +1100,16 @@ mod tests {
             ("/nodes/0/applied/ports", json!(["443/sctp"]), "Некорректная запись применённого состояния ноды."),
             ("/nodes/0/applied/ports", json!(["0443/tcp"]), "Некорректная запись применённого состояния ноды."),
             ("/nodes/0/operation", json!({"id": "op", "digest": "d".repeat(64)}), "Некорректная запись операции ноды."),
+            ("/nodes/0/params/awg/public_key", json!("pk"), "Некорректные сгенерированные параметры ноды."),
+            ("/nodes/0/params/awg/header_protection_key", json!(format!("{}\n", &WG_KEY[..43])), "Некорректные сгенерированные параметры ноды."),
+            ("/nodes/0/params/warp/public_key", json!("wk"), "Некорректные сгенерированные параметры ноды."),
+            ("/nodes/0/params/warp/ipv4", json!("172.16.0.2/33"), "Некорректные сгенерированные параметры ноды."),
+            ("/nodes/0/params/warp/ipv6", json!("172.16.0.2"), "Некорректные сгенерированные параметры ноды."),
+            ("/nodes/0/params/warp/plus_attempt", json!("XYZ"), "Некорректные сгенерированные параметры ноды."),
+            ("/clients/0/credentials/awg_private_key", json!("key"), "Некорректные ключи AmneziaWG клиента."),
+            ("/clients/0/credentials/awg_preshared_key", json!("p\"sk"), "Некорректные ключи AmneziaWG клиента."),
+            ("/profiles/0/amneziawg/dns", json!("1.1.1.1; rm -rf /"), "Некорректный DNS AmneziaWG."),
+            ("/profiles/0/amneziawg/dns", json!("dns.example"), "Некорректный DNS AmneziaWG."),
             ("/nodes/0/operation", json!({"id": "0".repeat(32), "digest": "d".repeat(64), "files": {"/etc": "a".repeat(64)}}),
                 "Некорректная запись операции ноды."),
         ] {

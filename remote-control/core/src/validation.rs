@@ -79,17 +79,52 @@ pub fn secret_id_matches(value: &str, node_id: &str) -> bool {
 }
 
 /// The stored value fits its secret: generated keys keep their encodings
-/// (they are written into server configs); other values are non-empty
-/// without NUL.
+/// (they are written into server configs), Telegram values are 32 hex, a
+/// WARP+ license is a dash-separated alphanumeric key; SSH passwords are any
+/// non-empty text without NUL.
 pub fn secret_value_valid(id: &str, value: &str) -> bool {
     match id.rsplit_once(':').map(|(_, suffix)| suffix) {
         // 32 bytes: unpadded base64url / padded standard base64.
         Some("reality-key") => value.len() == 43
             && value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
-        Some("awg-key" | "warp-key") => value.len() == 44 && value.ends_with('=')
-            && value.as_bytes()[..43].iter().all(|b| b.is_ascii_alphanumeric() || *b == b'+' || *b == b'/'),
+        Some("awg-key" | "warp-key") => wg_key_valid(value),
+        Some("telegram-secret" | "telegram-tag") => value.len() == 32 && value.bytes().all(|b| b.is_ascii_hexdigit()),
+        Some("warp-license") => warp_license_valid(value),
         _ => !value.is_empty() && !value.contains('\0'),
     }
+}
+
+/// A WireGuard key: 32 bytes in padded standard base64 (44 characters).
+pub fn wg_key_valid(value: &str) -> bool {
+    value.len() == 44 && value.ends_with('=')
+        && value.as_bytes()[..43].iter().all(|b| b.is_ascii_alphanumeric() || *b == b'+' || *b == b'/')
+}
+
+/// A WARP+ license key: letters, digits and dashes, up to 64 characters.
+pub fn warp_license_valid(value: &str) -> bool {
+    (1..=64).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+/// An IP address with an optional `/prefix` (WARP interface addresses).
+pub fn ip_with_prefix_valid(value: &str, v6: bool) -> bool {
+    let (address, prefix) = match value.split_once('/') {
+        Some((address, prefix)) => (address, Some(prefix)),
+        None => (value, None),
+    };
+    let (parsed, max) = if v6 {
+        (address.parse::<std::net::Ipv6Addr>().is_ok(), 128)
+    } else {
+        (address.parse::<std::net::Ipv4Addr>().is_ok(), 32)
+    };
+    parsed && prefix.is_none_or(|prefix| !prefix.starts_with('+') && prefix.parse::<u8>().is_ok_and(|bits| bits <= max))
+}
+
+/// DNS servers: IP addresses separated by commas (spaces after commas allowed).
+pub fn dns_list_valid(value: &str) -> bool {
+    !value.is_empty() && value.split(',').all(|item| {
+        let item = item.strip_prefix(' ').unwrap_or(item);
+        item.parse::<std::net::IpAddr>().is_ok()
+    })
 }
 
 /// Empty tags are valid; required-tag creation policy belongs to the command.
