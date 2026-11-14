@@ -339,15 +339,16 @@ type Claim = (String, Result<Desired>);
 type Claimed = (String, Result<(Operation, Desired)>);
 
 /// Under the configuration lock: re-check the agreed plan (`recheck` fails
-/// with `plan_changed`), then record a new operation for every node it
-/// returns. A node that already has an operation is refused (`in_use`).
-fn claim(session: &mut Session, label: &str, recheck: impl FnOnce(&State, &Config) -> Result<Vec<Claim>>)
+/// with `plan_changed` and may settle finished operations in `config`), then
+/// record a new operation for every node it returns. A node that already has
+/// an operation is refused (`in_use`).
+fn claim(session: &mut Session, label: &str, recheck: impl FnOnce(&State, &mut Config) -> Result<Vec<Claim>>)
     -> Result<Vec<Claimed>>
 {
     session.mutate(label, |state| {
         let mut config = state.load_config()?;
         let mut claimed = Vec::new();
-        for (id, desired) in recheck(state, &config)? {
+        for (id, desired) in recheck(state, &mut config)? {
             let Some(node) = config.nodes.iter_mut().find(|node| node.id == id) else { continue };
             let claim = match desired {
                 Ok(_) if node.operation.is_some() => Err(RcError::new("in_use", format!(
@@ -535,6 +536,11 @@ struct Planned<T> {
     sshd: Option<u16>,
     /// An unfinished operation to resume instead of starting a new one.
     resume: Option<String>,
+    /// A finished or dead operation to record (`op_id`, committed) once the
+    /// plan is confirmed.
+    settle: Option<(String, bool)>,
+    /// Run the executor (false: only the settlement is recorded).
+    run: bool,
 }
 
 /// Connect and probe one node.
@@ -564,7 +570,7 @@ fn busy_port(probe: &Probe, node: &Node, desired: &Desired) -> Option<Failure> {
 
 /// `node apply (--name N… | --profile P | --pending) [--yes]`.
 pub async fn apply<T: RemoteTransport>(session: &mut Session, invocation: &Invocation, connect: &dyn Fn() -> T) -> Result<Value> {
-    let mut config = session.state.load_config()?;
+    let config = session.state.load_config()?;
     let names = targets(&config, invocation)?;
     let mut report = Report::default();
     let mut planned: Vec<Planned<T>> = Vec::new();
@@ -593,20 +599,24 @@ pub async fn apply<T: RemoteTransport>(session: &mut Session, invocation: &Invoc
             }
         };
         let mut resume = None;
+        let mut settle = None;
         if let Some(operation) = node.operation.clone() {
             let result = probe.status.get("result").map(String::as_str);
             if result.is_none() && !unit_gone(&probe.status) {
                 resume = Some(operation.id);
             } else {
-                // Finished while nobody watched, or the executor died: settle it.
-                match result {
-                    Some("committed") => session.log(Level::Info, &format!("{name}: прошлое применение завершилось успешно.")),
-                    Some(_) => session.log(Level::Warn, &format!("{name}: прошлое применение завершилось неудачно.")),
-                    None => session.log(Level::Warn, &format!("{name}: прошлое применение прервано без результата.")),
-                }
-                finish_operation(session, &node.id, &operation.id, result == Some("committed"))?;
-                config = session.state.load_config()?;
-                node = nodes::find(&config, name)?.clone();
+                // Finished while nobody watched, or the executor died: the plan
+                // is built on the settled node; the settlement is recorded only
+                // after confirmation, under the lock (`claim`).
+                let committed = result == Some("committed");
+                lines.push(match result {
+                    Some("committed") => format!("{name}: прошлое применение завершилось успешно — результат будет записан."),
+                    Some(_) => format!("{name}: прошлое применение завершилось неудачно — отметка будет снята."),
+                    None => format!("{name}: прошлое применение прервано без результата — отметка будет снята."),
+                });
+                extra.push(format!("settle:{name}:{}:{committed}", operation.id));
+                conclude(&mut node, committed);
+                settle = Some((operation.id, committed));
                 desired = match render::desired(&config, &node, None) {
                     Ok(desired) => desired,
                     Err(error) if named => return Err(error),
@@ -626,23 +636,26 @@ pub async fn apply<T: RemoteTransport>(session: &mut Session, invocation: &Invoc
             .filter(|(path, hash)| desired.files.iter().any(|file| file.path == **path)
                 && probe.hashes.get(*path).is_some_and(|remote| remote.as_ref() != Some(hash)))
             .map(|(path, _)| path).collect();
-        if resume.is_none() && drift.is_empty() && applied.is_some_and(|applied| applied.digest == desired.digest) {
+        let run = resume.is_some() || !drift.is_empty() || !applied.is_some_and(|applied| applied.digest == desired.digest);
+        if !run && settle.is_none() {
             report.unchanged.push(name.clone());
             continue;
         }
-        lines.extend(desired.lines.iter().cloned());
-        if resume.is_some() {
-            lines.push(format!("{name}: продолжается незавершённое применение."));
+        if run {
+            lines.extend(desired.lines.iter().cloned());
+            if resume.is_some() {
+                lines.push(format!("{name}: продолжается незавершённое применение."));
+            }
+            if let Some(sshd) = probe.sshd.filter(|port| *port != node.port && !desired.teardown) {
+                lines.push(format!("SSH на ноде слушает порт {sshd}: при включении UFW он тоже будет разрешён."));
+            }
+            lines.extend(drift.iter().map(|path| format!("Изменено вручную, будет перезаписано: {path}")));
+            extra.push(format!("{name}={}", desired.digest));
+            extra.extend(drift.iter().map(|path| format!("drift:{name}:{path}")));
         }
-        if let Some(sshd) = probe.sshd.filter(|port| *port != node.port && !desired.teardown) {
-            lines.push(format!("SSH на ноде слушает порт {sshd}: при включении UFW он тоже будет разрешён."));
-        }
-        lines.extend(drift.iter().map(|path| format!("Изменено вручную, будет перезаписано: {path}")));
-        extra.push(format!("{name}={}", desired.digest));
-        extra.extend(drift.iter().map(|path| format!("drift:{name}:{path}")));
         planned.push(Planned {
             id: node.id.clone(), name: name.clone(), transport, digest: desired.digest, agent_ok: probe.agent_ok,
-            sshd: probe.sshd, resume,
+            sshd: probe.sshd, resume, settle, run,
         });
     }
     if planned.is_empty() {
@@ -655,6 +668,14 @@ pub async fn apply<T: RemoteTransport>(session: &mut Session, invocation: &Invoc
     let mut claims = claim(session, "node apply start", |state, config| {
         let mut claims = Vec::new();
         for item in &planned {
+            let node = config.nodes.iter_mut().find(|node| node.name == item.name)
+                .ok_or_else(|| plan.changed(invocation))?;
+            if let Some((op_id, committed)) = &item.settle {
+                if node.operation.as_ref().map(|operation| &operation.id) != Some(op_id) {
+                    return Err(plan.changed(invocation));
+                }
+                conclude(node, *committed);
+            }
             let node = nodes::find(config, &item.name)?;
             let digest = render::desired(config, node, None).map(|desired| desired.digest).ok();
             if node.id != item.id || node.operation.as_ref().map(|operation| &operation.id) != item.resume.as_ref()
@@ -662,7 +683,7 @@ pub async fn apply<T: RemoteTransport>(session: &mut Session, invocation: &Invoc
             {
                 return Err(plan.changed(invocation));
             }
-            if item.resume.is_none() {
+            if item.run && item.resume.is_none() {
                 claims.push((node.id.clone(), node_secrets(state, config, node)
                     .and_then(|secrets| render::desired(config, node, Some(&secrets)))));
             }
@@ -672,6 +693,10 @@ pub async fn apply<T: RemoteTransport>(session: &mut Session, invocation: &Invoc
     let config = session.state.load_config()?;
     let mut runs = Vec::new();
     for item in &mut planned {
+        if !item.run {
+            report.unchanged.push(item.name.clone());
+            continue;
+        }
         let node = nodes::find(&config, &item.name)?.clone();
         if item.resume.is_some() {
             let Some(operation) = node.operation.clone() else { continue };

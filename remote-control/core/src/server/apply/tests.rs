@@ -373,30 +373,38 @@ async fn a_resumed_operation_records_what_it_uploaded() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn an_operation_finished_unwatched_is_settled_at_the_probe() {
+async fn an_operation_finished_unwatched_is_settled_after_confirmation() {
     let root = tempfile::tempdir().unwrap();
-    let (mut session, journal) = fixture(root.path());
-    // Committed after RC gave up: the uploaded state is recorded, the operation
-    // cleared; the node is then compared as usual (here: unchanged).
+    let (mut session, _journal) = fixture(root.path());
+    // Committed after RC gave up: the plan is built on the recorded upload
+    // (here: nothing else to do); the record is written only with --yes.
     let digest = render::desired(&config(&session), &config(&session).nodes[0], None).unwrap().digest;
     let mut operation = recorded("a");
     operation.digest = digest;
     set_operation(&mut session, Some(operation));
     let de = config(&session).nodes[0].clone();
-    let hosts = Hosts::new(vec![vec![connect_step(&de, Ok(())), probe_step(&de,
-        &format!("{DEBIAN}agent=ok\nlisten tcp 0.0.0.0:443\n{}  /etc/mihomo/config.yaml\nunit=inactive\nstage=cleanup\nresult=committed\n", "c".repeat(64)))]]);
-    let data = run(&mut session, &hosts, &["node", "apply", "--name", "de"]).await.unwrap();
+    let probe = format!("{DEBIAN}agent=ok\nlisten tcp 0.0.0.0:443\n{}  /etc/mihomo/config.yaml\nunit=inactive\nstage=cleanup\nresult=committed\n",
+        "c".repeat(64));
+    let before = fingerprint(root.path());
+    let hosts = Hosts::new(vec![vec![connect_step(&de, Ok(())), probe_step(&de, &probe)]]);
+    let error = run(&mut session, &hosts, &["node", "apply", "--name", "de"]).await.unwrap_err();
+    hosts.finish();
+    assert_eq!(error.code, "confirmation_required");
+    assert_eq!(error.extra["plan"], json!(["de: прошлое применение завершилось успешно — результат будет записан."]));
+    assert_eq!(fingerprint(root.path()), before, "an unconfirmed apply changes nothing");
+
+    let hosts = Hosts::new(vec![vec![connect_step(&de, Ok(())), probe_step(&de, &probe)]]);
+    let data = run(&mut session, &hosts, &["node", "apply", "--name", "de", "--yes"]).await.unwrap();
     hosts.finish();
     assert_eq!(data, json!({"applied": [], "failed": [], "unchanged": ["de"]}));
     let node = &config(&session).nodes[0];
     assert!(node.operation.is_none() && node.applied.is_some());
-    assert!(journal.borrow().contains(&(Level::Info, "de: прошлое применение завершилось успешно.".into())));
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_dead_executor_is_not_resumed() {
     let root = tempfile::tempdir().unwrap();
-    let (mut session, journal) = fixture(root.path());
+    let (mut session, _journal) = fixture(root.path());
     // Killed without writing a result: cleared and started anew.
     set_operation(&mut session, Some(recorded("a")));
     let de = config(&session).nodes[0].clone();
@@ -410,7 +418,7 @@ async fn a_dead_executor_is_not_resumed() {
     let hosts = Hosts::new(vec![steps]);
     let error = run(&mut session, &hosts, &["node", "apply", "--name", "de", "--yes"]).await.unwrap_err();
     hosts.finish();
-    assert!(journal.borrow().contains(&(Level::Warn, "de: прошлое применение прервано без результата.".into())));
+    assert!(error.extra.get("plan").is_none());
     assert_eq!(error.extra["failed"], json!([{"name": "de", "stage": "mihomo", "code": "failed",
         "message": "исполнитель остановился без результата на этапе «установка mihomo»"}]));
     assert!(config(&session).nodes[0].operation.is_none(), "a dead operation is not kept for resuming");
