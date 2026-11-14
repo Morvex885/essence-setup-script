@@ -74,6 +74,39 @@ fn add_through_an_external_uri_keeps_the_first_line() {
 }
 
 #[test]
+fn add_refuses_reserved_names_and_client_user_clashes() {
+    let root = tempfile::tempdir().unwrap();
+    let mut session = setup(root.path());
+    let exit = ["--exit-node", "nl", "--exit-proxy", "VLESS TCP"];
+    let before = fingerprint(root.path());
+    for name in ["DIRECT", "REJECT", "GLOBAL", "outbound", "warp-wg", "hop-outbound", "awg-hop", "a--b", "AWG"] {
+        let argv = [&["cascade", "add", "--name", name, "--entry", "de", "--listener", "vless-tcp"][..], &exit].concat();
+        let error = run(&mut session, &argv, None).unwrap_err();
+        assert_eq!((error.code, error.extra["name"].clone()), ("invalid", json!(name)), "{name}");
+    }
+    assert_eq!(fingerprint(root.path()), before);
+    // A client `beta--hop` would share the listener user of `beta` through `hop`.
+    session.mutate("t", |state| {
+        let mut config = state.load_config()?;
+        config.clients.push(Client { name: "beta--hop".into(), group: "PC".into(), ..Client::default() });
+        state.save_config(&config)
+    }).unwrap();
+    let error = run(&mut session, &with(&exit), None).unwrap_err();
+    assert_eq!((error.code, error.extra["name"].clone()), ("invalid", json!("beta--hop")));
+    // With the cascade in place such a client cannot be saved either.
+    session.mutate("t", |state| {
+        let mut config = state.load_config()?;
+        config.clients.retain(|client| client.name != "beta--hop");
+        state.save_config(&config)
+    }).unwrap();
+    run(&mut session, &with(&exit), None).unwrap();
+    let mut config = session.state.load_config().unwrap();
+    config.clients.push(Client { name: "cascade--hop".into(), group: "PC".into(), ..Client::default() });
+    let error = session.state.save_config(&config).unwrap_err();
+    assert_eq!((error.code, error.message.as_str()), ("invalid", "Имя клиента «cascade--hop» совпадает с пользователем каскада «hop»."));
+}
+
+#[test]
 fn add_validates_before_any_change() {
     let root = tempfile::tempdir().unwrap();
     let mut session = setup(root.path());
@@ -95,6 +128,9 @@ fn add_validates_before_any_change() {
         (with(&["--exit-node", "bare", "--exit-proxy", "VLESS TCP"]), None, "invalid"),
         (ADD.to_vec(), Some("ftp://example.com"), "invalid"),
         (ADD.to_vec(), Some("vless://aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee@203.0.113.5:443?type=ws"), "invalid"),
+        // Decoded fields must match their formats: no YAML-breaking flow or key, a numeric port.
+        (ADD.to_vec(), Some("vless://aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee@203.0.113.5:443?flow=x%3A%20y&pbk=k%20%23c"), "invalid"),
+        (ADD.to_vec(), Some("vless://aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee@203.0.113.5:notaport"), "invalid"),
     ];
     for (argv, file, code) in cases {
         assert_eq!(run(&mut session, &argv, file).unwrap_err().code, code, "{argv:?}");

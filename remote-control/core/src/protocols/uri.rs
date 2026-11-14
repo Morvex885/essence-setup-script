@@ -18,6 +18,8 @@ pub enum UriError {
     UnknownTransport { transport: String, note: String },
     #[error("Неизвестный протокол. Поддерживаются: vless://, hysteria2://, hy2://")]
     UnknownScheme,
+    #[error("Недопустимое значение «{field}» в ссылке выхода")]
+    Field { field: &'static str },
 }
 
 /// A parsed exit proxy: its YAML block and the informational lines v1 showed
@@ -223,6 +225,73 @@ pub fn parse_proxy_uri(name: &str, input: &str) -> Result<ExitProxy, UriError> {
     } else {
         Err(UriError::UnknownScheme)
     }
+}
+
+/// A cascade exit link: [`parse_proxy_uri`] after a strict check of every
+/// field it renders (the v1 parser above keeps Bash parity and accepts more).
+/// Server — a host name or IP; port — 1–65535; VLESS — a UUID, `flow`/`fp`/
+/// `mode` as lower-case words, `pbk` as base64, `sid` as hex, `sni` as a host
+/// name, `path`/`serviceName` as URI path characters; Hysteria2 — a password
+/// and obfs password without control characters, `sni` as a host name.
+pub fn parse_exit_uri(name: &str, input: &str) -> Result<ExitProxy, UriError> {
+    let line = input.split('\n').next().unwrap_or_default();
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    check_exit_fields(line)?;
+    parse_proxy_uri(name, line)
+}
+
+fn chars_in(value: &str, max: usize, allowed: impl Fn(char) -> bool) -> bool {
+    value.len() <= max && value.chars().all(allowed)
+}
+
+fn host_name(value: &str) -> bool {
+    !value.is_empty() && chars_in(value, 253, |c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+}
+
+fn word(value: &str) -> bool {
+    chars_in(value, 32, |c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_'))
+}
+
+fn check_exit_fields(line: &str) -> Result<(), UriError> {
+    let field = |field: &'static str| UriError::Field { field };
+    let (rest, vless) = if let Some(rest) = line.strip_prefix("vless://") {
+        (rest, true)
+    } else if let Some(rest) = line.strip_prefix("hysteria2://").or_else(|| line.strip_prefix("hy2://")) {
+        (rest, false)
+    } else {
+        return Err(UriError::UnknownScheme);
+    };
+    let parts = split(rest);
+    if !(host_name(parts.server) || parts.server.parse::<std::net::Ipv6Addr>().is_ok()) {
+        return Err(field("server"));
+    }
+    let port_ok = !parts.port.is_empty() && parts.port.bytes().all(|b| b.is_ascii_digit())
+        && parts.port.parse::<u16>().is_ok_and(|port| port != 0);
+    if !port_ok {
+        return Err(field("port"));
+    }
+    let percent = if vless { UriError::VlessPercent } else { UriError::Hy2Percent };
+    let userinfo = decode_value(parts.userinfo, &percent)?;
+    for (key, value) in params(parts.params, percent)? {
+        let checked: Option<(&'static str, bool)> = match (vless, key) {
+            (_, "sni") => Some(("sni", value.is_empty() || host_name(&value))),
+            (true, "flow") => Some(("flow", word(&value))),
+            (true, "fp") => Some(("fp", word(&value))),
+            (true, "mode") => Some(("mode", word(&value))),
+            (true, "pbk") => Some(("pbk", chars_in(&value, 64, |c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '+' | '/' | '=')))),
+            (true, "sid") => Some(("sid", chars_in(&value, 16, |c| c.is_ascii_hexdigit()))),
+            (true, "path" | "serviceName") => Some(("path", chars_in(&value, 256, |c| c.is_ascii_alphanumeric() || "-._~/!$&'()*+,;=:@?%".contains(c)))),
+            _ => None,
+        };
+        if let Some((name, false)) = checked {
+            return Err(field(name));
+        }
+    }
+    let user_ok = if vless { crate::validation::vless_uuid_valid(&userinfo) } else { !userinfo.is_empty() };
+    if !user_ok {
+        return Err(field(if vless { "uuid" } else { "password" }));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

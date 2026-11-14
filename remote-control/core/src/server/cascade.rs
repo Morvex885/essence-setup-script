@@ -12,9 +12,9 @@ use crate::dispatch::Session;
 use crate::error::{RcError, Result};
 use crate::github::random_hex;
 use crate::log::Level;
-use crate::model::{Cascade, CascadeExit, CascadeListener, Config, ExitProxy, NodeExit, UriExit, CONNECTION_NAMES};
+use crate::model::{Cascade, CascadeExit, CascadeListener, Config, ExitProxy, NodeExit, UriExit, cascade_name_reserved, cascade_user_clash};
 use crate::nodes::required;
-use crate::protocols::uri::parse_proxy_uri;
+use crate::protocols::uri::parse_exit_uri;
 use crate::request_input::Input;
 use crate::validation as v;
 
@@ -96,8 +96,13 @@ fn check(config: &Config, cascade: &Cascade) -> Result<()> {
     if config.cascades.iter().any(|other| &other.name == name) {
         return Err(RcError::new("exists", format!("Каскад «{name}» уже существует.")).with_extra("name", name.as_str()));
     }
-    if CONNECTION_NAMES.contains(&name.as_str()) {
-        return Err(invalid(format!("Имя каскада «{name}» совпадает с именем подключения ноды.")));
+    if cascade_name_reserved(name) {
+        return Err(invalid(format!("Имя каскада «{name}» занято: подключения ноды, DIRECT, REJECT, outbound, warp-wg, \
+            имена «awg-…», «…-outbound» и с «--» зарезервированы.")).with_extra("name", name.as_str()));
+    }
+    if let Some(client) = config.clients.iter().find(|client| cascade_user_clash(&client.name, name)) {
+        return Err(invalid(format!("Имя клиента «{}» совпадает с пользователем каскада «{name}».", client.name))
+            .with_extra("name", client.name.as_str()));
     }
     let profiled = |node_name: &str| -> Result<Vec<String>> {
         let node = config.nodes.iter().find(|node| node.name == node_name).ok_or_else(|| node_not_found(node_name))?;
@@ -146,7 +151,7 @@ fn add(session: &mut Session, invocation: &Invocation, input: &Input) -> Result<
         }),
         (None, None, Some(text)) => {
             let line = text.split('\n').next().unwrap_or_default().trim();
-            parse_proxy_uri(&name, line).map_err(|error| invalid(error.to_string()))?;
+            parse_exit_uri(&name, line).map_err(|error| invalid(error.to_string()))?;
             CascadeExit::Uri(UriExit { uri: line.to_owned() })
         }
         _ => return Err(usage("Укажите выход: --exit-node M --exit-proxy P или --file PATH.")),

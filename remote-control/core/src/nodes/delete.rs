@@ -472,7 +472,7 @@ mod tests {
             ],
             clients: vec![Client { name: "alice".into(), group: "g".into(), nodes: Some(vec!["de".into(), "twin".into()]), ..Client::default() }],
             cascades: vec![cascade("in", "de", "twin"), cascade("out", "twin", "de"),
-                Cascade { exit: CascadeExit::Uri(UriExit { uri: "vless://x@y:1".into() }), ..cascade("ext", "twin", "de") }],
+                Cascade { exit: CascadeExit::Uri(UriExit { uri: "vless://11111111-2222-4333-8444-555555555555@y:1".into() }), ..cascade("ext", "twin", "de") }],
             telegram: vec![TelegramProxy { node: "de".into(), hostname: "tg.example".into(), secret_mark: "0123abcd".into(), tag_mark: None },
                 TelegramProxy { node: "twin".into(), hostname: "tg2.example".into(), secret_mark: "0123abcd".into(), tag_mark: None }],
             subscription_host: Some(SubscriptionHost { node: "de".into(), hostname: "x.example".into(), port: 443,

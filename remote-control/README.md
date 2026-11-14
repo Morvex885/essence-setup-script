@@ -184,9 +184,9 @@ Host-key callback сравнивает SHA256-отпечаток с явным �
 
 ## Клиенты, генерация, подписки, AmneziaWG, Telegram
 
-Код: `rc_core::protocols` (чистые билдеры `uri`, `hy2`, `vless_tcp|grpc|xhttp`, `dnat`, `listener_users`), `rc_core::clients` (`groups`, `templates`, `client`, `generate`), `rc_core::subscription` (`commands`, `remote`), `rc_core::server` (`render`, `apply`, `awg`, `warp`), `rc_core::telegram` (`status`). Каждая команда каталога выполняется, неизвестная — `usage`.
+Код: `rc_core::protocols` (чистые билдеры `uri`, `hy2`, `vless_tcp|grpc|xhttp`, `listener_users`), `rc_core::clients` (`groups`, `templates`, `client`, `generate`), `rc_core::subscription` (`commands`, `remote`), `rc_core::server` (`render`, `apply`, `awg`, `warp`, `cascade`), `rc_core::telegram` (`status`). Каждая команда каталога выполняется, неизвестная — `usage`.
 
-**Билдеры и golden.** `core/tests/protocols_golden.rs` воспроизводит все случаи `core/tests/golden/protocols/*.json` (stdout побайтно и rc; для разборщиков URI — и строки stderr; DNAT — выполнением Rust-текста команд под теми же заглушками в POSIX bash, на Windows случаи DNAT пропускаются). IPv6-цель DNAT использует `ip6tables` и `[addr]:port` (unit-тест `dnat::tests::ipv6_target_uses_ip6tables_and_brackets`).
+**Билдеры и golden.** `core/tests/protocols_golden.rs` воспроизводит все случаи `core/tests/golden/protocols/*.json` (stdout побайтно и rc; для разборщиков URI — и строки stderr). Ссылка выхода каскада дополнительно проходит строгую проверку полей (`uri::parse_exit_uri`).
 
 **Шаблоны.** Встроенные `core/templates/*.yaml` компилируются в бинарник; пользовательский файл с тем же именем имеет приоритет. Файлы машины пользователя трогает только клиент (`essence_rc_client::files`): `template export` (`CLIENT`) — `template show` плюс атомарная запись `--output`, существующий путь перезаписывается по плану, ссылка заменяется файлом, появившийся без плана файл не заменяется (`conflict` «Файл {output} появился во время экспорта: повторите команду.»); `--file` у `template import` — только обычный файл до 1 МиБ в UTF-8, символьная ссылка отклоняется (`invalid`). Импорт поверх существующего шаблона — по плану, `extra` которого — SHA-256 содержимого: токен для другого содержимого отвечает `plan_changed`.
 

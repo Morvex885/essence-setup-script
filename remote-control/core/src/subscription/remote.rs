@@ -35,14 +35,15 @@ pub(super) struct Host<T> {
     pub nginx_group: String,
 }
 
-/// Connect to the configured host. `node apply` installs it: until the host
-/// node's applied state matches the configuration, nothing is uploaded.
+/// Connect to the configured host. `node apply` installs it: until the
+/// subscription role of the host node is applied as configured, nothing is
+/// uploaded. Other pending changes of that node do not block subscriptions.
 pub(super) async fn open_host<T: RemoteTransport>(session: &Session, config: &Config, connect: &dyn Fn() -> T)
     -> Result<Host<T>>
 {
     let node = super::host_node(config)?;
     let host = config.subscription_host.as_ref().ok_or_else(super::not_configured)?;
-    if render::status(config, nodes::find(config, node)?) != "applied" {
+    if !render::sub_role_applied(config, nodes::find(config, node)?) {
         return Err(RcError::new("not_installed", "Хост подписок не применён: выполните node apply.").with_extra("name", node));
     }
     let transport = connect_node(session, config, node, connect).await?;

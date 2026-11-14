@@ -4,7 +4,7 @@
 use super::uri::percent_encode;
 use super::vless_grpc::listener_head;
 use super::vless_tcp::{push_reality_opts, reality_config};
-use super::{line, or, uri_host, yaml_escape, yaml_host, Vless, VlessListener};
+use super::{line, or, uri_host, yaml_escape, yaml_host, yaml_plain, Vless, VlessListener};
 
 /// A plain listener behind nginx TLS termination.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -91,10 +91,10 @@ pub fn exit_yaml(vless: &Vless, path: &str, mode: &str) -> String {
         "  - name: {}\n    type: vless\n    server: {}\n    port: {}\n    uuid: {}\n    network: xhttp\n    udp: true\n    xhttp-opts:\n      path: \"{}\"\n      mode: {}\n    tls: true\n    servername: \"{}\"\n",
         vless.name,
         yaml_host(vless.server),
-        vless.port,
-        vless.uuid,
+        yaml_plain(vless.port),
+        yaml_plain(vless.uuid),
         yaml_escape(path),
-        or(mode, "auto"),
+        yaml_plain(or(mode, "auto")),
         yaml_escape(vless.sni)
     );
     push_reality_opts(&mut out, vless);

@@ -60,8 +60,12 @@ fn fixture(root: &std::path::Path, base_url: &str) -> (Session, Journal) {
     });
     config.subscription_default_headers = Some(Vec::new());
     crate::server::keys::ensure_generated(&session.state, &mut config).unwrap();
-    let digest = render::desired(&config, &config.nodes[0], None).unwrap().digest;
-    config.nodes[0].applied = Some(Applied { digest, files: Default::default(), ports: Vec::new(), at: "2026-01-01T00:00:00Z".into() });
+    // The host role is applied: the vhost and marker hashes as `node apply` records them.
+    let secrets = render::NodeSecrets { reality_key: Some("PRIVKEY".to_owned().into()), awg_key: Some("AWGKEY".to_owned().into()),
+        ..render::NodeSecrets::default() };
+    let desired = render::desired(&config, &config.nodes[0], Some(&secrets)).unwrap();
+    config.nodes[0].applied = Some(Applied { digest: desired.digest, files: render::file_hashes(&desired.files), ports: Vec::new(),
+        at: "2026-01-01T00:00:00Z".into() });
     session.state.save_config(&config).unwrap();
     for client in ["alpha", "beta"] {
         let dir = root.join("generated/MOBILE").join(client);
@@ -373,6 +377,40 @@ async fn publish_uploads_then_saves_token_ttl_and_verifies_the_link() {
     hosts.finish(&[&token]);
     assert_eq!(client(&config(&session), "beta").subscription.as_ref().unwrap(), &subscription);
     assert_eq!(data["expires_at"], json!(subscription.expires_at));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn publish_works_while_the_host_node_is_pending_for_another_reason() {
+    let root = tempfile::tempdir().unwrap();
+    let base = http(200).await;
+    let (mut session, _journal) = fixture(root.path(), &base);
+    // A node port override: the host node is `pending`, its subscription role is not touched.
+    session.mutate("t", |state| {
+        let mut config = state.load_config()?;
+        config.nodes[0].ports.insert("hysteria2".into(), 20443);
+        state.save_config(&config)
+    }).unwrap();
+    let saved = config(&session);
+    assert_eq!(render::status(&saved, &saved.nodes[0]), "pending");
+    let mut steps = vec![connect_step(1)];
+    steps.extend(upload_steps(OLD_DIR, 1, 0));
+    steps.push(exec_ok(remote::expiry_command(OLD_DIR), 76, ""));
+    let hosts = Hosts::new(vec![steps]);
+    run(&mut session, &hosts, &["subscription", "publish", "--name", "beta", "--ttl", "30d"]).await.unwrap();
+    let token = client(&config(&session), "beta").subscription.clone().unwrap().token.unwrap();
+    hosts.finish(&[&token]);
+
+    // A running teardown of the host node blocks uploads before any connection.
+    session.mutate("t", |state| {
+        let mut config = state.load_config()?;
+        config.nodes[0].operation = Some(crate::model::Operation { id: "0".repeat(32), digest: "d".repeat(64), teardown: true,
+            ..Default::default() });
+        state.save_config(&config)
+    }).unwrap();
+    let none = Hosts::new(vec![]);
+    let error = run(&mut session, &none, &["subscription", "publish", "--name", "beta"]).await.unwrap_err();
+    assert_eq!(error.code, "not_installed");
+    none.finish(&[]);
 }
 
 #[tokio::test(flavor = "current_thread")]

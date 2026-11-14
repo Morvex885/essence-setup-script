@@ -923,16 +923,47 @@ exit 0'
     assert_failure
 }
 
-@test "sub_activate включает таймер, sub_remove снимает его и удаляет каталоги" {
-    mkdir -p "$ROOT/var/lib/essence-sub" "$ROOT/etc/nginx/snippets/essence-sub"
+# sub_timer_stub — systemctl, как настоящий, не включает и не отключает таймер
+# без файла юнита.
+sub_timer_stub() {
+    stub systemctl 'if [[ "$*" == *able*essence-sub-cleanup.timer && ! -f "$ESSENCE_NODE_ROOT/etc/systemd/system/essence-sub-cleanup.timer" ]]; then
+    echo "FAILED $*" >>"$CALLS"; exit 1
+fi
+exit 0'
+}
+
+@test "sub_activate включает таймер; откат первой установки останавливает его и убирает ссылку" {
+    sub_timer_stub
+    mkdir -p "$ROOT/etc/systemd/system/timers.target.wants"
+    : >"$ROOT/etc/systemd/system/essence-sub-cleanup.timer"
     awg_call sub_activate
     assert_success
     grep -qx "systemctl enable --now essence-sub-cleanup.timer" "$CALLS"
+    # Транзакция уже удалила новый юнит.
+    rm "$ROOT/etc/systemd/system/essence-sub-cleanup.timer"
+    ln -s /etc/systemd/system/essence-sub-cleanup.timer "$ROOT/etc/systemd/system/timers.target.wants/essence-sub-cleanup.timer"
+    : >"$CALLS"
     awg_call sub_rollback
+    grep -qx "systemctl stop essence-sub-cleanup.timer" "$CALLS"
+    ! grep -q "^FAILED" "$CALLS" || return 1
+    [[ ! -L "$ROOT/etc/systemd/system/timers.target.wants/essence-sub-cleanup.timer" ]]
+}
+
+@test "снятие sub: таймер отключается до удаления юнитов, каталоги удаляются" {
+    sub_timer_stub
+    mkdir -p "$ROOT/var/lib/essence-sub" "$ROOT/etc/nginx/snippets/essence-sub" "$ROOT/etc/systemd/system"
+    : >"$ROOT/etc/systemd/system/essence-sub-cleanup.timer"
+    : >"$ROOT/etc/systemd/system/essence-sub-cleanup.service"
+    printf '%s\n' /etc/systemd/system/essence-sub-cleanup.timer /etc/systemd/system/essence-sub-cleanup.service >"$OPDIR/remove.list"
+    add_file /etc/mihomo/config.yaml "new"
+    REMOVE_SPEC=sub write_spec
+    run_agent
     assert_success
-    awg_call sub_remove
-    assert_success
+    run status
+    assert_line "result=committed"
+    ! grep -q "^FAILED" "$CALLS" || return 1
     grep -qx "systemctl disable --now essence-sub-cleanup.timer" "$CALLS"
+    [[ ! -e "$ROOT/etc/systemd/system/essence-sub-cleanup.timer" ]]
     [[ ! -e "$ROOT/var/lib/essence-sub" && ! -e "$ROOT/etc/nginx/snippets/essence-sub" ]]
 }
 

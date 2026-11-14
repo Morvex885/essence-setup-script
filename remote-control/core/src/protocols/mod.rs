@@ -83,6 +83,20 @@ pub(crate) fn yaml_escape(name: &str) -> std::borrow::Cow<'_, str> {
     escaped.into()
 }
 
+/// An unquoted exit-proxy value (uuid, flow, keys, fingerprint, mode, port):
+/// kept as is when plain-safe — word characters and inner spaces, no `:`,
+/// `#` or quotes (Bash output for every normal value) — else double-quoted
+/// with [`yaml_escape`].
+fn yaml_plain(value: &str) -> std::borrow::Cow<'_, str> {
+    let safe = value.bytes().all(|b| b.is_ascii_alphanumeric() || b"._/+=- ".contains(&b))
+        && !value.starts_with(' ') && !value.ends_with(' ');
+    if safe {
+        value.into()
+    } else {
+        format!("\"{}\"", yaml_escape(value)).into()
+    }
+}
+
 /// Address for a YAML `server:`/`listen:` value. A bracketed IPv6 `[addr]`
 /// loses its brackets (a plain scalar starting with `[` is a flow sequence);
 /// an address ending with `:` (`::`, `2001:db8::`) is double-quoted, since a

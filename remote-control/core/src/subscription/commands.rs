@@ -142,11 +142,16 @@ pub(super) fn host(session: &mut Session, invocation: &Invocation) -> Result<Val
     if RESERVED_PORTS.contains(&port) {
         return Err(RcError::new("invalid", format!("Порт {port} зарезервирован для внутренних служб.")));
     }
+    if port == 80 {
+        return Err(RcError::new("invalid", "Порт 80 занят проверкой ACME (HTTP-01) для сертификатов."));
+    }
     host_record(&config, node, hostname, port)?;
     let previous = session.mutate("subscription_set_host", |state| {
         let mut config = state.load_config()?;
         let host = host_record(&config, node, hostname, port)?;
         let previous = config.subscription_host.replace(host);
+        // The host's port moves an AmneziaWG TPROXY port it would collide with.
+        crate::server::keys::ensure_generated(state, &mut config)?;
         state.save_config(&config)?;
         Ok(previous)
     })?;

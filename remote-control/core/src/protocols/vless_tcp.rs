@@ -1,7 +1,7 @@
 //! VLESS TCP + Reality builders (`common/protocols/vless-tcp.sh`).
 
 use super::uri::percent_encode;
-use super::{line, or, uri_host, yaml_escape, yaml_host, Vless, VlessListener};
+use super::{line, or, uri_host, yaml_escape, yaml_host, yaml_plain, Vless, VlessListener};
 
 /// Flow used by every TCP Reality client.
 pub const FLOW: &str = "xtls-rprx-vision";
@@ -66,15 +66,15 @@ pub fn uri(vless: &Vless) -> String {
 pub fn exit_yaml(vless: &Vless, flow: &str, fingerprint: &str) -> String {
     let mut out = format!(
         "  - name: {}\n    type: vless\n    server: {}\n    port: {}\n    uuid: {}\n    network: tcp\n    udp: true\n",
-        vless.name, yaml_host(vless.server), vless.port, vless.uuid
+        vless.name, yaml_host(vless.server), yaml_plain(vless.port), yaml_plain(vless.uuid)
     );
     if !flow.is_empty() {
-        line(&mut out, &format!("    flow: {flow}"));
+        line(&mut out, &format!("    flow: {}", yaml_plain(flow)));
     }
     line(&mut out, "    tls: true");
     line(&mut out, &format!("    servername: \"{}\"", yaml_escape(vless.sni)));
     push_reality_opts(&mut out, vless);
-    line(&mut out, &format!("    client-fingerprint: {}", or(fingerprint, "chrome")));
+    line(&mut out, &format!("    client-fingerprint: {}", yaml_plain(or(fingerprint, "chrome"))));
     out
 }
 
@@ -82,8 +82,8 @@ pub fn exit_yaml(vless: &Vless, flow: &str, fingerprint: &str) -> String {
 pub(super) fn push_reality_opts(out: &mut String, vless: &Vless) {
     if !vless.public_key.is_empty() {
         line(out, "    reality-opts:");
-        line(out, &format!("      public-key: {}", vless.public_key));
-        line(out, &format!("      short-id: {}", vless.short_id));
+        line(out, &format!("      public-key: {}", yaml_plain(vless.public_key)));
+        line(out, &format!("      short-id: {}", yaml_plain(vless.short_id)));
     }
 }
 

@@ -808,3 +808,29 @@ fn a_moved_subscription_host_releases_its_certificate() {
     assert!(gone.lines.contains(&"Будет удалён сертификат и сайт: sub.example.com".to_owned()));
     assert_eq!(spec(&teardown(&config.nodes[0]), "RELEASE_CERTS"), "de.example.com:/var/www/de.example.com sub.example.com:/var/www/sub.example.com");
 }
+
+#[test]
+fn the_subscription_role_stays_applied_while_other_changes_are_pending() {
+    let mut config = config(profile());
+    config.subscription_host = Some(sub_host(443));
+    assert!(!sub_role_applied(&config, &config.nodes[0]), "not applied yet");
+    let applied = render(&config);
+    config.nodes[0].applied = Some(Applied { digest: applied.digest.clone(), files: file_hashes(&applied.files), ports: applied.ports.clone(), at: "t".into() });
+    assert!(sub_role_applied(&config, &config.nodes[0]));
+    // A new client of the node makes it pending; the role is still in place.
+    config.clients.push(Client { inherit_nodes_from_group: false, nodes: Some(vec!["de".into()]), ..client("beta", "beta-pass") });
+    assert_eq!(status(&config, &config.nodes[0]), "pending");
+    assert!(sub_role_applied(&config, &config.nodes[0]));
+    // A running operation that keeps the vhost does not block; teardown does.
+    config.nodes[0].operation = Some(crate::model::Operation { id: "0".repeat(32), digest: "d".repeat(64),
+        files: file_hashes(&applied.files), ..Default::default() });
+    assert!(sub_role_applied(&config, &config.nodes[0]));
+    config.nodes[0].operation = Some(crate::model::Operation { id: "0".repeat(32), digest: "d".repeat(64), teardown: true, ..Default::default() });
+    assert!(!sub_role_applied(&config, &config.nodes[0]));
+    config.nodes[0].operation = None;
+    // A new hostname or listen port is not applied until `node apply`.
+    config.subscription_host.as_mut().unwrap().hostname = "subs.example.com".into();
+    assert!(!sub_role_applied(&config, &config.nodes[0]));
+    config.subscription_host = Some(sub_host(2096));
+    assert!(!sub_role_applied(&config, &config.nodes[0]));
+}

@@ -1447,7 +1447,13 @@ fn add_cascade(ctx: &mut Context<'_>) -> io::Result<()> {
     if name.is_empty() { return Ok(()); }
     let listed = ctx.call(&["node", "list"])?;
     if !listed.ok { ctx.failed(); return Ok(()); }
-    let profiled: Vec<&Value> = rows(&listed.data).iter().filter(|node| !text(&node["profile"]).is_empty()).collect();
+    // Entry and exit nodes serve at least one listener connection (the web's `entryNodes`/`exitNodes`).
+    let profiled: Vec<&Value> = rows(&listed.data).iter()
+        .filter(|node| !text(&node["profile"]).is_empty() && !cascade_proxies(node).is_empty()).collect();
+    if profiled.is_empty() {
+        ctx.ui.notice(ui::warn("Нет нод с профилем и включёнными VLESS или Hysteria2 — сначала назначьте ноде профиль."));
+        return Ok(());
+    }
     let labels: Vec<String> = profiled.iter().map(|node| node_label(node)).collect();
     let Some(i) = ctx.select("Входная нода каскада", &labels)? else { return Ok(()); };
     let entry = text(&profiled[i]["name"]);
@@ -2426,7 +2432,8 @@ mod tests {
         step(&["node", "list"], ok(json!([
             {"name": "de", "ip": "192.0.2.1", "port": 22, "profile": "edge", "proxies": ["VLESS TCP", "Hysteria2", "eu"]},
             {"name": "bare", "ip": "192.0.2.2", "port": 22, "profile": null, "proxies": []},
-            {"name": "ru", "ip": "192.0.2.3", "port": 22, "profile": "edge", "proxies": ["VLESS gRPC", "VLESS xHTTP"]}])))
+            {"name": "ru", "ip": "192.0.2.3", "port": 22, "profile": "edge", "proxies": ["VLESS gRPC", "VLESS xHTTP"]},
+            {"name": "aw", "ip": "192.0.2.4", "port": 22, "profile": "awg", "proxies": ["AWG"]}])))
     }
     fn cascades(list: Value) -> (Vec<String>, Reply) { step(&["cascade", "list"], ok(json!({"cascades": list}))) }
     fn via_ru() -> Value { json!({"name": "eu", "entry": "de", "listener": "hysteria2", "exit": {"node": "ru", "proxy": "VLESS gRPC"}}) }
@@ -2476,6 +2483,15 @@ mod tests {
         // Enter at the URI cancels without a request.
         let (_, client, _) = run(vec![cascade_nodes_list()], &["ext", "1", "1", "2", ""], add_cascade);
         assert_eq!(client.calls.len(), 1);
+    }
+    #[test]
+    fn cascade_add_without_listener_nodes_warns_and_asks_nothing_more() {
+        let list = step(&["node", "list"], ok(json!([{"name": "aw", "ip": "192.0.2.4", "port": 22, "profile": "awg", "proxies": ["AWG"]},
+            {"name": "bare", "ip": "192.0.2.2", "port": 22, "profile": null, "proxies": []}])));
+        let (_, client, ui) = run(vec![list], &["ext"], add_cascade);
+        assert_eq!(client.calls.len(), 1);
+        assert!(noticed(&ui, "Нет нод с профилем и включёнными VLESS или Hysteria2"));
+        assert!(!ui.views.iter().any(|v| v.title == "Входная нода каскада"));
     }
     #[test]
     fn cascade_delete_is_plan_gated_and_offers_apply_on_its_nodes() {

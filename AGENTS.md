@@ -6,7 +6,7 @@
 
 - [common/](common/) — независимый серверный слой. Никогда не импортирует `setup-essence/` или код из `remote-control/`.
 - [setup-essence/](setup-essence/) — серверные скрипты; импортирует только `common/`.
-- YAML-билдеры протоколов живут **только** в [common/protocols/](common/protocols/) (`vless-tcp.sh`, `vless-xhttp.sh`, `vless-grpc.sh`, `hy2.sh`, `iptables-dnat.sh`, `uri.sh`); их Rust-порты — в `remote-control/core/src/protocols/` с golden-паритетом (`remote-control/core/tests/protocols_golden.rs`). Не дублировать билдер в модуле.
+- YAML-билдеры протоколов живут **только** в [common/protocols/](common/protocols/) (`vless-tcp.sh`, `vless-xhttp.sh`, `vless-grpc.sh`, `hy2.sh`, `uri.sh`); их Rust-порты — в `remote-control/core/src/protocols/` с golden-паритетом (`remote-control/core/tests/protocols_golden.rs`). `iptables-dnat.sh` — только Bash (до этапа 6), Rust-порта нет. Не дублировать билдер в модуле.
 - `remote-control/` — Cargo workspace из пяти крейтов:
   - `remote-control/core` (`rc-core`) — ядро: модель состояния, блокировки, каталог команд, `dispatch`, SSH-эффекты (russh), GitHub-источник, билдеры протоколов. Не зависит от терминала и фронтенда.
   - `remote-control/client` (`essence-rc-client`) — типы протокола v3, `Client`, `DaemonClient` (локальный сокет и WebSocket), `ScriptedClient`, точка подключения и запуск демона.

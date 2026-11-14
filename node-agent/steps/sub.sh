@@ -25,16 +25,31 @@ sub_prepare() {
     chmod 755 "$SUB_SNIPPETS"
 }
 
+SUB_TIMER_UNIT="$R/etc/systemd/system/essence-sub-cleanup.timer"
+
 sub_activate() {
     systemctl enable --now essence-sub-cleanup.timer
 }
 
-# Файлы роли возвращает транзакция; таймер к ним не привязан.
+# Откат: юнит таймера восстановлен (роль была) — таймер включается снова,
+# в том числе после sub_deactivate; первой установки — файла уже нет: таймер
+# останавливается и ссылка в timers.target.wants убирается вручную
+# (systemctl disable без файла юнита отказывает).
 sub_rollback() {
-    return 0
+    if [[ -f "$SUB_TIMER_UNIT" ]]; then
+        systemctl enable --now essence-sub-cleanup.timer
+    else
+        systemctl stop essence-sub-cleanup.timer
+        rm -f -- "$R/etc/systemd/system/timers.target.wants/essence-sub-cleanup.timer"
+    fi
+}
+
+# Снятие роли, до удаления юнитов этапом config.
+sub_deactivate() {
+    [[ -f "$SUB_TIMER_UNIT" ]] || return 0
+    systemctl disable --now essence-sub-cleanup.timer
 }
 
 sub_remove() {
-    systemctl disable --now essence-sub-cleanup.timer >/dev/null 2>&1 || true
     rm -rf -- "$SUB_DIR_PATH" "$SUB_SNIPPETS"
 }

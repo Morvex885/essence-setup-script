@@ -16,7 +16,7 @@ use crate::model::{
     AmneziaWg, Cascade, CascadeExit, Client, Config, Ipv6, Node, NodeWarp, Profile, RealityMode, SUB_DIR, SiteSource,
     SubscriptionHost, XhttpTopology,
 };
-use crate::protocols::uri::parse_proxy_uri;
+use crate::protocols::uri::parse_exit_uri;
 use crate::protocols::vless_xhttp::NginxListener;
 use crate::protocols::{Vless, VlessListener, hy2, listener_users, vless_grpc, vless_tcp, vless_xhttp, yaml_escape};
 
@@ -762,7 +762,7 @@ fn exit_yaml(config: &Config, cascade: &Cascade) -> Result<String> {
     let broken = |reason: String| invalid(format!("Выход каскада «{}»: {reason}", cascade.name)).with_extra("name", cascade.name.clone());
     let exit = match &cascade.exit {
         CascadeExit::Uri(exit) => {
-            return parse_proxy_uri(&cascade.name, &exit.uri).map(|proxy| proxy.yaml).map_err(|error| broken(error.to_string()));
+            return parse_exit_uri(&cascade.name, &exit.uri).map(|proxy| proxy.yaml).map_err(|error| broken(error.to_string()));
         }
         CascadeExit::Node(exit) => exit,
     };
@@ -1127,6 +1127,21 @@ pub fn awg_nodes(config: &Config, client: &Client) -> Vec<String> {
             && node.params.awg.is_some()
             && awg::expected_peers(config, &node.name).iter().any(|peer| peer.name == client.name)
     }).map(|node| node.name.clone()).collect()
+}
+
+/// The subscription role of the node is installed as configured, whatever
+/// else is pending there: the applied state holds the hostname's webroot
+/// marker and the vhost the configuration renders now (hostname, listen,
+/// data directory), and a running operation, if any, keeps both.
+pub fn sub_role_applied(config: &Config, node: &Node) -> bool {
+    let Ok(Some(layout)) = layout(config, node) else { return false };
+    let Some(host) = layout.sub_host() else { return false };
+    let site = format!("{SITES_AVAILABLE}{SUB_SITE}");
+    let hash = hex::encode(Sha256::digest(layout.sub_site(host).as_bytes()));
+    let marker = sub_marker(&host.hostname);
+    let installed = |files: &BTreeMap<String, String>| files.get(&site) == Some(&hash) && files.contains_key(&marker);
+    node.applied.as_ref().is_some_and(|applied| installed(&applied.files))
+        && node.operation.as_ref().is_none_or(|operation| installed(&operation.files))
 }
 
 /// SHA-256 of rendered file contents by path (links are not recorded).
