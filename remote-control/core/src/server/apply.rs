@@ -324,22 +324,25 @@ fn operation_dir(op_id: &str, desired: &Desired) -> Result<tempfile::TempDir> {
 
 /// How a finished operation ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum End { Committed, Failed, RollbackFailed }
+enum End { Committed, Failed, Incomplete }
 
 impl End {
+    /// The end of an executor that has exited: no result (killed, OOM) or
+    /// an incomplete rollback may have left its files and listeners behind.
     fn of(result: Option<&str>) -> Self {
         match result {
             Some("committed") => End::Committed,
-            Some("rollback_failed") => End::RollbackFailed,
-            _ => End::Failed,
+            Some("rollback_failed") | None => End::Incomplete,
+            Some(_) => End::Failed,
         }
     }
 }
 
 /// End the node's operation: a commit records what the operation uploaded.
-/// An incomplete rollback may have left the attempt's files and listeners
-/// on the node: they stay ours (merged into `applied`) under a digest that
-/// never matches, so the node stays pending until an apply commits.
+/// An incomplete end (no result, or an incomplete rollback) may have left
+/// the attempt's files and listeners on the node: they stay ours (merged
+/// into `applied`) under a digest that never matches, so the node stays
+/// pending until an apply commits.
 fn conclude(node: &mut Node, end: End) {
     let Some(operation) = node.operation.take() else { return };
     match end {
@@ -349,7 +352,7 @@ fn conclude(node: &mut Node, end: End) {
             });
         }
         End::Failed => {}
-        End::RollbackFailed => {
+        End::Incomplete => {
             let applied = node.applied.get_or_insert_with(|| Applied {
                 digest: String::new(), files: BTreeMap::new(), ports: Vec::new(), at: String::new(),
             });
@@ -427,11 +430,13 @@ struct Run<'t, T> {
     stage: String,
     lost: Option<(Instant, usize, Instant)>,
     outcome: Option<Outcome>,
+    /// How the executor ended (recorded with a non-timeout failure).
+    end: End,
 }
 
 impl<'t, T: RemoteTransport> Run<'t, T> {
     fn new(node: Node, transport: &'t mut T, operation: Operation) -> Self {
-        Self { node, transport, operation, started: Instant::now(), stage: String::new(), lost: None, outcome: None }
+        Self { node, transport, operation, started: Instant::now(), stage: String::new(), lost: None, outcome: None, end: End::Failed }
     }
 
     fn fail(&mut self, failure: Failure) {
@@ -530,11 +535,13 @@ impl<'t, T: RemoteTransport> Run<'t, T> {
                         format!("откат на этапе «{}» не завершён: резервные копии оставлены на ноде", stage_label(&stage))),
                     _ => Failure::new(&stage, "failed", format!("ошибка на этапе «{}»", stage_label(&stage))),
                 };
+                self.end = End::of(Some(result));
                 self.fail(failure);
             }
             None if unit_gone(&status) => {
                 self.show_log(session).await;
                 let stage = self.current_stage();
+                self.end = End::Incomplete;
                 self.fail(Failure::new(&stage, "failed",
                     format!("исполнитель остановился без результата на этапе «{}»", stage_label(&stage))));
             }
@@ -543,14 +550,13 @@ impl<'t, T: RemoteTransport> Run<'t, T> {
     }
 
     /// Record the result: `applied` after a commit (or the attempt kept as
-    /// ours after an incomplete rollback), the operation cleared always
-    /// except after a timeout (the next `node apply` resumes it).
+    /// ours after an incomplete end), the operation cleared always except
+    /// after a timeout (the next `node apply` resumes it).
     fn record(&self, session: &mut Session) -> Result<()> {
         match &self.outcome {
             Some(Outcome::Committed) => finish_operation(session, &self.node.id, &self.operation.id, End::Committed),
             Some(Outcome::Failed(failure)) if failure.code != "timeout" => {
-                let end = if failure.code == "rollback_failed" { End::RollbackFailed } else { End::Failed };
-                finish_operation(session, &self.node.id, &self.operation.id, end)
+                finish_operation(session, &self.node.id, &self.operation.id, self.end)
             }
             _ => Ok(()),
         }
@@ -672,7 +678,8 @@ pub async fn apply<T: RemoteTransport>(session: &mut Session, invocation: &Invoc
                     Some("rollback_failed") => format!(
                         "{name}: прошлое применение не завершило откат — его файлы и порты остаются за Essence до следующего применения."),
                     Some(_) => format!("{name}: прошлое применение завершилось неудачно — отметка будет снята."),
-                    None => format!("{name}: прошлое применение прервано без результата — отметка будет снята."),
+                    None => format!(
+                        "{name}: прошлое применение прервалось без результата — его файлы и порты остаются за Essence до следующего применения."),
                 });
                 extra.push(format!("settle:{name}:{}:{end:?}", operation.id));
                 conclude(&mut node, end);

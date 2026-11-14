@@ -511,17 +511,26 @@ async fn an_operation_finished_unwatched_is_settled_after_confirmation() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_dead_executor_is_not_resumed() {
+async fn a_dead_executor_is_not_resumed_and_its_attempt_stays_ours() {
     let root = tempfile::tempdir().unwrap();
     let (mut session, _journal) = fixture(root.path());
-    // Killed without writing a result: cleared and started anew.
+    // Killed without writing a result (unwatched): not resumed; its files and
+    // ports stay ours until an apply commits.
     set_operation(&mut session, Some(recorded("a")));
     let de = config(&session).nodes[0].clone();
+    let dead = format!("{DEBIAN}agent=ok\nlisten tcp 0.0.0.0:443\nunit=inactive\nstage=config\n");
+    let hosts = Hosts::new(vec![vec![connect_step(&de, Ok(())), probe_step(&de, &dead)]]);
+    let error = run(&mut session, &hosts, &["node", "apply", "--name", "de"]).await.unwrap_err();
+    hosts.finish();
+    assert_eq!(error.code, "confirmation_required", "our own 443 is not busy: {error:?}");
+    assert!(error.extra["plan"].as_array().unwrap().contains(&json!(
+        "de: прошлое применение прервалось без результата — его файлы и порты остаются за Essence до следующего применения.")));
+
     let next = "fedcba9876543210fedcba9876543210";
     NEXT_OP_ID.with(|id| *id.borrow_mut() = Some(next.into()));
-    let mut steps = vec![connect_step(&de, Ok(())), probe_step(&de, &format!("{DEBIAN}agent=ok\nunit=inactive\nstage=config\n"))];
+    let mut steps = vec![connect_step(&de, Ok(())), probe_step(&de, &dead)];
     steps.extend(start_steps(next).into_iter().skip(2));
-    // While polling: the unit dies without a result.
+    // While polling (watched): the unit dies without a result.
     steps.push(exec(status_command(next), "unit=failed\nstage=mihomo\n"));
     steps.push(exec(log_command(next), "Killed\n"));
     let hosts = Hosts::new(vec![steps]);
@@ -530,7 +539,14 @@ async fn a_dead_executor_is_not_resumed() {
     assert!(error.extra.get("plan").is_none());
     assert_eq!(error.extra["failed"], json!([{"name": "de", "stage": "mihomo", "code": "failed",
         "message": "исполнитель остановился без результата на этапе «установка mihomo»"}]));
-    assert!(config(&session).nodes[0].operation.is_none(), "a dead operation is not kept for resuming");
+    let saved = config(&session);
+    let node = &saved.nodes[0];
+    assert!(node.operation.is_none(), "a dead operation is not kept for resuming");
+    let applied = node.applied.as_ref().expect("the attempt is kept");
+    assert_eq!(applied.digest, render::incomplete_digest());
+    assert!(applied.files.contains_key(render_paths::MIHOMO_CONFIG_PATH) && applied.ports == ["443/tcp"]);
+    assert_ne!(applied.files[render_paths::MIHOMO_CONFIG_PATH], "c".repeat(64), "the watched attempt's hashes win");
+    assert_eq!(render::status(&saved, node), "pending");
 }
 
 #[tokio::test(start_paused = true)]
