@@ -171,11 +171,15 @@ test('argv подключений', () => {
   assert.deepEqual(assignmentChanges(['p1', 'p2'], [['PC'], ['TV']], { 'proxy-0': ['PC'], 'proxy-1': ['TV', 'PC'] }), [['PC', ['p1', 'p2']]]);
 });
 
-/** Поддельный `ctx` назначения: `steps` — `[argv, reply]`, `answers` — ответы `form`. */
-function assignCtx(steps, answers) {
-  const record = { calls: [], forms: [], notices: [] };
+/**
+ * Поддельный `ctx` назначения: `steps` — `[argv, reply]`, `answers` — ответы `form`.
+ * Фоновое чтение `node list` предложения применить отвечает `nodes` и пишется в `offers`.
+ */
+function assignCtx(steps, answers, nodes = []) {
+  const record = { calls: [], forms: [], notices: [], offers: [] };
   const ctx = {
-    async request(argv) {
+    async request(argv, options = {}) {
+      if (options.quiet && argv.join(' ') === 'node list') { record.offers.push(argv); return ok(nodes); }
       assert.ok(steps.length > 0, `лишний запрос ${argv.join(' ')}`);
       const [expected, reply] = steps.shift();
       assert.deepEqual(argv, expected);
@@ -203,6 +207,8 @@ test('assignConnections: поле на подключение, текущие г
   assert.deepEqual(field(form, 'proxy-0').options.map((o) => o.value), ['g1', 'g2']);
   assert.equal(steps.length, 0);
   assert.deepEqual(record.notices, []);
+  // После conn set — чтение node list предложения применить (ожидающих нод нет — без вопроса).
+  assert.deepEqual(record.offers, [['node', 'list']]);
 });
 
 test('assignConnections: без подключений формы нет', async () => {

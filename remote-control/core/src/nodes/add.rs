@@ -269,6 +269,14 @@ pub async fn add<T: RemoteTransport>(session: &mut Session, invocation: &Invocat
     if !node_tag_valid(tag) {
         return Err(invalid(format!("Недопустимый тег «{tag}»: до 32 символов, без управляющих символов и ;\"'`$\\|&<>{{}}[]#,:/.")));
     }
+    let profile = invocation.value("profile").filter(|profile| !profile.is_empty());
+    if let Some(profile) = profile.filter(|profile| config.find_profile(profile).is_none()) {
+        return Err(RcError::new("not_found", format!("Профиль «{profile}» не найден.")).with_extra("name", profile));
+    }
+    let domain = invocation.value("domain").filter(|domain| !domain.is_empty());
+    if let Some(domain) = domain.filter(|domain| !crate::validation::domain_valid(domain)) {
+        return Err(invalid(format!("Недопустимый домен «{domain}».")));
+    }
     let pins = session.state.load_known_hosts()?.0.get(&endpoint_key(ip, port)?).cloned().unwrap_or_default();
 
     if let HostKeyMode::Replace(fingerprint) = &mode {
@@ -288,7 +296,8 @@ pub async fn add<T: RemoteTransport>(session: &mut Session, invocation: &Invocat
             id: id.clone(), name: name.to_owned(), ip: ip.to_owned(), port, user: user.to_owned(), auth,
             identity: (auth == Auth::Key).then(|| "system".to_owned()),
             secret_id: (auth == Auth::Password).then(|| format!("node:{id}:ssh-password")),
-            tag: Some(tag.to_owned()), aliases: Default::default(), ..Node::default()
+            tag: Some(tag.to_owned()), aliases: Default::default(),
+            profile: profile.map(str::to_owned), domain: domain.map(str::to_owned), ..Node::default()
         },
         password: password.filter(|_| auth == Auth::Password),
         github,

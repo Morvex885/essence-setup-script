@@ -42,3 +42,4 @@ windows-sys.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

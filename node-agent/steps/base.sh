@@ -1,0 +1,554 @@
+#!/bin/bash
+# ─── Базовые этапы исполнителя ──────────────────────────────────────────────
+# Подключается из apply.sh; использует $R, $OP, $NODE_DIR, $AGENT_DIR и spec.
+# Каждый этап возвращает ненулевой код при сбое; `error` не вызывается.
+
+MIHOMO_BIN_REL=/usr/local/bin/mihomo
+
+# agent_apt_wait — ждать освобождения блокировок apt/dpkg без вопросов.
+# Лимит — AGENT_APT_WAIT_SECONDS (по умолчанию 300 с); по истечении — код 1.
+agent_apt_wait() {
+    local limit="${AGENT_APT_WAIT_SECONDS:-300}" waited=0 lock busy
+    local locks=(/var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock)
+    while true; do
+        busy=""
+        for lock in "${locks[@]}"; do
+            if fuser "$R$lock" >/dev/null 2>&1; then
+                busy="$lock"
+                break
+            fi
+        done
+        [[ -z "$busy" ]] && return 0
+        if ((waited >= limit)); then
+            warn "Блокировка apt ($busy) не освободилась за ${limit} с."
+            return 1
+        fi
+        if ((waited % 30 == 0)); then
+            info "Ожидаю завершения другого процесса apt ($busy)..."
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+}
+
+# Транзакция затронула /etc/nginx/ (установка или удаление).
+tx_touches_nginx() {
+    local path
+    for path in "${TX_PATHS[@]}"; do
+        [[ "$path" == /etc/nginx/* ]] && return 0
+    done
+    return 1
+}
+
+# ─── packages ───────────────────────────────────────────────────────────────
+stage_packages() {
+    local pkgs=(curl wget unzip ufw openssl dnsutils cron)
+    [[ "$NGINX" == true ]] && pkgs+=(nginx)
+    [[ "$NGINX_STREAM" == true ]] && pkgs+=(libnginx-mod-stream)
+    agent_apt_wait || return 1
+    DEBIAN_FRONTEND=noninteractive apt-get update -q || return 1
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -q "${pkgs[@]}" || return 1
+    if [[ "$NGINX" == true ]]; then
+        systemctl enable nginx || return 1
+    fi
+}
+
+# ─── system ─────────────────────────────────────────────────────────────────
+stage_system() {
+    if ufw status 2>/dev/null | grep -q '^Status: active'; then
+        return 0
+    fi
+    ufw allow "$SSH_PORT/tcp" || return 1
+    ufw default deny incoming || return 1
+    ufw default allow outgoing || return 1
+    ufw --force enable || return 1
+}
+
+# ─── mihomo ─────────────────────────────────────────────────────────────────
+stage_mihomo() {
+    local bin="$R$MIHOMO_BIN_REL" latest="$MIHOMO_VERSION"
+    if [[ -z "$latest" ]]; then
+        warn "Не задана версия mihomo."
+        return 1
+    fi
+    if [[ -x "$bin" ]] && "$bin" -v 2>/dev/null | grep -qF -- "$latest"; then
+        return 0
+    fi
+    info "Версия: $latest"
+
+    local arch
+    case "$(uname -m)" in
+        aarch64|arm64) arch="arm64" ;;
+        armv7l|armv7) arch="armv7" ;;
+        *)
+            local cpu_flags
+            cpu_flags=$(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null || echo "")
+            if echo "$cpu_flags" | grep -qw "avx2"; then
+                arch="amd64-v3"
+            elif echo "$cpu_flags" | grep -qw "sse4_2"; then
+                arch="amd64-v2"
+            else
+                arch="amd64"
+            fi
+            ;;
+    esac
+    local download_dir
+    download_dir=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/essence-mihomo.XXXXXX") || {
+        warn "Не удалось подготовить временный каталог для Mihomo."
+        return 1
+    }
+    mkdir -p "$(dirname "$bin")" || { rm -rf -- "$download_dir"; return 1; }
+    if ! curl -fLo "$download_dir/mihomo.gz" \
+        "https://github.com/MetaCubeX/mihomo/releases/download/${latest}/mihomo-linux-${arch}-${latest}.gz" ||
+       ! gunzip -f "$download_dir/mihomo.gz" ||
+       ! mv "$download_dir/mihomo" "$bin.new" ||
+       ! chmod 0755 "$bin.new" ||
+       ! mv -f "$bin.new" "$bin"; then
+        rm -rf -- "$download_dir"
+        rm -f -- "$bin.new"
+        warn "Не удалось скачать или установить бинарник Mihomo."
+        return 1
+    fi
+    rm -rf -- "$download_dir"
+}
+
+# ─── dns ────────────────────────────────────────────────────────────────────
+external_ipv4() {
+    local url ip
+    for url in https://ifconfig.me https://icanhazip.com https://api4.ipify.org; do
+        ip=$(curl -4 -s --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]')
+        if [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+            printf '%s\n' "$ip"
+            return 0
+        fi
+    done
+    return 1
+}
+
+stage_dns() {
+    [[ -n "$DNS_DOMAINS" ]] || return 0
+    local ip domain resolved
+    ip=$(external_ipv4) || { warn "Не удалось определить внешний IPv4."; return 1; }
+    for domain in $DNS_DOMAINS; do
+        resolved=$(getent ahostsv4 "$domain" | awk '{print $1; exit}')
+        if [[ "$resolved" != "$ip" ]]; then
+            warn "A-запись $domain (${resolved:-нет}) не указывает на $ip."
+            return 1
+        fi
+    done
+}
+
+# ─── site ───────────────────────────────────────────────────────────────────
+# site_fetch <simple|sni|nothing|random> <каталог> — сайт-заглушка без вопросов.
+# Порт _randomhtml: при сбое загрузки по одной попытке на остальные источники.
+site_fetch() (
+    local template_source="$1" target_dir="$2"
+    umask 022
+    local template_urls=(
+        "https://github.com/eGamesAPI/simple-web-templates/archive/refs/heads/main.zip"
+        "https://github.com/distillium/sni-templates/archive/refs/heads/main.zip"
+        "https://github.com/prettyleaf/nothing-sni/archive/refs/heads/main.zip"
+    )
+    local first
+    case "$template_source" in
+        simple) first=0 ;;
+        sni) first=1 ;;
+        nothing) first=2 ;;
+        random|"") first=$((RANDOM % 3)) ;;
+        *) warn "Неизвестный источник сайта: $template_source"; return 1 ;;
+    esac
+
+    local work
+    work=$(mktemp -d "${TMPDIR:-/tmp}/essence-site.XXXXXX") || return 1
+    trap 'rm -rf -- "$work"' EXIT
+    cd "$work" || return 1
+
+    local i selected_url="" order=("$first")
+    for i in 0 1 2; do
+        [[ "$i" == "$first" ]] || order+=("$i")
+    done
+    info "Скачиваю шаблон..."
+    for i in "${order[@]}"; do
+        if wget --timeout=15 --tries=2 -q "${template_urls[$i]}" -O main.zip; then
+            selected_url="${template_urls[$i]}"
+            break
+        fi
+        warn "Не удалось скачать шаблон: ${template_urls[$i]}"
+        rm -f main.zip
+    done
+    [[ -n "$selected_url" ]] || return 1
+
+    if ! unzip -o main.zip &>/dev/null; then
+        warn "Не удалось распаковать архив шаблона"
+        return 1
+    fi
+    rm -f main.zip
+
+    local template_dir
+    if [[ "$selected_url" == *"eGamesAPI"* ]]; then
+        template_dir="simple-web-templates-main"
+        cd "$template_dir" || return 1
+        rm -rf assets ".gitattributes" "README.md" "_config.yml" 2>/dev/null
+    elif [[ "$selected_url" == *"nothing-sni"* ]]; then
+        template_dir="nothing-sni-main"
+        cd "$template_dir" || return 1
+        rm -rf .github README.md 2>/dev/null
+    else
+        template_dir="sni-templates-main"
+        cd "$template_dir" || return 1
+        rm -rf assets "README.md" "index.html" 2>/dev/null
+    fi
+
+    local RandomHTML
+    if [[ "$selected_url" == *"nothing-sni"* ]]; then
+        local selected_number=$((RANDOM % 8 + 1))
+        RandomHTML="${selected_number}.html"
+    else
+        local templates=() template
+        while IFS= read -r template; do
+            templates+=("$template")
+        done < <(find . -maxdepth 1 -type d -not -path . | sed 's|./||')
+        ((${#templates[@]} > 0)) || { warn "Архив шаблона пуст"; return 1; }
+        RandomHTML="${templates[$RANDOM % ${#templates[@]}]}"
+    fi
+
+    if [[ "$selected_url" == *"distillium"* && "$RandomHTML" == "503 error pages" ]]; then
+        local versions=("v1" "v2")
+        local RandomVersion="${versions[$RANDOM % ${#versions[@]}]}"
+        RandomHTML="$RandomHTML/$RandomVersion"
+    fi
+
+    # ── Антифингерпринтинг ────────────────────────────────────────────────────
+    local random_meta_id random_comment random_class_suffix random_title_suffix
+    local random_id_suffix random_meta_name random_username random_class_prefix
+    random_meta_id=$(openssl rand -hex 16)
+    random_comment=$(openssl rand -hex 8)
+    random_class_suffix=$(openssl rand -hex 4)
+    random_title_suffix=$(openssl rand -hex 4)
+    random_id_suffix=$(openssl rand -hex 4)
+
+    local meta_names=("viewport-id" "session-id" "track-id" "render-id" "page-id" "config-id")
+    local meta_usernames=("Payee6296" "UserX1234" "AlphaBeta" "GammaRay" "DeltaForce" "EchoZulu" "Foxtrot99" "HotelCalifornia" "IndiaInk" "JulietBravo")
+    local class_prefixes=("style" "data" "ui" "layout" "theme" "view")
+
+    random_meta_name=${meta_names[$RANDOM % ${#meta_names[@]}]}
+    random_username=${meta_usernames[$RANDOM % ${#meta_usernames[@]}]}
+    random_class_prefix=${class_prefixes[$RANDOM % ${#class_prefixes[@]}]}
+
+    local random_class="${random_class_prefix}-${random_class_suffix}"
+    local random_title="Page_${random_title_suffix}"
+    local random_footer_text="Designed by RandomSite_${random_title_suffix}"
+
+    find "./$RandomHTML" -type f -name "*.html" -exec sed -i \
+        -e "s|<!-- Website template by freewebsitetemplates.com -->||" \
+        -e "s|<!-- Theme by: WebThemez.com -->||" \
+        -e "s|<a href=\"http://freewebsitetemplates.com\">Free Website Templates</a>|<span>${random_footer_text}</span>|" \
+        -e "s|<a href=\"http://webthemez.com\" alt=\"webthemez\">WebThemez.com</a>|<span>${random_footer_text}</span>|" \
+        -e "s|id=\"Content\"|id=\"rnd_${random_id_suffix}\"|" \
+        -e "s|id=\"subscribe\"|id=\"sub_${random_id_suffix}\"|" \
+        -e "s|<title>.*</title>|<title>${random_title}</title>|" \
+        -e "s/<\/head>/<meta name=\"${random_meta_name}\" content=\"${random_meta_id}\">\n<!-- ${random_comment} -->\n<\/head>/" \
+        -e "s/<body/<body class=\"${random_class}\"/" \
+        -e "s/CHANGEMEPLS/${random_username}/g" \
+        {} \;
+
+    find "./$RandomHTML" -type f -name "*.css" -exec sed -i \
+        -e "1i\/* ${random_comment} */" \
+        -e "1i.${random_class} { display: block; }" \
+        {} \;
+
+    info "Выбран шаблон: $RandomHTML"
+
+    mkdir -p "$target_dir" || return 1
+    if [[ -d "${RandomHTML}" ]]; then
+        rm -rf "${target_dir:?}"/*
+        cp -a "${RandomHTML}"/. "$target_dir/" || return 1
+    elif [[ -f "${RandomHTML}" ]]; then
+        cp "${RandomHTML}" "$target_dir/index.html" || return 1
+    else
+        warn "Шаблон '$RandomHTML' не найден в распакованном архиве"
+        return 1
+    fi
+    success "Шаблон скопирован в $target_dir"
+)
+
+stage_site() {
+    [[ -n "$SITE_NAME" ]] || return 0
+    local www="$R/var/www/$SITE_NAME"
+    (umask 022; mkdir -p "$www") || return 1
+    mkdir -p "$R/etc/nginx/ssl/$SITE_NAME" || return 1
+    [[ -e "$www/.essence-site" ]] && return 0
+    site_fetch "$SITE_SOURCE" "$www" || return 1
+    (umask 022; : >"$www/.essence-site") || return 1
+}
+
+# ─── certificate ────────────────────────────────────────────────────────────
+stage_certificate() {
+    [[ -n "$CERTS" ]] || return 0
+    local entry name webroot
+    ensure_acme_installed "$ACME_EMAIL" || return 1
+    for entry in $CERTS; do
+        name="${entry%%:*}"
+        webroot="${entry#*:}"
+        (umask 022; mkdir -p "$R$webroot") || return 1
+        ensure_cert "$name" "$R$webroot" false "$R/etc/nginx/ssl" \
+            "$R/etc/nginx/sites-available" "$R/etc/nginx/sites-enabled" "$R/etc/nginx/nginx.conf" || return 1
+    done
+}
+
+# ─── prepare ────────────────────────────────────────────────────────────────
+stage_prepare() {
+    local hy2="$R/etc/mihomo/certs/hy2" feature
+    if [[ "$HY2_CERT" == true && ! -f "$hy2/server.crt" ]]; then
+        [[ -n "$HY2_CN" ]] || { warn "Не задан CN сертификата Hysteria2."; return 1; }
+        mkdir -p "$hy2" && chmod 0700 "$hy2" || return 1
+        openssl req -new -newkey rsa:2048 -days 3650 -nodes -x509 \
+            -subj "/C=US/ST=Denial/L=Springfield/O=Dis/CN=$HY2_CN" \
+            -keyout "$hy2/server.key" \
+            -out    "$hy2/server.crt" 2>/dev/null || {
+            warn "Не удалось создать сертификат"
+            rm -f "$hy2/server.key" "$hy2/server.crt"
+            return 1
+        }
+        chmod 0600 "$hy2/server.key" || return 1
+    fi
+    for feature in $FEATURES; do
+        feature_hook "$feature" prepare || return 1
+    done
+}
+
+# ─── config: транзакция ─────────────────────────────────────────────────────
+# tx_backup <абсолютный путь> — копия в <op>/backup/<путь> либо отметка .absent.
+tx_backup() {
+    local path="$1" dest="$R$1" bak="$OP/backup$1" known
+    for known in "${TX_PATHS[@]}"; do
+        [[ "$known" == "$path" ]] && return 0
+    done
+    mkdir -p "$(dirname "$bak")" || return 1
+    if [[ -e "$dest" || -L "$dest" ]]; then
+        cp -a -- "$dest" "$bak" || return 1
+    else
+        : >"$bak.absent" || return 1
+    fi
+    TX_PATHS+=("$path")
+}
+
+tx_restore_files() {
+    local path dest bak
+    for path in "${TX_PATHS[@]}"; do
+        dest="$R$path"
+        bak="$OP/backup$path"
+        if [[ -e "$bak.absent" ]]; then
+            rm -rf -- "$dest"
+        elif [[ -e "$bak" || -L "$bak" ]]; then
+            rm -rf -- "$dest"
+            mkdir -p "$(dirname "$dest")"
+            cp -a -- "$bak" "$dest"
+        fi
+    done
+}
+
+# Откат: вызывается из finish() при открытой транзакции.
+tx_rollback() {
+    local feature
+    warn "Откат изменений."
+    tx_restore_files
+    systemctl daemon-reload
+    if [[ "$OP_MODE" == teardown ]]; then
+        systemctl enable mihomo
+    fi
+    systemctl restart mihomo
+    if [[ "$NGINX" == true || "$OP_MODE" == teardown ]] && command -v nginx >/dev/null 2>&1; then
+        systemctl restart nginx
+    elif tx_touches_nginx && command -v nginx >/dev/null 2>&1; then
+        nginx -t && systemctl reload nginx
+    fi
+    sysctl --system >/dev/null
+    for feature in $FEATURES; do
+        feature_hook "$feature" rollback
+    done
+    TX_OPEN=false
+}
+
+# read_list <файл> — пути без пустых строк.
+read_list() {
+    [[ -f "$1" ]] || return 0
+    grep -v '^[[:space:]]*$' "$1"
+}
+
+install_file() {
+    local mode="$1" owner="$2" group="$3" path="$4"
+    local src="$OP/files$path" dest="$R$path" dir tmp
+    [[ -e "$src" ]] || { warn "Нет файла операции: $path"; return 1; }
+    dir="$(dirname "$dest")"
+    (umask 022; mkdir -p "$dir") || return 1
+    if [[ "$mode" == link ]]; then
+        rm -rf -- "$dest" 2>/dev/null
+        ln -sfn -- "$(cat "$src")" "$dest" || return 1
+        return 0
+    fi
+    [[ "$mode" =~ ^[0-7]{4}$ ]] || { warn "Некорректный режим $mode для $path"; return 1; }
+    tmp=$(mktemp "$dir/.essence.XXXXXX") || return 1
+    if ! cat -- "$src" >"$tmp" ||
+       ! chown "$owner:$group" "$tmp" ||
+       ! chmod "$mode" "$tmp" ||
+       ! mv -f -- "$tmp" "$dest"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+}
+
+wait_active() {
+    local unit="$1" seconds="$2" i
+    for ((i = 0; i < seconds; i++)); do
+        systemctl is-active --quiet "$unit" && return 0
+        sleep 1
+    done
+    systemctl is-active --quiet "$unit"
+}
+
+stage_config() {
+    local mode owner group path feature code
+    local entries=() removes=()
+    while read -r mode owner group path; do
+        [[ -n "${mode:-}" ]] || continue
+        [[ "$path" == /* ]] || { warn "Путь не абсолютный: $path"; return 1; }
+        entries+=("$mode $owner $group $path")
+    done < <(read_list "$OP/files.list")
+    while IFS= read -r path; do
+        [[ "$path" == /* ]] || { warn "Путь не абсолютный: $path"; return 1; }
+        removes+=("$path")
+    done < <(read_list "$OP/remove.list")
+
+    TX_OPEN=true
+    for path in "${entries[@]}"; do
+        read -r mode owner group path <<<"$path"
+        tx_backup "$path" || return 1
+    done
+    for path in "${removes[@]}"; do
+        tx_backup "$path" || return 1
+    done
+
+    for path in "${entries[@]}"; do
+        read -r mode owner group path <<<"$path"
+        install_file "$mode" "$owner" "$group" "$path" || return 1
+    done
+    for path in "${removes[@]}"; do
+        rm -rf -- "$R$path" || return 1
+    done
+
+    sysctl --system >/dev/null || return 1
+    "$R$MIHOMO_BIN_REL" -t -d "$R/etc/mihomo" -f "$R/etc/mihomo/config.yaml" || return 1
+    if [[ "$NGINX" == true ]]; then
+        nginx -t || return 1
+    fi
+    systemctl daemon-reload || return 1
+    systemctl enable mihomo || return 1
+    systemctl restart mihomo || return 1
+    wait_active mihomo 15 || { warn "mihomo не запустился."; return 1; }
+    if [[ "$NGINX" == true ]]; then
+        systemctl restart nginx || return 1
+    elif tx_touches_nginx && command -v nginx >/dev/null 2>&1; then
+        { nginx -t && systemctl reload nginx; } || return 1
+    fi
+    if [[ "$SITE_REQUIRE_200" == true ]]; then
+        code=$(curl -sk -o /dev/null -w '%{http_code}' https://127.0.0.1:8443 -H "Host: $SITE_NAME")
+        [[ "$code" == 200 ]] || { warn "Сайт-заглушка ответил $code."; return 1; }
+    fi
+    for feature in $FEATURES; do
+        feature_hook "$feature" activate || return 1
+    done
+    TX_OPEN=false
+}
+
+stage_teardown_config() {
+    local path removes=() sysctl_removed=false
+    while IFS= read -r path; do
+        [[ "$path" == /* ]] || { warn "Путь не абсолютный: $path"; return 1; }
+        removes+=("$path")
+    done < <(read_list "$OP/remove.list")
+
+    TX_OPEN=true
+    for path in "${removes[@]}" "$MIHOMO_BIN_REL"; do
+        tx_backup "$path" || return 1
+    done
+    for path in "${removes[@]}"; do
+        [[ "$path" == /etc/sysctl.d/99-vpn-speedup.conf ]] && sysctl_removed=true
+        rm -rf -- "$R$path" || return 1
+    done
+    systemctl disable --now mihomo || return 1
+    rm -f -- "$R$MIHOMO_BIN_REL" || return 1
+    systemctl daemon-reload || return 1
+    if command -v nginx >/dev/null 2>&1; then
+        { nginx -t && systemctl reload nginx; } || return 1
+    fi
+    if [[ "$sysctl_removed" == true ]]; then
+        sysctl -w net.ipv6.conf.all.disable_ipv6=0 net.ipv6.conf.default.disable_ipv6=0 \
+            net.ipv6.conf.lo.disable_ipv6=0 >/dev/null || return 1
+        sysctl --system >/dev/null || return 1
+    fi
+    TX_OPEN=false
+}
+
+# ─── firewall ───────────────────────────────────────────────────────────────
+# stage_firewall "<правила>" — учёт своих правил в $NODE_DIR/ufw-rules.
+stage_firewall() {
+    local wanted=" $1 " ledger="$NODE_DIR/ufw-rules" rule kept=()
+    local -A have=()
+    if [[ -f "$ledger" ]]; then
+        while IFS= read -r rule; do
+            [[ -n "$rule" ]] && have["$rule"]=1
+        done <"$ledger"
+    fi
+    for rule in $1; do
+        if [[ -z "${have[$rule]:-}" ]]; then
+            ufw allow "$rule" || return 1
+        fi
+        kept+=("$rule")
+    done
+    for rule in "${!have[@]}"; do
+        [[ "$wanted" == *" $rule "* ]] && continue
+        ufw delete allow "$rule" || return 1
+    done
+    if ((${#kept[@]})); then
+        printf '%s\n' "${kept[@]}" >"$ledger.tmp" || return 1
+    else
+        : >"$ledger.tmp" || return 1
+    fi
+    mv -f -- "$ledger.tmp" "$ledger"
+}
+
+# ─── cleanup ────────────────────────────────────────────────────────────────
+stage_cleanup() {
+    local feature entry name webroot dir self
+    for feature in $REMOVE_FEATURES; do
+        feature_hook "$feature" remove || return 1
+    done
+    for entry in $RELEASE_CERTS; do
+        name="${entry%%:*}"
+        webroot="${entry#*:}"
+        release_cert "$name" "$R$webroot" "$R/etc/nginx/ssl" \
+            "$R/etc/nginx/sites-available" "$R/etc/nginx/sites-enabled" "$R/etc/nginx/nginx.conf" || return 1
+        rm -rf -- "$R$webroot"
+    done
+    if [[ "$HY2_CERT" != true ]]; then
+        rm -rf -- "$R/etc/mihomo/certs/hy2"
+    fi
+    if [[ "$WARP" == false ]]; then
+        rm -rf -- "$R/root/wgcf"
+    fi
+    if [[ -d "$NODE_DIR/ops" ]]; then
+        while IFS= read -r dir; do
+            [[ "$(cd "$dir" && pwd -P)" == "$OP" ]] && continue
+            rm -rf -- "$dir"
+        done < <(ls -1dt "$NODE_DIR/ops"/*/ 2>/dev/null | tail -n +6)
+    fi
+    if [[ -d "$NODE_DIR/agent" ]]; then
+        for dir in "$NODE_DIR/agent"/*/; do
+            [[ -d "$dir" ]] || continue
+            self="$(cd "$dir" && pwd -P)"
+            [[ "$self" == "$AGENT_DIR" ]] && continue
+            rm -rf -- "$self"
+        done
+    fi
+}

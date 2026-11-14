@@ -49,7 +49,7 @@ impl ServerBundle {
     }
 }
 
-fn extract_tree(directory: &Dir<'_>, root: &Path) -> io::Result<()> {
+pub(crate) fn extract_tree(directory: &Dir<'_>, root: &Path) -> io::Result<()> {
     fs::create_dir_all(root.join(directory.path()))?;
     for file in directory.files() {
         write_file(&root.join(file.path()), file.contents())?;
@@ -60,7 +60,7 @@ fn extract_tree(directory: &Dir<'_>, root: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn write_file(path: &Path, contents: &[u8]) -> io::Result<()> {
+pub(crate) fn write_file(path: &Path, contents: &[u8]) -> io::Result<()> {
     fs::write(path, contents)?;
     #[cfg(unix)]
     if path.extension().is_some_and(|extension| extension == "sh") {

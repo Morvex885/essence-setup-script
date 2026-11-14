@@ -346,7 +346,6 @@ pub fn nodes(session: &mut Session, invocation: &Invocation) -> Result<Value> {
 
 struct SetGroupPlan {
     lines: Vec<String>,
-    affected: Vec<String>,
     awg_drop: Vec<String>,
     old_dir: PathBuf,
     published: bool,
@@ -413,9 +412,9 @@ fn set_group_plan(session: &Session, config: &Config, name: &str, group: &str) -
         lines.push(format!("Клиент AmneziaWG «{name}» будет удалён на нодах: {}", awg_drop.join(", ")));
     }
     if !affected.is_empty() {
-        lines.push("Служба mihomo на затронутых нодах может быть перезапущена.".into());
+        lines.push("Пользователи на затронутых нодах обновит node apply.".into());
     }
-    Ok(SetGroupPlan { lines, affected, awg_drop, old_dir, published })
+    Ok(SetGroupPlan { lines, awg_drop, old_dir, published })
 }
 
 /// Effective subscription header differences (default → group → client)
@@ -454,7 +453,7 @@ pub async fn set_group<T: RemoteTransport>(session: &mut Session, invocation: &I
     session.log(Level::Success, &format!("{name}: группа — {group}"));
 
     let mut failed = false;
-    let generated = match generate::regenerate_group(session, &group, &plan.affected, connect).await {
+    let generated = match generate::regenerate_group(session, &group) {
         Ok(report) => {
             if !report.complete() {
                 session.log(Level::Warn, "Генерация завершена с ошибками.");
@@ -554,7 +553,7 @@ fn delete_plan(config: &Config, scan: &DeleteScan) -> Vec<String> {
         "Локальные записи и сгенерированные конфиги будут удалены.".into(),
         "Подписки будут отозваны.".into(),
         "Клиенты AmneziaWG будут удалены; доступ в mihomo будет убран.".into(),
-        "Служба mihomo на затронутых нодах будет перезапущена.".into(),
+        "Пользователи на затронутых нодах обновит node apply.".into(),
     ]);
     lines
 }
@@ -629,9 +628,6 @@ pub async fn delete<T: RemoteTransport>(session: &mut Session, invocation: &Invo
             session.log(Level::Warn, &format!("Не удалось удалить каталог конфигов: {}", dir.display()));
             failed = true;
         }
-    }
-    if !generate::sync_listeners(session, &scan.affected, connect).await.is_empty() {
-        failed = true;
     }
     if failed {
         return Err(delete_outcome(RcError::new("partial", "Локальные клиенты удалены, но очистка завершена не полностью."),
@@ -902,7 +898,7 @@ mod tests {
             "Клиент: my-router", "Группа: ROUTER → PC", "Ноды клиента: ru-vps → de-vps", "Затронутые ноды:",
             " ru-vps  5.6.7.8:2222", " de-vps  1.2.3.4:22", "Старый каталог конфигов (удаляется после генерации нового):",
             format!(" {}", generated.join("ROUTER").join("my-router").display()),
-            "Служба mihomo на затронутых нодах может быть перезапущена.",
+            "Пользователи на затронутых нодах обновит node apply.",
         ]));
         for (argv, code) in [
             (&["client", "set-group", "--name", "my-router", "--group", "ROUTER"][..], "invalid"),
@@ -966,7 +962,7 @@ mod tests {
             "Клиенты AmneziaWG (my-router, my-pc) удаляются на нодах:", " ru-vps",
             "Подписки: my-router", "Хост подписок: de-vps",
             "Локальные записи и сгенерированные конфиги будут удалены.", "Подписки будут отозваны.",
-            "Клиенты AmneziaWG будут удалены; доступ в mihomo будет убран.", "Служба mihomo на затронутых нодах будет перезапущена.",
+            "Клиенты AmneziaWG будут удалены; доступ в mihomo будет убран.", "Пользователи на затронутых нодах обновит node apply.",
         ]));
         assert!(!serde_json::to_string(&error.extra).unwrap().contains(&"a".repeat(64)));
         assert_eq!(run(&mut session, &["client", "delete", "--name", ""], &no_ssh).await.unwrap_err().code, "usage");

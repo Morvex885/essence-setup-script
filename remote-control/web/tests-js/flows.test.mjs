@@ -319,3 +319,41 @@ test('retryable: сбой без изменений — да; успех, отк
     assert.equal(retryable(reply), false, JSON.stringify(reply));
   }
 });
+
+test('handleNodeCodes domain_required: домен для ноды из extra name, node domain и повтор', async () => {
+  const engine = scripted([
+    { argv: ['node', 'apply', '--pending'], reply: { ok: false, error: { code: 'domain_required', name: 'de' } } },
+    { argv: ['node', 'domain', '--name', 'de', '--domain', 'de.example.com'], reply: ok() },
+    { argv: ['node', 'apply', '--pending'], reply: ok() },
+  ]);
+  const asked = [];
+  const result = await nodeRequest('', ['node', 'apply', '--pending'], null, {
+    request: engine.request, confirm: async () => true, askSecret: async () => null,
+    ask: async (props) => { asked.push(props); return ' de.example.com '; },
+  });
+  assert.equal(result.ok, true);
+  assert.equal(asked.length, 1);
+  engine.assertDone();
+  // Отказ от ввода — без повтора.
+  const refused = scripted([{ argv: ['x'], reply: { ok: false, error: { code: 'domain_required', name: 'de' } } }]);
+  const again = await nodeRequest('de', ['x'], null, { request: refused.request, confirm: async () => true, ask: async () => null });
+  assert.equal(again.error.code, 'domain_required');
+  refused.assertDone();
+});
+
+test('nodeRequest под планом: expect и operation — expect у обоих запросов, operation только у подтверждённого', async () => {
+  const words = ['node', 'apply', '--name', 'de'];
+  const sent = [];
+  const replies = [plan('confirmation_required', 't'), { ok: false, error: { code: 'partial', failed: [] } }];
+  const notices = [];
+  const result = await nodeRequest('de', words, { title: 'T', question: 'Q?' }, {
+    request: async (argv, options) => { sent.push([argv, options]); return replies.shift(); },
+    confirm: async () => true, notify: (level, text) => notices.push([level, text]),
+  }, { expect: ['partial'], operation: 'Применение' });
+  assert.equal(result.error.code, 'partial');
+  assert.deepEqual(sent[0][1].expect, ['partial']);
+  assert.equal(sent[0][1].operation, undefined);
+  assert.deepEqual(sent[1][0], [...words, '--yes', '--plan-token', 't']);
+  assert.equal(sent[1][1].operation, 'Применение');
+  assert.deepEqual(notices, []);
+});

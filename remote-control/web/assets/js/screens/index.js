@@ -4,6 +4,7 @@
 // либо `null`. Неизвестный маршрут — сводка.
 import { SummaryScreen } from './summary.js';
 import { NodesScreen } from './nodes.js';
+import { ProfilesScreen } from './profiles.js';
 import { ClientsScreen } from './clients.js';
 import { GroupsScreen } from './groups.js';
 import { TemplatesScreen } from './templates.js';
@@ -16,6 +17,7 @@ import { JournalScreen } from './journal.js';
 export const SCREENS = {
   summary: SummaryScreen,
   nodes: NodesScreen,
+  profiles: ProfilesScreen,
   clients: ClientsScreen,
   groups: GroupsScreen,
   templates: TemplatesScreen,

@@ -27,8 +27,7 @@ use crate::transport::{RemoteSession, RemoteTransport};
 
 use super::add::transaction_files;
 use super::setup::{self, FileBackup};
-use super::scripts::{REMOTE_DIR, ensure_current};
-use super::{COMMAND_TIMEOUT, LONG_TIMEOUT, connect, connect_options, find, is_github, pin, pins, require_portable,
+use super::{COMMAND_TIMEOUT, connect, connect_options, find, is_github, pin, pins, require_portable,
     required, set_issue, sh_quote};
 
 /// v1 `_node_delete_scope_label`.
@@ -62,21 +61,11 @@ fn plan(config: &Config, node: &Node, server: bool, revoke: bool) -> Vec<String>
         format!("Затронутые клиенты: {}", if affected.is_empty() { "нет".to_owned() } else { affected.join(" ") }),
     ];
     if server {
-        lines.extend([
-            "Mihomo: бинарь, служба, конфигурация и клиентские записи.",
-            "AmneziaWG: служба, конфигурация, ключи и все клиенты.",
-            "WARP: /root/wgcf и профиль.",
-            "Сайты nginx Essence, webroot и /etc/nginx/ssl целиком.",
-            "Хостинг подписок, Telegram Proxy и acme.sh.",
-            "/etc/sysctl.d/99-vpn-speedup.conf; IPv6 будет восстановлен.",
-            "Пакеты nginx и AmneziaWG не удаляются.",
-            "Правила UFW будут сброшены. Настройки SSH сохранятся.",
-        ].map(str::to_owned));
-        lines.push(if node.port == 22 {
-            "UFW будет отключён.".to_owned()
-        } else {
-            format!("UFW останется включён: открыт только SSH TCP/{}.", node.port)
-        });
+        match node.applied {
+            Some(_) => lines.extend(crate::server::render::teardown(node).lines.into_iter().skip(1)),
+            None => lines.push("Essence на ноду не применялся: сервер не изменится.".to_owned()),
+        }
+        lines.push("Пакеты, acme.sh и UFW остаются; SSH-доступ сохранится.".to_owned());
     }
     if config.subscription_host.as_ref().is_some_and(|host| host.node == node.name) {
         lines.push("Хостинг подписок размещён на этой ноде: его настройка (subscription_host) будет удалена.".to_owned());
@@ -105,10 +94,6 @@ else exit 1; fi"#, sh_quote(public))
 /// `setup::revoke_command`, succeeding only once the exact line is gone.
 fn key_revoke_command(public: &str) -> String {
     format!("{} && {{ grep -qxF -e {} ~/.ssh/authorized_keys; [ \"$?\" -eq 1 ]; }}", setup::revoke_command(public), sh_quote(public))
-}
-
-fn uninstall_command() -> String {
-    format!("bash {} uninstall --force", sh_quote(&format!("{REMOTE_DIR}/setup-essence.sh")))
 }
 
 async fn run<S: RemoteSession>(session: &S, command: &str, timeout: std::time::Duration) -> Option<String> {
@@ -247,36 +232,36 @@ pub async fn delete<T: RemoteTransport>(session: &mut Session, invocation: &Invo
             _ => error,
         })?;
         if server {
-            ensure_current(&*transport, name, false).await
-                .map_err(|error| remote_failed(SERVER_NOT_REMOVED).with_extra("cause", error.message))?;
+            if node.applied.is_some() {
+                session.log(Level::Info, &format!("Удаляем компоненты Essence на ноде «{name}»..."));
+                crate::server::apply::teardown(session, &node, transport).await
+                    .map_err(|error| remote_failed(SERVER_NOT_REMOVED).with_extra("cause", error.message))?;
+                remote_removed = true;
+            } else {
+                session.log(Level::Info, &format!("Essence на ноду «{name}» не применялся — сервер не изменится."));
+            }
         }
         let held = transport.hold().map_err(|_| remote_failed(NO_RECOVERY_LEASE))?;
         if let Some(public) = public.as_deref() {
+            let kept = |error: RcError| if remote_removed {
+                with_outcome(RcError::new("partial", format!("Компоненты на сервере удалены. {}", error.message)), name, scope, false, true)
+                    .with_extra("key_restored", error.extra.get("key_restored").cloned().unwrap_or(Value::Null))
+            } else {
+                error
+            };
             match run(&*transport, &key_probe_command(public), COMMAND_TIMEOUT).await.as_deref() {
                 Some("present") => {
                     // Marked before sending: a lost reply may follow a successful revocation.
                     revoked = true;
                     if run(&*transport, &key_revoke_command(public), COMMAND_TIMEOUT).await.is_none() {
                         let restored = restore_key(session, transport, &held, &node, public).await;
-                        return Err(remote_failed("SSH-ключ не отозван. Нода сохранена в remote-control.")
-                            .with_extra("key_restored", restored));
+                        return Err(kept(remote_failed("SSH-ключ не отозван. Нода сохранена в remote-control.")
+                            .with_extra("key_restored", restored)));
                     }
                 }
                 Some("absent") => {}
-                _ => return Err(remote_failed("Не удалось проверить SSH-ключ. Нода сохранена в remote-control.")),
+                _ => return Err(kept(remote_failed("Не удалось проверить SSH-ключ. Нода сохранена в remote-control."))),
             }
-        }
-        if server {
-            session.log(Level::Info, &format!("Удаляем компоненты Essence на ноде «{name}»..."));
-            if run(&*transport, &uninstall_command(), LONG_TIMEOUT).await.is_none() {
-                let mut error = remote_failed(SERVER_NOT_REMOVED);
-                if revoked {
-                    let restored = restore_key(session, transport, &held, &node, public.as_deref().unwrap_or_default()).await;
-                    error = error.with_extra("key_restored", restored);
-                }
-                return Err(error);
-            }
-            remote_removed = true;
         }
         lease = Some(held);
     }
@@ -324,11 +309,11 @@ pub async fn delete<T: RemoteTransport>(session: &mut Session, invocation: &Invo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fake_transport::{AuthMethod, ConnectExpectation, FakeTransport, Operation, ScriptStep};
+    use crate::fake_transport::{AuthMethod, ConnectExpectation, FakeTransport, ScriptStep};
     use crate::github::{SyncStatus, Storage, Target, commands::GithubSession};
     use crate::model::{Auth, CascadeListener, Client, Connection, ConnectionGroup, ExitProxy, Fingerprint, NodeExit,
         SubscriptionHost, TelegramProxy, UriExit};
-    use crate::nodes::{CONNECT_TIMEOUT, scripts, testing};
+    use crate::nodes::{CONNECT_TIMEOUT, testing};
     use crate::transport::{ExecResult, HostKeyPolicy};
 
     const ID: &str = "0123456789abcdef0123456789abcdef";
@@ -384,10 +369,6 @@ mod tests {
         ]
     }
 
-    fn position(journal: &[Operation], wanted: &Operation) -> usize {
-        journal.iter().position(|operation| operation == wanted).expect("operation journaled")
-    }
-
     #[tokio::test]
     async fn unconfirmed_delete_changes_nothing_and_contacts_nobody() {
         let root = tempfile::tempdir().unwrap();
@@ -407,7 +388,8 @@ mod tests {
         assert_eq!(plan[0], "Нода: de  198.51.100.7:22");
         assert_eq!(plan[2], format!("Объём: {}", scope_label(true, false)));
         assert_eq!(plan[3], "Затронутые клиенты: alice");
-        assert_eq!(plan[plan.len() - 2], "UFW будет отключён.");
+        assert_eq!(plan[plan.len() - 3], "Essence на ноду не применялся: сервер не изменится.");
+        assert_eq!(plan[plan.len() - 2], "Пакеты, acme.sh и UFW остаются; SSH-доступ сохранится.");
         assert_eq!(plan[plan.len() - 1], "SSH-ключ на ноде сохранится.");
         assert!(transport.journal().is_empty());
         assert_eq!(testing::fingerprint(root.path()), before);
@@ -473,31 +455,59 @@ mod tests {
         assert!(transport.journal().is_empty());
     }
 
-    #[tokio::test]
-    async fn server_failure_after_revoke_restores_the_key_through_the_held_session() {
+    /// A local session with an applied key node (system key) and its pin.
+    fn applied_session(root: &std::path::Path) -> Session {
+        let (session, _journal) = testing::session(root);
+        let mut de = node("de", ID, Auth::Key);
+        de.identity = Some("system".into());
+        de.applied = Some(crate::model::Applied { digest: "d".into(),
+            files: [("/etc/mihomo/config.yaml".to_owned(), "h".to_owned())].into(), ports: vec!["443/tcp".into()], at: "t".into() });
+        session.state.save_config(&Config { nodes: vec![de], ..Config::default() }).unwrap();
+        pin(&session.state, "198.51.100.7", 22, vec![fp()]).unwrap();
+        session
+    }
+
+    fn teardown_steps(result: &str) -> Vec<ScriptStep> {
+        use crate::server::apply::{agent_reset_command, start_command, status_command};
+        let node = Node { applied: None, ..node("de", ID, Auth::Key) };
+        let op = "ab".repeat(16);
+        vec![
+            ScriptStep::connect(ConnectExpectation::new("198.51.100.7", 22, "root", AuthMethod::System, CONNECT_TIMEOUT)
+                .with_host_key(HostKeyPolicy { expected: None, known: vec![fp()] }), Ok(())),
+            ScriptStep::exec(crate::server::apply::probe_command(&node), 0, COMMAND_TIMEOUT, ok("os=debian\nsystemd=yes\n", 0)),
+            ScriptStep::exec(agent_reset_command(), 0, COMMAND_TIMEOUT, ok("", 0)),
+            ScriptStep::upload_any_local(crate::server::bundle::agent_dir(), crate::nodes::LONG_TIMEOUT, Ok(())),
+            ScriptStep::upload_any_local(format!("/root/essence-node/ops/{op}"), crate::nodes::LONG_TIMEOUT, Ok(())),
+            ScriptStep::exec(start_command(&op), 0, COMMAND_TIMEOUT, ok("", 0)),
+            ScriptStep::exec(status_command(&op), 0, COMMAND_TIMEOUT, ok(result, 0)),
+        ]
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn server_scope_tears_the_node_down_through_the_executor() {
         let root = tempfile::tempdir().unwrap();
-        let mut session = github_session(root.path());
-        let before = testing::fingerprint(root.path());
-        let local = scripts::local_version().unwrap();
-        let mut steps = vec![
-            key_connect(),
-            ScriptStep::exec(scripts::probe_command(), 0, COMMAND_TIMEOUT, ok(&format!("PRESENT\n{local}\n"), 0)),
-            ScriptStep::exec(key_probe_command(PUBLIC), 0, COMMAND_TIMEOUT, ok("present", 0)),
-            ScriptStep::exec(key_revoke_command(PUBLIC), 0, COMMAND_TIMEOUT, ok("", 0)),
-            ScriptStep::exec(uninstall_command(), 0, LONG_TIMEOUT, ok("", 1)),
-        ];
-        steps.extend(restore_steps());
+        let mut session = applied_session(root.path());
+        let invocation = testing::invocation(&["node", "delete", "--name", "de", "--scope", "server"]);
+        let plan = delete(&mut session, &invocation, &mut FakeTransport::new([])).await.unwrap_err().extra["plan"].clone();
+        assert!(plan.as_array().unwrap().contains(&json!("Будет удалено: /etc/mihomo/config.yaml")), "{plan}");
+
+        crate::server::apply::tests::NEXT_OP_ID.with(|next| *next.borrow_mut() = Some("ab".repeat(16)));
+        let mut steps = teardown_steps("stage=config\nresult=rolled_back\nerror=config\n");
+        steps.push(ScriptStep::exec(crate::server::apply::log_command(&"ab".repeat(16)), 0, COMMAND_TIMEOUT, ok("", 0)));
         let mut transport = FakeTransport::new(steps);
-        let error = delete(&mut session,
-            &testing::invocation(&["node", "delete", "--name", "de", "--scope", "server", "--revoke-key", "--yes"]), &mut transport)
-            .await.unwrap_err();
+        let argv = testing::invocation(&["node", "delete", "--name", "de", "--scope", "server", "--yes"]);
+        let error = delete(&mut session, &argv, &mut transport).await.unwrap_err();
         transport.assert_finished();
         assert_eq!((error.code, error.message.as_str()), ("remote_failed", SERVER_NOT_REMOVED));
-        assert_eq!(error.extra["key_restored"], json!(true));
-        let journal = transport.journal();
-        let restore = Operation::Exec { command: setup::install_command(PUBLIC), stdin_len: 0, timeout: COMMAND_TIMEOUT };
-        assert!(position(&journal, &Operation::Hold) < position(&journal, &restore));
-        assert_eq!(testing::fingerprint(root.path()), before, "node kept byte-identical");
+        let kept = session.state.load_config().unwrap();
+        assert!(kept.nodes[0].applied.is_some() && kept.nodes[0].operation.is_none());
+
+        crate::server::apply::tests::NEXT_OP_ID.with(|next| *next.borrow_mut() = Some("ab".repeat(16)));
+        let mut transport = FakeTransport::new(teardown_steps("stage=cleanup\nresult=committed\n"));
+        let data = delete(&mut session, &argv, &mut transport).await.unwrap();
+        transport.assert_finished();
+        assert_eq!(data, json!({"name": "de", "scope": "server"}));
+        assert!(session.state.load_config().unwrap().nodes.is_empty());
     }
 
     #[tokio::test]

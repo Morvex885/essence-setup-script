@@ -583,7 +583,7 @@ fn check_ports(tcp: &[(&str, u16)], udp: &[(&str, u16)]) -> Result<()> {
             if port == 0 {
                 return Err(invalid("Порт должен быть от 1 до 65535."));
             }
-            if crate::server::RESERVED_PORTS.contains(&port) {
+            if crate::server::render::RESERVED_PORTS.contains(&port) {
                 return Err(RcError::new("invalid", format!("Порт {port} зарезервирован для внутренних служб.")));
             }
             if !seen.insert(port) {

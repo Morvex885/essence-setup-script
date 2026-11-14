@@ -70,9 +70,11 @@ fn present(ctx: &mut Context<'_>, view: &View) -> io::Result<()> {
         }
     }
 }
+/// A command of an action; a failure warns. After a change of clients or
+/// connections nodes may wait for `node apply` — the shared offer follows.
 fn execute(ctx: &mut Context<'_>, words: &[&str]) -> io::Result<Reply> {
     let reply = ctx.call(words)?;
-    if !reply.ok { ctx.failed(); }
+    if !reply.ok { ctx.failed(); } else if crate::nodes::offers_apply(words) { crate::nodes::offer_apply(ctx)?; }
     Ok(reply)
 }
 fn confirmed(ctx: &mut Context<'_>, title: &str, question: &str, words: &[&str]) -> io::Result<Reply> {
@@ -81,6 +83,7 @@ fn confirmed(ctx: &mut Context<'_>, title: &str, question: &str, words: &[&str])
 fn confirmed_with(ctx: &mut Context<'_>, title: &str, question: &str, words: &[&str], input: &Input) -> io::Result<Reply> {
     let reply = run_confirmed_with(ctx, title, question, &argv(words), &Secrets::default(), input)?;
     if !reply.ok && !matches!(reply.code(), "confirmation_required" | "plan_changed") { ctx.failed(); }
+    if reply.ok && crate::nodes::offers_apply(words) { crate::nodes::offer_apply(ctx)?; }
     Ok(reply)
 }
 /// One-shot read inside an action: a failure warns and ends the action.
@@ -169,8 +172,12 @@ fn generate(ctx: &mut Context<'_>, scope: &[&str]) -> io::Result<()> {
     let reply = ctx.call(&words)?;
     let data = if reply.ok { &reply.data } else if reply.code() == "partial" { &reply.error } else { ctx.failed(); return Ok(()); };
     summary(ctx, "Итог генерации", data,
-        &[("ok", "Готово"), ("skipped", "Пропущено"), ("failed", "Ошибки"), ("nodes_failed", "Ноды с ошибкой"), ("dir", "Каталог")],
-        "Нет результатов")
+        &[("ok", "Готово"), ("skipped", "Пропущено"), ("failed", "Ошибки"), ("nodes_failed", "Ноды с ошибкой"),
+          ("nodes_pending", "Ноды с неприменёнными изменениями"), ("dir", "Каталог")],
+        "Нет результатов")?;
+    // Nodes with changes not applied yet — the same offer to apply.
+    if !strings(&data["nodes_pending"]).is_empty() { crate::nodes::offer_apply(ctx)?; }
+    Ok(())
 }
 
 // ─── Clients ─────────────────────────────────────────────────────────────────
@@ -979,6 +986,8 @@ mod tests {
     type Step = (Vec<String>, Reply);
     fn ok(words: &[&str], data: Value) -> Step { (argv(words), Reply::success(data)) }
     fn step(words: &[&str], reply: Reply) -> Step { (argv(words), reply) }
+    /// The apply offer reads `node list` after a change; no pending node — no question.
+    fn listed() -> Step { ok(&["node", "list"], json!([])) }
     fn yes(words: &[&str], data: Value) -> Step {
         let mut confirmed = argv(words);
         confirmed.extend(argv(&["--yes", "--plan-token", "T"]));
@@ -1046,7 +1055,7 @@ mod tests {
         for key in ["A", "a"] {
             let (_, ui) = drive(vec![
                 ok(&["client", "list"], json!([])), ok(&["group", "list"], group_list()),
-                ok(&["client", "add", "--name", "new", "--group", "PC"], json!({"name":"new","group":"PC"})),
+                ok(&["client", "add", "--name", "new", "--group", "PC"], json!({"name":"new","group":"PC"})), listed(),
                 ok(&["client", "list"], json!([])),
             ], &[key, "new", "1", "0"], clients);
             let list = &ui.views[0];
@@ -1082,7 +1091,7 @@ mod tests {
         let words = ["client", "delete", "--name", "alice", "--name", "bob"];
         for consent in ["", "n", "N", "y", "Y"] {
             let mut steps = vec![ok(&["client", "list"], data.clone()), step(&words, plan())];
-            if consent.eq_ignore_ascii_case("y") { steps.push(yes(&words, json!({"deleted":["alice","bob"]}))); }
+            if consent.eq_ignore_ascii_case("y") { steps.extend([yes(&words, json!({"deleted":["alice","bob"]})), listed()]); }
             steps.push(ok(&["client", "list"], data.clone()));
             let (_, ui) = drive(steps, &["d", "1", "2", "", consent, "0"], clients);
             let reviews: Vec<_> = ui.views.iter().filter(|v| v.prompt.contains("(y/N)")).collect();
@@ -1124,7 +1133,7 @@ mod tests {
         drive(vec![
             ok(&["client", "list"], alice(true)), ok(&["group", "list"], group_list()),
             step(&["client", "set-group", "--name", "alice", "--group", "PC"], plan()),
-            yes(&["client", "set-group", "--name", "alice", "--group", "PC"], json!({"name":"alice","group":"PC"})),
+            yes(&["client", "set-group", "--name", "alice", "--group", "PC"], json!({"name":"alice","group":"PC"})), listed(),
             ok(&["client", "list"], alice(true)),
             step(&["client", "rename", "--name", "alice", "--new-name", "requested"], fail("partial", json!({"name":"alice.2","nodes":["de"]}))),
             ok(&["client", "list"], renamed),
@@ -1155,9 +1164,9 @@ mod tests {
     fn client_nodes_mirror_current_nodes_and_returning_to_group_is_confirmed() {
         let (core, ui) = drive(vec![
             ok(&["node", "list"], nodes()),
-            ok(&["client", "nodes", "--name", "alice", "--node", "de", "--node", "ru"], json!({})),
+            ok(&["client", "nodes", "--name", "alice", "--node", "de", "--node", "ru"], json!({})), listed(),
             step(&["client", "nodes", "--name", "alice", "--inherit"], plan()),
-            yes(&["client", "nodes", "--name", "alice", "--inherit"], json!({})),
+            yes(&["client", "nodes", "--name", "alice", "--inherit"], json!({})), listed(),
             step(&["client", "nodes", "--name", "alice", "--inherit"], plan()),
         ], &["1", "2", "", "2", "y", "2", "n", "2", "0"], |ctx| {
             client_nodes(ctx, "alice", false, &["de".into()])?;
@@ -1169,7 +1178,7 @@ mod tests {
         assert_eq!(toggle.sections[0][0].label, "[x] de  127.0.0.1:22");
         assert_eq!(toggle.sections[0][1].label, "[ ] ru  10.0.0.2:2222");
         assert_eq!(notices(&ui, "Неверный выбор."), 1);
-        assert_eq!(core.calls.len(), 5);
+        assert_eq!(core.calls.len(), 7);
     }
     #[test]
     fn client_connections_discover_by_node_name_and_reset_needs_consent() {
@@ -1177,7 +1186,7 @@ mod tests {
             ok(&["node", "list"], nodes()),
             ok(&["client", "connections", "--name", "alice"], json!([{"node":"de","mode":"own","proxies":["p1"]}])),
             ok(&["conn", "list", "--name", "de", "--discover"], json!([{"node":"de","groups":[],"discovered":["p1","p2"]}])),
-            ok(&["client", "connections", "--name", "alice", "--node", "de", "--proxy", "p1", "--proxy", "p2"], json!({})),
+            ok(&["client", "connections", "--name", "alice", "--node", "de", "--proxy", "p1", "--proxy", "p2"], json!({})), listed(),
             ok(&["node", "list"], nodes()),
             step(&["client", "connections", "--name", "alice", "--node", "de", "--reset"], plan()),
         ], &["1", "1", "2", "", "1", "2", "n"], |ctx| {
@@ -1199,7 +1208,7 @@ mod tests {
             ok(&["node", "list"], nodes()),
             ok(&["client", "connections", "--name", "alice"], json!([{"node":"de","mode":"own","proxies":["p1","awg-alice","gone"]}])),
             ok(&["conn", "list", "--name", "de", "--discover"], json!([{"node":"de","groups":[],"discovered":["AWG","p1"]}])),
-            ok(&["client", "connections", "--name", "alice", "--node", "de", "--proxy", "p1", "--proxy", "awg-alice", "--proxy", "gone"], json!({})),
+            ok(&["client", "connections", "--name", "alice", "--node", "de", "--proxy", "p1", "--proxy", "awg-alice", "--proxy", "gone"], json!({})), listed(),
         ], &["1", "1", ""], |ctx| client_connections(ctx, "alice", &["de".into()]));
         core.assert_finished();
         let toggle = view(&ui, "Подключения клиента на de");
@@ -1372,7 +1381,7 @@ mod tests {
         // proxies too and starts from the group's set.
         let (core, ui) = drive(vec![
             ok(&["node", "list"], nodes.clone()), ok(&discover, found.clone()),
-            ok(&["conn", "set", "--name", "ru", "--assign", "PC=p1", "--assign", "PC=p2"], json!({"node":"ru","changed":[{"group":"PC","proxies":["p1","p2"]}]})),
+            ok(&["conn", "set", "--name", "ru", "--assign", "PC=p1", "--assign", "PC=p2"], json!({"node":"ru","changed":[{"group":"PC","proxies":["p1","p2"]}]})), listed(),
         ], &["2", "2", "3", ""], |ctx| group_connections(ctx, "PC"));
         core.assert_finished();
         let toggle = &ui.views[1];
@@ -1385,12 +1394,38 @@ mod tests {
         assert!(ui.notices.iter().any(|n| n.to_string().contains("Изменений нет")));
         // Clearing the set removes the group's assignment on the node.
         let (core, _) = drive(vec![ok(&["node", "list"], json!([nodes[1].clone()])), ok(&discover, found),
-            ok(&["conn", "set", "--name", "ru", "--assign", "PC="], json!({"node":"ru","changed":[{"group":"PC","proxies":[]}]}))],
+            ok(&["conn", "set", "--name", "ru", "--assign", "PC="], json!({"node":"ru","changed":[{"group":"PC","proxies":[]}]})), listed()],
             &["1", "3", ""], |ctx| group_connections(ctx, "PC"));
         core.assert_finished();
         let (core, ui) = drive(vec![ok(&["node", "list"], json!([]))], &[], |ctx| group_connections(ctx, "PC"));
         core.assert_finished();
         assert!(ui.notices.iter().any(|n| n.to_string().contains("Нет нод")));
+    }
+    /// After a change with pending nodes: «Применить изменения на N нодах?» →
+    /// `node apply --pending` under its plan; refusal applies nothing.
+    /// Generation with `nodes_pending` offers the same.
+    #[test]
+    fn changes_offer_to_apply_pending_nodes() {
+        let pending = json!([{"name":"de","status":"pending"},{"name":"ru","status":"applied"}]);
+        let add = ["client", "add", "--name", "new", "--group", "PC"];
+        let apply = ["node", "apply", "--pending"];
+        let report = json!({"applied":["de"],"failed":[],"unchanged":[]});
+        let (core, ui) = drive(vec![ok(&add, json!({"name":"new"})), ok(&["node", "list"], pending.clone()), step(&apply, plan()), yes(&apply, report)],
+            &["y", "y"], |ctx| execute(ctx, &add).map(|_| ()));
+        assert!(sent(&core, &["node", "apply", "--pending", "--yes", "--plan-token", "T"]));
+        assert_eq!(notices(&ui, "Применено: de"), 1);
+        // Refusal; a read (`client connections --name`) never offers.
+        drive(vec![ok(&add, json!({"name":"new"})), ok(&["node", "list"], pending.clone())], &["n"], |ctx| execute(ctx, &add).map(|_| ()));
+        drive(vec![ok(&["client", "connections", "--name", "c"], json!([]))], &[], |ctx| execute(ctx, &["client", "connections", "--name", "c"]).map(|_| ()));
+        // `partial`: one journal line per failed node with the stage label.
+        let partial = fail("partial", json!({"applied":[],"unchanged":[],"failed":[{"name":"de","stage":"config","reason":"rolled_back"},{"name":"ru","stage":"probe","reason":"port_busy","port":443}]}));
+        let (_, ui) = drive(vec![ok(&add, json!({"name":"new"})), ok(&["node", "list"], pending.clone()), step(&apply, plan()), (yes(&apply, Value::Null).0, partial)],
+            &["y", "y"], |ctx| execute(ctx, &add).map(|_| ()));
+        assert_eq!(notices(&ui, "de: откат на этапе «конфигурация и проверка»"), 1);
+        assert_eq!(notices(&ui, "ru: порт 443 занят"), 1);
+        drive(vec![
+            ok(&["generate", "--all"], json!({"ok":["new"],"nodes_pending":["de"]})), ok(&["node", "list"], pending),
+        ], &["", "n"], |ctx| generate(ctx, &["--all"]));
     }
     #[test]
     fn group_connections_fall_back_to_saved_assignments_and_keep_the_choice_on_failure() {
@@ -1403,7 +1438,7 @@ mod tests {
         let (core, ui) = drive(vec![
             ok(&["node", "list"], node), step(&["conn", "list", "--name", "ru", "--discover"], fail("remote_failed", json!({}))),
             ok(&["conn", "list", "--name", "ru"], saved),
-            step(&unset, fail("locked", json!({}))), ok(&unset, json!({"node":"ru","changed":[{"group":"PC","proxies":[]}]})),
+            step(&unset, fail("locked", json!({}))), ok(&unset, json!({"node":"ru","changed":[{"group":"PC","proxies":[]}]})), listed(),
         ], &["1", "", ""], |ctx| group_connections(ctx, "PC"));
         core.assert_finished();
         assert_eq!(ui.views[0].sections[0][0].label, "[x] p1");

@@ -9,6 +9,7 @@ import { asList, proxyLabel, unlisted } from '../format.js';
 import { refill } from '../form-model.js';
 import { NODE_CODES, retryable } from '../flows.js';
 import { interactive, nodeLabel } from './nodes-model.js';
+import { offerApply } from './apply-model.js';
 
 /** Пустой выбор (`nodes.rs::EMPTY`). */
 export const EMPTY = 'Нет объектов для выбора';
@@ -192,6 +193,7 @@ export async function assignConnections(ctx, name, proxies, assigned, stale = []
     if (changes.length === 0) return;
     const saved = await ctx.request(assignArgv(name, changes));
     if (ctx.isFailure(saved)) ctx.failed();
+    else if (saved.ok) await offerApply(ctx);
     if (!retryable(saved)) return;
     draft = values;
   }

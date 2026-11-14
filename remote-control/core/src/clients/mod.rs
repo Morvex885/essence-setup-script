@@ -30,7 +30,7 @@ pub async fn route<T: RemoteTransport>(noun: &str, verb: &str, invocation: &Invo
     input: &Input, session: &mut Session, connect: &dyn Fn() -> T) -> Result<Value>
 {
     match (noun, verb) {
-        ("generate", _) => generate::generate(session, invocation, connect).await,
+        ("generate", _) => generate::generate(session, invocation),
         ("group", "list") => groups::list(session),
         ("group", "add") => groups::add(session, invocation),
         ("group", "delete") => groups::delete(session, invocation),

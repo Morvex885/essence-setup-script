@@ -62,7 +62,7 @@ pub fn hex(chars: usize) -> Result<String> {
 }
 
 /// Uniform integer in `low..=high` (rejection sampling over a random u32).
-fn uniform(low: u32, high: u32) -> Result<u32> {
+pub(crate) fn uniform(low: u32, high: u32) -> Result<u32> {
     let span = u64::from(high - low) + 1;
     let limit = (1u64 << 32) / span * span;
     loop {

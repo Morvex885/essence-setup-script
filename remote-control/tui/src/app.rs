@@ -27,6 +27,7 @@ pub struct Registry { pub screens: Vec<Registration>, pub github_wizard: Option<
 pub fn registrations() -> Registry {
     Registry { screens: vec![
         Registration { key: 'n', factory: || Box::new(crate::nodes::Nodes) },
+        Registration { key: 'r', factory: || Box::new(crate::nodes::Profiles) },
         Registration { key: 'p', factory: || Box::new(crate::nodes::Connections) },
         Registration { key: 'a', factory: || Box::new(crate::nodes::AmneziaWg) },
         Registration { key: 't', factory: || Box::new(crate::nodes::Telegram) },
@@ -229,7 +230,8 @@ pub fn activity(words: &[String]) -> &'static str {
             "Отправка конфигурации в GitHub…",
         ("source", "github-delete-repo") => "Удаление репозитория GitHub…",
         ("source", verb) if verb.starts_with("github-") => "Обмен данными с GitHub…",
-        ("node" | "conn" | "awg" | "telegram", "list" | "show" | "aliases" | "rename" | "tag") => "Выполняется…",
+        ("node" | "conn" | "awg" | "telegram", "list" | "show" | "aliases" | "rename" | "tag" | "profile" | "domain" | "port") => "Выполняется…",
+        ("node", "apply") => "Применение на нодах…",
         ("node" | "conn" | "awg" | "telegram", _) => "Подключение к серверам…",
         ("subscription", "publish" | "publish-all" | "rotate" | "revoke" | "migrate" | "host") => "Публикация подписок на серверах…",
         ("self", "version" | "update") => "Проверка обновлений…",

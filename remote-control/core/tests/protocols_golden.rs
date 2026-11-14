@@ -206,6 +206,8 @@ fn replay(case: &Case) -> Outcome {
             password: a(3),
             proxy: a(4),
             obfs_password: a(5),
+            certificate: "",
+            private_key: "",
         })),
         ("_build_hy2_client_yaml", _) => ok(hy2::client_yaml(&hy2_endpoint(case))),
         ("_build_hy2_exit_yaml", _) => ok(hy2::exit_yaml(&hy2_endpoint(case))),

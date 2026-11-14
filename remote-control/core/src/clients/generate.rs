@@ -1,13 +1,12 @@
-//! `generate --all | --group G | --client C` (port of `generate.sh`): node
-//! client configs are read over SSH, missing AmneziaWG peers are created,
-//! per-client `config.yaml` files are rendered from the group template into
-//! `<data dir>/generated/<group>/<client>/`, and the listener users of every
-//! touched node are synchronized. Each node is handled over one connection
-//! (peers → config → listener users); rendering itself never touches SSH.
-//! Configs are replaced atomically and only after every proxy was resolved,
-//! so a failed node never leaves a client with a partial config.
+//! `generate --all | --group G | --client C` (port of `generate.sh`): every
+//! node's client proxies are rendered from its profile (`render::client_section`,
+//! no SSH), per-client `config.yaml` files are rendered from the group
+//! template into `<data dir>/generated/<group>/<client>/`. Configs are
+//! replaced atomically and only after every proxy was resolved, so a node
+//! without a usable profile never leaves a client with a partial config.
+//! Server-side listener users follow with `node apply`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -19,78 +18,15 @@ use crate::dispatch::Session;
 use crate::error::{RcError, Result};
 use crate::locking::LockKind;
 use crate::log::Level;
-use crate::model::{Client, Config, Node};
-use crate::nodes::scripts::{self, REMOTE_DIR};
-use crate::nodes::{self, COMMAND_TIMEOUT, LONG_TIMEOUT, required, sh_quote};
-use crate::protocols::listener_users;
+use crate::model::{Client, Config};
+use crate::nodes::required;
 use crate::secure_fs;
 use crate::state::StatePaths;
-use crate::transport::{RemoteSession, RemoteTransport};
 use crate::validation;
-
-/// Node client config plus every AmneziaWG peer's mihomo proxy (v1 prefetch).
-pub const FETCH_COMMAND: &str =
-    "cat /etc/mihomo/client-config.txt 2>/dev/null; cat /etc/mihomo/amnezia/*/mihomo-proxy.yaml 2>/dev/null; true";
 
 /// Display name of a client's AmneziaWG proxy in its config.
 const AWG_DISPLAY: &str = "  - name: \"AmneziaWG 3.1\"";
 const NAME_PREFIX: &str = "  - name:";
-
-/// Node config section header → listener marker of `listener-users.sh`.
-const LISTENER_MARKERS: [(&str, &str); 4] = [
-    ("--- VLESS TCP ---", "vless-tcp"),
-    ("--- VLESS xHTTP ---", "vless-xhttp"),
-    ("--- VLESS gRPC ---", "vless-grpc"),
-    ("--- Hysteria2 ---", "hy2"),
-];
-
-/// Reads `marker count` records and their user lines from stdin, so client
-/// uuids and passwords never enter argv (v1 `_listener_users_remote_cmd`).
-const LISTENER_LOOP: &str = r##"_sync_rc=0
-while IFS=' ' read -r _m _n; do
-    [ -n "$_m" ] || continue
-    case "$_m" in vless-tcp|vless-xhttp|vless-grpc|hy2) ;; *) exit 1 ;; esac
-    case "$_n" in ''|*[!0-9]*) exit 1 ;; esac
-    _u=''
-    while [ "$_n" -gt 0 ]; do
-        IFS= read -r _l || exit 1
-        _u="$_u$_l
-"
-        _n=$((_n - 1))
-    done
-    _u=${_u%?}
-"##;
-
-/// Generation: the first failure stops before mihomo is restarted.
-const STRICT_TAIL: &str = r##"    _sync_listener_users "$_m" "$_u" || exit 1
-done
-systemctl restart mihomo
-"##;
-
-/// Client deletion: markers absent on the node are skipped, failures add up.
-const LENIENT_TAIL: &str = r##"    if grep -q "^# --- $_m ---\$" /etc/mihomo/config.yaml 2>/dev/null; then
-        _sync_listener_users "$_m" "$_u" || _sync_rc=1
-    fi
-done
-if [ -f /etc/mihomo/config.yaml ]; then systemctl restart mihomo || _sync_rc=1; fi
-exit "$_sync_rc"
-"##;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ListenerMode {
-    Strict,
-    Lenient,
-}
-
-fn listener_command(mode: ListenerMode) -> String {
-    let module = sh_quote(&format!("{REMOTE_DIR}/common/listener-users.sh"));
-    let tail = match mode {
-        ListenerMode::Strict => STRICT_TAIL,
-        ListenerMode::Lenient => LENIENT_TAIL,
-    };
-    format!("source {module} || exit 1\n{LISTENER_LOOP}{tail}")
-}
-
 /// v1 `$GENERATED_DIR`: rendered client configs, local to this device.
 pub fn generated_dir(paths: &StatePaths) -> PathBuf {
     paths.root().join("generated")
@@ -184,21 +120,24 @@ pub struct Report {
     pub failed: Vec<String>,
     pub nodes_ok: Vec<String>,
     pub nodes_failed: Vec<String>,
+    /// Nodes whose server state lags behind (`node apply` needed).
+    pub nodes_pending: Vec<String>,
 }
 
 impl Report {
-    fn fields(&self, dir: &Path) -> [(&'static str, Value); 6] {
+    fn fields(&self, dir: &Path) -> [(&'static str, Value); 7] {
         [
             ("ok", json!(self.ok)),
             ("skipped", json!(self.skipped)),
             ("failed", json!(self.failed)),
             ("nodes_ok", json!(self.nodes_ok)),
             ("nodes_failed", json!(self.nodes_failed)),
+            ("nodes_pending", json!(self.nodes_pending)),
             ("dir", json!(dir.to_string_lossy())),
         ]
     }
 
-    /// No client and no node failed (skips are not failures).
+    /// No client and no node failed (skips and pending nodes are not failures).
     pub fn complete(&self) -> bool {
         self.failed.is_empty() && self.nodes_failed.is_empty()
     }
@@ -214,31 +153,17 @@ impl Report {
     }
 }
 
-/// Node configs read during one operation.
+/// Client proxy sections of the nodes of one operation.
 #[derive(Debug, Default)]
 struct Fetched {
     configs: BTreeMap<String, String>,
-    /// Nodes where needed AmneziaWG peers could not be checked or created.
-    awg_failed: BTreeSet<String>,
 }
 
-/// Work done on one node over a single connection.
-#[derive(Debug)]
-struct NodeWork {
-    name: String,
-    /// Clients whose AmneziaWG peer must exist on the node.
-    awg: Vec<String>,
-    sync: bool,
-}
-
-/// What one operation generates and which nodes it touches.
-struct Scope<'a> {
+/// What one operation generates and which nodes it renders.
+struct Scope {
     /// `(group, only this client)` in generation order.
     targets: Vec<(String, Option<String>)>,
-    /// Clients whose AmneziaWG peers are ensured where they need one.
-    awg_clients: Vec<&'a Client>,
-    fetch: Vec<String>,
-    sync: Vec<String>,
+    nodes: Vec<String>,
 }
 
 fn push_unique(list: &mut Vec<String>, items: impl IntoIterator<Item = String>) {
@@ -286,15 +211,17 @@ pub(crate) fn effective_connections(config: &Config, client: &Client, node: &str
     if own.is_empty() { group_connections(config, &client.group, node) } else { own }
 }
 
-/// Clients assigned to a node (via their group or own nodes) with credentials
-/// for its listeners; `None` when any name or credential is invalid.
-struct User<'a> {
-    name: &'a str,
-    uuid: &'a str,
-    password: &'a str,
+/// A client assigned to a node with its credentials for the node's listeners.
+pub(crate) struct User<'a> {
+    pub client: &'a Client,
+    pub name: &'a str,
+    pub uuid: &'a str,
+    pub password: &'a str,
 }
 
-fn node_users<'a>(config: &'a Config, node: &str) -> Option<Vec<User<'a>>> {
+/// Clients assigned to a node (via their group or own nodes) with credentials
+/// for its listeners; `None` when any name or credential is invalid.
+pub(crate) fn node_users<'a>(config: &'a Config, node: &str) -> Option<Vec<User<'a>>> {
     let mut users = Vec::new();
     for client in &config.clients {
         let assigned = if client.inherit_nodes_from_group {
@@ -311,32 +238,9 @@ fn node_users<'a>(config: &'a Config, node: &str) -> Option<Vec<User<'a>>> {
             || (!password.is_empty() && !validation::hy2_password_valid(password)) {
             return None;
         }
-        users.push(User { name: &client.name, uuid, password });
+        users.push(User { client, name: &client.name, uuid, password });
     }
     Some(users)
-}
-
-/// stdin of the listener command: per marker `marker count` and the YAML
-/// lines of its users (v1 `_listener_users_payload`), built by the
-/// `listener-users.sh` builders so Hysteria2 passwords are quoted YAML strings.
-fn listener_payload(markers: &[&str], users: &[User<'_>]) -> String {
-    let mut payload = String::new();
-    for marker in markers {
-        let block = if *marker == "hy2" {
-            listener_users::hy2_users_yaml(users.iter().map(|user| (user.name, user.password)))
-        } else {
-            listener_users::vless_users_yaml(marker, users.iter().map(|user| (user.name, user.uuid)))
-        };
-        payload.push_str(&format!("{marker} {}\n{block}", block.lines().count()));
-    }
-    payload
-}
-
-/// Listener markers present in a node's client config.
-fn node_markers(remote: &str) -> Vec<&'static str> {
-    LISTENER_MARKERS.iter()
-        .filter(|(header, _)| remote.split('\n').any(|line| line.starts_with(header)))
-        .map(|(_, marker)| *marker).collect()
 }
 
 /// Command substitution: trailing newlines go.
@@ -443,7 +347,6 @@ fn client_proxies(config: &Config, client: &Client, nodes: &[String], fetched: &
             continue;
         };
         let mut section = proxy_section(remote);
-        // Filtered even for an empty node answer: a failed peer must be noticed.
         if !allowed.is_empty() {
             let mut filtered = String::new();
             for connection in &allowed {
@@ -451,10 +354,6 @@ fn client_proxies(config: &Config, client: &Client, nodes: &[String], fetched: &
                 let target = if awg { format!("awg-{name}") } else { connection.clone() };
                 let mut block = select_blocks(&section, &target);
                 if block.is_empty() {
-                    if awg && fetched.awg_failed.contains(node_name) {
-                        log(Level::Warn, &format!("{name}: клиент AmneziaWG на {node_name} не создан"));
-                        complete = false;
-                    }
                     continue;
                 }
                 let kind = proxy_type(&block).map(str::to_owned);
@@ -632,176 +531,60 @@ fn generate_group(session: &mut Session, config: &Config, group: &str, only: Opt
     }
 }
 
-/// Exit 0 output of a remote command.
-async fn run_ok<S: RemoteSession>(session: &S, command: &str, stdin: &[u8], timeout: std::time::Duration) -> Option<Vec<u8>> {
-    session.exec(command, stdin, timeout).await.ok().filter(|result| result.exit_status == 0).map(|result| result.stdout)
-}
-
-/// Server scripts are checked at most once per node connection.
-async fn scripts_ready<S: RemoteSession>(session: &S, node: &str, ready: &mut bool) -> Result<()> {
-    if !*ready {
-        scripts::ensure_current(session, node, false).await?;
-        *ready = true;
-    }
-    Ok(())
-}
-
-/// Create the missing AmneziaWG peers of `clients`; `false` when the state
-/// of the peers is unknown or creation failed. No AmneziaWG is not a failure.
-async fn ensure_peers<T: RemoteTransport>(session: &mut Session, transport: &T, node: &str, clients: &[String], ready: &mut bool) -> bool {
-    let Some(stdout) = run_ok(transport, crate::awg::STATUS_COMMAND, b"", COMMAND_TIMEOUT).await else { return false };
-    let existing = match crate::awg::parse_probe(&stdout) {
-        None => return false,
-        Some(crate::awg::Probe::Absent) => return true,
-        Some(crate::awg::Probe::Installed(existing)) => existing,
-    };
-    let missing: Vec<String> = clients.iter().filter(|client| !existing.contains(client)).cloned().collect();
-    if missing.is_empty() {
-        return true;
-    }
-    session.log(Level::Info, &format!("Создаю клиентов AmneziaWG на {node}: {}...", missing.join(" ")));
-    if let Err(error) = scripts_ready(transport, node, ready).await {
-        session.log(Level::Warn, &format!("{node}: не удалось подготовить скрипты; клиенты AmneziaWG не изменены. {}", error.message));
-        return false;
-    }
-    if run_ok(transport, &crate::awg::create_command(&missing), b"", LONG_TIMEOUT).await.is_none() {
-        session.log(Level::Warn, &format!("Ошибка при создании клиентов AmneziaWG на {node}"));
-        return false;
-    }
-    true
-}
-
-/// Push the node's users into its listeners; the outcome is logged.
-async fn sync_node<T: RemoteTransport>(session: &mut Session, config: &Config, transport: &T, node: &str,
-    markers: &[&str], mode: ListenerMode, ready: &mut bool) -> bool
-{
-    let Some(users) = node_users(config, node) else {
-        session.log(Level::Warn, &format!(
-            "{node}: недопустимое имя или учётные данные клиента в конфигурации — пользователи на ноде не изменены."));
-        return false;
-    };
-    let payload = listener_payload(markers, &users);
-    if let Err(error) = scripts_ready(transport, node, ready).await {
-        session.log(Level::Warn, &format!("{node}: не удалось подготовить скрипты; входные подключения не изменены. {}", error.message));
-        return false;
-    }
-    let synced = run_ok(transport, &listener_command(mode), payload.as_bytes(), LONG_TIMEOUT).await.is_some();
-    let separator = if mode == ListenerMode::Strict { " —" } else { ":" };
-    if synced {
-        session.log(Level::Success, &format!("{node}{separator} входные подключения обновлены"));
-    } else {
-        session.log(Level::Warn, &format!("{node}{separator} не удалось обновить входные подключения"));
-    }
-    synced
-}
-
-/// Connect to a stored node; refusal and connection errors are logged.
-async fn open<T: RemoteTransport>(session: &mut Session, transport: &mut T, node: &Node) -> bool {
-    let opened = match nodes::require_portable(session, node) {
-        Ok(()) => nodes::connect(transport, &session.state, node).await,
-        Err(error) => Err(error),
-    };
-    if let Err(error) = &opened {
-        session.log(Level::Warn, &format!("Не удалось подключиться к {}: {}", node.name, error.message));
-    }
-    opened.is_ok()
-}
-
-/// One connection: peers, then the client config, then listener users.
-/// Returns the listener outcome when `work.sync`.
-async fn node_pass<T: RemoteTransport>(session: &mut Session, config: &Config, transport: &mut T, work: &NodeWork,
-    fetched: &mut Fetched) -> Option<bool>
-{
-    let name = work.name.as_str();
-    let failed = work.sync.then_some(false);
-    let Some(node) = config.nodes.iter().find(|node| node.name == name) else {
-        session.log(Level::Warn, &format!("Не удалось загрузить ноду «{name}»."));
-        return failed;
-    };
-    session.log(Level::Info, &format!("Подключаюсь к {name}..."));
-    if !open(session, transport, node).await {
-        session.log(Level::Warn, &format!("Не удалось получить конфиг с {name}"));
-        if !work.awg.is_empty() {
-            fetched.awg_failed.insert(name.to_owned());
-        }
-        return failed;
-    }
-    let mut ready = false;
-    if !work.awg.is_empty() && !ensure_peers(session, transport, name, &work.awg, &mut ready).await {
-        fetched.awg_failed.insert(name.to_owned());
-    }
-    let Some(stdout) = run_ok(&*transport, FETCH_COMMAND, b"", COMMAND_TIMEOUT).await else {
-        session.log(Level::Warn, &format!("Не удалось получить конфиг с {name}"));
-        return failed;
-    };
-    let remote = String::from_utf8_lossy(&stdout).into_owned();
-    session.log(Level::Success, &format!("{name} — конфиг загружен"));
-    let markers = node_markers(&remote);
-    fetched.configs.insert(name.to_owned(), remote);
-    if !work.sync {
-        return None;
-    }
-    Some(sync_node(session, config, transport, name, &markers, ListenerMode::Strict, &mut ready).await)
-}
-
-/// Node passes, rendering, then the listener outcome of the sync nodes.
-async fn run<T: RemoteTransport>(session: &mut Session, config: &Config, scope: Scope<'_>, connect: &dyn Fn() -> T) -> Report {
-    let mut order = scope.fetch.clone();
-    push_unique(&mut order, scope.sync.iter().cloned());
-    let work: Vec<NodeWork> = order.into_iter().map(|name| NodeWork {
-        awg: scope.awg_clients.iter().filter(|client| crate::awg::needs_peer(config, client, &name))
-            .map(|client| client.name.clone()).collect(),
-        sync: scope.sync.contains(&name),
-        name,
-    }).collect();
+/// Render the client sections of `scope.nodes`, then the configs of every
+/// target group. A node without a usable profile fails its clients; a node
+/// whose server state lags behind is reported as pending.
+fn run(session: &mut Session, config: &Config, scope: Scope) -> Report {
     let mut fetched = Fetched::default();
-    let mut synced = BTreeMap::new();
-    if !work.is_empty() {
-        let mut transport = connect();
-        for item in &work {
-            if let Some(outcome) = node_pass(session, config, &mut transport, item, &mut fetched).await {
-                synced.insert(item.name.clone(), outcome);
+    let mut report = Report::default();
+    for name in &scope.nodes {
+        let Some(node) = config.nodes.iter().find(|node| node.name == *name) else {
+            session.log(Level::Warn, &format!("Не удалось загрузить ноду «{name}»."));
+            report.nodes_failed.push(name.clone());
+            continue;
+        };
+        match crate::server::render::client_section(config, node) {
+            Some(section) => {
+                fetched.configs.insert(name.clone(), section);
+                report.nodes_ok.push(name.clone());
+            }
+            None => {
+                session.log(Level::Warn, &format!("{name}: профиль не готов (нет профиля, домена или ключей)"));
+                report.nodes_failed.push(name.clone());
             }
         }
+        if node.profile.is_some() && crate::server::render::status(config, node) != "applied" {
+            session.log(Level::Warn, &format!("{name}: есть неприменённые изменения — выполните node apply"));
+            report.nodes_pending.push(name.clone());
+        }
     }
-    let mut report = Report::default();
     for (group, only) in &scope.targets {
         generate_group(session, config, group, only.as_deref(), &fetched, &mut report);
-    }
-    for node in scope.sync {
-        if synced.get(&node) == Some(&true) {
-            report.nodes_ok.push(node);
-        } else {
-            report.nodes_failed.push(node);
-        }
     }
     report
 }
 
 /// `generate (--all | --group G | --client C)`.
-pub async fn generate<T: RemoteTransport>(session: &mut Session, invocation: &Invocation, connect: &dyn Fn() -> T) -> Result<Value> {
+pub fn generate(session: &mut Session, invocation: &Invocation) -> Result<Value> {
     require_one(invocation, &["all", "group", "client"])?;
     let config = session.state.load_config()?;
     let scope = if invocation.has("all") {
-        let mut scope = Scope { targets: Vec::new(), awg_clients: Vec::new(), fetch: Vec::new(), sync: Vec::new() };
+        let mut scope = Scope { targets: Vec::new(), nodes: Vec::new() };
         for group in &config.groups {
             scope.targets.push((group.name.clone(), None));
-            scope.awg_clients.extend(group_members(&config, &group.name));
-            push_unique(&mut scope.fetch, group_scope_nodes(&config, &group.name));
+            push_unique(&mut scope.nodes, group_scope_nodes(&config, &group.name));
         }
-        scope.sync = scope.fetch.clone();
         scope
     } else if invocation.has("group") {
         let group = required(invocation, "group")?;
         find_group(&config, group)?;
-        let nodes = group_scope_nodes(&config, group);
-        Scope { targets: vec![(group.to_owned(), None)], awg_clients: group_members(&config, group), fetch: nodes.clone(), sync: nodes }
+        Scope { targets: vec![(group.to_owned(), None)], nodes: group_scope_nodes(&config, group) }
     } else {
         let name = required(invocation, "client")?;
         let client = find_client(&config, name)?;
         let mut nodes = Vec::new();
         push_unique(&mut nodes, client_nodes(&config, client));
-        Scope { targets: vec![(client.group.clone(), Some(name.to_owned()))], awg_clients: vec![client], fetch: nodes.clone(), sync: nodes }
+        Scope { targets: vec![(client.group.clone(), Some(name.to_owned()))], nodes }
     };
     let dir = generated_dir(session.state.paths());
     if scope.targets.is_empty() {
@@ -809,64 +592,26 @@ pub async fn generate<T: RemoteTransport>(session: &mut Session, invocation: &In
         return Report::default().finish(&dir);
     }
     let _guard = session.state.locks().acquire(LockKind::Mutation, "generate")?;
-    run(session, &config, scope, connect).await.finish(&dir)
+    run(session, &config, scope).finish(&dir)
 }
 
-/// Regenerate `group` after a client changed groups (v1 set-group flow):
-/// configs of `nodes` and the group's nodes are read, the group's peers are
-/// ensured, its configs rendered and the users of `nodes` synchronized.
+/// Regenerate `group` after a client changed groups (v1 set-group flow).
 /// Client and node failures are in the report; `Err` only when nothing ran.
-pub async fn regenerate_group<T: RemoteTransport>(session: &mut Session, group: &str, nodes: &[String], connect: &dyn Fn() -> T) -> Result<Report> {
+pub fn regenerate_group(session: &mut Session, group: &str) -> Result<Report> {
     let config = session.state.load_config()?;
     let _guard = session.state.locks().acquire(LockKind::Mutation, "generate")?;
-    let mut sync = Vec::new();
-    push_unique(&mut sync, nodes.iter().cloned());
-    let mut fetch = sync.clone();
-    push_unique(&mut fetch, group_scope_nodes(&config, group));
-    let scope = Scope { targets: vec![(group.to_owned(), None)], awg_clients: group_members(&config, group), fetch, sync };
-    Ok(run(session, &config, scope, connect).await)
-}
-
-/// Remove deleted clients from the listeners of `nodes` (v1 client delete):
-/// every listener marker is sent, markers absent on a node are skipped.
-/// Returns the nodes that failed; outcomes are logged.
-pub async fn sync_listeners<T: RemoteTransport>(session: &mut Session, nodes: &[String], connect: &dyn Fn() -> T) -> Vec<String> {
-    let mut failed = Vec::new();
-    let config = match session.state.load_config() {
-        Ok(config) => config,
-        Err(error) => {
-            session.log(Level::Warn, &format!("Не удалось прочитать конфигурацию: {}", error.message));
-            return nodes.to_vec();
-        }
-    };
-    let markers: Vec<&str> = LISTENER_MARKERS.iter().map(|(_, marker)| *marker).collect();
-    let mut transport = None;
-    for name in nodes {
-        let Some(node) = config.nodes.iter().find(|node| node.name == *name) else {
-            session.log(Level::Warn, &format!("Не удалось загрузить ноду «{name}»."));
-            failed.push(name.clone());
-            continue;
-        };
-        let transport = transport.get_or_insert_with(connect);
-        let mut ready = false;
-        if !open(session, transport, node).await
-            || !sync_node(session, &config, transport, name, &markers, ListenerMode::Lenient, &mut ready).await {
-            failed.push(name.clone());
-        }
-    }
-    failed
+    let scope = Scope { targets: vec![(group.to_owned(), None)], nodes: group_scope_nodes(&config, group) };
+    Ok(run(session, &config, scope))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
-
     use super::*;
-    use crate::fake_transport::{AuthMethod, ConnectExpectation, FakeScript, FakeTransport, ScriptStep};
-    use crate::model::{Auth, ClientConnection, ClientCredentials, Connection, ConnectionGroup, Fingerprint, Group};
+    use crate::model::{
+        Applied, ClientConnection, ClientCredentials, Connection, ConnectionGroup, Group, Hysteria2, Node, NodeParams,
+        NodeReality, PortOnly, Profile, Xhttp, XhttpTopology,
+    };
     use crate::nodes::testing::{Journal, fingerprint, invocation, session};
-    use crate::nodes::{CONNECT_TIMEOUT, pin};
-    use crate::transport::{ExecResult, HostKeyPolicy};
 
     const SAMPLE: &str = "proxies:\n  - name: \"vless-reality\"\n    type: vless\n    server: 1.2.3.4\n    port: 443\n\
         \x20   uuid: \"test-uuid-1234\"\n    network: tcp\n    tls: true\n    servername: example.com\n\n\
@@ -876,19 +621,6 @@ mod tests {
     const TEMPLATE: &str = "mixed-port: 7890\n\nproxies:\n\n\n# --- PC ---\npc-only: true\n# --- PC ---\nproxy-groups: []\n";
     const ROUTER_UUID: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
     const PC_UUID: &str = "11111111-2222-3333-4444-555555555555";
-
-    fn fp(byte: u8) -> Fingerprint {
-        use base64::Engine;
-        format!("SHA256:{}", base64::engine::general_purpose::STANDARD_NO_PAD.encode([byte; 32])).parse().unwrap()
-    }
-
-    fn node(index: u8, name: &str, tag: &str) -> Node {
-        Node {
-            id: format!("{index:032x}"), name: name.into(), ip: format!("198.51.100.{index}"), port: 22, user: "root".into(),
-            auth: Auth::Key, identity: Some("system".into()), secret_id: None, tag: Some(tag.into()), aliases: Default::default(),
-            ..Node::default()
-        }
-    }
 
     fn client(name: &str, group: &str, own: Option<(&str, &[&str])>, uuid: &str, password: &str) -> Client {
         Client {
@@ -905,24 +637,41 @@ mod tests {
             name: (*name).into(), proxies: proxies.iter().map(|p| p.to_string()).collect() }).collect() }
     }
 
-    /// de (tag DE) and ru (alias vless-reality → RU-VLESS); ROUTER on both,
-    /// PC on de; my-router inherits ROUTER, my-pc owns de with vless only.
+    /// A self-steal node with every VLESS transport and Hysteria2.
+    fn profiled(index: u8, name: &str, tag: &str) -> Node {
+        Node {
+            id: format!("{index:032x}"), name: name.into(), ip: format!("198.51.100.{index}"), port: 22, user: "root".into(),
+            tag: Some(tag.into()), profile: Some("full".into()), domain: Some(format!("{name}.example.com")),
+            params: NodeParams {
+                reality: Some(NodeReality { public_key: "PUBKEY".into(), short_id: "0123456789abcdef".into() }),
+                xhttp_path: Some("/0123456789abcdef".into()), grpc_service: Some("grpc-01234567".into()),
+                ..NodeParams::default()
+            },
+            ..Node::default()
+        }
+    }
+
+    /// de (tag DE) and ru (alias VLESS TCP → RU-VLESS); ROUTER on both, PC on
+    /// de; my-router inherits ROUTER, my-pc owns de with VLESS TCP only.
     fn fixture(root: &Path) -> (Session, Journal) {
         let (session, journal) = session(root);
-        let de = node(1, "de", "DE");
-        let mut ru = node(2, "ru", "");
-        ru.aliases.insert("vless-reality".into(), "RU-VLESS".into());
-        for node in [&de, &ru] {
-            pin(&session.state, &node.ip, 22, vec![fp(node.id.as_bytes()[31])]).unwrap();
-        }
+        let de = profiled(1, "de", "DE");
+        let mut ru = profiled(2, "ru", "");
+        ru.aliases.insert("VLESS TCP".into(), "RU-VLESS".into());
+        let all: &[&str] = &["VLESS TCP", "VLESS xHTTP", "VLESS gRPC", "Hysteria2"];
         let config = Config {
+            profiles: vec![Profile {
+                name: "full".into(), mihomo_version: "v1.19.18".into(), acme_email: "admin@example.com".into(),
+                vless_tcp: true, vless_xhttp: Some(Xhttp { topology: XhttpTopology::Nginx, port: None }),
+                vless_grpc: Some(PortOnly { port: 2053 }), hysteria2: Some(Hysteria2 { port: 8843, obfs: false }),
+                ..Profile::default()
+            }],
             nodes: vec![de, ru],
             groups: vec![Group { name: "ROUTER".into(), template: "t.yaml".into(), ..Group::default() },
                 Group { name: "PC".into(), template: "t.yaml".into(), ..Group::default() }],
             clients: vec![client("my-router", "ROUTER", None, ROUTER_UUID, "router-hy2-pass-0001"),
-                client("my-pc", "PC", Some(("de", &["vless-reality"])), PC_UUID, "pc-hy2-pass-0002")],
-            connections: vec![connection("de", &[("ROUTER", &["vless-reality", "hy2-main"]), ("PC", &["vless-reality", "hy2-main"])]),
-                connection("ru", &[("ROUTER", &["vless-reality"])])],
+                client("my-pc", "PC", Some(("de", &["VLESS TCP"])), PC_UUID, "pc-hy2-pass-0002")],
+            connections: vec![connection("de", &[("ROUTER", all), ("PC", all)]), connection("ru", &[("ROUTER", &["VLESS TCP"])])],
             ..Config::default()
         };
         session.state.save_config(&config).unwrap();
@@ -931,26 +680,8 @@ mod tests {
         (session, journal)
     }
 
-    fn ok(stdout: &str) -> Result<ExecResult> {
-        Ok(ExecResult { stdout: stdout.as_bytes().to_vec(), stderr: Vec::new(), exit_status: 0 })
-    }
-
-    fn connect_step(node: &Node, outcome: Result<()>) -> ScriptStep {
-        ScriptStep::connect(ConnectExpectation::new(node.ip.clone(), 22, "root", AuthMethod::System, CONNECT_TIMEOUT)
-            .with_host_key(HostKeyPolicy { expected: None, known: vec![fp(node.id.as_bytes()[31])] }), outcome)
-    }
-
-    fn probe_step() -> ScriptStep {
-        ScriptStep::exec(scripts::probe_command(), 0, COMMAND_TIMEOUT, ok(&format!("PRESENT\n{}\n", scripts::local_version().unwrap())))
-    }
-
-    /// A `connect` that hands out the scripted transport once.
-    fn once(transport: FakeTransport) -> (FakeScript, RefCell<Option<FakeTransport>>) {
-        (transport.script(), RefCell::new(Some(transport)))
-    }
-
     fn fetched(configs: &[(&str, &str)]) -> Fetched {
-        Fetched { configs: configs.iter().map(|(n, c)| (n.to_string(), c.to_string())).collect(), ..Fetched::default() }
+        Fetched { configs: configs.iter().map(|(n, c)| (n.to_string(), c.to_string())).collect() }
     }
 
     fn proxies(config: &Config, client: &str, nodes: &[&str], fetched: &Fetched) -> (Option<String>, Vec<String>) {
@@ -965,30 +696,25 @@ mod tests {
     fn proxies_follow_connections_credentials_aliases_and_tags() {
         let root = tempfile::tempdir().unwrap();
         let (session, _) = fixture(root.path());
-        let config = session.state.load_config().unwrap();
+        let mut config = session.state.load_config().unwrap();
+        config.connections = vec![connection("de", &[("ROUTER", &["vless-reality", "hy2-main"])]), connection("ru", &[("ROUTER", &["vless-reality"])])];
+        config.nodes[1].aliases = [("vless-reality".to_owned(), "RU-VLESS".to_owned())].into();
         let cache = fetched(&[("de", SAMPLE), ("ru", &SAMPLE.replace('\n', "\r\n"))]);
 
         let (router, _) = proxies(&config, "my-router", &["de", "ru"], &cache);
-        let router = router.unwrap();
-        assert_eq!(router, format!("  - name: \"DE vless-reality\"\n    type: vless\n    server: 1.2.3.4\n    port: 443\n\
+        assert_eq!(router.unwrap(), format!("  - name: \"DE vless-reality\"\n    type: vless\n    server: 1.2.3.4\n    port: 443\n\
             \x20   uuid: {ROUTER_UUID}\n    network: tcp\n    tls: true\n    servername: example.com\n\n\
             \x20 - name: \"DE hy2-main\"\n    type: hysteria2\n    server: 1.2.3.4\n    port: 8443\n    password: router-hy2-pass-0001\n\n\n\
             \x20 - name: \"RU-VLESS\"\n    type: vless\n    server: 1.2.3.4\n    port: 443\n\
             \x20   uuid: {ROUTER_UUID}\n    network: tcp\n    tls: true\n    servername: example.com"));
 
-        // Own connections override the group's: no hy2 for my-pc.
-        let (pc, _) = proxies(&config, "my-pc", &["de"], &cache);
-        let pc = pc.unwrap();
-        assert!(pc.contains(&format!("uuid: {PC_UUID}")) && !pc.contains("hy2-main") && !pc.contains("test-uuid"));
-
-        // A node without a fetched config fails the client.
+        // A node without a section fails the client.
         assert_eq!(proxies(&config, "my-router", &["de", "ru"], &fetched(&[("de", SAMPLE)])).0, None);
 
         // xHTTP blocks get the client uuid and the firefox fingerprint.
         let xhttp = "proxies:\n  - name: \"vless-xhttp\"\n    type: vless\n    uuid: original\n    network: xhttp\n    client-fingerprint: chrome\n---\n";
-        let mut config_x = config.clone();
-        config_x.connections[0].groups[0].proxies.push("vless-xhttp".into());
-        let (out, _) = proxies(&config_x, "my-router", &["de"], &fetched(&[("de", xhttp)]));
+        config.connections[0].groups[0].proxies.push("vless-xhttp".into());
+        let (out, _) = proxies(&config, "my-router", &["de"], &fetched(&[("de", xhttp)]));
         let out = out.unwrap();
         assert!(out.contains(&format!("uuid: {ROUTER_UUID}")) && out.contains("client-fingerprint: firefox") && !out.contains("chrome"));
     }
@@ -997,7 +723,8 @@ mod tests {
     fn a_proxy_repeated_across_entries_of_a_node_is_used_once() {
         let root = tempfile::tempdir().unwrap();
         let (session, _) = fixture(root.path());
-        let config = session.state.load_config().unwrap();
+        let mut config = session.state.load_config().unwrap();
+        config.connections = vec![connection("de", &[("ROUTER", &["vless-reality", "hy2-main"])])];
         let cache = fetched(&[("de", SAMPLE)]);
         let (single, _) = proxies(&config, "my-router", &["de"], &cache);
         // A second entry of `de` names ROUTER's proxies again (overlapping sets).
@@ -1011,23 +738,17 @@ mod tests {
     }
 
     #[test]
-    fn awg_proxies_use_the_client_peer_and_fail_when_the_peer_was_not_created() {
+    fn awg_proxies_use_the_client_peer() {
         let root = tempfile::tempdir().unwrap();
         let (session, _) = fixture(root.path());
         let mut config = session.state.load_config().unwrap();
-        config.connections[0].groups[0].proxies.push("AWG".into());
+        config.connections[0].groups[0].proxies = vec!["AWG".into()];
         let awg = "proxies:\n  - name: \"awg-my-router\"\n    type: wireguard\n    ip: 10.10.8.2\n    amnezia-wg-option:\n      version: 3\n\
             proxies:\n  - name: \"awg-other\"\n    type: wireguard\n    server: 9.9.9.9\n---\n";
         let (out, _) = proxies(&config, "my-router", &["de"], &fetched(&[("de", awg)]));
         let out = out.unwrap();
         assert!(out.contains("  - name: \"DE AmneziaWG 3.1\"\n    type: wireguard\n    ip: 10.10.8.2\n    amnezia-wg-option:\n      version: 3"));
         assert!(!out.contains("9.9.9.9"));
-
-        let mut cache = fetched(&[("de", "")]);
-        cache.awg_failed.insert("de".into());
-        let (out, log) = proxies(&config, "my-router", &["de"], &cache);
-        assert_eq!(out, None);
-        assert!(log.contains(&"my-router: клиент AmneziaWG на de не создан".to_string()));
     }
 
     #[test]
@@ -1041,48 +762,26 @@ mod tests {
     }
 
     #[test]
-    fn listener_payload_and_commands_keep_credentials_on_stdin() {
-        let users = [User { name: "r", uuid: ROUTER_UUID, password: "p1" }, User { name: "n", uuid: "", password: "" },
-            User { name: "d", uuid: "", password: "-" }];
-        assert_eq!(listener_payload(&["vless-tcp", "vless-grpc", "hy2"], &users), format!(
-            "vless-tcp 3\n      - username: r\n        uuid: {ROUTER_UUID}\n        flow: xtls-rprx-vision\n\
-             vless-grpc 2\n      - username: r\n        uuid: {ROUTER_UUID}\nhy2 2\n      r: \"p1\"\n      d: \"-\"\n"));
-        assert_eq!(listener_payload(&["hy2"], &[]), "hy2 0\n");
-        let strict = listener_command(ListenerMode::Strict);
-        assert!(strict.starts_with("source '/root/essence-setup/common/listener-users.sh' || exit 1\n_sync_rc=0\n"));
-        assert!(strict.ends_with("|| exit 1\ndone\nsystemctl restart mihomo\n") && !strict.contains(ROUTER_UUID));
-        assert!(listener_command(ListenerMode::Lenient).ends_with("exit \"$_sync_rc\"\n"));
-        assert_eq!(node_markers("x\n--- VLESS TCP ---\r\n--- Hysteria2 --- (8443)\n"), ["vless-tcp", "hy2"]);
-    }
-
-    fn node_steps(node: &Node, remote: &str, payload_len: usize) -> Vec<ScriptStep> {
-        vec![connect_step(node, Ok(())), ScriptStep::exec(FETCH_COMMAND, 0, COMMAND_TIMEOUT, ok(remote)), probe_step(),
-            ScriptStep::exec(listener_command(ListenerMode::Strict), payload_len, LONG_TIMEOUT, ok(""))]
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn generate_all_renders_every_client_and_syncs_listeners() {
+    fn generate_all_renders_every_proxy_from_the_profiles_without_ssh() {
         let root = tempfile::tempdir().unwrap();
-        let (mut session, _) = fixture(root.path());
+        let (mut session, journal) = fixture(root.path());
         let config = session.state.load_config().unwrap();
-        let remote = format!("--- VLESS TCP ---\n{SAMPLE}");
-        let de_users = listener_payload(&["vless-tcp"], &node_users(&config, "de").unwrap()).len();
-        let ru_users = listener_payload(&["vless-tcp"], &node_users(&config, "ru").unwrap()).len();
-        let mut steps = node_steps(&config.nodes[0], &remote, de_users);
-        steps.extend(node_steps(&config.nodes[1], &remote, ru_users));
-        let (script, cell) = once(FakeTransport::new(steps));
-        let connect = || cell.borrow_mut().take().expect("one transport per command");
-        let data = generate(&mut session, &invocation(&["generate", "--all"]), &connect).await.unwrap();
-        script.assert_finished();
+        let data = generate(&mut session, &invocation(&["generate", "--all"])).unwrap();
         let dir = generated_dir(session.state.paths());
         assert_eq!(data, json!({"ok": ["my-router", "my-pc"], "skipped": [], "failed": [], "nodes_ok": ["de", "ru"],
-            "nodes_failed": [], "dir": dir.to_string_lossy()}));
+            "nodes_failed": [], "nodes_pending": ["de", "ru"], "dir": dir.to_string_lossy()}));
+        assert!(journal.borrow().iter().any(|(_, text)| text == "de: есть неприменённые изменения — выполните node apply"));
         let router = std::fs::read_to_string(dir.join("ROUTER/my-router/config.yaml")).unwrap();
-        assert!(router.starts_with("mixed-port: 7890\n\nproxies:\n  - name: \"DE vless-reality\"\n"));
-        assert!(router.ends_with("    servername: example.com\n\nproxy-groups: []\n") && !router.contains("pc-only"));
+        for proxy in ["DE VLESS TCP", "DE VLESS xHTTP", "DE VLESS gRPC", "DE Hysteria2", "RU-VLESS"] {
+            assert!(router.contains(&format!("  - name: \"{proxy}\"\n")), "{proxy} in {router}");
+        }
+        assert!(router.starts_with("mixed-port: 7890\n\nproxies:\n  - name: \"DE VLESS TCP\"\n    type: vless\n    server: de.example.com\n    port: 443\n"));
+        assert_eq!(router.matches(&format!("uuid: {ROUTER_UUID}")).count(), 4);
+        assert!(router.contains("    password: router-hy2-pass-0001\n") && !router.contains(crate::server::render::PLACEHOLDER_UUID));
+        assert!(!router.contains("placeholder") && router.ends_with("proxy-groups: []\n") && !router.contains("pc-only"));
         assert!(!router.contains("\n\n\n"));
         let pc = std::fs::read_to_string(dir.join("PC/my-pc/config.yaml")).unwrap();
-        assert!(pc.contains("pc-only: true\n") && pc.contains(PC_UUID));
+        assert!(pc.contains("pc-only: true\n") && pc.contains(PC_UUID) && !pc.contains("Hysteria2"));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1098,82 +797,58 @@ mod tests {
         assert_eq!(rendered_config(session.state.paths(), &invalid).unwrap_err().code, "invalid");
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn crlf_template_renders_like_the_lf_one() {
+    #[test]
+    fn applied_nodes_are_not_pending() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut session, _) = fixture(root.path());
+        let mut config = session.state.load_config().unwrap();
+        for index in 0..2 {
+            let digest = crate::server::render::desired(&config, &config.nodes[index], None).unwrap().digest;
+            config.nodes[index].applied = Some(Applied { digest, ..Applied::default() });
+        }
+        session.state.save_config(&config).unwrap();
+        let data = generate(&mut session, &invocation(&["generate", "--group", "ROUTER"])).unwrap();
+        assert_eq!(data["nodes_pending"], json!([]));
+    }
+
+    #[test]
+    fn crlf_template_renders_like_the_lf_one() {
         let mut rendered = Vec::new();
         for template in [TEMPLATE.to_owned(), TEMPLATE.replace('\n', "\r\n")] {
             let root = tempfile::tempdir().unwrap();
             let (mut session, _) = fixture(root.path());
             std::fs::write(session.state.paths().templates().join("t.yaml"), &template).unwrap();
-            let config = session.state.load_config().unwrap();
-            let remote = format!("--- VLESS TCP ---\n{SAMPLE}");
-            let users = |node: &str| listener_payload(&["vless-tcp"], &node_users(&config, node).unwrap()).len();
-            let mut steps = node_steps(&config.nodes[0], &remote, users("de"));
-            steps.extend(node_steps(&config.nodes[1], &remote, users("ru")));
-            let (script, cell) = once(FakeTransport::new(steps));
-            let connect = || cell.borrow_mut().take().expect("one transport per command");
-            generate(&mut session, &invocation(&["generate", "--all"]), &connect).await.unwrap();
-            script.assert_finished();
+            generate(&mut session, &invocation(&["generate", "--all"])).unwrap();
             let dir = generated_dir(session.state.paths());
             rendered.push(["ROUTER/my-router", "PC/my-pc"].map(|client| std::fs::read_to_string(dir.join(client).join("config.yaml")).unwrap()));
         }
         assert_eq!(rendered[0], rendered[1]);
-        assert!(rendered[1][1].contains("proxies:\n  - name: \"DE vless-reality\"\n") && rendered[1][1].contains("pc-only: true\n"));
+        assert!(rendered[1][1].contains("proxies:\n  - name: \"DE VLESS TCP\"\n") && rendered[1][1].contains("pc-only: true\n"));
         assert!(!rendered[1].iter().any(|config| config.contains('\r')));
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn failed_awg_peer_creation_keeps_the_client_config() {
+    #[test]
+    fn a_node_without_a_usable_profile_fails_its_clients_and_keeps_their_config() {
         let root = tempfile::tempdir().unwrap();
         let (mut session, journal) = fixture(root.path());
         let mut config = session.state.load_config().unwrap();
-        config.connections[0].groups[0].proxies.push("AWG".into());
+        config.nodes[0].domain = None;
         session.state.save_config(&config).unwrap();
-        let users = |node: &str| listener_payload(&[], &node_users(&config, node).unwrap()).len();
-        let mut steps = vec![connect_step(&config.nodes[0], Ok(())),
-            ScriptStep::exec(crate::awg::STATUS_COMMAND, 0, COMMAND_TIMEOUT, ok("AWG_OK\nmy-pc\n")), probe_step(),
-            ScriptStep::exec(crate::awg::create_command(&["my-router".into()]), 0, LONG_TIMEOUT,
-                Ok(ExecResult { exit_status: 1, ..ExecResult::default() })),
-            ScriptStep::exec(FETCH_COMMAND, 0, COMMAND_TIMEOUT, ok("proxies:\n---\n")),
-            ScriptStep::exec(listener_command(ListenerMode::Strict), users("de"), LONG_TIMEOUT, ok(""))];
-        steps.extend(node_steps(&config.nodes[1], SAMPLE, users("ru")));
-        let (script, cell) = once(FakeTransport::new(steps));
-        let connect = || cell.borrow_mut().take().expect("one transport per command");
-        let error = generate(&mut session, &invocation(&["generate", "--client", "my-router"]), &connect).await.unwrap_err();
-        script.assert_finished();
-        assert_eq!((error.extra["failed"].clone(), error.extra["nodes_ok"].clone()), (json!(["my-router"]), json!(["de", "ru"])));
-        assert!(!generated_dir(session.state.paths()).join("ROUTER/my-router/config.yaml").exists());
-        let journal = journal.borrow();
-        for line in ["Ошибка при создании клиентов AmneziaWG на de", "my-router: клиент AmneziaWG на de не создан"] {
-            assert!(journal.iter().any(|(_, text)| text == line), "{line}");
-        }
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn unreachable_node_fails_its_clients_and_keeps_their_previous_config() {
-        let root = tempfile::tempdir().unwrap();
-        let (mut session, journal) = fixture(root.path());
-        let config = session.state.load_config().unwrap();
         let previous = generated_dir(session.state.paths()).join("ROUTER/my-router");
         std::fs::create_dir_all(&previous).unwrap();
         std::fs::write(previous.join("config.yaml"), "previous\n").unwrap();
-        let ru_users = listener_payload(&[], &node_users(&config, "ru").unwrap()).len();
-        let mut steps = vec![connect_step(&config.nodes[0], Err(RcError::new("remote_failed", "x").with_extra("reason", "timeout")))];
-        steps.extend(node_steps(&config.nodes[1], SAMPLE, ru_users));
-        let (script, cell) = once(FakeTransport::new(steps));
-        let connect = || cell.borrow_mut().take().expect("one transport per command");
-        let error = generate(&mut session, &invocation(&["generate", "--group", "ROUTER"]), &connect).await.unwrap_err();
-        script.assert_finished();
+        let error = generate(&mut session, &invocation(&["generate", "--group", "ROUTER"])).unwrap_err();
         assert_eq!((error.code, error.message.as_str(), error.exit_code()), ("partial", "Генерация завершена с ошибками.", 1));
         assert_eq!((error.extra["ok"].clone(), error.extra["failed"].clone()), (json!([]), json!(["my-router"])));
         assert_eq!((error.extra["nodes_ok"].clone(), error.extra["nodes_failed"].clone()), (json!(["ru"]), json!(["de"])));
         assert_eq!(std::fs::read_to_string(previous.join("config.yaml")).unwrap(), "previous\n");
         let journal = journal.borrow();
+        assert!(journal.iter().any(|(_, text)| text == "de: профиль не готов (нет профиля, домена или ключей)"));
         assert!(journal.iter().any(|(_, text)| text == "my-router — не удалось получить все подключения; конфиг сохранён без изменений"));
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn generation_reports_write_failures_and_missing_templates_without_ssh() {
+    #[test]
+    fn generation_reports_write_failures_and_missing_templates() {
         let root = tempfile::tempdir().unwrap();
         let (mut session, _) = session(root.path());
         let config = Config {
@@ -1188,8 +863,7 @@ mod tests {
         let dir = generated_dir(session.state.paths());
         std::fs::create_dir_all(dir.join("PC")).unwrap();
         std::fs::write(dir.join("PC/bad"), "blocked\n").unwrap();
-        let connect = FakeTransport::default;
-        let error = generate(&mut session, &invocation(&["generate", "--all"]), &connect).await.unwrap_err();
+        let error = generate(&mut session, &invocation(&["generate", "--all"])).unwrap_err();
         assert_eq!(error.code, "partial");
         assert_eq!((error.extra["ok"].clone(), error.extra["skipped"].clone(), error.extra["failed"].clone()),
             (json!(["good"]), json!(["skipped"]), json!(["bad"])));
@@ -1197,33 +871,14 @@ mod tests {
         assert!(!dir.join("MOBILE").exists());
 
         std::fs::remove_file(dir.join("PC/bad")).unwrap();
-        let data = generate(&mut session, &invocation(&["generate", "--client", "bad"]), &connect).await.unwrap();
+        let data = generate(&mut session, &invocation(&["generate", "--client", "bad"])).unwrap();
         assert_eq!((data["ok"].clone(), data["failed"].clone()), (json!(["bad"]), json!([])));
 
         let before = fingerprint(root.path());
         for (argv, code) in [(&["generate"][..], "usage"), (&["generate", "--all", "--group", "PC"], "usage"),
             (&["generate", "--group", "NOPE"], "not_found"), (&["generate", "--client", "nobody"], "not_found")] {
-            assert_eq!(generate(&mut session, &invocation(argv), &connect).await.unwrap_err().code, code);
+            assert_eq!(generate(&mut session, &invocation(argv)).unwrap_err().code, code);
         }
         assert_eq!(fingerprint(root.path()), before);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn lenient_sync_sends_every_marker_and_reports_failed_nodes() {
-        let root = tempfile::tempdir().unwrap();
-        let (mut session, _) = fixture(root.path());
-        let config = session.state.load_config().unwrap();
-        let markers: Vec<&str> = LISTENER_MARKERS.iter().map(|(_, m)| *m).collect();
-        let de_len = listener_payload(&markers, &node_users(&config, "de").unwrap()).len();
-        let (script, cell) = once(FakeTransport::new([
-            connect_step(&config.nodes[0], Ok(())), probe_step(),
-            ScriptStep::exec(listener_command(ListenerMode::Lenient), de_len, LONG_TIMEOUT, Ok(ExecResult { exit_status: 1, ..ExecResult::default() })),
-            connect_step(&config.nodes[1], Ok(())), probe_step(),
-            ScriptStep::exec(listener_command(ListenerMode::Lenient), listener_payload(&markers, &node_users(&config, "ru").unwrap()).len(), LONG_TIMEOUT, ok("")),
-        ]));
-        let connect = || cell.borrow_mut().take().expect("one transport per command");
-        let failed = sync_listeners(&mut session, &["de".into(), "ru".into(), "ghost".into()], &connect).await;
-        script.assert_finished();
-        assert_eq!(failed, ["de", "ghost"]);
     }
 }

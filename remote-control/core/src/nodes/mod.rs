@@ -41,7 +41,7 @@ pub async fn route<T: RemoteTransport>(noun: &str, verb: &str, invocation: &Invo
     match (noun, verb) {
         ("node", "list") => basic::list(session),
         ("node", "show") => basic::show(session, invocation),
-        ("node", "aliases") => basic::aliases(session, invocation, transport).await,
+        ("node", "aliases") => basic::aliases(session, invocation),
         ("node", "rename") => basic::rename(session, invocation),
         ("node", "tag") => basic::tag(session, invocation),
         ("node", "password") => basic::password(session, invocation, secrets),
@@ -49,12 +49,14 @@ pub async fn route<T: RemoteTransport>(noun: &str, verb: &str, invocation: &Invo
         ("node", "trust-host-key") => basic::trust_host_key(session, invocation, transport).await,
         ("node", "add") => add::add(session, invocation, secrets, transport).await,
         ("node", "delete") => delete::delete(session, invocation, transport).await,
-        ("node", "upload-scripts") => scripts::upload(session, invocation, transport).await,
+        ("node", "profile") => basic::profile(session, invocation),
+        ("node", "domain") => basic::domain(session, invocation),
+        ("node", "port") => basic::port(session, invocation),
         ("node", "harden") => harden::harden(session, invocation, transport).await,
         ("node", "setup-ssh") => setup::setup_ssh(session, invocation, transport).await,
-        ("conn", "list") => conn::list(session, invocation, transport).await,
+        ("conn", "list") => conn::list(session, invocation),
         ("conn", "set") => conn::set(session, invocation),
-        ("conn", "sync") => conn::sync(session, invocation, transport).await,
+        ("conn", "sync") => conn::sync(session, invocation),
         _ => Err(RcError::new("usage", "Неизвестная команда.")),
     }
 }

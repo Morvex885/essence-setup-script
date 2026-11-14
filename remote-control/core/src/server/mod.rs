@@ -1,20 +1,8 @@
-//! Server-side state of profiled nodes: generated keys and parameters.
+//! Server-side state of profiled nodes: generated keys, the pure render of
+//! the desired node state, the embedded executor, profiles and `node apply`.
 
+pub mod apply;
+pub mod bundle;
 pub mod keys;
-
-/// nginx site behind Reality self-steal.
-pub const SITE_PORT: u16 = 8443;
-/// mihomo Reality listener behind the nginx stream front.
-pub const REALITY_INNER_PORT: u16 = 8444;
-/// Subscription vhost behind the nginx stream front.
-pub const SUB_INNER_PORT: u16 = 8445;
-/// Telegram Proxy behind the nginx stream front.
-pub const TG_INNER_PORT: u16 = 8446;
-/// mihomo xHTTP listener behind nginx.
-pub const XHTTP_NGINX_PORT: u16 = 8447;
-
-/// Ports profiles may not use: the internal ones and local services.
-pub const RESERVED_PORTS: [u16; 11] = [
-    SITE_PORT, REALITY_INNER_PORT, SUB_INNER_PORT, TG_INNER_PORT, XHTTP_NGINX_PORT,
-    9090, 1053, 2398, 8080, 8081, 8888,
-];
+pub mod profile;
+pub mod render;

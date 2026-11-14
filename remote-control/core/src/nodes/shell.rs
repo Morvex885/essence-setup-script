@@ -1,8 +1,7 @@
-//! `node shell --name N`: the server menu (`setup-essence.sh`) on a remote
-//! pseudo-terminal bound to the requester's console (v1 `cli_cmd_node_shell`
-//! and `run_remote`). `prepare` does the session part: lookup, connection,
-//! current scripts and the journal; the returned job runs on the console
-//! without the session and without a deadline.
+//! `node shell --name N`: a login shell on a remote pseudo-terminal bound to
+//! the requester's console. `prepare` does the session part: lookup,
+//! connection and the journal; the returned job runs on the console without
+//! the session and without a deadline.
 
 use crate::cli::Invocation;
 use crate::dispatch::Session;
@@ -11,7 +10,10 @@ use crate::log::Level;
 use crate::terminal::TerminalJob;
 use crate::transport::RemoteTransport;
 
-use super::{connect, find, require_portable, required, scripts, sh_quote};
+use super::{connect, find, require_portable, required};
+
+/// The remote command of `node shell`.
+pub const SHELL_COMMAND: &str = "exec \"${SHELL:-/bin/bash}\" -l";
 
 pub async fn prepare<T: RemoteTransport>(session: &mut Session, invocation: &Invocation, mut transport: T)
     -> Result<TerminalJob<T>>
@@ -22,14 +24,9 @@ pub async fn prepare<T: RemoteTransport>(session: &mut Session, invocation: &Inv
     session.log(Level::Info, &format!("Подключаемся к {} ({}@{}:{})...", node.name, node.user, node.ip, node.port));
     connect(&mut transport, &session.state, &node).await?;
     session.log(Level::Success, "Соединение установлено");
-    if scripts::ensure_current(&transport, &node.name, false).await?.uploaded {
-        session.log(Level::Success, "Скрипты загружены");
-    }
     session.log(Level::Info, &format!("Открываю интерактивную SSH-сессию на {} ({})...", node.name, node.ip));
-    session.log(Level::Output, "  (введите 0 в меню сервера для выхода)");
-    let command = format!("bash {}", sh_quote(&format!("{}/setup-essence.sh", scripts::REMOTE_DIR)));
     let failure = format!("SSH-сессия с нодой «{}» завершилась с ошибкой.", node.name);
-    Ok(TerminalJob::new(node.name, command, failure, "SSH-сессия завершена.", transport))
+    Ok(TerminalJob::new(node.name, SHELL_COMMAND.to_owned(), failure, "SSH-сессия завершена.", transport))
 }
 
 #[cfg(test)]
@@ -43,8 +40,8 @@ mod tests {
     use crate::fake_transport::{AuthMethod, ConnectExpectation, FakeScript, FakeTransport, Operation, ScriptStep};
     use crate::model::{Auth, Config, Fingerprint, Node};
     use crate::nodes::testing::{fingerprint, invocation, session};
-    use crate::nodes::{COMMAND_TIMEOUT, CONNECT_TIMEOUT, LONG_TIMEOUT, pin};
-    use crate::transport::{ConsoleEvent, ConsoleSize, ExecResult, HostKeyPolicy, PtyRequest, RawConsole, remote_failure};
+    use crate::nodes::{CONNECT_TIMEOUT, pin};
+    use crate::transport::{ConsoleEvent, ConsoleSize, HostKeyPolicy, PtyRequest, RawConsole, remote_failure};
 
     const SIZE: ConsoleSize = ConsoleSize { cols: 132, rows: 43 };
 
@@ -97,26 +94,7 @@ mod tests {
         PtyRequest { term: "xterm-256color".into(), size: SIZE }
     }
 
-    fn probe(stdout: String) -> ScriptStep {
-        ScriptStep::exec(scripts::probe_command(), 0, COMMAND_TIMEOUT,
-            Ok(ExecResult { stdout: stdout.into_bytes(), stderr: Vec::new(), exit_status: 0 }))
-    }
-
-    /// Server scripts already at the local version: one probe.
-    fn current() -> Vec<ScriptStep> {
-        vec![probe(format!("PRESENT\n{}\n", scripts::local_version().unwrap()))]
-    }
-
-    /// Missing server scripts: probe, upload, confirming probe.
-    fn uploaded() -> Vec<ScriptStep> {
-        vec![
-            probe("MISSING".into()),
-            ScriptStep::upload_any_local(scripts::REMOTE_DIR, LONG_TIMEOUT, Ok(())),
-            probe(format!("PRESENT\n{}\n", scripts::local_version().unwrap())),
-        ]
-    }
-
-    const COMMAND: &str = "bash '/root/essence-setup/setup-essence.sh'";
+    const COMMAND: &str = "exec \"${SHELL:-/bin/bash}\" -l";
 
     fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread().build().unwrap()
@@ -150,11 +128,10 @@ mod tests {
     }
 
     #[test]
-    fn interactive_session_requests_a_pty_for_the_server_menu() {
+    fn interactive_session_opens_a_login_shell() {
         let root = tempfile::tempdir().unwrap();
         let (mut session, journal) = fixture(root.path());
         let mut steps = vec![connect_step()];
-        steps.extend(uploaded());
         steps.push(ScriptStep::interactive(COMMAND, pty(), b"\x1b[1mMENU\x1b[0m\r\n".to_vec(), Ok(0)));
         let before = fingerprint(root.path());
         let mut console = TestConsole::default();
@@ -167,9 +144,7 @@ mod tests {
         assert_eq!(lines, [
             (Level::Info, "Подключаемся к alpha (root@203.0.113.7:2222)...".to_owned()),
             (Level::Success, "Соединение установлено".to_owned()),
-            (Level::Success, "Скрипты загружены".to_owned()),
             (Level::Info, "Открываю интерактивную SSH-сессию на alpha (203.0.113.7)...".to_owned()),
-            (Level::Output, "  (введите 0 в меню сервера для выхода)".to_owned()),
         ], "the job owner journals the done line");
         assert_eq!(fingerprint(root.path()), before, "a shell session changes no local state");
     }
@@ -180,7 +155,6 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let (mut session, _journal) = fixture(root.path());
             let mut steps = vec![connect_step()];
-            steps.extend(current());
             steps.push(ScriptStep::interactive(COMMAND, pty(), Vec::new(), status));
             let (result, script) = shell(&mut session, "alpha", steps, &mut TestConsole::default());
             script.assert_finished();
