@@ -384,19 +384,12 @@ export async function readClientConfig(ctx, name) {
 
 // ─── Конфиг AmneziaWG ───────────────────────────────────────────────────────
 
-/** Подключение AmneziaWG в группах нод. */
-export const AWG_PROXY = 'AWG';
 export const awgConfigArgv = (name, node) => ['client', 'awg-config', '--name', name, '--node', node];
 /** Имя файла конфига AmneziaWG: `<клиент>-<нода>.conf`. */
 export const awgConfigFile = (name, node) => `${name}-${node}.conf`;
 
-/** Ноды, где клиент — пир AmneziaWG: строки `client show .connections` с `AWG`. */
-export function awgNodes(data) {
-  const nodes = asList(data && data.connections)
-    .filter((row) => row && typeof row.node === 'string' && strings(row.proxies).includes(AWG_PROXY))
-    .map((row) => row.node);
-  return [...new Set(nodes)];
-}
+/** Ноды, где клиент — пир AmneziaWG: `client show .awg_nodes` (правило ядра). */
+export const awgNodes = (data) => strings(data && data.awg_nodes);
 
 /**
  * «Конфиг AmneziaWG»: ноды из `client show`, выбор (одна — без вопроса) и

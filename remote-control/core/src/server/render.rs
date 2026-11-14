@@ -4,6 +4,7 @@
 //! Nothing here touches the network or the data directory.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::IpAddr;
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -87,6 +88,9 @@ pub struct Desired {
     pub spec: Vec<(&'static str, String)>,
     /// Firewall rules (`443/tcp`, `8843/udp`).
     pub ports: Vec<String>,
+    /// Sockets our services take (`443/tcp`): the firewall rules and the
+    /// AmneziaWG TPROXY inlet. `node apply` needs them free unless already ours.
+    pub listen: Vec<String>,
     pub lines: Vec<String>,
     pub digest: String,
 }
@@ -417,7 +421,7 @@ impl Layout<'_> {
         Ok(fill_template(MIHOMO_CONFIG, &[
             ("#@ipv6", ipv6.to_owned()), ("#@tproxy", String::new()), ("#@proxies", proxies),
             ("#@outbound", outbound), ("#@groups", String::new()), ("#@listeners", listeners),
-            ("#@sub-rules", inbound_sub_rules()),
+            ("#@sub-rules", self.inbound_sub_rules()),
         ]))
     }
 
@@ -555,6 +559,25 @@ impl Layout<'_> {
             "awg_peers": peers, "cascades": [], "subscription_host": host, "telegram": telegram, "tg_revision": null,
         }))
     }
+
+    /// The reject lines every inbound sub-rule starts with: [`INBOUND_REJECT`]
+    /// and the node's own address (`DIRECT` would reach it over `lo`, past the
+    /// firewall). Without `no-resolve`, so a domain that resolves into these
+    /// ranges is rejected too.
+    fn inbound_rejects(&self) -> String {
+        let own = match self.node.ip.parse::<IpAddr>() {
+            Ok(IpAddr::V4(ip)) => Some(format!("IP-CIDR,{ip}/32")),
+            Ok(IpAddr::V6(ip)) => Some(format!("IP-CIDR6,{ip}/128")),
+            Err(_) => None,
+        };
+        INBOUND_REJECT.iter().map(|rule| (*rule).to_owned()).chain(own)
+            .map(|rule| format!("    - {rule},REJECT\n")).collect()
+    }
+
+    /// `sub-rules:` with `essence-in`: the rejects, then `outbound`.
+    fn inbound_sub_rules(&self) -> String {
+        format!("sub-rules:\n  {INBOUND_RULE}:\n{}    - MATCH,{INBOUND_PROXY}\n", self.inbound_rejects())
+    }
 }
 
 /// The group every inbound connection ends in.
@@ -570,15 +593,6 @@ pub const INBOUND_REJECT: [&str; 9] = [
     "IP-CIDR,192.168.0.0/16", "IP-CIDR,100.64.0.0/10", "IP-CIDR6,fc00::/7", "IP-CIDR6,fe80::/10",
 ];
 
-/// `sub-rules:` with `essence-in`: the rejects, then `outbound`.
-fn inbound_sub_rules() -> String {
-    let mut text = format!("sub-rules:\n  {INBOUND_RULE}:\n");
-    for rule in INBOUND_REJECT {
-        text.push_str(&format!("    - {rule},REJECT\n"));
-    }
-    text.push_str(&format!("    - MATCH,{INBOUND_PROXY}\n"));
-    text
-}
 
 fn file(path: &str, mode: &'static str, content: String) -> RenderedFile {
     RenderedFile { path: path.to_owned(), mode, owner: "root", group: "root", content: Zeroizing::new(content) }
@@ -671,6 +685,10 @@ pub fn desired(config: &Config, node: &Node, secrets: Option<&NodeSecrets>) -> R
     let remove = removed(node, &keep);
     let release: Vec<String> = applied_sites(node).into_iter().filter(|site| layout.site != Some(site.as_str())).collect();
     let ports = layout.rules();
+    let mut listen = ports.clone();
+    if let (Some(_), Some(awg)) = (layout.awg(), &node.params.awg) {
+        listen.extend([format!("{}/tcp", awg.tproxy_port), format!("{}/udp", awg.tproxy_port)]);
+    }
     let profile = layout.profile;
     let (_, _, hy2_cn, hy2_cert) = layout.hy2_tls();
     let hy2_cert = hy2_cert && profile.hysteria2.is_some();
@@ -732,7 +750,7 @@ pub fn desired(config: &Config, node: &Node, secrets: Option<&NodeSecrets>) -> R
     if node.applied.is_none() {
         lines.push(format!("Первая установка: UFW будет включён, если выключен (SSH TCP/{} разрешён).", node.port));
     }
-    Ok(Desired { teardown: false, digest: layout.digest(&users), files, remove, spec, ports, lines })
+    Ok(Desired { teardown: false, digest: layout.digest(&users), files, remove, spec, ports, listen, lines })
 }
 
 fn teardown_digest() -> String {
@@ -772,7 +790,7 @@ pub fn teardown(node: &Node) -> Desired {
         ("REMOVE_FEATURES", "awg sub telegram".to_owned()),
         ("WARP", "false".to_owned()),
     ];
-    Desired { teardown: true, files: Vec::new(), remove, spec, ports: Vec::new(), lines, digest: teardown_digest() }
+    Desired { teardown: true, files: Vec::new(), remove, spec, ports: Vec::new(), listen: Vec::new(), lines, digest: teardown_digest() }
 }
 
 /// `none` (no profile, nothing applied), `running`, `applied` or `pending`
@@ -857,6 +875,16 @@ pub fn awg_client_config(config: &Config, node: &Node, client: &Client) -> Resul
     }
     awg::client_conf(client, layout.server, port, profile, params)
         .ok_or_else(|| invalid(format!("У клиента «{}» нет учётных данных AmneziaWG.", client.name)))
+}
+
+/// Nodes where `client awg-config` serves the client: AmneziaWG is on in the
+/// node's profile, its parameters exist and the client is one of its peers.
+pub fn awg_nodes(config: &Config, client: &Client) -> Vec<String> {
+    config.nodes.iter().filter(|node| {
+        matches!(layout(config, node), Ok(Some(layout)) if layout.awg().is_some())
+            && node.params.awg.is_some()
+            && awg::expected_peers(config, &node.name).iter().any(|peer| peer.name == client.name)
+    }).map(|node| node.name.clone()).collect()
 }
 
 /// SHA-256 of rendered file contents by path (links are not recorded).

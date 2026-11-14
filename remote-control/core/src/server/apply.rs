@@ -67,6 +67,16 @@ fn stage_label(stage: &str) -> &str {
     }
 }
 
+/// What the user does about a failure the executor recognised (`hint=` in
+/// its status); an unknown id adds nothing.
+fn hint_text(hint: &str) -> Option<&'static str> {
+    match hint {
+        "kernel_headers" => Some("в репозиториях нет заголовков текущего ядра для AmneziaWG: обновите ядро \
+            (apt-get install linux-image-amd64 на Debian, linux-image-generic на Ubuntu), перезагрузите сервер и повторите node apply"),
+        _ => None,
+    }
+}
+
 /// The unit state, then the status file of an operation (lines `unit=`,
 /// `stage=`, `result=`, `error=`). The unit is read first: once it is gone
 /// the executor has exited and its status is final.
@@ -418,7 +428,7 @@ fn claim(session: &mut Session, label: &str, recheck: impl FnOnce(&State, &mut C
                 Ok(desired) => {
                     let operation = Operation {
                         id: new_op_id(), digest: desired.digest.clone(), files: render::file_hashes(&desired.files),
-                        ports: desired.ports.clone(), teardown: desired.teardown,
+                        ports: desired.listen.clone(), teardown: desired.teardown,
                     };
                     node.operation = Some(operation.clone());
                     Ok((operation, desired))
@@ -546,7 +556,10 @@ impl<'t, T: RemoteTransport> Run<'t, T> {
                     ("rolled_back", _) => Failure::new(&stage, "rolled_back", format!("откат на этапе «{}»", stage_label(&stage))),
                     ("rollback_failed", _) => Failure::new(&stage, "rollback_failed",
                         format!("откат на этапе «{}» не завершён: резервные копии оставлены на ноде", stage_label(&stage))),
-                    _ => Failure::new(&stage, "failed", format!("ошибка на этапе «{}»", stage_label(&stage))),
+                    _ => Failure::new(&stage, "failed", match status.get("hint").and_then(|hint| hint_text(hint)) {
+                        Some(hint) => format!("ошибка на этапе «{}»: {hint}", stage_label(&stage)),
+                        None => format!("ошибка на этапе «{}»", stage_label(&stage)),
+                    }),
                 };
                 self.end = End::of(Some(result));
                 self.fail(failure);
@@ -633,11 +646,12 @@ async fn probe<T: RemoteTransport>(session: &Session, transport: &mut T, node: &
     Ok(probe)
 }
 
-/// A port the node does not listen on for us yet is taken by someone else.
+/// A socket the node does not hold for us yet (firewall ports and the
+/// AmneziaWG TPROXY inlet) is taken by someone else.
 fn busy_port(probe: &Probe, node: &Node, desired: &Desired) -> Option<Failure> {
     let ours: Vec<&String> = node.applied.iter().flat_map(|applied| &applied.ports)
         .chain(node.operation.iter().flat_map(|operation| &operation.ports)).collect();
-    desired.ports.iter().filter(|rule| !ours.contains(rule)).find_map(|rule| {
+    desired.listen.iter().filter(|rule| !ours.contains(rule)).find_map(|rule| {
         let (port, proto) = rule.split_once('/').and_then(|(port, proto)| Some((port.parse::<u16>().ok()?, proto)))?;
         probe.listening.iter().any(|(listening, busy)| listening == proto && *busy == port).then(|| Failure {
             port: Some(port), ..Failure::new("probe", "port_busy", format!("порт {port} уже занят"))

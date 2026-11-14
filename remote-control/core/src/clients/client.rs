@@ -89,6 +89,8 @@ pub fn show(session: &mut Session, invocation: &Invocation) -> Result<Value> {
         "hy2_password": client.credentials.as_ref().map(|c| &c.hy2_password),
     }));
     object.insert("connections".into(), connections_view(&config, client));
+    // Nodes where `client awg-config` serves the client: the one rule for every front end.
+    object.insert("awg_nodes".into(), json!(crate::server::render::awg_nodes(&config, client)));
     object.insert("config".into(), json!({"path": path.display().to_string(), "exists": path.is_file()}));
     object.insert("subscription".into(), subscription.unwrap_or(Value::Null));
     Ok(data)

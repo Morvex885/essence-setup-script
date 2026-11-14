@@ -226,7 +226,7 @@ fn card_view(name: &str, node: &Value, password: bool) -> View {
         view.context.push(plain(format!("Порты ноды: {}", list.join(", "))));
     }
     if let Some((state, color)) = apply_state(node) { view.context.push(ui::text(format!("Применение: {state}"), color)); }
-    if !profile.is_empty() { view.context.push(plain(format!("WARP: {}", warp_label(node)))); }
+    if let Some(label) = warp_label(node) { view.context.push(plain(format!("WARP: {label}"))); }
     let issues = joined(&node["issues"]);
     if !issues.is_empty() { view.context.push(ui::text(format!("Требует настройки: {issues}"), ui::YELLOW)); }
     let groups = joined(&node["groups"]);
@@ -241,7 +241,7 @@ fn card_view(name: &str, node: &Value, password: bool) -> View {
         Item::new('f', "Профиль", ui::YELLOW), Item::new('m', "Домен", ui::YELLOW), Item::new('i', "Порты", ui::YELLOW),
         Item::new('h', "Усилить защиту SSH", ui::YELLOW), Item::new('r', "Переименовать", ui::YELLOW), Item::new('e', "Тег", ui::YELLOW),
     ];
-    if warp_registered(node) { actions.push(Item::new('g', "Перерегистрировать WARP", ui::YELLOW)); }
+    if warp_label(node).is_some() { actions.push(Item::new('g', "Перерегистрировать WARP", ui::YELLOW)); }
     if password { actions.push(Item::new('w', "Пароль SSH", ui::YELLOW)); }
     actions.extend([Item::new('l', "Псевдонимы подключений", ui::YELLOW), Item::new('d', "Удалить ноду", ui::RED), Item::new(0, "Назад", ui::NC)]);
     view.sections.push(actions);
@@ -263,7 +263,7 @@ impl Screen for NodeCard {
                 "o" | "O" => interactive(ctx, &name, false)?,
                 "t" | "T" => interactive(ctx, &name, true)?,
                 "p" | "P" => connection_node(ctx, &name)?,
-                "g" | "G" if warp_registered(node) => warp_reregister(ctx, &name)?,
+                "g" | "G" if warp_label(node).is_some() => warp_reregister(ctx, &name)?,
                 "k" | "K" => { node_request(ctx, &name, &argv(&["node", "check", "--name", &name]), None)?; }
                 "y" | "Y" => { apply(ctx, &argv(&["node", "apply", "--name", &name]), &name)?; }
                 "f" | "F" => node_profile(ctx, &name, node)?,
@@ -305,7 +305,6 @@ fn delete_node(ctx: &mut Context<'_>, name: &str, node: &Value) -> io::Result<bo
     let reply = node_request(ctx, name, &words, Some(("Удаление ноды", "Удалить ноду в выбранном объёме?")))?;
     Ok(reply.ok || reply.error["deleted"] == true)
 }
-fn warp_registered(node: &Value) -> bool { matches!(node["warp"].as_str(), Some("free" | "plus")) }
 /// «Перерегистрировать WARP»: the core's plan → `node warp-reregister`; the
 /// node then waits for `node apply`, offered right away.
 fn warp_reregister(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
@@ -882,8 +881,10 @@ fn apply_state(node: &Value) -> Option<(&'static str, Color)> {
     }
 }
 fn pending_count(list: &Value) -> usize { rows(list).iter().filter(|node| node["status"] == "pending").count() }
-fn warp_label(node: &Value) -> &'static str {
-    match node["warp"].as_str() { Some("free") => "бесплатный", Some("plus") => "WARP+", _ => "не зарегистрирован" }
+/// `node show .warp`: `None` — WARP is off in the node's profile (no line, no
+/// reregistration); the core's rule, shared with the web.
+fn warp_label(node: &Value) -> Option<&'static str> {
+    match node["warp"].as_str() { Some("free") => Some("бесплатный"), Some("plus") => Some("WARP+"), Some("none") => Some("не зарегистрирован"), _ => None }
 }
 /// `node apply …` under its plan; `name` — the node of `--name` (node codes
 /// and the top-level `domain_required` are resolved, then the command is
@@ -1728,10 +1729,16 @@ mod tests {
         let item = ui.views[0].sections.iter().flatten().find(|i| i.key == "g").unwrap();
         assert_eq!(item.color, ui::YELLOW);
         assert!(ui.views.iter().any(|v| v.context.iter().any(|l| l.to_string() == "WARP: бесплатный")));
-        // Not registered: the line says so and there is nothing to reregister.
-        let (_, ui) = screen(&mut NodeCard("n".into()), &["g", "0"], vec![shown("none"), shown("none")]);
-        assert!(noticed(&ui, "Неверный выбор."));
+        // Not registered yet: the line says so and reregistration registers it.
+        let (client, ui) = screen(&mut NodeCard("n".into()), &["g", "n", "0"], vec![
+            shown("none"), (words.clone(), plan("confirmation_required", "w")), shown("none"),
+        ]);
+        assert_eq!(client.calls.iter().filter(|call| call[..2] == ["node", "warp-reregister"]).count(), 1);
         assert!(ui.views[0].context.iter().any(|l| l.to_string() == "WARP: не зарегистрирован"));
+        // WARP off in the profile: no line and no action.
+        let (_, ui) = screen(&mut NodeCard("n".into()), &["g", "0"], vec![shown("off"), shown("off")]);
+        assert!(noticed(&ui, "Неверный выбор."));
+        assert!(!ui.views[0].context.iter().any(|l| l.to_string().starts_with("WARP:")));
         assert!(!ui.views[0].sections.iter().flatten().any(|i| i.key == "g"));
     }
 

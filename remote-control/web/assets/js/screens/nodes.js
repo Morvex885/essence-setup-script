@@ -107,7 +107,7 @@ const TABS = [
   { id: 'maintenance', label: 'Обслуживание' },
 ];
 
-function Overview({ ctx, node, profile }) {
+function Overview({ ctx, node }) {
   const password = model.passwordStatus(node);
   const issues = model.joinedPlain(node.issues);
   const apply = applyState(node);
@@ -124,7 +124,7 @@ function Overview({ ctx, node, profile }) {
       { label: 'Порты ноды', value: ports.length ? ports.map(([key, value]) => `${key}: ${model.plain(value)}`).join(', ') : 'как в профиле' },
       { label: 'Применение', value: html`<${Badge} tone=${apply.tone}>${apply.label}<//>` },
       { label: 'Подключения', value: model.joinedPlain(node.proxies) || '—' },
-      { label: 'WARP', value: model.warpLabel(node, profile) },
+      { label: 'WARP', value: model.warpLabel(node) },
       { label: 'Требует настройки', value: issues && html`<${Badge} tone="warn">${issues}<//>` },
       { label: 'Группы', value: html`<${Chips} items=${asList(node.groups).map((group) => ({ label: model.plain(group), href: ctx.href('groups', model.plain(group)) }))} />` },
       { label: 'Клиентов', value: model.plain(node.clients) },
@@ -170,10 +170,6 @@ function NodeCard({ ctx, name, tab }) {
   useEffect(() => {
     if (show.reply && show.reply.error && show.reply.error.code === 'not_found') ctx.navigate('nodes');
   }, [show.reply]);
-  // Профиль ноды — только для строки WARP; сбой чтения строку «не зарегистрирован» скрывает.
-  const profileName = show.data ? model.plain(show.data.profile) : '';
-  const profileShow = useCommand(ctx, profileName ? ['profile', 'show', '--name', profileName] : null, [], { quiet: true });
-  const profile = profileName ? profileShow.data : null;
   const back = { href: ctx.href('nodes'), label: 'Ноды' };
   const active = TABS.some((item) => item.id === tab) ? tab : TABS[0].id;
   const tabs = TABS.map((item) => ({ ...item, href: ctx.href('nodes', name, item.id), active: item.id === active }));
@@ -212,7 +208,7 @@ function NodeCard({ ctx, name, tab }) {
         { label: 'Изменить', icon: 'pencil', disabled: busy, onClick: edit },
         ...(password ? [{ label: 'Пароль SSH', icon: 'key-round', disabled: busy, onClick: () => then(() => model.setNodePassword(ctx, name)) }] : []),
         { label: 'Проверить подключение', icon: 'refresh-cw', disabled: busy, onClick: act.check },
-        ...(model.warpLabel(node, profile) !== null
+        ...(model.warpReregisterOffered(node)
           ? [{ label: 'Перерегистрировать WARP', icon: 'refresh-cw', disabled: busy, onClick: () => then(() => model.warpReregister(ctx, name)) }]
           : []),
         { label: 'Удалить ноду', icon: 'trash-2', danger: true, disabled: busy, onClick: remove },
@@ -222,7 +218,7 @@ function NodeCard({ ctx, name, tab }) {
     switch (active) {
       case 'connections': body = html`<${NodeConnections} ctx=${ctx} name=${name} />`; break;
       case 'maintenance': body = html`<${Maintenance} busy=${busy} act=${act} remove=${remove} />`; break;
-      default: body = html`<${Overview} ctx=${ctx} node=${node} profile=${profile} />`;
+      default: body = html`<${Overview} ctx=${ctx} node=${node} />`;
     }
     const apply = applyState(node);
     return html`<${Page} title=${name} back=${back} tabs=${tabs} actions=${actions}

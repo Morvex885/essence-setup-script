@@ -395,15 +395,16 @@ export const nodeDomainArgv = (name, domain) => ['node', 'domain', '--name', nam
 export const nodePortArgv = (name, protocol, port) => ['node', 'port', '--name', name, '--protocol', protocol, '--port', port];
 
 /**
- * Строка WARP карточки (`node show .warp`: `none|free|plus`): зарегистрированный
- * WARP — всегда, «не зарегистрирован» — только у ноды профиля с WARP
- * (`profile show .warp`). `null` — строки нет (WARP ноде не нужен или профиль не прочитан).
+ * Строка WARP карточки и действие «Перерегистрировать WARP» (`node show .warp`:
+ * `off|none|free|plus`, правило ядра, как в TUI): `null` — WARP в профиле ноды
+ * выключен, строки и действия нет.
  */
-export function warpLabel(node, profile = null) {
-  const label = { free: 'бесплатный', plus: 'WARP+' }[node && node.warp];
-  if (label) return label;
-  return profile && profile.warp === true ? 'не зарегистрирован' : null;
+export function warpLabel(node) {
+  return { none: 'не зарегистрирован', free: 'бесплатный', plus: 'WARP+' }[node && node.warp] || null;
 }
+
+/** «Перерегистрировать WARP» в меню карточки: для `none|free|plus`, не для `off` (как в TUI). */
+export const warpReregisterOffered = (node) => warpLabel(node) !== null;
 
 export const warpReregisterArgv = (name) => ['node', 'warp-reregister', '--name', name];
 

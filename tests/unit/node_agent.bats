@@ -80,8 +80,8 @@ HY2_CERT='false'
 HY2_CN=''
 UFW_RULES='${RULES-443/tcp}'
 RELEASE_CERTS='${RELEASE-}'
-FEATURES=''
-REMOVE_FEATURES=''
+FEATURES='${FEATURES_SPEC-}'
+REMOVE_FEATURES='${REMOVE_SPEC-}'
 EOF
 }
 
@@ -739,7 +739,7 @@ awg_files() {
     awg_call awg_activate
     assert_success
     grep -qx "awg syncconf awg0 /dev/fd/63" "$CALLS" || grep -q "^awg syncconf awg0" "$CALLS"
-    ! grep -q "restart awg-quick@awg0" "$CALLS"
+    ! grep -q "restart awg-quick@awg0" "$CALLS" || return 1
     grep -qx "sysctl -w net.ipv4.ip_forward=1" "$CALLS"
 }
 
@@ -748,7 +748,7 @@ awg_files() {
     awg_call awg_activate
     assert_success
     grep -qx "systemctl restart awg-quick@awg0" "$CALLS"
-    ! grep -q "^awg syncconf" "$CALLS"
+    ! grep -q "^awg syncconf" "$CALLS" || return 1
     : >"$CALLS"
     awg_files 40000
     AWG_DOWN=1 awg_call awg_activate
@@ -756,12 +756,153 @@ awg_files() {
     ! grep -q "^awg syncconf" "$CALLS"
 }
 
-@test "awg_rollback и awg_remove" {
-    awg_files 40000
-    awg_call awg_rollback
+@test "awg_rollback: перезапуск только при изменённом транзакцией awg0.conf; awg_remove удаляет каталог" {
+    awg_files 41000
+    mkdir -p "$OPDIR/files/etc/amnezia/amneziawg"
+    cp "$ROOT/etc/amnezia/amneziawg/awg0.conf" "$OPDIR/files/etc/amnezia/amneziawg/awg0.conf"
+    # awg0.conf вне транзакции — AWG не трогается.
+    awg_call 'TX_PATHS=(/etc/mihomo/config.yaml); TX_DEACTIVATED=""; awg_rollback'
+    assert_success
+    ! grep -q "awg-quick@awg0" "$CALLS" || return 1
+    # В транзакции и изменён (порт 41000 против копии с 40000) — прежний конфиг перезапускается.
+    awg_call 'TX_PATHS=(/etc/amnezia/amneziawg/awg0.conf); TX_DEACTIVATED=""; awg_rollback'
+    grep -qx "systemctl enable awg-quick@awg0" "$CALLS"
     grep -qx "systemctl restart awg-quick@awg0" "$CALLS"
+    # В транзакции, но совпадает с копией — перезапуска нет.
+    : >"$CALLS"
+    cp "$OPDIR/backup/etc/amnezia/amneziawg/awg0.conf" "$OPDIR/files/etc/amnezia/amneziawg/awg0.conf"
+    awg_call 'TX_PATHS=(/etc/amnezia/amneziawg/awg0.conf); TX_DEACTIVATED=""; awg_rollback'
+    ! grep -q "awg-quick@awg0" "$CALLS" || return 1
     awg_call awg_remove
     assert_success
     [[ ! -e "$ROOT/etc/amnezia" ]]
+}
+
+@test "откат по чужой причине не перезапускает работающий awg0" {
+    awg_real_stubs
+    printf 'awg_prepare() { :; }\n' >>"$AGENT/steps/awg.sh"
+    write_manifest
+    mkdir -p "$ROOT/etc/amnezia/amneziawg"
+    printf '[Interface]\n' >"$ROOT/etc/amnezia/amneziawg/awg0.conf"
+    add_file /etc/mihomo/config.yaml "new"
+    add_file /etc/amnezia/amneziawg/awg0.conf "[Interface]"
+    FEATURES_SPEC=awg write_spec
+    MIHOMO_T_RC=1 run_agent
+    assert_failure
+    run status
+    assert_line "result=rolled_back"
+    ! grep -q "awg-quick@awg0" "$CALLS" || return 1
+    [[ -e "$AWG_UP" ]]
+}
+
+@test "откат после awg_deactivate поднимает AmneziaWG с восстановленным конфигом" {
+    awg_real_stubs
+    mkdir -p "$ROOT/etc/amnezia/amneziawg"
+    printf '[Interface]\nListenPort = 40000\n' >"$ROOT/etc/amnezia/amneziawg/awg0.conf"
+    printf '/etc/amnezia/amneziawg/awg0.conf\n' >"$OPDIR/remove.list"
+    add_file /etc/mihomo/config.yaml "new"
+    RULES="" REMOVE_SPEC=awg write_spec
+    # mihomo -t отклоняет конфиг уже после снятия и удаления awg0.conf.
+    MIHOMO_T_RC=1 run_agent
+    assert_failure
+    run status
+    assert_line "result=rolled_back"
+    assert_line "error=config"
+    [[ "$(cat "$ROOT/etc/amnezia/amneziawg/awg0.conf")" == $'[Interface]\nListenPort = 40000' ]]
+    local down restart
+    down=$(line_of "systemctl disable --now awg-quick@awg0")
+    restart=$(line_of "systemctl restart awg-quick@awg0")
+    [[ -n "$down" && -n "$restart" && "$down" -lt "$restart" ]]
+    grep -qx "systemctl enable awg-quick@awg0" "$CALLS"
+}
+
+# awg_real_stubs — awg-quick, как настоящий, без конфига в /etc не находит
+# интерфейс; ExecStop юнита (`disable --now`) — тот же `awg-quick down awg0`.
+awg_real_stubs() {
+    export AWG_UP="$BATS_TEST_TMPDIR/awg0-up"
+    stub awg-quick 'conf="$2"; [[ "$conf" == */* ]] || conf="$ESSENCE_NODE_ROOT/etc/amnezia/amneziawg/$conf.conf"
+[[ -f "$conf" ]] || { echo "FAILED $*" >>"$CALLS"; exit 1; }
+rm -f "$AWG_UP"; exit 0'
+    stub ip '[[ "$*" == "link show awg0" && -e "$AWG_UP" ]]'
+    stub systemctl 'if [[ "$*" == "disable --now awg-quick@awg0" && -e "$AWG_UP" ]]; then awg-quick down awg0 || true; fi
+exit 0'
+    : >"$AWG_UP"
+}
+
+@test "снятие awg: интерфейс опускается до удаления awg0.conf (apply и teardown)" {
+    local mode
+    for mode in apply teardown; do
+        : >"$CALLS"
+        rm -rf "$OPDIR"; mkdir -p "$OPDIR/files"
+        awg_real_stubs
+        mkdir -p "$ROOT/etc/amnezia/amneziawg"
+        printf '[Interface]\nListenPort = 40000\n' >"$ROOT/etc/amnezia/amneziawg/awg0.conf"
+        printf '/etc/amnezia/amneziawg/awg0.conf\n' >"$OPDIR/remove.list"
+        [[ "$mode" == apply ]] && add_file /etc/mihomo/config.yaml "new"
+        MODE=$mode RULES="" REMOVE_SPEC=awg write_spec
+        run_agent
+        assert_success
+        run status
+        assert_line "result=committed"
+        ! grep -q "^FAILED" "$CALLS" || return 1
+        grep -qx "awg-quick down awg0" "$CALLS"
+        [[ ! -e "$AWG_UP" && ! -e "$ROOT/etc/amnezia" ]]
+    done
+}
+
+@test "сбой первой установки awg опускает интерфейс по конфигу операции" {
+    awg_real_stubs
+    # Пакеты и подъём интерфейса — вне теста; интерфейс уже поднят.
+    printf 'awg_prepare() { :; }\nawg_activate() { :; }\n' >>"$AGENT/steps/awg.sh"
+    write_manifest
+    add_file /etc/mihomo/config.yaml "new"
+    add_file /etc/amnezia/amneziawg/awg0.conf "[Interface]"
+    FEATURES_SPEC=awg write_spec
+    # Готовность (ss) не прошла: откат.
+    SS_OMIT=8443 AGENT_LISTEN_WAIT_SECONDS=1 run_agent
+    assert_failure
+    run status
+    assert_line "result=rolled_back"
+    ! grep -q "^FAILED" "$CALLS" || return 1
+    grep -q "^awg-quick down .*/files/etc/amnezia/amneziawg/awg0.conf$" "$CALLS"
     grep -qx "systemctl disable --now awg-quick@awg0" "$CALLS"
+    [[ ! -e "$AWG_UP" && ! -e "$ROOT/etc/amnezia/amneziawg/awg0.conf" ]]
+}
+
+@test "ключ PPA: в keyring попадает только ключ с закреплённым отпечатком" {
+    command -v gpg >/dev/null || skip "нет gpg"
+    local home="$BATS_TEST_TMPDIR/gpg" fpr
+    mkdir -m 700 "$home"
+    gpg --batch --homedir "$home" --passphrase '' --quick-gen-key 'Pinned <p@example.com>' ed25519 sign never 2>/dev/null
+    gpg --batch --homedir "$home" --passphrase '' --quick-gen-key 'Extra <e@example.com>' ed25519 sign never 2>/dev/null
+    fpr=$(gpg --batch --homedir "$home" --with-colons --list-keys p@example.com | awk -F: '$1 == "fpr" { print $10; exit }')
+    gpg --batch --homedir "$home" --armor --export >"$BATS_TEST_TMPDIR/both.asc"
+    gpg --batch --homedir "$home" --armor --export e@example.com >"$BATS_TEST_TMPDIR/extra.asc"
+    mkdir -p "$BATS_TEST_TMPDIR/tx"
+    awg_call "AWG_PPA_FINGERPRINT=$fpr; _awg_pinned_keyring '$BATS_TEST_TMPDIR/both.asc' '$BATS_TEST_TMPDIR/out.gpg' '$BATS_TEST_TMPDIR/tx'"
+    assert_success
+    [[ "$(gpg --batch --show-keys --with-colons "$BATS_TEST_TMPDIR/out.gpg" | awk -F: '$1 == "pub"' | wc -l)" -eq 1 ]]
+    gpg --batch --show-keys --with-colons "$BATS_TEST_TMPDIR/out.gpg" | grep -q "^fpr:::::::::$fpr:"
+    [[ -z "$(ls -A "$BATS_TEST_TMPDIR/tx")" ]]
+    awg_call "AWG_PPA_FINGERPRINT=$fpr; _awg_pinned_keyring '$BATS_TEST_TMPDIR/extra.asc' '$BATS_TEST_TMPDIR/out.gpg' '$BATS_TEST_TMPDIR/tx'"
+    assert_failure
+}
+
+@test "awg: в репозиториях нет headers текущего ядра — подсказка kernel_headers в status" {
+    stub gpg 'exit 0'
+    stub apt-cache 'echo "  Candidate: (none)"'
+    awg_call 'AWG_KERNEL=9.9.9-test; _awg_bootstrap_dependencies; echo "rc=$? hint=$HINT"'
+    [[ "$output" == *"rc=1 hint=kernel_headers"* ]]
+    [[ "$output" == *"перезагрузите сервер"* ]]
+}
+
+@test "подсказка шага попадает в status вместе с ошибкой этапа" {
+    printf 'awg_prepare() { HINT=kernel_headers; return 1; }\n' >"$AGENT/steps/zz-hint.sh"
+    write_manifest
+    FEATURES_SPEC=awg write_spec
+    run_agent
+    run status
+    assert_line "result=failed"
+    assert_line "error=prepare"
+    assert_line "hint=kernel_headers"
 }

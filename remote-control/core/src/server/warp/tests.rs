@@ -31,6 +31,23 @@ fn script_output_is_parsed_from_its_tail() {
     assert!(register_command(false).ends_with(" essence-warp 0"));
 }
 
+#[test]
+fn the_warp_plus_key_stays_out_of_argv_and_is_bound_on_any_account() {
+    // wgcf reads `license_key` from `WGCF_LICENSE_KEY` (viper, prefix `WGCF`).
+    assert!(REGISTER.contains("\nif [[ -n \"$key\" ]]; then\n    WGCF_LICENSE_KEY=\"$key\" ./wgcf update >&2 && plus=true\nfi\n"));
+    assert!(!REGISTER.contains("--license-key") && !REGISTER.contains("new=1"));
+    let umask = REGISTER.find("umask 077\n").unwrap();
+    assert!(umask < REGISTER.find("mkdir -p /root/wgcf").unwrap());
+}
+
+#[test]
+fn curl_is_installed_from_refreshed_package_lists() {
+    // A fresh image ships stale lists: `install` alone gets 404 from the mirror.
+    let update = REGISTER.find("apt-get -o DPkg::Lock::Timeout=300 update -q").unwrap();
+    let install = REGISTER.find("apt-get -o DPkg::Lock::Timeout=300 install -y -q curl").unwrap();
+    assert!(update < install);
+}
+
 fn profile(warp: bool, mark: Option<&str>) -> Profile {
     Profile { warp, warp_plus: mark.map(str::to_owned), ..crate::model::test_profile("main") }
 }

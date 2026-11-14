@@ -250,7 +250,7 @@ fn client_card(ctx: &mut Context<'_>, mut name: String) -> io::Result<()> {
             "0" => return Ok(()),
             "v" => show_client(ctx, &name)?,
             "s" => client_subscription(ctx, &name)?,
-            "a" => awg_config(ctx, &name, &strings(&row["nodes"]))?,
+            "a" => awg_config(ctx, &name)?,
             "f" => generate(ctx, &["--client", &name])?,
             "n" => client_nodes(ctx, &name, inherit, &strings(&row["nodes"]))?,
             "p" => if inherit { ctx.ui.notice(ui::warn("Подключения настраиваются только для клиента со своими нодами.")); }
@@ -294,17 +294,15 @@ fn show_client(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
     }
     present(ctx, &view)
 }
-/// «Конфиг AmneziaWG»: a node of the client with AmneziaWG (`node list
-/// .proxies` has `AWG`) → `client awg-config` → a local file (default
-/// `<client>-<node>.conf`). The config holds secrets: it goes only to the file.
-fn awg_config(ctx: &mut Context<'_>, name: &str, nodes: &[String]) -> io::Result<()> {
-    let Some(data) = fetch(ctx, &["node", "list"])? else { return Ok(()); };
-    let available: Vec<&Value> = rows(&data).iter()
-        .filter(|r| nodes.iter().any(|n| r["name"] == n.as_str()) && strings(&r["proxies"]).iter().any(|p| p == "AWG")).collect();
+/// «Конфиг AmneziaWG»: a node from `client show .awg_nodes` (the core's peer
+/// rule) → `client awg-config` → a local file (default `<client>-<node>.conf`).
+/// The config holds secrets: it goes only to the file.
+fn awg_config(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
+    let Some(data) = fetch(ctx, &["client", "show", "--name", name])? else { return Ok(()); };
+    let available = strings(&data["awg_nodes"]);
     if available.is_empty() { ctx.ui.notice(ui::warn("У клиента нет нод с AmneziaWG.")); return Ok(()); }
-    let labels: Vec<String> = available.iter().map(|r| node_label(r)).collect();
-    let Some(i) = ctx.select(&format!("Конфиг AmneziaWG: {name}"), &labels)? else { return Ok(()); };
-    let node = text(&available[i]["name"]).to_owned();
+    let Some(i) = ctx.select(&format!("Конфиг AmneziaWG: {name}"), &available)? else { return Ok(()); };
+    let node = available[i].clone();
     let default = format!("{name}-{node}.conf");
     let Some(path) = ask(ctx, &format!("Путь к файлу (Enter — {default})"))? else { return Ok(()); };
     let path = expand_home(if path.is_empty() { &default } else { &path });
@@ -1141,33 +1139,33 @@ mod tests {
         assert!(data.sections.is_empty());
     }
     #[test]
-    fn awg_config_picks_a_client_node_with_awg_and_writes_only_the_file() {
+    fn awg_config_picks_a_node_from_client_show_and_writes_only_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("alice-de.conf");
         let target_arg = target.to_str().unwrap().to_owned();
-        let nodes = json!([{"name":"de","ip":"127.0.0.1","port":22,"proxies":["VLESS Reality","AWG"]},
-            {"name":"ru","ip":"10.0.0.2","port":2222,"proxies":["AWG"]}, {"name":"fi","ip":"10.0.0.3","port":22,"proxies":["VLESS Reality"]}]);
+        let show = ["client", "show", "--name", "alice"];
+        let shown = json!({"name": "alice", "awg_nodes": ["de"]});
         let config = "[Interface]\nPrivateKey = AWG-SECRET\n";
         let words = ["client", "awg-config", "--name", "alice", "--node", "de"];
         // Card key (both cases) → a fresh file; an existing one is kept on refusal;
         // Enter takes the default name; `invalid` writes nothing.
         let (core, ui) = drive(vec![
-            ok(&["client", "list"], alice(false)), ok(&["node", "list"], nodes.clone()), ok(&words, json!({"config": config})),
-            ok(&["client", "list"], alice(false)), ok(&["node", "list"], nodes.clone()), ok(&words, json!({"config": "OTHER"})),
-            ok(&["client", "list"], alice(false)), ok(&["node", "list"], nodes.clone()), step(&words, fail("invalid", json!({}))),
+            ok(&["client", "list"], alice(false)), ok(&show, shown.clone()), ok(&words, json!({"config": config})),
+            ok(&["client", "list"], alice(false)), ok(&show, shown.clone()), ok(&words, json!({"config": "OTHER"})),
+            ok(&["client", "list"], alice(false)), ok(&show, shown), step(&words, fail("invalid", json!({}))),
             ok(&["client", "list"], alice(false)),
         ], &["a", "1", &target_arg, "A", "1", &target_arg, "n", "a", "1", "", "0"], |ctx| client_card(ctx, "alice".into()));
         assert_eq!(core.calls.iter().filter(|call| **call == argv(&words)).count(), 3);
         assert_eq!(fs::read_to_string(&target).unwrap(), config, "overwritten only after consent");
-        assert_eq!(view(&ui, "Конфиг AmneziaWG: alice").sections[0].iter().filter(|item| item.key != "0").count(), 1, "only the client's nodes with AWG");
+        assert_eq!(view(&ui, "Конфиг AmneziaWG: alice").sections[0].iter().filter(|item| item.key != "0").count(), 1, "only the core's AmneziaWG nodes");
         assert!(ui.views.iter().any(|v| v.title == "Конфиг AmneziaWG" && v.prompt.contains("(y/N)")));
         assert!(ui.views.iter().any(|v| v.title.contains("alice-de.conf")), "the default file name is offered");
         assert_eq!(notices(&ui, "Конфиг AmneziaWG alice (de) сохранён в"), 1);
         assert!(!Path::new("alice-de.conf").exists());
         assert!(!ui.views.iter().any(|v| content(v).contains("AWG-SECRET")) && !ui.notices.iter().any(|l| l.to_string().contains("AWG-SECRET")));
         assert!(!core.calls.iter().flatten().any(|word| word.contains(dir.path().to_str().unwrap())), "no local path reaches the daemon");
-        // No node of the client has AmneziaWG: a warning, no question.
-        let (core, ui) = drive(vec![ok(&["node", "list"], nodes)], &[], |ctx| awg_config(ctx, "alice", &["fi".to_owned()]));
+        // The client is a peer nowhere: a warning, no question.
+        let (core, ui) = drive(vec![ok(&show, json!({"name": "alice", "awg_nodes": []}))], &[], |ctx| awg_config(ctx, "alice"));
         assert_eq!(core.calls.len(), 1);
         assert_eq!(notices(&ui, "нет нод с AmneziaWG"), 1);
     }

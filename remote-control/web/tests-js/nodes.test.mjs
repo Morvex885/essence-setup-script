@@ -335,16 +335,18 @@ test('argv профиля, домена и портов ноды', () => {
   ]);
 });
 
-test('WARP ноды: строка по node.warp и профилю, argv перерегистрации', () => {
-  assert.notEqual(model.warpLabel({ warp: 'plus' }), model.warpLabel({ warp: 'free' }));
-  assert.equal(typeof model.warpLabel({ warp: 'free' }), 'string');
-  // Не зарегистрирован — строка только у ноды профиля с WARP.
-  assert.equal(model.warpLabel({ warp: 'none' }), null);
-  assert.equal(model.warpLabel({ warp: 'none' }, { warp: false }), null);
-  const none = model.warpLabel({ warp: 'none' }, { warp: true });
-  assert.equal(typeof none, 'string');
-  assert.notEqual(none, model.warpLabel({ warp: 'free' }));
-  assert.equal(model.warpLabel({ warp: 'plus' }, { warp: false }), model.warpLabel({ warp: 'plus' }));
+test('WARP ноды: строка и действие по node.warp (правило ядра), argv перерегистрации', () => {
+  assert.equal(model.warpLabel({ warp: 'plus' }), 'WARP+');
+  assert.equal(model.warpLabel({ warp: 'free' }), 'бесплатный');
+  // Не зарегистрирован, но WARP в профиле включён — строка и перерегистрация есть.
+  assert.equal(model.warpLabel({ warp: 'none' }), 'не зарегистрирован');
+  // WARP в профиле выключен — ни строки, ни действия.
+  assert.equal(model.warpLabel({ warp: 'off' }), null);
+  assert.equal(model.warpLabel({}), null);
+  assert.equal(model.warpLabel(null), null);
+  // Действие в меню карточки — по тому же правилу: при `off` его нет.
+  assert.deepEqual(['off', 'none', 'free', 'plus'].map((warp) => model.warpReregisterOffered({ warp })), [false, true, true, true]);
+  assert.equal(model.warpReregisterOffered({}), false);
   assert.deepEqual(model.warpReregisterArgv('n'), ['node', 'warp-reregister', '--name', 'n']);
 });
 

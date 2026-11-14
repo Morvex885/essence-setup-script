@@ -30,6 +30,8 @@ exec </dev/null >>"$OP/log" 2>&1
 STAGE=init
 RESULT=""
 ERROR=""
+# Идентификатор подсказки для RC (`hint=` в status): что сделать пользователю.
+HINT=""
 TX_OPEN=false
 TX_PATHS=()
 # Службы, работавшие до открытия транзакции (tx_open).
@@ -37,6 +39,9 @@ TX_ACTIVE=""
 # Свои правила UFW, добавленные и удалённые этой операцией («правило\n»).
 FW_ADDED=""
 FW_DELETED=""
+# Фичи из REMOVE_FEATURES, остановленные этапом config («фича »): откат
+# поднимает их снова.
+TX_DEACTIVATED=""
 
 # status: запись целиком через tmp + mv.
 write_status() {
@@ -45,6 +50,7 @@ write_status() {
         printf 'stage=%s\n' "$STAGE"
         if [[ -n "$RESULT" ]]; then printf 'result=%s\n' "$RESULT"; fi
         if [[ -n "$ERROR" ]]; then printf 'error=%s\n' "$ERROR"; fi
+        if [[ -n "$HINT" ]]; then printf 'hint=%s\n' "$HINT"; fi
     } >"$tmp" && mv -f "$tmp" "$OP/status"
 }
 
@@ -64,7 +70,8 @@ stage() {
     info "Этап: $STAGE"
 }
 
-# feature_hook <фича> <prepare|activate|rollback|remove> — только если определён.
+# feature_hook <фича> <prepare|activate|deactivate|rollback|remove> — только
+# если определён. deactivate — снятие фичи до удаления её файлов этапом config.
 feature_hook() {
     local fn="${1}_${2}"
     declare -F "$fn" >/dev/null || return 0

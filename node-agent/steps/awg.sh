@@ -1,7 +1,8 @@
 #!/bin/bash
 # ─── Фича awg: AmneziaWG (этап 3 плана) ─────────────────────────────────────
-# Хуки исполнителя: awg_prepare (пакеты PPA+DKMS до транзакции), awg_activate
-# и awg_rollback (внутри транзакции `config`), awg_remove (cleanup при снятии).
+# Хуки исполнителя: awg_prepare (пакеты PPA+DKMS до транзакции), awg_activate,
+# awg_deactivate и awg_rollback (внутри транзакции `config`), awg_remove
+# (необратимая очистка после committed при снятии).
 # Конфиг /etc/amnezia/amneziawg/awg0.conf рендерит RC и ставит транзакция.
 # Перенос `setup-essence/modules/amneziawg.sh:55-560` без меню и без
 # проверок базовой установки mihomo (её ставят этапы этого же применения).
@@ -263,7 +264,8 @@ _awg_bootstrap_dependencies() {
         candidate=$(LC_ALL=C apt-cache policy "$AWG_HEADERS_PKG" 2>/dev/null \
             | awk '/Candidate:/ { print $2; exit }')
         if [[ -z "$candidate" || "$candidate" == "(none)" ]]; then
-            _awg_fail "Активные репозитории не предоставляют headers для текущего ядра ($AWG_HEADERS_PKG). Возможные причины: старое/custom/provider kernel, неполные репозитории или APT pinning. Ядро не обновлялось, сервер не перезагружался."
+            HINT=kernel_headers
+            _awg_fail "Активные репозитории не предоставляют headers для текущего ядра ($AWG_HEADERS_PKG). Возможные причины: старое/custom/provider kernel, неполные репозитории или APT pinning. Ядро не обновлялось, сервер не перезагружался. Обновите ядро (apt-get install linux-image-amd64 на Debian, linux-image-generic на Ubuntu), перезагрузите сервер и повторите node apply."
             return 1
         fi
         if LC_ALL=C dpkg-query -W -f='${Status}' "$AWG_HEADERS_PKG" 2>/dev/null \
@@ -302,8 +304,26 @@ _awg_bootstrap_dependencies() {
     return 0
 }
 
+# _awg_pinned_keyring <armor> <keyring> <tmpdir> — в keyring попадает только
+# ключ $AWG_PPA_FINGERPRINT: импорт во временный каталог gpg и экспорт по
+# отпечатку, лишние ключи из загруженного файла отбрасываются.
+_awg_pinned_keyring() {
+    local armor="$1" keyring="$2" home pubs fingerprint
+    home=$(mktemp -d "$3/gnupg.XXXXXX") || return 1
+    if ! gpg --batch --quiet --homedir "$home" --import "$armor" 2>/dev/null ||
+       ! gpg --batch --homedir "$home" --export "$AWG_PPA_FINGERPRINT" >"$keyring" 2>/dev/null; then
+        rm -rf -- "$home"
+        return 1
+    fi
+    rm -rf -- "$home"
+    pubs=$(gpg --batch --show-keys --with-colons "$keyring" 2>/dev/null | awk -F: '$1 == "pub"' | wc -l)
+    fingerprint=$(gpg --batch --show-keys --with-colons "$keyring" 2>/dev/null \
+        | awk -F: '$1 == "fpr" { print toupper($10); exit }')
+    [[ "$pubs" -eq 1 && "$fingerprint" == "$AWG_PPA_FINGERPRINT" ]]
+}
+
 _awg_install_repository() {
-    local key_ascii key_tmp source_tmp fingerprint old_umask
+    local key_ascii key_tmp source_tmp old_umask
     _awg_repo_begin || {
         _awg_fail "Не удалось начать транзакцию настройки PPA Amnezia."
         return 1
@@ -333,14 +353,6 @@ _awg_install_repository() {
         _awg_repo_abort
         return 1
     }
-    fingerprint=$(gpg --batch --show-keys --with-colons "$key_ascii" 2>/dev/null \
-        | awk -F: '$1 == "fpr" { print toupper($10); exit }')
-    if [[ "$fingerprint" != "$AWG_PPA_FINGERPRINT" ]]; then
-        _awg_fail "Fingerprint ключа PPA не совпал с ожидаемым $AWG_PPA_FINGERPRINT."
-        _awg_repo_abort
-        return 1
-    fi
-
     mkdir -p -- "$(dirname "$AWG_APT_KEYRING")" "$(dirname "$AWG_APT_SOURCE")" || {
         _awg_repo_abort
         return 1
@@ -349,9 +361,9 @@ _awg_install_repository() {
         _awg_repo_abort
         return 1
     }
-    if ! gpg --batch --dearmor < "$key_ascii" > "$key_tmp"; then
+    if ! _awg_pinned_keyring "$key_ascii" "$key_tmp" "$AWG_REPO_TX_DIR"; then
         rm -f -- "$key_tmp"
-        _awg_fail "Не удалось преобразовать ключ PPA в keyring."
+        _awg_fail "В ключе PPA нет ключа с fingerprint $AWG_PPA_FINGERPRINT."
         _awg_repo_abort
         return 1
     fi
@@ -558,18 +570,43 @@ awg_activate() {
     _awg_wait_up
 }
 
+# Откат трогает AmneziaWG, только если транзакция трогала его: awg_deactivate
+# в этой операции — интерфейс поднимается с восстановленным конфигом;
+# awg0.conf в транзакции (TX_PATHS) и изменён ею — прежний конфиг
+# перезапускается, первой установки (копии нет) — интерфейс опускается по
+# новому конфигу из файлов операции (в /etc его уже нет). Откат по чужой
+# причине (mihomo -t, nginx, sub…) работающий awg0 не перезапускает.
 awg_rollback() {
-    local backup="$OP/backup${AWG_CONF#"$R"}"
+    local path="${AWG_CONF#"$R"}"
+    local backup="$OP/backup$path" staged="$OP/files$path"
+    # Явный код: в обработчике trap (finish) голый `return` вернул бы код
+    # команды до trap.
+    if [[ " $TX_DEACTIVATED " == *" awg "* ]]; then
+        systemctl enable awg-quick@awg0 && systemctl restart awg-quick@awg0
+        return $?
+    fi
+    [[ " ${TX_PATHS[*]} " == *" $path "* ]] || return 0
     if [[ -f "$backup" ]]; then
-        systemctl restart awg-quick@awg0
+        cmp -s -- "$backup" "$staged" && return 0
+        systemctl enable awg-quick@awg0 && systemctl restart awg-quick@awg0
     else
-        awg-quick down awg0
-        systemctl disable awg-quick@awg0
+        if ip link show awg0 >/dev/null 2>&1 && [[ -f "$staged" ]]; then
+            awg-quick down "$staged"
+        fi
+        systemctl disable --now awg-quick@awg0
+    fi
+}
+
+# Снятие фичи, до удаления awg0.conf этапом config: awg-quick и ExecStop юнита
+# находят интерфейс только по этому файлу.
+awg_deactivate() {
+    [[ -f "$AWG_CONF" ]] || return 0
+    systemctl disable --now awg-quick@awg0 || return 1
+    if ip link show awg0 >/dev/null 2>&1; then
+        awg-quick down awg0 || return 1
     fi
 }
 
 awg_remove() {
-    awg-quick down awg0 >/dev/null 2>&1 || true
-    systemctl disable --now awg-quick@awg0 >/dev/null 2>&1 || true
     rm -rf -- "$R/etc/amnezia"
 }

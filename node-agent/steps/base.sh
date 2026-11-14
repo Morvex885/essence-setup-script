@@ -509,7 +509,7 @@ tx_rollback() {
     fi
     port_handover "$nginx_action"
     sysctl --system >/dev/null
-    for feature in $FEATURES; do
+    for feature in $FEATURES $TX_DEACTIVATED; do
         if ! feature_hook "$feature" rollback; then
             warn "Откат фичи $feature не удался."
             rc=1
@@ -562,6 +562,16 @@ wait_active() {
     systemctl is-active --quiet "$unit"
 }
 
+# tx_deactivate — снятые фичи останавливаются, пока их файлы на месте
+# (awg-quick down и ExecStop юнитов читают конфиг, disable требует юнит).
+tx_deactivate() {
+    local feature
+    for feature in $REMOVE_FEATURES; do
+        TX_DEACTIVATED+="$feature "
+        feature_hook "$feature" deactivate || return 1
+    done
+}
+
 stage_config() {
     local mode owner group path feature code nginx_action=none
     local entries=() removes=()
@@ -592,6 +602,7 @@ stage_config() {
         read -r mode owner group path <<<"$path"
         install_file "$mode" "$owner" "$group" "$path" || return 1
     done
+    tx_deactivate || return 1
     for path in "${removes[@]}"; do
         rm -rf -- "$R$path" || return 1
     done
@@ -632,6 +643,7 @@ stage_teardown_config() {
     for path in "${removes[@]}" "$MIHOMO_BIN_REL"; do
         tx_backup "$path" || return 1
     done
+    tx_deactivate || return 1
     # Сначала disable: без файла юнита systemctl disable отказывает. Юнита нет,
     # если первое применение прервалось до этапа config, — тогда снимать нечего.
     if [[ -e "$R/etc/systemd/system/mihomo.service" ]]; then

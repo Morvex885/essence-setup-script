@@ -353,9 +353,11 @@ fn client_proxies(config: &Config, client: &Client, nodes: &[String], sections: 
         } else if selected {
             group
         } else {
+            let peer = |block: &str| block.strip_prefix("awg-")
+                .is_some_and(|peer| config.clients.iter().any(|client| client.name == peer));
             let mut every = Vec::new();
             push_unique(&mut every, section.split('\n').filter(|line| line.starts_with(NAME_PREFIX))
-                .map(|line| block_name(line).to_owned()).filter(|block| !block.starts_with("awg-")));
+                .map(|line| block_name(line).to_owned()).filter(|block| !peer(block)));
             every.push("AWG".to_owned());
             every
         };

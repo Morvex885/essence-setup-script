@@ -12,7 +12,9 @@ use super::keys::wg_public;
 
 /// The server's address in the AmneziaWG subnet.
 pub const SERVER_ADDRESS: &str = "10.10.0.1/16";
-const SUBNET: &str = "10.10.0.0/16";
+/// The server's own tunnel address: the only one kept out of TPROXY, so
+/// traffic to other peers goes through mihomo and its rejects.
+const SERVER_HOST: &str = "10.10.0.1/32";
 
 /// Fixed obfuscation parameters of `_awg_gen_params`.
 const JMIN: u8 = 10;
@@ -31,7 +33,7 @@ pub(crate) fn needs_peer(config: &Config, client: &Client, node: &str) -> bool {
         return false;
     }
     let connections = effective_connections(config, client, node);
-    connections.is_empty() || connections.iter().any(|proxy| proxy == "AWG" || proxy.starts_with("awg-"))
+    connections.is_empty() || connections.iter().any(|proxy| proxy == "AWG")
 }
 
 /// Peers of the node: clients that need one and have AmneziaWG credentials,
@@ -66,19 +68,23 @@ fn obfuscation(awg: &NodeAwg, out: &mut String, key: impl Fn(&str) -> String) {
 }
 
 /// The server `awg0.conf`: the interface, then one `# peer:` block per peer.
+/// Peers are isolated: the forward between them is dropped and only the
+/// server's own address skips TPROXY.
 pub fn server_conf(config: &Config, node_name: &str, awg: &NodeAwg, port: u16, private_key: &str) -> Result<String> {
     let mut out = format!("[Interface]\nPrivateKey = {private_key}\nAddress = {SERVER_ADDRESS}\nListenPort = {port}\n");
     obfuscation(awg, &mut out, str::to_owned);
     let tproxy = awg.tproxy_port;
     out.push_str(&format!(
-        "PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -I INPUT -m mark --mark 1 -j ACCEPT; ip rule add fwmark 1 table 100 || true; \
+        "PostUp = iptables -I FORWARD -i %i -o %i -j DROP; iptables -A FORWARD -i %i -j ACCEPT; iptables -I INPUT -m mark --mark 1 -j ACCEPT; \
+ip rule add fwmark 1 table 100 || true; \
 ip route add local 0.0.0.0/0 dev lo table 100 || true; iptables -t mangle -N MIHOMO_AWG || true; iptables -t mangle -F MIHOMO_AWG; \
-iptables -t mangle -A MIHOMO_AWG -d {SUBNET} -j RETURN; iptables -t mangle -A MIHOMO_AWG -d 127.0.0.0/8 -j RETURN; \
+iptables -t mangle -A MIHOMO_AWG -d {SERVER_HOST} -j RETURN; iptables -t mangle -A MIHOMO_AWG -d 127.0.0.0/8 -j RETURN; \
 iptables -t mangle -A MIHOMO_AWG -d 224.0.0.0/4 -j RETURN; \
 iptables -t mangle -A MIHOMO_AWG -p tcp -j TPROXY --on-ip 127.0.0.1 --on-port {tproxy} --tproxy-mark 1; \
 iptables -t mangle -A MIHOMO_AWG -p udp -j TPROXY --on-ip 127.0.0.1 --on-port {tproxy} --tproxy-mark 1; \
 iptables -t mangle -A PREROUTING -i %i -j MIHOMO_AWG; iptables -t nat -A PREROUTING -i %i -p udp --dport 53 -j REDIRECT --to-ports 1053\n\
-PostDown = iptables -D FORWARD -i %i -j ACCEPT || true; iptables -D INPUT -m mark --mark 1 -j ACCEPT || true; \
+PostDown = iptables -D FORWARD -i %i -o %i -j DROP || true; iptables -D FORWARD -i %i -j ACCEPT || true; \
+iptables -D INPUT -m mark --mark 1 -j ACCEPT || true; \
 iptables -t mangle -D PREROUTING -i %i -j MIHOMO_AWG || true; iptables -t mangle -F MIHOMO_AWG || true; \
 iptables -t mangle -X MIHOMO_AWG || true; iptables -t nat -D PREROUTING -i %i -p udp --dport 53 -j REDIRECT --to-ports 1053 || true; \
 ip rule del fwmark 1 table 100 || true; ip route del local 0.0.0.0/0 dev lo table 100 || true\n"));

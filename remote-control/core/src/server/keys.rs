@@ -12,7 +12,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
 use crate::error::{RcError, Result};
-use crate::model::{ClientCredentials, Config, NodeAwg, NodeReality};
+use crate::model::{ClientCredentials, Config, Node, NodeAwg, NodeReality, Profile, SubscriptionHost};
 use crate::secrets::random_bytes;
 use crate::state::State;
 
@@ -108,16 +108,41 @@ pub fn awg_params() -> Result<AwgParams> {
     }
 }
 
+/// Ports the node's AmneziaWG TPROXY inlet must avoid: the profile's
+/// listening ports with node overrides (TCP and UDP), 443, SSH, the reserved
+/// internal ports and the subscription host's port.
+fn taken_ports(node: &Node, profile: &Profile, host: Option<&SubscriptionHost>) -> BTreeSet<u16> {
+    let (tcp, udp) = profile.listen_ports(&node.ports);
+    let mut taken: BTreeSet<u16> = tcp.iter().chain(&udp).map(|(_, port)| *port).collect();
+    taken.extend([443, node.port]);
+    taken.extend(super::ports::RESERVED_PORTS);
+    taken.extend(host.filter(|host| host.node == node.name).map(|host| host.port));
+    taken
+}
+
+/// A TPROXY port in 10000–60000 outside `taken`.
+fn tproxy_port(taken: &BTreeSet<u16>) -> Result<u16> {
+    loop {
+        let port = u16::try_from(uniform(10000, 60000)?).unwrap_or(10000);
+        if !taken.contains(&port) {
+            return Ok(port);
+        }
+    }
+}
+
 /// Fill every missing generated value: node parameters of the transports the
 /// node's profile enables (private keys go to the secret store) and client
-/// credentials. Existing values are never changed. Runs inside `Session::mutate`.
+/// credentials. Existing values are never changed, except a TPROXY port that
+/// another port of the node has taken since. Runs inside `Session::mutate`.
 pub fn ensure_generated(state: &State, config: &mut Config) -> Result<()> {
     let profiles = config.profiles.clone();
+    let host = config.subscription_host.clone();
     let store = state.secret_store();
     for node in &mut config.nodes {
         let Some(profile) = node.profile.as_deref().and_then(|name| profiles.iter().find(|p| p.name == name)) else {
             continue;
         };
+        let taken = taken_ports(node, profile, host.as_ref());
         let params = &mut node.params;
         if params.reality.is_none() && profile.has_reality() {
             let (private, public_key) = reality_keypair()?;
@@ -133,14 +158,17 @@ pub fn ensure_generated(state: &State, config: &mut Config) -> Result<()> {
         if params.hy2_obfs_password.is_none() && profile.hysteria2.as_ref().is_some_and(|hy2| hy2.obfs) {
             params.hy2_obfs_password = Some(hex(24)?);
         }
-        if params.awg.is_none() && profile.amneziawg.is_some() {
-            let (private, public_key) = wg_keypair()?;
-            store.set(&format!("node:{}:awg-key", node.id), private)?;
-            let AwgParams { jc, s1, s2, s3 } = awg_params()?;
-            params.awg = Some(NodeAwg {
-                public_key, header_protection_key: wg_key()?.to_string(),
-                tproxy_port: u16::try_from(uniform(10000, 60000)?).unwrap_or(10000), jc, s1, s2, s3,
-            });
+        match params.awg.as_mut() {
+            None if profile.amneziawg.is_some() => {
+                let (private, public_key) = wg_keypair()?;
+                store.set(&format!("node:{}:awg-key", node.id), private)?;
+                let AwgParams { jc, s1, s2, s3 } = awg_params()?;
+                params.awg = Some(NodeAwg {
+                    public_key, header_protection_key: wg_key()?.to_string(), tproxy_port: tproxy_port(&taken)?, jc, s1, s2, s3,
+                });
+            }
+            Some(awg) if taken.contains(&awg.tproxy_port) => awg.tproxy_port = tproxy_port(&taken)?,
+            _ => {}
         }
     }
     let mut used: BTreeSet<u32> = config.clients.iter()
@@ -312,6 +340,15 @@ mod tests {
         let before = config.clone();
         ensure_generated(&state, &mut config).unwrap();
         assert_eq!(config, before, "a second run changes nothing");
+
+        // A node port that takes the TPROXY port moves it; the rest stays.
+        let old = config.nodes[0].params.awg.as_ref().unwrap().tproxy_port;
+        config.nodes[0].ports.insert("hysteria2".into(), old);
+        ensure_generated(&state, &mut config).unwrap();
+        let moved = config.nodes[0].params.awg.as_ref().unwrap();
+        assert_ne!(moved.tproxy_port, old);
+        assert!(!taken_ports(&config.nodes[0], &config.profiles[0], None).contains(&moved.tproxy_port));
+        assert_eq!(moved.public_key, awg.public_key);
     }
 
     #[test]

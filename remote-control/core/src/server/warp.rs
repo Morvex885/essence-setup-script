@@ -75,10 +75,15 @@ profile_value() {
         print value; exit
     }' "$2"
 }
+# Registration precedes the executor's `packages` stage: on a fresh image the
+# package lists are stale (their pool files are gone), so refresh them first.
 if ! command -v curl >/dev/null 2>&1; then
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -q curl >&2 || exit 1
+    { DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 update -q \
+        && DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install -y -q curl; } >&2 || exit 1
 fi
-mkdir -p /root/wgcf && cd /root/wgcf || exit 1
+# The account file keeps the license, the profile the private key.
+umask 077
+mkdir -p /root/wgcf && chmod 0700 /root/wgcf && cd /root/wgcf || exit 1
 if [[ ! -x ./wgcf ]] || ! ./wgcf --version 2>/dev/null | grep -qF "$version"; then
     case "$(uname -m)" in
         aarch64|arm64) arch=arm64 ;;
@@ -102,14 +107,14 @@ if [[ "$reregister" == 1 && -f wgcf-account.toml ]]; then
     [[ -f wgcf-profile.conf ]] && { cp -a wgcf-profile.conf "$backup"/ || exit 1; }
     rm -f wgcf-account.toml wgcf-profile.conf
 fi
-new=0
 if [[ ! -f wgcf-account.toml ]]; then
     printf 'y\n' | ./wgcf register >&2 || { restore; exit 1; }
-    new=1
 fi
 plus=false
-if [[ "$new" == 1 && -n "$key" ]]; then
-    ./wgcf update --license-key "$key" >&2 && plus=true
+# Also on an existing account (re-added node): `update` rebinds only a
+# different key. The key goes through the environment (viper `WGCF_*`), not argv.
+if [[ -n "$key" ]]; then
+    WGCF_LICENSE_KEY="$key" ./wgcf update >&2 && plus=true
 fi
 rm -f wgcf-profile.conf
 ./wgcf generate >&2 && [[ -s wgcf-profile.conf ]] || { restore; exit 1; }
@@ -218,9 +223,15 @@ pub async fn register<T: RemoteTransport>(session: &mut Session, node: &Node, tr
     stdin.push('\n');
     session.log(Level::Info, &format!("{}: {}", node.name,
         if reregister { "перерегистрация аккаунта WARP" } else { "регистрация аккаунта WARP" }));
-    let failed = || RcError::new("remote_failed", format!("{}: не удалось зарегистрировать WARP.", node.name)).with_extra("name", node.name.clone());
+    let failed = || RcError::new("remote_failed", "Не удалось зарегистрировать WARP.").with_extra("name", node.name.clone());
     let result = transport.exec(&register_command(reregister), stdin.as_bytes(), LONG_TIMEOUT).await.map_err(|_| failed())?;
     if result.exit_status != 0 {
+        // The script's own diagnostics (apt, curl, wgcf); keys go only to stdout.
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        let lines: Vec<&str> = stderr.lines().collect();
+        for line in &lines[lines.len().saturating_sub(20)..] {
+            session.log(Level::Output, line);
+        }
         return Err(failed());
     }
     let registered = parse_output(&String::from_utf8_lossy(&result.stdout)).ok_or_else(failed)?;
@@ -228,7 +239,8 @@ pub async fn register<T: RemoteTransport>(session: &mut Session, node: &Node, tr
         session.log(Level::Warn, &format!(
             "{}: ключ WARP+ не привязан (лимит 5 устройств или ключ не от официального приложения) — используется бесплатный WARP", node.name));
     }
-    let attempt = profile.warp_plus.clone();
+    // Only a key that was actually tried counts as an attempt.
+    let attempt = profile.warp_plus.clone().filter(|_| license.is_some());
     let id = node.id.clone();
     session.mutate("warp register", |state| {
         let mut config = state.load_config()?;

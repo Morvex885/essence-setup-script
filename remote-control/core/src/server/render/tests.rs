@@ -280,14 +280,27 @@ fn every_listener_routes_through_the_inbound_sub_rule() {
     }
     assert!(!mihomo.contains("\n    proxy: "), "no listener bypasses the rules: {mihomo}");
     let rules: Vec<&str> = document["sub-rules"]["essence-in"].as_vec().unwrap().iter().map(|rule| rule.as_str().unwrap()).collect();
-    // Without `no-resolve`: a domain pointing into these networks is rejected too.
+    // Without `no-resolve`: a domain that resolves into a rejected range is
+    // rejected too. The node's own address comes last.
     assert_eq!(rules, [
         "IP-CIDR,127.0.0.0/8,REJECT", "IP-CIDR6,::1/128,REJECT", "IP-CIDR,169.254.0.0/16,REJECT",
         "IP-CIDR,10.0.0.0/8,REJECT", "IP-CIDR,172.16.0.0/12,REJECT", "IP-CIDR,192.168.0.0/16,REJECT",
         "IP-CIDR,100.64.0.0/10,REJECT", "IP-CIDR6,fc00::/7,REJECT", "IP-CIDR6,fe80::/10,REJECT",
-        "MATCH,outbound",
+        "IP-CIDR,198.51.100.7/32,REJECT", "MATCH,outbound",
     ]);
-    assert!(!mihomo.contains("no-resolve"));
+    assert!(!mihomo.contains("no-resolve"), "{mihomo}");
+}
+
+#[test]
+fn the_node_rejects_its_own_address() {
+    let mut config = config(profile());
+    config.nodes[0].ip = "2001:db8::7".into();
+    let mihomo = content(&render(&config), MIHOMO_CONFIG_PATH).to_owned();
+    assert!(mihomo.contains("    - IP-CIDR6,2001:db8::7/128,REJECT\n"), "{mihomo}");
+    // A host name cannot be matched by address.
+    config.nodes[0].ip = "de.example.com".into();
+    let mihomo = content(&render(&config), MIHOMO_CONFIG_PATH).to_owned();
+    assert!(!mihomo.contains("de.example.com/"), "{mihomo}");
 }
 
 #[test]
@@ -519,7 +532,13 @@ fn amneziawg_renders_the_server_config_peers_and_tproxy() {
         S1 = 20\nS2 = 30\nS3 = 40\nS4 = 12\nH1 = 1\nH2 = 2\nH3 = 3\nH4 = 4\nHeaderProtectionKey = HPK\nContentPaddingAddition = 10-100\n\
         RekeyAfterTime = 100-120\nRekeyTimeout = 3-7\nRejectAfterTime = 150-180\nKeepaliveTimeout = 5-15\nMaxHandshakeAttempts = 15-20\n\
         RandomTrailers = on\nDisableCookies = on\nPostUp = "), "{conf}");
-    assert!(conf.contains("-d 10.10.0.0/16 -j RETURN") && conf.contains("--on-port 23456 --tproxy-mark 1") && !conf.contains("10.10.8"));
+    assert!(conf.contains("--on-port 23456 --tproxy-mark 1") && !conf.contains("10.10.8"));
+    // Peers are isolated: no forward between them, and only the server's own
+    // address skips TPROXY (other peers go through mihomo's rejects).
+    let (up, down) = conf.split_once("\nPostDown = ").unwrap();
+    assert!(up.contains("PostUp = iptables -I FORWARD -i %i -o %i -j DROP; "), "{conf}");
+    assert!(down.starts_with("iptables -D FORWARD -i %i -o %i -j DROP || true; "), "{conf}");
+    assert!(up.contains("-d 10.10.0.1/32 -j RETURN") && !conf.contains("-d 10.10.0.0/16"), "{conf}");
     let beta = conf.find("# peer: beta").unwrap();
     let alpha = conf.find("# peer: alpha").unwrap();
     assert!(beta < alpha, "peers by ascending index");
@@ -559,6 +578,20 @@ fn amneziawg_client_blocks_and_native_config() {
     assert_eq!(awg_client_config(&other, &other.nodes[0], &other.clients[0]).unwrap_err().code, "invalid");
     let plain = self::config(profile());
     assert_eq!(awg_client_config(&plain, &plain.nodes[0], &plain.clients[0]).unwrap_err().code, "invalid");
+}
+
+#[test]
+fn awg_nodes_follow_the_peer_rule() {
+    let mut config = awg_config();
+    assert_eq!(awg_nodes(&config, &config.clients[0]), ["de"]);
+    // No connections on the node: the client uses every one, AmneziaWG too.
+    config.connections[0].groups[0].proxies.clear();
+    assert_eq!(awg_nodes(&config, &config.clients[0]), ["de"]);
+    assert!(awg_client_config(&config, &config.nodes[0], &config.clients[0]).is_ok());
+    config.connections[0].groups[0].proxies = vec!["VLESS TCP".into()];
+    assert!(awg_nodes(&config, &config.clients[0]).is_empty());
+    let plain = self::config(profile());
+    assert!(awg_nodes(&plain, &plain.clients[0]).is_empty());
 }
 
 #[test]

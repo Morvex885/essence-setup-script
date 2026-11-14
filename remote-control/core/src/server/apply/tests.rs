@@ -314,6 +314,29 @@ async fn an_incomplete_rollback_of_a_reapply_keeps_both_sets() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_recognised_failure_tells_what_to_do() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut session, _journal) = fixture(root.path());
+    let de = node(1, "de");
+    for (hint, tail) in [("kernel_headers", Some("обновите ядро")), ("unknown_id", None)] {
+        NEXT_OP_ID.with(|next| *next.borrow_mut() = Some(OP.into()));
+        let mut steps = vec![connect_step(&de, Ok(())), probe_step(&de, DEBIAN)];
+        steps.extend(start_steps(OP));
+        steps.push(exec(status_command(OP), &format!("unit=inactive\nstage=prepare\nresult=failed\nerror=prepare\nhint={hint}\n")));
+        steps.push(exec(log_command(OP), ""));
+        let hosts = Hosts::new(vec![steps]);
+        let error = run(&mut session, &hosts, &["node", "apply", "--name", "de", "--yes"]).await.unwrap_err();
+        hosts.finish();
+        let message = error.extra["failed"][0]["message"].as_str().unwrap();
+        match tail {
+            Some(tail) => assert!(message.starts_with("ошибка на этапе «подготовка компонентов»: ") && message.contains(tail)
+                && message.contains("перезагрузите сервер"), "{message}"),
+            None => assert_eq!(message, "ошибка на этапе «подготовка компонентов»"),
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_dropped_connection_is_reestablished_while_polling() {
     let root = tempfile::tempdir().unwrap();
     let (mut session, _journal) = fixture(root.path());
@@ -706,9 +729,11 @@ async fn warp_is_registered_before_the_render_and_with_a_new_key_again() {
     let node = config(&session).nodes[0].clone();
     let hosts = Hosts::new(vec![vec![connect_step(&node, Ok(())), probe_step(&node, DEBIAN),
         ScriptStep::exec(super::super::warp::register_command(false), "KEY-123\n".len(), LONG_TIMEOUT,
-            Ok(ExecResult { exit_status: 1, ..ExecResult::default() }))]]);
+            Ok(ExecResult { exit_status: 1, stderr: b"E: Unable to fetch some archives\n".to_vec(), ..ExecResult::default() }))]]);
     let error = run(&mut session, &hosts, &["node", "apply", "--name", "de", "--yes"]).await.unwrap_err();
     assert_eq!(error.extra["failed"][0]["stage"], "warp");
+    assert_eq!(error.extra["failed"][0]["message"], "Не удалось зарегистрировать WARP.");
+    assert!(journal.borrow().contains(&(Level::Output, "E: Unable to fetch some archives".into())), "the script's diagnostics reach the journal");
     assert_eq!(hosts.uploads(), 0);
 }
 
@@ -726,4 +751,16 @@ fn probe_output_parses() {
     assert!(unit_gone(&parse_status("unit=failed\nstage=config\n")));
     // systemd re-executing itself (needrestart in `packages`): no answer is not an exit.
     assert!(!unit_gone(&parse_status("unit=\nstage=packages\n")) && !unit_gone(&parse_status("unit=unknown\nstage=packages\n")));
+}
+
+#[test]
+fn a_foreign_listener_on_the_tproxy_port_is_busy_until_it_is_ours() {
+    let probe = parse_probe("listen tcp 127.0.0.1:23456\n");
+    let desired = Desired { teardown: false, files: Vec::new(), remove: Vec::new(), spec: Vec::new(), ports: vec!["443/tcp".into()],
+        listen: vec!["443/tcp".into(), "23456/tcp".into(), "23456/udp".into()], lines: Vec::new(), digest: String::new() };
+    let mut node = Node::default();
+    let failure = busy_port(&probe, &node, &desired).unwrap();
+    assert_eq!((failure.code.as_str(), failure.port), ("port_busy", Some(23456)));
+    node.applied = Some(Applied { digest: String::new(), files: Default::default(), ports: desired.listen.clone(), at: String::new() });
+    assert!(busy_port(&probe, &node, &desired).is_none(), "our own mihomo holds it");
 }

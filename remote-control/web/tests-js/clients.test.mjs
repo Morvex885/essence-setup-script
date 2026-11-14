@@ -578,23 +578,19 @@ test('генерация: nodes_pending в итоге и предложение 
   assert.deepEqual(clean.offers, []);
 });
 
-test('конфиг AmneziaWG: argv, имя файла и ноды-пиры из client show', () => {
+test('конфиг AmneziaWG: argv, имя файла и ноды-пиры из client show .awg_nodes', () => {
   assert.deepEqual(m.awgConfigArgv('alice', 'de'), ['client', 'awg-config', '--name', 'alice', '--node', 'de']);
   assert.equal(m.awgConfigFile('alice', 'de'), 'alice-de.conf');
-  const data = { connections: [
-    { node: 'de', mode: 'group', proxies: ['p1', m.AWG_PROXY] },
-    { node: 'ru', mode: 'own', proxies: ['p1'] },
-    { node: 'nl', mode: 'own', proxies: [m.AWG_PROXY] },
-    { node: 'de', mode: 'own', proxies: [m.AWG_PROXY] },
-    null,
-  ] };
+  // Ядро решает, где клиент — пир: клиент без подключений на ноде (`proxies: []`)
+  // пользуется всеми, и нода приходит в `awg_nodes`; строки подключений не разбираются.
+  const data = { connections: [{ node: 'de', mode: 'group', proxies: [] }, { node: 'ru', mode: 'own', proxies: ['AWG'] }], awg_nodes: ['de', 7, 'nl'] };
   assert.deepEqual(m.awgNodes(data), ['de', 'nl']);
   assert.deepEqual(m.awgNodes({}), []);
   assert.deepEqual(m.awgNodes(null), []);
 });
 
 test('конфиг AmneziaWG: одна нода — без выбора, несколько — выбор, нет нод и сбой — null', async () => {
-  const show = (nodes) => okReply({ connections: nodes.map((node) => ({ node, proxies: [m.AWG_PROXY] })) });
+  const show = (nodes) => okReply({ connections: [], awg_nodes: nodes });
   let ctx = fakeCtx({ replies: [show(['de']), okReply({ config: '[Interface]\n' })] });
   assert.deepEqual(await m.awgConfigFlow(ctx, 'alice'), { node: 'de', config: '[Interface]\n' });
   assert.deepEqual(commands(ctx), [['client', 'show', '--name', 'alice'], m.awgConfigArgv('alice', 'de')]);
