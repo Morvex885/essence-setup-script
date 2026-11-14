@@ -158,14 +158,15 @@ test('изменение профиля: сбой profile set — форма с�
   const current = model.profileValues(edge);
   const changed = { ...current, protocols: current.protocols.filter((p) => p !== 'warp'), hysteria2_port: '31000' };
   const argv = model.profileSetArgv('edge', changed, edge);
-  const s = scripted([[argv, fail('locked')], [argv, ok()]], [changed, changed]);
+  const show = [['profile', 'show', '--name', 'edge'], ok(edge)];
+  const s = scripted([[argv, fail('locked')], show, [argv, ok()]], [changed, changed]);
   assert.equal(await model.editProfileFlow(s.ctx, edge), true);
   assert.equal(s.record.failed, 1);
   const refilled = s.record.dialogs[1].fields;
   assert.deepEqual(refilled.find((f) => f.name === 'protocols').value, changed.protocols);
   assert.equal(refilled.find((f) => f.name === 'hysteria2_port').value, '31000');
   s.done();
-  const cancelled = scripted([[argv, fail('locked')]], [changed, null]);
+  const cancelled = scripted([[argv, fail('locked')], show], [changed, null]);
   assert.equal(await model.editProfileFlow(cancelled.ctx, edge), false);
   cancelled.done();
   // partial не повторяет форму.
@@ -173,6 +174,20 @@ test('изменение профиля: сбой profile set — форма с�
   assert.equal(await model.editProfileFlow(partial.ctx, edge), false);
   assert.equal(partial.record.dialogs.length, 1);
   partial.done();
+  // Сбой после записи (checkpoint) сохранил ipv6=disabled: повтор считается от
+  // перечитанного профиля — возврат к default уходит вместе с новым email;
+  // форма показывает введённое пользователем.
+  const first = { ...current, ipv6: 'disabled' };
+  const second = { ...first, ipv6: 'default', acme_email: 'b@example.com' };
+  const saved = { ...edge, ipv6: 'disabled' };
+  const persisted = scripted([
+    [['profile', 'set', '--name', 'edge', '--ipv6', 'disabled'], fail('checkpoint_failed')],
+    [['profile', 'show', '--name', 'edge'], ok(saved)],
+    [['profile', 'set', '--name', 'edge', '--ipv6', 'default', '--acme-email', 'b@example.com'], ok()],
+  ], [first, second]);
+  assert.equal(await model.editProfileFlow(persisted.ctx, edge), true);
+  assert.equal(persisted.record.dialogs[1].fields.find((f) => f.name === 'ipv6').value, 'disabled');
+  persisted.done();
 });
 
 test('удаление и применение профиля', async () => {

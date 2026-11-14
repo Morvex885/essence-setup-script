@@ -123,11 +123,30 @@ fn node_request(ctx: &mut Context<'_>, name: &str, words: &[String], review: Opt
 }
 /// `node shell` / `telegram menu`: a terminal request; the daemon runs the
 /// remote PTY and the local console relays it while the UI is suspended.
+/// `telegram menu` on a node with missing or stale scripts answers with the
+/// upload plan: it is shown, and on consent the command runs again with
+/// `--yes --plan-token` (a changed plan is shown again, at most twice — as
+/// `confirm::run_confirmed`).
 fn interactive(ctx: &mut Context<'_>, name: &str, telegram: bool) -> io::Result<()> {
-    let words = if telegram { argv(&["telegram", "menu", "--name", name]) } else { argv(&["node", "shell", "--name", name]) };
+    let base = if telegram { argv(&["telegram", "menu", "--name", name]) } else { argv(&["node", "shell", "--name", name]) };
+    let mut words = base.clone();
+    let mut changes = 0;
     loop {
         let reply = ctx.interactive(&words)?;
         if reply.ok { return Ok(()); }
+        if matches!(reply.code(), "confirmation_required" | "plan_changed") {
+            if reply.code() == "plan_changed" {
+                changes += 1;
+                if changes > 2 { ctx.ui.notice(ui::warn("План продолжает меняться. Действие не выполнено; повторите позже.")); return Ok(()); }
+                ctx.ui.notice(ui::warn("План изменился. Проверьте его ещё раз."));
+            }
+            let Some(token) = reply.error["plan_token"].as_str().filter(|s| !s.is_empty()) else { ctx.failed(); return Ok(()); };
+            if !ctx.confirm(View::review(format!("Нода: {name}"), &reply.error["plan"]), "Продолжить?")? { return Ok(()); }
+            words = base.clone();
+            confirm::set_flag(&mut words, "--yes", None);
+            confirm::set_flag(&mut words, "--plan-token", Some(token));
+            continue;
+        }
         if handle_node_codes(ctx, &reply, name)? { continue; }
         outcome(ctx, &reply);
         return Ok(());
@@ -1288,13 +1307,20 @@ fn add_profile(ctx: &mut Context<'_>) -> io::Result<()> {
 /// «Изменить»: `profile set` with the changed flags; a failed command reopens
 /// the wizard with the answers.
 fn edit_profile(ctx: &mut Context<'_>, name: &str, profile: &Value) -> io::Result<()> {
+    let mut current = profile.clone();
     let mut draft = ProfileForm::from_profile(profile);
     loop {
         let Some(form) = profile_wizard(ctx, Some(&draft), false)? else { return Ok(()); };
-        let Some(words) = profile_set_argv(name, &form, profile) else { ctx.ui.notice(ui::warn("Изменений нет.")); return Ok(()); };
+        let Some(words) = profile_set_argv(name, &form, &current) else { ctx.ui.notice(ui::warn("Изменений нет.")); return Ok(()); };
         let reply = ctx.request(&words, &Secrets::default())?;
         outcome(ctx, &reply);
         if !confirm::retryable(&reply) { return Ok(()); }
+        // A failure after the local write (e.g. the checkpoint) may have saved
+        // part of it: the next command is computed against the saved profile,
+        // the wizard keeps the user's answers.
+        let shown = ctx.call(&["profile", "show", "--name", name])?;
+        if !shown.ok { return Ok(()); }
+        current = shown.data;
         draft = form;
     }
 }
@@ -2054,6 +2080,16 @@ mod tests {
         ], &["y", "pw"], |ctx| interactive(ctx, "n", false));
         assert_eq!(ui.suspensions, 2);
         assert_eq!(client.secret_names[1], ["password"]);
+        // `telegram menu` with stale scripts: the upload plan, one y/N, then the
+        // menu with `--yes --plan-token`; refusal opens nothing.
+        let menu = argv(&["telegram", "menu", "--name", "n"]);
+        let (_, client, ui) = run(vec![term(&menu, plan("confirmation_required", "m")), term(&with_yes(&menu, "m"), ok(json!({})))],
+            &["y"], |ctx| interactive(ctx, "n", true));
+        assert_eq!((ui.suspensions, confirms(&ui), client.calls.len()), (2, 1, 2));
+        assert!(ui.views.iter().any(|v| v.context.iter().any(|l| l.to_string() == "Operation and consequences")));
+        let (_, client, ui) = run(vec![term(&menu, plan("confirmation_required", "m"))], &["n"], |ctx| interactive(ctx, "n", true));
+        assert_eq!((ui.suspensions, client.calls.len()), (1, 1));
+        assert!(ui.notices.is_empty());
         let (_, ui) = screen(&mut Telegram, &["o", "0"], vec![step(&["node", "list"], ok(json!([])))]);
         assert!(ui.views.iter().any(|v| v.context.iter().any(|l| l.style.fg == Some(ui::DIM))));
     }
@@ -2133,14 +2169,28 @@ mod tests {
         keys.extend([""; 10]);
         keys.push("0");
         let (_, ui) = screen(&mut ProfileCard("edge".into()), &keys, vec![
-            show(), (set.clone(), err("locked", json!({}))), (set, ok(json!({}))), show(),
+            show(), (set.clone(), err("locked", json!({}))), show(), (set, ok(json!({}))), show(),
         ]);
         let ipv6: Vec<_> = ui.views.iter().filter(|v| v.title == "IPv6").collect();
         assert_eq!(ipv6.iter().map(|v| v.cursor).collect::<Vec<_>>(), [Some(0), Some(1)]);
         // Cancelling the reopened wizard sends nothing more.
         screen(&mut ProfileCard("edge".into()), &["e", "", "", "", "", "", "", "", "2", "", "", "0", "0"], vec![
-            show(), (argv(&["profile", "set", "--name", "edge", "--ipv6", "enabled"]), err("locked", json!({}))), show(),
+            show(), (argv(&["profile", "set", "--name", "edge", "--ipv6", "enabled"]), err("locked", json!({}))), show(), show(),
         ]);
+        // The failed set was saved (checkpoint error after the local write):
+        // the retry is computed against the re-read profile, so returning
+        // IPv6 to «default» is sent along with the new email.
+        let mut saved = edge();
+        saved["ipv6"] = json!("disabled");
+        let mut keys = vec!["e", "", "", "", "", "", "", "", "3", "", ""];
+        keys.extend(["", "", "", "", "", "", "", "1", "b@example.com", "", "0"]);
+        let (_, ui) = screen(&mut ProfileCard("edge".into()), &keys, vec![
+            show(), (argv(&["profile", "set", "--name", "edge", "--ipv6", "disabled"]), err("checkpoint_failed", json!({}))),
+            step(&["profile", "show", "--name", "edge"], ok(saved)),
+            (argv(&["profile", "set", "--name", "edge", "--ipv6", "default", "--acme-email", "b@example.com"]), ok(json!({}))), show(),
+        ]);
+        let ipv6: Vec<_> = ui.views.iter().filter(|v| v.title == "IPv6").collect();
+        assert_eq!(ipv6[1].cursor, Some(2), "the reopened wizard shows the user's answer");
     }
     #[test]
     fn bulk_apply_resolves_node_codes_of_failed_nodes_and_repeats_once() {

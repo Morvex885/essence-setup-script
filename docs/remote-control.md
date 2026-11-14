@@ -1161,7 +1161,6 @@ SSH-настройка нод — раздел n → h». Данные — ко�
 | `p` | Подключения ноды | экран «Подключения ноды» |
 | `a` | Клиенты AmneziaWG | экран «AmneziaWG: N» |
 | `k` | Проверить подключение | `node check --name N` |
-| `u` | Загрузить скрипты принудительно | `node upload-scripts --name N --force` (план и подтверждение) |
 | `h` | Усилить защиту SSH | `node harden --name N [--port P]` |
 | `r` | Переименовать | `node rename --name N --new-name M` |
 | `e` | Тег | `node tag --name N --tag T` |
@@ -1175,11 +1174,10 @@ SSH-настройка нод — раздел n → h». Данные — ко�
 вопрос «Доверять новому ключу?»; `needs_setup` — подсказка «раздел n → h». После
 решения команда повторяется.
 
-Если `telegram menu` отвечает, что скрипты на ноде отсутствуют, устарели или
-повреждены (`invalid` с полем `state`), экран «Скрипты на ноде» предлагает `u`
-«Загрузить скрипты» (`node upload-scripts --name N`, для повреждённой или
-неизвестной установки — `--force`) с планом и подтверждением. Само меню Telegram
-скрипты не загружает и после загрузки заново не открывается.
+Если скрипты на ноде отсутствуют, устарели или повреждены, `telegram menu`
+отвечает `confirmation_required` с планом «На ноду «N» будут загружены скрипты
+vX.». Экран показывает план и после подтверждения повторяет команду с
+`--yes --plan-token`: скрипты загружаются, затем открывается меню.
 
 **Добавление ноды.** Вопросы по порядку: название (по умолчанию `vps-1`), IP,
 SSH-порт (22), логин (`root`), способ входа («SSH-ключ» или «Пароль»), пароль
@@ -1417,7 +1415,7 @@ Bash-версии) и вопрос «Заменить их конфигурац�
 | Восстановление GitHub | `source github-migrate-format`, `source github-replace-with-local [--provision-keys yes\|no]` |
 | Сводка | `status`, `subscription list`, `group list`, `node list` |
 | Ноды | `node list`, `status`; `node add --name N --ip IP --port P --user U --auth key\|password --tag T --accept-new-host-key` / `--replace-host-key SHA256:…` / `--defer-ssh-setup`; `node setup-ssh [--provision-keys yes\|no] [--on-failure defer]` |
-| Карточка ноды | `node show`, `node shell`, `telegram menu`, `node check`, `node upload-scripts [--force]`, `node harden [--port P]`, `node rename`, `node tag`, `node password`, `node aliases [--set …] [--unset …]`, `node delete --scope … [--revoke-key]`, `node trust-host-key --host-key SHA256:…` |
+| Карточка ноды | `node show`, `node shell`, `telegram menu`, `node check`, `node harden [--port P]`, `node rename`, `node tag`, `node password`, `node aliases [--set …] [--unset …]`, `node delete --scope … [--revoke-key]`, `node trust-host-key --host-key SHA256:…` |
 | Подключения | `conn sync [--name N]`, `conn list [--name N]`, `group list`, `conn set --name N --assign G=P…`, `node check` |
 | AmneziaWG | `node list`, `awg status`, `awg sync`, `awg remove --peer P` / `--orphans` |
 | Telegram Proxy | `node list`, `telegram menu --name N`, `telegram status --all`, `telegram install\|refresh-ip\|web-update\|web-restart\|backend-restart\|remove-all --name N…`, `telegram remove --component web\|mtproto --name N…` |
@@ -1735,12 +1733,12 @@ Proxy, затем Источник, Настройки и Журнал. Дейс
 `telegram menu --name N` открывает серверное меню Telegram Proxy одной ноды по
 SSH с терминалом (ссылки, смена секрета, спонсорский тег, диагностика); без
 терминала команда отвечает `tty_required`. Сначала выполняется read-only проверка
-ноды: SSH, ключ сервера, версия скриптов. Скрипты эта команда **не загружает**:
-если их нет или они старше встроенного комплекта, ответ — `invalid` с полем
-`state` (`missing`, `outdated`, `broken`) и подсказкой `node upload-scripts --name N`
-(для повреждённой или неизвестной установки — с `--force`). Меню превращает такой
-ответ в отдельную подтверждённую загрузку и само серверное меню после неё заново не
-открывает.
+ноды: SSH, ключ сервера, версия скриптов. Если скриптов нет, они старше
+встроенного комплекта или повреждены, загрузка идёт только по плану «На ноду «N»
+будут загружены скрипты vX.» (в токен входят VERSION и SHA-256 комплекта): без
+`--yes` ответ — `confirmation_required`, с `--yes --plan-token` скрипты
+загружаются, версия на ноде сверяется, и открывается меню. Меню TUI и веб-панель
+показывают план и повторяют команду после подтверждения.
 
 Пакетные команды `telegram status|install|refresh-ip|web-update|web-restart|backend-restart|remove|remove-all`
 принимают `--name N…` или `--all` и проходят три фазы:

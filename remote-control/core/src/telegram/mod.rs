@@ -448,23 +448,40 @@ fn report<T>(session: &mut Session, action: Action, targets: &[Target<T>], outco
     }
 }
 
+/// The plan of `telegram menu` on a node whose scripts are missing, older
+/// than the embedded kit or damaged; the bundle SHA-256 and VERSION are part
+/// of the token, as in the batch plan.
+fn menu_upload_plan(node: &str, version: &str) -> Result<Plan> {
+    Ok(Plan::new(vec![format!("На ноду «{node}» будут загружены скрипты v{version}.")], format!("{} {version}", bundle_sha256()?)))
+}
+
 /// `telegram menu --name N`: the server Telegram Proxy menu on a remote
-/// pseudo-terminal. Until stage 5 moves Telegram into the executor, the
-/// scripts are brought to the embedded version as an implicit part of the
-/// script-driven commands: the menu does it without a plan (it has no
-/// plan step), the batch actions name it in theirs. Then the returned job
-/// runs on the requester's console.
+/// pseudo-terminal. Until stage 5 moves Telegram into the executor, the menu
+/// needs the scripts at the embedded version: a read-only probe comes first;
+/// missing, stale or damaged scripts are uploaded only under a plan
+/// («будут загружены скрипты vX», `confirmation_required` without `--yes`).
+/// Then the returned job runs on the requester's console.
 pub async fn menu_prepare<T: RemoteTransport>(session: &mut Session, invocation: &Invocation, connect: &dyn Fn() -> T)
     -> Result<TerminalJob<T>>
 {
     let name = required(invocation, "name")?;
     let node = session.state.load_config()?.nodes.into_iter().find(|node| node.name == name).ok_or_else(|| not_found(name))?;
     require_portable(session, &node)?;
+    let local = scripts::local()?;
     session.log(Level::Info, &format!("Подключаемся к {} ({}@{}:{})...", node.name, node.user, node.ip, node.port));
     let mut transport = connect();
     nodes::connect(&mut transport, &session.state, &node).await?;
-    if scripts::ensure_current(&transport, &node.name).await? {
-        session.log(Level::Info, &format!("Скрипты на ноде «{}» обновлены.", node.name));
+    let current = match scripts::probe(&transport).await {
+        Some((ScriptsState::Ready, Some(remote))) => local <= remote,
+        Some(_) => false,
+        None => return Err(RcError::new("remote_failed", format!("Не удалось определить состояние скриптов на ноде «{}».", node.name))
+            .with_extra("name", node.name.as_str())),
+    };
+    if !current {
+        menu_upload_plan(&node.name, &scripts::format_version(local))?.confirm(invocation)?;
+        if scripts::ensure_current(&transport, &node.name).await? {
+            session.log(Level::Info, &format!("Скрипты на ноде «{}» обновлены.", node.name));
+        }
     }
     session.log(Level::Info, &format!("Открываю меню Telegram Proxy на {} ({})...", node.name, node.ip));
     session.log(Level::Output, "  (введите 0 в меню для выхода)");
@@ -711,7 +728,10 @@ mod tests {
 
     /// `menu_prepare` then `run`, as the daemon does.
     fn run_menu(session: &mut Session, connect: &dyn Fn() -> FakeTransport, console: &mut TestConsole) -> Result<Value> {
-        let invocation = invocation(&["telegram", "menu", "--name", "alpha"]);
+        run_menu_argv(session, &["telegram", "menu", "--name", "alpha"], connect, console)
+    }
+    fn run_menu_argv(session: &mut Session, argv: &[&str], connect: &dyn Fn() -> FakeTransport, console: &mut TestConsole) -> Result<Value> {
+        let invocation = invocation(argv);
         tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(async {
             let job = menu_prepare(session, &invocation, connect).await?;
             assert_eq!((job.node.as_str(), job.done_log), ("alpha", "SSH-сессия завершена."));
@@ -720,11 +740,12 @@ mod tests {
     }
 
     #[test]
-    fn menu_opens_the_server_menu_uploading_scripts_on_a_fresh_node() {
+    fn menu_opens_the_server_menu_uploading_scripts_only_under_a_plan() {
         let root = tempfile::tempdir().unwrap();
         let (mut session, journal) = fixture(root.path());
         let command = "bash '/root/essence-setup/setup-essence.sh' telegram-proxy menu";
         let pty = PtyRequest { term: "xterm".into(), size: SIZE };
+        // Current scripts: no plan, the menu opens at once.
         let (connect, observers) = transports(vec![vec![connect_step(0, Ok(())), current(),
             ScriptStep::interactive(command, pty.clone(), b"MENU".to_vec(), Ok(0))]]);
         let mut console = TestConsole::default();
@@ -733,11 +754,25 @@ mod tests {
         assert_eq!(console.0, b"MENU");
         assert_eq!(journal.borrow().last().unwrap(), &(Level::Output, "  (введите 0 в меню для выхода)".to_owned()));
 
-        let (connect, observers) = transports(vec![vec![connect_step(0, Ok(())), missing(),
+        // A fresh node without --yes: the read-only probe, then the plan; nothing uploaded, no menu.
+        let (connect, observers) = transports(vec![vec![connect_step(0, Ok(())), missing()]]);
+        let error = run_menu(&mut session, &connect, &mut TestConsole::default()).unwrap_err();
+        assert_eq!((error.code, error.exit_code()), ("confirmation_required", 2));
+        let version = scripts::local_version().unwrap();
+        assert_eq!(error.extra["plan"], json!([format!("На ноду «alpha» будут загружены скрипты v{version}.")]));
+        let token = error.extra["plan_token"].as_str().unwrap().to_owned();
+        let parsed = invocation(&["telegram", "menu", "--name", "alpha"]);
+        assert_eq!(token, menu_upload_plan("alpha", &version).unwrap().token(&parsed.noun, &parsed.verb, parsed.confirmation_args()));
+        observers[0].assert_finished();
+        assert!(!observers[0].journal().iter().any(|op| matches!(op, Operation::Upload { .. })));
+
+        // Confirmed: probe, upload (`ensure_current`: probe, upload, confirming probe), menu.
+        let (connect, observers) = transports(vec![vec![connect_step(0, Ok(())), missing(), missing(),
             ScriptStep::upload_any_local(scripts::REMOTE_DIR, LONG_TIMEOUT, Ok(())), current(),
             ScriptStep::interactive(command, pty, b"MENU".to_vec(), Ok(0))]]);
         let mut console = TestConsole::default();
-        assert_eq!(run_menu(&mut session, &connect, &mut console).unwrap(), json!({}));
+        let argv = ["telegram", "menu", "--name", "alpha", "--yes", "--plan-token", token.as_str()];
+        assert_eq!(run_menu_argv(&mut session, &argv, &connect, &mut console).unwrap(), json!({}));
         observers[0].assert_finished();
         assert_eq!(console.0, b"MENU");
         assert!(journal.borrow().contains(&(Level::Info, "Скрипты на ноде «alpha» обновлены.".to_owned())));

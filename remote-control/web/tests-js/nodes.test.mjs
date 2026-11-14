@@ -376,6 +376,28 @@ test('оболочка: node shell без загрузки скриптов, con
   assert.equal(typeof model.uploadOffer, 'undefined');
 });
 
+test('telegram menu: план загрузки скриптов — подтверждение и терминал с --yes --plan-token; отказ — без терминала', async () => {
+  const menu = ['telegram', 'menu', '--name', 'n'];
+  const plan = fail('confirmation_required', { plan: ['На ноду «n» будут загружены скрипты v1.'], plan_token: 'T' });
+  const run = async (answer) => {
+    const opened = [];
+    const replies = [plan, ok({})];
+    const s = scripted([], [answer]);
+    s.ctx.terminal = async (argv) => { opened.push(argv); return replies.shift(); };
+    await model.interactive(s.ctx, 'n', true);
+    return { opened, s };
+  };
+  const yes = await run(true);
+  assert.deepEqual(yes.opened, [menu, [...menu, '--yes', '--plan-token', 'T']]);
+  assert.deepEqual(yes.s.record.dialogs.map((d) => [d.kind, d.plan]), [['confirm', plan.error.plan]]);
+  assert.equal(yes.s.record.failed, 0);
+  yes.s.done();
+  const no = await run(false);
+  assert.deepEqual(no.opened, [menu]);
+  assert.equal(no.s.record.failed, 0);
+  no.s.done();
+});
+
 test('применение: состояние, подписи сбоев, отчёт и argv', async () => {
   assert.equal(apply.applyState({ status: 'pending' }).tone, 'warn');
   assert.equal(apply.applyState({ status: 'applied' }).tone, 'ok');

@@ -366,13 +366,17 @@ function deps(ctx) {
 /**
  * `node shell` / `telegram menu` в оверлее терминала (`nodes.rs::interactive`).
  * Состояния ноды разрешаются и команда повторяется; `conflict` — терминал
- * этой ноды уже открыт.
+ * этой ноды уже открыт. `telegram menu` на ноде с отсутствующими или
+ * устаревшими скриптами отвечает планом загрузки: план показывается
+ * (`reviewReply`), после согласия терминал открывается с `--yes --plan-token`.
  */
 export async function interactive(ctx, name, telegram) {
   const argv = interactiveArgv(name, telegram);
   const title = telegram ? `Telegram Proxy: ${name}` : `Оболочка: ${name}`;
+  const open = (words) => ctx.terminal(words, title, { expect: ['conflict'] });
   for (;;) {
-    const reply = await ctx.terminal(argv, title, { expect: ['conflict'] });
+    const reply = await reviewReply(`Нода: ${name}`, 'Продолжить?', argv, await open(argv),
+      { request: open, confirm: ctx.confirm, notify: ctx.notify });
     if (reply.ok) return;
     if (await handleNodeCodes(reply, name, deps(ctx))) continue;
     if (errorCode(reply) === 'conflict') {

@@ -257,22 +257,28 @@ export async function addProfileFlow(ctx, go) {
 /**
  * «Изменить»: те же поля с текущими значениями → `profile set` только с
  * изменёнными флагами; невыполненная команда (`retryable`) открывает форму
- * снова с введённым.
+ * снова с введённым. Сбой после локальной записи (например, checkpoint) мог
+ * сохранить часть правки: перед повтором профиль перечитывается
+ * (`profile show`), и следующая команда считается от сохранённого.
  */
 export async function editProfileFlow(ctx, profile) {
   const name = text(profile.name);
+  let current = profile;
   let previous = profileValues(profile);
   for (;;) {
     const values = await ctx.form({
       title: `Профиль: ${name}`, fields: profileFields(previous, { editing: true }), wide: true,
     });
     if (values === null || values === undefined) return false;
-    const argv = profileSetArgv(name, values, profile);
+    const argv = profileSetArgv(name, values, current);
     if (argv === null) { ctx.notify('info', 'Изменений нет.'); return false; }
     const reply = await ctx.request(argv);
     if (reply.ok) return true;
     if (ctx.isFailure(reply)) ctx.failed();
     if (!retryable(reply)) return false;
+    const shown = await ctx.request(profileShowArgv(name));
+    if (!shown.ok) return false;
+    current = shown.data || {};
     previous = values;
   }
 }
