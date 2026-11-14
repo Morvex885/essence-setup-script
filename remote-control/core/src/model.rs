@@ -93,7 +93,7 @@ pub struct Node {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub applied: Option<Applied>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub operation: Option<String>,
+    pub operation: Option<Operation>,
 }
 
 fn required_nullable<'de, D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Option<String>, D::Error> {
@@ -247,6 +247,22 @@ pub struct Applied {
     #[serde(default)]
     pub ports: Vec<String>,
     pub at: String,
+}
+
+/// The executor operation started on the node, with what a commit records
+/// (the state that was uploaded, not whatever the configuration is later).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Operation {
+    pub id: String,
+    pub digest: String,
+    #[serde(default)]
+    pub files: BTreeMap<String, String>,
+    #[serde(default)]
+    pub ports: Vec<String>,
+    /// Removing everything: a commit clears `applied`.
+    #[serde(default)]
+    pub teardown: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -583,7 +599,7 @@ fn check_ports(tcp: &[(&str, u16)], udp: &[(&str, u16)]) -> Result<()> {
             if port == 0 {
                 return Err(invalid("Порт должен быть от 1 до 65535."));
             }
-            if crate::server::render::RESERVED_PORTS.contains(&port) {
+            if crate::server::ports::RESERVED_PORTS.contains(&port) {
                 return Err(RcError::new("invalid", format!("Порт {port} зарезервирован для внутренних служб.")));
             }
             if !seen.insert(port) {
@@ -679,6 +695,17 @@ impl Node {
         if self.ports.keys().any(|key| !NODE_PORT_KEYS.contains(&key.as_str())) {
             return Err(invalid("Некорректный ключ порта ноды."));
         }
+        if !self.params.formats_valid() {
+            return Err(invalid("Некорректные сгенерированные параметры ноды."));
+        }
+        if self.applied.as_ref().is_some_and(|applied| !hex_valid(&applied.digest, 64)
+            || !files_valid(&applied.files) || !rules_valid(&applied.ports)) {
+            return Err(invalid("Некорректная запись применённого состояния ноды."));
+        }
+        if self.operation.as_ref().is_some_and(|operation| !hex_valid(&operation.id, 32) || !hex_valid(&operation.digest, 64)
+            || !files_valid(&operation.files) || !rules_valid(&operation.ports)) {
+            return Err(invalid("Некорректная запись операции ноды."));
+        }
         match self.auth {
             Auth::Key if self.secret_id.is_some() => Err(invalid("У ноды с ключом secret_id должен быть null.")),
             Auth::Password if !self.secret_id.as_deref().is_some_and(|s| v::secret_id_matches(s, &self.id)) => {
@@ -686,6 +713,41 @@ impl Node {
             }
             _ => Ok(()),
         }
+    }
+}
+
+/// `len` hex digits.
+fn hex_valid(value: &str, len: usize) -> bool {
+    value.len() == len && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Applied file hashes keyed by managed paths only: the keys end up in the
+/// executor's `remove.list`.
+fn files_valid(files: &BTreeMap<String, String>) -> bool {
+    files.iter().all(|(path, hash)| crate::server::paths::managed_file(path) && hex_valid(hash, 64))
+}
+
+/// Firewall rules `PORT/tcp|udp`.
+fn rules_valid(rules: &[String]) -> bool {
+    rules.iter().all(|rule| rule.split_once('/').is_some_and(|(port, proto)| matches!(proto, "tcp" | "udp")
+        && !port.starts_with('0') && port.bytes().all(|b| b.is_ascii_digit()) && port.parse::<u16>().is_ok()))
+}
+
+impl NodeParams {
+    /// Generated values keep their generated shapes: they are written into
+    /// the mihomo config, the nginx site and client configs.
+    fn formats_valid(&self) -> bool {
+        let base64url = |value: &str| value.len() == 43
+            && value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+        let token = |value: &str, extra: &[u8]| (1..=64).contains(&value.len())
+            && value.bytes().all(|b| b.is_ascii_alphanumeric() || extra.contains(&b));
+        self.reality.as_ref().is_none_or(|reality| base64url(&reality.public_key)
+            && reality.short_id.len() <= 16 && reality.short_id.len() % 2 == 0
+            && reality.short_id.bytes().all(|b| b.is_ascii_hexdigit()))
+            && self.xhttp_path.as_deref().is_none_or(|path| path.strip_prefix('/').is_some_and(|rest| token(rest, b"._~-")))
+            && self.grpc_service.as_deref().is_none_or(|service| token(service, b"._-"))
+            && self.hy2_obfs_password.as_deref().is_none_or(|password| (1..=64).contains(&password.len())
+                && password.bytes().all(|b| b.is_ascii_hexdigit()))
     }
 }
 
@@ -928,10 +990,11 @@ mod tests {
         }
         raw["nodes"][0]["domain"] = json!("de.example.com");
         raw["nodes"][0]["ports"] = json!({"hysteria2": 9443});
-        raw["nodes"][0]["params"] = json!({"reality": {"public_key": "pk", "short_id": "0123456789abcdef"},
+        raw["nodes"][0]["params"] = json!({"reality": {"public_key": "P".repeat(43), "short_id": "0123456789abcdef"},
             "xhttp_path": "/0123456789abcdef", "awg": {"public_key": "pk", "header_protection_key": "hk", "tproxy_port": 12345,
             "jc": 4, "s1": 20, "s2": 30, "s3": 40}, "warp": {"public_key": "wk", "ipv4": "172.16.0.2", "plus": false}});
-        raw["nodes"][0]["applied"] = json!({"digest": "d", "files": {"/etc/mihomo/config.yaml": "sha"}, "ports": ["443/tcp"], "at": "2026-11-14T00:00:00Z"});
+        raw["nodes"][0]["applied"] = json!({"digest": "d".repeat(64), "files": {"/etc/mihomo/config.yaml": "a".repeat(64)},
+            "ports": ["443/tcp"], "at": "2026-11-14T00:00:00Z"});
         raw["cascades"] = json!([
             {"name": "via-ru", "entry": "de-vps", "listener": "vless-tcp", "exit": {"node": "ru-vps", "proxy": "VLESS TCP"},
              "uuid": "11111111-2222-4333-8444-555555555555", "password": "0123456789abcdef0123456789abcdef"},
@@ -1011,6 +1074,23 @@ mod tests {
             ("/nodes/0/ports", json!({"vless-tcp": 444}), "Некорректный ключ порта ноды."),
             ("/nodes/0/domain", json!("localhost"), "Некорректный домен ноды."),
             ("/nodes/0/domain", json!("-a.example"), "Некорректный домен ноды."),
+            ("/nodes/0/params/reality/short_id", json!("xyz"), "Некорректные сгенерированные параметры ноды."),
+            ("/nodes/0/params/reality/short_id", json!("x\"\n  - name: open"), "Некорректные сгенерированные параметры ноды."),
+            ("/nodes/0/params/reality/public_key", json!("pk"), "Некорректные сгенерированные параметры ноды."),
+            ("/nodes/0/params/xhttp_path", json!("/x { return 200; } location /y"), "Некорректные сгенерированные параметры ноды."),
+            ("/nodes/0/params/xhttp_path", json!("/a;b"), "Некорректные сгенерированные параметры ноды."),
+            ("/nodes/0/params/grpc_service", json!("a b"), "Некорректные сгенерированные параметры ноды."),
+            ("/nodes/0/params/hy2_obfs_password", json!("not hex"), "Некорректные сгенерированные параметры ноды."),
+            ("/nodes/0/applied/files", json!({"/root/.ssh": "a".repeat(64)}), "Некорректная запись применённого состояния ноды."),
+            ("/nodes/0/applied/files", json!({"/etc/nginx/sites-available/../../../home": "a".repeat(64)}),
+                "Некорректная запись применённого состояния ноды."),
+            ("/nodes/0/applied/files", json!({"/etc/mihomo": "a".repeat(64)}), "Некорректная запись применённого состояния ноды."),
+            ("/nodes/0/applied/digest", json!("d"), "Некорректная запись применённого состояния ноды."),
+            ("/nodes/0/applied/ports", json!(["443/sctp"]), "Некорректная запись применённого состояния ноды."),
+            ("/nodes/0/applied/ports", json!(["0443/tcp"]), "Некорректная запись применённого состояния ноды."),
+            ("/nodes/0/operation", json!({"id": "op", "digest": "d".repeat(64)}), "Некорректная запись операции ноды."),
+            ("/nodes/0/operation", json!({"id": "0".repeat(32), "digest": "d".repeat(64), "files": {"/etc": "a".repeat(64)}}),
+                "Некорректная запись операции ноды."),
         ] {
             let mut raw = profiled();
             set(&mut raw, pointer, value);

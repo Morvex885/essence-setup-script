@@ -94,15 +94,19 @@ pub fn handle_node_codes(ctx: &mut Context<'_>, reply: &Reply, name: &str) -> io
             Ok(false)
         }
         "domain_required" => {
-            // `extra.name` names the node: `--pending`/`--profile` carry no name.
+            // `node apply --name N` names the node in `extra.name` too.
             let target = reply.error["name"].as_str().filter(|s| !s.is_empty()).unwrap_or(name).to_owned();
-            if target.is_empty() { return Ok(false); }
-            let Some(domain) = ask_valid(ctx, &format!("Нода: {target}"), "Домен ноды (Enter — отмена)", |d| d.is_empty() || domain_valid(d), DOMAIN_INVALID)? else { return Ok(false); };
-            if domain.is_empty() { return Ok(false); }
-            Ok(ctx.call(&["node", "domain", "--name", &target, "--domain", &domain])?.ok)
+            set_domain(ctx, &target)
         }
         _ => Ok(false),
     }
+}
+/// The domain question of `domain_required` → `node domain`; true when saved.
+fn set_domain(ctx: &mut Context<'_>, name: &str) -> io::Result<bool> {
+    if name.is_empty() { return Ok(false); }
+    let Some(domain) = ask_valid(ctx, &format!("Нода: {name}"), "Домен ноды (Enter — отмена)", |d| d.is_empty() || domain_valid(d), DOMAIN_INVALID)? else { return Ok(false); };
+    if domain.is_empty() { return Ok(false); }
+    Ok(ctx.call(&["node", "domain", "--name", name, "--domain", &domain])?.ok)
 }
 /// v1 `_tui_node_try` / `_tui_node_confirmed` (`review` = plan title and question).
 fn node_request(ctx: &mut Context<'_>, name: &str, words: &[String], review: Option<(&str, &str)>) -> io::Result<Reply> {
@@ -913,32 +917,6 @@ impl Screen for Telegram {
 
 // ─── Применение ──────────────────────────────────────────────────────────────
 
-/// Stage labels of the node executor (`node-agent/apply.sh`), as in the core's journal.
-const STAGES: [(&str, &str); 10] = [
-    ("packages", "установка пакетов"), ("system", "системные настройки"), ("mihomo", "установка mihomo"),
-    ("dns", "проверка DNS"), ("site", "сайт-заглушка"), ("certificate", "сертификаты"),
-    ("prepare", "подготовка компонентов"), ("config", "конфигурация и проверка"), ("firewall", "правила UFW"), ("cleanup", "очистка"),
-];
-/// Failure reasons that are not a stage of the executor.
-fn reason_label(code: &str) -> Option<&'static str> {
-    Some(match code {
-        "unsupported_os" => "не Debian/Ubuntu с systemd", "timeout" => "нет ответа", "start" => "не удалось запустить",
-        "missing_secret" => "нет ключа ноды", "warp" => "не удалось зарегистрировать WARP", _ => return None,
-    })
-}
-/// One `failed[]` entry `{name, stage, reason, port?}` of `node apply` as a label.
-pub(crate) fn failure_label(entry: &Value) -> String {
-    let (reason, stage) = (text(&entry["reason"]), text(&entry["stage"]));
-    if reason == "port_busy" {
-        let port = text(&entry["port"]);
-        return if port.is_empty() { "порт занят".into() } else { format!("порт {port} занят") };
-    }
-    if let Some(label) = reason_label(&reason).or_else(|| reason_label(&stage)) { return label.into(); }
-    if let Some((_, label)) = STAGES.iter().find(|(id, _)| *id == stage) {
-        return format!("{} на этапе «{label}»", if reason == "rolled_back" { "откат" } else { "ошибка" });
-    }
-    if !reason.is_empty() { reason } else if !stage.is_empty() { stage } else { "ошибка".into() }
-}
 /// The apply state of a node (`node list|show .status`); none for a node without a profile.
 fn apply_state(node: &Value) -> Option<(&'static str, Color)> {
     match node["status"].as_str() {
@@ -953,9 +931,12 @@ fn warp_label(node: &Value) -> &'static str {
     match node["warp"].as_str() { Some("free") => "бесплатный", Some("plus") => "WARP+", _ => "не зарегистрирован" }
 }
 /// `node apply …` under its plan; `name` — the node of `--name` (node codes
-/// and `domain_required` are resolved, then the command is repeated). The
-/// report (success or `partial`) goes to the journal, one line per failure.
+/// and the top-level `domain_required` are resolved, then the command is
+/// repeated). The report (success or `partial`) goes to the journal, one
+/// `name: message` line per failure; for bulk nodes failed with
+/// `domain_required` the domain is asked and the command repeated once.
 pub(crate) fn apply(ctx: &mut Context<'_>, words: &[String], name: &str) -> io::Result<Reply> {
+    let mut repeated = false;
     loop {
         let reply = confirm::run_confirmed(ctx, "Применение на нодах", "Применить?", words, &Secrets::default())?;
         if reply.ok || reply.code() == "partial" {
@@ -964,10 +945,18 @@ pub(crate) fn apply(ctx: &mut Context<'_>, words: &[String], name: &str) -> io::
             if !applied.is_empty() { ctx.ui.notice(ui::success(format!("Применено: {applied}"))); }
             let unchanged = joined(&data["unchanged"]);
             if !unchanged.is_empty() { ctx.ui.notice(ui::text(format!("Без изменений: {unchanged}"), ui::DIM)); }
-            for entry in rows(&data["failed"]) {
-                ctx.ui.notice(ui::warn(format!("{}: {}", text(&entry["name"]), failure_label(entry))));
+            let failed = rows(&data["failed"]);
+            for entry in failed {
+                ctx.ui.notice(ui::warn(format!("{}: {}", text(&entry["name"]), text(&entry["message"]))));
             }
-            return Ok(reply);
+            if repeated { return Ok(reply); }
+            let mut domains = false;
+            for entry in failed.iter().filter(|entry| entry["code"] == "domain_required") {
+                domains |= set_domain(ctx, &text(&entry["name"]))?;
+            }
+            if !domains { return Ok(reply); }
+            repeated = true;
+            continue;
         }
         // The core's message is already in the journal.
         if reply.code() == "nothing_pending" { return Ok(reply); }
@@ -2110,26 +2099,48 @@ mod tests {
     }
     #[test]
     fn domain_required_asks_the_domain_and_repeats_apply() {
-        let words = argv(&["node", "apply", "--pending"]);
+        let words = argv(&["node", "apply", "--name", "n"]);
         let (reply, client, ui) = run(vec![
             (words.clone(), err("domain_required", json!({"name": "n"}))),
             step(&["node", "domain", "--name", "n", "--domain", "de.example.com"], ok(json!({"name": "n"}))),
             (words.clone(), plan("confirmation_required", "a")), (with_yes(&words, "a"), ok(json!({"applied": ["n"], "failed": [], "unchanged": []}))),
-        ], &["bad", "de.example.com", "y"], |ctx| apply(ctx, &words, ""));
+        ], &["bad", "de.example.com", "y"], |ctx| apply(ctx, &words, "n"));
         assert!(reply.ok);
         assert!(noticed(&ui, DOMAIN_INVALID));
         assert_eq!(client.calls.len(), 4);
         // Cancelling the domain question stops without repeating.
-        run(vec![(words.clone(), err("domain_required", json!({"name": "n"})))], &[""], |ctx| apply(ctx, &words, ""));
+        run(vec![(words.clone(), err("domain_required", json!({"name": "n"})))], &[""], |ctx| apply(ctx, &words, "n"));
     }
     #[test]
-    fn apply_partial_reports_one_label_per_failed_node() {
+    fn bulk_apply_asks_domains_of_failed_nodes_and_repeats_once() {
+        let words = argv(&["node", "apply", "--pending"]);
+        let entry = json!({"name":"de","stage":"probe","code":"domain_required","message":"Для ноды «de» нужен домен: node domain --name de --domain D."});
+        let partial = || err("partial", json!({"message": "Применение завершено с ошибками.", "applied": [], "unchanged": [], "failed": [entry.clone()]}));
+        let (reply, client, ui) = run(vec![
+            (words.clone(), plan("confirmation_required", "a")), (with_yes(&words, "a"), partial()),
+            step(&["node", "domain", "--name", "de", "--domain", "de.example.com"], ok(json!({"name": "de"}))),
+            (words.clone(), plan("confirmation_required", "b")), (with_yes(&words, "b"), partial()),
+        ], &["y", "de.example.com", "y"], |ctx| apply(ctx, &words, ""));
+        // The repeated apply is not followed by another domain question.
+        assert_eq!(reply.code(), "partial");
+        assert_eq!(client.calls.len(), 5);
+        assert_eq!(ui.notices.iter().filter(|l| l.to_string().contains("de: Для ноды «de» нужен домен")).count(), 2);
+        // Cancelling the domain question keeps the report without repeating.
+        let (_, client, _) = run(vec![(words.clone(), plan("confirmation_required", "a")), (with_yes(&words, "a"), partial())],
+            &["y", ""], |ctx| apply(ctx, &words, ""));
+        assert_eq!(client.calls.len(), 2);
+    }
+    #[test]
+    fn apply_partial_reports_one_message_per_failed_node() {
         let words = argv(&["node", "apply", "--pending"]);
         let partial = err("partial", json!({"applied": ["a"], "unchanged": [], "failed": [
-            {"name": "b", "stage": "dns", "reason": "failed"}, {"name": "c", "stage": "probe", "reason": "unsupported_os"},
-            {"name": "d", "stage": "probe", "reason": "port_busy", "port": 443}, {"name": "e", "stage": "config", "reason": "rolled_back"}]}));
+            {"name":"de","stage":"config","code":"rolled_back","message":"откат на этапе «конфигурация и проверка»"},
+            {"name":"de","stage":"probe","code":"port_busy","message":"порт 443 уже занят","port":443},
+            {"name":"de","stage":"probe","code":"remote_failed","message":"Не удалось подключиться к «de»."},
+            {"name":"de","stage":"probe","code":"unsupported_os","message":"нужна Debian или Ubuntu с systemd"}]}));
         let (_, _, ui) = run(vec![(words.clone(), plan("confirmation_required", "a")), (with_yes(&words, "a"), partial)], &["y"], |ctx| apply(ctx, &words, ""));
-        for line in ["Применено: a", "b: ошибка на этапе «проверка DNS»", "c: не Debian/Ubuntu с systemd", "d: порт 443 занят", "e: откат на этапе «конфигурация и проверка»"] {
+        for line in ["Применено: a", "de: откат на этапе «конфигурация и проверка»", "de: порт 443 уже занят",
+            "de: Не удалось подключиться к «de».", "de: нужна Debian или Ubuntu с systemd"] {
             assert!(noticed(&ui, line), "{line}");
         }
         // Nothing pending: the core's message only, no report.

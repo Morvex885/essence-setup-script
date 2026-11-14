@@ -15,16 +15,26 @@ setup() {
     cp "$PROJECT_ROOT/node-agent/apply.sh" "$AGENT/"
     cp "$PROJECT_ROOT/node-agent/steps/"*.sh "$AGENT/steps/"
     cp "$PROJECT_ROOT/common/common.sh" "$PROJECT_ROOT/common/cert.sh" "$AGENT/common/"
+    write_manifest
 
     local cmd
     for cmd in apt-get nginx curl sysctl getent openssl wget; do
         stub "$cmd" 'exit 0'
     done
     stub fuser 'exit 1'
-    stub systemctl '[[ "$*" == "restart mihomo" && -n "${HUP_ON_RESTART:-}" ]] && { unset HUP_ON_RESTART; kill -HUP "$PPID"; }
+    stub systemctl '[[ "$*" == "start mihomo" && -n "${HUP_ON_START:-}" ]] && kill -HUP "$PPID"
 exit 0'
-    stub ufw '[[ "$1" == status ]] && { echo "Status: ${UFW_STATE:-active}"; }
+    stub ufw 'case "$1 ${2:-}" in
+    "status "*) echo "Status: ${UFW_STATE:-active}" ;;
+    "show added") echo "Added user rules (see ufw status for running firewall):"
+        [[ -n "${UFW_ADDED:-}" ]] && printf "%s\n" "$UFW_ADDED" ;;
+esac
 exit 0'
+    # ss -Htln: LISTEN на портах SS_PORTS, кроме SS_OMIT.
+    stub ss 'for p in ${SS_PORTS-443 8443}; do
+    [[ "$p" == "${SS_OMIT:-}" ]] && continue
+    printf "LISTEN 0 4096 [::]:%s [::]:*\n" "$p"
+done'
     cat >"$ROOT/usr/local/bin/mihomo" <<'SH'
 #!/bin/bash
 printf 'mihomo %s\n' "$*" >>"$CALLS"
@@ -47,13 +57,18 @@ stub() {
     chmod +x "$STUBS/$1"
 }
 
+write_manifest() {
+    (cd "$AGENT" && find . -type f ! -name MANIFEST -printf '%P\n' | sort | xargs sha256sum >MANIFEST)
+}
+
 write_spec() {
     cat >"$OPDIR/spec.sh" <<EOF
 OP_ID='op1'
 OP_MODE='${MODE:-apply}'
-SSH_PORT='2222'
+SSH_PORTS='${SSH_PORTS_SPEC:-2222}'
+LISTEN_TCP='443 8443'
 MIHOMO_VERSION='v1.19.18'
-NGINX='false'
+NGINX='${NGINX_ON:-false}'
 NGINX_STREAM='false'
 SITE_NAME=''
 SITE_SOURCE=''
@@ -64,10 +79,15 @@ DNS_DOMAINS=''
 HY2_CERT='false'
 HY2_CN=''
 UFW_RULES='${RULES-443/tcp}'
-RELEASE_CERTS=''
+RELEASE_CERTS='${RELEASE-}'
 FEATURES=''
 REMOVE_FEATURES=''
 EOF
+}
+
+# line_of <точная строка> — номер первой такой строки в $CALLS.
+line_of() {
+    grep -nxF -- "$1" "$CALLS" | head -n1 | cut -d: -f1
 }
 
 # add_file <путь> <содержимое>
@@ -83,6 +103,12 @@ run_agent() {
 
 status() { cat "$OPDIR/status"; }
 
+# Остались только status и log.
+assert_scrubbed() {
+    [[ -f "$OPDIR/status" && -f "$OPDIR/log" ]]
+    [[ ! -e "$OPDIR/files" && ! -e "$OPDIR/backup" ]]
+}
+
 @test "успешное применение фиксирует файлы и пишет committed" {
     add_file /etc/mihomo/config.yaml "new"
     run_agent
@@ -92,8 +118,12 @@ status() { cat "$OPDIR/status"; }
     assert_line "result=committed"
     [[ "$(cat "$ROOT/etc/mihomo/config.yaml")" == new ]]
     [[ "$(stat -c %a "$ROOT/etc/mihomo/config.yaml")" == 600 ]]
-    grep -qx "systemctl restart mihomo" "$CALLS"
+    grep -qx "systemctl start mihomo" "$CALLS"
     grep -qx "ufw allow 443/tcp" "$CALLS"
+    assert_scrubbed
+    [[ "$(stat -c %a "$ROOT/root/essence-node")" == 700 ]]
+    [[ "$(stat -c %a "$ROOT/root/essence-node/ops")" == 700 ]]
+    [[ "$(stat -c %a "$OPDIR")" == 700 ]]
 }
 
 @test "mihomo -t с ошибкой откатывает транзакцию" {
@@ -108,6 +138,7 @@ status() { cat "$OPDIR/status"; }
     [[ "$(cat "$ROOT/etc/mihomo/config.yaml")" == old ]]
     [[ ! -e "$ROOT/etc/mihomo/extra.yaml" ]]
     ! grep -q "^ufw allow 443" "$CALLS"
+    assert_scrubbed
 }
 
 @test "занятая блокировка даёт failed/locked" {
@@ -124,7 +155,7 @@ status() { cat "$OPDIR/status"; }
 @test "SIGHUP во время config откатывает изменения" {
     printf 'old\n' >"$ROOT/etc/mihomo/config.yaml"
     add_file /etc/mihomo/config.yaml "new"
-    HUP_ON_RESTART=1 run bash "$AGENT/apply.sh" "$OPDIR"
+    HUP_ON_START=1 run bash "$AGENT/apply.sh" "$OPDIR"
     assert_failure
     run status
     assert_line "stage=config"
@@ -147,12 +178,14 @@ status() { cat "$OPDIR/status"; }
     [[ "$(sort "$ROOT/root/essence-node/ufw-rules")" == $'443/tcp\n51820/udp' ]]
 }
 
-@test "неактивный UFW включается с разрешённым SSH-портом" {
+@test "неактивный UFW включается со всеми SSH-портами" {
+    SSH_PORTS_SPEC="2222 22" write_spec
     add_file /etc/mihomo/config.yaml "new"
     UFW_STATE=inactive run bash "$AGENT/apply.sh" "$OPDIR"
     assert_success
-    grep -qx "ufw allow 2222/tcp" "$CALLS"
-    grep -qx "ufw --force enable" "$CALLS"
+    [[ -n "$(line_of "ufw allow 2222/tcp")" && -n "$(line_of "ufw allow 22/tcp")" ]]
+    (($(line_of "ufw allow 22/tcp") < $(line_of "ufw default deny incoming")))
+    (($(line_of "ufw allow 2222/tcp") < $(line_of "ufw --force enable")))
 }
 
 @test "teardown удаляет каталог, mihomo и свои правила UFW" {
@@ -207,4 +240,144 @@ status() { cat "$OPDIR/status"; }
     grep -qx "nginx -t" "$CALLS"
     grep -qx "systemctl reload nginx" "$CALLS"
     ! grep -qx "systemctl restart nginx" "$CALLS"
+}
+
+@test "без HOME исполнитель применяет операцию" {
+    add_file /etc/mihomo/config.yaml "new"
+    run env -u HOME bash "$AGENT/apply.sh" "$OPDIR"
+    assert_success
+    run status
+    assert_line "result=committed"
+}
+
+@test "teardown отключает mihomo до удаления файла юнита" {
+    stub systemctl 'if [[ "$1" == disable && ! -e "$ESSENCE_NODE_ROOT/etc/systemd/system/mihomo.service" ]]; then
+    echo "Failed to disable unit, unit mihomo.service does not exist." >&2
+    exit 1
+fi
+exit 0'
+    mkdir -p "$ROOT/etc/systemd/system"
+    printf '[Unit]\n' >"$ROOT/etc/systemd/system/mihomo.service"
+    printf 'cfg\n' >"$ROOT/etc/mihomo/config.yaml"
+    MODE=teardown RULES="" write_spec
+    printf '/etc/mihomo\n/etc/systemd/system/mihomo.service\n' >"$OPDIR/remove.list"
+    run_agent
+    assert_success
+    run status
+    assert_line "result=committed"
+    [[ ! -e "$ROOT/etc/systemd/system/mihomo.service" && ! -e "$ROOT/etc/mihomo" ]]
+    grep -qx "systemctl disable --now mihomo" "$CALLS"
+    (($(line_of "systemctl disable --now mihomo") < $(line_of "systemctl daemon-reload")))
+}
+
+@test "порты передаются: stop mihomo → nginx → start mihomo → проверка LISTEN" {
+    NGINX_ON=true write_spec
+    add_file /etc/mihomo/config.yaml "new"
+    run_agent
+    assert_success
+    local stop restart start check
+    stop=$(line_of "systemctl stop mihomo")
+    restart=$(line_of "systemctl restart nginx")
+    start=$(line_of "systemctl start mihomo")
+    check=$(line_of "ss -Htln")
+    [[ -n "$stop" && -n "$restart" && -n "$start" && -n "$check" ]]
+    ((stop < restart && restart < start && start < check))
+    ! grep -qx "systemctl restart mihomo" "$CALLS"
+}
+
+@test "порт из LISTEN_TCP не слушается — откат" {
+    printf 'old\n' >"$ROOT/etc/mihomo/config.yaml"
+    add_file /etc/mihomo/config.yaml "new"
+    SS_OMIT=8443 AGENT_LISTEN_WAIT_SECONDS=2 run bash "$AGENT/apply.sh" "$OPDIR"
+    assert_failure
+    run status
+    assert_line "result=rolled_back"
+    assert_line "error=config"
+    grep -qF "Порт 8443 не слушается." "$OPDIR/log"
+    [[ "$(cat "$ROOT/etc/mihomo/config.yaml")" == old ]]
+    assert_scrubbed
+}
+
+@test "teardown удаляет чужие операции и все исполнители, оставляя status и log" {
+    mkdir -p "$ROOT/root/essence-node/ops/old1/files" "$ROOT/root/essence-node/agent/stale"
+    printf 'cfg\n' >"$ROOT/etc/mihomo/config.yaml"
+    MODE=teardown RULES="" write_spec
+    printf '/etc/mihomo\n' >"$OPDIR/remove.list"
+    run_agent
+    assert_success
+    run status
+    assert_line "result=committed"
+    [[ "$(ls "$ROOT/root/essence-node/ops")" == op1 ]]
+    [[ -z "$(ls "$ROOT/root/essence-node/agent")" ]]
+    assert_scrubbed
+}
+
+@test "путь вне управляемого набора в remove.list отклоняется до удаления" {
+    mkdir -p "$ROOT/root/x"
+    printf 'cfg\n' >"$ROOT/etc/mihomo/config.yaml"
+    add_file /etc/mihomo/config.yaml "new"
+    printf '/etc/mihomo/config.yaml\n/root/x\n' >"$OPDIR/remove.list"
+    run_agent
+    assert_failure
+    run status
+    assert_line "result=failed"
+    assert_line "error=config"
+    [[ -d "$ROOT/root/x" && "$(cat "$ROOT/etc/mihomo/config.yaml")" == cfg ]]
+}
+
+@test "teardown с «..» в remove.list ничего не удаляет" {
+    mkdir -p "$ROOT/etc/x"
+    printf 'cfg\n' >"$ROOT/etc/mihomo/config.yaml"
+    MODE=teardown RULES="" write_spec
+    printf '/etc/mihomo\n/etc/mihomo/../x\n' >"$OPDIR/remove.list"
+    run_agent
+    assert_failure
+    run status
+    assert_line "result=failed"
+    [[ -d "$ROOT/etc/x" && -f "$ROOT/etc/mihomo/config.yaml" && -x "$ROOT/usr/local/bin/mihomo" ]]
+    ! grep -q "^systemctl disable" "$CALLS"
+}
+
+@test "RELEASE_CERTS с пробелом или glob отклоняется без удаления" {
+    mkdir -p "$ROOT/var/www/a" "$ROOT/var/www/keep"
+    add_file /etc/mihomo/config.yaml "new"
+    local bad
+    for bad in 'a b:/var/www/a b' '*:/var/www/*' 'a:/var/www/a/../keep'; do
+        RELEASE="$bad" write_spec
+        add_file /etc/mihomo/config.yaml "new"
+        run_agent
+        assert_failure
+        run status
+        assert_line "result=failed"
+        assert_line "error=cleanup"
+        [[ -d "$ROOT/var/www/a" && -d "$ROOT/var/www/keep" ]]
+    done
+}
+
+@test "существовавшее правило UFW не попадает в учёт и не удаляется teardown" {
+    add_file /etc/mihomo/config.yaml "new"
+    UFW_ADDED="ufw allow 443/tcp" run bash "$AGENT/apply.sh" "$OPDIR"
+    assert_success
+    ! grep -qx "ufw allow 443/tcp" "$CALLS"
+    [[ ! -s "$ROOT/root/essence-node/ufw-rules" ]]
+    MODE=teardown RULES="" write_spec
+    printf '/etc/mihomo\n' >"$OPDIR/remove.list"
+    UFW_ADDED="ufw allow 443/tcp" run bash "$AGENT/apply.sh" "$OPDIR"
+    assert_success
+    ! grep -q "ufw delete" "$CALLS"
+}
+
+@test "подключаются только этапы из MANIFEST, без MANIFEST — сбой init" {
+    printf 'stage_packages() { : >"%s/evil"; }\n' "$BATS_TEST_TMPDIR" >"$AGENT/steps/zz-evil.sh"
+    add_file /etc/mihomo/config.yaml "new"
+    run_agent
+    assert_success
+    [[ ! -e "$BATS_TEST_TMPDIR/evil" ]]
+    rm -f "$AGENT/MANIFEST"
+    add_file /etc/mihomo/config.yaml "new"
+    run_agent
+    assert_failure
+    run status
+    assert_line "stage=init"
+    assert_line "result=failed"
 }

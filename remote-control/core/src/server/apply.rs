@@ -1,6 +1,13 @@
 //! `node apply`: probe every target node, show one plan, then run the
 //! executor on each node as a detached systemd unit and poll its status file
 //! (reconnecting after drops) until it commits or rolls back.
+//!
+//! Locking: the configuration lock is held only while the plan is re-checked
+//! and the operations are recorded (`claim`), and again for each result. The
+//! executor itself runs and is polled without it: a recorded
+//! `node.operation` (status `running`) and the node-side `flock` keep a second
+//! operation off the node. `node delete --scope server` (`teardown`) goes
+//! through the same `claim`, start, poll and record.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -13,20 +20,21 @@ use crate::clients::require_one;
 use crate::confirmation::Plan;
 use crate::dispatch::Session;
 use crate::error::{RcError, Result};
-use crate::locking::LockKind;
 use crate::log::Level;
-use crate::model::{Applied, Config, Node};
+use crate::model::{Applied, Config, Node, Operation};
 use crate::nodes::{self, COMMAND_TIMEOUT, LONG_TIMEOUT, required, sh_quote};
 use crate::state::State;
 use crate::transport::RemoteTransport;
 
-use super::bundle::{NODE_ROOT, agent_dir, materialize_agent};
+use super::bundle::{NODE_ROOT, agent_dir, agent_sha, materialize_agent};
 use super::render::{self, Desired, NodeSecrets, RenderedFile};
 
 const POLL_PAUSE: Duration = Duration::from_secs(2);
 const RECONNECT_PAUSES: [u64; 5] = [1, 2, 4, 8, 15];
 const OFFLINE_LIMIT: Duration = Duration::from_secs(10 * 60);
 const OPERATION_LIMIT: Duration = Duration::from_secs(60 * 60);
+/// `systemctl is-active` states of a unit that is still running.
+const LIVE_UNIT: [&str; 4] = ["active", "activating", "deactivating", "reloading"];
 
 fn ops_dir(op_id: &str) -> String {
     format!("{NODE_ROOT}/ops/{op_id}")
@@ -41,8 +49,8 @@ fn new_op_id() -> String {
     crate::github::random_hex(16)
 }
 
-/// The Russian label of an executor stage (or failure id).
-pub fn stage_label(stage: &str) -> &str {
+/// The Russian label of an executor stage.
+fn stage_label(stage: &str) -> &str {
     match stage {
         "packages" => "установка пакетов",
         "system" => "системные настройки",
@@ -54,43 +62,59 @@ pub fn stage_label(stage: &str) -> &str {
         "config" => "конфигурация и проверка",
         "firewall" => "правила UFW",
         "cleanup" => "очистка",
-        "locked" => "другая операция",
+        "init" => "запуск исполнителя",
         other => other,
     }
 }
 
-/// One read-only command: OS, systemd, executor integrity, listening sockets,
-/// hashes of the applied files and the status of an unfinished operation.
+/// The unit state, then the status file of an operation (lines `unit=`,
+/// `stage=`, `result=`, `error=`). The unit is read first: once it is gone
+/// the executor has exited and its status is final.
+fn status_lines(op_id: &str) -> String {
+    format!("printf 'unit=%s\\n' \"$(systemctl is-active essence-apply-{op_id} 2>/dev/null)\"\ncat {} 2>/dev/null\n",
+        sh_quote(&format!("{}/status", ops_dir(op_id))))
+}
+
+/// The executor directory is complete and is the one this RC embeds.
+fn agent_check() -> String {
+    format!("cd {} 2>/dev/null && [ \"$(sha256sum < MANIFEST | cut -d' ' -f1)\" = {} ] && sha256sum -c --quiet MANIFEST >/dev/null 2>&1",
+        sh_quote(&agent_dir()), agent_sha())
+}
+
+/// One read-only command: OS, systemd, sshd's own port, executor integrity,
+/// listening sockets, hashes of the applied files and the state of a
+/// recorded operation.
 pub fn probe_command(node: &Node) -> String {
-    let agent = sh_quote(&agent_dir());
     let mut command = format!(
         ". /etc/os-release; printf 'os=%s\\n' \"$ID\"\n\
          [ -d /run/systemd/system ] && echo systemd=yes\n\
-         (cd {agent} 2>/dev/null && sha256sum -c --quiet MANIFEST >/dev/null 2>&1) && echo agent=ok\n\
-         ss -H -tuln | awk '{{print \"listen\", $1, $5}}'\n");
+         printf 'sshd=%s\\n' \"${{SSH_CONNECTION##* }}\"\n\
+         ({}) && echo agent=ok\n\
+         ss -H -tuln | awk '{{print \"listen\", $1, $5}}'\n", agent_check());
     let files: Vec<String> = node.applied.iter().flat_map(|applied| applied.files.keys()).map(|path| sh_quote(path)).collect();
     if !files.is_empty() {
         command.push_str(&format!(
             "for f in {}; do if [ -f \"$f\" ]; then sha256sum \"$f\"; else echo \"missing $f\"; fi; done\n", files.join(" ")));
     }
-    if let Some(op_id) = &node.operation {
-        command.push_str(&format!("cat {} 2>/dev/null\n", sh_quote(&format!("{}/status", ops_dir(op_id)))));
+    if let Some(operation) = &node.operation {
+        command.push_str(&status_lines(&operation.id));
     }
     command.push_str("true");
     command
 }
 
 pub fn status_command(op_id: &str) -> String {
-    format!("cat {}", sh_quote(&format!("{}/status", ops_dir(op_id))))
+    format!("{}true", status_lines(op_id))
 }
 
 pub fn log_command(op_id: &str) -> String {
     format!("tail -n 40 {}", sh_quote(&format!("{}/log", ops_dir(op_id))))
 }
 
+/// Start the executor if its directory is still intact.
 pub fn start_command(op_id: &str) -> String {
-    format!("systemd-run --unit=essence-apply-{op_id} --collect --quiet /bin/bash {} {}",
-        sh_quote(&format!("{}/apply.sh", agent_dir())), sh_quote(&ops_dir(op_id)))
+    format!("({}) && systemd-run --unit=essence-apply-{op_id} --collect --quiet --setenv=HOME=/root /bin/bash {} {}",
+        agent_check(), sh_quote(&format!("{}/apply.sh", agent_dir())), sh_quote(&ops_dir(op_id)))
 }
 
 pub fn agent_reset_command() -> String {
@@ -102,6 +126,8 @@ pub fn agent_reset_command() -> String {
 struct Probe {
     os: String,
     systemd: bool,
+    /// The port sshd accepted this session on (differs from the dialed one behind NAT).
+    sshd: Option<u16>,
     agent_ok: bool,
     /// `(proto, port)` of listening sockets.
     listening: Vec<(String, u16)>,
@@ -116,6 +142,8 @@ fn parse_probe(stdout: &str) -> Probe {
             probe.os = os.trim_matches('"').to_owned();
         } else if line == "systemd=yes" {
             probe.systemd = true;
+        } else if let Some(port) = line.strip_prefix("sshd=") {
+            probe.sshd = port.parse().ok().filter(|port| *port != 0);
         } else if line == "agent=ok" {
             probe.agent_ok = true;
         } else if let Some(rest) = line.strip_prefix("listen ") {
@@ -126,7 +154,7 @@ fn parse_probe(stdout: &str) -> Probe {
             }
         } else if let Some(path) = line.strip_prefix("missing ") {
             probe.hashes.insert(path.to_owned(), None);
-        } else if let Some((key, value)) = line.split_once('=').filter(|(key, _)| matches!(*key, "stage" | "result" | "error")) {
+        } else if let Some((key, value)) = line.split_once('=').filter(|(key, _)| matches!(*key, "unit" | "stage" | "result" | "error")) {
             probe.status.insert(key.to_owned(), value.to_owned());
         } else if let Some((hash, path)) = line.split_once("  ").filter(|(hash, _)| hash.len() == 64) {
             probe.hashes.insert(path.to_owned(), Some(hash.to_owned()));
@@ -140,9 +168,38 @@ fn parse_status(stdout: &str) -> BTreeMap<String, String> {
         .map(|(key, value)| (key.to_owned(), value.to_owned())).collect()
 }
 
-/// A failed node of the report.
-fn failure(name: &str, stage: &str, reason: impl Into<String>) -> Value {
-    json!({"name": name, "stage": stage, "reason": reason.into()})
+/// The unit of the operation has exited.
+fn unit_gone(status: &BTreeMap<String, String>) -> bool {
+    !status.get("unit").is_some_and(|unit| LIVE_UNIT.contains(&unit.as_str()))
+}
+
+/// A failed node of the report: `{name, stage, code, message, port?}`.
+/// `stage` is the executor stage or `probe`/`start`; `message` is shown after
+/// the node name.
+#[derive(Clone, Debug)]
+struct Failure {
+    stage: String,
+    code: String,
+    message: String,
+    port: Option<u16>,
+}
+
+impl Failure {
+    fn new(stage: &str, code: &str, message: impl Into<String>) -> Self {
+        Self { stage: stage.to_owned(), code: code.to_owned(), message: message.into(), port: None }
+    }
+
+    fn of(stage: &str, error: RcError) -> Self {
+        Self::new(stage, error.code, error.message)
+    }
+
+    fn entry(&self, name: &str) -> Value {
+        let mut entry = json!({"name": name, "stage": self.stage, "code": self.code, "message": self.message});
+        if let Some(port) = self.port {
+            entry["port"] = json!(port);
+        }
+        entry
+    }
 }
 
 #[derive(Default)]
@@ -153,6 +210,11 @@ struct Report {
 }
 
 impl Report {
+    fn fail(&mut self, session: &mut Session, name: &str, failure: &Failure) {
+        session.log(Level::Warn, &format!("{name}: {}", failure.message));
+        self.failed.push(failure.entry(name));
+    }
+
     fn finish(self) -> Result<Value> {
         let data = json!({"applied": self.applied, "failed": self.failed, "unchanged": self.unchanged});
         if self.failed.is_empty() {
@@ -232,26 +294,74 @@ fn operation_dir(op_id: &str, desired: &Desired) -> Result<tempfile::TempDir> {
     Ok(dir)
 }
 
-/// Persist the node's running operation (`None` clears it).
-fn set_operation(session: &mut Session, id: &str, operation: Option<String>) -> Result<()> {
-    session.mutate("node apply start", |state| {
+/// End the node's operation: a commit records what the operation uploaded.
+fn conclude(node: &mut Node, committed: bool) {
+    if let Some(operation) = node.operation.take()
+        && committed
+    {
+        node.applied = (!operation.teardown).then(|| Applied {
+            digest: operation.digest, files: operation.files, ports: operation.ports, at: crate::github::utc_stamp(),
+        });
+    }
+}
+
+/// Persist the end of operation `op_id` of node `id` (if it is still the recorded one).
+fn finish_operation(session: &mut Session, id: &str, op_id: &str, committed: bool) -> Result<()> {
+    session.mutate("node apply", |state| {
         let mut config = state.load_config()?;
-        if let Some(node) = config.nodes.iter_mut().find(|node| node.id == id) {
-            node.operation = operation;
+        if let Some(node) = config.nodes.iter_mut()
+            .find(|node| node.id == id && node.operation.as_ref().is_some_and(|operation| operation.id == op_id))
+        {
+            conclude(node, committed);
         }
         state.save_config(&config)
     })
 }
 
-/// Outcome of one node's operation.
-enum Outcome { Committed, Failed { stage: String, reason: String } }
+/// A node whose new operation is to be recorded, or why it cannot be.
+type Claim = (String, Result<Desired>);
+/// A node with its recorded operation and the files to upload, or why not.
+type Claimed = (String, Result<(Operation, Desired)>);
+
+/// Under the configuration lock: re-check the agreed plan (`recheck` fails
+/// with `plan_changed`), then record a new operation for every node it
+/// returns. A node that already has an operation is refused (`in_use`).
+fn claim(session: &mut Session, label: &str, recheck: impl FnOnce(&State, &Config) -> Result<Vec<Claim>>)
+    -> Result<Vec<Claimed>>
+{
+    session.mutate(label, |state| {
+        let mut config = state.load_config()?;
+        let mut claimed = Vec::new();
+        for (id, desired) in recheck(state, &config)? {
+            let Some(node) = config.nodes.iter_mut().find(|node| node.id == id) else { continue };
+            let claim = match desired {
+                Ok(_) if node.operation.is_some() => Err(RcError::new("in_use", format!(
+                    "На ноде «{0}» уже выполняется применение: дождитесь его завершения (node apply --name {0}).", node.name))
+                    .with_extra("name", node.name.clone())),
+                Ok(desired) => {
+                    let operation = Operation {
+                        id: new_op_id(), digest: desired.digest.clone(), files: render::file_hashes(&desired.files),
+                        ports: desired.ports.clone(), teardown: desired.teardown,
+                    };
+                    node.operation = Some(operation.clone());
+                    Ok((operation, desired))
+                }
+                Err(error) => Err(error),
+            };
+            claimed.push((id, claim));
+        }
+        state.save_config(&config)?;
+        Ok(claimed)
+    })
+}
+
+enum Outcome { Committed, Failed(Failure) }
 
 /// One node through start and polling.
 struct Run<'t, T> {
     node: Node,
     transport: &'t mut T,
-    desired: Desired,
-    op_id: String,
+    operation: Operation,
     started: Instant,
     stage: String,
     lost: Option<(Instant, usize, Instant)>,
@@ -259,13 +369,23 @@ struct Run<'t, T> {
 }
 
 impl<'t, T: RemoteTransport> Run<'t, T> {
-    fn fail(&mut self, stage: &str, reason: impl Into<String>) {
-        self.outcome = Some(Outcome::Failed { stage: stage.to_owned(), reason: reason.into() });
+    fn new(node: Node, transport: &'t mut T, operation: Operation) -> Self {
+        Self { node, transport, operation, started: Instant::now(), stage: String::new(), lost: None, outcome: None }
+    }
+
+    fn fail(&mut self, failure: Failure) {
+        self.outcome = Some(Outcome::Failed(failure));
+    }
+
+    /// The last stage seen, or `start` before the first one.
+    fn current_stage(&self) -> String {
+        if self.stage.is_empty() { "start".to_owned() } else { self.stage.clone() }
     }
 
     /// Upload the executor when needed, the operation directory, then start it.
-    async fn start(&mut self, session: &mut Session, agent_ok: bool) -> Result<()> {
+    async fn start(&mut self, session: &mut Session, agent_ok: bool, desired: &Desired) -> Result<()> {
         let name = self.node.name.clone();
+        let op_id = self.operation.id.clone();
         if !agent_ok {
             let reset = self.transport.exec(&agent_reset_command(), b"", COMMAND_TIMEOUT).await?;
             if reset.exit_status != 0 {
@@ -275,24 +395,33 @@ impl<'t, T: RemoteTransport> Run<'t, T> {
             self.transport.upload(agent.path(), &agent_dir(), LONG_TIMEOUT).await?;
             session.log(Level::Info, &format!("{name}: исполнитель загружен"));
         }
-        let dir = operation_dir(&self.op_id, &self.desired)?;
-        self.transport.upload(dir.path(), &ops_dir(&self.op_id), LONG_TIMEOUT).await?;
-        let started = self.transport.exec(&start_command(&self.op_id), b"", COMMAND_TIMEOUT).await?;
+        let dir = operation_dir(&op_id, desired)?;
+        self.transport.upload_private(dir.path(), &ops_dir(&op_id), LONG_TIMEOUT).await?;
+        let started = self.transport.exec(&start_command(&op_id), b"", COMMAND_TIMEOUT).await?;
         if started.exit_status != 0 {
             return Err(RcError::new("remote_failed", "Не удалось запустить исполнитель."));
         }
         Ok(())
     }
 
+    /// Print the tail of the executor log.
+    async fn show_log(&mut self, session: &mut Session) {
+        if let Ok(log) = self.transport.exec(&log_command(&self.operation.id), b"", COMMAND_TIMEOUT).await {
+            for line in String::from_utf8_lossy(&log.stdout).lines() {
+                session.log(Level::Output, line);
+            }
+        }
+    }
+
     /// One poll: read the status or try to reconnect.
     async fn poll(&mut self, session: &mut Session) {
         let now = Instant::now();
         if now.duration_since(self.started) > OPERATION_LIMIT {
-            return self.fail("timeout", "Операция не завершилась за 60 минут.");
+            return self.fail(Failure::new(&self.current_stage(), "timeout", "операция не завершилась за 60 минут"));
         }
         if let Some((since, attempt, next)) = self.lost {
             if now.duration_since(since) > OFFLINE_LIMIT {
-                return self.fail("timeout", "Нет связи с нодой больше 10 минут.");
+                return self.fail(Failure::new(&self.current_stage(), "timeout", "нет связи с нодой больше 10 минут"));
             }
             if now < next {
                 return;
@@ -305,7 +434,7 @@ impl<'t, T: RemoteTransport> Run<'t, T> {
                 return;
             }
         }
-        let status = match self.transport.exec(&status_command(&self.op_id), b"", COMMAND_TIMEOUT).await {
+        let status = match self.transport.exec(&status_command(&self.operation.id), b"", COMMAND_TIMEOUT).await {
             Ok(result) if result.exit_status == 0 => parse_status(&String::from_utf8_lossy(&result.stdout)),
             Ok(_) => return,
             Err(_) => {
@@ -321,40 +450,37 @@ impl<'t, T: RemoteTransport> Run<'t, T> {
             }
         }
         match status.get("result").map(String::as_str) {
-            None => {}
             Some("committed") => self.outcome = Some(Outcome::Committed),
             Some(result) => {
-                let stage = status.get("error").cloned().unwrap_or_else(|| self.stage.clone());
-                let what = if result == "rolled_back" { "откат" } else { "ошибка" };
-                if let Ok(log) = self.transport.exec(&log_command(&self.op_id), b"", COMMAND_TIMEOUT).await {
-                    for line in String::from_utf8_lossy(&log.stdout).lines() {
-                        session.log(Level::Output, line);
-                    }
-                }
-                let reason = format!("{}: {what} на этапе «{}»", self.node.name, stage_label(&stage));
-                session.log(Level::Warn, &reason);
-                self.fail(&stage, reason);
+                let stage = status.get("error").cloned().unwrap_or_else(|| self.current_stage());
+                self.show_log(session).await;
+                let failure = match (result, stage.as_str()) {
+                    (_, "locked") => Failure::new(&self.current_stage(), "failed", "на ноде выполняется другая операция"),
+                    ("rolled_back", _) => Failure::new(&stage, "rolled_back", format!("откат на этапе «{}»", stage_label(&stage))),
+                    _ => Failure::new(&stage, "failed", format!("ошибка на этапе «{}»", stage_label(&stage))),
+                };
+                self.fail(failure);
             }
+            None if unit_gone(&status) => {
+                self.show_log(session).await;
+                let stage = self.current_stage();
+                self.fail(Failure::new(&stage, "failed",
+                    format!("исполнитель остановился без результата на этапе «{}»", stage_label(&stage))));
+            }
+            None => {}
         }
     }
 
-    /// Record the result: `applied` after a commit, the operation cleared always.
+    /// Record the result: `applied` after a commit, the operation cleared
+    /// always except after a timeout (the next `node apply` resumes it).
     fn record(&self, session: &mut Session) -> Result<()> {
-        let committed = matches!(self.outcome, Some(Outcome::Committed));
-        let desired = &self.desired;
-        session.mutate("node apply", |state| {
-            let mut config = state.load_config()?;
-            if let Some(node) = config.nodes.iter_mut().find(|node| node.id == self.node.id) {
-                node.operation = None;
-                if committed {
-                    node.applied = (!desired.teardown).then(|| Applied {
-                        digest: desired.digest.clone(), files: render::file_hashes(&desired.files),
-                        ports: desired.ports.clone(), at: crate::github::utc_stamp(),
-                    });
-                }
+        match &self.outcome {
+            Some(Outcome::Committed) => finish_operation(session, &self.node.id, &self.operation.id, true),
+            Some(Outcome::Failed(failure)) if failure.code != "timeout" => {
+                finish_operation(session, &self.node.id, &self.operation.id, false)
             }
-            state.save_config(&config)
-        })
+            _ => Ok(()),
+        }
     }
 }
 
@@ -373,73 +499,113 @@ async fn drive<T: RemoteTransport>(session: &mut Session, runs: &mut [Run<'_, T>
     }
 }
 
+/// Start a claimed operation; a failed start clears it again.
+async fn launch<T: RemoteTransport>(session: &mut Session, run: &mut Run<'_, T>, agent_ok: bool, desired: &Desired)
+    -> Result<()>
+{
+    if let Err(error) = run.start(session, agent_ok, desired).await {
+        finish_operation(session, &run.node.id, &run.operation.id, false)?;
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// Planned work on one probed node.
 struct Planned<T> {
+    id: String,
     name: String,
     transport: T,
     digest: String,
     agent_ok: bool,
+    sshd: Option<u16>,
     /// An unfinished operation to resume instead of starting a new one.
     resume: Option<String>,
 }
 
-/// Probe one node; `Err((stage, reason))` excludes it.
-async fn probe<T: RemoteTransport>(session: &Session, transport: &mut T, node: &Node, desired: &Desired)
-    -> std::result::Result<Probe, (String, String, Option<u16>)>
-{
-    let fail = |error: RcError| (error.code.to_owned(), error.message, None);
+/// Connect and probe one node.
+async fn probe<T: RemoteTransport>(session: &Session, transport: &mut T, node: &Node) -> std::result::Result<Probe, Failure> {
+    let fail = |error: RcError| Failure::of("probe", error);
     nodes::require_portable(session, node).map_err(fail)?;
     nodes::connect(transport, &session.state, node).await.map_err(fail)?;
     let result = transport.exec(&probe_command(node), b"", COMMAND_TIMEOUT).await.map_err(fail)?;
     let probe = parse_probe(&String::from_utf8_lossy(&result.stdout));
     if !matches!(probe.os.as_str(), "debian" | "ubuntu") || !probe.systemd {
-        return Err(("unsupported_os".into(), format!("Нода «{}»: нужна Debian или Ubuntu с systemd.", node.name), None));
-    }
-    let applied_ports = node.applied.as_ref().map(|applied| applied.ports.clone()).unwrap_or_default();
-    for rule in desired.ports.iter().filter(|rule| !applied_ports.contains(rule)) {
-        let Some((port, proto)) = rule.split_once('/').and_then(|(port, proto)| Some((port.parse::<u16>().ok()?, proto))) else { continue };
-        if probe.listening.iter().any(|(listening, busy)| listening == proto && *busy == port) {
-            return Err(("port_busy".into(), format!("Нода «{}»: порт {port} уже занят.", node.name), Some(port)));
-        }
+        return Err(Failure::new("probe", "unsupported_os", "нужна Debian или Ubuntu с systemd"));
     }
     Ok(probe)
 }
 
+/// A port the node does not listen on for us yet is taken by someone else.
+fn busy_port(probe: &Probe, node: &Node, desired: &Desired) -> Option<Failure> {
+    let ours: Vec<&String> = node.applied.iter().flat_map(|applied| &applied.ports)
+        .chain(node.operation.iter().flat_map(|operation| &operation.ports)).collect();
+    desired.ports.iter().filter(|rule| !ours.contains(rule)).find_map(|rule| {
+        let (port, proto) = rule.split_once('/').and_then(|(port, proto)| Some((port.parse::<u16>().ok()?, proto)))?;
+        probe.listening.iter().any(|(listening, busy)| listening == proto && *busy == port).then(|| Failure {
+            port: Some(port), ..Failure::new("probe", "port_busy", format!("порт {port} уже занят"))
+        })
+    })
+}
+
 /// `node apply (--name N… | --profile P | --pending) [--yes]`.
 pub async fn apply<T: RemoteTransport>(session: &mut Session, invocation: &Invocation, connect: &dyn Fn() -> T) -> Result<Value> {
-    let config = session.state.load_config()?;
+    let mut config = session.state.load_config()?;
     let names = targets(&config, invocation)?;
     let mut report = Report::default();
     let mut planned: Vec<Planned<T>> = Vec::new();
     let mut lines = Vec::new();
     let mut extra = Vec::new();
+    // An explicitly named node reports its configuration problem (`domain_required`)
+    // so the front end can resolve it and repeat; in bulk it fails the node.
+    let named = invocation.has("name");
     for name in &names {
-        let node = nodes::find(&config, name)?;
-        let desired = match render::desired(&config, node, None) {
+        let mut node = nodes::find(&config, name)?.clone();
+        let mut desired = match render::desired(&config, &node, None) {
             Ok(desired) => desired,
-            // An explicitly named node reports its configuration problem
-            // (`domain_required`) so the front end can resolve and repeat.
-            Err(error) if invocation.has("name") => return Err(error),
+            Err(error) if named => return Err(error),
             Err(error) => {
-                report.failed.push(failure(name, error.code, error.message));
+                report.fail(session, name, &Failure::of("probe", error));
                 continue;
             }
         };
         let mut transport = connect();
         session.log(Level::Info, &format!("Проверка ноды {name}…"));
-        let probe = match probe(session, &mut transport, node, &desired).await {
+        let probe = match probe(session, &mut transport, &node).await {
             Ok(probe) => probe,
-            Err((stage, reason, port)) => {
-                session.log(Level::Warn, &reason);
-                let mut entry = failure(name, &stage, reason);
-                if let Some(port) = port {
-                    entry["port"] = json!(port);
-                }
-                report.failed.push(entry);
+            Err(failure) => {
+                report.fail(session, name, &failure);
                 continue;
             }
         };
-        let resume = node.operation.clone().filter(|_| !probe.status.is_empty() && !probe.status.contains_key("result"));
+        let mut resume = None;
+        if let Some(operation) = node.operation.clone() {
+            let result = probe.status.get("result").map(String::as_str);
+            if result.is_none() && !unit_gone(&probe.status) {
+                resume = Some(operation.id);
+            } else {
+                // Finished while nobody watched, or the executor died: settle it.
+                match result {
+                    Some("committed") => session.log(Level::Info, &format!("{name}: прошлое применение завершилось успешно.")),
+                    Some(_) => session.log(Level::Warn, &format!("{name}: прошлое применение завершилось неудачно.")),
+                    None => session.log(Level::Warn, &format!("{name}: прошлое применение прервано без результата.")),
+                }
+                finish_operation(session, &node.id, &operation.id, result == Some("committed"))?;
+                config = session.state.load_config()?;
+                node = nodes::find(&config, name)?.clone();
+                desired = match render::desired(&config, &node, None) {
+                    Ok(desired) => desired,
+                    Err(error) if named => return Err(error),
+                    Err(error) => {
+                        report.fail(session, name, &Failure::of("probe", error));
+                        continue;
+                    }
+                };
+            }
+        }
+        if let Some(failure) = busy_port(&probe, &node, &desired) {
+            report.fail(session, name, &failure);
+            continue;
+        }
         let applied = node.applied.as_ref();
         let drift: Vec<&String> = applied.iter().flat_map(|applied| applied.files.iter())
             .filter(|(path, hash)| desired.files.iter().any(|file| file.path == **path)
@@ -453,10 +619,16 @@ pub async fn apply<T: RemoteTransport>(session: &mut Session, invocation: &Invoc
         if resume.is_some() {
             lines.push(format!("{name}: продолжается незавершённое применение."));
         }
+        if let Some(sshd) = probe.sshd.filter(|port| *port != node.port && !desired.teardown) {
+            lines.push(format!("SSH на ноде слушает порт {sshd}: при включении UFW он тоже будет разрешён."));
+        }
         lines.extend(drift.iter().map(|path| format!("Изменено вручную, будет перезаписано: {path}")));
         extra.push(format!("{name}={}", desired.digest));
         extra.extend(drift.iter().map(|path| format!("drift:{name}:{path}")));
-        planned.push(Planned { name: name.clone(), transport, digest: desired.digest, agent_ok: probe.agent_ok, resume });
+        planned.push(Planned {
+            id: node.id.clone(), name: name.clone(), transport, digest: desired.digest, agent_ok: probe.agent_ok,
+            sshd: probe.sshd, resume,
+        });
     }
     if planned.is_empty() {
         return report.finish();
@@ -465,61 +637,61 @@ pub async fn apply<T: RemoteTransport>(session: &mut Session, invocation: &Invoc
     let plan = Plan::new(lines, extra.join("\n"));
     plan.confirm(invocation)?;
 
-    let locks = session.state.locks().clone();
-    let _guard = locks.acquire(LockKind::Mutation, "node apply")?;
+    let mut claims = claim(session, "node apply start", |state, config| {
+        let mut claims = Vec::new();
+        for item in &planned {
+            let node = nodes::find(config, &item.name)?;
+            let digest = render::desired(config, node, None).map(|desired| desired.digest).ok();
+            if node.id != item.id || node.operation.as_ref().map(|operation| &operation.id) != item.resume.as_ref()
+                || digest.as_deref() != Some(item.digest.as_str())
+            {
+                return Err(plan.changed(invocation));
+            }
+            if item.resume.is_none() {
+                claims.push((node.id.clone(), node_secrets(state, config, node)
+                    .and_then(|secrets| render::desired(config, node, Some(&secrets)))));
+            }
+        }
+        Ok(claims)
+    })?;
     let config = session.state.load_config()?;
     let mut runs = Vec::new();
-    for item in &planned {
-        let node = nodes::find(&config, &item.name)?;
-        if render::desired(&config, node, None).map(|desired| desired.digest).ok().as_deref() != Some(item.digest.as_str()) {
-            return Err(plan.changed(invocation));
-        }
-    }
     for item in &mut planned {
         let node = nodes::find(&config, &item.name)?.clone();
-        let desired = match node_secrets(&session.state, &config, &node)
-            .and_then(|secrets| render::desired(&config, &node, Some(&secrets)))
-        {
-            Ok(desired) => desired,
-            Err(error) => {
-                report.failed.push(failure(&item.name, error.code, error.message));
-                continue;
-            }
-        };
-        let mut run = Run {
-            transport: &mut item.transport, desired, op_id: String::new(), started: Instant::now(),
-            stage: String::new(), lost: None, outcome: None, node,
-        };
-        if let Some(op_id) = item.resume.clone() {
+        if item.resume.is_some() {
+            let Some(operation) = node.operation.clone() else { continue };
             session.log(Level::Info, &format!("{}: продолжаю незавершённое применение", item.name));
-            run.op_id = op_id;
-        } else {
-            run.op_id = new_op_id();
-            set_operation(session, &run.node.id, Some(run.op_id.clone()))?;
-            if let Err(error) = run.start(session, item.agent_ok).await {
-                set_operation(session, &run.node.id, None)?;
-                session.log(Level::Warn, &format!("{}: не удалось запустить применение: {}", item.name, error.message));
-                report.failed.push(failure(&item.name, "start", error.message));
+            runs.push(Run::new(node, &mut item.transport, operation));
+            continue;
+        }
+        let Some(index) = claims.iter().position(|(id, _)| *id == item.id) else { continue };
+        let (operation, mut desired) = match claims.swap_remove(index).1 {
+            Ok(claimed) => claimed,
+            Err(error) => {
+                report.fail(session, &item.name, &Failure::of("start", error));
                 continue;
             }
-            session.log(Level::Info, &format!("{}: применение запущено", item.name));
+        };
+        if let Some(port) = item.sshd {
+            desired.add_ssh_port(port);
         }
+        let mut run = Run::new(node, &mut item.transport, operation);
+        if let Err(error) = launch(session, &mut run, item.agent_ok, &desired).await {
+            report.fail(session, &item.name, &Failure::new("start", "start", format!("не удалось запустить применение: {}", error.message)));
+            continue;
+        }
+        session.log(Level::Info, &format!("{}: применение запущено", item.name));
         runs.push(run);
     }
     drive(session, &mut runs).await;
     for run in &runs {
+        run.record(session)?;
         match &run.outcome {
             Some(Outcome::Committed) => {
-                run.record(session)?;
                 session.log(Level::Success, &format!("{}: применено", run.node.name));
                 report.applied.push(run.node.name.clone());
             }
-            Some(Outcome::Failed { stage, reason }) => {
-                if stage != "timeout" {
-                    run.record(session)?;
-                }
-                report.failed.push(failure(&run.node.name, stage, reason.clone()));
-            }
+            Some(Outcome::Failed(failure)) => report.fail(session, &run.node.name, failure),
             None => {}
         }
     }
@@ -527,30 +699,29 @@ pub async fn apply<T: RemoteTransport>(session: &mut Session, invocation: &Invoc
 }
 
 /// Remove everything Essence installed on a connected node (`node delete
-/// --scope server`). `Ok` only after the executor committed.
+/// --scope server`). `Ok` only after the executor committed. A node with a
+/// recorded operation is refused (`in_use`).
 pub async fn teardown<T: RemoteTransport>(session: &mut Session, node: &Node, transport: &mut T) -> Result<()> {
-    let probe = transport.exec(&probe_command(&Node { applied: None, operation: None, ..node.clone() }), b"", COMMAND_TIMEOUT).await?;
-    let agent_ok = parse_probe(&String::from_utf8_lossy(&probe.stdout)).agent_ok;
-    let mut run = Run {
-        node: node.clone(), transport, desired: render::teardown(node), op_id: new_op_id(),
-        started: Instant::now(), stage: String::new(), lost: None, outcome: None,
-    };
-    set_operation(session, &node.id, Some(run.op_id.clone()))?;
-    if let Err(error) = run.start(session, agent_ok).await {
-        set_operation(session, &node.id, None)?;
-        return Err(error);
+    let output = transport.exec(&probe_command(&Node { applied: None, operation: None, ..node.clone() }), b"", COMMAND_TIMEOUT).await?;
+    let probe = parse_probe(&String::from_utf8_lossy(&output.stdout));
+    let claims = claim(session, "node delete", |_, config| {
+        let current = config.nodes.iter().find(|current| current.id == node.id)
+            .ok_or_else(|| RcError::new("not_found", format!("Нода «{}» не найдена.", node.name)))?;
+        Ok(vec![(current.id.clone(), Ok(render::teardown(current)))])
+    })?;
+    let (operation, mut desired) = claims.into_iter().next().map(|(_, claim)| claim)
+        .unwrap_or_else(|| Err(RcError::new("not_found", format!("Нода «{}» не найдена.", node.name))))?;
+    if let Some(port) = probe.sshd {
+        desired.add_ssh_port(port);
     }
+    let mut run = Run::new(node.clone(), transport, operation);
+    launch(session, &mut run, probe.agent_ok, &desired).await?;
     drive(session, std::slice::from_mut(&mut run)).await;
+    run.record(session)?;
     match run.outcome.take() {
-        Some(Outcome::Committed) => {
-            run.outcome = Some(Outcome::Committed);
-            run.record(session)
-        }
-        Some(Outcome::Failed { stage, reason }) => {
-            if stage != "timeout" {
-                set_operation(session, &node.id, None)?;
-            }
-            Err(RcError::new("remote_failed", reason).with_extra("stage", stage))
+        Some(Outcome::Committed) => Ok(()),
+        Some(Outcome::Failed(failure)) => {
+            Err(RcError::new("remote_failed", failure.message).with_extra("stage", failure.stage).with_extra("code", failure.code))
         }
         None => Err(RcError::new("remote_failed", "Снятие не завершено.")),
     }

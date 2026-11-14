@@ -207,6 +207,10 @@ pub async fn delete<T: RemoteTransport>(session: &mut Session, invocation: &Invo
     }
     if server {
         require_portable(session, &node)?;
+        if node.operation.is_some() {
+            return Err(RcError::new("in_use", format!(
+                "На ноде «{name}» уже выполняется применение: дождитесь его завершения (node apply --name {name}).")).with_extra("name", name));
+        }
     }
     Plan::new(plan(&config, &node, server, revoke), "").confirm(invocation)?;
 
@@ -460,8 +464,8 @@ mod tests {
         let (session, _journal) = testing::session(root);
         let mut de = node("de", ID, Auth::Key);
         de.identity = Some("system".into());
-        de.applied = Some(crate::model::Applied { digest: "d".into(),
-            files: [("/etc/mihomo/config.yaml".to_owned(), "h".to_owned())].into(), ports: vec!["443/tcp".into()], at: "t".into() });
+        de.applied = Some(crate::model::Applied { digest: "d".repeat(64),
+            files: [("/etc/mihomo/config.yaml".to_owned(), "a".repeat(64))].into(), ports: vec!["443/tcp".into()], at: "t".into() });
         session.state.save_config(&Config { nodes: vec![de], ..Config::default() }).unwrap();
         pin(&session.state, "198.51.100.7", 22, vec![fp()]).unwrap();
         session
@@ -508,6 +512,23 @@ mod tests {
         transport.assert_finished();
         assert_eq!(data, json!({"name": "de", "scope": "server"}));
         assert!(session.state.load_config().unwrap().nodes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn server_scope_waits_for_a_running_operation() {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = applied_session(root.path());
+        session.mutate("t", |state| {
+            let mut config = state.load_config()?;
+            config.nodes[0].operation = Some(crate::model::Operation { id: "ab".repeat(16), digest: "d".repeat(64), ..Default::default() });
+            state.save_config(&config)
+        }).unwrap();
+        let argv = testing::invocation(&["node", "delete", "--name", "de", "--scope", "server", "--yes"]);
+        let mut transport = FakeTransport::new([]);
+        let error = delete(&mut session, &argv, &mut transport).await.unwrap_err();
+        assert_eq!((error.code, error.extra["name"].as_str()), ("in_use", Some("de")));
+        assert!(transport.journal().is_empty());
+        assert_eq!(session.state.load_config().unwrap().nodes[0].operation.as_ref().map(|op| op.id.clone()), Some("ab".repeat(16)));
     }
 
     #[tokio::test]

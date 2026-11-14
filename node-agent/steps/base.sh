@@ -55,10 +55,17 @@ stage_packages() {
 
 # ─── system ─────────────────────────────────────────────────────────────────
 stage_system() {
+    local ports=() port
     if ufw status 2>/dev/null | grep -q '^Status: active'; then
         return 0
     fi
-    ufw allow "$SSH_PORT/tcp" || return 1
+    # Порт, к которому подключается RC, и порт sshd на сервере (NAT/проброс).
+    read -r -a ports <<<"$SSH_PORTS"
+    ((${#ports[@]})) || ports=(22)
+    for port in "${ports[@]}"; do
+        [[ "$port" =~ ^[0-9]{1,5}$ ]] || { warn "Некорректный SSH-порт: $port"; return 1; }
+        ufw allow "$port/tcp" || return 1
+    done
     ufw default deny incoming || return 1
     ufw default allow outgoing || return 1
     ufw --force enable || return 1
@@ -283,11 +290,29 @@ stage_site() {
 }
 
 # ─── certificate ────────────────────────────────────────────────────────────
+# parse_cert_entries <список> — записи «имя:/var/www/имя» в CERT_ENTRIES.
+# Разбор без glob; любая некорректная запись — сбой этапа.
+parse_cert_entries() {
+    local entry name list=()
+    CERT_ENTRIES=()
+    read -r -d '' -a list <<<"$1" || true
+    for entry in "${list[@]}"; do
+        name="${entry%%:*}"
+        if [[ "$entry" != *:* || ! "$name" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ || "$name" == *..* ||
+              "${entry#*:}" != "/var/www/$name" ]]; then
+            warn "Некорректная запись сертификата: $entry"
+            return 1
+        fi
+        CERT_ENTRIES+=("$entry")
+    done
+}
+
 stage_certificate() {
     [[ -n "$CERTS" ]] || return 0
     local entry name webroot
+    parse_cert_entries "$CERTS" || return 1
     ensure_acme_installed "$ACME_EMAIL" || return 1
-    for entry in $CERTS; do
+    for entry in "${CERT_ENTRIES[@]}"; do
         name="${entry%%:*}"
         webroot="${entry#*:}"
         (umask 022; mkdir -p "$R$webroot") || return 1
@@ -318,9 +343,30 @@ stage_prepare() {
 }
 
 # ─── config: транзакция ─────────────────────────────────────────────────────
+# managed_path <путь> — путь из files.list/remove.list входит в набор, которым
+# управляет RC; без сегментов «..»/«.», «//», пробелов и управляющих символов.
+managed_path() {
+    local path="$1"
+    [[ "$path" == /* && "$path" != */ && "$path" != *//* ]] || return 1
+    [[ "$path/" != */../* && "$path/" != */./* ]] || return 1
+    [[ ! "$path" =~ [[:space:][:cntrl:]] ]] || return 1
+    case "$path" in
+        /etc/mihomo|/etc/mihomo/*|/etc/systemd/system/mihomo.service|/etc/sysctl.d/99-vpn-speedup.conf)
+            return 0 ;;
+    esac
+    [[ "$path" =~ ^/etc/nginx/(sites-available|sites-enabled|modules-enabled)/[^/]+$ ]]
+}
+
+check_path() {
+    managed_path "$1" && return 0
+    warn "Путь вне управляемого набора: $1"
+    return 1
+}
+
 # tx_backup <абсолютный путь> — копия в <op>/backup/<путь> либо отметка .absent.
 tx_backup() {
     local path="$1" dest="$R$1" bak="$OP/backup$1" known
+    [[ "$path" == "$MIHOMO_BIN_REL" ]] || check_path "$path" || return 1
     for known in "${TX_PATHS[@]}"; do
         [[ "$known" == "$path" ]] && return 0
     done
@@ -348,21 +394,62 @@ tx_restore_files() {
     done
 }
 
+# port_handover <restart|reload|none> — mihomo остановлен, пока nginx занимает
+# или освобождает общие порты (443), затем запускается заново. Все шаги
+# выполняются и при сбое одного из них (откат зовёт то же самое).
+port_handover() {
+    local rc=0
+    systemctl stop mihomo || rc=1
+    case "$1" in
+        restart) systemctl restart nginx || rc=1 ;;
+        reload) { nginx -t && systemctl reload nginx; } || rc=1 ;;
+    esac
+    systemctl start mihomo || rc=1
+    if ! wait_active mihomo 15; then
+        warn "mihomo не запустился."
+        rc=1
+    fi
+    return "$rc"
+}
+
+# listen_ready — каждый порт LISTEN_TCP в состоянии LISTEN (ss -Htln);
+# ждёт до AGENT_LISTEN_WAIT_SECONDS (по умолчанию 10 с).
+listen_ready() {
+    local limit="${AGENT_LISTEN_WAIT_SECONDS:-10}" ports=() port missing listening i
+    read -r -a ports <<<"$LISTEN_TCP"
+    ((${#ports[@]})) || return 0
+    for port in "${ports[@]}"; do
+        [[ "$port" =~ ^[0-9]{1,5}$ ]] || { warn "Некорректный порт LISTEN_TCP: $port"; return 1; }
+    done
+    for ((i = 1; ; i++)); do
+        missing=""
+        listening=$(ss -Htln 2>/dev/null | awk '{ n = split($4, a, ":"); print a[n] }')
+        for port in "${ports[@]}"; do
+            grep -qxF -- "$port" <<<"$listening" || { missing="$port"; break; }
+        done
+        [[ -z "$missing" ]] && return 0
+        ((i >= limit)) && break
+        sleep 1
+    done
+    warn "Порт $missing не слушается."
+    return 1
+}
+
 # Откат: вызывается из finish() при открытой транзакции.
 tx_rollback() {
-    local feature
+    local feature nginx_action=none
     warn "Откат изменений."
     tx_restore_files
     systemctl daemon-reload
     if [[ "$OP_MODE" == teardown ]]; then
         systemctl enable mihomo
     fi
-    systemctl restart mihomo
     if [[ "$NGINX" == true || "$OP_MODE" == teardown ]] && command -v nginx >/dev/null 2>&1; then
-        systemctl restart nginx
+        nginx_action=restart
     elif tx_touches_nginx && command -v nginx >/dev/null 2>&1; then
-        nginx -t && systemctl reload nginx
+        nginx_action=reload
     fi
+    port_handover "$nginx_action"
     sysctl --system >/dev/null
     for feature in $FEATURES; do
         feature_hook "$feature" rollback
@@ -408,15 +495,15 @@ wait_active() {
 }
 
 stage_config() {
-    local mode owner group path feature code
+    local mode owner group path feature code nginx_action=none
     local entries=() removes=()
     while read -r mode owner group path; do
         [[ -n "${mode:-}" ]] || continue
-        [[ "$path" == /* ]] || { warn "Путь не абсолютный: $path"; return 1; }
+        check_path "$path" || return 1
         entries+=("$mode $owner $group $path")
     done < <(read_list "$OP/files.list")
     while IFS= read -r path; do
-        [[ "$path" == /* ]] || { warn "Путь не абсолютный: $path"; return 1; }
+        check_path "$path" || return 1
         removes+=("$path")
     done < <(read_list "$OP/remove.list")
 
@@ -444,13 +531,13 @@ stage_config() {
     fi
     systemctl daemon-reload || return 1
     systemctl enable mihomo || return 1
-    systemctl restart mihomo || return 1
-    wait_active mihomo 15 || { warn "mihomo не запустился."; return 1; }
     if [[ "$NGINX" == true ]]; then
-        systemctl restart nginx || return 1
+        nginx_action=restart
     elif tx_touches_nginx && command -v nginx >/dev/null 2>&1; then
-        { nginx -t && systemctl reload nginx; } || return 1
+        nginx_action=reload
     fi
+    port_handover "$nginx_action" || return 1
+    listen_ready || return 1
     if [[ "$SITE_REQUIRE_200" == true ]]; then
         code=$(curl -sk -o /dev/null -w '%{http_code}' https://127.0.0.1:8443 -H "Host: $SITE_NAME")
         [[ "$code" == 200 ]] || { warn "Сайт-заглушка ответил $code."; return 1; }
@@ -464,7 +551,7 @@ stage_config() {
 stage_teardown_config() {
     local path removes=() sysctl_removed=false
     while IFS= read -r path; do
-        [[ "$path" == /* ]] || { warn "Путь не абсолютный: $path"; return 1; }
+        check_path "$path" || return 1
         removes+=("$path")
     done < <(read_list "$OP/remove.list")
 
@@ -472,11 +559,12 @@ stage_teardown_config() {
     for path in "${removes[@]}" "$MIHOMO_BIN_REL"; do
         tx_backup "$path" || return 1
     done
+    # Сначала disable: без файла юнита systemctl disable отказывает.
+    systemctl disable --now mihomo || return 1
     for path in "${removes[@]}"; do
         [[ "$path" == /etc/sysctl.d/99-vpn-speedup.conf ]] && sysctl_removed=true
         rm -rf -- "$R$path" || return 1
     done
-    systemctl disable --now mihomo || return 1
     rm -f -- "$R$MIHOMO_BIN_REL" || return 1
     systemctl daemon-reload || return 1
     if command -v nginx >/dev/null 2>&1; then
@@ -492,22 +580,33 @@ stage_teardown_config() {
 
 # ─── firewall ───────────────────────────────────────────────────────────────
 # stage_firewall "<правила>" — учёт своих правил в $NODE_DIR/ufw-rules.
+# Правило, которое уже было в `ufw show added` до нас, принадлежит
+# администратору: в учёт не попадает и нами не удаляется.
 stage_firewall() {
-    local wanted=" $1 " ledger="$NODE_DIR/ufw-rules" rule kept=()
-    local -A have=()
+    local ledger="$NODE_DIR/ufw-rules" rule added="" kept=() wanted=()
+    local -A have=() want=()
     if [[ -f "$ledger" ]]; then
         while IFS= read -r rule; do
             [[ -n "$rule" ]] && have["$rule"]=1
         done <"$ledger"
     fi
-    for rule in $1; do
-        if [[ -z "${have[$rule]:-}" ]]; then
+    read -r -a wanted <<<"$1"
+    if ((${#wanted[@]})); then
+        added=$(ufw show added 2>/dev/null) || { warn "Не удалось прочитать правила UFW."; return 1; }
+    fi
+    for rule in "${wanted[@]}"; do
+        want["$rule"]=1
+        if [[ -n "${have[$rule]:-}" ]]; then
+            kept+=("$rule")
+        elif grep -qxF -- "ufw allow $rule" <<<"$added"; then
+            info "Правило UFW $rule уже было добавлено вручную — не учитываю."
+        else
             ufw allow "$rule" || return 1
+            kept+=("$rule")
         fi
-        kept+=("$rule")
     done
     for rule in "${!have[@]}"; do
-        [[ "$wanted" == *" $rule "* ]] && continue
+        [[ -n "${want[$rule]:-}" ]] && continue
         ufw delete allow "$rule" || return 1
     done
     if ((${#kept[@]})); then
@@ -519,12 +618,16 @@ stage_firewall() {
 }
 
 # ─── cleanup ────────────────────────────────────────────────────────────────
+# apply: пять последних операций и только текущий исполнитель.
+# teardown: все остальные операции и исполнители; свой каталог исполнителя
+# apply.sh удаляет после записи committed, от своей операции остаются status и log.
 stage_cleanup() {
     local feature entry name webroot dir self
+    parse_cert_entries "$RELEASE_CERTS" || return 1
     for feature in $REMOVE_FEATURES; do
         feature_hook "$feature" remove || return 1
     done
-    for entry in $RELEASE_CERTS; do
+    for entry in "${CERT_ENTRIES[@]}"; do
         name="${entry%%:*}"
         webroot="${entry#*:}"
         release_cert "$name" "$R$webroot" "$R/etc/nginx/ssl" \
@@ -540,15 +643,19 @@ stage_cleanup() {
     if [[ -d "$NODE_DIR/ops" ]]; then
         while IFS= read -r dir; do
             [[ "$(cd "$dir" && pwd -P)" == "$OP" ]] && continue
-            rm -rf -- "$dir"
-        done < <(ls -1dt "$NODE_DIR/ops"/*/ 2>/dev/null | tail -n +6)
+            rm -rf -- "${dir%/}"
+        done < <(if [[ "$OP_MODE" == teardown ]]; then
+                     ls -1d "$NODE_DIR/ops"/*/ 2>/dev/null
+                 else
+                     ls -1dt "$NODE_DIR/ops"/*/ 2>/dev/null | tail -n +6
+                 fi)
     fi
     if [[ -d "$NODE_DIR/agent" ]]; then
         for dir in "$NODE_DIR/agent"/*/; do
             [[ -d "$dir" ]] || continue
             self="$(cd "$dir" && pwd -P)"
             [[ "$self" == "$AGENT_DIR" ]] && continue
-            rm -rf -- "$self"
+            rm -rf -- "${dir%/}"
         done
     fi
 }

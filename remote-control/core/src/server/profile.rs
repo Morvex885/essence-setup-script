@@ -20,7 +20,7 @@ use crate::request_secrets::Secrets;
 use crate::validation as v;
 
 use super::keys::{ensure_generated, hex, uniform};
-use super::render::RESERVED_PORTS;
+use super::ports::RESERVED_PORTS;
 
 const MIHOMO_LATEST: &str = "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest";
 

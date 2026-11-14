@@ -5,4 +5,6 @@ pub mod apply;
 pub mod bundle;
 pub mod keys;
 pub mod profile;
+pub mod paths;
+pub mod ports;
 pub mod render;

@@ -7,6 +7,9 @@
 
 set -uo pipefail
 umask 077
+# systemd-run без User= не задаёт HOME, а cert.sh читает его под set -u.
+: "${HOME:=/root}"
+export HOME
 
 OP="${1:-}"
 if [[ -z "$OP" || ! -d "$OP" ]]; then
@@ -34,6 +37,12 @@ write_status() {
         if [[ -n "$RESULT" ]]; then printf 'result=%s\n' "$RESULT"; fi
         if [[ -n "$ERROR" ]]; then printf 'error=%s\n' "$ERROR"; fi
     } >"$tmp" && mv -f "$tmp" "$OP/status"
+}
+
+# После записи результата в каталоге операции остаются только status и log:
+# files/ и backup/ содержат ключи и пароли.
+scrub_op() {
+    rm -rf -- "$OP/files" "$OP/backup"
 }
 
 stage() {
@@ -64,6 +73,7 @@ finish() {
         write_status
         warn "Операция завершилась: $RESULT ($ERROR)"
     fi
+    scrub_op
     exit "$rc"
 }
 
@@ -71,15 +81,29 @@ trap 'exit 1' HUP INT TERM
 trap finish EXIT
 write_status
 
+mkdir -p "$NODE_DIR" || exit 1
+NODE_DIR="$(cd "$NODE_DIR" && pwd -P)" || exit 1
+chmod 700 "$NODE_DIR" "$OP" || exit 1
+if [[ -d "$NODE_DIR/ops" ]]; then
+    chmod 700 "$NODE_DIR/ops" || exit 1
+fi
+chmod -R go-rwx "$OP" || exit 1
+
 # shellcheck source=/dev/null
 source "$AGENT_DIR/common/common.sh" || exit 1
 # shellcheck source=/dev/null
 source "$AGENT_DIR/common/cert.sh" || exit 1
-for _step in "$AGENT_DIR"/steps/*.sh; do
+# Подключаются только этапы из MANIFEST («<sha256>  <относительный путь>»).
+if [[ ! -f "$AGENT_DIR/MANIFEST" ]]; then
+    warn "Нет MANIFEST исполнителя."
+    exit 1
+fi
+mapfile -t _steps < <(awk '$2 ~ /^steps\/[A-Za-z0-9_.-]+\.sh$/ { print $2 }' "$AGENT_DIR/MANIFEST" | sort -u)
+for _step in "${_steps[@]}"; do
     # shellcheck source=/dev/null
-    source "$_step" || exit 1
+    source "$AGENT_DIR/$_step" || exit 1
 done
-unset _step
+unset _step _steps
 
 if [[ ! -f "$OP/spec.sh" ]]; then
     warn "Нет spec.sh."
@@ -87,12 +111,11 @@ if [[ ! -f "$OP/spec.sh" ]]; then
 fi
 # shellcheck source=/dev/null
 source "$OP/spec.sh" || exit 1
-: "${OP_ID:=}" "${OP_MODE:=apply}" "${SSH_PORT:=22}" "${MIHOMO_VERSION:=}" "${NGINX:=false}" "${NGINX_STREAM:=false}"
-: "${SITE_NAME:=}" "${SITE_SOURCE:=random}" "${SITE_REQUIRE_200:=false}" "${CERTS:=}" "${ACME_EMAIL:=}"
-: "${DNS_DOMAINS:=}" "${HY2_CERT:=false}" "${HY2_CN:=}" "${UFW_RULES:=}" "${RELEASE_CERTS:=}"
+: "${OP_ID:=}" "${OP_MODE:=apply}" "${SSH_PORTS:=22}" "${LISTEN_TCP:=}" "${MIHOMO_VERSION:=}" "${NGINX:=false}"
+: "${NGINX_STREAM:=false}" "${SITE_NAME:=}" "${SITE_SOURCE:=random}" "${SITE_REQUIRE_200:=false}" "${CERTS:=}"
+: "${ACME_EMAIL:=}" "${DNS_DOMAINS:=}" "${HY2_CERT:=false}" "${HY2_CN:=}" "${UFW_RULES:=}" "${RELEASE_CERTS:=}"
 : "${FEATURES:=}" "${REMOVE_FEATURES:=}" "${WARP:=}"
 
-mkdir -p "$NODE_DIR" || exit 1
 exec 9>"$NODE_DIR/lock" || exit 1
 if ! flock -n 9; then
     RESULT=failed
@@ -128,5 +151,11 @@ esac
 
 RESULT=committed
 write_status
+scrub_op
+# Teardown убирает и сам исполнитель: функции уже загружены, а bash
+# дочитывает этот скрипт из открытого дескриптора.
+if [[ "$OP_MODE" == teardown && "$AGENT_DIR" == "$NODE_DIR/agent/"* ]]; then
+    rm -rf -- "$AGENT_DIR"
+fi
 success "Операция $OP_ID применена."
 exit 0

@@ -1417,12 +1417,14 @@ mod tests {
         // Refusal; a read (`client connections --name`) never offers.
         drive(vec![ok(&add, json!({"name":"new"})), ok(&["node", "list"], pending.clone())], &["n"], |ctx| execute(ctx, &add).map(|_| ()));
         drive(vec![ok(&["client", "connections", "--name", "c"], json!([]))], &[], |ctx| execute(ctx, &["client", "connections", "--name", "c"]).map(|_| ()));
-        // `partial`: one journal line per failed node with the stage label.
-        let partial = fail("partial", json!({"applied":[],"unchanged":[],"failed":[{"name":"de","stage":"config","reason":"rolled_back"},{"name":"ru","stage":"probe","reason":"port_busy","port":443}]}));
+        // `partial`: one journal line `name: message` per failed node.
+        let partial = fail("partial", json!({"applied":[],"unchanged":[],"failed":[
+            {"name":"de","stage":"config","code":"rolled_back","message":"откат на этапе «конфигурация и проверка»"},
+            {"name":"de","stage":"probe","code":"port_busy","message":"порт 443 уже занят","port":443}]}));
         let (_, ui) = drive(vec![ok(&add, json!({"name":"new"})), ok(&["node", "list"], pending.clone()), step(&apply, plan()), (yes(&apply, Value::Null).0, partial)],
             &["y", "y"], |ctx| execute(ctx, &add).map(|_| ()));
         assert_eq!(notices(&ui, "de: откат на этапе «конфигурация и проверка»"), 1);
-        assert_eq!(notices(&ui, "ru: порт 443 занят"), 1);
+        assert_eq!(notices(&ui, "de: порт 443 уже занят"), 1);
         drive(vec![
             ok(&["generate", "--all"], json!({"ok":["new"],"nodes_pending":["de"]})), ok(&["node", "list"], pending),
         ], &["", "n"], |ctx| generate(ctx, &["--all"]));

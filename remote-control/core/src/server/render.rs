@@ -13,34 +13,13 @@ use crate::clients::generate::{User, effective_connections, node_users};
 use crate::error::{RcError, Result};
 use crate::model::{Config, Ipv6, Node, Profile, RealityMode, SiteSource, XhttpTopology};
 use crate::protocols::vless_xhttp::NginxListener;
-use crate::protocols::{Vless, VlessListener, hy2, listener_users, vless_grpc, vless_tcp, vless_xhttp};
+use crate::protocols::{Vless, VlessListener, hy2, listener_users, vless_grpc, vless_tcp, vless_xhttp, yaml_escape};
 
-/// nginx site behind Reality self-steal (name-based vhosts).
-pub const SITE_PORT: u16 = 8443;
-/// mihomo Reality listener behind the nginx stream front.
-pub const REALITY_INNER_PORT: u16 = 8444;
-/// Subscription vhost behind the nginx stream front.
-pub const SUB_INNER_PORT: u16 = 8445;
-/// Telegram Proxy behind the nginx stream front.
-pub const TG_INNER_PORT: u16 = 8446;
-/// mihomo xHTTP listener behind nginx.
-pub const XHTTP_NGINX_PORT: u16 = 8447;
-
-/// Ports profiles may not use: the internal ones and local services.
-pub const RESERVED_PORTS: [u16; 11] = [
-    SITE_PORT, REALITY_INNER_PORT, SUB_INNER_PORT, TG_INNER_PORT, XHTTP_NGINX_PORT,
-    9090, 1053, 2398, 8080, 8081, 8888,
-];
+use super::paths::{MIHOMO_CONFIG_PATH, MIHOMO_SERVICE_PATH, SITES_AVAILABLE, SITES_ENABLED, STREAM_PATH, SYSCTL_PATH};
+use super::ports::{REALITY_INNER_PORT, SITE_PORT, SUB_INNER_PORT, TG_INNER_PORT, XHTTP_NGINX_PORT};
 
 /// Bumped whenever rendered files change for an unchanged configuration.
-pub const RENDER_REVISION: u32 = 1;
-
-pub const MIHOMO_CONFIG_PATH: &str = "/etc/mihomo/config.yaml";
-pub const MIHOMO_SERVICE_PATH: &str = "/etc/systemd/system/mihomo.service";
-pub const SYSCTL_PATH: &str = "/etc/sysctl.d/99-vpn-speedup.conf";
-pub const STREAM_PATH: &str = "/etc/nginx/modules-enabled/90-essence-stream.conf";
-const SITES_AVAILABLE: &str = "/etc/nginx/sites-available/";
-const SITES_ENABLED: &str = "/etc/nginx/sites-enabled/";
+pub const RENDER_REVISION: u32 = 2;
 
 const MIHOMO_CONFIG: &str = include_str!("assets/mihomo-config.yaml");
 const MIHOMO_SERVICE: &str = include_str!("assets/mihomo.service");
@@ -90,6 +69,17 @@ pub struct Desired {
     pub ports: Vec<String>,
     pub lines: Vec<String>,
     pub digest: String,
+}
+
+impl Desired {
+    /// Also allow `port` (sshd's own port behind NAT) when UFW is enabled.
+    pub fn add_ssh_port(&mut self, port: u16) {
+        if let Some((_, ports)) = self.spec.iter_mut().find(|(key, _)| *key == "SSH_PORTS")
+            && !ports.split(' ').any(|known| known == port.to_string())
+        {
+            ports.push_str(&format!(" {port}"));
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -145,8 +135,16 @@ fn needs_site(profile: &Profile) -> bool {
         && (profile.has_reality() || profile.vless_xhttp.is_some() || profile.hysteria2.is_some())
 }
 
+/// Whether a Reality listener takes the public 443 (effective ports).
+fn reality_on_443(node: &Node, profile: &Profile) -> bool {
+    profile.listen_ports(&node.ports).0.iter()
+        .any(|&(key, port)| port == 443 && matches!(key, "vless-tcp" | "vless-xhttp" | "vless-grpc"))
+}
+
+/// Reality takes the 443 front only when one of its listeners is on 443;
+/// otherwise the node's site and roles answer 443 themselves.
 fn front(config: &Config, node: &Node, profile: &Profile) -> Front {
-    match (profile.has_reality(), profile.reality_mode) {
+    match (reality_on_443(node, profile), profile.reality_mode) {
         (false, _) => Front::Free,
         (true, RealityMode::SelfSteal) => Front::SelfSteal,
         (true, RealityMode::Sni) if role_on_443(config, node) => Front::Stream,
@@ -196,8 +194,11 @@ fn layout<'a>(config: &'a Config, node: &'a Node) -> Result<Option<Layout<'a>>> 
         None
     };
     let sni_domain = profile.sni_domain.as_deref().unwrap_or_default();
-    let (dest, sni) = match (front, site) {
-        (Front::SelfSteal, Some(domain)) => (format!("127.0.0.1:{SITE_PORT}"), domain),
+    let (dest, sni) = match (profile.reality_mode, site) {
+        // Self-steal borrows the node's own site: behind Reality on 8443, on
+        // 443 itself when Reality listens elsewhere.
+        (RealityMode::SelfSteal, Some(domain)) if front == Front::SelfSteal => (format!("127.0.0.1:{SITE_PORT}"), domain),
+        (RealityMode::SelfSteal, Some(domain)) => ("127.0.0.1:443".to_owned(), domain),
         _ => (format!("{sni_domain}:443"), sni_domain),
     };
     let layout = Layout {
@@ -309,11 +310,16 @@ impl Layout<'_> {
     fn listener_block(&self, listener: &Listener, users: &[(&str, &str)], private_key: &str) -> Result<String> {
         let (username, credential) = users[0];
         let port = listener.port.to_string();
+        // The shared builders write these inside double quotes as given (Bash
+        // parity); the server config escapes them. Generated values are
+        // unchanged by escaping.
+        let private_key = yaml_escape(private_key);
+        let short_id = self.node.params.reality.as_ref().map(|reality| yaml_escape(&reality.short_id));
         let vless = |name| -> Result<VlessListener<'_>> {
-            let (_, short_id) = self.reality()?;
+            let short_id = short_id.as_deref().ok_or_else(|| self.missing_params())?;
             Ok(VlessListener {
                 name, listen: listener.listen, port: &port, username, uuid: credential, dest: &self.dest,
-                private_key, short_id, sni: self.sni, proxy: "outbound",
+                private_key: &private_key, short_id, sni: self.sni, proxy: "outbound",
             })
         };
         let block = match listener.kind {
@@ -397,20 +403,57 @@ impl Layout<'_> {
         text
     }
 
-    fn files(&self, users: &[User<'_>], private_key: &str) -> Result<Vec<RenderedFile>> {
+    /// Managed files; contents only with `secrets` (users and the Reality
+    /// key), otherwise just the paths and modes.
+    fn files(&self, secrets: Option<(&[User<'_>], &str)>) -> Result<Vec<RenderedFile>> {
+        let text = |render: &dyn Fn() -> Result<String>| if secrets.is_some() { render() } else { Ok(String::new()) };
         let mut files = vec![
-            file(MIHOMO_CONFIG_PATH, "0600", self.mihomo_config(users, private_key)?),
-            file(MIHOMO_SERVICE_PATH, "0644", MIHOMO_SERVICE.to_owned()),
-            file(SYSCTL_PATH, "0644", self.sysctl()),
+            file(MIHOMO_CONFIG_PATH, "0600", text(&|| {
+                let (users, private_key) = secrets.unwrap_or_default();
+                self.mihomo_config(users, private_key)
+            })?),
+            file(MIHOMO_SERVICE_PATH, "0644", text(&|| Ok(MIHOMO_SERVICE.to_owned()))?),
+            file(SYSCTL_PATH, "0644", text(&|| Ok(self.sysctl()))?),
         ];
         if let Some(domain) = self.site {
-            files.push(file(&format!("{SITES_AVAILABLE}{domain}"), "0644", self.site_config(domain)));
-            files.push(file(&format!("{SITES_ENABLED}{domain}"), "link", format!("{SITES_AVAILABLE}{domain}")));
+            files.push(file(&format!("{SITES_AVAILABLE}{domain}"), "0644", text(&|| Ok(self.site_config(domain)))?));
+            files.push(file(&format!("{SITES_ENABLED}{domain}"), "link", text(&|| Ok(format!("{SITES_AVAILABLE}{domain}")))?));
         }
         if self.front == Front::Stream {
-            files.push(file(STREAM_PATH, "0644", self.stream_config()));
+            files.push(file(STREAM_PATH, "0644", text(&|| Ok(self.stream_config()))?));
         }
         Ok(files)
+    }
+
+    /// Every rendered listener has the generated parameters it needs (the
+    /// same checks the file render makes, without rendering).
+    fn check_params(&self, users: &[User<'_>]) -> Result<()> {
+        for listener in self.listeners.iter().filter(|listener| !self.users(users, listener).is_empty()) {
+            if matches!(listener.kind, Kind::Tcp | Kind::Xhttp | Kind::Grpc) {
+                self.reality()?;
+            }
+            match listener.kind {
+                Kind::Xhttp | Kind::XhttpNginx => { self.xhttp_path()?; }
+                Kind::Grpc => { self.grpc_service()?; }
+                Kind::Hy2 => { self.hy2_obfs()?; }
+                Kind::Tcp => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// TCP ports that must listen once the configuration is active.
+    fn listen_tcp(&self, users: &[User<'_>]) -> Vec<u16> {
+        let mut ports: BTreeSet<u16> = self.listeners.iter()
+            .filter(|listener| listener.kind != Kind::Hy2 && !self.users(users, listener).is_empty())
+            .map(|listener| listener.port).collect();
+        if self.site.is_some() {
+            ports.insert(if self.front == Front::SelfSteal { SITE_PORT } else { 443 });
+        }
+        if self.front == Front::Stream || self.nginx_on_443() {
+            ports.insert(443);
+        }
+        ports.into_iter().collect()
     }
 
     /// Canonical digest input: everything the rendered files depend on.
@@ -520,8 +563,9 @@ pub fn desired(config: &Config, node: &Node, secrets: Option<&NodeSecrets>) -> R
         return Ok(teardown(node));
     };
     let users = layout.node_users()?;
-    let private_key = secrets.and_then(|s| s.reality_key.as_deref()).map(String::as_str).unwrap_or_default();
-    let mut files = layout.files(&users, private_key)?;
+    layout.check_params(&users)?;
+    let contents = secrets.map(|s| (users.as_slice(), s.reality_key.as_deref().map(String::as_str).unwrap_or_default()));
+    let files = layout.files(contents)?;
     let keep: BTreeSet<&str> = files.iter().map(|f| f.path.as_str()).collect();
     let remove = removed(node, &keep);
     let release: Vec<String> = applied_sites(node).into_iter().filter(|site| layout.site != Some(site.as_str())).collect();
@@ -532,7 +576,8 @@ pub fn desired(config: &Config, node: &Node, secrets: Option<&NodeSecrets>) -> R
     let site = layout.site.unwrap_or_default();
     let spec = vec![
         ("OP_MODE", "apply".to_owned()),
-        ("SSH_PORT", node.port.to_string()),
+        ("SSH_PORTS", node.port.to_string()),
+        ("LISTEN_TCP", layout.listen_tcp(&users).iter().map(u16::to_string).collect::<Vec<_>>().join(" ")),
         ("MIHOMO_VERSION", profile.mihomo_version.clone()),
         ("NGINX", bool_text(layout.nginx())),
         ("NGINX_STREAM", bool_text(layout.front == Front::Stream)),
@@ -573,9 +618,6 @@ pub fn desired(config: &Config, node: &Node, secrets: Option<&NodeSecrets>) -> R
     if node.applied.is_none() {
         lines.push(format!("Первая установка: UFW будет включён, если выключен (SSH TCP/{} разрешён).", node.port));
     }
-    if secrets.is_none() {
-        files.iter_mut().for_each(|file| file.content = Zeroizing::new(String::new()));
-    }
     Ok(Desired { teardown: false, digest: layout.digest(&users), files, remove, spec, ports, lines })
 }
 
@@ -603,7 +645,7 @@ pub fn teardown(node: &Node) -> Desired {
     lines.extend(release.iter().map(|name| format!("Будет удалён сертификат и сайт: {name}")));
     let spec = vec![
         ("OP_MODE", "teardown".to_owned()),
-        ("SSH_PORT", node.port.to_string()),
+        ("SSH_PORTS", node.port.to_string()),
         ("UFW_RULES", String::new()),
         ("RELEASE_CERTS", release.iter().map(|name| format!("{name}:/var/www/{name}")).collect::<Vec<_>>().join(" ")),
         ("FEATURES", String::new()),

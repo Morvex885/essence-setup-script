@@ -46,6 +46,12 @@ pub trait RemoteSession {
         -> impl Future<Output = Result<ExecResult>> + 'a;
     fn upload<'a>(&'a self, local_dir: &'a Path, remote_dir: &'a str, timeout: Duration)
         -> impl Future<Output = Result<()>> + 'a;
+    /// `upload` for private data: new directories 0700, files 0600 (the
+    /// node operation directory carries keys and client credentials).
+    fn upload_private<'a>(&'a self, local_dir: &'a Path, remote_dir: &'a str, timeout: Duration)
+        -> impl Future<Output = Result<()>> + 'a {
+        self.upload(local_dir, remote_dir, timeout)
+    }
 }
 
 pub trait RemoteTransport: RemoteSession {

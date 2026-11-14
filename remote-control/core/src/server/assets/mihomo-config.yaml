@@ -7,7 +7,6 @@ allow-lan: false
 bind-address: "*"
 #@tproxy
 keep-alive-interval: 15
-external-controller: 127.0.0.1:9090
 
 dns:
   enable: false
@@ -156,4 +155,6 @@ rules:
   - RULE-SET,microsoft-asn,outbound
   - RULE-SET,leaseweb-asn,outbound
   - RULE-SET,geoip-ru,outbound
+  - IP-CIDR,127.0.0.0/8,REJECT
+  - IP-CIDR6,::1/128,REJECT
   - MATCH,DIRECT

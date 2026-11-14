@@ -113,6 +113,72 @@ fn self_steal_front_serves_reality_on_443_with_the_node_site() {
 }
 
 #[test]
+fn self_steal_without_reality_on_443_leaves_443_to_the_site() {
+    // gRPC on 20000 and xHTTP through nginx: no Reality listener on 443.
+    let profile = Profile {
+        vless_tcp: false, vless_grpc: Some(PortOnly { port: 20000 }),
+        vless_xhttp: Some(Xhttp { topology: XhttpTopology::Nginx, port: None }), ..profile()
+    };
+    let config = config(profile);
+    let desired = render(&config);
+    let site = content(&desired, "/etc/nginx/sites-available/de.example.com");
+    assert!(site.starts_with("server {\n    listen 443 ssl http2;\n    listen [::]:443 ssl http2;\n"), "{site}");
+    assert!(site.contains("location /0123456789abcdef"));
+    let mihomo = content(&desired, MIHOMO_CONFIG_PATH);
+    assert!(mihomo.contains("  - name: VLESS gRPC\n    type: vless\n    listen: 0.0.0.0\n    port: 20000\n"), "{mihomo}");
+    assert!(mihomo.contains("      dest: \"127.0.0.1:443\"\n") && mihomo.contains("        - \"de.example.com\"\n"));
+    assert!(!mihomo.contains("    port: 443\n"));
+    assert_eq!((spec(&desired, "SITE_REQUIRE_200"), spec(&desired, "UFW_RULES")), ("false", "443/tcp 20000/tcp"));
+    assert_eq!(spec(&desired, "LISTEN_TCP"), "443 8447 20000");
+    let client = client_section(&config, &config.nodes[0]).unwrap();
+    assert!(client.contains("  - name: \"VLESS xHTTP\"\n    type: vless\n    server: de.example.com\n    port: 443\n"), "{client}");
+
+    // The same in SNI mode has no site: nothing of Essence answers 443.
+    let sni_profile = Profile { vless_xhttp: None, ..sni(config.profiles[0].clone()) };
+    let mut sni_config = self::config(sni_profile);
+    sni_config.nodes[0].domain = None;
+    sni_config.nodes[0].port = 443;
+    let desired = render(&sni_config);
+    assert_eq!((spec(&desired, "NGINX"), spec(&desired, "UFW_RULES"), spec(&desired, "LISTEN_TCP")), ("false", "20000/tcp", "20000"));
+}
+
+#[test]
+fn self_steal_with_reality_on_443_keeps_the_site_behind_it() {
+    let profile = Profile { vless_grpc: Some(PortOnly { port: 20000 }), ..profile() };
+    let desired = render(&config(profile));
+    let site = content(&desired, "/etc/nginx/sites-available/de.example.com");
+    assert!(site.starts_with("server {\n    listen 127.0.0.1:8443 ssl http2;\n"), "{site}");
+    assert!(content(&desired, MIHOMO_CONFIG_PATH).contains("      dest: \"127.0.0.1:8443\"\n"));
+    assert_eq!((spec(&desired, "UFW_RULES"), spec(&desired, "LISTEN_TCP")), ("443/tcp 20000/tcp", "443 8443 20000"));
+}
+
+#[test]
+fn the_reality_key_and_short_id_are_escaped_in_the_server_config() {
+    let mut config = config(profile());
+    config.nodes[0].params.reality.as_mut().unwrap().short_id = "ab\"\n  - x".into();
+    let secrets = NodeSecrets { reality_key: Some(Zeroizing::new("K\"\n  - name: open".into())), ..NodeSecrets::default() };
+    let desired = desired(&config, &config.nodes[0], Some(&secrets)).unwrap();
+    let mihomo = content(&desired, MIHOMO_CONFIG_PATH);
+    assert!(mihomo.contains("      private-key: \"K\\\"\\n  - name: open\"\n      short-id:\n        - \"ab\\\"\\n  - x\"\n"), "{mihomo}");
+    // Generated values (base64url key, hex short id) are written unchanged.
+    let key = "Ab-_".repeat(10) + "xyz";
+    assert_eq!(yaml_escape(&key), key.as_str());
+    assert!(matches!(yaml_escape("0123456789abcdef"), std::borrow::Cow::Borrowed(_)));
+}
+
+#[test]
+fn without_secrets_only_paths_digest_lines_and_ports() {
+    let config = config(profile());
+    let bare = desired(&config, &config.nodes[0], None).unwrap();
+    let full = render(&config);
+    assert!(bare.files.iter().all(|file| file.content.is_empty()));
+    assert_eq!((paths(&bare), &bare.digest, &bare.lines, &bare.ports), (paths(&full), &full.digest, &full.lines, &full.ports));
+    let mut broken = config.clone();
+    broken.nodes[0].params.reality = None;
+    assert_eq!(desired(&broken, &broken.nodes[0], None).err().map(|error| error.code), Some("invalid"));
+}
+
+#[test]
 fn bare_and_stream_fronts_share_the_client_block() {
     let mut config = config(sni(profile()));
     config.nodes[0].domain = None;
@@ -315,7 +381,7 @@ fn status_and_removed_files_follow_the_applied_set() {
     files.insert("/etc/nginx/sites-available/old.example.com".into(), "x".into());
     config.nodes[0].applied = Some(Applied { digest: desired_now.digest.clone(), files, ports: desired_now.ports.clone(), at: "t".into() });
     assert_eq!(status(&config, &config.nodes[0]), "applied");
-    config.nodes[0].operation = Some("op".into());
+    config.nodes[0].operation = Some(crate::model::Operation { id: "0".repeat(32), digest: "d".repeat(64), ..Default::default() });
     assert_eq!(status(&config, &config.nodes[0]), "running");
     config.nodes[0].operation = None;
     let next = render(&config);

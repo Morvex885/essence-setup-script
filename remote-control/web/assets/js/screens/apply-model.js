@@ -1,8 +1,10 @@
 // Применение желаемого состояния на нодах (`node apply`) без DOM — паритет с
 // TUI: состояние ноды в списке, argv, отчёт `applied|failed|unchanged`
-// (успех или `partial`), подписи этапов и причин сбоя и предложение
-// «Применить изменения на N нодах?» после правок клиентов и подключений.
+// (успех или `partial`; сбой ноды — `имя: сообщение ядра`), домены нод,
+// упавших с `domain_required`, и предложение «Применить изменения на N
+// нодах?» после правок клиентов и подключений.
 import { asList, strings } from '../format.js';
+import { setNodeDomain } from '../flows.js';
 
 /** Состояние применения (`node list .status`) → `{ tone, label }`. */
 export const APPLY_STATES = {
@@ -16,42 +18,7 @@ export function applyState(node) {
   return APPLY_STATES[node && node.status] || { tone: 'neutral', label: '—' };
 }
 
-/** Подписи этапов исполнителя (`node-agent/apply.sh`), как в журнале ядра. */
-export const STAGE_LABELS = {
-  packages: 'установка пакетов',
-  system: 'системные настройки',
-  mihomo: 'установка mihomo',
-  dns: 'проверка DNS',
-  site: 'сайт-заглушка',
-  certificate: 'сертификаты',
-  prepare: 'подготовка компонентов',
-  config: 'конфигурация и проверка',
-  firewall: 'правила UFW',
-  cleanup: 'очистка',
-};
-
-/** Подписи причин сбоя ноды, не связанных с этапом. */
-export const REASON_LABELS = {
-  unsupported_os: 'не Debian/Ubuntu с systemd',
-  timeout: 'нет ответа',
-  start: 'не удалось запустить',
-  missing_secret: 'нет ключа ноды',
-  warp: 'не удалось зарегистрировать WARP',
-};
-
 const text = (value) => (value === null || value === undefined ? '' : String(value));
-
-/** Подпись сбоя ноды из `failed[]`: `{ name, stage, reason, port? }`. */
-export function failureLabel(entry) {
-  const reason = text(entry && entry.reason);
-  const stage = text(entry && entry.stage);
-  if (reason === 'port_busy') return entry.port !== undefined && entry.port !== null ? `порт ${text(entry.port)} занят` : 'порт занят';
-  if (REASON_LABELS[reason]) return REASON_LABELS[reason];
-  if (REASON_LABELS[stage]) return REASON_LABELS[stage];
-  const label = STAGE_LABELS[stage];
-  if (label) return reason === 'rolled_back' ? `откат на этапе «${label}»` : `ошибка на этапе «${label}»`;
-  return reason || stage || 'ошибка';
-}
 
 export const applyNamesArgv = (names) => ['node', 'apply', ...strings(names).flatMap((name) => ['--name', name])];
 export const applyProfileArgv = (profile) => ['node', 'apply', '--profile', profile];
@@ -71,9 +38,7 @@ export function applyLines(report) {
   const unchanged = strings(report.unchanged);
   if (applied.length) lines.push(`Применено: ${applied.join(', ')}`);
   if (unchanged.length) lines.push(`Без изменений: ${unchanged.join(', ')}`);
-  for (const entry of asList(report.failed)) {
-    if (entry && typeof entry === 'object') lines.push({ text: `${text(entry.name)}: ${failureLabel(entry)}`, tone: 'error' });
-  }
+  for (const entry of failedEntries(report)) lines.push({ text: `${text(entry.name)}: ${text(entry.message)}`, tone: 'error' });
   return lines.length ? lines : ['Нет нод для применения.'];
 }
 
@@ -97,21 +62,36 @@ export function offersApply(argv) {
 
 export const NOTHING_PENDING = 'Нет нод, ожидающих применения.';
 
+/** Сбои нод `failed[]` отчёта: `{ name, stage, code, message, port? }`. */
+function failedEntries(report) {
+  return asList(report.failed).filter((entry) => entry && typeof entry === 'object');
+}
+
 /**
  * `node apply` под планом с окном операции; `name` — нода при `--name`
  * (коды нод и `domain_required` разрешаются и команда повторяется).
- * Итог — отчёт в окне. Возвращает ответ ядра.
+ * Итог — отчёт в окне; для нод из `failed[]` с кодом `domain_required`
+ * спрашивается домен (`node domain`), и при сохранённом домене команда
+ * повторяется один раз. Возвращает ответ ядра.
  */
 export async function applyFlow(ctx, argv, name = null) {
-  const reply = await ctx.nodeRequest(name || '', argv, { title: 'Применение на нодах', question: 'Применить?' },
-    { expect: ['partial', 'nothing_pending'], operation: 'Применение' });
-  if (!reply.ok && reply.error && reply.error.code === 'nothing_pending') {
-    ctx.notify('info', NOTHING_PENDING);
-    return reply;
+  for (let repeated = false; ; repeated = true) {
+    const reply = await ctx.nodeRequest(name || '', argv, { title: 'Применение на нодах', question: 'Применить?' },
+      { expect: ['partial', 'nothing_pending'], operation: 'Применение' });
+    if (!reply.ok && reply.error && reply.error.code === 'nothing_pending') {
+      ctx.notify('info', NOTHING_PENDING);
+      return reply;
+    }
+    const report = applyReport(reply);
+    if (report === null) return reply;
+    await ctx.show({ title: 'Итог применения', context: applyLines(report) });
+    if (repeated) return reply;
+    let domains = false;
+    for (const entry of failedEntries(report).filter((item) => item.code === 'domain_required')) {
+      if (await setNodeDomain(text(entry.name), ctx)) domains = true;
+    }
+    if (!domains) return reply;
   }
-  const report = applyReport(reply);
-  if (report !== null) await ctx.show({ title: 'Итог применения', context: applyLines(report) });
-  return reply;
 }
 
 /**

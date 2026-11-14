@@ -125,11 +125,23 @@ export function retryable(reply) {
 }
 
 /**
+ * Вопрос домена ноды (`nodes.rs::set_domain`) → `node domain --name N
+ * --domain D`; `true`, если домен сохранён. `deps` — `{ request, ask }`.
+ */
+export async function setNodeDomain(name, { request, ask }) {
+  if (!ask || !name) return false;
+  const domain = await ask({ title: `Нода: ${name}`, label: 'Домен ноды', placeholder: 'example.com' });
+  if (!domain || !domain.trim()) return false;
+  const saved = await request(['node', 'domain', '--name', name, '--domain', domain.trim()]);
+  return saved.ok;
+}
+
+/**
  * Разрешение состояния ноды (`nodes.rs::handle_node_codes`): `true`, если
  * условие устранено и исходную команду можно повторить.
  */
 export async function handleNodeCodes(reply, name, deps) {
-  const { request, confirm, askSecret, ask, notify = quiet } = deps;
+  const { request, confirm, askSecret, notify = quiet } = deps;
   const code = reply && reply.error ? reply.error.code : null;
   switch (code) {
     case 'missing_secret': {
@@ -151,13 +163,9 @@ export async function handleNodeCodes(reply, name, deps) {
       return trusted.ok;
     }
     case 'domain_required': {
-      // Ядро называет ноду в `extra.name` (при `--pending` и `--profile` имени в argv нет).
+      // `node apply --name N`: ядро называет ноду и в `extra.name`.
       const target = typeof reply.error.name === 'string' && reply.error.name ? reply.error.name : name;
-      if (!ask || !target) return false;
-      const domain = await ask({ title: `Нода: ${target}`, label: 'Домен ноды', placeholder: 'example.com' });
-      if (!domain || !domain.trim()) return false;
-      const saved = await request(['node', 'domain', '--name', target, '--domain', domain.trim()]);
-      return saved.ok;
+      return setNodeDomain(target, deps);
     }
     case 'needs_setup':
       notify('warn', NEEDS_SETUP);

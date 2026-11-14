@@ -9,11 +9,10 @@ use include_dir::{Dir, include_dir};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
-use crate::bundle::write_file;
+use crate::bundle::{COMMON, write_file};
 use crate::error::Result;
 
 static AGENT: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../node-agent");
-static COMMON: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../common");
 
 /// Libraries of `common/` the executor sources.
 const COMMON_FILES: [&str; 2] = ["common.sh", "cert.sh"];

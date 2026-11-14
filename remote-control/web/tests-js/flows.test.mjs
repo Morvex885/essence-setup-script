@@ -3,7 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  decisionFlag, setFlag, clearFlag, runConfirmed, reviewReply, nodeRequest,
+  decisionFlag, setFlag, clearFlag, runConfirmed, reviewReply, nodeRequest, setNodeDomain,
   handleNodeCodes, PLAN_KEEPS_CHANGING, PLAN_CHANGED, BROKEN_PLAN, NODE_CODES, OPERATION_FAILED, screenDialogs, retryable,
 } from '../assets/js/flows.js';
 
@@ -320,14 +320,15 @@ test('retryable: сбой без изменений — да; успех, отк
   }
 });
 
-test('handleNodeCodes domain_required: домен для ноды из extra name, node domain и повтор', async () => {
+test('handleNodeCodes domain_required у node apply --name: node domain и повтор', async () => {
+  const words = ['node', 'apply', '--name', 'de'];
   const engine = scripted([
-    { argv: ['node', 'apply', '--pending'], reply: { ok: false, error: { code: 'domain_required', name: 'de' } } },
+    { argv: words, reply: { ok: false, error: { code: 'domain_required', name: 'de' } } },
     { argv: ['node', 'domain', '--name', 'de', '--domain', 'de.example.com'], reply: ok() },
-    { argv: ['node', 'apply', '--pending'], reply: ok() },
+    { argv: words, reply: ok() },
   ]);
   const asked = [];
-  const result = await nodeRequest('', ['node', 'apply', '--pending'], null, {
+  const result = await nodeRequest('de', words, null, {
     request: engine.request, confirm: async () => true, askSecret: async () => null,
     ask: async (props) => { asked.push(props); return ' de.example.com '; },
   });
@@ -335,10 +336,18 @@ test('handleNodeCodes domain_required: домен для ноды из extra nam
   assert.equal(asked.length, 1);
   engine.assertDone();
   // Отказ от ввода — без повтора.
-  const refused = scripted([{ argv: ['x'], reply: { ok: false, error: { code: 'domain_required', name: 'de' } } }]);
-  const again = await nodeRequest('de', ['x'], null, { request: refused.request, confirm: async () => true, ask: async () => null });
+  const refused = scripted([{ argv: words, reply: { ok: false, error: { code: 'domain_required', name: 'de' } } }]);
+  const again = await nodeRequest('de', words, null, { request: refused.request, confirm: async () => true, ask: async () => null });
   assert.equal(again.error.code, 'domain_required');
   refused.assertDone();
+});
+
+test('setNodeDomain: пустой ввод и пустое имя — без запроса', async () => {
+  const engine = scripted([{ argv: ['node', 'domain', '--name', 'de', '--domain', 'de.example.com'], reply: ok() }]);
+  assert.equal(await setNodeDomain('de', { request: engine.request, ask: async () => '  ' }), false);
+  assert.equal(await setNodeDomain('', { request: engine.request, ask: async () => 'de.example.com' }), false);
+  assert.equal(await setNodeDomain('de', { request: engine.request, ask: async () => 'de.example.com' }), true);
+  engine.assertDone();
 });
 
 test('nodeRequest под планом: expect и operation — expect у обоих запросов, operation только у подтверждённого', async () => {

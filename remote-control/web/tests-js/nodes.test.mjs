@@ -383,20 +383,22 @@ test('применение: состояние, подписи сбоев, от�
   assert.deepEqual(apply.applyNamesArgv(['a', 'b']), ['node', 'apply', '--name', 'a', '--name', 'b']);
   assert.deepEqual(apply.applyProfileArgv('edge'), ['node', 'apply', '--profile', 'edge']);
   assert.deepEqual(apply.APPLY_PENDING_ARGV, ['node', 'apply', '--pending']);
-  assert.ok(apply.failureLabel({ reason: 'port_busy', port: 443 }).includes('443'));
-  assert.equal(apply.failureLabel({ reason: 'unsupported_os' }), apply.REASON_LABELS.unsupported_os);
-  assert.ok(apply.failureLabel({ stage: 'config', reason: 'rolled_back' }).includes(apply.STAGE_LABELS.config));
-  assert.notEqual(apply.failureLabel({ stage: 'config', reason: 'rolled_back' }), apply.failureLabel({ stage: 'config', reason: 'failed' }));
   assert.deepEqual(apply.pendingNodes([{ name: 'a', status: 'pending' }, { name: 'b', status: 'running' }, { name: 'c', status: 'applied' }]), ['a']);
   assert.ok(apply.offersApply(['client', 'set-group', '--name', 'c']));
   assert.ok(apply.offersApply(['conn', 'set', '--name', 'n']));
   assert.ok(!apply.offersApply(['conn', 'sync']));
   assert.ok(!apply.offersApply(['client', 'rename', '--name', 'c']));
-  // partial: отчёт из error, строка сбоя с тоном error.
-  const partial = fail('partial', { applied: ['a'], failed: [{ name: 'b', stage: 'dns', reason: 'failed' }], unchanged: ['c'] });
+  // partial: отчёт из error, строка сбоя `имя: сообщение` с тоном error.
+  const entries = [
+    {"name":"de","stage":"config","code":"rolled_back","message":"откат на этапе «конфигурация и проверка»"},
+    {"name":"de","stage":"probe","code":"port_busy","message":"порт 443 уже занят","port":443},
+    {"name":"de","stage":"probe","code":"remote_failed","message":"Не удалось подключиться к «de»."},
+    {"name":"de","stage":"probe","code":"unsupported_os","message":"нужна Debian или Ubuntu с systemd"},
+  ];
+  const partial = fail('partial', { message: 'Применение завершено с ошибками.', applied: ['a'], failed: entries, unchanged: ['c'] });
   const lines = apply.applyLines(apply.applyReport(partial));
-  assert.equal(lines.length, 3);
-  assert.equal(lines[2].tone, 'error');
+  assert.equal(lines.length, 6);
+  assert.deepEqual(lines.slice(2), entries.map((entry) => ({ text: `de: ${entry.message}`, tone: 'error' })));
   assert.equal(apply.applyReport(fail('locked')), null);
   // applyFlow: expect partial и nothing_pending, окно операции; nothing_pending — уведомление без окна итога.
   const s = scripted([[['node', 'apply', '--pending'], partial], [['node', 'apply', '--pending'], fail('nothing_pending')]], [undefined]);
@@ -407,4 +409,27 @@ test('применение: состояние, подписи сбоев, от�
   assert.deepEqual(s.record.dialogs.map((d) => d.kind), ['show']);
   assert.equal(s.record.notices.length, 1);
   s.done();
+});
+
+test('применение: ноды partial с domain_required — домен, node domain и один повтор', async () => {
+  const entry = {"name":"de","stage":"probe","code":"domain_required","message":"Для ноды «de» нужен домен: node domain --name de --domain D."};
+  const partial = fail('partial', { message: 'Применение завершено с ошибками.', applied: [], unchanged: [], failed: [entry] });
+  const pending = ['node', 'apply', '--pending'];
+  // Повтор с тем же отказом — без второго вопроса домена.
+  const s = scripted([
+    [pending, partial],
+    [['node', 'domain', '--name', 'de', '--domain', 'de.example.com'], ok()],
+    [pending, partial],
+  ], [undefined, ' de.example.com ', undefined]);
+  const reply = await apply.applyFlow(s.ctx, apply.APPLY_PENDING_ARGV);
+  assert.equal(reply.error.code, 'partial');
+  assert.deepEqual(s.record.dialogs.map((d) => d.kind), ['show', 'text', 'show']);
+  assert.deepEqual(s.record.options[2].expect, ['partial', 'nothing_pending'], 'повтор — тем же потоком подтверждения');
+  s.done();
+  // Отказ от ввода домена — итог без повтора; профиль — тот же путь.
+  const profile = apply.applyProfileArgv('edge');
+  const refused = scripted([[profile, partial]], [undefined, null]);
+  await apply.applyFlow(refused.ctx, profile);
+  assert.deepEqual(refused.record.dialogs.map((d) => d.kind), ['show', 'text']);
+  refused.done();
 });

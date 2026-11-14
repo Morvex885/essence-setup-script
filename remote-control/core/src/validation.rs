@@ -78,6 +78,20 @@ pub fn secret_id_matches(value: &str, node_id: &str) -> bool {
         && value.strip_prefix("node:").and_then(|v| v.strip_suffix(":ssh-password")) == Some(node_id)
 }
 
+/// The stored value fits its secret: generated keys keep their encodings
+/// (they are written into server configs); other values are non-empty
+/// without NUL.
+pub fn secret_value_valid(id: &str, value: &str) -> bool {
+    match id.rsplit_once(':').map(|(_, suffix)| suffix) {
+        // 32 bytes: unpadded base64url / padded standard base64.
+        Some("reality-key") => value.len() == 43
+            && value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+        Some("awg-key" | "warp-key") => value.len() == 44 && value.ends_with('=')
+            && value.as_bytes()[..43].iter().all(|b| b.is_ascii_alphanumeric() || *b == b'+' || *b == b'/'),
+        _ => !value.is_empty() && !value.contains('\0'),
+    }
+}
+
 /// Empty tags are valid; required-tag creation policy belongs to the command.
 pub fn node_tag_valid(value: &str) -> bool {
     value.chars().count() <= 32

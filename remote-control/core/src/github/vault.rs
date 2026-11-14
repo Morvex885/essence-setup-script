@@ -34,7 +34,7 @@ use crate::validation as v;
 
 /// Current snapshot format and the oldest essence-rc that reads it.
 pub const FORMAT: u64 = 1;
-pub const FORMAT_MIN_VERSION: &str = "2.0.0";
+pub const FORMAT_MIN_VERSION: &str = "2.1.0";
 
 /// Registered format migrations `(from, step)`; none exist for format 1.
 const MIGRATIONS: &[(u64, fn(Value) -> Option<Value>)] = &[];
@@ -138,7 +138,7 @@ impl Snapshot {
         check(v::version_valid(&self.minimum_remote_control_version))?;
         self.config.validate().map_err(|_| invalid_format())?;
         for (id, password) in &self.secrets.node_passwords {
-            check(secret_owned(&self.config, id) && !password.is_empty() && !password.contains('\0'))?;
+            check(secret_owned(&self.config, id) && v::secret_value_valid(id, password))?;
         }
         let issues = &self.portability.issues;
         check(Portability::from_issues(issues.clone()) == self.portability)?;
@@ -1178,8 +1178,13 @@ mod tests {
             .map(|suffix| format!("node:{id}:{suffix}")).into_iter()
             .chain(["profile:main:warp-license".to_owned()]).collect::<Vec<_>>();
         let store = local.secret_store();
+        let value = |secret: &str| match secret.rsplit_once(':').map(|(_, suffix)| suffix) {
+            Some("reality-key") => "R".repeat(43),
+            Some("awg-key" | "warp-key") => format!("{}=", "W".repeat(43)),
+            _ => format!("value of {secret}"),
+        };
         for secret in &carried {
-            store.set(secret, Zeroizing::new(format!("value of {secret}"))).unwrap();
+            store.set(secret, Zeroizing::new(value(secret))).unwrap();
         }
         store.set(&format!("node:{}:reality-key", "d".repeat(32)), Zeroizing::new("orphan".into())).unwrap();
         store.set("profile:gone:warp-license", Zeroizing::new("orphan".into())).unwrap();
@@ -1195,7 +1200,7 @@ mod tests {
         materialize(local.paths(), local.locks(), &reread).unwrap();
         let runtime = State::with_locks(local.paths().runtime(), local.locks().clone());
         for secret in &carried {
-            assert_eq!(runtime.secret_store().get(secret).unwrap().unwrap().as_str(), format!("value of {secret}"));
+            assert_eq!(runtime.secret_store().get(secret).unwrap().unwrap().as_str(), value(secret));
         }
 
         let mut orphaned = serialize(&local).unwrap();
@@ -1204,6 +1209,12 @@ mod tests {
         let mut orphaned = serialize(&local).unwrap();
         orphaned.secrets.node_passwords.insert("profile:gone:warp-license".into(), Zeroizing::new("x".into()));
         assert!(orphaned.validate().is_err(), "a license of an unknown profile");
+        for (suffix, bad) in [("reality-key", "x\"\n  - name: open".to_owned()), ("reality-key", "R".repeat(44)),
+            ("awg-key", "W".repeat(44)), ("warp-key", format!("{}\n=", "W".repeat(42)))] {
+            let mut forged = serialize(&local).unwrap();
+            forged.secrets.node_passwords.insert(format!("node:{id}:{suffix}"), Zeroizing::new(bad.clone()));
+            assert!(forged.validate().is_err(), "{suffix} {bad:?}");
+        }
     }
 
     #[test]

@@ -153,12 +153,6 @@ impl Report {
     }
 }
 
-/// Client proxy sections of the nodes of one operation.
-#[derive(Debug, Default)]
-struct Fetched {
-    configs: BTreeMap<String, String>,
-}
-
 /// What one operation generates and which nodes it renders.
 struct Scope {
     /// `(group, only this client)` in generation order.
@@ -316,11 +310,11 @@ fn proxy_type(block: &str) -> Option<&str> {
     block.split('\n').find(|line| line.contains("    type:")).and_then(|line| line.split_whitespace().nth(1))
 }
 
-/// Proxies of one client from the fetched node configs (v1
+/// Proxies of one client from the nodes' client sections (v1
 /// `_fetch_proxies_for_client`): allowed connections, client credentials,
-/// AmneziaWG display name, aliases and tag. `None` when a node config is
+/// AmneziaWG display name, aliases and tag. `None` when a node section is
 /// missing, a needed AmneziaWG peer was not created or credentials are invalid.
-fn client_proxies(config: &Config, client: &Client, nodes: &[String], fetched: &Fetched,
+fn client_proxies(config: &Config, client: &Client, nodes: &[String], sections: &BTreeMap<String, String>,
     log: &mut dyn FnMut(Level, &str)) -> Option<String>
 {
     let name = client.name.as_str();
@@ -342,7 +336,7 @@ fn client_proxies(config: &Config, client: &Client, nodes: &[String], fetched: &
             }
         }
         let allowed = if own.is_empty() { group } else { own };
-        let Some(remote) = fetched.configs.get(node_name) else {
+        let Some(remote) = sections.get(node_name) else {
             complete = false;
             continue;
         };
@@ -454,8 +448,10 @@ fn squeeze_blank(text: &str) -> String {
     out
 }
 
-/// Render the configs of `group` (only `only` when given) from `fetched`.
-fn generate_group(session: &mut Session, config: &Config, group: &str, only: Option<&str>, fetched: &Fetched, report: &mut Report) {
+/// Render the configs of `group` (only `only` when given) from the node sections.
+fn generate_group(session: &mut Session, config: &Config, group: &str, only: Option<&str>, sections: &BTreeMap<String, String>,
+    report: &mut Report)
+{
     let members: Vec<&Client> = group_members(config, group).into_iter()
         .filter(|client| only.is_none_or(|only| client.name == only)).collect();
     let names = || members.iter().map(|client| client.name.clone());
@@ -501,7 +497,7 @@ fn generate_group(session: &mut Session, config: &Config, group: &str, only: Opt
         let entries = if nodes.is_empty() {
             Some(String::new())
         } else {
-            client_proxies(config, client, &nodes, fetched, &mut |level, text| session.log(level, text))
+            client_proxies(config, client, &nodes, sections, &mut |level, text| session.log(level, text))
         };
         let Some(entries) = entries else {
             session.log(Level::Warn, &format!("{name} — не удалось получить все подключения; конфиг сохранён без изменений"));
@@ -535,7 +531,7 @@ fn generate_group(session: &mut Session, config: &Config, group: &str, only: Opt
 /// target group. A node without a usable profile fails its clients; a node
 /// whose server state lags behind is reported as pending.
 fn run(session: &mut Session, config: &Config, scope: Scope) -> Report {
-    let mut fetched = Fetched::default();
+    let mut sections = BTreeMap::new();
     let mut report = Report::default();
     for name in &scope.nodes {
         let Some(node) = config.nodes.iter().find(|node| node.name == *name) else {
@@ -545,7 +541,7 @@ fn run(session: &mut Session, config: &Config, scope: Scope) -> Report {
         };
         match crate::server::render::client_section(config, node) {
             Some(section) => {
-                fetched.configs.insert(name.clone(), section);
+                sections.insert(name.clone(), section);
                 report.nodes_ok.push(name.clone());
             }
             None => {
@@ -559,7 +555,7 @@ fn run(session: &mut Session, config: &Config, scope: Scope) -> Report {
         }
     }
     for (group, only) in &scope.targets {
-        generate_group(session, config, group, only.as_deref(), &fetched, &mut report);
+        generate_group(session, config, group, only.as_deref(), &sections, &mut report);
     }
     report
 }
@@ -643,7 +639,7 @@ mod tests {
             id: format!("{index:032x}"), name: name.into(), ip: format!("198.51.100.{index}"), port: 22, user: "root".into(),
             tag: Some(tag.into()), profile: Some("full".into()), domain: Some(format!("{name}.example.com")),
             params: NodeParams {
-                reality: Some(NodeReality { public_key: "PUBKEY".into(), short_id: "0123456789abcdef".into() }),
+                reality: Some(NodeReality { public_key: "P".repeat(43), short_id: "0123456789abcdef".into() }),
                 xhttp_path: Some("/0123456789abcdef".into()), grpc_service: Some("grpc-01234567".into()),
                 ..NodeParams::default()
             },
@@ -680,11 +676,11 @@ mod tests {
         (session, journal)
     }
 
-    fn fetched(configs: &[(&str, &str)]) -> Fetched {
-        Fetched { configs: configs.iter().map(|(n, c)| (n.to_string(), c.to_string())).collect() }
+    fn fetched(configs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        configs.iter().map(|(n, c)| (n.to_string(), c.to_string())).collect()
     }
 
-    fn proxies(config: &Config, client: &str, nodes: &[&str], fetched: &Fetched) -> (Option<String>, Vec<String>) {
+    fn proxies(config: &Config, client: &str, nodes: &[&str], fetched: &BTreeMap<String, String>) -> (Option<String>, Vec<String>) {
         let client = config.clients.iter().find(|c| c.name == client).unwrap();
         let mut log = Vec::new();
         let nodes: Vec<String> = nodes.iter().map(|n| n.to_string()).collect();
