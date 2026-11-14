@@ -179,6 +179,29 @@ pub async fn connect<T: RemoteTransport>(transport: &mut T, state: &State, node:
     })
 }
 
+/// Pause before the single repeat of a transiently failed connection.
+pub const CONNECT_RETRY_PAUSE: Duration = Duration::from_secs(2);
+
+/// The connection itself failed (refused, stalled handshake, dropped) — not
+/// a host key, authentication or configuration decision.
+fn transient(error: &RcError) -> bool {
+    error.code == "remote_failed"
+        && matches!(error.extra.get("reason").and_then(Value::as_str), Some("connect" | "timeout" | "connection_closed"))
+}
+
+/// `connect` repeated once after `CONNECT_RETRY_PAUSE` on a transient
+/// connection failure; for read-only probes that otherwise fail a node on one
+/// lost handshake.
+pub async fn connect_retrying<T: RemoteTransport>(transport: &mut T, state: &State, node: &Node) -> Result<()> {
+    match connect(transport, state, node).await {
+        Err(error) if transient(&error) => {
+            tokio::time::sleep(CONNECT_RETRY_PAUSE).await;
+            connect(transport, state, node).await
+        }
+        other => other,
+    }
+}
+
 /// POSIX single-quoted shell word for remote command text.
 pub fn sh_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))

@@ -547,7 +547,7 @@ struct Planned<T> {
 async fn probe<T: RemoteTransport>(session: &Session, transport: &mut T, node: &Node) -> std::result::Result<Probe, Failure> {
     let fail = |error: RcError| Failure::of("probe", error);
     nodes::require_portable(session, node).map_err(fail)?;
-    nodes::connect(transport, &session.state, node).await.map_err(fail)?;
+    nodes::connect_retrying(transport, &session.state, node).await.map_err(fail)?;
     let result = transport.exec(&probe_command(node), b"", COMMAND_TIMEOUT).await.map_err(fail)?;
     let probe = parse_probe(&String::from_utf8_lossy(&result.stdout));
     if !matches!(probe.os.as_str(), "debian" | "ubuntu") || !probe.systemd {

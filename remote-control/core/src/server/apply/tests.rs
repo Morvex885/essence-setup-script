@@ -264,7 +264,8 @@ async fn unreachable_unsupported_and_busy_nodes_are_excluded() {
     let mut steps = vec![connect_step(&nl, Ok(())), probe_step(&nl, DEBIAN)];
     steps.extend(start_steps(OP));
     steps.push(exec(status_command(OP), "stage=cleanup\nresult=committed\n"));
-    let hosts = Hosts::new(vec![vec![connect_step(&de, Err(remote_failure("connect")))], steps]);
+    // A transient failure is retried once, then the node fails.
+    let hosts = Hosts::new(vec![vec![connect_step(&de, Err(remote_failure("connect"))), connect_step(&de, Err(remote_failure("timeout")))], steps]);
     let error = run(&mut session, &hosts, &["node", "apply", "--pending", "--yes"]).await.unwrap_err();
     hosts.finish();
     assert_eq!(error.code, "partial");
@@ -281,6 +282,23 @@ async fn unreachable_unsupported_and_busy_nodes_are_excluded() {
     let error = run(&mut session, &hosts, &["node", "apply", "--name", "de"]).await.unwrap_err();
     assert_eq!(error.extra["failed"], json!([{"name": "de", "stage": "probe", "code": "port_busy",
         "message": "порт 443 уже занят", "port": 443}]));
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_probe_retries_a_lost_handshake_once_but_not_a_refused_login() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut session, _journal) = fixture(root.path());
+    let de = node(1, "de");
+    let hosts = Hosts::new(vec![vec![connect_step(&de, Err(remote_failure("connect"))), connect_step(&de, Ok(())), probe_step(&de, DEBIAN)]]);
+    let error = run(&mut session, &hosts, &["node", "apply", "--name", "de"]).await.unwrap_err();
+    hosts.finish();
+    assert_eq!(error.code, "confirmation_required");
+    for refused in [remote_failure("authentication"), RcError::new("host_key_changed", "x")] {
+        let hosts = Hosts::new(vec![vec![connect_step(&de, Err(refused))]]);
+        let error = run(&mut session, &hosts, &["node", "apply", "--name", "de"]).await.unwrap_err();
+        hosts.finish();
+        assert_eq!(error.code, "partial");
+    }
 }
 
 #[tokio::test(start_paused = true)]
