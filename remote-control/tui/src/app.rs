@@ -171,15 +171,20 @@ impl Context<'_> {
     }
     /// A selector never reads input when empty, never accepts leading zeroes,
     /// and returns no partial result on cancellation.
-    pub fn select(&mut self, title: &str, labels: &[String]) -> io::Result<Option<usize>> {
+    pub fn select(&mut self, title: &str, labels: &[String]) -> io::Result<Option<usize>> { self.select_current(title, labels, None) }
+    /// `select` starting at `current`: the item is highlighted and Enter keeps it.
+    pub fn select_current(&mut self, title: &str, labels: &[String], current: Option<usize>) -> io::Result<Option<usize>> {
         if labels.is_empty() { self.empty_list(title, "Нет объектов для выбора")?; return Ok(None); }
+        let current = current.filter(|i| *i < labels.len());
         let mut items: Vec<_> = labels.iter().enumerate().map(|(i,l)| Item::new(i+1,l,ui::CYAN)).collect();
         items.push(Item::new(0,"Отмена",ui::NC));
         let mut view = View::menu(title, items);
         view.mode = ui::Mode::Select;
+        view.cursor = current;
         loop {
             let Some(choice) = self.choose(&view)? else { return Ok(None); };
             if choice == "0" { return Ok(None); }
+            if choice.is_empty() && let Some(i) = current { return Ok(Some(i)); }
             if let Some(i) = list_index(&choice, labels.len()) { return Ok(Some(i)); }
             self.invalid();
         }
@@ -339,11 +344,13 @@ enum Step { Pass, Stay, Submit(String), Cancel }
 /// Arrow-key selection of one frame with items; no terminal access.
 struct Picker { keys: Vec<String>, mode: ui::Mode, cursor: usize }
 impl Picker {
-    /// `None` for a frame without items. `remembered` is the item key stored for this title.
+    /// `None` for a frame without items. `remembered` is the item key stored
+    /// for this title; without it the view's own `cursor` (a selector's current item).
     fn new(view: &View, remembered: Option<&str>) -> Option<Self> {
         let keys = view.keys();
         if keys.is_empty() { return None; }
-        let cursor = remembered.and_then(|key| keys.iter().position(|k| k == key)).unwrap_or(0);
+        let cursor = remembered.and_then(|key| keys.iter().position(|k| k == key))
+            .or(view.cursor.filter(|i| *i < keys.len())).unwrap_or(0);
         Some(Self { keys, mode: view.mode, cursor })
     }
     /// Item shown highlighted: the cursor for empty input, else the item whose
@@ -718,6 +725,30 @@ mod tests {
         assert_eq!(ui.notices.len(),4);
         assert_eq!(ui.views[0].sections[0][0].key,"0");
         assert!(ui.views[0].context.len()==1);
+        client.assert_finished();
+    }
+    #[test]
+    fn selector_starts_at_the_current_item_and_enter_keeps_it() {
+        let registry=Registry {screens:vec![],github_wizard:None};
+        let mut client=ScriptedClient::new(Vec::<essence_rc_client::Step>::new());
+        let mut ui=ScriptedUi::new(&["","1",""]);
+        let mut context=Context::for_test(&mut client,&mut ui,&registry);
+        let labels:Vec<String>=["one","two","three"].map(String::from).into();
+        assert_eq!(context.select_current("Choose",&labels,Some(2)).unwrap(),Some(2));
+        assert_eq!(context.select_current("Choose",&labels,Some(2)).unwrap(),Some(0));
+        // Without a current item Enter is no choice; an out-of-range one is ignored.
+        ui.inputs.extend([Some("2".into())]);
+        let mut context=Context::for_test(&mut client,&mut ui,&registry);
+        assert_eq!(context.select_current("Choose",&labels,Some(7)).unwrap(),Some(1));
+        assert_eq!(ui.notices.len(),1);
+        assert_eq!(ui.views[0].cursor,Some(2));
+        assert_eq!(ui.views[2].cursor,None);
+        // The arrow picker starts there too: Enter submits the current item's key.
+        let mut view=View::menu("T",vec![Item::new(1,"one",ui::CYAN),Item::new(2,"two",ui::CYAN),Item::new(3,"three",ui::CYAN),Item::new(0,"Отмена",ui::NC)]);
+        view.mode=ui::Mode::Select;
+        view.cursor=Some(2);
+        let mut picker=Picker::new(&view,None).unwrap();
+        assert_eq!(press(&mut picker,KeyCode::Enter,"").0,submit("3"));
         client.assert_finished();
     }
     struct ChildScreen;

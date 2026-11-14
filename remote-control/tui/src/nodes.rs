@@ -934,7 +934,8 @@ fn warp_label(node: &Value) -> &'static str {
 /// and the top-level `domain_required` are resolved, then the command is
 /// repeated). The report (success or `partial`) goes to the journal, one
 /// `name: message` line per failure; for bulk nodes failed with
-/// `domain_required` the domain is asked and the command repeated once.
+/// `domain_required` the domain is asked, other node codes go to
+/// `handle_node_codes`, and after a resolved one the command is repeated once.
 pub(crate) fn apply(ctx: &mut Context<'_>, words: &[String], name: &str) -> io::Result<Reply> {
     let mut repeated = false;
     loop {
@@ -950,11 +951,15 @@ pub(crate) fn apply(ctx: &mut Context<'_>, words: &[String], name: &str) -> io::
                 ctx.ui.notice(ui::warn(format!("{}: {}", text(&entry["name"]), text(&entry["message"]))));
             }
             if repeated { return Ok(reply); }
-            let mut domains = false;
+            let mut resolved = false;
             for entry in failed.iter().filter(|entry| entry["code"] == "domain_required") {
-                domains |= set_domain(ctx, &text(&entry["name"]))?;
+                resolved |= set_domain(ctx, &text(&entry["name"]))?;
             }
-            if !domains { return Ok(reply); }
+            for entry in failed.iter().filter(|entry| entry["code"] != "domain_required") {
+                let failure = Reply { error: (*entry).clone(), ..Reply::default() };
+                resolved |= handle_node_codes(ctx, &failure, &text(&entry["name"]))?;
+            }
+            if !resolved { return Ok(reply); }
             repeated = true;
             continue;
         }
@@ -976,15 +981,12 @@ pub(crate) fn offers_apply(words: &[&str]) -> bool {
         _ => false,
     }
 }
-/// «Применить изменения на N нодах?» when `node list` has pending nodes → `node apply --pending`.
+/// Nodes pending after a change: `node apply --pending` opens the core's plan
+/// at once (its confirmation is the only question).
 pub(crate) fn offer_apply(ctx: &mut Context<'_>) -> io::Result<()> {
     let listed = ctx.call(&["node", "list"])?;
-    if !listed.ok { return Ok(()); }
-    let count = pending_count(&listed.data);
-    if count == 0 { return Ok(()); }
-    if ctx.confirm(View::new("Применение на нодах"), &format!("Применить изменения на {count} нодах?"))? {
-        apply(ctx, &argv(&["node", "apply", "--pending"]), "")?;
-    }
+    if !listed.ok || pending_count(&listed.data) == 0 { return Ok(()); }
+    apply(ctx, &argv(&["node", "apply", "--pending"]), "")?;
     Ok(())
 }
 
@@ -1184,24 +1186,29 @@ fn email_valid(value: &str) -> bool {
 fn version_valid(value: &str) -> bool {
     value.strip_prefix('v').is_some_and(|rest| { let parts: Vec<_> = rest.split('.').collect(); parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())) })
 }
-/// One of `options` (value, label) by number; the current value is marked.
+/// One of `options` (value, label) by number; the current value is marked,
+/// highlighted and kept by Enter.
 fn choose_option(ctx: &mut Context<'_>, title: &str, options: &[(&str, &str)], current: Option<&str>) -> io::Result<Option<String>> {
     let labels: Vec<String> = options.iter().map(|(value, label)| if current == Some(*value) { format!("{label} (сейчас)") } else { (*label).to_owned() }).collect();
-    Ok(ctx.select(title, &labels)?.map(|i| options[i].0.to_owned()))
+    let at = options.iter().position(|(value, _)| current == Some(*value));
+    Ok(ctx.select_current(title, &labels, at)?.map(|i| options[i].0.to_owned()))
 }
 /// The profile wizard (plan order): name → Reality → masking domain or site
 /// source → protocols → xHTTP topology → ports → obfs → AmneziaWG DNS → IPv6 →
-/// email → mihomo version. Editing (`current`) skips the name; Enter keeps the
-/// current answer. `None` — cancelled.
-fn profile_wizard(ctx: &mut Context<'_>, current: Option<&ProfileForm>) -> io::Result<Option<ProfileForm>> {
+/// email → mihomo version. `current` — the answers to start from (the profile
+/// being edited or a failed attempt), Enter keeps each of them; `rename` asks
+/// the name (adding), editing skips it. `None` — cancelled.
+fn profile_wizard(ctx: &mut Context<'_>, current: Option<&ProfileForm>, rename: bool) -> io::Result<Option<ProfileForm>> {
     let editing = current.is_some();
     let mut form = current.cloned().unwrap_or_default();
-    let title = if editing { format!("Профиль: {}", form.name) } else { "Добавление профиля".to_owned() };
+    let title = if rename { "Добавление профиля".to_owned() } else { format!("Профиль: {}", form.name) };
     let mark = |value: &str| editing.then_some(value.to_owned());
-    if !editing {
+    if rename {
         loop {
-            let Some(name) = ask(ctx, &title, "Имя профиля")? else { return Ok(None); };
+            let prompt = if form.name.is_empty() { "Имя профиля".to_owned() } else { format!("Имя профиля [{}]", form.name) };
+            let Some(name) = ask(ctx, &title, &prompt)? else { return Ok(None); };
             if !name.trim().is_empty() { form.name = name.trim().to_owned(); break; }
+            if !form.name.is_empty() { break; }
             ctx.ui.notice(ui::warn("Имя профиля не указано."));
         }
     }
@@ -1265,6 +1272,32 @@ fn profile_wizard(ctx: &mut Context<'_>, current: Option<&ProfileForm>) -> io::R
     if !version.is_empty() || !keep { form.mihomo_version = version; }
     Ok(Some(form))
 }
+/// «Добавить профиль»: success opens its card; a failed `profile add`
+/// (`confirm::retryable`) reopens the wizard with the answers, name included.
+fn add_profile(ctx: &mut Context<'_>) -> io::Result<()> {
+    let mut draft = None;
+    loop {
+        let Some(form) = profile_wizard(ctx, draft.as_ref(), true)? else { return Ok(()); };
+        let added = ctx.request(&profile_add_argv(&form), &Secrets::default())?;
+        if added.ok { ProfileCard(added.data["name"].as_str().unwrap_or(&form.name).to_owned()).run(ctx)?; return Ok(()); }
+        outcome(ctx, &added);
+        if !confirm::retryable(&added) { return Ok(()); }
+        draft = Some(form);
+    }
+}
+/// «Изменить»: `profile set` with the changed flags; a failed command reopens
+/// the wizard with the answers.
+fn edit_profile(ctx: &mut Context<'_>, name: &str, profile: &Value) -> io::Result<()> {
+    let mut draft = ProfileForm::from_profile(profile);
+    loop {
+        let Some(form) = profile_wizard(ctx, Some(&draft), false)? else { return Ok(()); };
+        let Some(words) = profile_set_argv(name, &form, profile) else { ctx.ui.notice(ui::warn("Изменений нет.")); return Ok(()); };
+        let reply = ctx.request(&words, &Secrets::default())?;
+        outcome(ctx, &reply);
+        if !confirm::retryable(&reply) { return Ok(()); }
+        draft = form;
+    }
+}
 impl Screen for Profiles {
     fn run(&mut self, ctx: &mut Context<'_>) -> io::Result<Navigation> {
         loop {
@@ -1283,11 +1316,7 @@ impl Screen for Profiles {
             view.sections.push(vec![Item::new('a', "Добавить профиль", ui::GREEN), Item::new(0, "Назад", ui::NC)]);
             let Some(choice) = ctx.choose(&view)? else { return Ok(Navigation::Back); };
             match choice.as_str() {
-                "a" | "A" => {
-                    let Some(form) = profile_wizard(ctx, None)? else { continue; };
-                    let added = ctx.request(&profile_add_argv(&form), &Secrets::default())?;
-                    if added.ok { ProfileCard(added.data["name"].as_str().unwrap_or(&form.name).to_owned()).run(ctx)?; } else { outcome(ctx, &added); }
-                }
+                "a" | "A" => add_profile(ctx)?,
                 "0" => return Ok(Navigation::Back),
                 _ => match index(&choice, list.len()) {
                     Some(i) => { ProfileCard(text(&list[i]["name"])).run(ctx)?; }
@@ -1342,13 +1371,7 @@ impl Screen for ProfileCard {
                     if rows(&profile["nodes"]).is_empty() { ctx.ui.notice(ui::warn("Профиль не назначен нодам.")); continue; }
                     apply(ctx, &argv(&["node", "apply", "--profile", &name]), "")?;
                 }
-                "e" | "E" => {
-                    let Some(form) = profile_wizard(ctx, Some(&ProfileForm::from_profile(profile)))? else { continue; };
-                    match profile_set_argv(&name, &form, profile) {
-                        None => ctx.ui.notice(ui::warn("Изменений нет.")),
-                        Some(words) => { let reply = ctx.request(&words, &Secrets::default())?; outcome(ctx, &reply); }
-                    }
-                }
+                "e" | "E" => edit_profile(ctx, &name, profile)?,
                 "d" | "D" => {
                     let words = argv(&["profile", "delete", "--name", &name]);
                     let reply = confirm::run_confirmed(ctx, "Удаление профиля", "Удалить профиль?", &words, &Secrets::default())?;
@@ -2047,19 +2070,19 @@ mod tests {
     fn profile_wizard_builds_the_add_argv_in_plan_order() {
         // Self-Steal, random site, + xHTTP (nginx), gRPC (port after an invalid one), Hysteria2 (random port, obfs).
         let (form, _, ui) = run(none(), &["edge", "1", "1", "2", "3", "4", "", "2", "70000", "20000", "", "1", "1", "", ""],
-            |ctx| profile_wizard(ctx, None));
+            |ctx| profile_wizard(ctx, None, true));
         assert_eq!(profile_add_argv(&form.unwrap()), argv(&["profile", "add", "--name", "edge", "--reality", "self-steal", "--site-source", "random",
             "--vless-tcp", "on", "--xhttp", "nginx", "--grpc", "on", "--grpc-port", "20000", "--hysteria2", "on", "--hysteria2-obfs", "on",
             "--amneziawg", "off", "--warp", "off", "--ipv6", "default", "--random-acme-email"]));
         assert!(noticed(&ui, PORT_INVALID));
         // SNI: the masking domain is checked; email and version are passed.
-        let (form, _, ui) = run(none(), &["sni", "2", "bad", "www.example.com", "", "3", "me@example.com", "v1.19.20"], |ctx| profile_wizard(ctx, None));
+        let (form, _, ui) = run(none(), &["sni", "2", "bad", "www.example.com", "", "3", "me@example.com", "v1.19.20"], |ctx| profile_wizard(ctx, None, true));
         assert_eq!(profile_add_argv(&form.unwrap()), argv(&["profile", "add", "--name", "sni", "--reality", "sni", "--sni-domain", "www.example.com",
             "--vless-tcp", "on", "--xhttp", "off", "--grpc", "off", "--hysteria2", "off", "--amneziawg", "off", "--warp", "off", "--ipv6", "disabled",
             "--acme-email", "me@example.com", "--mihomo-version", "v1.19.20"]));
         assert!(noticed(&ui, DOMAIN_INVALID));
         // Cancelled at any question: nothing.
-        let (form, _, _) = run(none(), &["edge", "1"], |ctx| profile_wizard(ctx, None));
+        let (form, _, _) = run(none(), &["edge", "1"], |ctx| profile_wizard(ctx, None, true));
         assert!(form.is_none());
     }
     #[test]
@@ -2075,12 +2098,67 @@ mod tests {
         sni.sni_domain = "www.example.com".into();
         assert_eq!(profile_set_argv("edge", &sni, &edge()),
             Some(argv(&["profile", "set", "--name", "edge", "--reality", "sni", "--sni-domain", "www.example.com", "--xhttp", "reality"])));
-        // The edit wizard keeps every answer on Enter: no change, no command.
-        let (_, ui) = screen(&mut ProfileCard("edge".into()), &["e", "1", "1", "", "2", "", "", "1", "1", "", "", "0"], vec![
+        // The edit wizard keeps every answer on Enter (selectors start at the
+        // current item, the nginx topology is not first): no change, no command.
+        let (_, ui) = screen(&mut ProfileCard("edge".into()), &["e", "", "", "", "", "", "", "", "", "", "", "0"], vec![
             step(&["profile", "show", "--name", "edge"], ok(edge())), step(&["profile", "show", "--name", "edge"], ok(edge())),
         ]);
         assert!(noticed(&ui, "Изменений нет."));
+        let topology = ui.views.iter().find(|v| v.title == "Топология xHTTP").unwrap();
+        assert_eq!(topology.cursor, Some(1));
+        let (value, _, _) = run(none(), &[""], |ctx| choose_option(ctx, "IPv6", &IPV6, Some("disabled")));
+        assert_eq!(value.as_deref(), Some("disabled"));
         assert!(needs_domain(&edge()) && !needs_domain(&json!({"reality_mode": "sni", "vless_tcp": true})));
+    }
+    #[test]
+    fn failed_profile_add_or_set_reopens_the_wizard_with_the_answers() {
+        let list = || step(&["profile", "list"], ok(json!({"profiles": []})));
+        let first = ProfileForm { name: "edge".into(), ..ProfileForm::default() };
+        let second = ProfileForm { name: "edge2".into(), ..first.clone() };
+        let mut renamed = edge();
+        renamed["name"] = json!("edge2");
+        // `exists`: the name is asked again with the old one kept by Enter, the
+        // other answers are kept; the corrected add opens the card.
+        let (client, ui) = screen(&mut Profiles, &["a", "edge", "1", "1", "", "1", "", "", "edge2", "", "", "", "", "", "", "0", "0"], vec![
+            list(), (profile_add_argv(&first), err("exists", json!({}))), (profile_add_argv(&second), ok(json!({"name": "edge2"}))),
+            step(&["profile", "show", "--name", "edge2"], ok(renamed)), list(),
+        ]);
+        assert!(ui.views.iter().any(|v| v.prompt.contains("Имя профиля [edge]")));
+        assert_eq!(client.calls.len(), 5);
+        // A failed `profile set` reopens the edit wizard with the changed IPv6
+        // (now the current item); Enter everywhere repeats the same command.
+        let set = argv(&["profile", "set", "--name", "edge", "--ipv6", "enabled"]);
+        let show = || step(&["profile", "show", "--name", "edge"], ok(edge()));
+        let mut keys = vec!["e", "", "", "", "", "", "", "", "2", "", ""];
+        keys.extend([""; 10]);
+        keys.push("0");
+        let (_, ui) = screen(&mut ProfileCard("edge".into()), &keys, vec![
+            show(), (set.clone(), err("locked", json!({}))), (set, ok(json!({}))), show(),
+        ]);
+        let ipv6: Vec<_> = ui.views.iter().filter(|v| v.title == "IPv6").collect();
+        assert_eq!(ipv6.iter().map(|v| v.cursor).collect::<Vec<_>>(), [Some(0), Some(1)]);
+        // Cancelling the reopened wizard sends nothing more.
+        screen(&mut ProfileCard("edge".into()), &["e", "", "", "", "", "", "", "", "2", "", "", "0", "0"], vec![
+            show(), (argv(&["profile", "set", "--name", "edge", "--ipv6", "enabled"]), err("locked", json!({}))), show(),
+        ]);
+    }
+    #[test]
+    fn bulk_apply_resolves_node_codes_of_failed_nodes_and_repeats_once() {
+        let words = argv(&["node", "apply", "--pending"]);
+        let entry = json!({"name":"de","stage":"probe","code":"missing_secret","message":"Пароль SSH для «de» не сохранён."});
+        let partial = || err("partial", json!({"applied": [], "unchanged": [], "failed": [entry.clone()]}));
+        let (reply, client, _) = run(vec![
+            (words.clone(), plan("confirmation_required", "a")), (with_yes(&words, "a"), partial()),
+            step(&["node", "password", "--name", "de"], ok(json!({"name": "de"}))),
+            (words.clone(), plan("confirmation_required", "b")), (with_yes(&words, "b"), ok(json!({"applied": ["de"], "failed": [], "unchanged": []}))),
+        ], &["y", "y", "pw", "y"], |ctx| apply(ctx, &words, ""));
+        assert!(reply.ok);
+        assert_eq!(client.secret_names[2], ["password"]);
+        // Refusing to save the password keeps the report without repeating.
+        let (reply, client, _) = run(vec![(words.clone(), plan("confirmation_required", "a")), (with_yes(&words, "a"), partial())],
+            &["y", "n"], |ctx| apply(ctx, &words, ""));
+        assert_eq!(reply.code(), "partial");
+        assert_eq!(client.calls.len(), 2);
     }
     #[test]
     fn profiles_list_card_apply_and_refused_delete() {

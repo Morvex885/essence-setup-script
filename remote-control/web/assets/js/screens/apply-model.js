@@ -1,10 +1,10 @@
 // Применение желаемого состояния на нодах (`node apply`) без DOM — паритет с
 // TUI: состояние ноды в списке, argv, отчёт `applied|failed|unchanged`
 // (успех или `partial`; сбой ноды — `имя: сообщение ядра`), домены нод,
-// упавших с `domain_required`, и предложение «Применить изменения на N
-// нодах?» после правок клиентов и подключений.
+// упавших с `domain_required`, коды нод из `failed[]` (`handleNodeCodes`) и
+// предложение применения после правок клиентов и подключений (сразу план ядра).
 import { asList, strings } from '../format.js';
-import { setNodeDomain } from '../flows.js';
+import { handleNodeCodes, setNodeDomain } from '../flows.js';
 
 /** Состояние применения (`node list .status`) → `{ tone, label }`. */
 export const APPLY_STATES = {
@@ -71,8 +71,9 @@ function failedEntries(report) {
  * `node apply` под планом с окном операции; `name` — нода при `--name`
  * (коды нод и `domain_required` разрешаются и команда повторяется).
  * Итог — отчёт в окне; для нод из `failed[]` с кодом `domain_required`
- * спрашивается домен (`node domain`), и при сохранённом домене команда
- * повторяется один раз. Возвращает ответ ядра.
+ * спрашивается домен (`node domain`), прочие коды нод решает
+ * `handleNodeCodes`; после принятого решения команда повторяется один раз.
+ * Возвращает ответ ядра.
  */
 export async function applyFlow(ctx, argv, name = null) {
   for (let repeated = false; ; repeated = true) {
@@ -86,23 +87,25 @@ export async function applyFlow(ctx, argv, name = null) {
     if (report === null) return reply;
     await ctx.show({ title: 'Итог применения', context: applyLines(report) });
     if (repeated) return reply;
-    let domains = false;
-    for (const entry of failedEntries(report).filter((item) => item.code === 'domain_required')) {
-      if (await setNodeDomain(text(entry.name), ctx)) domains = true;
+    let resolved = false;
+    const failed = failedEntries(report);
+    for (const entry of failed.filter((item) => item.code === 'domain_required')) {
+      if (await setNodeDomain(text(entry.name), ctx)) resolved = true;
     }
-    if (!domains) return reply;
+    for (const entry of failed.filter((item) => item.code !== 'domain_required')) {
+      if (await handleNodeCodes({ ok: false, error: entry }, text(entry.name), ctx)) resolved = true;
+    }
+    if (!resolved) return reply;
   }
 }
 
 /**
  * Предложение применить после изменения клиентов и подключений: есть
- * ноды `pending` → вопрос → `node apply --pending`. Сбой чтения — молча.
+ * ноды `pending` → сразу `node apply --pending` с планом ядра (его
+ * подтверждение — единственный вопрос). Сбой чтения — молча.
  */
 export async function offerApply(ctx) {
   const listed = await ctx.request(['node', 'list'], { quiet: true });
-  if (!listed.ok) return;
-  const count = pendingNodes(listed.data).length;
-  if (count === 0) return;
-  const yes = await ctx.confirm({ title: 'Применение на нодах', plan: [], question: `Применить изменения на ${count} нодах?` });
-  if (yes) await applyFlow(ctx, APPLY_PENDING_ARGV);
+  if (!listed.ok || pendingNodes(listed.data).length === 0) return;
+  await applyFlow(ctx, APPLY_PENDING_ARGV);
 }

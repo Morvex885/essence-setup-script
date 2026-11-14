@@ -433,3 +433,36 @@ test('применение: ноды partial с domain_required — домен, 
   assert.deepEqual(refused.record.dialogs.map((d) => d.kind), ['show', 'text']);
   refused.done();
 });
+
+test('применение: прочие коды нод из partial — handleNodeCodes и один повтор', async () => {
+  const entry = { name: 'de', stage: 'probe', code: 'missing_secret', message: 'Пароль SSH для «de» не сохранён.' };
+  const partial = fail('partial', { message: 'Применение завершено с ошибками.', applied: [], unchanged: [], failed: [entry] });
+  const pending = ['node', 'apply', '--pending'];
+  const s = scripted([
+    [pending, partial],
+    [['node', 'password', '--name', 'de'], ok()],
+    [pending, ok({ applied: ['de'], failed: [], unchanged: [] })],
+  ], [undefined, true, 'pw', undefined]);
+  const reply = await apply.applyFlow(s.ctx, apply.APPLY_PENDING_ARGV);
+  assert.equal(reply.ok, true);
+  assert.deepEqual(s.record.dialogs.map((d) => d.kind), ['show', 'confirm', 'secret', 'show']);
+  assert.deepEqual(s.record.secrets[1], { password: 'pw' });
+  s.done();
+  // Отказ сохранить пароль — итог без повтора.
+  const refused = scripted([[pending, partial]], [undefined, false]);
+  assert.equal((await apply.applyFlow(refused.ctx, apply.APPLY_PENDING_ARGV)).error.code, 'partial');
+  refused.done();
+});
+
+test('предложение применить: сразу node apply --pending без своего вопроса, без ожидающих — ничего', async () => {
+  const s = scripted([
+    [['node', 'list'], ok([{ name: 'de', status: 'pending' }])],
+    [['node', 'apply', '--pending'], ok({ applied: ['de'], failed: [], unchanged: [] })],
+  ], [undefined]);
+  await apply.offerApply(s.ctx);
+  assert.deepEqual(s.record.dialogs.map((d) => d.kind), ['show']);
+  s.done();
+  const none = scripted([[['node', 'list'], ok([{ name: 'de', status: 'applied' }])]], []);
+  await apply.offerApply(none.ctx);
+  none.done();
+});

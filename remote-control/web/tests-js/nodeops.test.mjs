@@ -207,7 +207,7 @@ test('assignConnections: поле на подключение, текущие г
   assert.deepEqual(field(form, 'proxy-0').options.map((o) => o.value), ['g1', 'g2']);
   assert.equal(steps.length, 0);
   assert.deepEqual(record.notices, []);
-  // После conn set — чтение node list предложения применить (ожидающих нод нет — без вопроса).
+  // После conn set — чтение node list предложения применить (ожидающих нод нет — без node apply).
   assert.deepEqual(record.offers, [['node', 'list']]);
 });
 

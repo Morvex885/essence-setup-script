@@ -93,10 +93,13 @@ test('поля формы: условия видимости и проверки
 });
 
 test('подписи списка: протоколы и Reality', () => {
-  assert.equal(model.protocolsLabel(edge), 'TCP xHTTP gRPC HY2 AWG WARP');
-  assert.equal(model.protocolsLabel({}), '—');
-  assert.equal(model.realityLabel(edge), 'Self-Steal');
-  assert.equal(model.realityLabel({ reality_mode: 'sni', sni_domain: 'www.example.com' }), 'SNI www.example.com');
+  // Все протоколы edge включены: сокращения — из экспортированных PROTOCOLS, в их порядке.
+  assert.equal(model.protocolsLabel(edge), model.PROTOCOLS.map((p) => p.short).join(' '));
+  assert.notEqual(model.protocolsLabel({}), model.protocolsLabel(edge));
+  const sni = model.realityLabel({ reality_mode: 'sni', sni_domain: 'www.example.com' });
+  assert.notEqual(model.realityLabel(edge), sni);
+  assert.ok(sni.includes('www.example.com'));
+  assert.ok(!model.realityLabel(edge).includes('www.example.com'));
   assert.deepEqual(model.profileRows({ profiles: [edge, null, { x: 1 }] }).map((p) => p.name), ['edge']);
   assert.deepEqual(model.profileRows([]), []);
 });
@@ -149,6 +152,27 @@ test('изменение профиля: profile set только с измен�
   assert.equal(await model.editProfileFlow(s.ctx, edge), false);
   assert.equal(s.record.notices.length, 1);
   s.done();
+});
+
+test('изменение профиля: сбой profile set — форма снова с введённым, отказ формы — без команды', async () => {
+  const current = model.profileValues(edge);
+  const changed = { ...current, protocols: current.protocols.filter((p) => p !== 'warp'), hysteria2_port: '31000' };
+  const argv = model.profileSetArgv('edge', changed, edge);
+  const s = scripted([[argv, fail('locked')], [argv, ok()]], [changed, changed]);
+  assert.equal(await model.editProfileFlow(s.ctx, edge), true);
+  assert.equal(s.record.failed, 1);
+  const refilled = s.record.dialogs[1].fields;
+  assert.deepEqual(refilled.find((f) => f.name === 'protocols').value, changed.protocols);
+  assert.equal(refilled.find((f) => f.name === 'hysteria2_port').value, '31000');
+  s.done();
+  const cancelled = scripted([[argv, fail('locked')]], [changed, null]);
+  assert.equal(await model.editProfileFlow(cancelled.ctx, edge), false);
+  cancelled.done();
+  // partial не повторяет форму.
+  const partial = scripted([[argv, fail('partial')]], [changed]);
+  assert.equal(await model.editProfileFlow(partial.ctx, edge), false);
+  assert.equal(partial.record.dialogs.length, 1);
+  partial.done();
 });
 
 test('удаление и применение профиля', async () => {

@@ -5,6 +5,7 @@
 // протоколы `on|off`, `ipv6=default|enabled|disabled`).
 import { asList, strings } from '../format.js';
 import { applyFlow, applyProfileArgv } from './apply-model.js';
+import { retryable } from '../flows.js';
 
 /** Протоколы формы: значение поля `protocols` → подпись и сокращение списка. */
 export const PROTOCOLS = [
@@ -235,7 +236,11 @@ export function profileFields(values = {}, { editing = false, random = randomAcm
 
 const replyName = (reply, fallback) => (reply.ok && reply.data && typeof reply.data.name === 'string' && reply.data.name ? reply.data.name : fallback);
 
-/** Добавление профиля одной формой; успех — `go(имя)` (экран открывает карточку, пока смонтирован). */
+/**
+ * Добавление профиля одной формой; успех — `go(имя)` (экран открывает карточку,
+ * пока смонтирован). Невыполненная команда (`retryable`) открывает форму снова
+ * с введённым, включая имя.
+ */
 export async function addProfileFlow(ctx, go) {
   let previous = {};
   for (;;) {
@@ -244,23 +249,32 @@ export async function addProfileFlow(ctx, go) {
     previous = values;
     const reply = await ctx.request(profileAddArgv(values), { operation: 'Добавление профиля' });
     if (reply.ok) { go(replyName(reply, values.name)); return true; }
-    if (!ctx.isFailure(reply)) return false;
-    ctx.failed();
+    if (ctx.isFailure(reply)) ctx.failed();
+    if (!retryable(reply)) return false;
   }
 }
 
-/** «Изменить»: те же поля с текущими значениями → `profile set` только с изменёнными флагами. */
+/**
+ * «Изменить»: те же поля с текущими значениями → `profile set` только с
+ * изменёнными флагами; невыполненная команда (`retryable`) открывает форму
+ * снова с введённым.
+ */
 export async function editProfileFlow(ctx, profile) {
   const name = text(profile.name);
-  const values = await ctx.form({
-    title: `Профиль: ${name}`, fields: profileFields(profileValues(profile), { editing: true }), wide: true,
-  });
-  if (values === null || values === undefined) return false;
-  const argv = profileSetArgv(name, values, profile);
-  if (argv === null) { ctx.notify('info', 'Изменений нет.'); return false; }
-  const reply = await ctx.request(argv);
-  if (ctx.isFailure(reply)) { ctx.failed(); return false; }
-  return reply.ok;
+  let previous = profileValues(profile);
+  for (;;) {
+    const values = await ctx.form({
+      title: `Профиль: ${name}`, fields: profileFields(previous, { editing: true }), wide: true,
+    });
+    if (values === null || values === undefined) return false;
+    const argv = profileSetArgv(name, values, profile);
+    if (argv === null) { ctx.notify('info', 'Изменений нет.'); return false; }
+    const reply = await ctx.request(argv);
+    if (reply.ok) return true;
+    if (ctx.isFailure(reply)) ctx.failed();
+    if (!retryable(reply)) return false;
+    previous = values;
+  }
 }
 
 /** Удаление по плану ядра; `in_use` (есть ноды) показывает текст ядра. `true` — профиль удалён. */

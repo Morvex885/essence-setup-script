@@ -1401,9 +1401,9 @@ mod tests {
         core.assert_finished();
         assert!(ui.notices.iter().any(|n| n.to_string().contains("Нет нод")));
     }
-    /// After a change with pending nodes: «Применить изменения на N нодах?» →
-    /// `node apply --pending` under its plan; refusal applies nothing.
-    /// Generation with `nodes_pending` offers the same.
+    /// After a change with pending nodes `node apply --pending` opens its plan
+    /// at once: the plan's confirmation is the only question; refusal applies
+    /// nothing. Generation with `nodes_pending` offers the same.
     #[test]
     fn changes_offer_to_apply_pending_nodes() {
         let pending = json!([{"name":"de","status":"pending"},{"name":"ru","status":"applied"}]);
@@ -1411,22 +1411,23 @@ mod tests {
         let apply = ["node", "apply", "--pending"];
         let report = json!({"applied":["de"],"failed":[],"unchanged":[]});
         let (core, ui) = drive(vec![ok(&add, json!({"name":"new"})), ok(&["node", "list"], pending.clone()), step(&apply, plan()), yes(&apply, report)],
-            &["y", "y"], |ctx| execute(ctx, &add).map(|_| ()));
+            &["y"], |ctx| execute(ctx, &add).map(|_| ()));
         assert!(sent(&core, &["node", "apply", "--pending", "--yes", "--plan-token", "T"]));
         assert_eq!(notices(&ui, "Применено: de"), 1);
-        // Refusal; a read (`client connections --name`) never offers.
-        drive(vec![ok(&add, json!({"name":"new"})), ok(&["node", "list"], pending.clone())], &["n"], |ctx| execute(ctx, &add).map(|_| ()));
+        assert_eq!(ui.views.iter().filter(|v| v.prompt.contains("(y/N)")).count(), 1);
+        // Refusal of the plan; a read (`client connections --name`) never offers.
+        drive(vec![ok(&add, json!({"name":"new"})), ok(&["node", "list"], pending.clone()), step(&apply, plan())], &["n"], |ctx| execute(ctx, &add).map(|_| ()));
         drive(vec![ok(&["client", "connections", "--name", "c"], json!([]))], &[], |ctx| execute(ctx, &["client", "connections", "--name", "c"]).map(|_| ()));
         // `partial`: one journal line `name: message` per failed node.
         let partial = fail("partial", json!({"applied":[],"unchanged":[],"failed":[
             {"name":"de","stage":"config","code":"rolled_back","message":"откат на этапе «конфигурация и проверка»"},
             {"name":"de","stage":"probe","code":"port_busy","message":"порт 443 уже занят","port":443}]}));
         let (_, ui) = drive(vec![ok(&add, json!({"name":"new"})), ok(&["node", "list"], pending.clone()), step(&apply, plan()), (yes(&apply, Value::Null).0, partial)],
-            &["y", "y"], |ctx| execute(ctx, &add).map(|_| ()));
+            &["y"], |ctx| execute(ctx, &add).map(|_| ()));
         assert_eq!(notices(&ui, "de: откат на этапе «конфигурация и проверка»"), 1);
         assert_eq!(notices(&ui, "de: порт 443 уже занят"), 1);
         drive(vec![
-            ok(&["generate", "--all"], json!({"ok":["new"],"nodes_pending":["de"]})), ok(&["node", "list"], pending),
+            ok(&["generate", "--all"], json!({"ok":["new"],"nodes_pending":["de"]})), ok(&["node", "list"], pending), step(&apply, plan()),
         ], &["", "n"], |ctx| generate(ctx, &["--all"]));
     }
     #[test]
