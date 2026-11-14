@@ -33,8 +33,6 @@ const POLL_PAUSE: Duration = Duration::from_secs(2);
 const RECONNECT_PAUSES: [u64; 5] = [1, 2, 4, 8, 15];
 const OFFLINE_LIMIT: Duration = Duration::from_secs(10 * 60);
 const OPERATION_LIMIT: Duration = Duration::from_secs(60 * 60);
-/// `systemctl is-active` states of a unit that is still running.
-const LIVE_UNIT: [&str; 4] = ["active", "activating", "deactivating", "reloading"];
 
 fn ops_dir(op_id: &str) -> String {
     format!("{NODE_ROOT}/ops/{op_id}")
@@ -171,9 +169,12 @@ fn parse_status(stdout: &str) -> BTreeMap<String, String> {
         .map(|(key, value)| (key.to_owned(), value.to_owned())).collect()
 }
 
-/// The unit of the operation has exited.
+/// The unit of the operation has exited: `systemctl is-active` answered
+/// `inactive` (also for a collected, unknown unit) or `failed`. Any other
+/// answer — notably none while systemd re-executes itself (needrestart after a
+/// package upgrade in `packages`) — does not prove the executor is gone.
 fn unit_gone(status: &BTreeMap<String, String>) -> bool {
-    !status.get("unit").is_some_and(|unit| LIVE_UNIT.contains(&unit.as_str()))
+    status.get("unit").is_none_or(|unit| matches!(unit.as_str(), "inactive" | "failed"))
 }
 
 /// A failed node of the report: `{name, stage, code, message, port?}` plus

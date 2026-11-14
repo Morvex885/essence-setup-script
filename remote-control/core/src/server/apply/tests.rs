@@ -652,4 +652,7 @@ fn probe_output_parses() {
     assert_eq!((probe.status["stage"].as_str(), unit_gone(&probe.status)), ("config", false));
     assert!(parse_probe("sshd=\n").sshd.is_none());
     assert!(unit_gone(&parse_status("unit=inactive\nstage=config\n")) && unit_gone(&parse_status("stage=config\n")));
+    assert!(unit_gone(&parse_status("unit=failed\nstage=config\n")));
+    // systemd re-executing itself (needrestart in `packages`): no answer is not an exit.
+    assert!(!unit_gone(&parse_status("unit=\nstage=packages\n")) && !unit_gone(&parse_status("unit=unknown\nstage=packages\n")));
 }
