@@ -19,12 +19,13 @@ use super::paths::{MIHOMO_CONFIG_PATH, MIHOMO_SERVICE_PATH, SITES_AVAILABLE, SIT
 use super::ports::{REALITY_INNER_PORT, SITE_PORT, SUB_INNER_PORT, TG_INNER_PORT, XHTTP_NGINX_PORT};
 
 /// Bumped whenever rendered files change for an unchanged configuration.
-pub const RENDER_REVISION: u32 = 3;
+pub const RENDER_REVISION: u32 = 4;
 
 const MIHOMO_CONFIG: &str = include_str!("assets/mihomo-config.yaml");
 const MIHOMO_SERVICE: &str = include_str!("assets/mihomo.service");
 const SYSCTL: &str = include_str!("assets/sysctl.conf");
 const SYSCTL_IPV6_DISABLED: &str = include_str!("assets/sysctl-ipv6-disabled.txt");
+const SYSCTL_IPV6_ENABLED: &str = include_str!("assets/sysctl-ipv6-enabled.txt");
 const SYSCTL_IPV6_FORWARDING: &str = "net.ipv6.conf.all.forwarding = 1";
 const NGINX_SITE: &str = include_str!("assets/nginx-site.conf");
 const NGINX_XHTTP: &str = include_str!("assets/nginx-xhttp-location.conf");
@@ -135,16 +136,25 @@ fn needs_site(profile: &Profile) -> bool {
         && (profile.has_reality() || profile.vless_xhttp.is_some() || profile.hysteria2.is_some())
 }
 
-/// Whether a Reality listener takes the public 443 (effective ports).
-fn reality_on_443(node: &Node, profile: &Profile) -> bool {
-    profile.listen_ports(&node.ports).0.iter()
-        .any(|&(key, port)| port == 443 && matches!(key, "vless-tcp" | "vless-xhttp" | "vless-grpc"))
+/// Clients of a listener: assigned to the node and using the listener (a
+/// client without connections on the node uses all of them), with the
+/// credential the listener needs. A listener without them is not rendered.
+fn listener_users<'u>(config: &Config, node: &Node, users: &'u [User<'u>], listener: &Listener) -> Vec<(&'u str, &'u str)> {
+    users.iter().filter(|user| {
+        let connections = effective_connections(config, user.client, &node.name);
+        connections.is_empty() || connections.iter().any(|name| name == listener.name)
+    }).map(|user| (user.name, if listener.kind == Kind::Hy2 { user.password } else { user.uuid }))
+        .filter(|(_, credential)| !credential.is_empty()).collect()
 }
 
-/// Reality takes the 443 front only when one of its listeners is on 443;
-/// otherwise the node's site and roles answer 443 themselves.
-fn front(config: &Config, node: &Node, profile: &Profile) -> Front {
-    match (reality_on_443(node, profile), profile.reality_mode) {
+/// Reality takes the 443 front only when one of its rendered listeners (with
+/// users) is on 443; otherwise the node's site and roles answer 443 themselves.
+fn front(config: &Config, node: &Node, profile: &Profile, users: &[User<'_>]) -> Front {
+    let reality_on_443 = listeners(node, profile, Front::Free).iter().any(|listener| {
+        listener.port == 443 && matches!(listener.kind, Kind::Tcp | Kind::Xhttp | Kind::Grpc)
+            && !listener_users(config, node, users, listener).is_empty()
+    });
+    match (reality_on_443, profile.reality_mode) {
         (false, _) => Front::Free,
         (true, RealityMode::SelfSteal) => Front::SelfSteal,
         (true, RealityMode::Sni) if role_on_443(config, node) => Front::Stream,
@@ -184,7 +194,8 @@ fn listeners(node: &Node, profile: &Profile, front: Front) -> Vec<Listener> {
 
 fn layout<'a>(config: &'a Config, node: &'a Node) -> Result<Option<Layout<'a>>> {
     let Some(profile) = node.profile.as_deref().and_then(|name| config.find_profile(name)) else { return Ok(None) };
-    let front = front(config, node, profile);
+    // Invalid users fail `desired` itself; here they only leave 443 to the site.
+    let front = front(config, node, profile, &node_users(config, &node.name).unwrap_or_default());
     let site = if needs_site(profile) {
         Some(node.domain.as_deref().filter(|domain| !domain.is_empty()).ok_or_else(|| {
             RcError::new("domain_required", format!("Для ноды «{0}» нужен домен: node domain --name {0} --domain D.", node.name))
@@ -246,6 +257,9 @@ impl Layout<'_> {
         if self.front != Front::Free || self.nginx_on_443() {
             tcp.insert(443);
         }
+        if self.site.is_some() && self.front == Front::SelfSteal {
+            tcp.insert(SITE_PORT);
+        }
         if tcp.contains(&self.node.port) {
             return Err(invalid(format!("Порт {} ноды «{}» занят SSH.", self.node.port, self.node.name)).with_extra("port", self.node.port));
         }
@@ -290,15 +304,8 @@ impl Layout<'_> {
         }
     }
 
-    /// Clients of a listener: assigned to the node and using the listener (a
-    /// client without connections on the node uses all of them), with the
-    /// credential the listener needs.
     fn users<'u>(&self, users: &'u [User<'u>], listener: &Listener) -> Vec<(&'u str, &'u str)> {
-        users.iter().filter(|user| {
-            let connections = effective_connections(self.config, user.client, &self.node.name);
-            connections.is_empty() || connections.iter().any(|name| name == listener.name)
-        }).map(|user| (user.name, if listener.kind == Kind::Hy2 { user.password } else { user.uuid }))
-            .filter(|(_, credential)| !credential.is_empty()).collect()
+        listener_users(self.config, self.node, users, listener)
     }
 
     fn node_users(&self) -> Result<Vec<User<'_>>> {
@@ -371,14 +378,19 @@ impl Layout<'_> {
         ]))
     }
 
+    /// `Enabled` sets `disable_ipv6 = 0` explicitly: `sysctl --system` only
+    /// applies what files set, so a node leaving `Disabled` gets IPv6 back.
     fn sysctl(&self) -> String {
-        if self.profile.ipv6 != Ipv6::Disabled {
-            return SYSCTL.to_owned();
+        match self.profile.ipv6 {
+            Ipv6::Default => SYSCTL.to_owned(),
+            Ipv6::Enabled => format!("{SYSCTL}{SYSCTL_IPV6_ENABLED}"),
+            Ipv6::Disabled => {
+                let mut text: String = SYSCTL.lines().filter(|line| *line != SYSCTL_IPV6_FORWARDING)
+                    .map(|line| format!("{line}\n")).collect();
+                text.push_str(SYSCTL_IPV6_DISABLED);
+                text
+            }
         }
-        let mut text: String = SYSCTL.lines().filter(|line| *line != SYSCTL_IPV6_FORWARDING)
-            .map(|line| format!("{line}\n")).collect();
-        text.push_str(SYSCTL_IPV6_DISABLED);
-        text
     }
 
     fn site_config(&self, domain: &str) -> String {
@@ -491,7 +503,8 @@ const INBOUND_PROXY: &str = "outbound";
 pub const INBOUND_RULE: &str = "essence-in";
 /// Destinations no client may reach through the node: its loopback,
 /// link-local (cloud metadata) and private networks. Every inbound sub-rule
-/// (cascades too) starts with these.
+/// (cascades too) starts with these. Without `no-resolve`: a domain is
+/// resolved and rejected when it points into these networks.
 pub const INBOUND_REJECT: [&str; 9] = [
     "IP-CIDR,127.0.0.0/8", "IP-CIDR6,::1/128", "IP-CIDR,169.254.0.0/16", "IP-CIDR,10.0.0.0/8", "IP-CIDR,172.16.0.0/12",
     "IP-CIDR,192.168.0.0/16", "IP-CIDR,100.64.0.0/10", "IP-CIDR6,fc00::/7", "IP-CIDR6,fe80::/10",
@@ -501,7 +514,7 @@ pub const INBOUND_REJECT: [&str; 9] = [
 fn inbound_sub_rules() -> String {
     let mut text = format!("sub-rules:\n  {INBOUND_RULE}:\n");
     for rule in INBOUND_REJECT {
-        text.push_str(&format!("    - {rule},REJECT,no-resolve\n"));
+        text.push_str(&format!("    - {rule},REJECT\n"));
     }
     text.push_str(&format!("    - MATCH,{INBOUND_PROXY}\n"));
     text

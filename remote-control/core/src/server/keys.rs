@@ -138,6 +138,8 @@ pub fn ensure_generated(state: &State, config: &mut Config) -> Result<()> {
     }
     let mut used: BTreeSet<u32> = config.clients.iter()
         .filter_map(|client| client.credentials.as_ref().map(|c| c.awg_index)).filter(|index| *index != 0).collect();
+    // Every index below the last one handed out is taken: the search goes on from there.
+    let mut next_index = AWG_INDEX_MIN;
     for client in &mut config.clients {
         let credentials = client.credentials.get_or_insert_with(ClientCredentials::default);
         if credentials.vless_uuid.is_empty() {
@@ -153,9 +155,10 @@ pub fn ensure_generated(state: &State, config: &mut Config) -> Result<()> {
             credentials.awg_preshared_key = wg_key()?.to_string();
         }
         if credentials.awg_index == 0 {
-            let index = (AWG_INDEX_MIN..=AWG_INDEX_MAX).find(|index| !used.contains(index))
+            let index = (next_index..=AWG_INDEX_MAX).find(|index| !used.contains(index))
                 .ok_or_else(|| RcError::new("invalid", "Слишком много клиентов для подсети AmneziaWG."))?;
             used.insert(index);
+            next_index = index + 1;
             credentials.awg_index = index;
         }
     }
@@ -286,6 +289,17 @@ mod tests {
         let fresh = config.clients[1].credentials.clone().unwrap();
         assert!(v::vless_uuid_valid(&fresh.vless_uuid) && v::hy2_password_valid(&fresh.hy2_password));
         assert_eq!(fresh.awg_index, 3);
+        // Several fresh clients take the lowest free indexes in order, around taken ones.
+        config.clients[0].credentials.as_mut().unwrap().awg_index = 4;
+        config.clients[1].credentials.as_mut().unwrap().awg_index = 0;
+        config.clients.extend(["a", "b"].map(|name| Client { name: name.into(), group: "PC".into(), ..Client::default() }));
+        let mut again = config.clone();
+        ensure_generated(&state, &mut again).unwrap();
+        let indexes: Vec<u32> = again.clients.iter().map(|client| client.credentials.as_ref().unwrap().awg_index).collect();
+        assert_eq!(indexes, [4, 2, 3, 5]);
+        config.clients[0].credentials.as_mut().unwrap().awg_index = 2;
+        config.clients[1].credentials.as_mut().unwrap().awg_index = 3;
+        config.clients.truncate(2);
         assert_eq!(STANDARD.decode(&fresh.awg_private_key).unwrap().len(), 32);
 
         let before = config.clone();

@@ -16,7 +16,9 @@ use crate::model::{
     default_awg_dns,
 };
 use crate::nodes::required;
+use crate::nodes::setup::FileBackup;
 use crate::request_secrets::Secrets;
+use crate::state::State;
 use crate::validation as v;
 
 use super::keys::{ensure_generated, hex, uniform};
@@ -290,26 +292,37 @@ fn in_use(name: &str, nodes: Vec<String>) -> RcError {
         .with_extra("name", name).with_extra("nodes", nodes)
 }
 
+/// Plan of `profile delete` from the current state. The extra binds it to
+/// the profile's settings: a profile changed or recreated with the same name
+/// after the confirmation changes the plan.
+fn delete_plan(config: &Config, name: &str) -> Result<Plan> {
+    let profile = find(config, name)?;
+    let nodes = nodes_of(config, name);
+    if !nodes.is_empty() {
+        return Err(in_use(name, nodes));
+    }
+    let extra = serde_json::to_string(profile).map_err(|error| RcError::new("failed", error.to_string()))?;
+    Ok(Plan::new(vec![format!("Профиль «{name}» будет удалён.")], extra))
+}
+
+/// The confirmed deletion under the mutation lock: the plan is rebuilt from
+/// the state and must not have changed.
+fn delete_planned(state: &State, name: &str, planned: &Plan, invocation: &Invocation) -> Result<()> {
+    let mut config = state.load_config()?;
+    let plan = delete_plan(&config, name)?;
+    if plan.lines != planned.lines || plan.extra != planned.extra {
+        return Err(plan.changed(invocation));
+    }
+    config.profiles.retain(|profile| profile.name != name);
+    state.save_config(&config)?;
+    state.secret_store().remove(&format!("profile:{name}:warp-license"))
+}
+
 fn delete(session: &mut Session, invocation: &Invocation) -> Result<Value> {
     let name = required(invocation, "name")?.to_owned();
-    let config = session.state.load_config()?;
-    find(&config, &name)?;
-    let nodes = nodes_of(&config, &name);
-    if !nodes.is_empty() {
-        return Err(in_use(&name, nodes));
-    }
-    Plan::new(vec![format!("Профиль «{name}» будет удалён.")], "").confirm(invocation)?;
-    session.mutate("profile delete", |state| {
-        let mut config = state.load_config()?;
-        find(&config, &name)?;
-        let nodes = nodes_of(&config, &name);
-        if !nodes.is_empty() {
-            return Err(in_use(&name, nodes));
-        }
-        config.profiles.retain(|profile| profile.name != name);
-        state.save_config(&config)?;
-        state.secret_store().remove(&format!("profile:{name}:warp-license"))
-    })?;
+    let plan = delete_plan(&session.state.load_config()?, &name)?;
+    plan.confirm(invocation)?;
+    session.mutate("profile delete", |state| delete_planned(state, &name, &plan, invocation))?;
     session.log(Level::Success, &format!("Профиль «{name}» удалён"));
     Ok(json!({"name": name}))
 }
@@ -338,11 +351,20 @@ fn warp_license(session: &mut Session, invocation: &Invocation, secrets: &Secret
         let mut config = state.load_config()?;
         let profile = config.profiles.iter_mut().find(|profile| profile.name == name).ok_or_else(|| not_found(&name))?;
         profile.warp_plus = mark.clone();
-        match license {
-            Some(license) => state.secret_store().set(&id, license)?,
-            None => state.secret_store().remove(&id)?,
+        // Local `mutate` does not restore on a failed closure: the secret and
+        // the mark change together or not at all.
+        let paths = state.paths();
+        let backup = FileBackup::take([paths.config(), paths.secrets(), paths.secret_key()].map(std::path::Path::to_path_buf))?;
+        let changed = match license {
+            Some(license) => state.secret_store().set(&id, license),
+            None => state.secret_store().remove(&id),
+        }.and_then(|()| state.save_config(&config));
+        let Err(error) = changed else { return Ok(()) };
+        if backup.restore().is_ok() {
+            return Err(error);
         }
-        state.save_config(&config)
+        Err(RcError::new("failed", format!("Ключ WARP+ профиля «{name}» не изменён, прежнее локальное состояние восстановить не удалось."))
+            .with_extra("name", name.clone()).with_extra("cause", error.message))
     })?;
     session.log(Level::Success, &if clear { format!("Ключ WARP+ профиля «{name}» удалён") } else { format!("Ключ WARP+ профиля «{name}» сохранён") });
     Ok(json!({"name": name, "warp_plus": !clear}))
@@ -439,6 +461,44 @@ mod tests {
         assert_eq!(run(&mut session, &["profile", "delete", "--name", "edge"]).unwrap_err().code, "confirmation_required");
         run(&mut session, &["profile", "delete", "--name", "edge", "--yes"]).unwrap();
         assert!(session.state.load_config().unwrap().profiles.is_empty());
+    }
+
+    #[test]
+    fn delete_rechecks_the_agreed_profile_under_the_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut session, _) = session(root.path());
+        run(&mut session, ADD).unwrap();
+        let invocation = invocation(&["profile", "delete", "--name", "edge", "--yes"]);
+        let agreed = delete_plan(&session.state.load_config().unwrap(), "edge").unwrap();
+        // Changed after the confirmation: same plan lines, other settings.
+        run(&mut session, &["profile", "set", "--name", "edge", "--reality", "sni", "--sni-domain", "www.example.org"]).unwrap();
+        let error = delete_planned(&session.state, "edge", &agreed, &invocation).unwrap_err();
+        assert_eq!(error.code, "plan_changed");
+        assert_eq!(error.extra["plan"], json!(["Профиль «edge» будет удалён."]));
+        assert_eq!(session.state.load_config().unwrap().profiles.len(), 1);
+        let current = delete_plan(&session.state.load_config().unwrap(), "edge").unwrap();
+        delete_planned(&session.state, "edge", &current, &invocation).unwrap();
+        assert!(session.state.load_config().unwrap().profiles.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_save_puts_the_warp_license_back() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut session, _) = session(root.path());
+        run(&mut session, ADD).unwrap();
+        let invocation = invocation(&["profile", "warp-license", "--name", "edge"]);
+        warp_license(&mut session, &invocation, &Secrets::from_json(r#"{"password":"old-key"}"#).unwrap()).unwrap();
+        let mark = session.state.load_config().unwrap().profiles[0].warp_plus.clone();
+        // The configuration stays readable but can no longer be replaced.
+        let config = session.state.paths().config().to_path_buf();
+        let real = config.with_extension("real");
+        std::fs::rename(&config, &real).unwrap();
+        std::os::unix::fs::symlink(&real, &config).unwrap();
+        let error = warp_license(&mut session, &invocation, &Secrets::from_json(r#"{"password":"new-key"}"#).unwrap()).unwrap_err();
+        assert_eq!(error.code, "failed");
+        assert_eq!(session.state.secret_store().get("profile:edge:warp-license").unwrap().unwrap().as_str(), "old-key");
+        assert_eq!(session.state.load_config().unwrap().profiles[0].warp_plus, mark);
     }
 
     #[test]

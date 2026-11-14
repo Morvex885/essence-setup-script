@@ -280,12 +280,14 @@ fn every_listener_routes_through_the_inbound_sub_rule() {
     }
     assert!(!mihomo.contains("\n    proxy: "), "no listener bypasses the rules: {mihomo}");
     let rules: Vec<&str> = document["sub-rules"]["essence-in"].as_vec().unwrap().iter().map(|rule| rule.as_str().unwrap()).collect();
+    // Without `no-resolve`: a domain pointing into these networks is rejected too.
     assert_eq!(rules, [
-        "IP-CIDR,127.0.0.0/8,REJECT,no-resolve", "IP-CIDR6,::1/128,REJECT,no-resolve", "IP-CIDR,169.254.0.0/16,REJECT,no-resolve",
-        "IP-CIDR,10.0.0.0/8,REJECT,no-resolve", "IP-CIDR,172.16.0.0/12,REJECT,no-resolve", "IP-CIDR,192.168.0.0/16,REJECT,no-resolve",
-        "IP-CIDR,100.64.0.0/10,REJECT,no-resolve", "IP-CIDR6,fc00::/7,REJECT,no-resolve", "IP-CIDR6,fe80::/10,REJECT,no-resolve",
+        "IP-CIDR,127.0.0.0/8,REJECT", "IP-CIDR6,::1/128,REJECT", "IP-CIDR,169.254.0.0/16,REJECT",
+        "IP-CIDR,10.0.0.0/8,REJECT", "IP-CIDR,172.16.0.0/12,REJECT", "IP-CIDR,192.168.0.0/16,REJECT",
+        "IP-CIDR,100.64.0.0/10,REJECT", "IP-CIDR6,fc00::/7,REJECT", "IP-CIDR6,fe80::/10,REJECT",
         "MATCH,outbound",
     ]);
+    assert!(!mihomo.contains("no-resolve"));
 }
 
 #[test]
@@ -320,6 +322,9 @@ fn ports_conflicting_with_ssh_or_tproxy_are_invalid_and_overrides_apply() {
     assert_eq!((error.code, error.extra["port"].clone()), ("invalid", serde_json::json!(2053)));
     config.nodes[0].port = 443;
     assert!(desired(&config, &config.nodes[0], None).err().unwrap().message.contains("443"));
+    // The self-steal site behind Reality listens on 8443.
+    config.nodes[0].port = SITE_PORT;
+    assert_eq!(desired(&config, &config.nodes[0], None).err().unwrap().extra["port"], serde_json::json!(SITE_PORT));
     config.nodes[0].port = 22;
 
     config.nodes[0].ports.insert("vless-grpc".into(), 2083);
@@ -343,7 +348,9 @@ fn three_ipv6_states() {
     config.profiles[0].ipv6 = Ipv6::Enabled;
     let enabled = render(&config);
     assert!(content(&enabled, MIHOMO_CONFIG_PATH).contains("\nipv6: true\n"));
-    assert_eq!(content(&enabled, SYSCTL_PATH), SYSCTL);
+    assert_eq!(content(&enabled, SYSCTL_PATH), format!("{SYSCTL}\n# IPv6 включён по запросу пользователя\n\
+        net.ipv6.conf.all.disable_ipv6 = 0\nnet.ipv6.conf.default.disable_ipv6 = 0\nnet.ipv6.conf.lo.disable_ipv6 = 0\n"),
+        "leaving Disabled turns IPv6 back on under `sysctl --system`");
     config.profiles[0].ipv6 = Ipv6::Disabled;
     let disabled = render(&config);
     assert!(content(&disabled, MIHOMO_CONFIG_PATH).contains("\nipv6: false\n"));
@@ -379,6 +386,29 @@ fn xhttp_through_nginx_adds_the_location_and_the_inner_listener() {
     assert!(content(&free, "/etc/nginx/sites-available/de.example.com")
         .starts_with("# Essence site de.example.com\nserver {\n    listen 443 ssl http2;\n    listen [::]:443 ssl http2;\n"));
     assert_eq!((spec(&free, "UFW_RULES"), spec(&free, "SITE_REQUIRE_200")), ("443/tcp", "false"));
+}
+
+#[test]
+fn reality_without_users_on_443_leaves_443_to_the_site() {
+    // TCP and xHTTP through nginx, the client uses only xHTTP: no TCP
+    // listener is rendered, so the site answers 443 itself.
+    let mut profile = profile();
+    profile.vless_xhttp = Some(Xhttp { topology: XhttpTopology::Nginx, port: None });
+    let mut config = config(profile);
+    config.connections[0].groups[0].proxies = vec!["VLESS xHTTP".into()];
+    let desired = render(&config);
+    assert!(!content(&desired, MIHOMO_CONFIG_PATH).contains("# --- vless-tcp ---"));
+    assert!(content(&desired, "/etc/nginx/sites-available/de.example.com")
+        .starts_with("# Essence site de.example.com\nserver {\n    listen 443 ssl http2;\n    listen [::]:443 ssl http2;\n"));
+    assert_eq!((spec(&desired, "LISTEN_TCP"), spec(&desired, "SITE_REQUIRE_200")), ("443 8447", "false"));
+    assert_eq!(spec(&desired, "UFW_RULES"), "443/tcp");
+
+    // SNI mode without a role: no Reality listener on 443, nothing opens it.
+    let mut sni_config = self::config(sni(self::profile()));
+    sni_config.nodes[0].domain = None;
+    sni_config.connections[0].groups[0].proxies = vec!["Hysteria2".into()];
+    let desired = render(&sni_config);
+    assert_eq!((spec(&desired, "UFW_RULES"), spec(&desired, "LISTEN_TCP")), ("", ""));
 }
 
 #[test]

@@ -91,7 +91,10 @@ pub fn probe_command(node: &Node) -> String {
          printf 'sshd=%s\\n' \"${{SSH_CONNECTION##* }}\"\n\
          ({}) && echo agent=ok\n\
          ss -H -tuln | awk '{{print \"listen\", $1, $5}}'\n", agent_check());
-    let files: Vec<String> = node.applied.iter().flat_map(|applied| applied.files.keys()).map(|path| sh_quote(path)).collect();
+    // A recorded operation may settle into `applied` with its own files.
+    let files: Vec<String> = node.applied.iter().flat_map(|applied| applied.files.keys())
+        .chain(node.operation.iter().flat_map(|operation| operation.files.keys()))
+        .collect::<std::collections::BTreeSet<_>>().into_iter().map(|path| sh_quote(path)).collect();
     if !files.is_empty() {
         command.push_str(&format!(
             "for f in {}; do if [ -f \"$f\" ]; then sha256sum \"$f\"; else echo \"missing $f\"; fi; done\n", files.join(" ")));
@@ -173,30 +176,40 @@ fn unit_gone(status: &BTreeMap<String, String>) -> bool {
     !status.get("unit").is_some_and(|unit| LIVE_UNIT.contains(&unit.as_str()))
 }
 
-/// A failed node of the report: `{name, stage, code, message, port?}`.
-/// `stage` is the executor stage or `probe`/`start`; `message` is shown after
-/// the node name.
+/// A failed node of the report: `{name, stage, code, message, port?}` plus
+/// the error's `NODE_CODE_EXTRA` keys. `stage` is the executor stage or
+/// `probe`/`start`; `message` is shown after the node name.
 #[derive(Clone, Debug)]
 struct Failure {
     stage: String,
     code: String,
     message: String,
     port: Option<u16>,
+    extra: Vec<(String, Value)>,
 }
+
+/// Error extra the front ends' node-code handlers read from a `failed[]`
+/// entry (`host_key_*` fingerprints, the missing secret's name); none of
+/// them is secret.
+const NODE_CODE_EXTRA: [&str; 3] = ["fingerprints", "host", "secret"];
 
 impl Failure {
     fn new(stage: &str, code: &str, message: impl Into<String>) -> Self {
-        Self { stage: stage.to_owned(), code: code.to_owned(), message: message.into(), port: None }
+        Self { stage: stage.to_owned(), code: code.to_owned(), message: message.into(), port: None, extra: Vec::new() }
     }
 
     fn of(stage: &str, error: RcError) -> Self {
-        Self::new(stage, error.code, error.message)
+        let extra = error.extra.into_iter().filter(|(key, _)| NODE_CODE_EXTRA.contains(&key.as_str())).collect();
+        Self { extra, ..Self::new(stage, error.code, error.message) }
     }
 
     fn entry(&self, name: &str) -> Value {
         let mut entry = json!({"name": name, "stage": self.stage, "code": self.code, "message": self.message});
         if let Some(port) = self.port {
             entry["port"] = json!(port);
+        }
+        for (key, value) in &self.extra {
+            entry[key.as_str()] = value.clone();
         }
         entry
     }
@@ -398,7 +411,10 @@ impl<'t, T: RemoteTransport> Run<'t, T> {
         if self.stage.is_empty() { "start".to_owned() } else { self.stage.clone() }
     }
 
-    /// Upload the executor when needed, the operation directory, then start it.
+    /// Upload the executor when needed, the operation directory, then start
+    /// it. A failure before `systemd-run` means nothing started (`Err`). A
+    /// connection lost during `systemd-run` leaves the start uncertain: the
+    /// run goes on reconnecting and polling, so the remote status decides.
     async fn start(&mut self, session: &mut Session, agent_ok: bool, desired: &Desired) -> Result<()> {
         let name = self.node.name.clone();
         let op_id = self.operation.id.clone();
@@ -413,11 +429,16 @@ impl<'t, T: RemoteTransport> Run<'t, T> {
         }
         let dir = operation_dir(&op_id, desired)?;
         self.transport.upload_private(dir.path(), &ops_dir(&op_id), LONG_TIMEOUT).await?;
-        let started = self.transport.exec(&start_command(&op_id), b"", COMMAND_TIMEOUT).await?;
-        if started.exit_status != 0 {
-            return Err(RcError::new("remote_failed", "Не удалось запустить исполнитель."));
+        match self.transport.exec(&start_command(&op_id), b"", COMMAND_TIMEOUT).await {
+            Ok(started) if started.exit_status != 0 => Err(RcError::new("remote_failed", "Не удалось запустить исполнитель.")),
+            Ok(_) => Ok(()),
+            Err(_) => {
+                session.log(Level::Warn, &format!("{name}: связь потеряна при запуске, проверяю состояние…"));
+                let now = Instant::now();
+                self.lost = Some((now, 0, now + Duration::from_secs(RECONNECT_PAUSES[0])));
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     /// Print the tail of the executor log.
@@ -473,6 +494,8 @@ impl<'t, T: RemoteTransport> Run<'t, T> {
                 let failure = match (result, stage.as_str()) {
                     (_, "locked") => Failure::new(&self.current_stage(), "failed", "на ноде выполняется другая операция"),
                     ("rolled_back", _) => Failure::new(&stage, "rolled_back", format!("откат на этапе «{}»", stage_label(&stage))),
+                    ("rollback_failed", _) => Failure::new(&stage, "rollback_failed",
+                        format!("откат на этапе «{}» не завершён: резервные копии оставлены на ноде", stage_label(&stage))),
                     _ => Failure::new(&stage, "failed", format!("ошибка на этапе «{}»", stage_label(&stage))),
                 };
                 self.fail(failure);
@@ -515,7 +538,8 @@ async fn drive<T: RemoteTransport>(session: &mut Session, runs: &mut [Run<'_, T>
     }
 }
 
-/// Start a claimed operation; a failed start clears it again.
+/// Start a claimed operation; a start that certainly did not happen clears
+/// it again (an uncertain one is kept and settled by polling).
 async fn launch<T: RemoteTransport>(session: &mut Session, run: &mut Run<'_, T>, agent_ok: bool, desired: &Desired)
     -> Result<()>
 {

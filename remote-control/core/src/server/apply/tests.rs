@@ -238,6 +238,24 @@ async fn rollback_is_reported_with_the_log_and_clears_the_operation() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn an_incomplete_rollback_is_reported_apart() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut session, _journal) = fixture(root.path());
+    let de = node(1, "de");
+    NEXT_OP_ID.with(|next| *next.borrow_mut() = Some(OP.into()));
+    let mut steps = vec![connect_step(&de, Ok(())), probe_step(&de, DEBIAN)];
+    steps.extend(start_steps(OP));
+    steps.push(exec(status_command(OP), "unit=inactive\nstage=config\nresult=rollback_failed\nerror=config\n"));
+    steps.push(exec(log_command(OP), "[✗] restore failed\n"));
+    let hosts = Hosts::new(vec![steps]);
+    let error = run(&mut session, &hosts, &["node", "apply", "--name", "de", "--yes"]).await.unwrap_err();
+    hosts.finish();
+    assert_eq!(error.extra["failed"], json!([{"name": "de", "stage": "config", "code": "rollback_failed",
+        "message": "откат на этапе «конфигурация и проверка» не завершён: резервные копии оставлены на ноде"}]));
+    assert!(config(&session).nodes[0].operation.is_none());
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_dropped_connection_is_reestablished_while_polling() {
     let root = tempfile::tempdir().unwrap();
     let (mut session, _journal) = fixture(root.path());
@@ -299,6 +317,21 @@ async fn the_probe_retries_a_lost_handshake_once_but_not_a_refused_login() {
         hosts.finish();
         assert_eq!(error.code, "partial");
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_changed_host_key_keeps_its_fingerprint_in_the_failed_entry() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut session, _journal) = fixture(root.path());
+    let de = node(1, "de");
+    let presented = fp(b'Z');
+    let refused = RcError::new("host_key_changed", "Ключ SSH-сервера не подтверждён.").with_extra("host", de.ip.clone())
+        .with_extra("port", 22).with_extra("fingerprints", json!([presented])).with_extra("cause", "x");
+    let hosts = Hosts::new(vec![vec![connect_step(&de, Err(refused))]]);
+    let error = run(&mut session, &hosts, &["node", "apply", "--name", "de"]).await.unwrap_err();
+    hosts.finish();
+    assert_eq!(error.extra["failed"], json!([{"name": "de", "stage": "probe", "code": "host_key_changed",
+        "message": "Ключ сервера ноды «de» изменился.", "host": de.ip, "fingerprints": [presented]}]));
 }
 
 #[tokio::test(start_paused = true)]
@@ -457,6 +490,64 @@ async fn a_timeout_keeps_the_operation_for_the_next_apply() {
     assert_eq!(error.extra["failed"], json!([{"name": "de", "stage": "start", "code": "timeout",
         "message": "нет связи с нодой больше 10 минут"}]));
     assert_eq!(config(&session).nodes[0].operation.as_ref().map(|operation| operation.id.as_str()), Some(OP));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_start_with_an_unknown_result_is_settled_by_polling() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut session, _journal) = fixture(root.path());
+    let de = node(1, "de");
+    NEXT_OP_ID.with(|next| *next.borrow_mut() = Some(OP.into()));
+    // The connection drops during systemd-run, the unit did start and commits.
+    let mut steps = vec![connect_step(&de, Ok(())), probe_step(&de, DEBIAN)];
+    steps.extend(start_steps(OP).into_iter().take(3));
+    steps.push(ScriptStep::exec(start_command(OP), 0, COMMAND_TIMEOUT, Err(remote_failure("connection_lost"))));
+    steps.push(connect_step(&de, Ok(())));
+    steps.push(exec(status_command(OP), "unit=inactive\nstage=cleanup\nresult=committed\n"));
+    let hosts = Hosts::new(vec![steps]);
+    let data = run(&mut session, &hosts, &["node", "apply", "--name", "de", "--yes"]).await.unwrap();
+    hosts.finish();
+    assert_eq!(data["applied"], json!(["de"]));
+    assert!(config(&session).nodes[0].applied.is_some());
+
+    // Unreachable after the drop: the operation stays for the next apply.
+    let root = tempfile::tempdir().unwrap();
+    let (mut session, _journal) = fixture(root.path());
+    NEXT_OP_ID.with(|next| *next.borrow_mut() = Some(OP.into()));
+    let mut steps = vec![connect_step(&de, Ok(())), probe_step(&de, DEBIAN)];
+    steps.extend(start_steps(OP).into_iter().take(3));
+    steps.push(ScriptStep::exec(start_command(OP), 0, COMMAND_TIMEOUT, Err(remote_failure("connection_lost"))));
+    let hosts = Hosts::new(vec![steps]);
+    let error = run(&mut session, &hosts, &["node", "apply", "--name", "de", "--yes"]).await.unwrap_err();
+    assert_eq!(error.extra["failed"][0]["code"], "timeout");
+    assert_eq!(config(&session).nodes[0].operation.as_ref().map(|operation| operation.id.as_str()), Some(OP));
+
+    // A refused start certainly did not happen: the operation is cleared.
+    let root = tempfile::tempdir().unwrap();
+    let (mut session, _journal) = fixture(root.path());
+    NEXT_OP_ID.with(|next| *next.borrow_mut() = Some(OP.into()));
+    let mut steps = vec![connect_step(&de, Ok(())), probe_step(&de, DEBIAN)];
+    steps.extend(start_steps(OP).into_iter().take(3));
+    steps.push(ScriptStep::exec(start_command(OP), 0, COMMAND_TIMEOUT,
+        Ok(ExecResult { stdout: Vec::new(), stderr: Vec::new(), exit_status: 1 })));
+    let hosts = Hosts::new(vec![steps]);
+    let error = run(&mut session, &hosts, &["node", "apply", "--name", "de", "--yes"]).await.unwrap_err();
+    hosts.finish();
+    assert_eq!(error.extra["failed"][0]["code"], "start");
+    assert!(config(&session).nodes[0].operation.is_none());
+}
+
+#[test]
+fn the_probe_hashes_the_files_of_a_recorded_operation_too() {
+    let mut de = node(1, "de");
+    de.operation = Some(recorded("a"));
+    de.operation.as_mut().unwrap().files.insert(render_paths::SYSCTL_PATH.to_owned(), "d".repeat(64));
+    de.applied = Some(crate::model::Applied {
+        digest: "b".repeat(64), files: [(render_paths::MIHOMO_CONFIG_PATH.to_owned(), "c".repeat(64))].into(),
+        ports: Vec::new(), at: String::new(),
+    });
+    let command = probe_command(&de);
+    assert!(command.contains(&format!("for f in '{}' '{}'; do", render_paths::MIHOMO_CONFIG_PATH, render_paths::SYSCTL_PATH)), "{command}");
 }
 
 #[tokio::test(start_paused = true)]
