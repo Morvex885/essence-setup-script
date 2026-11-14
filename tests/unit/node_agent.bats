@@ -716,3 +716,52 @@ exit 0'
     assert_line "error=config"
     ! grep -qF "Служба mihomo работала до операции" "$OPDIR/log"
 }
+
+# ─── Фича awg: awg_activate ─────────────────────────────────────────────────
+
+# awg_call <код> — функции исполнителя с $R, $OP в окружении теста.
+awg_call() {
+    run bash -c 'R="$1"; OP="$2"; source "$3/common/common.sh"; for f in "$3"/steps/*.sh; do source "$f"; done; eval "$4"' \
+        _ "$ROOT" "$OPDIR" "$AGENT" "$1"
+}
+
+awg_files() {
+    stub ip '[[ "$*" == "link show awg0" ]] && exit "${AWG_DOWN:-0}"; exit 0'
+    stub awg 'exit 0'
+    stub awg-quick '[[ "$1" == strip ]] && echo stripped; exit 0'
+    mkdir -p "$ROOT/etc/amnezia/amneziawg" "$OPDIR/backup/etc/amnezia/amneziawg"
+    printf '[Interface]\nListenPort = %s\n# peer: b\n[Peer]\nPublicKey = B\n' "$1" >"$ROOT/etc/amnezia/amneziawg/awg0.conf"
+    printf '[Interface]\nListenPort = 40000\n# peer: a\n[Peer]\nPublicKey = A\n' >"$OPDIR/backup/etc/amnezia/amneziawg/awg0.conf"
+}
+
+@test "awg_activate: изменились только пиры — syncconf без перезапуска" {
+    awg_files 40000
+    awg_call awg_activate
+    assert_success
+    grep -qx "awg syncconf awg0 /dev/fd/63" "$CALLS" || grep -q "^awg syncconf awg0" "$CALLS"
+    ! grep -q "restart awg-quick@awg0" "$CALLS"
+    grep -qx "sysctl -w net.ipv4.ip_forward=1" "$CALLS"
+}
+
+@test "awg_activate: изменился интерфейс или он не поднят — перезапуск" {
+    awg_files 41000
+    awg_call awg_activate
+    assert_success
+    grep -qx "systemctl restart awg-quick@awg0" "$CALLS"
+    ! grep -q "^awg syncconf" "$CALLS"
+    : >"$CALLS"
+    awg_files 40000
+    AWG_DOWN=1 awg_call awg_activate
+    grep -qx "systemctl restart awg-quick@awg0" "$CALLS"
+    ! grep -q "^awg syncconf" "$CALLS"
+}
+
+@test "awg_rollback и awg_remove" {
+    awg_files 40000
+    awg_call awg_rollback
+    grep -qx "systemctl restart awg-quick@awg0" "$CALLS"
+    awg_call awg_remove
+    assert_success
+    [[ ! -e "$ROOT/etc/amnezia" ]]
+    grep -qx "systemctl disable --now awg-quick@awg0" "$CALLS"
+}
