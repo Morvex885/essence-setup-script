@@ -201,6 +201,8 @@ assert_scrubbed() {
 @test "teardown удаляет каталог, mihomo и свои правила UFW" {
     printf '443/tcp\n' >"$ROOT/root/essence-node/ufw-rules"
     printf 'cfg\n' >"$ROOT/etc/mihomo/config.yaml"
+    mkdir -p "$ROOT/etc/systemd/system"
+    printf '[Unit]\n' >"$ROOT/etc/systemd/system/mihomo.service"
     MODE=teardown RULES="" write_spec
     printf '/etc/mihomo\n' >"$OPDIR/remove.list"
     run_agent
@@ -278,6 +280,23 @@ exit 0'
     [[ ! -e "$ROOT/etc/systemd/system/mihomo.service" && ! -e "$ROOT/etc/mihomo" ]]
     grep -qx "systemctl disable --now mihomo" "$CALLS"
     (($(line_of "systemctl disable --now mihomo") < $(line_of "systemctl daemon-reload")))
+}
+
+@test "teardown без юнита mihomo (первое применение прервалось до config) завершается" {
+    stub systemctl 'if [[ "$1" == disable && ! -e "$ESSENCE_NODE_ROOT/etc/systemd/system/mihomo.service" ]]; then
+    echo "Failed to disable unit, unit mihomo.service does not exist." >&2
+    exit 1
+fi
+exit 0'
+    printf 'cfg\n' >"$ROOT/etc/mihomo/config.yaml"
+    MODE=teardown RULES="" write_spec
+    printf '/etc/mihomo\n/etc/systemd/system/mihomo.service\n' >"$OPDIR/remove.list"
+    run_agent
+    assert_success
+    run status
+    assert_line "result=committed"
+    [[ ! -e "$ROOT/etc/mihomo" ]]
+    ! grep -q "^systemctl disable" "$CALLS" || return 1
 }
 
 @test "порты передаются: stop mihomo → nginx → start mihomo → проверка LISTEN" {

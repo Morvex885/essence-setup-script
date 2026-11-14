@@ -632,8 +632,11 @@ stage_teardown_config() {
     for path in "${removes[@]}" "$MIHOMO_BIN_REL"; do
         tx_backup "$path" || return 1
     done
-    # Сначала disable: без файла юнита systemctl disable отказывает.
-    systemctl disable --now mihomo || return 1
+    # Сначала disable: без файла юнита systemctl disable отказывает. Юнита нет,
+    # если первое применение прервалось до этапа config, — тогда снимать нечего.
+    if [[ -e "$R/etc/systemd/system/mihomo.service" ]]; then
+        systemctl disable --now mihomo || return 1
+    fi
     for path in "${removes[@]}"; do
         [[ "$path" == /etc/sysctl.d/99-vpn-speedup.conf ]] && sysctl_removed=true
         rm -rf -- "$R$path" || return 1
