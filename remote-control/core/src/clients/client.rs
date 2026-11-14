@@ -616,7 +616,7 @@ mod tests {
         config.nodes.iter_mut().filter(|node| node.name == "de-vps").for_each(|node| node.profile = Some("main".into()));
         config.subscription_host = Some(SubscriptionHost {
             node: "de-vps".into(), hostname: "sub.example".into(), port: 443, base_url: "https://sub.example".into(),
-            sub_dir: "/srv/sub".into(), nginx_group: "www-data".into(),
+            sub_dir: crate::model::SUB_DIR.into(), nginx_group: "www-data".into(),
         });
         config
     }

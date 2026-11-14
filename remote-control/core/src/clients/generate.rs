@@ -19,6 +19,7 @@ use crate::error::{RcError, Result};
 use crate::locking::LockKind;
 use crate::log::Level;
 use crate::model::{Client, Config};
+use crate::server::keys::{cascade_password, cascade_uuid};
 use crate::nodes::required;
 use crate::secure_fs;
 use crate::state::StatePaths;
@@ -373,13 +374,19 @@ fn client_proxies(config: &Config, client: &Client, nodes: &[String], sections: 
                 }
                 continue;
             }
+            // A cascade block takes the client's credentials derived for it.
+            let cascade = config.cascades.iter().any(|cascade| cascade.entry == *node_name && cascade.name == *connection);
             let kind = proxy_type(&block).map(str::to_owned);
             match kind.as_deref() {
                 Some("vless") => {
-                    block = set_field(&block, "uuid", uuid);
+                    let uuid = if cascade { cascade_uuid(uuid, connection) } else { uuid.to_owned() };
+                    block = set_field(&block, "uuid", &uuid);
                     block = trim_newlines(&crate::protocols::vless_xhttp::normalize_proxy_yaml(&block)).to_owned();
                 }
-                Some("hysteria2") => block = set_field(&block, "password", password),
+                Some("hysteria2") => {
+                    let password = if cascade { cascade_password(password, connection) } else { password.to_owned() };
+                    block = set_field(&block, "password", &password);
+                }
                 _ => {}
             }
             if awg {
@@ -765,6 +772,27 @@ mod tests {
         let out = out.unwrap();
         assert!(out.contains("  - name: \"DE AmneziaWG 3.1\"\n    type: wireguard\n    ip: 10.10.8.2\n    amnezia-wg-option:\n      version: 3"));
         assert!(!out.contains("9.9.9.9"));
+    }
+
+    #[test]
+    fn cascade_proxies_take_the_derived_credentials() {
+        use crate::model::{Cascade, CascadeExit, CascadeListener, UriExit};
+        let root = tempfile::tempdir().unwrap();
+        let (session, _) = fixture(root.path());
+        let mut config = session.state.load_config().unwrap();
+        let cascade = |name: &str, listener| Cascade { name: name.into(), entry: "de".into(), listener,
+            exit: CascadeExit::Uri(UriExit { uri: "hysteria2://x@203.0.113.5:443".into() }), uuid: String::new(), password: String::new() };
+        config.cascades = vec![cascade("hop", CascadeListener::VlessTcp), cascade("hy", CascadeListener::Hysteria2)];
+        config.connections[0].groups[0].proxies = vec!["hop".into(), "hy".into(), "vless-reality".into()];
+        let section = "proxies:\n  - name: \"hop\"\n    type: vless\n    uuid: 00000000-0000-0000-0000-000000000000\n\
+            \x20 - name: \"hy\"\n    type: hysteria2\n    password: placeholder\n\
+            \x20 - name: \"vless-reality\"\n    type: vless\n    uuid: 00000000-0000-0000-0000-000000000000\n---\n";
+        let (out, _) = proxies(&config, "my-router", &["de"], &fetched(&[("de", section)]));
+        let out = out.unwrap();
+        let hop = cascade_uuid(ROUTER_UUID, "hop");
+        assert!(out.contains(&format!("    uuid: {hop}\n")), "{out}");
+        assert!(out.contains(&format!("    password: {}\n", cascade_password("router-hy2-pass-0001", "hy"))));
+        assert!(out.ends_with(&format!("    uuid: {ROUTER_UUID}")) && hop != ROUTER_UUID, "{out}");
     }
 
     #[test]

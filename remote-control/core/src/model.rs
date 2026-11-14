@@ -546,7 +546,11 @@ impl Config {
                     }
                 }
                 CascadeExit::Uri(exit) => {
-                    if exit.uri.is_empty() || exit.uri.chars().any(|c| c.is_control() || c.is_whitespace()) {
+                    // The exit becomes a proxy in the entry node's mihomo config:
+                    // only a single supported share link is accepted.
+                    if exit.uri.is_empty() || exit.uri.len() > 4096 || exit.uri.chars().any(|c| c.is_control() || c.is_whitespace())
+                        || crate::protocols::uri::parse_proxy_uri(&cascade.name, &exit.uri).is_err()
+                    {
                         return Err(invalid("Некорректная ссылка выхода каскада."));
                     }
                     if !credentials_valid && !(cascade.uuid.is_empty() && cascade.password.is_empty()) {
@@ -570,7 +574,12 @@ impl Config {
         }
         if let Some(host) = &self.subscription_host {
             require_profiled(&host.node)?;
-            if !v::domain_valid(&host.hostname) || host.port == 0 {
+            // `sub_dir` and `nginx_group` reach root commands on the host
+            // node; `base_url` goes into client links.
+            let url_ok = (host.base_url.starts_with("https://") || host.base_url.starts_with("http://"))
+                && host.base_url.len() <= 512 && !host.base_url.contains(|c: char| c.is_control() || c.is_whitespace() || "\"'`\\<>".contains(c));
+            if !v::domain_valid(&host.hostname) || host.port == 0 || !url_ok
+                || host.sub_dir != SUB_DIR || host.nginx_group != default_nginx_group() {
                 return Err(invalid("Некорректный адрес хостинга подписок."));
             }
         }
@@ -1154,11 +1163,17 @@ mod tests {
             ("/cascades/0/uuid", json!(""), "Некорректные учётные данные каскада."),
             ("/cascades/1/uuid", json!("bad"), "Некорректные учётные данные каскада."),
             ("/cascades/1/exit/uri", json!("vless://a b"), "Некорректная ссылка выхода каскада."),
+            ("/cascades/1/exit/uri", json!("ftp://203.0.113.5"), "Некорректная ссылка выхода каскада."),
+            ("/cascades/1/exit/uri", json!(format!("vless://u@h:443?{}", "a".repeat(4096))), "Некорректная ссылка выхода каскада."),
             ("/telegram/0/node", json!("ghost"), "Ссылка на неизвестную ноду."),
             ("/telegram/0/hostname", json!("tg"), "Некорректный домен Telegram Proxy."),
             ("/telegram/0/secret_mark", json!("x"), "Некорректная метка секрета Telegram Proxy."),
             ("/subscription_host/node", json!("ghost"), "Ссылка на неизвестную ноду."),
             ("/subscription_host/hostname", json!("sub"), "Некорректный адрес хостинга подписок."),
+            ("/subscription_host/base_url", json!("https://a\"b.example"), "Некорректный адрес хостинга подписок."),
+            ("/subscription_host/base_url", json!("javascript:alert(1)"), "Некорректный адрес хостинга подписок."),
+            ("/subscription_host/sub_dir", json!("/etc"), "Некорректный адрес хостинга подписок."),
+            ("/subscription_host/nginx_group", json!("root"), "Некорректный адрес хостинга подписок."),
         ] {
             let mut raw = profiled();
             set(&mut raw, pointer, value);

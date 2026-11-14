@@ -5,7 +5,7 @@
 // (`app.js::makeContext`). Применение (`node apply`) — `apply-model.js`.
 import { handleNodeCodes, reviewReply, setFlag, decisionFlag } from '../flows.js';
 import { asList } from '../format.js';
-import { applyFlow, applyNamesArgv } from './apply-model.js';
+import { applyFlow, applyNamesArgv, offerApplyNodes } from './apply-model.js';
 import { needsDomain, profileRows, domainError, portError as profilePortError } from './profiles-model.js';
 
 /** Строковое значение поля (`nodes.rs::text`): `null`/`undefined` → ''. */
@@ -508,8 +508,7 @@ export function applyNode(ctx, name) {
 export async function warpReregister(ctx, name) {
   const reply = await ctx.nodeRequest(name, warpReregisterArgv(name), { title: 'Перерегистрация WARP', question: 'Перерегистрировать WARP?' });
   if (!reply.ok) return false;
-  const yes = await ctx.confirm({ title: 'Применение на нодах', plan: [], question: `Применить изменения на ноде ${name}?` });
-  if (yes) await applyNode(ctx, name);
+  await offerApplyNodes(ctx, [name]);
   return true;
 }
 

@@ -211,7 +211,7 @@ pub struct Dashboard;
 pub fn dashboard_route(key: &str) -> Option<char> {
     let mut chars = key.chars();
     let ch = chars.next()?.to_ascii_lowercase();
-    (chars.next().is_none() && "nrcgmpfstio0".contains(ch)).then_some(ch)
+    (chars.next().is_none() && "nrkcgmpfstio0".contains(ch)).then_some(ch)
 }
 /// The header and context come only from `status`.
 pub fn dashboard_view(data: &Value, version: &str) -> View {
@@ -238,8 +238,8 @@ pub fn dashboard_view(data: &Value, version: &str) -> View {
     if data["ssh_setup_pending"] == true { view.context.push(ui::text("Отложена SSH-настройка нод — раздел n → h", ui::YELLOW)); }
     view.sections = vec![
         vec![
-            Item::new('n', "Ноды", ui::GREEN), Item::new('r', "Профили нод", ui::GREEN), Item::new('c', "Клиенты", ui::GREEN),
-            Item::new('g', "Группы", ui::GREEN), Item::new('m', "Шаблоны", ui::GREEN),
+            Item::new('n', "Ноды", ui::GREEN), Item::new('r', "Профили нод", ui::GREEN), Item::new('k', "Каскады", ui::GREEN),
+            Item::new('c', "Клиенты", ui::GREEN), Item::new('g', "Группы", ui::GREEN), Item::new('m', "Шаблоны", ui::GREEN),
             Item::new('p', "Подключения", ui::YELLOW), Item::new('f', "Генерация конфигов", ui::YELLOW), Item::new('s', "Подписки", ui::YELLOW),
             Item::new('t', "Telegram Proxy", ui::CYAN),
         ],
@@ -569,7 +569,7 @@ pub(crate) mod tests {
         assert_frames(&[view]);
     }
     #[test] fn dashboard_keys_colours_and_both_cases() {
-        for key in "nrcgmpfstio".chars() {
+        for key in "nrkcgmpfstio".chars() {
             assert_eq!(dashboard_route(&key.to_string()), Some(key));
             assert_eq!(dashboard_route(&key.to_ascii_uppercase().to_string()), Some(key));
         }
@@ -577,9 +577,9 @@ pub(crate) mod tests {
         let view = dashboard_view(&status_data(), "1");
         assert_eq!(view.sections.len(), 2);
         for item in view.sections.iter().flatten() {
-            assert_eq!(item.color, match item.key.as_str() { "n" | "r" | "c" | "g" | "m" => ui::GREEN, "p" | "f" | "s" | "o" => ui::YELLOW, "0" => ui::NC, _ => ui::CYAN }, "{}", item.key);
+            assert_eq!(item.color, match item.key.as_str() { "n" | "r" | "k" | "c" | "g" | "m" => ui::GREEN, "p" | "f" | "s" | "o" => ui::YELLOW, "0" => ui::NC, _ => ui::CYAN }, "{}", item.key);
         }
-        assert_eq!(keys(&view), ["n", "r", "c", "g", "m", "p", "f", "s", "t", "i", "o", "0"]);
+        assert_eq!(keys(&view), ["n", "r", "k", "c", "g", "m", "p", "f", "s", "t", "i", "o", "0"]);
     }
     struct Probe;
     impl Screen for Probe { fn run(&mut self, _: &mut Context<'_>) -> io::Result<Navigation> { Ok(Navigation::Back) } }

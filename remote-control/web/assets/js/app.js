@@ -21,6 +21,7 @@ const MENU = [
   { name: 'summary', route: null, label: 'Сводка', icon: 'layout-dashboard' },
   { name: 'nodes', label: 'Ноды', icon: 'server' },
   { name: 'profiles', label: 'Профили нод', icon: 'layers' },
+  { name: 'cascades', label: 'Каскады', icon: 'route' },
   { name: 'clients', label: 'Клиенты', icon: 'users' },
   { name: 'groups', label: 'Группы', icon: 'folders' },
   { name: 'templates', label: 'Шаблоны', icon: 'file-code' },

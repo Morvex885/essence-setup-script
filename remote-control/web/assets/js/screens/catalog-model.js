@@ -146,15 +146,29 @@ export function generateScope(values) {
 // ─── Подписки ───────────────────────────────────────────────────────────────
 
 export const SUBSCRIPTION_HOST = ['subscription', 'host'];
-export const subscriptionSetHost = (node) => ['subscription', 'host', '--name', node];
+/** Порт хоста подписок по умолчанию (ядро подставляет его без `--port`). */
+export const SUBSCRIPTION_DEFAULT_PORT = '443';
+/** `subscription host --name N --domain D [--port P]`: порт по умолчанию не передаётся. */
+export function subscriptionSetHost(node, domain, port = '') {
+  const argv = ['subscription', 'host', '--name', node, '--domain', String(domain).trim()];
+  const value = String(port ?? '').trim();
+  if (value !== '' && value !== SUBSCRIPTION_DEFAULT_PORT) argv.push('--port', value);
+  return argv;
+}
+export const SUBSCRIPTION_REMOVE_HOST = ['subscription', 'host', '--remove'];
 export const SUBSCRIPTION_LIST = ['subscription', 'list'];
 export const SUBSCRIPTION_PUBLISH_ALL = ['subscription', 'publish-all'];
-export const subscriptionMigrate = (node) => ['subscription', 'migrate', '--name', node];
 
-/** Хост-нода: `{ node, baseUrl }` при заданной ноде, иначе `null` (хост не задан). */
+/**
+ * Хост подписок из `subscription host`: `{ node, hostname, port, baseUrl }`
+ * (порт — строкой) при заданной ноде, иначе `null` (хост не задан).
+ */
 export function subscriptionHost(host) {
   const node = host && typeof host.node === 'string' && host.node !== '' ? host.node : null;
-  return node ? { node, baseUrl: text(host.base_url) } : null;
+  if (!node) return null;
+  const port = Number.isInteger(host.port) ? String(host.port) : SUBSCRIPTION_DEFAULT_PORT;
+  const hostname = typeof host.hostname === 'string' ? host.hostname : '';
+  return { node, hostname, port, baseUrl: text(host.base_url) };
 }
 
 /** Состояние подписки из `subscription list`. */

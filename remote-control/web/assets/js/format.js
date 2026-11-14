@@ -73,7 +73,7 @@ export function activity(argv) {
   if (nodeNouns.includes(noun)) {
     return ['list', 'show', 'aliases', 'rename', 'tag'].includes(verb) ? 'Выполняется…' : 'Подключение к серверам…';
   }
-  if (noun === 'subscription' && ['publish', 'publish-all', 'rotate', 'revoke', 'migrate', 'host'].includes(verb)) {
+  if (noun === 'subscription' && ['publish', 'publish-all', 'rotate', 'revoke', 'host'].includes(verb)) {
     return 'Публикация подписок на серверах…';
   }
   if (noun === 'self' && (verb === 'version' || verb === 'update')) return 'Проверка обновлений…';

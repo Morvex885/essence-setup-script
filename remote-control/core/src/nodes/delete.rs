@@ -476,7 +476,7 @@ mod tests {
             telegram: vec![TelegramProxy { node: "de".into(), hostname: "tg.example".into(), secret_mark: "0123abcd".into(), tag_mark: None },
                 TelegramProxy { node: "twin".into(), hostname: "tg2.example".into(), secret_mark: "0123abcd".into(), tag_mark: None }],
             subscription_host: Some(SubscriptionHost { node: "de".into(), hostname: "x.example".into(), port: 443,
-                base_url: "https://x.example".into(), sub_dir: "s".into(), nginx_group: "www-data".into() }),
+                base_url: "https://x.example".into(), sub_dir: crate::model::SUB_DIR.into(), nginx_group: "www-data".into() }),
             ..Config::default()
         }).unwrap();
         for suffix in ["ssh-password", "reality-key", "awg-key", "warp-key", "telegram-secret", "telegram-tag"] {

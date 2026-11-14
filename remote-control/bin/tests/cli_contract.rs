@@ -473,6 +473,9 @@ fn help_json_lists_whole_v2_catalog() {
         "profile set",
         "profile delete",
         "profile warp-license",
+        "cascade list",
+        "cascade add",
+        "cascade delete",
         "conn list",
         "conn set",
         "conn sync",
@@ -516,7 +519,6 @@ fn help_json_lists_whole_v2_catalog() {
         "subscription publish-all",
         "subscription rotate",
         "subscription revoke",
-        "subscription migrate",
     ];
     for prefix in catalog {
         assert!(
@@ -613,6 +615,10 @@ fn catalog_grammar_is_accepted_for_every_command() {
         &["profile", "set", "--name", "p1", "--acme-email", "a@example.com"],
         &["profile", "delete", "--name", "p1"],
         &["profile", "warp-license", "--name", "p1", "--clear"],
+        &["cascade", "list"],
+        &["cascade", "add", "--name", "hop", "--entry", "n1", "--listener", "vless-tcp", "--exit-node", "n2", "--exit-proxy", "VLESS TCP"],
+        &["cascade", "add", "--name", "ext", "--entry", "n1", "--listener", "hysteria2", "--file", "exit.txt"],
+        &["cascade", "delete", "--name", "hop"],
         &["conn", "list"],
         &["conn", "list", "--name", "n1", "--discover"],
         &["conn", "set", "--name", "n1", "--assign", "G1=p1", "--assign", "G1=p2", "--assign", "G2="],
@@ -659,7 +665,8 @@ fn catalog_grammar_is_accepted_for_every_command() {
         &["generate", "--all"],
         &["generate", "--group", "G1"],
         &["generate", "--client", "c1"],
-        &["subscription", "host", "--name", "n1"],
+        &["subscription", "host", "--name", "n1", "--domain", "sub.example.com", "--port", "2096"],
+        &["subscription", "host", "--remove"],
         &["subscription", "list"],
         &["subscription", "show", "--name", "c1"],
         &["subscription", "headers", "--client", "c1", "--set", "X=1", "--unset", "Y"],
@@ -669,7 +676,6 @@ fn catalog_grammar_is_accepted_for_every_command() {
         &["subscription", "publish-all"],
         &["subscription", "rotate", "--name", "c1"],
         &["subscription", "revoke", "--name", "c1"],
-        &["subscription", "migrate", "--name", "n1"],
         &["--json", "status"],
     ];
     for row in rows {

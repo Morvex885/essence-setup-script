@@ -482,7 +482,7 @@ mod tests {
                 uuid: "11111111-2222-4333-8444-555555555555".into(), password: "0123456789abcdef".into() }],
             telegram: vec![TelegramProxy { node: "a".into(), hostname: "tg.example".into(), secret_mark: "0123abcd".into(), tag_mark: None }],
             subscription_host: Some(SubscriptionHost { node: "a".into(), hostname: "s.example".into(), port: 443,
-                base_url: "https://s.example".into(), sub_dir: "sub".into(), nginx_group: "www-data".into() }),
+                base_url: "https://s.example".into(), sub_dir: crate::model::SUB_DIR.into(), nginx_group: "www-data".into() }),
             ..Config::default()
         });
         assert_eq!(rename(&mut session, &invocation(&["node", "rename", "--name", "a", "--new-name", "b"])).unwrap(), json!({"name": "b"}));

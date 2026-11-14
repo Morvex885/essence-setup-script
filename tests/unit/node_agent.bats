@@ -906,3 +906,46 @@ exit 0'
     assert_line "error=prepare"
     assert_line "hint=kernel_headers"
 }
+
+# ─── Фича sub: хост подписок ────────────────────────────────────────────────
+
+@test "sub_prepare: каталоги данных, сниппетов и webroot; без SUB_HOST — отказ" {
+    stub chown 'exit 0'
+    stub setfacl 'exit 0'
+    awg_call 'SUB_HOST=sub.example.com; sub_prepare'
+    assert_success
+    [[ -d "$ROOT/var/www/sub.example.com" && -d "$ROOT/etc/nginx/snippets/essence-sub" ]]
+    [[ "$(stat -c %a "$ROOT/var/lib/essence-sub")" == 2750 ]]
+    [[ "$(stat -c %a "$ROOT/etc/nginx/snippets/essence-sub")" == 755 ]]
+    grep -qx "chown root:www-data $ROOT/var/lib/essence-sub" "$CALLS"
+    grep -qx "setfacl -d -m g:www-data:r $ROOT/var/lib/essence-sub" "$CALLS"
+    awg_call 'SUB_HOST=; sub_prepare'
+    assert_failure
+}
+
+@test "sub_activate включает таймер, sub_remove снимает его и удаляет каталоги" {
+    mkdir -p "$ROOT/var/lib/essence-sub" "$ROOT/etc/nginx/snippets/essence-sub"
+    awg_call sub_activate
+    assert_success
+    grep -qx "systemctl enable --now essence-sub-cleanup.timer" "$CALLS"
+    awg_call sub_rollback
+    assert_success
+    awg_call sub_remove
+    assert_success
+    grep -qx "systemctl disable --now essence-sub-cleanup.timer" "$CALLS"
+    [[ ! -e "$ROOT/var/lib/essence-sub" && ! -e "$ROOT/etc/nginx/snippets/essence-sub" ]]
+}
+
+@test "отметка .essence-sub не удаляется в config и подтверждает снятие сертификата хоста подписок" {
+    mkdir -p "$ROOT/var/www/sub.example" "$ROOT/var/www/shop.example"
+    : >"$ROOT/var/www/sub.example/.essence-sub"
+    awg_call 'removable /var/www/sub.example/.essence-sub'
+    assert_failure
+    awg_call 'release_cert() { printf "release %s\n" "$1" >>"$CALLS"; }
+        AGENT_DIR="$3"; NODE_DIR="$R/root/essence-node"; OP_MODE=apply; HY2_CERT=true; WARP=""; REMOVE_FEATURES=""
+        RELEASE_CERTS="sub.example:/var/www/sub.example shop.example:/var/www/shop.example"; stage_cleanup && cleanup_committed'
+    assert_success
+    grep -qx "release sub.example" "$CALLS"
+    ! grep -qx "release shop.example" "$CALLS" || return 1
+    [[ ! -e "$ROOT/var/www/sub.example" && -d "$ROOT/var/www/shop.example" ]]
+}

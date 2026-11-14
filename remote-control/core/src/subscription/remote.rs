@@ -10,51 +10,12 @@ use crate::dispatch::Session;
 use crate::error::{RcError, Result};
 use crate::model::Config;
 use crate::nodes::{self, COMMAND_TIMEOUT, sh_quote};
+use crate::server::render;
 use crate::transport::{RemoteSession, RemoteTransport};
 use crate::validation::subscription_token_valid;
 
 /// Per-token `location` snippets included by the server's nginx site.
 pub(super) const SNIPPETS_DIR: &str = "/etc/nginx/snippets/essence-sub";
-
-/// Hosting settings written by the server module; exit 3 = not installed.
-pub(super) const CONF_COMMAND: &str =
-    r#"f=/etc/mihomo/subscription.conf; [ -f "$f" ] || exit 3; cat "$f""#;
-
-/// `KEY=value` settings of `/etc/mihomo/subscription.conf`.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub(super) struct HostConf {
-    pub base_url: String,
-    pub sub_dir: String,
-    pub nginx_group: String,
-}
-
-impl HostConf {
-    pub fn parse(text: &str) -> Self {
-        let value = |key: &str| text.lines()
-            .find_map(|line| line.strip_prefix(key).and_then(|rest| rest.strip_prefix('=')))
-            .map(|value| value.trim_end_matches('\r').to_owned()).unwrap_or_default();
-        Self { base_url: value("SUB_BASE_URL"), sub_dir: value("SUB_DIR"), nginx_group: value("NGINX_GROUP") }
-    }
-
-    /// The subscription directory: absolute, without `..`, control characters.
-    pub fn sub_dir(&self) -> Option<&str> {
-        let dir = self.sub_dir.as_str();
-        (dir.starts_with('/') && !dir.chars().any(char::is_control) && dir.split('/').all(|part| part != ".."))
-            .then_some(dir)
-    }
-
-    /// The nginx group (`www-data` when unset); `None` when unusable.
-    pub fn nginx_group(&self) -> Option<String> {
-        let group = if self.nginx_group.is_empty() { "www-data" } else { self.nginx_group.as_str() };
-        group.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')).then(|| group.to_owned())
-    }
-
-    /// Base URL, directory and group usable in links and commands.
-    pub fn complete(&self) -> bool {
-        !self.base_url.is_empty() && !self.base_url.chars().any(|c| c.is_control() || c.is_whitespace())
-            && self.sub_dir().is_some() && self.nginx_group().is_some()
-    }
-}
 
 /// Connect to a configured node under its pins (deferred GitHub nodes refused).
 pub(super) async fn connect_node<T: RemoteTransport>(session: &Session, config: &Config, name: &str,
@@ -67,19 +28,6 @@ pub(super) async fn connect_node<T: RemoteTransport>(session: &Session, config: 
     Ok(transport)
 }
 
-/// Hosting settings of a connected node: `not_installed` when the server module
-/// is not installed, `remote_failed` with `unreachable` otherwise.
-pub(super) async fn read_conf<S: RemoteSession>(remote: &S, node: &str, unreachable: &str) -> Result<HostConf> {
-    match remote.exec(CONF_COMMAND, &[], COMMAND_TIMEOUT).await {
-        Ok(result) if result.exit_status == 0 && !result.stdout.trim_ascii().is_empty() => {
-            Ok(HostConf::parse(&String::from_utf8_lossy(&result.stdout)))
-        }
-        Ok(result) if result.exit_status == 0 || result.exit_status == 3 => Err(RcError::new("not_installed",
-            format!("На ноде «{node}» не установлен хостинг подписок.")).with_extra("name", node)),
-        _ => Err(RcError::new("remote_failed", unreachable).with_extra("name", node)),
-    }
-}
-
 /// The current host node, connected, with its directory and nginx group.
 pub(super) struct Host<T> {
     pub transport: T,
@@ -87,18 +35,18 @@ pub(super) struct Host<T> {
     pub nginx_group: String,
 }
 
-/// Connect to the configured host. The host's own settings are
-/// authoritative for paths; the cached copy in the config only names links.
+/// Connect to the configured host. `node apply` installs it: until the host
+/// node's applied state matches the configuration, nothing is uploaded.
 pub(super) async fn open_host<T: RemoteTransport>(session: &Session, config: &Config, connect: &dyn Fn() -> T)
     -> Result<Host<T>>
 {
     let node = super::host_node(config)?;
+    let host = config.subscription_host.as_ref().ok_or_else(super::not_configured)?;
+    if render::status(config, nodes::find(config, node)?) != "applied" {
+        return Err(RcError::new("not_installed", "Хост подписок не применён: выполните node apply.").with_extra("name", node));
+    }
     let transport = connect_node(session, config, node, connect).await?;
-    let conf = read_conf(&transport, node, "Хост-нода подписок недоступна.").await?;
-    let (Some(sub_dir), Some(nginx_group)) = (conf.sub_dir(), conf.nginx_group()) else {
-        return Err(RcError::new("remote_failed", "Не удалось определить каталог подписок на хост-ноде."));
-    };
-    Ok(Host { sub_dir: sub_dir.to_owned(), nginx_group, transport })
+    Ok(Host { sub_dir: host.sub_dir.clone(), nginx_group: host.nginx_group.clone(), transport })
 }
 
 fn with_vars(vars: &[(&str, &str)], body: &str) -> String {

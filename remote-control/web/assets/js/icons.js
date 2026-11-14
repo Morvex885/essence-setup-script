@@ -87,6 +87,7 @@ export const ICONS = {
   'save': html`<path d="M15.2 3a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z" /> <path d="M17 21v-7a1 1 0 0 0-1-1H8a1 1 0 0 0-1 1v7" /> <path d="M7 3v4a1 1 0 0 0 1 1h7" />`,
   'chevron-down': html`<path d="m6 9 6 6 6-6" />`,
   'circle-check': html`<circle cx="12" cy="12" r="10" /> <path d="m16 9-5.5 5.5L8 12" />`,
+  'route': html`<path d="M9 5h8.5a1 1 0 010 7h-11a1 1 0 000 7H15" /> <circle cx="18" cy="19" r="3" /> <circle cx="6" cy="5" r="3" />`,
 };
 
 export function Icon({ name, size = 18 }) {

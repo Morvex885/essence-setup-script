@@ -1424,7 +1424,8 @@ Bash-версии) и вопрос «Заменить их конфигурац�
 | Группы | `group list`, `template list`, `group add --name G [--template T]`, `node list`, `conn list --name N --discover`, `conn set --name N --assign G=P…`, `group set-template`, `template create --group G`, `subscription headers --group G [--set … \| --unset …]`, `generate --group G`, `group delete` |
 | Шаблоны | `template list`, `template create`, `template show` (и экспорт), `template import --name T` (+`input.file`), `template check --name T`, `group list`, `template groups --name T --group G…`, `template delete --name T` |
 | Генерация | `group list`, `client list`, `generate --all\|--group G\|--client C` |
-| Подписки | `subscription host [--name N]`, `node list`, `subscription list`, `subscription publish-all`, `subscription migrate --name N`, `client list`, `group list` |
+| Подписки | `subscription host`, `node list`, `subscription host --name N --domain D [--port P]`, `subscription host --remove`, `node apply --name N…`, `subscription list`, `subscription publish-all`, `client list`, `group list` |
+| Каскады | `cascade list`, `node list`, `cascade add --name C --entry N --listener L (--exit-node M --exit-proxy P \| +input.file с URI)`, `cascade delete --name C`, `node apply --name N…` |
 | Источник | `source status`, `source github-accounts`, `source github-login`, `source github-connect`, `source github-change-account`, `source github-fetch`, `source github-push`, `source github-rewrap-password`, `source github-rotate-key`, `source github-import-recovery-key`, `source github-switch-local`, `source github-replace-with-local`, `source github-delete-repo` |
 | Настройки | `self version`, `status`, `self update`, `self password-set`, `self password-remove`, `self uninstall [--remove-data]` |
 

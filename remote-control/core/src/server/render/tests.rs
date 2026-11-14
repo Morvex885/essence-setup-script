@@ -621,3 +621,190 @@ fn warp_adds_the_proxy_and_outbound_member() {
     assert_eq!(render(&forgotten).digest, off.digest);
     assert_ne!(off.digest, digest_on);
 }
+
+const CASCADE_UUID: &str = "11111111-2222-4333-8444-555555555555";
+
+/// `de` enters cascade `hop` through VLESS TCP and leaves through `nl`'s
+/// `exit` connection; alpha uses `hop`.
+fn cascade_config(exit: crate::model::ExitProxy) -> Config {
+    use crate::model::{Cascade, CascadeExit, CascadeListener, NodeExit};
+    let mut config = config(Profile { hysteria2: Some(Hysteria2 { port: 20443, obfs: false }), ..profile() });
+    let mut nl = node();
+    nl.id = "b".repeat(32);
+    nl.name = "nl".into();
+    nl.domain = Some("nl.example.com".into());
+    nl.params.reality = Some(NodeReality { public_key: "NLPUB".into(), short_id: "fedcba9876543210".into() });
+    config.nodes.push(nl);
+    config.connections[0].groups[0].proxies.push("hop".into());
+    config.cascades.push(Cascade {
+        name: "hop".into(), entry: "de".into(), listener: CascadeListener::VlessTcp,
+        exit: CascadeExit::Node(NodeExit { node: "nl".into(), proxy: exit }), uuid: CASCADE_UUID.into(), password: "c".repeat(32),
+    });
+    config
+}
+
+#[test]
+fn a_cascade_routes_its_users_on_the_entry_node_to_the_exit_node() {
+    let mut config = cascade_config(crate::model::ExitProxy::VlessTcp);
+    let entry = render(&config);
+    let mihomo = content(&entry, MIHOMO_CONFIG_PATH);
+    let user = super::super::keys::cascade_uuid(UUID, "hop");
+    assert!(mihomo.contains(&format!("      - username: alpha\n        uuid: {UUID}\n        flow: xtls-rprx-vision\n\
+        \x20     - username: alpha--hop\n        uuid: {user}\n        flow: xtls-rprx-vision\n")), "{mihomo}");
+    let tcp = mihomo.split("# --- vless-tcp ---").nth(1).unwrap().split("# --- /vless-tcp ---").next().unwrap();
+    assert!(tcp.contains("    rule: vless-tcp-shared\n") && !tcp.contains("    proxy: outbound"));
+    let hy2 = mihomo.split("# --- hy2 ---").nth(1).unwrap().split("# --- /hy2 ---").next().unwrap();
+    assert!(hy2.contains("    rule: essence-in\n") && !hy2.contains("alpha--hop"), "other listeners keep the plain inbound rule");
+    assert!(mihomo.contains(&format!("proxies:\n  - name: hop\n    type: vless\n    server: nl.example.com\n    port: 443\n    uuid: {CASCADE_UUID}\n\
+        \x20   network: tcp\n    udp: true\n    flow: xtls-rprx-vision\n    tls: true\n    servername: \"nl.example.com\"\n\
+        \x20   reality-opts:\n      public-key: NLPUB\n      short-id: fedcba9876543210\n    client-fingerprint: chrome\n")), "{mihomo}");
+    assert!(mihomo.contains("      - DIRECT\n    url: https://www.gstatic.com/generate_204\n    interval: 10\n    timeout: 3000\n    lazy: false\n\
+        \x20 - name: hop-outbound\n    type: fallback\n    proxies:\n      - hop\n      - DIRECT\n"));
+    // The shared sub-rule rejects as `essence-in` does: no `no-resolve`, the node's own address.
+    let rejects: String = INBOUND_REJECT.iter().map(|rule| format!("    - {rule},REJECT\n"))
+        .chain([format!("    - IP-CIDR,{}/32,REJECT\n", config.nodes[0].ip)]).collect();
+    assert!(mihomo.contains(&format!("sub-rules:\n  essence-in:\n{rejects}    - MATCH,outbound\n  vless-tcp-shared:\n{rejects}\
+        \x20   - IN-USER,alpha--hop,hop-outbound\n    - MATCH,outbound\nrule-providers:")), "{mihomo}");
+    assert!(!mihomo.contains("no-resolve"), "{mihomo}");
+    let document = yaml(mihomo);
+    assert_eq!(document["sub-rules"]["vless-tcp-shared"].as_vec().map(Vec::len), Some(INBOUND_REJECT.len() + 3));
+    assert!(entry.lines.contains(&"Каскад «hop»: вход VLESS TCP, выход — нода nl (VLESS TCP), клиентов 1".to_owned()), "{:?}", entry.lines);
+    let section = client_section(&config, &config.nodes[0]).unwrap();
+    assert!(section.contains(&format!("  - name: \"hop\"\n    type: vless\n    server: de.example.com\n    port: 443\n    uuid: {PLACEHOLDER_UUID}\n")));
+
+    let exit = desired(&config, &config.nodes[1], Some(&secrets())).unwrap();
+    let mihomo = content(&exit, MIHOMO_CONFIG_PATH);
+    assert!(mihomo.contains(&format!("      - username: cascade--hop\n        uuid: {CASCADE_UUID}\n        flow: xtls-rprx-vision\n")), "{mihomo}");
+    assert!(!mihomo.contains("-shared") && !mihomo.contains("hop-outbound"));
+    assert!(exit.lines.contains(&"Каскад «hop»: выход через VLESS TCP этой ноды.".to_owned()));
+    // Only the cascade uses the exit node's Reality listener on 443: it is
+    // rendered, so Reality takes the 443 front with the site behind it.
+    assert!(exit.lines.contains(&"VLESS TCP: порт 443, клиентов 0".to_owned()), "{:?}", exit.lines);
+    assert_eq!(spec(&exit, "SITE_REQUIRE_200"), "true");
+
+    // The exit node's client parameters are part of the entry digest.
+    config.nodes[1].params.reality.as_mut().unwrap().public_key = "NEWPUB".into();
+    assert_ne!(render(&config).digest, entry.digest);
+}
+
+#[test]
+fn hysteria2_and_uri_exits_and_broken_cascades() {
+    use crate::model::{CascadeExit, CascadeListener, UriExit};
+    let mut config = cascade_config(crate::model::ExitProxy::Hysteria2);
+    let mihomo = content(&render(&config), MIHOMO_CONFIG_PATH).to_owned();
+    assert!(mihomo.contains(&format!("  - name: hop\n    type: hysteria2\n    server: nl.example.com\n    port: 20443\n    password: \"{}\"\n", "c".repeat(32))), "{mihomo}");
+    let exit = content(&desired(&config, &config.nodes[1], Some(&secrets())).unwrap(), MIHOMO_CONFIG_PATH).to_owned();
+    assert!(exit.contains(&format!("      cascade--hop: \"{}\"\n", "c".repeat(32))), "{exit}");
+
+    // An entry through Hysteria2 derives the client password.
+    config.cascades[0].listener = CascadeListener::Hysteria2;
+    let mihomo = content(&render(&config), MIHOMO_CONFIG_PATH).to_owned();
+    assert!(mihomo.contains(&format!("      alpha--hop: \"{}\"\n", super::super::keys::cascade_password("alpha-pass", "hop"))));
+    let rejects: String = INBOUND_REJECT.iter().map(|rule| format!("    - {rule},REJECT\n"))
+        .chain([format!("    - IP-CIDR,{}/32,REJECT\n", config.nodes[0].ip)]).collect();
+    assert!(mihomo.contains("    rule: hy2-shared\n") && mihomo.contains(&format!("  hy2-shared:\n{rejects}    - IN-USER,alpha--hop,hop-outbound\n")));
+
+    config.cascades[0].exit = CascadeExit::Uri(UriExit { uri: "hysteria2://secret@203.0.113.5:443?sni=exit.example.com#x".into() });
+    let mihomo = content(&render(&config), MIHOMO_CONFIG_PATH).to_owned();
+    assert!(mihomo.contains("  - name: hop\n    type: hysteria2\n    server: 203.0.113.5\n    port: 443\n"), "{mihomo}");
+
+    config.cascades[0].exit = CascadeExit::Uri(UriExit { uri: "ftp://203.0.113.5".into() });
+    assert_eq!(desired(&config, &config.nodes[0], None).err().map(|e| e.code), Some("invalid"));
+    assert_eq!(status(&config, &config.nodes[0]), "pending");
+
+    // A listener the profile no longer enables leaves the cascade idle.
+    config.cascades[0].listener = CascadeListener::VlessGrpc;
+    let idle = render(&config);
+    assert!(idle.lines.contains(&"Каскад «hop»: подключение «VLESS gRPC» не включено в профиле — каскад не работает.".to_owned()));
+    assert!(!content(&idle, MIHOMO_CONFIG_PATH).contains("hop"));
+    assert!(!client_section(&config, &config.nodes[0]).unwrap().contains("\"hop\""));
+}
+
+fn sub_host(port: u16) -> SubscriptionHost {
+    SubscriptionHost { node: "de".into(), hostname: "sub.example.com".into(), port,
+        base_url: SubscriptionHost::base_url_for("sub.example.com", port), sub_dir: SUB_DIR.into(), nginx_group: "www-data".into() }
+}
+
+fn sub_listen(desired: &Desired) -> Vec<&str> {
+    content(desired, "/etc/nginx/sites-available/essence-sub").lines().filter(|line| line.trim_start().starts_with("listen ")).collect()
+}
+
+#[test]
+fn subscription_host_behind_self_steal_with_its_files_and_spec() {
+    let mut config = config(profile());
+    config.subscription_host = Some(sub_host(443));
+    let desired = render(&config);
+    let site = content(&desired, "/etc/nginx/sites-available/essence-sub");
+    assert!(site.starts_with("# Essence site essence-sub\nserver {\n    listen 127.0.0.1:8443 ssl http2;\n    server_name sub.example.com;\n\n\
+        \x20   ssl_certificate     /etc/nginx/ssl/sub.example.com/fullchain.pem;\n"), "{site}");
+    assert!(site.contains("    location ~ \"^/sub/([a-f0-9]{64})$\" {\n        alias /var/lib/essence-sub/$1.yaml;\n"));
+    assert!(site.contains("    include /etc/nginx/snippets/essence-sub/sub-*.conf;\n") && !site.contains("{{"));
+    assert_eq!(content(&desired, "/etc/nginx/sites-enabled/essence-sub"), "/etc/nginx/sites-available/essence-sub");
+    assert_eq!(content(&desired, "/etc/nginx/conf.d/essence-sub-limit.conf"), "limit_req_zone $binary_remote_addr zone=sub:1m rate=10r/m;\n");
+    let cleanup = desired.files.iter().find(|file| file.path == "/usr/local/bin/essence-sub-cleanup").unwrap();
+    assert_eq!(cleanup.mode, "0755");
+    assert!(cleanup.content.starts_with("#!/bin/bash\nSUB_DIR=/var/lib/essence-sub\nLIST=\"${SUB_DIR}/expiry.list\"\n"));
+    assert!(content(&desired, "/etc/systemd/system/essence-sub-cleanup.timer").contains("OnUnitActiveSec=5min\n"));
+    assert!(content(&desired, "/etc/systemd/system/essence-sub-cleanup.service").contains("ExecStart=/usr/local/bin/essence-sub-cleanup\n"));
+    assert_eq!(content(&desired, "/var/www/sub.example.com/.essence-sub"), "");
+    assert_eq!(spec(&desired, "CERTS"), "de.example.com:/var/www/de.example.com sub.example.com:/var/www/sub.example.com");
+    assert_eq!(spec(&desired, "DNS_DOMAINS"), "de.example.com sub.example.com");
+    assert_eq!((spec(&desired, "FEATURES"), spec(&desired, "SUB_HOST"), spec(&desired, "UFW_RULES")), ("sub", "sub.example.com", "443/tcp"));
+    assert!(desired.lines.contains(&"Хост подписок: https://sub.example.com".to_owned()));
+
+    // Its own port opens in the firewall and must not clash with a listener.
+    config.subscription_host = Some(sub_host(2096));
+    let own = render(&config);
+    assert_eq!(sub_listen(&own), ["    listen 0.0.0.0:2096 ssl http2;"]);
+    assert_eq!(spec(&own, "UFW_RULES"), "443/tcp 2096/tcp");
+    assert_eq!(spec(&own, "LISTEN_TCP"), "443 2096 8443");
+    config.subscription_host = Some(sub_host(443 + 1));
+    config.profiles[0].hysteria2 = Some(Hysteria2 { port: 444, obfs: false });
+    let error = desired_error(&config);
+    assert_eq!((error.code, error.extra["port"].clone()), ("invalid", json!(444)));
+}
+
+fn desired_error(config: &Config) -> RcError {
+    desired(config, &config.nodes[0], None).err().unwrap()
+}
+
+#[test]
+fn subscription_host_behind_the_stream_and_on_a_free_443() {
+    let mut config = config(sni(profile()));
+    config.nodes[0].domain = None;
+    config.subscription_host = Some(sub_host(443));
+    let stream = render(&config);
+    assert_eq!(sub_listen(&stream), ["    listen 127.0.0.1:8445 ssl http2;"]);
+    assert!(content(&stream, STREAM_PATH).contains("        sub.example.com subscription;\n"));
+    assert!(content(&stream, MIHOMO_CONFIG_PATH).contains("    listen: 127.0.0.1\n    port: 8444\n"));
+    assert_eq!((spec(&stream, "NGINX_STREAM"), spec(&stream, "CERTS")), ("true", "sub.example.com:/var/www/sub.example.com"));
+    assert_eq!(spec(&stream, "LISTEN_TCP"), "443 8444 8445");
+
+    // Without Reality nginx owns 443 itself.
+    config.profiles[0].vless_tcp = false;
+    config.profiles[0].hysteria2 = Some(Hysteria2 { port: 20443, obfs: false });
+    let free = render(&config);
+    assert_eq!(sub_listen(&free), ["    listen 443 ssl http2;", "    listen [::]:443 ssl http2;"]);
+    assert_eq!((spec(&free, "NGINX"), spec(&free, "NGINX_STREAM")), ("true", "false"));
+    assert!(spec(&free, "UFW_RULES").starts_with("443/tcp "));
+}
+
+#[test]
+fn a_moved_subscription_host_releases_its_certificate() {
+    let mut config = config(profile());
+    config.subscription_host = Some(sub_host(443));
+    let applied = render(&config);
+    config.nodes[0].applied = Some(Applied { digest: applied.digest.clone(), files: file_hashes(&applied.files), ports: applied.ports.clone(), at: "t".into() });
+    config.subscription_host.as_mut().unwrap().hostname = "subs.example.com".into();
+    let renamed = render(&config);
+    assert_eq!(spec(&renamed, "RELEASE_CERTS"), "sub.example.com:/var/www/sub.example.com");
+    assert!(renamed.remove.contains(&"/var/www/sub.example.com/.essence-sub".to_owned()));
+    assert_eq!(spec(&renamed, "REMOVE_FEATURES"), "");
+    config.subscription_host = None;
+    let gone = render(&config);
+    assert_eq!((spec(&gone, "REMOVE_FEATURES"), spec(&gone, "RELEASE_CERTS"), spec(&gone, "SUB_HOST")),
+        ("sub", "sub.example.com:/var/www/sub.example.com", ""));
+    assert!(gone.remove.contains(&"/etc/nginx/sites-enabled/essence-sub".to_owned()));
+    assert!(gone.lines.contains(&"Будет удалён сертификат и сайт: sub.example.com".to_owned()));
+    assert_eq!(spec(&teardown(&config.nodes[0]), "RELEASE_CERTS"), "de.example.com:/var/www/de.example.com sub.example.com:/var/www/sub.example.com");
+}

@@ -1,4 +1,4 @@
-//! `subscription host|list|show|headers|publish|publish-all|rotate|revoke|migrate`.
+//! `subscription host|list|show|headers|publish|publish-all|rotate|revoke`.
 
 use serde_json::{json, Value};
 
@@ -11,8 +11,9 @@ use crate::confirmation::Plan;
 use crate::dispatch::Session;
 use crate::error::{RcError, Result};
 use crate::log::Level;
-use crate::model::{Client, Config, SubscriptionHeader, SubscriptionHost};
+use crate::model::{Client, Config, SUB_DIR, SubscriptionHeader, SubscriptionHost};
 use crate::nodes::{self, required};
+use crate::server::ports::RESERVED_PORTS;
 use crate::transport::RemoteTransport;
 
 /// A stored token of any shape (v1 `(.subscription.token // "") != ""`).
@@ -24,20 +25,6 @@ fn host_json(config: &Config) -> Value {
     serde_json::to_value(&config.subscription_host).unwrap_or(Value::Null)
 }
 
-/// The host record of a node's hosting settings: hostname and port come from
-/// the server's `https://host[:port]` base URL, the hostname checked like
-/// [`Config::validate`] does before anything remote changes.
-fn host_record(node: &str, base_url: &str, sub_dir: &str, nginx_group: String) -> Result<SubscriptionHost> {
-    let (hostname, port) = SubscriptionHost::parse_base_url(base_url)
-        .ok_or_else(|| RcError::new("invalid", "Конфигурация хостинга подписок неполна.").with_extra("name", node))?;
-    if !crate::validation::domain_valid(&hostname) {
-        return Err(RcError::new("invalid", format!("Некорректный адрес хостинга подписок: {base_url}.")).with_extra("name", node));
-    }
-    Ok(SubscriptionHost {
-        node: node.into(), base_url: SubscriptionHost::base_url_for(&hostname, port), hostname, port,
-        sub_dir: sub_dir.into(), nginx_group,
-    })
-}
 
 /// Subscriptions are hosted only on a node with a server profile.
 fn require_profiled(config: &Config, name: &str) -> Result<()> {
@@ -46,6 +33,26 @@ fn require_profiled(config: &Config, name: &str) -> Result<()> {
             .with_extra("name", name));
     }
     Ok(())
+}
+
+/// The host record: the domain must not be another vhost of the node.
+fn host_record(config: &Config, node: &str, hostname: &str, port: u16) -> Result<SubscriptionHost> {
+    require_profiled(config, node)?;
+    let taken = nodes::find(config, node)?.domain.as_deref() == Some(hostname)
+        || config.telegram.iter().any(|proxy| proxy.node == node && proxy.hostname == hostname);
+    if taken {
+        return Err(RcError::new("invalid", format!("Домен «{hostname}» уже занят сайтом или Telegram Proxy ноды «{node}»."))
+            .with_extra("name", node));
+    }
+    Ok(SubscriptionHost {
+        node: node.into(), hostname: hostname.into(), port, base_url: SubscriptionHost::base_url_for(hostname, port),
+        sub_dir: SUB_DIR.into(), nginx_group: "www-data".into(),
+    })
+}
+
+fn apply_hint(session: &mut Session, nodes: &[&str]) {
+    let names: Vec<String> = nodes.iter().map(|node| format!("--name {node}")).collect();
+    session.log(Level::Info, &format!("Примените изменения: node apply {}", names.join(" ")));
 }
 
 fn with_data(mut error: RcError, data: &Value) -> RcError {
@@ -90,45 +97,68 @@ async fn verify(data: Value) -> Result<Value> {
 
 // ─── host / list / show ──────────────────────────────────────────────────────
 
-/// Without `--name`: the configured host. With it: read the node's hosting
-/// settings and make it the host (only while no subscription is published
-/// elsewhere — moving published links is `migrate`).
-pub(super) async fn host<T: RemoteTransport>(session: &mut Session, invocation: &Invocation, connect: &dyn Fn() -> T)
-    -> Result<Value>
-{
+/// `subscription host`: without flags the configured host; `--name N
+/// --domain D [--port P]` makes the node the host (rendered by `node apply`);
+/// `--remove` drops the record. Tokens stay: after moving the host,
+/// `node apply` and `subscription publish-all` restore the links.
+pub(super) fn host(session: &mut Session, invocation: &Invocation) -> Result<Value> {
     let config = session.state.load_config()?;
+    if invocation.has("remove") {
+        if invocation.has("name") || invocation.has("domain") || invocation.has("port") {
+            return Err(RcError::new("usage", "--remove используется без --name, --domain и --port."));
+        }
+        let old = config.subscription_host.clone().ok_or_else(not_configured)?;
+        let published = config.clients.iter().filter(|client| has_token(client)).count();
+        let mut lines = vec![format!("Хост подписок {} на ноде «{}» будет убран; его файлы удалит node apply.", old.base_url, old.node)];
+        if published > 0 {
+            lines.push(format!("Опубликованные ссылки ({published}) перестанут открываться до нового хоста и subscription publish-all."));
+        }
+        Plan::new(lines, "").confirm(invocation)?;
+        session.mutate("subscription_remove_host", |state| {
+            let mut config = state.load_config()?;
+            config.subscription_host = None;
+            state.save_config(&config)
+        })?;
+        session.log(Level::Success, "Хост подписок убран");
+        apply_hint(session, &[&old.node]);
+        return Ok(Value::Null);
+    }
     if !invocation.has("name") {
+        if invocation.has("domain") || invocation.has("port") {
+            return Err(RcError::new("usage", "Укажите --name N --domain D [--port P]."));
+        }
         return Ok(host_json(&config));
     }
     let node = required(invocation, "name")?;
-    require_profiled(&config, node)?;
-    let conflict = |config: &Config| {
-        let current = config.subscription_host.as_ref().map_or("", |host| host.node.as_str());
-        if !current.is_empty() && current != node && config.clients.iter().any(has_token) {
-            return Err(RcError::new("conflict", format!(
-                "Есть опубликованные подписки. Для смены хост-ноды используйте subscription migrate --name {node}."))
-                .with_extra("name", node));
-        }
-        Ok(())
+    let hostname = required(invocation, "domain")?;
+    if !crate::validation::domain_valid(hostname) {
+        return Err(RcError::new("invalid", format!("Некорректный домен «{hostname}».")));
+    }
+    let port = match invocation.value("port") {
+        None => 443,
+        Some(text) => text.parse::<u16>().ok().filter(|port| *port != 0)
+            .ok_or_else(|| RcError::new("invalid", format!("Некорректный порт «{text}».")))?,
     };
-    conflict(&config)?;
-    let conf = {
-        let transport = remote::connect_node(session, &config, node, connect).await?;
-        remote::read_conf(&transport, node, "Хост-нода подписок недоступна.").await?
-    };
-    let (Some(sub_dir), Some(nginx_group), true) = (conf.sub_dir(), conf.nginx_group(), conf.complete()) else {
-        return Err(RcError::new("invalid", "Конфигурация хостинга подписок неполна.").with_extra("name", node));
-    };
-    let host = host_record(node, &conf.base_url, sub_dir, nginx_group)?;
-    session.mutate("subscription_set_host", |state| {
+    if RESERVED_PORTS.contains(&port) {
+        return Err(RcError::new("invalid", format!("Порт {port} зарезервирован для внутренних служб.")));
+    }
+    host_record(&config, node, hostname, port)?;
+    let previous = session.mutate("subscription_set_host", |state| {
         let mut config = state.load_config()?;
-        nodes::find(&config, node)?;
-        conflict(&config)?;
-        config.subscription_host = Some(host);
-        state.save_config(&config)
+        let host = host_record(&config, node, hostname, port)?;
+        let previous = config.subscription_host.replace(host);
+        state.save_config(&config)?;
+        Ok(previous)
     })?;
-    session.log(Level::Success, &format!("Хост-нода подписок: {node} ({})", conf.base_url));
-    Ok(host_json(&session.state.load_config()?))
+    let config = session.state.load_config()?;
+    let base_url = SubscriptionHost::base_url_for(hostname, port);
+    session.log(Level::Success, &format!("Хост подписок: {node} ({base_url})"));
+    let old_node = previous.as_ref().map(|host| host.node.as_str()).filter(|old| *old != node);
+    apply_hint(session, &[Some(node), old_node].into_iter().flatten().collect::<Vec<_>>());
+    if previous.is_some_and(|host| host.base_url != base_url) && config.clients.iter().any(has_token) {
+        session.log(Level::Warn, "Адреса подписок изменятся: после node apply выполните subscription publish-all.");
+    }
+    Ok(host_json(&config))
 }
 
 /// Published subscriptions with their state; links stay out of the listing.
@@ -586,105 +616,5 @@ pub(super) async fn publish_all<T: RemoteTransport>(session: &mut Session, invoc
         return Err(with_data(RcError::new("partial",
             "Подписки опубликованы, но не все подписки без клиента удалены с хост-ноды."), &data));
     }
-    Ok(data)
-}
-
-// ─── migrate ─────────────────────────────────────────────────────────────────
-
-struct Moving {
-    name: String,
-    token: String,
-    yaml: Vec<u8>,
-    headers: Vec<SubscriptionHeader>,
-    expiry: Option<i64>,
-}
-
-/// Move every published subscription to another node: expiry entries and
-/// files first, then the host switch, then removal of the old links. Tokens
-/// stay; only the base URL changes. A failure before the switch leaves the
-/// old host and links intact.
-pub(super) async fn migrate<T: RemoteTransport>(session: &mut Session, invocation: &Invocation,
-    connect: &dyn Fn() -> T) -> Result<Value>
-{
-    let config = session.state.load_config()?;
-    let old = config.subscription_host.clone().filter(|host| !host.node.is_empty())
-        .ok_or_else(not_configured)?;
-    let target = required(invocation, "name")?;
-    require_profiled(&config, target)?;
-    if target == old.node {
-        return Err(RcError::new("invalid", "Выбрана текущая хост-нода. Перенос не выполнен."));
-    }
-    let mut moving = Vec::new();
-    for client in config.clients.iter().filter(|client| has_token(client)) {
-        let name = &client.name;
-        let token = client_token(client).ok().flatten().ok_or_else(|| RcError::new("invalid", format!(
-            "Токен подписки клиента «{name}» в конфигурации повреждён. Перенос отменён.")).with_extra("name", name.clone()))?;
-        let yaml = rendered(session, client)?
-            .ok_or_else(|| not_generated(name, &format!("{name}: конфиг отсутствует или пуст. Перенос отменён.")))?;
-        let headers = check_headers(&config, client)?;
-        let expiry = match client.subscription.as_ref().and_then(|s| s.expires_at.as_deref()).filter(|e| !e.is_empty()) {
-            Some(text) => Some(parse_iso(text).ok_or_else(|| RcError::new("invalid", format!(
-                "{name}: срок подписки не распознан. Перенос отменён.")).with_extra("name", name.clone()))?),
-            None => None,
-        };
-        moving.push(Moving { name: name.clone(), token, yaml, headers, expiry });
-    }
-    if moving.is_empty() {
-        session.log(Level::Info, "Нет опубликованных подписок для переноса; хост не изменён.");
-        return Ok(json!({"node": target, "base_url": null, "migrated": 0}));
-    }
-
-    let old_remote = remote::connect_node(session, &config, &old.node, connect).await?;
-    let old_conf = remote::read_conf(&old_remote, &old.node, "Хост-нода подписок недоступна.").await?;
-    let new_remote = remote::connect_node(session, &config, target, connect).await?;
-    let new_conf = remote::read_conf(&new_remote, target, "Новая хост-нода подписок недоступна.").await?;
-    let (Some(old_dir), Some(new_dir), Some(nginx_group), true) =
-        (old_conf.sub_dir(), new_conf.sub_dir(), new_conf.nginx_group(), new_conf.complete()) else {
-        return Err(RcError::new("invalid", "Конфигурация хостинга подписок неполна. Перенос отменён."));
-    };
-    let host = host_record(target, &new_conf.base_url, new_dir, nginx_group)?;
-    let mut lines = vec![format!("Старая хост-нода: {}", old.node), format!("Базовый URL: {}", old.base_url),
-        format!("Новая хост-нода: {target}"), format!("Базовый URL: {}", new_conf.base_url)];
-    lines.extend(moving.iter().map(|m| m.name.clone()));
-    lines.push("Все адреса подписок изменятся.".into());
-    lines.push("Старые ссылки будут удалены только после загрузки всех подписок.".into());
-    Plan::new(lines, "").confirm(invocation)?;
-
-    // Expiry first: a stale entry of the token on the new host must not
-    // delete the uploaded YAML.
-    let pairs: Vec<(String, Option<i64>)> = moving.iter().map(|m| (m.token.clone(), m.expiry)).collect();
-    let mut copied = remote::write_expiry(&new_remote, new_dir, &pairs).await;
-    if copied {
-        let items: Vec<Item> = moving.iter().map(|m| Item {
-            token: &m.token, yaml: &m.yaml, snippet: render_snippet(&m.token, new_dir, &m.headers),
-        }).collect();
-        if let Err(failure) = remote::upload(&new_remote, new_dir, &host.nginx_group, &items).await {
-            session.log(Level::Warn, batch_warning(failure));
-            copied = false;
-        }
-    }
-    drop(new_remote);
-    if !copied {
-        session.log(Level::Warn, "Перенос не завершён: старый хост и старые ссылки сохранены.");
-        return Err(RcError::new("remote_failed", "На новой ноде могли остаться копии подписок."));
-    }
-    session.mutate("subscription_migrate", |state| {
-        let mut config = state.load_config()?;
-        config.subscription_host = Some(host);
-        state.save_config(&config)
-    })?;
-    let data = json!({"node": target, "base_url": new_conf.base_url, "migrated": moving.len()});
-    let mut clean = true;
-    for m in &moving {
-        let (removal, warning) = remote::remove_token(&old_remote, old_dir, &m.token, None).await;
-        if let Some(warning) = warning { session.log(Level::Warn, &warning); }
-        clean &= removal == Removal::Removed;
-    }
-    if !clean {
-        return Err(with_data(RcError::new("partial",
-            "Подписки перенесены, но старые ссылки не удалось полностью удалить. Требуется очистка старой ноды."), &data));
-    }
-    session.log(Level::Success, &format!("Перенесено {} подписок на «{target}»", moving.len()));
-    session.log(Level::Info, &format!("Новый базовый URL: {}", new_conf.base_url));
     Ok(data)
 }

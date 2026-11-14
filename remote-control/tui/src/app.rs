@@ -28,6 +28,7 @@ pub fn registrations() -> Registry {
     Registry { screens: vec![
         Registration { key: 'n', factory: || Box::new(crate::nodes::Nodes) },
         Registration { key: 'r', factory: || Box::new(crate::nodes::Profiles) },
+        Registration { key: 'k', factory: || Box::new(crate::nodes::Cascades) },
         Registration { key: 'p', factory: || Box::new(crate::nodes::Connections) },
         Registration { key: 't', factory: || Box::new(crate::nodes::Telegram) },
         Registration { key: 'c', factory: || Box::new(crate::clients::Clients) },
@@ -237,7 +238,7 @@ pub fn activity(words: &[String]) -> &'static str {
         ("node" | "conn" | "telegram", "list" | "show" | "aliases" | "rename" | "tag" | "profile" | "domain" | "port") => "Выполняется…",
         ("node", "apply") => "Применение на нодах…",
         ("node" | "conn" | "telegram", _) => "Подключение к серверам…",
-        ("subscription", "publish" | "publish-all" | "rotate" | "revoke" | "migrate" | "host") => "Публикация подписок на серверах…",
+        ("subscription", "publish" | "publish-all" | "rotate" | "revoke") => "Публикация подписок на серверах…",
         ("self", "version" | "update") => "Проверка обновлений…",
         _ => "Выполняется…",
     }

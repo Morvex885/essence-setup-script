@@ -7,7 +7,6 @@
 //! values select Bash defaults, except explicit empty TCP exit flow omits flow.
 //! Byte parity with Bash is pinned by `tests/protocols_golden.rs`.
 
-pub mod dnat;
 pub mod hy2;
 pub mod listener_users;
 pub mod uri;

@@ -940,23 +940,32 @@ fn generation(ctx: &mut Context<'_>) -> io::Result<()> {
 fn subscriptions(ctx: &mut Context<'_>) -> io::Result<()> {
     loop {
         let Some(host) = load(ctx, "Подписки", &["subscription", "host"])? else { return Ok(()); };
-        let mut view = View::menu("Подписки", vec![
-            Item::new('h', "Хост-нода подписок", ui::YELLOW), Item::new('l', "Список подписок", ui::CYAN),
-            Item::new('u', "Обновить все подписки", ui::YELLOW), Item::new('m', "Перенос на другую ноду", ui::YELLOW),
+        let current = host["node"].as_str().filter(|s| !s.is_empty()).map(str::to_owned);
+        let mut actions = vec![Item::new('h', "Хост подписок", ui::YELLOW)];
+        if current.is_some() { actions.push(Item::new('x', "Убрать хост", ui::RED)); }
+        actions.extend([
+            Item::new('l', "Список подписок", ui::CYAN), Item::new('u', "Обновить все подписки", ui::YELLOW),
             Item::new('c', "Подписка клиента", ui::CYAN), Item::new('g', "Заголовки группы", ui::YELLOW), back(),
         ]);
-        match host["node"].as_str().filter(|s| !s.is_empty()) {
+        let mut view = View::menu("Подписки", actions);
+        match &current {
             Some(node) => {
-                view.context.push(Line::from(vec![Span::raw("Хост-нода: "), Span::styled(node.to_owned(), Style::default().fg(ui::GREEN))]));
+                view.context.push(Line::from(vec![
+                    Span::raw("Хост подписок: "),
+                    Span::styled(format!("{}:{}", text(&host["hostname"]), scalar(&host["port"])), Style::default().fg(ui::GREEN)),
+                    Span::raw(format!(" (нода {node})")),
+                ]));
                 view.context.push(ui::text(format!("Базовый URL: {}", text(&host["base_url"])), ui::NC));
             }
-            None => view.context.push(ui::text("Хост-нода подписок не задана", ui::DIM)),
+            None => view.context.push(ui::text("Хост подписок не задан", ui::DIM)),
         }
         let Some(choice) = ctx.choose(&view)? else { return Ok(()); };
         match choice.to_ascii_lowercase().as_str() {
             "0" => return Ok(()),
-            "h" => if let Some(node) = pick(ctx, "node", "Хост-нода подписок")? {
-                node_request(ctx, &node, &["subscription", "host", "--name", &node])?;
+            "h" => set_host(ctx, current.as_deref())?,
+            "x" => match &current {
+                Some(node) => remove_host(ctx, node)?,
+                None => ctx.invalid(),
             },
             "l" => subscription_list(ctx)?,
             "u" => {
@@ -969,14 +978,35 @@ fn subscriptions(ctx: &mut Context<'_>) -> io::Result<()> {
                         "Нечего публиковать.")?;
                 }
             },
-            "m" => if let Some(node) = pick(ctx, "node", "Перенос подписок на ноду")? {
-                confirmed(ctx, "Перенос подписок", "Перенести подписки?", &["subscription", "migrate", "--name", &node])?;
-            },
             "c" => if let Some(name) = pick(ctx, "client", "Подписка клиента")? { client_subscription(ctx, &name)?; },
             "g" => if let Some(name) = pick(ctx, "group", "Заголовки группы")? { headers(ctx, "group", &name)?; },
             _ => ctx.invalid(),
         }
     }
+}
+/// «Хост подписок»: a node with a profile, the domain and the port (Enter —
+/// 443) → `subscription host`; the new and a replaced host node then wait for
+/// `node apply`, offered right away.
+fn set_host(ctx: &mut Context<'_>, current: Option<&str>) -> io::Result<()> {
+    let Some(data) = fetch(ctx, &["node", "list"])? else { return Ok(()); };
+    let profiled: Vec<&Value> = rows(&data).iter().filter(|node| node["profile"].as_str().is_some_and(|p| !p.is_empty())).collect();
+    let labels: Vec<String> = profiled.iter().map(|node| node_label(node)).collect();
+    let Some(i) = ctx.select("Нода хоста подписок", &labels)? else { return Ok(()); };
+    let node = text(&profiled[i]["name"]).to_owned();
+    let Some(domain) = required(ctx, "Домен подписок", "Домен не указан.")? else { return Ok(()); };
+    let Some(port) = ask(ctx, "Порт подписок [443]")? else { return Ok(()); };
+    let (domain, port) = (domain.trim(), port.trim());
+    let mut words = vec!["subscription", "host", "--name", node.as_str(), "--domain", domain];
+    if !port.is_empty() { words.extend(["--port", port]); }
+    if !execute(ctx, &words)?.ok { return Ok(()); }
+    crate::nodes::offer_apply_on(ctx, &[node, current.unwrap_or_default().to_owned()])
+}
+/// «Убрать хост»: `subscription host --remove` under its plan; the old host
+/// node then waits for `node apply`, offered right away.
+fn remove_host(ctx: &mut Context<'_>, node: &str) -> io::Result<()> {
+    let reply = confirmed(ctx, "Хост подписок", "Убрать хост подписок?", &["subscription", "host", "--remove"])?;
+    if reply.ok { crate::nodes::offer_apply_on(ctx, &[node.to_owned()])?; }
+    Ok(())
 }
 fn subscription_list(ctx: &mut Context<'_>) -> io::Result<()> {
     let Some(data) = fetch(ctx, &["subscription", "list"])? else { return Ok(()); };
@@ -1069,7 +1099,7 @@ mod tests {
     }
     fn nodes() -> Value { json!([{"name":"de","ip":"127.0.0.1","port":22},{"name":"ru","ip":"10.0.0.2","port":2222}]) }
     fn group_list() -> Value { json!([{"name":"PC","template":"default.yaml","clients":1,"nodes":["de"]}]) }
-    fn host() -> Value { json!({"node":"de","base_url":"https://h","sub_dir":"/var/www/sub","nginx_group":"www-data"}) }
+    fn host() -> Value { json!({"node":"de","hostname":"sub.de.example","port":443,"base_url":"https://sub.de.example","sub_dir":"/var/www/sub","nginx_group":"www-data"}) }
     fn bundle(url: &str) -> Value { json!({"client":"alice","url":url,"expires_at":null,"headers":[]}) }
 
     #[test]
@@ -1689,46 +1719,75 @@ mod tests {
         assert!(content(list).contains("u  —  без срока"));
     }
     #[test]
-    fn publish_all_summary_and_migration_by_node_name_are_confirmed() {
-        let (core, ui) = drive(vec![
+    fn publish_all_summary_is_confirmed_and_reads_failures_from_error() {
+        let (_, ui) = drive(vec![
             ok(&["subscription", "host"], host()), step(&["subscription", "publish-all"], plan()),
             yes(&["subscription", "publish-all"], json!({"published":["alice"],"skipped":[],"failed":[],"removed":0})),
-            ok(&["subscription", "host"], host()), ok(&["node", "list"], nodes()),
-            step(&["subscription", "migrate", "--name", "ru"], plan()),
             ok(&["subscription", "host"], host()), step(&["subscription", "publish-all"], plan()),
             (yes(&["subscription", "publish-all"], Value::Null).0, fail("remote_failed", json!({"published":[],"skipped":[],"failed":["alice"],"removed":0}))),
             ok(&["subscription", "host"], host()),
-        ], &["U", "y", "", "M", "2", "n", "u", "y", "", "0"], subscriptions);
+        ], &["U", "y", "", "u", "y", "", "0"], subscriptions);
         let results: Vec<_> = ui.views.iter().filter(|v| v.title == "Итог публикации подписок").map(content).collect();
         assert_eq!(results.len(), 2);
         assert!(results[0].contains("Опубликовано: alice") && !results[0].contains("Удалено"));
         assert!(results[1].contains("Ошибки: alice"));
-        assert!(!sent(&core, &["subscription", "migrate", "--name", "ru", "--yes", "--plan-token", "T"]));
         assert_eq!(ui.views[0].context[0].spans[1].style.fg, Some(ui::GREEN));
-        assert_eq!(keys(&ui.views[0]).len(), 7);
+        assert!(content(&ui.views[0]).contains("Хост подписок: sub.de.example:443 (нода de)"));
+        let menu: Vec<_> = keys(&ui.views[0]).into_iter().map(|(key, _)| key).collect();
+        assert_eq!(menu, ["h", "x", "l", "u", "c", "g", "0"]);
+    }
+    fn moved(port: u16) -> Value {
+        json!({"node":"ru","hostname":"sub.example.com","port":port,"base_url":format!("https://sub.example.com:{port}"),"sub_dir":"/var/www/sub","nginx_group":"www-data"})
     }
     #[test]
-    fn host_picker_resolves_missing_secret_without_password_in_argv() {
+    fn host_is_set_on_a_profiled_node_and_offers_apply_on_the_new_and_old_node() {
+        let profiled = || ok(&["node", "list"], json!([
+            {"name":"de","ip":"127.0.0.1","port":22,"profile":"edge"},{"name":"bare","ip":"10.0.0.3","port":22,"profile":null},
+            {"name":"ru","ip":"10.0.0.2","port":2222,"profile":"edge"}]));
+        let apply = ["node", "apply", "--name", "ru", "--name", "de"];
         let (core, ui) = drive(vec![
-            ok(&["subscription", "host"], Value::Null), ok(&["node", "list"], nodes()),
-            step(&["subscription", "host", "--name", "de"], fail("missing_secret", json!({"name":"de"}))),
-            ok(&["node", "password", "--name", "de"], json!({})),
-            ok(&["subscription", "host", "--name", "de"], host()),
-            ok(&["subscription", "host"], host()),
-        ], &["H", "1", "y", "PRIVATE-PASSWORD", "0"], subscriptions);
-        assert_eq!(core.secret_names[3], ["password"]);
-        assert!(core.secret_names.iter().enumerate().all(|(i, s)| i == 3 || s.is_empty()));
-        assert!(!core.calls.iter().flatten().any(|s| s.contains("PRIVATE-PASSWORD")));
-        assert!(!ui.views.iter().any(|v| content(v).contains("PRIVATE-PASSWORD")));
-        assert!(content(&ui.views[0]).contains("Хост-нода подписок не задана"));
+            ok(&["subscription", "host"], host()), profiled(),
+            ok(&["subscription", "host", "--name", "ru", "--domain", "sub.example.com"], moved(443)),
+            step(&apply, plan()), yes(&apply, json!({"applied":["ru","de"],"failed":[],"unchanged":[]})),
+            ok(&["subscription", "host"], moved(443)), profiled(),
+            ok(&["subscription", "host", "--name", "ru", "--domain", "sub.example.com", "--port", "8443"], moved(8443)),
+            ok(&["subscription", "host"], moved(8443)),
+        ], &["h", "2", "sub.example.com", "", "y", "y", "H", "2", "sub.example.com", "8443", "n", "0"], subscriptions);
+        assert!(!sent(&core, &["node", "apply", "--name", "ru"]), "the refused offer applies nothing");
+        assert_eq!(notices(&ui, "Применено: ru, de"), 1);
+        assert!(!content(view(&ui, "Нода хоста подписок")).contains("bare"));
+        assert!(ui.views.iter().any(|v| v.prompt.contains("на нодах ru, de сейчас?")));
+        assert!(ui.views.iter().any(|v| v.title == "Нода: ru" && v.prompt.contains("на ноде сейчас?")));
+        assert!(ui.views.iter().any(|v| content(v).contains("Хост подписок: sub.example.com:8443 (нода ru)")));
     }
     #[test]
-    fn host_key_trust_refusal_never_retries_the_host_command() {
+    fn host_removal_is_plan_gated_and_offers_apply_on_the_old_node() {
+        let remove = ["subscription", "host", "--remove"];
+        let apply = ["node", "apply", "--name", "de"];
+        let (core, ui) = drive(vec![
+            ok(&["subscription", "host"], host()), step(&remove, plan()), yes(&remove, Value::Null),
+            step(&apply, plan()), yes(&apply, json!({"applied":["de"],"failed":[],"unchanged":[]})),
+            ok(&["subscription", "host"], Value::Null), ok(&["subscription", "host"], Value::Null),
+        ], &["X", "y", "y", "y", "x", "0"], subscriptions);
+        assert!(sent(&core, &["subscription", "host", "--remove", "--yes", "--plan-token", "T"]));
+        assert_eq!(notices(&ui, "Применено: de"), 1);
+        assert_eq!(notices(&ui, "Неверный выбор."), 1, "no host — nothing to remove");
+        let last = ui.views.last().unwrap();
+        assert!(content(last).contains("Хост подписок не задан"));
+        assert!(!keys(last).iter().any(|(key, _)| key == "x"));
+        // A refused plan removes nothing and offers no apply.
+        let (core, _) = drive(vec![ok(&["subscription", "host"], host()), step(&remove, plan()), ok(&["subscription", "host"], host())],
+            &["x", "n", "0"], subscriptions);
+        assert_eq!(core.calls.len(), 3);
+    }
+    #[test]
+    fn host_key_trust_refusal_never_retries_the_node_command() {
         let changed = fail("host_key_changed", json!({"host":"127.0.0.1","port":22,"fingerprints":["SHA256:key"]}));
+        let discover = ["conn", "list", "--name", "de", "--discover"];
         let (_, ui) = drive(vec![
-            step(&["subscription", "host", "--name", "de"], changed),
+            step(&discover, changed),
             step(&["node", "trust-host-key", "--name", "de", "--host-key", "SHA256:key"], plan()),
-        ], &["n"], |ctx| { assert!(node_request(ctx, "de", &["subscription", "host", "--name", "de"])?.is_none()); Ok(()) });
+        ], &["n"], |ctx| { assert!(node_request(ctx, "de", &discover)?.is_none()); Ok(()) });
         assert_eq!(notices(&ui, "Операция завершилась ошибкой"), 1);
     }
     #[test]

@@ -27,12 +27,12 @@ sed "s|/etc/mihomo/config.yaml|$SYNC_DIR/config.yaml|" \
     "$ROOT/common/listener-users.sh" > "$SYNC_DIR/listener-users.sh"
 
 source "$ROOT/common/common.sh"
-for f in uri hy2 vless-tcp vless-grpc vless-xhttp iptables-dnat; do
+for f in uri hy2 vless-tcp vless-grpc vless-xhttp; do
     source "$ROOT/common/protocols/$f.sh"
 done
 source "$SYNC_DIR/listener-users.sh"
 
-MODULES="uri hy2 vless-tcp vless-grpc vless-xhttp iptables-dnat listener-users"
+MODULES="uri hy2 vless-tcp vless-grpc vless-xhttp listener-users"
 for m in $MODULES; do : > "$WORK/$m.ndjson"; done
 GLOBALS_JSON=''
 COUNT=0
@@ -80,34 +80,6 @@ w_server_port() {
     _parse_server_port_from_uri "$1"
     printf 'server=%s\nport=%s\n' "$URI_SERVER" "$URI_PORT"
 }
-
-# Stubs shadow iptables/sysctl/netfilter-persistent and the two sed/grep calls
-# that touch /etc/sysctl.conf. Each stub appends argv to $DNAT_LOG. Functions
-# are defined inside the per-case subshell, so nothing leaks and the real
-# firewall and sysctl configuration are never touched.
-dnat_rec() { printf '%s' "$1"; shift; local a; for a in "$@"; do printf ' [%s]' "$a"; done; printf '\n'; }
-dnat_stubs() {
-    DNAT_LOG="$WORK/dnat.log"; : > "$DNAT_LOG"
-    iptables() { dnat_rec iptables "$@" >> "$DNAT_LOG"; }
-    ip6tables() { dnat_rec ip6tables "$@" >> "$DNAT_LOG"; }
-    sysctl() { dnat_rec sysctl "$@" >> "$DNAT_LOG"; }
-    netfilter-persistent() { dnat_rec netfilter-persistent "$@" >> "$DNAT_LOG"; }
-    grep() {
-        if [[ "$*" == *"/etc/sysctl.conf"* ]]; then
-            dnat_rec grep "$@" >> "$DNAT_LOG"
-            [[ "$1" == "-q" ]]
-            return
-        fi
-        command grep "$@"
-    }
-    sed() {
-        if [[ "$*" == *"/etc/sysctl.conf"* ]]; then dnat_rec sed "$@" >> "$DNAT_LOG"; return 0; fi
-        command sed "$@"
-    }
-}
-w_apply_dnat() { dnat_stubs; _apply_dnat_rules "$@"; local rc=$?; cat "$DNAT_LOG"; return "$rc"; }
-w_remove_dnat() { dnat_stubs; _remove_dnat_rules "$@"; local rc=$?; cat "$DNAT_LOG"; return "$rc"; }
-w_persist_dnat() { dnat_stubs; _persist_dnat_rules "$@"; local rc=$?; cat "$DNAT_LOG"; return "$rc"; }
 
 w_sync() {
     _sync_listener_users "$1" "$2"
@@ -476,20 +448,6 @@ c vless-xhttp _normalize_vless_xhttp_proxy_yaml nx_crlf_passthrough $'  - name: 
 c vless-xhttp _normalize_vless_xhttp_proxy_yaml nx_empty '<none>'
 c vless-xhttp _normalize_vless_xhttp_proxy_yaml nx_fp_spaces $'  - name: n\n    network: xhttp\n    client-fingerprint:   chrome  \n'
 c vless-xhttp _normalize_vless_xhttp_proxy_yaml nx_wrong_indent $'  - name: n\n  network: xhttp\n'
-
-# ── iptables-dnat ───────────────────────────────────────────────────────────
-
-dn() { run_case iptables-dnat "$1" "$2" "$3" '<none>' "${@:4}"; }
-dn _apply_dnat_rules w_apply_dnat dn_apply_basic 'vless-cascade' 203.0.113.5 443 8443
-dn _apply_dnat_rules w_apply_dnat dn_apply_ipv6_remote 'v6' 2001:db8::5 443 8443
-dn _apply_dnat_rules w_apply_dnat dn_apply_name_space 'my node' 203.0.113.5 443 8443
-dn _apply_dnat_rules w_apply_dnat dn_apply_ports_edge 'edge' 203.0.113.5 65535 1
-dn _apply_dnat_rules w_apply_dnat dn_apply_empty_local 'x' 203.0.113.5 443 ''
-dn _remove_dnat_rules w_remove_dnat dn_remove_basic 'vless-cascade' 203.0.113.5 443 8443
-dn _remove_dnat_rules w_remove_dnat dn_remove_ipv6_remote 'v6' 2001:db8::5 443 8443
-dn _remove_dnat_rules w_remove_dnat dn_remove_name_space 'my node' 203.0.113.5 443 8443
-dn _remove_dnat_rules w_remove_dnat dn_remove_empty_local 'x' 203.0.113.5 443 ''
-dn _persist_dnat_rules w_persist_dnat dn_persist_netfilter_present
 
 # ── listener-users ──────────────────────────────────────────────────────────
 

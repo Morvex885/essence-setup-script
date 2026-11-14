@@ -118,6 +118,9 @@ static CATALOG: &[Spec] = &[
     spec("profile", "set", PROFILE, &[], 0),
     spec("profile", "delete", "name=", &[], 0),
     spec("profile", "warp-license", "name= clear", &["password"], 0),
+    spec("cascade", "list", "", &[], 0),
+    spec("cascade", "add", "name= entry= listener= exit-node= exit-proxy= @file?", &[], 0),
+    spec("cascade", "delete", "name=", &[], 0),
     spec("conn", "list", "name= discover", &[], 0),
     spec("conn", "set", "name= assign+", &[], 0),
     spec("conn", "sync", "name=", &[], 0),
@@ -153,7 +156,7 @@ static CATALOG: &[Spec] = &[
     spec("client", "set-group", "name= group=", &[], 0),
     spec("client", "delete", "name+", &[], 0),
     spec("generate", "", "all group= client=", &[], 0),
-    spec("subscription", "host", "name=", &[], 0),
+    spec("subscription", "host", "name= domain= port= remove", &[], 0),
     spec("subscription", "list", "", &[], 0),
     spec("subscription", "show", "name=", &[], 0),
     spec("subscription", "headers", "client= group= default set+ unset+", &[], 0),
@@ -161,7 +164,6 @@ static CATALOG: &[Spec] = &[
     spec("subscription", "publish-all", "", &[], 0),
     spec("subscription", "rotate", "name=", &[], 0),
     spec("subscription", "revoke", "name=", &[], 0),
-    spec("subscription", "migrate", "name=", &[], 0),
 ];
 
 /// Help catalog: general lines, then nouns in byte order (v1 `LC_ALL=C sort`).
@@ -175,6 +177,11 @@ static HELP: &[(&str, &[(&str, &str)])] = &[
         ("--connect URL [--fingerprint SHA256:…] [--insecure] КОМАНДА", "Выполнить команду на удалённом демоне (https://host[:port]); --fingerprint закрепляет сертификат, --insecure разрешает http:// не на loopback"),
         ("ESSENCE_RC_CONNECT, ESSENCE_RC_FINGERPRINT, ESSENCE_RC_INSECURE", "Окружение: то же, что --connect, --fingerprint и --insecure (=1)"),
         ("Коды выхода", "0 — успех; 1 — ошибка; 2 — неверное использование, нужно решение или --yes; telegram: 3 — не установлено, 4 — частично"),
+    ]),
+    ("cascade", &[
+        ("cascade list", "Каскады"),
+        ("cascade add --name C --entry N --listener vless-tcp|vless-xhttp|vless-grpc|hysteria2 (--exit-node M --exit-proxy P | --file PATH)", "Добавить каскад: клиенты входной ноды выходят через другую ноду или внешний сервер (файл с URI vless://, hysteria2://)"),
+        ("cascade delete --name C [--yes]", "Удалить каскад и снять его назначения"),
     ]),
     ("client", &[
         ("client list [--group G]", "Список клиентов"),
@@ -268,7 +275,7 @@ static HELP: &[(&str, &[(&str, &str)])] = &[
         ("status", "Сводка: версия, источник, счётчики, проблемы"),
     ]),
     ("subscription", &[
-        ("subscription host [--name N]", "Хост-нода подписок (с --name — задать)"),
+        ("subscription host [--name N --domain D [--port P] | --remove [--yes]]", "Хост подписок: без флагов — показать; --name — задать ноду и домен (порт 443 по умолчанию), затем node apply"),
         ("subscription list", "Список подписок"),
         ("subscription show --name C", "Ссылка и заголовки подписки"),
         ("subscription headers (--client C | --group G | --default) [--set NAME=VALUE…] [--unset NAME…]", "Заголовки подписки"),
@@ -276,7 +283,6 @@ static HELP: &[(&str, &[(&str, &str)])] = &[
         ("subscription publish-all [--yes]", "Опубликовать все готовые подписки и удалить с хоста подписки без клиента"),
         ("subscription rotate --name C [--yes]", "Перевыпустить ссылку"),
         ("subscription revoke --name C [--yes]", "Отозвать подписку"),
-        ("subscription migrate --name N [--yes]", "Перенести подписки на другую ноду"),
     ]),
     ("telegram", &[
         ("telegram status [--name N… | --all]", "Состояние Telegram Proxy"),

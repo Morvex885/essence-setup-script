@@ -377,6 +377,7 @@ async fn route(invocation: &Invocation, secrets: &Secrets, input: &Input, agent_
         }
         ("node", "apply") => crate::server::apply::apply(session, invocation, &connect).await,
         ("profile", verb) => crate::server::profile::route(verb, invocation, secrets, session).await,
+        ("cascade", verb) => crate::server::cascade::route(verb, invocation, input, session),
         (noun @ ("node" | "conn"), verb) => crate::nodes::route(noun, verb, invocation, secrets, session, &mut connect()).await,
         (noun @ ("group" | "template" | "client" | "generate"), verb) => {
             crate::clients::route(noun, verb, invocation, secrets, input, session, &connect).await

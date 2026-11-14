@@ -370,9 +370,11 @@ managed_path() {
     case "$path" in
         /etc/mihomo|/etc/mihomo/*|/etc/systemd/system/mihomo.service|/etc/sysctl.d/99-vpn-speedup.conf|/etc/amnezia/amneziawg/awg0.conf)
             return 0 ;;
+        /etc/nginx/conf.d/essence-sub-limit.conf|/usr/local/bin/essence-sub-cleanup|/etc/systemd/system/essence-sub-cleanup.service|/etc/systemd/system/essence-sub-cleanup.timer)
+            return 0 ;;
     esac
     [[ "$path" == /etc/nginx/modules-enabled/90-essence-stream.conf ||
-       "$path" =~ ^/etc/nginx/(sites-available|sites-enabled)/[^/]+$ ]]
+       "$path" =~ ^/etc/nginx/(sites-available|sites-enabled)/[^/]+$ || "$path" =~ ^/var/www/[^/]+/\.essence-sub$ ]]
 }
 
 check_path() {
@@ -399,6 +401,10 @@ removable() {
         /etc/nginx/sites-enabled/*)
             [[ -L "$dest" && "$(readlink -- "$dest")" == "/etc/nginx/sites-available/$name" ]] && return 0
             warn "Пропускаю $path: это не ссылка на сайт Essence."
+            return 1 ;;
+        /var/www/*/.essence-sub)
+            # Отметка хоста подписок уходит вместе с webroot в cleanup
+            # (RELEASE_CERTS): до этого она подтверждает, что webroot наш.
             return 1 ;;
     esac
 }
@@ -782,7 +788,7 @@ cleanup_committed() {
     for entry in "${CERT_ENTRIES[@]}"; do
         name="${entry%%:*}"
         webroot="${entry#*:}"
-        if [[ ! -e "$R$webroot/.essence-site" ]]; then
+        if [[ ! -e "$R$webroot/.essence-site" && ! -e "$R$webroot/.essence-sub" ]]; then
             warn "Пропускаю сертификат $name: в $webroot нет отметки Essence."
             continue
         fi

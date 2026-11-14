@@ -109,3 +109,20 @@ export async function offerApply(ctx) {
   if (!listed.ok || pendingNodes(listed.data).length === 0) return;
   await applyFlow(ctx, APPLY_PENDING_ARGV);
 }
+
+/** Ноды с профилем из `node list` (только их рендерит `node apply`). */
+export function profiledNodes(list) {
+  return asList(list).filter((node) => node && typeof node.name === 'string' && typeof node.profile === 'string' && node.profile !== '');
+}
+
+/**
+ * Предложение применить на названных нодах после правки, которая их
+ * затрагивает (WARP, каскад, хост подписок): вопрос → `node apply --name N…`.
+ */
+export async function offerApplyNodes(ctx, names) {
+  const nodes = [...new Set(strings(names))];
+  if (nodes.length === 0) return;
+  const question = nodes.length === 1 ? `Применить изменения на ноде ${nodes[0]}?` : `Применить изменения на нодах ${nodes.join(', ')}?`;
+  const yes = await ctx.confirm({ title: 'Применение на нодах', plan: [], question });
+  if (yes) await applyFlow(ctx, applyNamesArgv(nodes), nodes.length === 1 ? nodes[0] : null);
+}
