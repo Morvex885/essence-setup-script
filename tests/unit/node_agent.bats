@@ -126,6 +126,16 @@ assert_scrubbed() {
     [[ "$(stat -c %a "$OPDIR")" == 700 ]]
 }
 
+@test "apt-get исполнителя идёт с NEEDRESTART_MODE=l и NEEDRESTART_SUSPEND=1" {
+    stub apt-get 'printf "apt-env %s %s\n" "${NEEDRESTART_MODE:-unset}" "${NEEDRESTART_SUSPEND:-unset}" >>"$CALLS"; exit 0'
+    add_file /etc/mihomo/config.yaml "new"
+    NEEDRESTART_MODE= NEEDRESTART_SUSPEND= run_agent
+    assert_success
+    grep -q "^apt-env " "$CALLS"
+    # Ни одного вызова без обеих переменных.
+    if grep "^apt-env " "$CALLS" | grep -vqx "apt-env l 1"; then return 1; fi
+}
+
 @test "mihomo -t с ошибкой откатывает транзакцию" {
     printf 'old\n' >"$ROOT/etc/mihomo/config.yaml"
     add_file /etc/mihomo/config.yaml "new"

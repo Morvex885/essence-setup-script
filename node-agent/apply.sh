@@ -10,6 +10,10 @@ umask 077
 # systemd-run без User= не задаёт HOME, а cert.sh читает его под set -u.
 : "${HOME:=/root}"
 export HOME
+# Любой apt-get исполнителя (этапы, шаги awg/telegram, установщик upstream):
+# needrestart только перечисляет службы — не перезапускает их и не делает
+# daemon-reexec systemd посреди применения.
+export NEEDRESTART_MODE=l NEEDRESTART_SUSPEND=1
 
 OP="${1:-}"
 if [[ -z "$OP" || ! -d "$OP" ]]; then
