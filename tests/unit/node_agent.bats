@@ -137,7 +137,7 @@ assert_scrubbed() {
     assert_line "error=config"
     [[ "$(cat "$ROOT/etc/mihomo/config.yaml")" == old ]]
     [[ ! -e "$ROOT/etc/mihomo/extra.yaml" ]]
-    ! grep -q "^ufw allow 443" "$CALLS"
+    ! grep -q "^ufw allow 443" "$CALLS" || return 1
     assert_scrubbed
 }
 
@@ -172,9 +172,9 @@ assert_scrubbed() {
     assert_success
     grep -qx "ufw allow 443/tcp" "$CALLS"
     grep -qx "ufw delete allow 8443/tcp" "$CALLS"
-    ! grep -q "51820" "$CALLS"
-    ! grep -q -- "--force reset" "$CALLS"
-    ! grep -q "ufw default" "$CALLS"
+    ! grep -q "51820" "$CALLS" || return 1
+    ! grep -q -- "--force reset" "$CALLS" || return 1
+    ! grep -q "ufw default" "$CALLS" || return 1
     [[ "$(sort "$ROOT/root/essence-node/ufw-rules")" == $'443/tcp\n51820/udp' ]]
 }
 
@@ -358,7 +358,7 @@ exit 0'
     add_file /etc/mihomo/config.yaml "new"
     UFW_ADDED="ufw allow 443/tcp" run bash "$AGENT/apply.sh" "$OPDIR"
     assert_success
-    ! grep -qx "ufw allow 443/tcp" "$CALLS"
+    ! grep -qx "ufw allow 443/tcp" "$CALLS" || return 1
     [[ ! -s "$ROOT/root/essence-node/ufw-rules" ]]
     MODE=teardown RULES="" write_spec
     printf '/etc/mihomo\n' >"$OPDIR/remove.list"

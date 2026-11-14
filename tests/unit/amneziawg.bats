@@ -456,7 +456,7 @@ EOF
     assert_success
     grep -q '^apt-get update$' "$MOCK_CALLS"
     grep -q '^apt-get install -y gnupg$' "$MOCK_CALLS"
-    ! grep -q "linux-headers-$MOCK_KERNEL" "$MOCK_CALLS"
+    ! grep -q "linux-headers-$MOCK_KERNEL" "$MOCK_CALLS" || return 1
     grep -q '^apt-get install -y amneziawg amneziawg-tools amneziawg-dkms$' "$MOCK_CALLS"
     source_states=()
     while IFS= read -r value; do source_states+=("$value"); done < <(grep '^apt-update-amnezia-source=' "$MOCK_CALLS")
@@ -464,7 +464,7 @@ EOF
     assert_equal "${source_states[1]}" 'apt-update-amnezia-source=present'
     [[ -f "$AWG_APT_KEYRING" ]]
     grep -qxF "Suites: jammy" "$AWG_APT_SOURCE"
-    ! grep -Fq "$AWG_PPA_URI" "$AWG_APT_SOURCES_DIR/legacy.list"
+    ! grep -Fq "$AWG_PPA_URI" "$AWG_APT_SOURCES_DIR/legacy.list" || return 1
     grep -qxF 'deb https://deb.debian.org/debian bookworm main' "$AWG_APT_SOURCES_DIR/legacy.list"
 }
 
@@ -490,7 +490,7 @@ EOF
     run _awg_ensure_packages
     assert_success
     assert_equal "$(grep -c '^apt-get update$' "$MOCK_CALLS")" 1
-    ! grep -q "apt-get install.*linux-headers-$MOCK_KERNEL" "$MOCK_CALLS"
+    ! grep -q "apt-get install.*linux-headers-$MOCK_KERNEL" "$MOCK_CALLS" || return 1
     grep -qxF 'apt-update-amnezia-source=present' "$MOCK_CALLS"
 }
 
@@ -502,7 +502,7 @@ EOF
     assert_success
     grep -q "^apt-cache policy linux-headers-$MOCK_KERNEL$" "$MOCK_CALLS"
     grep -q "^apt-get install -y linux-headers-$MOCK_KERNEL$" "$MOCK_CALLS"
-    ! grep -q '^apt-get install --reinstall' "$MOCK_CALLS"
+    ! grep -q '^apt-get install --reinstall' "$MOCK_CALLS" || return 1
     [[ -d "$AWG_MODULES_ROOT/$MOCK_KERNEL/build" ]]
     source_states=()
     while IFS= read -r value; do source_states+=("$value"); done < <(grep '^apt-update-amnezia-source=' "$MOCK_CALLS")
@@ -666,7 +666,7 @@ EOF
         assert_failure
         [[ -f "$MOCK_STATE/gpg.available" ]]
         [[ -d "$AWG_MODULES_ROOT/$MOCK_KERNEL/build" ]]
-        ! grep -Eq '^apt-get (remove|purge)' "$MOCK_CALLS"
+        ! grep -Eq '^apt-get (remove|purge)' "$MOCK_CALLS" || return 1
         _assert_old_repo_state_restored
     done
 }
@@ -694,8 +694,8 @@ EOF
     grep -qxF "Suites: jammy" "$AWG_APT_SOURCE"
     grep -qxF "Signed-By: $AWG_APT_KEYRING" "$AWG_APT_SOURCE"
     grep -q 'deb.debian.org' "$AWG_APT_SOURCES_LIST"
-    ! grep -Fq "$AWG_PPA_URI" "$AWG_APT_SOURCES_LIST"
-    ! grep -Fq "$AWG_PPA_URI" "$AWG_APT_SOURCES_DIR/legacy.list"
+    ! grep -Fq "$AWG_PPA_URI" "$AWG_APT_SOURCES_LIST" || return 1
+    ! grep -Fq "$AWG_PPA_URI" "$AWG_APT_SOURCES_DIR/legacy.list" || return 1
     grep -q '^URIs: https://example.invalid/repo$' "$AWG_APT_SOURCES_DIR/mixed.sources"
     [[ "$(grep -RhoF "$AWG_PPA_URI" "$AWG_TEST_ROOT/etc/apt" | wc -l)" -eq 1 ]]
     [[ -z "$(find "$AWG_TEST_ROOT/etc/apt" -name '.amnezia.gpg.*' -o -name '.amnezia.sources.*')" ]]
@@ -815,8 +815,8 @@ EOF
 
     run _run_install_with_sentinel
     assert_output --partial "INSTALL_RC=1"
-    ! grep -q 'systemctl stop awg-quick@awg0' "$MOCK_CALLS"
-    ! grep -q '^ufw allow' "$MOCK_CALLS"
+    ! grep -q 'systemctl stop awg-quick@awg0' "$MOCK_CALLS" || return 1
+    ! grep -q '^ufw allow' "$MOCK_CALLS" || return 1
     cmp -s "$AWG_CLIENT_CONFIG" "$BATS_TEST_TMPDIR/client.before"
     [[ -f "$AWG_CONF" ]]
     [[ "$(_file_mode "$AWG_CONF")" == 600 ]]
@@ -829,7 +829,7 @@ EOF
 
     run _run_install_with_sentinel
     assert_output --partial "INSTALL_RC=1"
-    ! grep -q '^ufw allow' "$MOCK_CALLS"
+    ! grep -q '^ufw allow' "$MOCK_CALLS" || return 1
     cmp -s "$AWG_CLIENT_CONFIG" "$BATS_TEST_TMPDIR/client.before"
     [[ -f "$AWG_CONF" ]]
 }
