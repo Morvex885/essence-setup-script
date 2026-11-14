@@ -489,3 +489,16 @@ test('подписки: хост-нода через nodeRequest, перенос
   await m.groupHeadersFlow(noGroup);
   assert.deepEqual(kinds(noGroup), ['request', 'form']);
 });
+
+test('конфиг клиента: client config → текст; не создан или сбой — null', async () => {
+  const ready = fakeCtx({ replies: [okReply({ exists: true, content: 'proxies:\n' })] });
+  assert.equal(await m.readClientConfig(ready, 'a'), 'proxies:\n');
+  assert.deepEqual(commands(ready), [m.clientConfigArgv('a')]);
+  assert.deepEqual(m.clientConfigArgv('a'), ['client', 'config', '--name', 'a']);
+  const missing = fakeCtx({ replies: [okReply({ exists: false })] });
+  assert.equal(await m.readClientConfig(missing, 'a'), null);
+  assert.deepEqual(kinds(missing), ['request', 'notify']);
+  const broken = fakeCtx({ replies: [failure()] });
+  assert.equal(await m.readClientConfig(broken, 'a'), null);
+  assert.deepEqual(kinds(broken), ['request', 'failed']);
+});

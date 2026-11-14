@@ -16,11 +16,12 @@ export function SummaryScreen({ ctx }) {
   const subscriptions = useCommand(ctx, ['subscription', 'list'], [], { quiet: true });
   const groups = useCommand(ctx, ['group', 'list'], [], { quiet: true });
   const nodes = useCommand(ctx, ['node', 'list'], [], { quiet: true });
+  const clients = useCommand(ctx, ['client', 'list'], [], { quiet: true });
   const [busy, run] = useBusy();
   const mounted = useMounted();
   const version = ctx.hello && typeof ctx.hello.version === 'string' ? ctx.hello.version : '';
   // Шапка перечитывает `status` сама по окончании изменяющей команды.
-  const reload = () => Promise.all([state.reload(), subscriptions.reload(), groups.reload(), nodes.reload()]);
+  const reload = () => Promise.all([state.reload(), subscriptions.reload(), groups.reload(), nodes.reload(), clients.reload()]);
   const act = (action) => run(async () => { await action(); await reload(); });
   /** Переход к созданному объекту — только пока сводка открыта. */
   const go = (name) => (param) => { if (mounted.current) ctx.navigate(name, param); };
@@ -29,7 +30,7 @@ export function SummaryScreen({ ctx }) {
     if (action.type === 'password') return act(() => setNodePassword(ctx, action.node));
     if (action.type === 'ssh-setup') return act(() => setupSsh(ctx));
     if (action.type === 'group-connections') return act(() => groupConnectionsFlow(ctx, action.group));
-    if (action.type === 'reload') return run(() => Promise.all([groups.reload(), nodes.reload()]));
+    if (action.type === 'reload') return run(() => Promise.all([groups.reload(), nodes.reload(), clients.reload()]));
     return ctx.navigate(action.route, action.param || null, action.tab || null);
   };
   const actions = html`
@@ -40,8 +41,8 @@ export function SummaryScreen({ ctx }) {
     const title = dashboardTitle(data, version);
     const counts = (data && data.counts) || {};
     const subs = subscriptions.reply === null ? '…' : subscriptions.reply.ok ? String(asList(subscriptions.data).length) : '—';
-    const read = assignmentsRead(groups.reply, nodes.reply);
-    const items = attentionItems(data, ctx.hello, { groups: groups.data, nodes: nodes.data, read });
+    const read = assignmentsRead(groups.reply, nodes.reply, clients.reply);
+    const items = attentionItems(data, ctx.hello, { groups: groups.data, nodes: nodes.data, clients: clients.data, read });
     return html`<${Page} title="Сводка" subtitle=${title} actions=${actions}>
       <${Stats}>
         <${Stat} label="Ноды" value=${count(counts.nodes)} href=${ctx.href('nodes')} />

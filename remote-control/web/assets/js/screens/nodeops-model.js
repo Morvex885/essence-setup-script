@@ -6,6 +6,7 @@
 // результатов экран передаёт функцией. Тоны: `ok` (GREEN), `warn` (YELLOW),
 // `error` (RED), `neutral` (DIM).
 import { asList, proxyLabel, unlisted } from '../format.js';
+import { NODE_CODES } from '../flows.js';
 import { interactive, nodeLabel } from './nodes-model.js';
 
 /** Пустой выбор (`nodes.rs::EMPTY`). */
@@ -190,6 +191,34 @@ export async function assignConnections(ctx, name, proxies, assigned, stale = []
 export const connSyncArgv = (name = null) => (name === null ? ['conn', 'sync'] : ['conn', 'sync', '--name', name]);
 export const connListArgv = (name = null) => (name === null ? ['conn', 'list'] : ['conn', 'list', '--name', name]);
 export const nodeCheckArgv = (name) => ['node', 'check', '--name', name];
+
+/**
+ * Синхронизация вкладки «Подключения» (`connection_node`): `conn sync
+ * --name`; при `partial` с кодом ноды (`NODE_CODES`) — один `node check`
+ * через `ctx.nodeRequest` (вопросы о ключе и пароле) и повтор синхронизации,
+ * при прочем `partial` — `ctx.failed()`. Итог: `{ synced }` — строка ноды из
+ * ответа (`null`, если её нет), либо `{ failed: reply }` — сбой чтения
+ * (`not_found` — нода исчезла; текст ошибки уже показан `ctx.request`).
+ */
+export async function syncConnections(ctx, name) {
+  let resolve = true;
+  for (;;) {
+    const reply = await ctx.request(connSyncArgv(name), { expect: 'not_found' });
+    if (reply.ok) return { synced: syncedNode(reply.data, name) };
+    if (!reply.error || reply.error.code !== 'partial') return { failed: reply };
+    const synced = syncedNode(reply.error, name);
+    const code = synced && typeof synced.error === 'string' ? synced.error : '';
+    if (resolve && NODE_CODES.includes(code)) {
+      // Строка синхронизации называет только код; `node check` вернёт
+      // состояние с подробностями (отпечатками) для обработчика.
+      resolve = false;
+      if ((await ctx.nodeRequest(name, nodeCheckArgv(name), null)).ok) continue;
+    } else {
+      ctx.failed();
+    }
+    return { synced };
+  }
+}
 
 // ─── AmneziaWG ───────────────────────────────────────────────────────────────
 

@@ -359,6 +359,21 @@ export async function fetchData(ctx, argv) {
   return reply.ok ? { data: reply.data } : null;
 }
 
+export const CONFIG_MISSING = 'Конфиг не создан';
+export const clientConfigArgv = (name) => ['client', 'config', '--name', name];
+
+/**
+ * «Показать конфиг» / «Скачать конфиг» (`client config`): текст конфига или
+ * `null` — сбой либо конфиг ещё не создан (сообщение показано).
+ */
+export async function readClientConfig(ctx, name) {
+  const read = await fetchData(ctx, clientConfigArgv(name));
+  if (!read) return null;
+  const data = read.data || {};
+  if (data.exists === false || typeof data.content !== 'string') { ctx.notify('warn', CONFIG_MISSING); return null; }
+  return data.content;
+}
+
 /**
  * Чтение подменю (`clients.rs::load`): `not_found` — выход, прочие сбои —
  * явный «Повторить». Возвращает `{ data }` или `null`.

@@ -2,7 +2,11 @@
    Компоненты — daisyUI 5 (vendor/daisyui.css, слой @layer daisyui): правила
    этого файла вне слоёв и потому сильнее. Утилит Tailwind нет — только
    классы ниже. Спокойная тема: серые поверхности, фиолетовый — только
-   главная кнопка, активный пункт меню и ссылки; рамки 1px, без теней. */
+   главная кнопка, активный пункт меню и ссылки; рамки 1px, без теней.
+   Контраст (WCAG 2.2, 1.4.3) — не ниже 4,5:1 в обеих темах для каждого
+   цвета статуса и primary как текста на base-100, base-200 и мягкой заливке
+   (8% цвета, badge-soft/alert-soft/btn-soft), для X-content на заливке X и
+   для --muted на base-100/base-200; светлая тема — минимум 4,6:1. */
 
 /* ─── Темы ──────────────────────────────────────────────────────────────── */
 
@@ -20,13 +24,13 @@
   --color-accent-content: oklch(98% 0.01 293);
   --color-neutral: oklch(30% 0.015 286);
   --color-neutral-content: oklch(97% 0 0);
-  --color-info: oklch(60% 0.14 240);
+  --color-info: oklch(53% 0.13 240);
   --color-info-content: oklch(98% 0 0);
-  --color-success: oklch(60% 0.15 150);
+  --color-success: oklch(52% 0.13 150);
   --color-success-content: oklch(98% 0 0);
-  --color-warning: oklch(75% 0.15 75);
-  --color-warning-content: oklch(22% 0.03 75);
-  --color-error: oklch(58% 0.21 25);
+  --color-warning: oklch(54% 0.12 70);
+  --color-warning-content: oklch(98% 0 0);
+  --color-error: oklch(56% 0.2 25);
   --color-error-content: oklch(98% 0 0);
   --radius-selector: .5rem;
   --radius-field: .5rem;
@@ -74,7 +78,7 @@
 
 :root {
   --line: var(--color-base-300);
-  --muted: color-mix(in oklch, var(--color-base-content) 60%, transparent);
+  --muted: color-mix(in oklch, var(--color-base-content) 68%, transparent);
   --nav-wide: 248px;
   --nav-rail: 64px;
   --mono: ui-monospace, "Cascadia Mono", Menlo, Consolas, monospace;
@@ -101,7 +105,7 @@ a.link:hover, .cell-link:hover, .page-back:hover { text-decoration: underline; }
 
 /* Тоны текста */
 .t-ok { color: var(--color-success); }
-.t-warn { color: color-mix(in oklch, var(--color-warning) 70%, var(--color-base-content)); }
+.t-warn { color: var(--color-warning); }
 .t-error { color: var(--color-error); }
 .t-info { color: var(--color-info); }
 .t-dim { color: var(--muted); }
@@ -323,7 +327,7 @@ a.chip:hover { border-color: var(--color-primary); color: var(--color-primary); 
 }
 .operation { max-height: 55vh; overflow: auto; font-family: var(--mono); font-size: 13px; padding: .5rem 0; }
 .log-line { white-space: pre-wrap; overflow-wrap: anywhere; padding: .05rem 0; }
-.level-warn { color: color-mix(in oklch, var(--color-warning) 70%, var(--color-base-content)); }
+.level-warn { color: var(--color-warning); }
 .level-error { color: var(--color-error); }
 .level-success { color: var(--color-success); }
 

@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { runConfirmed } from '../assets/js/flows.js';
 import { joined } from '../assets/js/format.js';
 import {
-  dashboardTitle, attentionItems, assignmentsRead, updateAvailable, updateState, settingsAction, uninstallArgv, daemonLines,
+  dashboardTitle, attentionItems, assignmentsRead, inheritingClients, updateAvailable, updateState, settingsAction, uninstallArgv, daemonLines,
   sourceView, sourceAction, importRecoveryKey, recoveryRun, githubWizardFlow, wizardAccounts,
   storageLabel, existingLabel, targetReplaceContext, passwordForm, CANCELLED, FILE_UNREADABLE, PASSWORDS_DIFFER, PASSWORD_EMPTY,
   OTHER_LOGIN,
@@ -99,35 +99,51 @@ test('сводка: группы без нод и ноды без назначе
   const calm = { source: { type: 'local' }, subscription_host: 'de' };
   const groups = [
     { name: 'PC', clients: 2, nodes: [] },
+    { name: 'OWN', clients: 1, nodes: [] },
     { name: 'EMPTY', clients: 0, nodes: [] },
     { name: 'ROUTER', clients: 1, nodes: ['de'] },
   ];
   const nodes = [{ name: 'de' }, { name: 'nl' }];
-  const items = attentionItems(calm, null, { groups, nodes });
+  // В PC один клиент наследует ноды группы, второй — со своими нодами; в OWN — только свои.
+  const clients = [
+    { name: 'a', group: 'PC', inherit_nodes: true, nodes: [] },
+    { name: 'b', group: 'PC', inherit_nodes: false, nodes: ['de'] },
+    { name: 'c', group: 'OWN', inherit_nodes: false, nodes: ['de'] },
+    { name: 'r', group: 'ROUTER', inherit_nodes: true, nodes: ['de'] },
+  ];
+  assert.equal(inheritingClients(clients, 'PC'), 1);
+  assert.equal(inheritingClients(clients, 'OWN'), 0);
+  assert.equal(inheritingClients(null, 'PC'), 0);
+  const items = attentionItems(calm, null, { groups, nodes, clients });
   assert.deepEqual(items.map((item) => [item.id, item.tone]), [
-    ['group-nodes:PC', 'warn'], ['group-nodes:EMPTY', 'info'], ['node-groups:nl', 'info'],
+    ['group-nodes:PC', 'warn'], ['group-nodes:OWN', 'info'], ['group-nodes:EMPTY', 'info'], ['node-groups:nl', 'info'],
   ]);
+  // Затронутые — только наследующие клиенты, а не все клиенты группы.
+  assert.ok(items[0].text.includes('(1)') && !items[0].text.includes('(2)'));
+  assert.equal(items[1].text, items[2].text.replace('EMPTY', 'OWN'));
   // Группа без нод — поток назначения подключений этой группе.
   assert.deepEqual([items[0].action.type, items[0].action.group], ['group-connections', 'PC']);
   // Нода без назначений ведёт на свою вкладку подключений.
-  assert.deepEqual(items[2].action, { label: items[2].action.label, type: 'route', route: 'nodes', param: 'nl', tab: 'connections' });
+  assert.deepEqual(items[3].action, { label: items[3].action.label, type: 'route', route: 'nodes', param: 'nl', tab: 'connections' });
   // Списки не прочитаны — пунктов нет.
-  assert.deepEqual(attentionItems(calm, null, { groups: null, nodes }), []);
-  assert.deepEqual(attentionItems(calm, null, { groups: [{ name: 'PC', clients: 0, nodes: ['de'] }], nodes: null }), []);
+  assert.deepEqual(attentionItems(calm, null, { groups: null, nodes, clients }), []);
+  assert.deepEqual(attentionItems(calm, null, { groups: [{ name: 'PC', clients: 0, nodes: ['de'] }], nodes: null, clients }), []);
 });
 
-test('сводка: группы или ноды не прочитаны — пункт с повтором, а не «всё в порядке»', () => {
+test('сводка: группы, ноды или клиенты не прочитаны — пункт с повтором, а не «всё в порядке»', () => {
   const calm = { source: { type: 'local' }, subscription_host: 'de' };
   const okReply = { ok: true, data: [] };
   const failed = { ok: false, error: { code: 'failed', message: 'x' } };
-  assert.equal(assignmentsRead(null, okReply), 'pending');
-  assert.equal(assignmentsRead(okReply, null), 'pending');
-  assert.equal(assignmentsRead(failed, okReply), 'failed');
-  assert.equal(assignmentsRead(okReply, failed), 'failed');
-  assert.equal(assignmentsRead(okReply, okReply), 'ready');
+  assert.equal(assignmentsRead(null, okReply, okReply), 'pending');
+  assert.equal(assignmentsRead(okReply, null, okReply), 'pending');
+  assert.equal(assignmentsRead(okReply, okReply, null), 'pending');
+  assert.equal(assignmentsRead(failed, okReply, okReply), 'failed');
+  assert.equal(assignmentsRead(okReply, failed, okReply), 'failed');
+  assert.equal(assignmentsRead(okReply, okReply, failed), 'failed');
+  assert.equal(assignmentsRead(okReply, okReply, okReply), 'ready');
   const items = attentionItems(calm, null, { groups: null, nodes: [], read: 'failed' });
   assert.deepEqual(items.map((item) => [item.id, item.action.type]), [['assignments-unread', 'reload']]);
-  assert.deepEqual(attentionItems(calm, null, { groups: [], nodes: [], read: 'ready' }), []);
+  assert.deepEqual(attentionItems(calm, null, { groups: [], nodes: [], clients: [], read: 'ready' }), []);
 });
 
 // ─── Настройки ─────────────────────────────────────────────────────────────

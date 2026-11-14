@@ -151,23 +151,14 @@ function ClientOverview({ ctx, name, row, busy, act, leave }) {
 
 // ─── Данные подключения ─────────────────────────────────────────────────────
 
-/** `client config`: `null` — сбой или конфиг не создан (сообщение показано). */
-async function readConfig(ctx, name) {
-  const read = await fetchData(ctx, ['client', 'config', '--name', name]);
-  if (!read) return null;
-  const data = read.data || {};
-  if (data.exists === false || typeof data.content !== 'string') { ctx.notify('warn', 'Конфиг не создан'); return null; }
-  return data.content;
-}
-
 async function viewConfig(ctx, name) {
-  const content = await readConfig(ctx, name);
+  const content = await model.readClientConfig(ctx, name);
   if (content === null) return;
   await ctx.show({ title: `Конфиг: ${name}`, wide: true, body: html`<pre class="plan">${content}</pre>` });
 }
 
 async function downloadConfig(ctx, name) {
-  const content = await readConfig(ctx, name);
+  const content = await model.readClientConfig(ctx, name);
   if (content !== null) downloadText(`${name}.yaml`, content);
 }
 

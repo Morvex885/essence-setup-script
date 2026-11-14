@@ -49,25 +49,37 @@ export async function passwordForm(ctx, title, { current = false, currentLabel =
 // ─── Сводка ────────────────────────────────────────────────────────────────
 
 /**
- * Состояние чтения `group list` и `node list` для проверки назначений на
- * сводке: `pending` — ответа ещё нет, `failed` — хотя бы одно чтение не
- * удалось, иначе `ready`. «Всё в порядке» сводка показывает только при `ready`.
+ * Состояние чтения `group list`, `node list` и `client list` для проверки
+ * назначений на сводке: `pending` — ответа ещё нет, `failed` — хотя бы одно
+ * чтение не удалось, иначе `ready`. «Всё в порядке» сводка показывает только
+ * при `ready`.
  */
-export function assignmentsRead(groupsReply, nodesReply) {
-  if (!groupsReply || !nodesReply) return 'pending';
-  return groupsReply.ok && nodesReply.ok ? 'ready' : 'failed';
+export function assignmentsRead(groupsReply, nodesReply, clientsReply) {
+  const replies = [groupsReply, nodesReply, clientsReply];
+  if (replies.some((reply) => !reply)) return 'pending';
+  return replies.every((reply) => reply.ok) ? 'ready' : 'failed';
+}
+
+/**
+ * Клиенты группы, наследующие её ноды (`client list`: `inherit_nodes`);
+ * клиенты со своими нодами и подключениями от нод группы не зависят.
+ */
+export function inheritingClients(clients, group) {
+  if (!Array.isArray(clients)) return 0;
+  return clients.filter((client) => client && client.group === group && client.inherit_nodes === true).length;
 }
 
 /**
  * «Требует внимания» на сводке из `status` и `hello`: `[{ id, tone, text,
  * action }]`; `action` — `{ label, type: 'password'|'ssh-setup'|'group-connections'|'route'|'reload',
  * node?, group?, route?, param?, tab? }` (экран выполняет действие по `type`).
- * Третий аргумент — ответы `group list` и `node list` (`null`, если не
- * прочитаны): группы без нод и ноды, чьи подключения не назначены ни одной
- * группе; `read` — `assignmentsRead`: при `failed` — пункт «не удалось
- * прочитать» с повтором чтения (`reload`).
+ * Третий аргумент — ответы `group list`, `node list` и `client list` (`null`,
+ * если не прочитаны): группы без нод (предупреждение — только если её ноды
+ * наследуют клиенты) и ноды, чьи подключения не назначены ни одной группе;
+ * `read` — `assignmentsRead`: при `failed` — пункт «не удалось прочитать» с
+ * повтором чтения (`reload`).
  */
-export function attentionItems(status, hello, { groups = null, nodes = null, read = 'ready' } = {}) {
+export function attentionItems(status, hello, { groups = null, nodes = null, clients = null, read = 'ready' } = {}) {
   const data = status && typeof status === 'object' ? status : {};
   const items = [];
   for (const node of strings(data.password_missing)) {
@@ -112,7 +124,7 @@ export function attentionItems(status, hello, { groups = null, nodes = null, rea
   }
   if (read === 'failed') {
     items.push({
-      id: 'assignments-unread', tone: 'warn', text: 'Не удалось прочитать группы и ноды — назначения подключений не проверены',
+      id: 'assignments-unread', tone: 'warn', text: 'Не удалось прочитать группы, ноды или клиентов — назначения подключений не проверены',
       action: { label: 'Повторить', type: 'reload' },
     });
   }
@@ -121,11 +133,11 @@ export function attentionItems(status, hello, { groups = null, nodes = null, rea
     for (const group of groups) {
       const name = str(group && group.name);
       if (!name || strings(group.nodes).length > 0) continue;
-      const clients = Number.isInteger(group.clients) ? group.clients : 0;
+      const inheriting = inheritingClients(clients, name);
       items.push({
-        id: `group-nodes:${name}`, tone: clients > 0 ? 'warn' : 'info',
-        text: clients > 0
-          ? `Группа «${name}»: нет нод — клиенты группы (${clients}) получат конфиг без подключений`
+        id: `group-nodes:${name}`, tone: inheriting > 0 ? 'warn' : 'info',
+        text: inheriting > 0
+          ? `Группа «${name}»: нет нод — клиенты, наследующие ноды группы (${inheriting}), получат конфиг без подключений`
           : `Группа «${name}»: нет нод`,
         action: { label: 'Добавить подключения', type: 'group-connections', group: name },
       });

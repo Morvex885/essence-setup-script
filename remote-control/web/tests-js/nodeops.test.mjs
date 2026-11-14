@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   EMPTY, nodeText, syncedNode, syncProblem, syncData, overviewNodes, syncAll,
-  connectionView, assignmentChanges, assignArgv, assignConnections, connSyncArgv, connListArgv, nodeCheckArgv,
+  connectionView, assignmentChanges, assignArgv, assignConnections, connSyncArgv, connListArgv, nodeCheckArgv, syncConnections,
   awgStatusArgv, awgSyncArgv, awgRemovePeerArgv, awgOrphansArgv, awgView,
   TELEGRAM_BATCH, TELEGRAM_COMPONENTS, TELEGRAM_STATUS_ARGV, telegramArgv, telegramResults,
   telegramMenu, telegramBatch, telegramStatus,
@@ -81,6 +81,45 @@ test('«Синхронизировать все»: conn sync по всем но�
   s = syncCtx([ok({ nodes: [] }), err('locked')]);
   assert.equal(await syncAll(s.ctx), null);
   assert.equal(s.state.failed, 1);
+});
+
+test('вкладка «Подключения»: conn sync --name; partial с кодом ноды — один node check и повтор', async () => {
+  const flow = (replies, checks = []) => {
+    const calls = [];
+    const state = { failed: 0 };
+    const ctx = {
+      request: async (argv, options) => { calls.push(['request', argv, options.expect]); return replies.shift(); },
+      nodeRequest: async (node, argv) => { calls.push(['node', node, argv]); return checks.shift(); },
+      failed: () => { state.failed += 1; },
+    };
+    return { ctx, calls, state };
+  };
+  const row = (extra = {}) => ({ nodes: [{ name: 'n', status: 'synced', discovered: ['p'], ...extra }] });
+  let s = flow([ok(row())]);
+  assert.deepEqual(await syncConnections(s.ctx, 'n'), { synced: row().nodes[0] });
+  assert.deepEqual(s.calls, [['request', ['conn', 'sync', '--name', 'n'], 'not_found']]);
+  // Ключ хоста неизвестен: node check решает вопрос, синхронизация повторяется один раз.
+  const locked = err('partial', row({ status: 'unreachable', error: 'host_key_unknown' }));
+  s = flow([locked, ok(row())], [ok({})]);
+  assert.deepEqual(await syncConnections(s.ctx, 'n'), { synced: row().nodes[0] });
+  assert.deepEqual(s.calls.map((call) => call[0]), ['request', 'node', 'request']);
+  assert.deepEqual(s.calls[1], ['node', 'n', ['node', 'check', '--name', 'n']]);
+  // Повторный код после проверки — без второго node check, итог сбоя.
+  s = flow([locked, locked], [ok({})]);
+  assert.equal((await syncConnections(s.ctx, 'n')).synced.error, 'host_key_unknown');
+  assert.deepEqual([s.calls.length, s.state.failed], [3, 1]);
+  // Проверка не удалась — строка partial без повторов (сбой сообщил nodeRequest).
+  s = flow([locked], [err('cancelled')]);
+  assert.equal((await syncConnections(s.ctx, 'n')).synced.error, 'host_key_unknown');
+  assert.deepEqual([s.calls.length, s.state.failed], [2, 0]);
+  // partial без кода ноды — итог сбоя; прочие ошибки — сбой чтения экрану.
+  s = flow([err('partial', row({ status: 'unreachable', error: 'unreachable' }))]);
+  assert.equal((await syncConnections(s.ctx, 'n')).synced.status, 'unreachable');
+  assert.equal(s.state.failed, 1);
+  const gone = err('not_found');
+  s = flow([gone]);
+  assert.deepEqual(await syncConnections(s.ctx, 'n'), { failed: gone });
+  assert.equal(s.state.failed, 0);
 });
 
 test('подключения ноды: группы подключений и проблема синхронизации', () => {

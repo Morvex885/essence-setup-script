@@ -14,13 +14,14 @@ import { errorMessage, asList } from '../format.js';
 import { AceEditor } from '../template-editor.js';
 import { useCommand, useBusy, useMounted, Loaded, ReadFailed } from './kit.js';
 import {
-  TEMPLATE_NAME_MISSING, DEFAULT_TEMPLATE, NO_GROUP, TEMPLATE_KINDS,
-  templateList, templateCreate, templateShow, templateInput, templateCheck,
+  NO_GROUP, TEMPLATE_KINDS, DEFAULT_TEMPLATE,
+  templateList, templateShow, templateInput, templateCheck,
   templateKind, findTemplate, templateContent, problemCounts, annotations,
   droppedRanges, variantOptions, effectiveVariant, problemVariant, inVariant,
 } from './catalog-model.js';
 import {
   settleDraft, unsavedChanges, saveTemplate, importTemplateFile, deleteLabel, deleteTemplate, editTemplateGroups, checkRunner,
+  createTemplate, exportTemplate, offerLostDraft, confirmLeave,
 } from './templates-model.js';
 
 /** Задержка проверки черновика после последней правки, мс. */
@@ -40,15 +41,6 @@ function KindBadge({ row }) {
   return html`<${Badge} tone=${kind.tone}>${kind.label}<//>`;
 }
 
-/** `template show` → файл `<имя>` (`clients.rs::export_template`): сохранённый текст. */
-async function exportTemplate(ctx, name) {
-  const reply = await ctx.request(templateShow(name));
-  const content = reply.ok ? templateContent(reply.data) : null;
-  if (content === null) { ctx.failed(); return; }
-  downloadText(name, content);
-  ctx.notify('success', `Шаблон ${name} сохранён в файл ${name}`);
-}
-
 // ─── Список ─────────────────────────────────────────────────────────────────
 
 function TemplateList({ ctx }) {
@@ -56,26 +48,15 @@ function TemplateList({ ctx }) {
   const [busy, run] = useBusy();
   const mounted = useMounted();
   const create = () => run(async () => {
-    const names = asList(state.data).map((row) => row && row.name).filter((name) => typeof name === 'string');
-    const values = await ctx.form({
-      title: 'Создать шаблон',
-      submit: 'Создать',
-      fields: [
-        { name: 'name', label: 'Имя шаблона', type: 'text', placeholder: 'my.yaml', required: TEMPLATE_NAME_MISSING, autofocus: true },
-        { name: 'from', label: 'На основе', type: 'select', value: names.includes(DEFAULT_TEMPLATE) ? DEFAULT_TEMPLATE : names[0],
-          options: names.map((name) => ({ value: name, label: name })) },
-      ],
-    });
-    if (values === null) return;
-    const reply = await ctx.request(templateCreate(values.name, values.from || null));
-    if (!reply.ok) { ctx.failed(); await state.reload(); return; }
+    const created = await createTemplate(ctx, state.data);
+    if (created === null) return;
     // Как в TUI: созданный шаблон сразу открывается в редакторе — только пока
     // список открыт, иначе поздний ответ уведёт из выбранного раздела.
-    if (reply.data && typeof reply.data.name === 'string') { if (mounted.current) ctx.navigate('templates', reply.data.name); }
+    if (created.name !== null) { if (mounted.current) ctx.navigate('templates', created.name); }
     else await state.reload();
   });
   const menu = (row) => {
-    const items = [{ label: 'Экспорт', icon: 'download', disabled: busy, onClick: () => run(() => exportTemplate(ctx, row.name)) }];
+    const items = [{ label: 'Экспорт', icon: 'download', disabled: busy, onClick: () => run(() => exportTemplate(ctx, row.name, downloadText)) }];
     if (templateKind(row) !== 'builtin') {
       items.push({
         label: deleteLabel(row), icon: 'trash-2', danger: true, disabled: busy,
@@ -172,11 +153,7 @@ function TemplateEditor({ ctx, name }) {
     if (gone.current || !mounted.current) return;
     gone.current = true;
     ctx.setLeaveGuard(null);
-    ctx.notify('warn', `Шаблон «${name}» не найден.`);
-    const lost = unsaved.current;
-    if (lost !== null && await ctx.confirm({
-      title: 'Шаблон не найден', plan: [], question: `Скачать несохранённые изменения в файл ${name}?`, yes: 'Скачать',
-    })) downloadText(name, lost);
+    await offerLostDraft(ctx, name, unsaved.current, downloadText);
     leave('templates');
   };
   useEffect(() => {
@@ -188,9 +165,7 @@ function TemplateEditor({ ctx, name }) {
   // Несохранённые изменения (и правки поверх идущего сохранения): уход с экрана — только после вопроса.
   useEffect(() => {
     if (gone.current) return;
-    ctx.setLeaveGuard(guarded
-      ? () => ctx.confirm({ title: 'Несохранённые изменения', question: 'Уйти без сохранения?', yes: 'Уйти', tone: 'danger' })
-      : null);
+    ctx.setLeaveGuard(guarded ? () => confirmLeave(ctx) : null);
   }, [guarded]);
   useEffect(() => () => ctx.setLeaveGuard(null), []);
 
@@ -266,7 +241,7 @@ function TemplateEditor({ ctx, name }) {
 
   const back = { href: ctx.href('templates'), label: 'Шаблоны' };
   const more = [
-    { label: 'Экспорт сохранённого', icon: 'download', disabled: busy || content === null, onClick: () => run(() => exportTemplate(ctx, name)) },
+    { label: 'Экспорт сохранённого', icon: 'download', disabled: busy || content === null, onClick: () => run(() => exportTemplate(ctx, name, downloadText)) },
     ...(dirty ? [{ label: 'Сбросить изменения', icon: 'x', disabled: busy, onClick: replaceText }] : []),
     ...(row && kind !== 'builtin' ? [{ label: deleteLabel(row), icon: 'trash-2', danger: true, disabled: busy, onClick: remove }] : []),
   ];

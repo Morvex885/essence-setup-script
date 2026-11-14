@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   settleDraft, unsavedChanges, saveTemplate, importTemplateFile, deleteLabel, deleteTemplate, editTemplateGroups, checkRunner,
-  GROUPS_UNCHANGED, DRAFT_REPLACED,
+  createTemplate, exportTemplate, offerLostDraft, confirmLeave, GROUPS_UNCHANGED, DRAFT_REPLACED,
 } from '../assets/js/screens/templates-model.js';
 import { TEMPLATE_FILE_UNREADABLE, DEFAULT_GROUP_HINT, DEFAULT_TEMPLATE } from '../assets/js/screens/catalog-model.js';
 import { isFailure } from '../assets/js/flows.js';
@@ -163,4 +163,59 @@ test('очередь проверок: один запрос, из ожидаю�
   assert.deepEqual(delivered, [['r:c', 'c']], 'после close ответы не доставляются');
   runner.submit('e');
   assert.deepEqual(started, ['a', 'c', 'd']);
+});
+
+test('создание: форма → template create; отмена, сбой и имя созданного', async () => {
+  const rows = [{ name: 'a.yaml' }, { name: DEFAULT_TEMPLATE }, null];
+  const cancelled = fakeCtx({ answers: [null] });
+  assert.equal(await createTemplate(cancelled, rows), null);
+  assert.deepEqual(cancelled.calls.map((call) => call[0]), ['form'], 'отмена — без команды');
+  // Основа по умолчанию — default.yaml из списка; варианты — имена строк.
+  const form = cancelled.calls[0][1];
+  const from = form.fields.find((field) => field.name === 'from');
+  assert.deepEqual([from.value, from.options.map((option) => option.value)], [DEFAULT_TEMPLATE, ['a.yaml', DEFAULT_TEMPLATE]]);
+
+  const created = fakeCtx({ answers: [{ name: 'my', from: 'a.yaml' }], replies: [{ ok: true, data: { name: 'my.yaml' } }] });
+  assert.deepEqual(await createTemplate(created, rows), { name: 'my.yaml' });
+  assert.deepEqual(created.calls[1], ['request', ['template', 'create', '--name', 'my', '--from', 'a.yaml']]);
+  // Без основы — без --from; ответ без имени — список перечитывается.
+  const bare = fakeCtx({ answers: [{ name: 'x', from: '' }], replies: [{ ok: true, data: {} }] });
+  assert.deepEqual(await createTemplate(bare, []), { name: null });
+  assert.deepEqual(bare.calls[1], ['request', ['template', 'create', '--name', 'x']]);
+
+  const refused = fakeCtx({ answers: [{ name: 'x', from: DEFAULT_TEMPLATE }], replies: [{ ok: false, error: { code: 'exists', message: '' } }] });
+  assert.deepEqual(await createTemplate(refused, rows), { name: null });
+  assert.deepEqual(refused.calls.slice(2), [['failed']]);
+});
+
+test('экспорт: template show → save(имя, текст); сбой — failed без файла', async () => {
+  const saved = [];
+  const save = (name, text) => saved.push([name, text]);
+  const ok = fakeCtx({ replies: [{ ok: true, data: { name: 'a.yaml', content: 'proxies:\n' } }] });
+  assert.equal(await exportTemplate(ok, 'a.yaml', save), true);
+  assert.deepEqual(ok.calls[0], ['request', ['template', 'show', '--name', 'a.yaml']]);
+  assert.deepEqual(saved, [['a.yaml', 'proxies:\n']]);
+  assert.equal(ok.calls[1][1], 'success');
+  for (const reply of [{ ok: false, error: { code: 'not_found', message: '' } }, { ok: true, data: {} }]) {
+    const failed = fakeCtx({ replies: [reply] });
+    assert.equal(await exportTemplate(failed, 'a.yaml', save), false);
+    assert.deepEqual(failed.calls.slice(1), [['failed']]);
+  }
+  assert.equal(saved.length, 1);
+});
+
+test('исчезнувший шаблон: черновик скачивается только по согласию; уход — вопрос confirm', async () => {
+  const saved = [];
+  const save = (name, text) => saved.push([name, text]);
+  const clean = fakeCtx();
+  assert.equal(await offerLostDraft(clean, 'a.yaml', null, save), false);
+  assert.deepEqual(clean.calls.map((call) => call[0]), ['notify'], 'без черновика — без вопроса');
+  const declined = fakeCtx({ answers: [false] });
+  assert.equal(await offerLostDraft(declined, 'a.yaml', 'draft', save), false);
+  const accepted = fakeCtx({ answers: [true] });
+  assert.equal(await offerLostDraft(accepted, 'a.yaml', 'draft', save), true);
+  assert.deepEqual(saved, [['a.yaml', 'draft']]);
+  const leave = fakeCtx({ answers: [true] });
+  assert.equal(await confirmLeave(leave), true);
+  assert.deepEqual(leave.calls.map((call) => call[0]), ['confirm']);
 });

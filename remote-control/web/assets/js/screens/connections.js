@@ -5,9 +5,8 @@
 import { html, useEffect, useRef, useState } from '../../vendor/preact-htm.js';
 import { Card, DataTable, Chips, Button, Badge } from '../ui.js';
 import { Icon } from '../icons.js';
-import { NODE_CODES } from '../flows.js';
 import { useBusy, useMounted, ReadFailed } from './kit.js';
-import { syncedNode, connectionView, assignConnections, connSyncArgv, connListArgv, nodeCheckArgv } from './nodeops-model.js';
+import { connectionView, assignConnections, syncConnections, connListArgv } from './nodeops-model.js';
 import { editAliases } from './nodes-model.js';
 
 export function NodeConnections({ ctx, name }) {
@@ -25,31 +24,15 @@ export function NodeConnections({ ctx, name }) {
     fail(reply);
   };
 
-  /** `conn sync --name`; при `partial` с кодом ноды — один раз `node check`. */
+  /** `conn sync --name` (`syncConnections`); `false` — сбой чтения. */
   const refresh = async () => {
-    let resolve = true;
-    for (;;) {
-      const reply = await ctx.request(connSyncArgv(name), { expect: 'not_found' });
-      if (reply.ok) {
-        synced.current = syncedNode(reply.data, name);
-        return true;
-      }
-      if (reply.error && reply.error.code === 'partial') {
-        synced.current = syncedNode(reply.error, name);
-        const code = synced.current && typeof synced.current.error === 'string' ? synced.current.error : '';
-        if (resolve && NODE_CODES.includes(code)) {
-          // Строка синхронизации называет только код; `node check` вернёт
-          // состояние с подробностями (отпечатками) для обработчика.
-          resolve = false;
-          if ((await ctx.nodeRequest(name, nodeCheckArgv(name), null)).ok) continue;
-        } else {
-          ctx.failed();
-        }
-        return true;
-      }
-      failure(reply);
+    const result = await syncConnections(ctx, name);
+    if (result.failed) {
+      failure(result.failed);
       return false;
     }
+    synced.current = result.synced;
+    return true;
   };
 
   const list = async () => {

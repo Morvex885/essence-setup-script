@@ -27,8 +27,14 @@ const LIMIT: usize = 200;
 const MAX_VARIANTS: usize = 16;
 /// Schema problems collected per request, all variants together.
 const PROBLEM_BUDGET: usize = 1000;
-/// JSON nodes given to the validator per request, all variants together.
+/// JSON nodes the schema stage validates or copies per request, all
+/// variants together.
 const WORK_BUDGET: usize = 4_000_000;
+/// Key and string bytes the schema stage validates, copies or keeps per
+/// request, all variants together: documents and copies of their parts,
+/// paths and messages of problems. Every such allocation is charged before
+/// it is made; the first one over the budget stops the check (`truncated`).
+const BYTE_BUDGET: usize = 64 << 20;
 /// Nesting of YAML collections at most; deeper is a `yaml` error before any
 /// recursive step (the tree loader, `to_json`, `locate`, the validator).
 const MAX_DEPTH: usize = 128;
@@ -160,7 +166,13 @@ pub struct Report {
     pub variants: Vec<Variant>,
 }
 
+/// A problem; every message is cut to `MESSAGE_CHARS` here (marker tags and
+/// YAML errors may quote long parts of the template).
 fn problem(line: usize, column: usize, level: &'static str, code: &'static str, message: String) -> Problem {
+    let message = match message.char_indices().nth(MESSAGE_CHARS) {
+        Some((end, _)) => message[..end].to_owned(),
+        None => message,
+    };
     Problem { line, column, level, code, message, path: None, variant: None }
 }
 
@@ -200,26 +212,29 @@ pub fn check(content: &str, groups: &[String]) -> Report {
     let total = content.split_inclusive('\n').count();
     let mut variants = Vec::with_capacity(tags.len() + 1);
     let mut found: Vec<Vec<Problem>> = Vec::with_capacity(tags.len() + 1);
-    let mut checked: HashMap<Vec<usize>, usize> = HashMap::new();
     let mut budget = Budget::default();
     // The variant without groups: no group is named "", so no block is kept.
     for (index, tag) in std::iter::once(None).chain(tags.into_iter().map(Some)).enumerate() {
         if budget.exhausted { break; }
         let kept = process_lines(content, tag.as_deref().unwrap_or(""));
-        let numbers: Vec<usize> = kept.iter().map(|(line, _)| *line).collect();
-        let list = match checked.get(&numbers) {
+        // Variants are told apart by their dropped ranges (kept lines are
+        // the rest): no copy of every kept line number per variant.
+        let dropped = dropped(&kept, total);
+        let list = match variants.iter().position(|variant: &Variant| variant.dropped == dropped) {
             // The same lines as a checked variant: the same problems.
-            Some(&same) => found[same].clone(),
+            Some(same) => {
+                if !budget.charge(0, problem_bytes(&found[same])) { break; }
+                found[same].clone()
+            }
             None => {
                 let list = check_variant(&kept, &mut budget);
                 // A variant cut by the budget would look like it lacks the
                 // problems of the others: only the first one is kept partial.
                 if budget.exhausted && index > 0 { break; }
-                checked.insert(numbers, found.len());
                 list
             }
         };
-        variants.push(Variant { tag, dropped: dropped(&kept, total) });
+        variants.push(Variant { tag, dropped });
         found.push(list);
     }
     if budget.exhausted {
@@ -293,28 +308,45 @@ fn source_position(kept: &[(usize, &str)], marker: &Marker) -> (usize, usize) {
     (line, marker.col() + 1)
 }
 
-/// The request's share of work: schema problems and validated JSON nodes.
+/// The request's share of work: schema problems, nodes and bytes. Charged
+/// before the work; a charge over a budget is refused and stops the check.
 #[derive(Default)]
 struct Budget {
     problems: usize,
     work: usize,
+    bytes: usize,
     exhausted: bool,
 }
 
 impl Budget {
-    /// Spend on validating `nodes` nodes; `false` — nothing is left.
-    fn spend(&mut self, nodes: usize) -> bool {
-        self.work += nodes;
-        if self.work > WORK_BUDGET { self.exhausted = true; }
-        !self.exhausted
+    /// Charge `nodes` nodes and `bytes` bytes about to be validated, copied
+    /// or kept; `false` — over a budget (nothing is charged), stop.
+    fn charge(&mut self, nodes: usize, bytes: usize) -> bool {
+        let work = self.work.saturating_add(nodes);
+        let total = self.bytes.saturating_add(bytes);
+        if self.exhausted || work > WORK_BUDGET || total > BYTE_BUDGET {
+            self.exhausted = true;
+            return false;
+        }
+        (self.work, self.bytes) = (work, total);
+        true
     }
 
-    /// Count one problem; `false` — the problem budget is used up.
-    fn take_problem(&mut self) -> bool {
-        if self.problems >= PROBLEM_BUDGET { self.exhausted = true; }
+    /// Count one problem keeping `bytes` bytes; `false` — a budget is used up.
+    fn take_problem(&mut self, bytes: usize) -> bool {
+        if self.problems >= PROBLEM_BUDGET {
+            self.exhausted = true;
+            return false;
+        }
+        if !self.charge(0, bytes) { return false; }
         self.problems += 1;
-        !self.exhausted
+        true
     }
+}
+
+/// Bytes a list of problems keeps (paths and messages).
+fn problem_bytes(problems: &[Problem]) -> usize {
+    problems.iter().map(|p| p.message.len() + p.path.as_ref().map_or(0, String::len)).sum()
 }
 
 /// Problems of one variant.
@@ -344,8 +376,7 @@ fn check_variant(kept: &[(usize, &str)], budget: &mut Budget) -> Vec<Problem> {
         Ok(documents) => documents,
         Err(error) => {
             let (line, column) = source_position(kept, error.marker());
-            let message: String = format!("Ошибка YAML: {}.", error.info()).chars().take(MESSAGE_CHARS).collect();
-            problems.push(problem(line, column, "error", "yaml", message));
+            problems.push(problem(line, column, "error", "yaml", format!("Ошибка YAML: {}.", error.info())));
             return problems;
         }
     };
@@ -357,6 +388,9 @@ fn check_variant(kept: &[(usize, &str)], budget: &mut Budget) -> Vec<Problem> {
     let mut found = Vec::new();
     schema_errors(&instance, budget, &mut found);
     for (path, what) in found {
+        // `locate` and `masked` copy the path's segments once more; the
+        // masked path is at most as long as the raw one.
+        if !budget.charge(0, 2 * path.len() + 4 * MESSAGE_CHARS) { break; }
         let marker = root.map_or_else(Marker::default, |root| locate(root, &path));
         let (line, column) = source_position(kept, &marker);
         let path = masked(&instance, &path);
@@ -467,10 +501,10 @@ fn too_large(text: &str) -> Option<(Marker, Excess)> {
     None
 }
 
-/// One step from a collection to a child.
+/// One step from a collection to a child; `large` walks with borrowed keys.
 #[derive(Clone)]
-enum Step {
-    Key(String),
+enum Step<K = String> {
+    Key(K),
     Index(usize),
 }
 
@@ -481,26 +515,49 @@ fn pointer(steps: &[Step]) -> String {
     }).collect()
 }
 
-/// Nodes of a JSON value (depth is bounded by `MAX_DEPTH`).
-fn nodes(value: &Value) -> usize {
-    1 + match value {
-        Value::Array(items) => items.iter().map(nodes).sum(),
-        Value::Object(fields) => fields.values().map(nodes).sum(),
-        _ => 0,
+/// Bytes of the steps or of their pointer, at most (escapes double a key).
+fn steps_bytes<K: AsRef<str>>(steps: &[Step<K>]) -> usize {
+    steps.iter().map(|step| match step {
+        Step::Key(key) => 2 * key.as_ref().len() + 1,
+        Step::Index(_) => 21,
+    }).sum()
+}
+
+/// Nodes and key and string bytes of a JSON value.
+#[derive(Clone, Copy, Default)]
+struct Size {
+    nodes: usize,
+    bytes: usize,
+}
+
+/// The size of a JSON value (depth is bounded by `MAX_DEPTH`).
+fn size(value: &Value) -> Size {
+    let mut total = Size { nodes: 1, bytes: 0 };
+    let mut add = |child: Size, key: usize| {
+        total.nodes += child.nodes;
+        total.bytes += child.bytes + key;
+    };
+    match value {
+        Value::String(text) => return Size { nodes: 1, bytes: text.len() },
+        Value::Array(items) => items.iter().for_each(|item| add(size(item), 0)),
+        Value::Object(fields) => fields.iter().for_each(|(key, field)| add(size(field), key.len())),
+        _ => {}
     }
+    total
 }
 
 /// The outermost collections below the root worth splitting: more than
 /// `SPLIT_NODES` nodes and several items (a sequence) or more than
-/// `MAP_ENTRIES` entries (a mapping). Returns the node count of `value`.
-fn large(value: &Value, steps: &mut Vec<Step>, found: &mut Vec<Vec<Step>>) -> usize {
+/// `MAP_ENTRIES` entries (a mapping). Keys are borrowed while walking; a
+/// found path is copied within the budget. Returns the node count of `value`.
+fn large<'a>(value: &'a Value, steps: &mut Vec<Step<&'a str>>, found: &mut Vec<Vec<Step>>, budget: &mut Budget) -> usize {
     let start = found.len();
     let (size, splittable) = match value {
         Value::Array(items) => {
             let mut size = 1;
             for (index, item) in items.iter().enumerate() {
                 steps.push(Step::Index(index));
-                size += large(item, steps, found);
+                size += large(item, steps, found, budget);
                 steps.pop();
             }
             (size, items.len() > 1)
@@ -508,8 +565,8 @@ fn large(value: &Value, steps: &mut Vec<Step>, found: &mut Vec<Vec<Step>>) -> us
         Value::Object(fields) => {
             let mut size = 1;
             for (key, field) in fields {
-                steps.push(Step::Key(key.clone()));
-                size += large(field, steps, found);
+                steps.push(Step::Key(key.as_str()));
+                size += large(field, steps, found, budget);
                 steps.pop();
             }
             (size, fields.len() > MAP_ENTRIES)
@@ -518,7 +575,12 @@ fn large(value: &Value, steps: &mut Vec<Step>, found: &mut Vec<Vec<Step>>) -> us
     };
     if !steps.is_empty() && splittable && size > SPLIT_NODES {
         found.truncate(start);
-        found.push(steps.clone());
+        if budget.charge(0, steps_bytes(steps)) {
+            found.push(steps.iter().map(|step| match step {
+                Step::Key(key) => Step::Key((*key).to_owned()),
+                Step::Index(index) => Step::Index(*index),
+            }).collect());
+        }
     }
     size
 }
@@ -548,31 +610,40 @@ fn split_children(value: &Value) -> Vec<(Step, Value)> {
 /// lists keep every anyOf branch): its large collections are cut to a
 /// skeleton (a sequence keeps its first item, a mapping its first
 /// `MAP_ENTRIES` entries), and every other child is validated in its
-/// top-level key with that collection holding only this child.
+/// top-level key with that collection holding only this child. Every copy
+/// (skeleton, children, a part's top-level key) and every kept path is
+/// charged to the budget before it is made.
 fn schema_errors(document: &Value, budget: &mut Budget, out: &mut Vec<(String, String)>) {
     // `ready()` was asked before `check`; without a schema nothing is checked.
     let Ok(Schema { validator, .. }) = COMPILED.as_ref() else { return };
-    if !budget.spend(nodes(document)) || validator.is_valid(document) { return; }
+    let whole = size(document);
+    if !budget.charge(whole.nodes, whole.bytes) || validator.is_valid(document) { return; }
     let mut split = Vec::new();
-    large(document, &mut Vec::new(), &mut split);
+    large(document, &mut Vec::new(), &mut split, budget);
+    if budget.exhausted { return; }
     if split.is_empty() {
         for error in validator.iter_errors(document) {
-            if !budget.take_problem() { return; }
-            out.push((error.instance_path().as_str().to_owned(), schema_what(error.kind())));
+            let path = error.instance_path().as_str();
+            let what = schema_what(error.kind());
+            if !budget.take_problem(path.len() + what.len()) { return; }
+            out.push((path.to_owned(), what));
         }
         return;
     }
+    if !budget.charge(whole.nodes, whole.bytes) { return; }
     let mut skeleton = document.clone();
     let mut parts = Vec::with_capacity(split.len());
     // Items of split sequences come from their parts (the first one too).
     let mut sequences = Vec::new();
-    for steps in &split {
-        let Some(collection) = at_mut(&mut skeleton, steps) else { continue };
-        parts.push((steps.clone(), split_children(collection)));
+    for steps in split {
+        let Some(collection) = at_mut(&mut skeleton, &steps) else { continue };
+        let children = size(collection);
+        if !budget.charge(children.nodes, children.bytes + steps_bytes(&steps)) { return; }
+        let children = split_children(collection);
         match collection {
             Value::Array(items) => {
                 items.truncate(1);
-                sequences.push(format!("{}/", pointer(steps)));
+                sequences.push(format!("{}/", pointer(&steps)));
             }
             Value::Object(fields) => {
                 let kept: Map<String, Value> = std::mem::take(fields).into_iter().take(MAP_ENTRIES).collect();
@@ -580,16 +651,22 @@ fn schema_errors(document: &Value, budget: &mut Budget, out: &mut Vec<(String, S
             }
             _ => {}
         }
+        parts.push((steps, children));
     }
     let mut found = Vec::new();
     schema_errors(&skeleton, budget, &mut found);
     out.extend(found.into_iter().filter(|(path, _)| !sequences.iter().any(|prefix| path.starts_with(prefix.as_str()))));
     for (steps, children) in parts {
-        let Some((Step::Key(top), below)) = steps.split_first().map(|(first, rest)| (first.clone(), rest)) else { continue };
+        let Some((Step::Key(top), below)) = steps.split_first() else { continue };
+        if !budget.charge(0, steps_bytes(&steps)) { return; }
         let base = pointer(&steps);
+        // Each part copies the top-level key of the skeleton, the key and
+        // two pointers to the child.
+        let copy = skeleton.get(top).map_or_else(Size::default, size);
         for (step, child) in children {
-            if budget.exhausted { return; }
-            let mut subtree = skeleton.get(&top).cloned().unwrap_or(Value::Null);
+            let step_bytes = steps_bytes(std::slice::from_ref(&step));
+            if !budget.charge(copy.nodes, copy.bytes + top.len() + step_bytes + 2 * (base.len() + step_bytes)) { return; }
+            let mut subtree = skeleton.get(top).cloned().unwrap_or(Value::Null);
             let (inner, original) = match &step {
                 Step::Index(index) => (Value::Array(vec![child]), format!("{base}/{index}")),
                 Step::Key(key) => (Value::Object(Map::from_iter([(key.clone(), child)])), format!("{base}{}", pointer(std::slice::from_ref(&step)))),
@@ -604,6 +681,7 @@ fn schema_errors(document: &Value, budget: &mut Budget, out: &mut Vec<(String, S
             schema_errors(&part, budget, &mut found);
             for (path, what) in found {
                 if let Some(rest) = path.strip_prefix(shown.as_str()).filter(|rest| rest.is_empty() || rest.starts_with('/')) {
+                    if !budget.charge(0, original.len() + rest.len() + what.len()) { return; }
                     out.push((format!("{original}{rest}"), what));
                 } else if !path.is_empty() && base.strip_prefix(path.as_str()).is_some_and(|rest| rest.starts_with('/')) {
                     // An ancestor below the root (an anyOf item holding the
@@ -627,7 +705,7 @@ fn schema_message(what: &str, path: &str) -> String {
     } else {
         format!("«{}»", path[1..].replace("~1", "/").replace("~0", "~"))
     };
-    format!("{place}: {what}.").chars().take(MESSAGE_CHARS).collect()
+    format!("{place}: {what}.")
 }
 
 fn schema_what(kind: &ValidationErrorKind) -> String {
@@ -888,6 +966,10 @@ mod tests {
         // A tag without a group is never generated: no variant for it.
         let tags: Vec<_> = report.variants.iter().map(|v| v.tag.as_deref()).collect();
         assert_eq!(tags, [None, Some("PC"), Some("ROUTER")]);
+        // A long tag is not copied into the messages whole.
+        let report = check(&format!("proxies:\n# --- {} ---\n", "G".repeat(100_000)), &groups());
+        assert_eq!(codes(&report), [(2, "marker_unclosed", None), (2, "marker_unknown_group", None)]);
+        assert!(report.problems.iter().all(|p| p.message.chars().count() <= MESSAGE_CHARS), "{:?}", codes(&report));
     }
 
     #[test]
@@ -939,6 +1021,30 @@ mod tests {
         assert!(report.truncated);
         assert!(codes(&report).iter().any(|(_, code, _)| *code == "check_limit"));
         assert!(report.warnings <= PROBLEM_BUDGET + 1, "{}", report.warnings);
+    }
+
+    #[test]
+    fn long_paths_and_copies_of_large_parts_stay_within_the_byte_budget() {
+        // Under 1 MiB of text each: a 600 KiB provider name (an explicit
+        // key) on every path of 1000 (validated whole) or 100 000 (split
+        // item by item) wrong items; and a 512 KiB string aliased 12 times
+        // next to a split list, copied with every part of it.
+        let key = "k".repeat(600 * 1024);
+        let alias = format!("proxies:\nx: &s \"{}\"\ndns:\n  fallback: [{}]\n  nameserver: [{}{{}}]\n",
+            "s".repeat(512 * 1024), ["*s"; 12].join(","), "'',".repeat(150_000));
+        let cases = [1000, 100_000].map(|items| format!("proxies:\nproxy-providers:\n  ? {key}\n  :\n    override:\n      override-expr: [{}]\n",
+            vec!["{}"; items].join(","))).into_iter().chain([alias]);
+        for content in cases {
+            assert!(content.len() < crate::request_input::Input::MAX_VALUE);
+            let started = std::time::Instant::now();
+            let report = check(&content, &groups());
+            assert!(started.elapsed().as_secs() < 10, "{:?}", started.elapsed());
+            assert!(report.truncated && codes(&report).iter().any(|(_, code, _)| *code == "check_limit"),
+                "{:?}", codes(&report));
+            assert!(report.problems.iter().all(|p| p.code != "yaml"), "{:?}", codes(&report));
+            // Kept paths are masked: the output stays small.
+            assert!(problem_bytes(&report.problems) < 64 * 1024, "{}", problem_bytes(&report.problems));
+        }
     }
 
     #[test]

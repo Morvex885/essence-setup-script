@@ -1,15 +1,70 @@
-// Действия редактора шаблонов (`tui/src/clients.rs::edit_template`,
-// `template_groups`, удаление) без DOM: зависимости — объект `ctx` экрана
-// (`runConfirmed`, `isFailure`, `failed`, `notify`, `request`, `confirm`, `form`).
-// Экран `templates.js` только перечитывает данные и обновляет черновик.
+// Действия списка и редактора шаблонов (`tui/src/clients.rs::templates`,
+// `export_template`, `edit_template`, `template_groups`, удаление) без DOM:
+// зависимости — объект `ctx` экрана (`runConfirmed`, `isFailure`, `failed`,
+// `notify`, `request`, `confirm`, `form`) и функция сохранения файла `save(имя,
+// текст)` (в браузере — `downloadText`). Экран `templates.js` только
+// перечитывает данные, переходит по результату и обновляет черновик.
 import { asList } from '../format.js';
 import {
-  TEMPLATE_FILE_UNREADABLE, DEFAULT_TEMPLATE, templateImport, templateInput, templateDelete, templateGroups,
-  templateKind, groupOptions,
+  TEMPLATE_FILE_UNREADABLE, TEMPLATE_NAME_MISSING, DEFAULT_TEMPLATE, templateImport, templateInput, templateDelete,
+  templateGroups, templateCreate, templateShow, templateContent, templateKind, groupOptions,
 } from './catalog-model.js';
 
 export const GROUPS_UNCHANGED = 'Изменений нет.';
 export const DRAFT_REPLACED = 'Импорт заменит несохранённые изменения в редакторе.';
+
+/**
+ * «Создать шаблон»: форма имени и основы (строки `template list`, по
+ * умолчанию `default.yaml`), затем `template create`. `null` — форма
+ * отменена, ничего не изменилось; иначе `{ name }`: имя созданного шаблона
+ * (экран открывает редактор) либо `null` — сбой (сообщение показано) или
+ * ответ без имени, экран перечитывает список.
+ */
+export async function createTemplate(ctx, rows) {
+  const names = asList(rows).map((row) => row && row.name).filter((name) => typeof name === 'string');
+  const values = await ctx.form({
+    title: 'Создать шаблон',
+    submit: 'Создать',
+    fields: [
+      { name: 'name', label: 'Имя шаблона', type: 'text', placeholder: 'my.yaml', required: TEMPLATE_NAME_MISSING, autofocus: true },
+      { name: 'from', label: 'На основе', type: 'select', value: names.includes(DEFAULT_TEMPLATE) ? DEFAULT_TEMPLATE : names[0],
+        options: names.map((name) => ({ value: name, label: name })) },
+    ],
+  });
+  if (values === null || values === undefined) return null;
+  const reply = await ctx.request(templateCreate(values.name, values.from || null));
+  if (!reply.ok) { ctx.failed(); return { name: null }; }
+  return { name: reply.data && typeof reply.data.name === 'string' ? reply.data.name : null };
+}
+
+/** «Экспорт» (`clients.rs::export_template`): сохранённый текст `template show` → `save(имя, текст)`. `true` — сохранён. */
+export async function exportTemplate(ctx, name, save) {
+  const reply = await ctx.request(templateShow(name));
+  const content = reply.ok ? templateContent(reply.data) : null;
+  if (content === null) { ctx.failed(); return false; }
+  save(name, content);
+  ctx.notify('success', `Шаблон ${name} сохранён в файл ${name}`);
+  return true;
+}
+
+/**
+ * Шаблон исчез (удалён другим клиентом): сообщение и — при несохранённом
+ * черновике `lost` — вопрос, скачать ли его через `save(имя, текст)`.
+ * `true` — черновик сохранён в файл.
+ */
+export async function offerLostDraft(ctx, name, lost, save) {
+  ctx.notify('warn', `Шаблон «${name}» не найден.`);
+  if (lost === null || !(await ctx.confirm({
+    title: 'Шаблон не найден', plan: [], question: `Скачать несохранённые изменения в файл ${name}?`, yes: 'Скачать',
+  }))) return false;
+  save(name, lost);
+  return true;
+}
+
+/** Вопрос защиты ухода с несохранённым черновиком (`ctx.setLeaveGuard`): `true` — уйти. */
+export function confirmLeave(ctx) {
+  return ctx.confirm({ title: 'Несохранённые изменения', question: 'Уйти без сохранения?', yes: 'Уйти', tone: 'danger' });
+}
 
 /**
  * Черновик после успешного сохранения текста `sent`: тот же текст — сохранён
