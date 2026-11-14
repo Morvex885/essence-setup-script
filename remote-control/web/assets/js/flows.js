@@ -113,6 +113,14 @@ export function isFailure(reply) {
 }
 
 /**
+ * Команда не выполнилась и ничего не изменила (`confirm.rs::retryable`): не
+ * отказ от плана и не `partial` — форма, отправившая её, открывается снова с введённым.
+ */
+export function retryable(reply) {
+  return isFailure(reply) && !(reply.error && reply.error.code === 'partial');
+}
+
+/**
  * Разрешение состояния ноды (`nodes.rs::handle_node_codes`): `true`, если
  * условие устранено и исходную команду можно повторить.
  */
@@ -151,16 +159,40 @@ export async function handleNodeCodes(reply, name, deps) {
  * для команды под подтверждением либо `null`. После устранённого состояния
  * ноды исходная команда повторяется. Оставшийся сбой (не отказ от плана)
  * сообщается `OPERATION_FAILED` (`nodes.rs::outcome`); текст ядра (`error.message`)
- * уже показал `request` — вызывающий экран сбой не повторяет.
+ * уже показал `request` — вызывающий экран сбой не повторяет. Коды `expect`
+ * (команда без подтверждения) экран обрабатывает сам: `request` их не
+ * показывает, `OPERATION_FAILED` нет.
  */
-export async function nodeRequest(name, argv, review, deps) {
+export async function nodeRequest(name, argv, review, deps, { expect = null } = {}) {
   for (;;) {
     const reply = review
       ? await runConfirmed(review.title, review.question, argv, { request: deps.request, confirm: deps.confirm, notify: deps.notify })
-      : await deps.request([...argv], {});
+      : await deps.request([...argv], expect === null ? {} : { expect });
     if (reply.ok) return reply;
+    if (!review && expect !== null && reply.error && reply.error.code === expect) return reply;
     if (await handleNodeCodes(reply, name, deps)) continue;
     if (isFailure(reply) && deps.notify) deps.notify('warn', OPERATION_FAILED);
     return reply;
   }
+}
+
+/** Значение отмены окна по виду (как Esc и «Отмена»): `confirm` → `false`, `show` → `undefined`, прочие → `null`. */
+const CANCEL = { confirm: false, show: undefined };
+export const cancelValue = (kind) => (kind in CANCEL ? CANCEL[kind] : null);
+
+/** Методы `ctx` с окнами-вопросами и вид окна (`dialogs.js`). */
+const DIALOG_KINDS = { confirm: 'confirm', askSecret: 'secret', ask: 'text', choose: 'choose', form: 'form', show: 'show' };
+
+/**
+ * Окна экрана: пока `alive()` — окна `api`, после ухода с экрана —
+ * сразу значение отмены без окна. Поток ушедшего экрана (цикл меню, повтор
+ * формы) завершается сам и не открывает окна поверх нового раздела; окна
+ * операций (`operation`) не затрагиваются — их закрывает сама команда.
+ */
+export function screenDialogs(api, alive) {
+  const scoped = { ...api };
+  for (const [method, kind] of Object.entries(DIALOG_KINDS)) {
+    scoped[method] = (props) => (alive() ? api[method](props) : Promise.resolve(cancelValue(kind)));
+  }
+  return scoped;
 }

@@ -244,6 +244,31 @@ pub async fn check<T: RemoteTransport>(session: &mut Session, invocation: &Invoc
     Ok(json!({"name": name, "reachable": true}))
 }
 
+/// The plan of `node trust-host-key`: the node, its pinned and the new fingerprint.
+fn trust_plan(name: &str, node: &Node, previous: &[Fingerprint], fingerprint: &Fingerprint) -> Plan {
+    let known = previous.iter().map(Fingerprint::as_str).collect::<Vec<_>>().join(", ");
+    Plan::new(vec![
+        format!("Нода: {name} {}:{}", node.ip, node.port),
+        format!("Прежние отпечатки: {}", if known.is_empty() { "нет" } else { &known }),
+        format!("Новый отпечаток: {fingerprint}"),
+        "Прежние записи known_hosts для узла будут удалены.".to_owned(),
+    ], "")
+}
+
+/// `trust_plan` again under the mutation lock: another node under the name or
+/// a different plan (address, pins) is `plan_changed` with the current plan.
+fn trust_recheck(state: &crate::state::State, name: &str, node: &Node, fingerprint: &Fingerprint, planned: &Plan,
+    invocation: &Invocation) -> Result<()>
+{
+    let config = state.load_config()?;
+    let current = find(&config, name)?;
+    let plan = trust_plan(name, current, &pins(&state.load_known_hosts()?, current)?, fingerprint);
+    if current.id != node.id || plan.lines != planned.lines {
+        return Err(plan.changed(invocation));
+    }
+    Ok(())
+}
+
 /// Trust exactly the operator-supplied fingerprint: a successful connection
 /// that expects it proves the server presents it. Nothing is written before
 /// that proof and the confirmed plan.
@@ -263,19 +288,10 @@ pub async fn trust_host_key<T: RemoteTransport>(session: &mut Session, invocatio
         }
         error.with_extra("name", name.clone())
     })?;
-    let known = previous.iter().map(Fingerprint::as_str).collect::<Vec<_>>().join(", ");
-    Plan::new(vec![
-        format!("Нода: {name} {}:{}", node.ip, node.port),
-        format!("Прежние отпечатки: {}", if known.is_empty() { "нет" } else { &known }),
-        format!("Новый отпечаток: {fingerprint}"),
-        "Прежние записи known_hosts для узла будут удалены.".to_owned(),
-    ], "").confirm(invocation)?;
+    let plan = trust_plan(&name, &node, &previous, &fingerprint);
+    plan.confirm(invocation)?;
     session.mutate("trust_host_key", |state| {
-        let config = state.load_config()?;
-        let current = find(&config, &name)?;
-        if current.id != node.id || current.ip != node.ip || current.port != node.port {
-            return Err(RcError::new("plan_changed", "План изменился: проверьте его и подтвердите заново."));
-        }
+        trust_recheck(state, &name, &node, &fingerprint, &plan, invocation)?;
         pin(state, &node.ip, node.port, vec![fingerprint.clone()])?;
         let mut manifest = state.load_manifest()?;
         if manifest.portability.issues.iter().any(|issue| issue.node_id == node.id && issue.reason == PortabilityReason::MissingHostKey) {
@@ -400,6 +416,24 @@ mod tests {
         let error = trust_host_key(&mut session, &invocation(&["node", "trust-host-key", "--name", "a", "--host-key", "SHA256:short"]),
             &mut FakeTransport::default()).await.unwrap_err();
         assert_eq!(error.code, "usage");
+    }
+
+    #[test]
+    fn trust_host_key_rechecks_the_plan_under_the_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let a = node(1, "a", Auth::Key);
+        let session = setup(root.path(), Config { nodes: vec![a.clone()], ..Config::default() });
+        pin(&session.state, &a.ip, a.port, vec![fp(1)]).unwrap();
+        let wanted = fp(2);
+        let invocation = invocation(&["node", "trust-host-key", "--name", "a", "--host-key", wanted.as_str(), "--yes"]);
+        let planned = trust_plan("a", &a, &[fp(1)], &wanted);
+        trust_recheck(&session.state, "a", &a, &wanted, &planned, &invocation).unwrap();
+        // Another pin was written meanwhile: the plan names it now.
+        pin(&session.state, &a.ip, a.port, vec![fp(3)]).unwrap();
+        let error = trust_recheck(&session.state, "a", &a, &wanted, &planned, &invocation).unwrap_err();
+        assert_eq!(error.code, "plan_changed");
+        assert_eq!(error.extra["plan"][1], json!(format!("Прежние отпечатки: {}", fp(3))));
+        assert!(error.extra["plan_token"].is_string());
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -1,17 +1,25 @@
-// Модальные диалоги экранов — аналог `Context::confirm/secret/select/toggle`
-// TUI: каждый вызов возвращает `Promise`, окно закрывается ответом. Диалоги
-// складываются стопкой (подтверждение поверх окна операции); фокус — в
-// верхнем окне, после закрытия возвращается туда, откуда окно открыто.
+// Модальные диалоги экранов — аналог `Context::confirm/secret/select`
+// TUI и формы `ctx.form`: каждый вызов возвращает `Promise`, окно
+// закрывается ответом. Диалоги складываются стопкой (подтверждение поверх
+// окна операции); фокус — в верхнем окне, Esc закрывает верхнее окно
+// значением отмены, щелчок по фону окно не закрывает и фокус из окна не уводит.
 import { html, useState, useEffect, useRef } from '../vendor/preact-htm.js';
 import { Button, useModalFocus } from './ui.js';
+import { Icon } from './icons.js';
+import { initialValues, visibleFields, validate, result } from './form-model.js';
+import { asList } from './format.js';
+import { cancelValue } from './flows.js';
 
 /**
  * Хранилище стопки диалогов. `push(kind, props)` → `Promise` ответа.
- * Возвращает `{ stack, api }`; `api` — функции для `ctx`.
+ * Возвращает `{ stack, api }`; `api` — функции для `ctx` и `cancelAll()`.
  */
 export function useDialogs() {
   const [stack, setStack] = useState([]);
   const counter = useRef(0);
+  // Текущая стопка вне состояния: `cancelAll` вызывается и из старых замыканий.
+  const entries = useRef([]);
+  const sync = () => setStack([...entries.current]);
   /** Открыть окно: `{ promise, close }`; `close` доступен сразу, до отрисовки. */
   const open = (kind, props) => {
     counter.current += 1;
@@ -19,15 +27,25 @@ export function useDialogs() {
     let resolve;
     const promise = new Promise((done) => { resolve = done; });
     const close = (value) => {
-      setStack((current) => current.filter((entry) => entry.id !== id));
+      if (!entries.current.some((entry) => entry.id === id)) return;
+      entries.current = entries.current.filter((entry) => entry.id !== id);
+      sync();
       resolve(value);
     };
-    setStack((current) => [...current, { id, kind, props, close }]);
+    entries.current = [...entries.current, { id, kind, props, close }];
+    sync();
     return { promise, close };
   };
   const push = (kind, props) => open(kind, props).promise;
   const api = {
-    /** План/вопрос → `true` только по «Да». */
+    /**
+     * Закрыть окна ушедшего экрана значением отмены (смена раздела или
+     * объекта); окна операций остаются — их закрывает сама команда.
+     */
+    cancelAll: () => {
+      for (const entry of [...entries.current]) if (entry.kind !== 'operation') entry.close(cancelValue(entry.kind));
+    },
+    /** План/вопрос → `true` только по «Да»; отмена — `false`. */
     confirm: (props) => push('confirm', props),
     /** Скрытый ввод; отмена → `null`; пустое значение → `null`, с `allowEmpty` → `''`. */
     askSecret: (props) => push('secret', props),
@@ -35,9 +53,14 @@ export function useDialogs() {
     ask: (props) => push('text', props),
     /** Один из списка (`options: [{value,label,tone?}]`); отмена → `null`. */
     choose: (props) => push('choose', props),
-    /** Несколько из списка; `selected` — исходные отметки; отмена → `null`. */
-    toggle: (props) => push('toggle', props),
-    /** Окно с содержимым (`lines` или `body`), закрывается кнопкой. */
+    /** Открыто ли окно (горячие клавиши экрана не действуют поверх окон). */
+    dialogOpen: () => entries.current.length > 0,
+    /**
+     * Форма: `{ title, context, fields, submit, tone, wide }` → значения
+     * видимых полей или `null` при отмене (`form-model.js`).
+     */
+    form: (props) => push('form', props),
+    /** Окно с содержимым (`lines` или `body`), закрывается кнопкой; итог — `undefined`. */
     show: (props) => push('show', props),
     /**
      * Окно операции: строки журнала команды (адреса — ссылками). Возвращает
@@ -65,35 +88,60 @@ export function useDialogs() {
   return { stack, api };
 }
 
-const TONE_KIND = { view: 'view', create: 'create', change: 'change', danger: 'danger', plain: 'plain' };
+/** Окно — верхнее в стопке (последнее открытое `.modal-open` в документе). */
+function isTop(box) {
+  const all = document.querySelectorAll('.modal.modal-open');
+  return Boolean(box) && all.length > 0 && all[all.length - 1].contains(box);
+}
 
 /**
  * Рамка окна. Фокус при открытии — на самом окне (Enter не подтверждает
- * план случайно), поля ввода ставят его на себя.
+ * план случайно), поля ввода ставят его на себя. Esc и Tab обрабатываются на
+ * документе и только верхним окном: щелчок по фону не ломает ни Esc, ни
+ * удержание фокуса (нажатие по фону фокус не забирает).
  */
-function Shell({ title, context, wide = false, children }) {
+function Shell({ title, context, wide = false, onDismiss = null, children }) {
   const lines = Array.isArray(context) ? context : context ? [context] : [];
   const modal = useRef(null);
-  useModalFocus(modal);
+  const dismiss = useRef(onDismiss);
+  dismiss.current = onDismiss;
+  useModalFocus(modal, null, () => isTop(modal.current));
+  useEffect(() => {
+    const onKey = (event) => {
+      if (event.key !== 'Escape' || event.defaultPrevented || !isTop(modal.current)) return;
+      event.preventDefault();
+      if (dismiss.current) dismiss.current();
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, []);
+  const keepFocus = (event) => { if (event.target === event.currentTarget) event.preventDefault(); };
   return html`
-    <div class="overlay" role="dialog" aria-modal="true" aria-label=${title}>
-      <div class="modal ${wide ? 'modal-wide' : ''}" ref=${modal} tabindex="-1">
-        <h3>${title}</h3>
-        ${lines.length > 0 && html`<div class="modal-context">${lines.map((line, index) => html`<div key=${index}>${line}</div>`)}</div>`}
+    <div class="modal modal-open" role="dialog" aria-modal="true" aria-label=${title} onMouseDown=${keepFocus}>
+      <div class="modal-box ${wide ? 'modal-wide' : ''}" ref=${modal} tabindex="-1">
+        <h3 class="modal-title">${title}</h3>
+        ${lines.length > 0 && html`<div class="modal-context">${lines.map((line, index) => (isToned(line)
+          ? html`<div key=${index} class=${line.tone ? `t-${line.tone}` : ''}>${line.text}</div>`
+          : html`<div key=${index}>${line}</div>`))}</div>`}
         ${children}
       </div>
     </div>
   `;
 }
 
+/** Строка контекста `{ text, tone }` (`tone`: `ok|warn|error|dim|info`), а не текст или разметка. */
+function isToned(line) {
+  return Boolean(line) && typeof line === 'object' && typeof line.text === 'string' && !('props' in line);
+}
+
 function ConfirmDialog({ props, close }) {
-  const { title = 'Подтверждение', plan = [], context = null, question, yes = 'Да', tone = 'change' } = props;
-  return html`<${Shell} title=${title} context=${context}>
+  const { title = 'Подтверждение', plan = [], context = null, question, yes = 'Да', tone = 'primary' } = props;
+  return html`<${Shell} title=${title} context=${context} onDismiss=${() => close(false)}>
     ${plan && plan.length > 0 && html`<pre class="plan">${plan.join('\n')}</pre>`}
     ${question && html`<p class="question">${question}</p>`}
-    <div class="modal-buttons">
-      <${Button} kind=${TONE_KIND[tone] || 'change'} onClick=${() => close(true)}>${yes}<//>
-      <${Button} onClick=${() => close(false)}>Отмена<//>
+    <div class="modal-action">
+      <${Button} kind="ghost" onClick=${() => close(false)}>Отмена<//>
+      <${Button} kind=${tone === 'danger' ? 'danger' : 'primary'} onClick=${() => close(true)}>${yes}<//>
     </div>
   <//>`;
 }
@@ -107,19 +155,19 @@ function InputDialog({ props, close, secret }) {
     if (secret) close(value || allowEmpty ? value : null);
     else close(value);
   };
-  return html`<${Shell} title=${title} context=${context} wide=${multiline}>
+  return html`<${Shell} title=${title} context=${context} wide=${multiline} onDismiss=${() => close(null)}>
     <form class="form" onSubmit=${(event) => { event.preventDefault(); done(); }}>
       <label class="field">
         <span class="field-label">${label}</span>
         ${multiline
-          ? html`<textarea ref=${ref} class="code" rows="16" value=${value} onInput=${(event) => setValue(event.target.value)}></textarea>`
-          : html`<input ref=${ref} type=${secret ? 'password' : 'text'} autocomplete="off" placeholder=${placeholder} value=${value}
+          ? html`<textarea ref=${ref} class="textarea code" rows="16" value=${value} onInput=${(event) => setValue(event.target.value)}></textarea>`
+          : html`<input ref=${ref} class="input input-sm" type=${secret ? 'password' : 'text'} autocomplete="off" placeholder=${placeholder} value=${value}
               onInput=${(event) => setValue(event.target.value)} />`}
       </label>
-      ${secret && !allowEmpty && html`<p class="dim">Пустое значение — отмена.</p>`}
-      <div class="modal-buttons">
-        <${Button} kind="create" type="submit">${submit}<//>
-        <${Button} onClick=${() => close(null)}>Отмена<//>
+      ${secret && !allowEmpty && html`<p class="t-dim">Пустое значение — отмена.</p>`}
+      <div class="modal-action">
+        <${Button} kind="ghost" onClick=${() => close(null)}>Отмена<//>
+        <${Button} kind="primary" type="submit">${submit}<//>
       </div>
     </form>
   <//>`;
@@ -127,46 +175,159 @@ function InputDialog({ props, close, secret }) {
 
 function ChooseDialog({ props, close }) {
   const { title, context = null, options = [], empty = 'Нет объектов для выбора', cancel = 'Отмена' } = props;
-  return html`<${Shell} title=${title} context=${context}>
-    ${options.length === 0 && html`<p class="dim">${empty}</p>`}
-    <div class="modal-buttons column">
-      ${options.map((option) => html`
-        <${Button} key=${String(option.value)} kind=${TONE_KIND[option.tone] || 'view'} disabled=${option.disabled}
-          onClick=${() => close(option.value)}>${option.label}<//>
-      `)}
-      <${Button} onClick=${() => close(null)}>${cancel}<//>
-    </div>
+  return html`<${Shell} title=${title} context=${context} onDismiss=${() => close(null)}>
+    ${options.length === 0
+      ? html`<p class="t-dim">${empty}</p>`
+      : html`<ul class="menu choose-list">
+          ${options.map((option) => html`<li key=${String(option.value)}>
+            <button type="button" class=${option.tone === 'danger' ? 't-error' : ''} disabled=${option.disabled}
+              onClick=${() => close(option.value)}>${option.label}</button>
+          </li>`)}
+        </ul>`}
+    <div class="modal-action"><${Button} kind="ghost" onClick=${() => close(null)}>${cancel}<//></div>
   <//>`;
 }
 
-function ToggleDialog({ props, close }) {
-  const { title, context = null, options = [], selected = [], empty = 'Нет объектов для выбора', submit = 'Сохранить' } = props;
-  const [value, setValue] = useState([...selected]);
-  const flip = (item) => setValue(value.includes(item) ? value.filter((v) => v !== item) : [...value, item]);
-  return html`<${Shell} title=${title} context=${context}>
-    ${options.length === 0
-      ? html`<p class="dim">${empty}</p>`
-      : html`<div class="toggle">
-          ${options.map((option) => html`
-            <label key=${String(option.value)} class="checkbox">
-              <input type="checkbox" checked=${value.includes(option.value)} onChange=${() => flip(option.value)} />
-              <span>${option.label}</span>
-            </label>
-          `)}
-        </div>`}
-    <div class="modal-buttons">
-      ${options.length > 0 && html`<${Button} kind="change" onClick=${() => close(options.map((o) => o.value).filter((v) => value.includes(v)))}>${submit}<//>`}
-      <${Button} onClick=${() => close(null)}>Отмена<//>
+// ─── Форма ───────────────────────────────────────────────────────────────────
+
+const MULTI_FILTER_FROM = 8;
+
+function MultiField({ field, value, onChange, invalid, ids }) {
+  const [query, setQuery] = useState('');
+  const options = field.options || [];
+  const needle = query.trim().toLowerCase();
+  const shown = needle ? options.filter((option) => String(option.label).toLowerCase().includes(needle)) : options;
+  const selected = asList(value);
+  const flip = (item) => onChange(selected.includes(item) ? selected.filter((v) => v !== item) : [...selected, item]);
+  return html`<div class="choice-box ${invalid ? 'choice-invalid' : ''}">
+    ${options.length > MULTI_FILTER_FROM && html`<label class="input input-sm choice-filter">
+      <${Icon} name="search" size=${16} />
+      <input type="search" placeholder="Фильтр" aria-label=${`Фильтр: ${field.label}`} value=${query}
+        onInput=${(event) => setQuery(event.target.value)}
+        onKeyDown=${(event) => { if (event.key === 'Enter') event.preventDefault(); }} />
+    </label>`}
+    ${options.length === 0 && html`<p class="t-dim">Нет вариантов для выбора</p>`}
+    <div class="choice-list" role="group" aria-labelledby=${ids.label} aria-describedby=${ids.desc}
+      aria-invalid=${invalid ? 'true' : undefined}>
+      ${shown.map((option) => html`<label key=${String(option.value)} class="check-row">
+        <input type="checkbox" class="checkbox checkbox-sm" name=${field.name} disabled=${option.disabled}
+          checked=${selected.includes(option.value)} onChange=${() => flip(option.value)} />
+        <span>${option.label}${option.hint && html` <span class="t-dim">${option.hint}</span>`}</span>
+      </label>`)}
     </div>
+  </div>`;
+}
+
+/**
+ * Поле формы. `ids` — `{ control, label, desc }`: подпись `label for` у полей
+ * ввода и `aria-labelledby` у групп (radio, multi), подсказка или ошибка —
+ * `aria-describedby`.
+ */
+function FormControl({ field, value, onChange, invalid, ids }) {
+  const common = {
+    id: ids.control, name: field.name, 'aria-invalid': invalid ? 'true' : undefined,
+    'aria-describedby': ids.desc, autofocus: field.autofocus || undefined,
+  };
+  switch (field.type) {
+    case 'select':
+      return html`<select ...${common} class="select select-sm ${invalid ? 'select-error' : ''}" value=${value}
+        onChange=${(event) => onChange(event.target.value)}>
+        ${(field.options || []).map((option) => html`<option key=${String(option.value)} value=${option.value}
+          disabled=${option.disabled}>${option.label}</option>`)}
+      </select>`;
+    case 'radio':
+      return html`<div class="choice-list ${invalid ? 'choice-invalid' : ''}" role="radiogroup" aria-labelledby=${ids.label}
+        aria-describedby=${ids.desc} aria-invalid=${invalid ? 'true' : undefined}>
+        ${(field.options || []).map((option) => html`<label key=${String(option.value)} class="check-row">
+          <input type="radio" class="radio radio-sm" name=${field.name} disabled=${option.disabled}
+            checked=${value === option.value} onChange=${() => onChange(option.value)} />
+          <span>${option.label}${option.hint && html`<span class="choice-hint t-dim">${option.hint}</span>`}</span>
+        </label>`)}
+      </div>`;
+    case 'multi':
+      return html`<${MultiField} field=${field} value=${value} onChange=${onChange} invalid=${invalid} ids=${ids} />`;
+    case 'checkbox':
+      return html`<label class="check-row">
+        <input type="checkbox" class="checkbox checkbox-sm" name=${field.name} checked=${value === true}
+          aria-describedby=${ids.desc} aria-invalid=${invalid ? 'true' : undefined}
+          onChange=${(event) => onChange(event.target.checked)} />
+        <span>${field.label}</span>
+      </label>`;
+    case 'textarea':
+      return html`<textarea ...${common} class="textarea code ${invalid ? 'textarea-error' : ''}" rows="8"
+        placeholder=${field.placeholder || ''} value=${value} onInput=${(event) => onChange(event.target.value)}></textarea>`;
+    default:
+      return html`<input ...${common} class="input input-sm ${invalid ? 'input-error' : ''}"
+        type=${field.type === 'secret' ? 'password' : 'text'} autocomplete="off" placeholder=${field.placeholder || ''}
+        value=${value} onInput=${(event) => onChange(event.target.value)} />`;
+  }
+}
+
+/** Номер формы для уникальных `id` полей (формы бывают в стопке одновременно). */
+let formCount = 0;
+
+const GROUP_TYPES = new Set(['radio', 'multi']);
+
+function FormDialog({ props, close }) {
+  const { title, context = null, fields = [], submit = 'Сохранить', tone = 'primary', wide = false } = props;
+  const [values, setValues] = useState(() => initialValues(fields));
+  const [errors, setErrors] = useState({});
+  const [prefix] = useState(() => { formCount += 1; return `form${formCount}`; });
+  const body = useRef(null);
+  const visible = visibleFields(fields, values);
+  useEffect(() => {
+    const target = body.current && (body.current.querySelector('[autofocus]')
+      || body.current.querySelector('input:not([type=checkbox]):not([type=radio]):not([type=search]), select, textarea'));
+    if (target) target.focus();
+  }, []);
+  const update = (name, value) => {
+    setValues((current) => ({ ...current, [name]: value }));
+    if (errors[name]) setErrors((current) => { const next = { ...current }; delete next[name]; return next; });
+  };
+  const send = (event) => {
+    event.preventDefault();
+    const found = validate(fields, values);
+    setErrors(found);
+    const first = visible.find((field) => found[field.name]);
+    if (first) {
+      const target = body.current && body.current.querySelector(`[name="${CSS.escape(first.name)}"]`);
+      if (target) target.focus();
+      return;
+    }
+    close(result(fields, values));
+  };
+  return html`<${Shell} title=${title} context=${context} wide=${wide} onDismiss=${() => close(null)}>
+    <form class="form" ref=${body} onSubmit=${send} novalidate>
+      ${visible.map((field) => {
+        const error = errors[field.name];
+        const base = `${prefix}-${field.name}`;
+        const described = Boolean(error || field.hint);
+        const ids = { control: base, label: `${base}-label`, desc: described ? `${base}-desc` : undefined };
+        const mark = field.required && html`<span class="t-dim" aria-hidden="true"> *</span>`;
+        return html`<div key=${field.name} class="field">
+          ${field.type === 'checkbox' ? null : GROUP_TYPES.has(field.type)
+            ? html`<span class="field-label" id=${ids.label}>${field.label}${mark}</span>`
+            : html`<label class="field-label" id=${ids.label} for=${ids.control}>${field.label}${mark}</label>`}
+          <${FormControl} field=${field} value=${values[field.name]} invalid=${Boolean(error)} ids=${ids}
+            onChange=${(value) => update(field.name, value)} />
+          ${field.hint && !error && html`<span class="field-hint t-dim" id=${ids.desc}>${field.hint}</span>`}
+          ${error && html`<span class="field-error" id=${ids.desc} role="alert">${error}</span>`}
+        </div>`;
+      })}
+      <div class="modal-action">
+        <${Button} kind="ghost" onClick=${() => close(null)}>Отмена<//>
+        <${Button} kind=${tone === 'danger' ? 'danger' : 'primary'} type="submit">${submit}<//>
+      </div>
+    </form>
   <//>`;
 }
 
 function ShowDialog({ props, close }) {
   const { title, context = null, lines = null, body = null, wide = false, close: label = 'Закрыть' } = props;
-  return html`<${Shell} title=${title} context=${context} wide=${wide}>
+  return html`<${Shell} title=${title} context=${context} wide=${wide} onDismiss=${() => close(undefined)}>
     ${lines && html`<pre class="plan">${lines.join('\n')}</pre>`}
     ${body}
-    <div class="modal-buttons"><${Button} onClick=${() => close(undefined)}>${label}<//></div>
+    <div class="modal-action"><${Button} onClick=${() => close(undefined)}>${label}<//></div>
   <//>`;
 }
 
@@ -176,7 +337,7 @@ const URL_RE = /(https?:\/\/[^\s«»"'<>]+)/g;
 export function Linkified({ text }) {
   const parts = String(text).split(URL_RE);
   return parts.map((part, index) => (index % 2 === 1
-    ? html`<a key=${index} href=${part} target="_blank" rel="noopener noreferrer">${part}</a>`
+    ? html`<a key=${index} class="link" href=${part} target="_blank" rel="noopener noreferrer">${part}</a>`
     : part));
 }
 
@@ -189,14 +350,15 @@ function OperationDialog({ props, close }) {
     setView({ lines: shared.lines, finished: shared.finished });
     return () => { shared.update = null; };
   }, []);
-  return html`<${Shell} title=${title} wide=${true}>
+  return html`<${Shell} title=${title} wide=${true} onDismiss=${() => { if (view.finished) close(undefined); }}>
     <div class="operation">
-      ${view.lines.length === 0 && !view.finished && html`<p class="dim">Выполняется…</p>`}
+      ${view.lines.length === 0 && !view.finished && html`<p class="t-dim">Выполняется…</p>`}
       ${view.lines.map((entry, index) => html`
-        <div key=${index} class="journal-line level-${entry.level || 'info'}"><${Linkified} text=${entry.text} /></div>
+        <div key=${index} class="log-line level-${entry.level || 'info'}"><${Linkified} text=${entry.text} /></div>
       `)}
     </div>
-    ${view.finished && html`<div class="modal-buttons"><${Button} onClick=${() => close(undefined)}>Закрыть<//></div>`}
+    ${!view.finished && html`<progress class="progress progress-primary"></progress>`}
+    ${view.finished && html`<div class="modal-action"><${Button} onClick=${() => close(undefined)}>Закрыть<//></div>`}
   <//>`;
 }
 
@@ -205,7 +367,7 @@ const VIEWS = {
   secret: (args) => InputDialog({ ...args, secret: true }),
   text: (args) => InputDialog({ ...args, secret: false }),
   choose: ChooseDialog,
-  toggle: ToggleDialog,
+  form: FormDialog,
   show: ShowDialog,
   operation: OperationDialog,
 };

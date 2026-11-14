@@ -117,10 +117,20 @@ fn quoted_scalar(body: &str, quote: char) -> (String, usize) {
     (name, body.len() + 1)
 }
 
+/// The node's groups, each once (in order of first mention) with the union of
+/// its proxies over every entry of the node, each proxy once — the set
+/// `conn set` compares and generation uses.
 fn node_groups(config: &Config, node: &str) -> Value {
-    let groups: Vec<&ConnectionGroup> = config.connections.iter()
-        .filter(|connection| connection.node == node)
-        .flat_map(|connection| &connection.groups).collect();
+    let mut groups: Vec<ConnectionGroup> = Vec::new();
+    for group in config.connections.iter().filter(|connection| connection.node == node).flat_map(|connection| &connection.groups) {
+        let index = match groups.iter().position(|seen| seen.name == group.name) {
+            Some(index) => index,
+            None => { groups.push(ConnectionGroup { name: group.name.clone(), proxies: Vec::new() }); groups.len() - 1 }
+        };
+        for proxy in &group.proxies {
+            if !groups[index].proxies.contains(proxy) { groups[index].proxies.push(proxy.clone()); }
+        }
+    }
     json!(groups)
 }
 
@@ -153,59 +163,108 @@ pub async fn list<T: RemoteTransport>(session: &mut Session, invocation: &Invoca
     Ok(Value::Array(entries))
 }
 
-/// Replace the proxies of `groups` in the node's assignment (in place, new
-/// groups appended); without proxies the groups are unassigned.
-fn assign(config: &mut Config, node: &str, groups: &[String], proxies: &[String]) {
+/// Replace the proxies of `group` in the node's assignment (in place, a new
+/// group appended); without proxies the group is unassigned.
+fn assign(config: &mut Config, node: &str, group: &str, proxies: &[String]) {
     let mut first = true;
     for connection in config.connections.iter_mut().filter(|connection| connection.node == node) {
         if first && !proxies.is_empty() {
-            for group in groups {
-                match connection.groups.iter_mut().find(|existing| existing.name == *group) {
-                    Some(existing) => existing.proxies = proxies.to_vec(),
-                    None => connection.groups.push(ConnectionGroup { name: group.clone(), proxies: proxies.to_vec() }),
-                }
+            match connection.groups.iter_mut().find(|existing| existing.name == group) {
+                Some(existing) => existing.proxies = proxies.to_vec(),
+                None => connection.groups.push(ConnectionGroup { name: group.to_owned(), proxies: proxies.to_vec() }),
             }
         } else {
-            connection.groups.retain(|existing| !groups.contains(&existing.name));
+            connection.groups.retain(|existing| existing.name != group);
         }
         first = false;
     }
     if first && !proxies.is_empty() {
         config.connections.push(Connection {
             node: node.to_owned(),
-            groups: groups.iter().map(|group| ConnectionGroup { name: group.clone(), proxies: proxies.to_vec() }).collect(),
+            groups: vec![ConnectionGroup { name: group.to_owned(), proxies: proxies.to_vec() }],
         });
     }
     config.connections.retain(|connection| connection.node != node || !connection.groups.is_empty());
 }
 
+/// Proxies of `group` on `node` as a set; `None` — the node has no entry
+/// for the group at all (an entry with no proxies is still an assignment:
+/// `group_nodes` counts it, so `G=` must remove it).
+fn assigned(config: &Config, node: &str, group: &str) -> Option<BTreeSet<String>> {
+    let mut entries = config.connections.iter().filter(|connection| connection.node == node)
+        .flat_map(|connection| &connection.groups)
+        .filter(|existing| existing.name == group)
+        .peekable();
+    entries.peek()?;
+    Some(entries.flat_map(|existing| existing.proxies.iter().cloned()).collect())
+}
+
+/// `--assign G=P` values, one proxy per flag (a proxy name may hold any
+/// character, commas included): (group, unique proxies in order) per group
+/// in order of first mention; `G=` — none. `G=` together with `G=P` is
+/// ambiguous — `usage`.
+fn assignments(invocation: &Invocation) -> Result<Vec<(String, Vec<String>)>> {
+    if !invocation.has("assign") {
+        return Err(RcError::new("usage", "Укажите --assign ГРУППА=ПОДКЛЮЧЕНИЕ."));
+    }
+    // (group, proxies, unassigned with `G=`)
+    let mut parsed: Vec<(String, Vec<String>, bool)> = Vec::new();
+    for value in invocation.values("assign") {
+        let Some((group, proxy)) = value.split_once('=').filter(|(group, _)| !group.is_empty()) else {
+            return Err(RcError::new("invalid", format!("Назначение «{value}»: нужно ГРУППА=ПОДКЛЮЧЕНИЕ.")));
+        };
+        let index = match parsed.iter().position(|(seen, ..)| seen == group) {
+            Some(index) => index,
+            None => { parsed.push((group.to_owned(), Vec::new(), false)); parsed.len() - 1 }
+        };
+        let entry = &mut parsed[index];
+        if proxy.is_empty() { entry.2 = true; } else { entry.1.push(proxy.to_owned()); }
+        if entry.2 && !entry.1.is_empty() {
+            return Err(RcError::new("usage", format!("Группа «{group}»: --assign {group}= снимает назначение и не сочетается с {group}=ПОДКЛЮЧЕНИЕ.")));
+        }
+    }
+    Ok(parsed.into_iter().map(|(group, proxies, _)| (group, unique(&proxies))).collect())
+}
+
+/// The assignments that differ from the state (as sets of proxies); the node
+/// and every group must exist.
+fn changed_assignments(config: &Config, node: &str, wanted: &[(String, Vec<String>)]) -> Result<Vec<(String, Vec<String>)>> {
+    find(config, node)?;
+    if let Some((group, _)) = wanted.iter().find(|(group, _)| !config.groups.iter().any(|known| known.name == *group)) {
+        return Err(RcError::new("not_found", format!("Группа «{group}» не найдена.")).with_extra("group", group.clone()));
+    }
+    Ok(wanted.iter()
+        .filter(|(group, proxies)| assigned(config, node, group) != (!proxies.is_empty()).then(|| proxies.iter().cloned().collect()))
+        .cloned().collect())
+}
+
+/// `conn set --name N --assign G=P…`: each listed group gets exactly its
+/// proxies on the node (`G=` unassigns); other groups stay. A group whose
+/// proxies are already the same set is unchanged; nothing changed — no
+/// mutation (no checkpoint, no GitHub commit).
 pub fn set(session: &mut Session, invocation: &Invocation) -> Result<Value> {
     let node = required(invocation, "name")?.to_owned();
-    if !invocation.has("group") {
-        return Err(RcError::new("usage", "Укажите --group."));
+    let wanted = assignments(invocation)?;
+    let mut changed = changed_assignments(&session.state.load_config()?, &node, &wanted)?;
+    if !changed.is_empty() {
+        changed = session.mutate("assign_connections", |state| {
+            let mut config = state.load_config()?;
+            let changed = changed_assignments(&config, &node, &wanted)?;
+            for (group, proxies) in &changed {
+                assign(&mut config, &node, group, proxies);
+            }
+            state.save_config(&config)?;
+            Ok(changed)
+        })?;
     }
-    let groups = unique(invocation.values("group"));
-    let proxies = unique(invocation.values("proxy"));
-    if groups.is_empty() {
-        return Err(RcError::new("invalid", "Не выбрана ни одна группа."));
-    }
-    if let Some(proxy) = proxies.iter().find(|proxy| proxy.contains(',')) {
-        return Err(RcError::new("invalid", format!("Недопустимое имя подключения: «{proxy}».")));
-    }
-    session.mutate("assign_connections", |state| {
-        let mut config = state.load_config()?;
-        find(&config, &node)?;
-        if let Some(group) = groups.iter().find(|group| !config.groups.iter().any(|known| known.name == **group)) {
-            return Err(RcError::new("not_found", format!("Группа «{group}» не найдена.")).with_extra("group", group.clone()));
-        }
-        assign(&mut config, &node, &groups, &proxies);
-        state.save_config(&config)
-    })?;
-    for group in &groups {
+    for (group, proxies) in &changed {
         let text = if proxies.is_empty() { format!("{node} -> {group}: назначение снято") } else { format!("{node} -> {group} сохранено") };
         session.log(Level::Success, &text);
     }
-    Ok(json!({"node": node, "groups": groups, "proxies": proxies}))
+    Ok(json!({
+        "node": node,
+        "changed": changed.iter().map(|(group, proxies)| json!({"group": group, "proxies": proxies})).collect::<Vec<_>>(),
+    }))
 }
 
 /// Keep only discovered proxies of `node`: in its group assignments (empty
@@ -405,30 +464,127 @@ mod tests {
         assert_eq!(without.connections[0].groups, vec![group("PC", &["vless"])]);
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn set_replaces_in_place_clears_and_rejects_unknown_groups() {
+    #[test]
+    fn set_assigns_exact_lists_per_group_and_changes_only_what_differs() {
         let root = tempfile::tempdir().unwrap();
-        let de = node(1, "de", Auth::Key);
-        let mut session = setup(root.path(), vec![de.clone()], vec![Connection {
-            node: "de".into(), groups: vec![group("ROUTER", &["old"]), group("PC", &["pc"])] }], vec![]);
-        let data = set(&mut session, &invocation(&["conn", "set", "--name", "de", "--group", "ROUTER",
-            "--group", "MOBILE", "--group", "ROUTER", "--proxy", "a", "--proxy", "b"])).unwrap();
-        assert_eq!(data, json!({"node": "de", "groups": ["ROUTER", "MOBILE"], "proxies": ["a", "b"]}));
+        let (mut session, journal) = session(root.path());
+        let mut config = session.state.load_config().unwrap();
+        config.nodes = vec![node(1, "de", Auth::Key)];
+        config.connections = vec![Connection { node: "de".into(), groups: vec![group("ROUTER", &["old"]), group("PC", &["pc", "x"])] }];
+        session.state.save_config(&config).unwrap();
+        let run = |session: &mut Session, assign: &[&str]| {
+            let mut argv = vec!["conn", "set", "--name", "de"];
+            for value in assign { argv.extend(["--assign", value]); }
+            set(session, &invocation(&argv))
+        };
+        // ROUTER replaced in place, MOBILE appended (deduped, in order), PC
+        // the same set in another order: unchanged and not reported.
+        let data = run(&mut session, &["ROUTER=b", "MOBILE=a", "ROUTER=a", "MOBILE=b", "MOBILE=a", "PC=x", "PC=pc"]).unwrap();
+        assert_eq!(data, json!({"node": "de", "changed": [
+            {"group": "ROUTER", "proxies": ["b", "a"]}, {"group": "MOBILE", "proxies": ["a", "b"]}]}));
         assert_eq!(session.state.load_config().unwrap().connections[0].groups,
-            vec![group("ROUTER", &["a", "b"]), group("PC", &["pc"]), group("MOBILE", &["a", "b"])]);
+            vec![group("ROUTER", &["b", "a"]), group("PC", &["pc", "x"]), group("MOBILE", &["a", "b"])]);
+        let logged: Vec<String> = journal.borrow().iter().map(|(_, text)| text.clone()).collect();
+        assert_eq!(logged, ["de -> ROUTER сохранено", "de -> MOBILE сохранено"]);
 
-        set(&mut session, &invocation(&["conn", "set", "--name", "de", "--group", "ROUTER", "--group", "MOBILE"])).unwrap();
-        assert_eq!(session.state.load_config().unwrap().connections[0].groups, vec![group("PC", &["pc"])]);
-        set(&mut session, &invocation(&["conn", "set", "--name", "de", "--group", "PC"])).unwrap();
+        // Every group sent again, nothing different: no write at all.
+        let before = fingerprint(root.path());
+        let data = run(&mut session, &["ROUTER=a", "ROUTER=b", "MOBILE=b", "MOBILE=a", "PC=pc", "PC=x"]).unwrap();
+        assert_eq!(data, json!({"node": "de", "changed": []}));
+        assert_eq!(fingerprint(root.path()), before);
+        assert_eq!(journal.borrow().len(), 2);
+
+        // `G=` unassigns; groups not mentioned stay.
+        run(&mut session, &["ROUTER=", "MOBILE="]).unwrap();
+        assert_eq!(session.state.load_config().unwrap().connections[0].groups, vec![group("PC", &["pc", "x"])]);
+        assert_eq!(journal.borrow().last().unwrap().1, "de -> MOBILE: назначение снято");
+        run(&mut session, &["PC=", "PC="]).unwrap();
         assert!(session.state.load_config().unwrap().connections.is_empty());
 
+        // A proxy name with a comma (or `=`) stays one proxy.
+        let data = run(&mut session, &["PC=vless,backup", "PC=a=b"]).unwrap();
+        assert_eq!(data["changed"], json!([{"group": "PC", "proxies": ["vless,backup", "a=b"]}]));
+        assert_eq!(session.state.load_config().unwrap().connections[0].groups, vec![group("PC", &["vless,backup", "a=b"])]);
+
         let before = fingerprint(root.path());
-        let error = set(&mut session, &invocation(&["conn", "set", "--name", "de", "--group", "NOPE", "--proxy", "a"])).unwrap_err();
-        assert_eq!((error.code, error.message.as_str()), ("not_found", "Группа «NOPE» не найдена."));
-        let error = set(&mut session, &invocation(&["conn", "set", "--name", "ghost", "--group", "PC", "--proxy", "a"])).unwrap_err();
+        let error = run(&mut session, &["PC=a", "NOPE=a"]).unwrap_err();
+        assert_eq!((error.code, error.message.as_str(), error.extra["group"].clone()), ("not_found", "Группа «NOPE» не найдена.", json!("NOPE")));
+        let error = set(&mut session, &invocation(&["conn", "set", "--name", "ghost", "--assign", "PC=a"])).unwrap_err();
         assert_eq!(error.code, "not_found");
-        let error = set(&mut session, &invocation(&["conn", "set", "--name", "de", "--group", "PC", "--proxy", "a,b"])).unwrap_err();
-        assert_eq!(error.code, "invalid");
+        for bad in [&["PC"][..], &["=a"]] {
+            assert_eq!(run(&mut session, bad).unwrap_err().code, "invalid", "{bad:?}");
+        }
+        for bad in [&["PC=a", "PC="][..], &["PC=", "PC=a"]] {
+            assert_eq!(run(&mut session, bad).unwrap_err().code, "usage", "{bad:?}");
+        }
+        assert_eq!(set(&mut session, &invocation(&["conn", "set", "--name", "de"])).unwrap_err().code, "usage");
+        assert_eq!(fingerprint(root.path()), before);
+    }
+
+    #[test]
+    fn set_reads_a_group_from_every_entry_of_the_node() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut session, _journal) = session(root.path());
+        let mut config = session.state.load_config().unwrap();
+        config.nodes = vec![node(1, "de", Auth::Key)];
+        config.connections = vec![
+            Connection { node: "de".into(), groups: vec![group("PC", &["p1"])] },
+            Connection { node: "de".into(), groups: vec![group("PC", &["p2"]), group("ROUTER", &["r"])] },
+        ];
+        session.state.save_config(&config).unwrap();
+        let run = |session: &mut Session, assign: &[&str]| {
+            let mut argv = vec!["conn", "set", "--name", "de"];
+            for value in assign { argv.extend(["--assign", value]); }
+            set(session, &invocation(&argv)).unwrap()
+        };
+        // The union of both entries is the group's set: nothing changed.
+        let before = fingerprint(root.path());
+        assert_eq!(run(&mut session, &["PC=p2", "PC=p1"])["changed"], json!([]));
+        assert_eq!(fingerprint(root.path()), before);
+        // A new set lands in the first entry and leaves the second.
+        run(&mut session, &["PC=p1", "PC=p2", "PC=p3"]);
+        let connections = session.state.load_config().unwrap().connections;
+        assert_eq!(connections[0].groups, vec![group("PC", &["p1", "p2", "p3"])]);
+        assert_eq!(connections[1].groups, vec![group("ROUTER", &["r"])]);
+    }
+
+    #[test]
+    fn a_proxy_repeated_across_entries_is_one_assignment() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut session, _journal) = session(root.path());
+        let mut config = session.state.load_config().unwrap();
+        config.nodes = vec![node(1, "de", Auth::Key)];
+        config.connections = vec![
+            Connection { node: "de".into(), groups: vec![group("PC", &["vless-reality"])] },
+            Connection { node: "de".into(), groups: vec![group("PC", &["vless-reality", "hy2"]), group("ROUTER", &["r"])] },
+        ];
+        config.validate().unwrap();
+        session.state.save_config(&config).unwrap();
+        // Views see each group once with each proxy once.
+        assert_eq!(node_groups(&config, "de"), json!([{"name": "PC", "proxies": ["vless-reality", "hy2"]}, {"name": "ROUTER", "proxies": ["r"]}]));
+        // The same set: nothing to change (generation reads the union once).
+        let before = fingerprint(root.path());
+        let unchanged = set(&mut session, &invocation(&["conn", "set", "--name", "de", "--assign", "PC=hy2", "--assign", "PC=vless-reality"])).unwrap();
+        assert_eq!(unchanged["changed"], json!([]));
+        assert_eq!(fingerprint(root.path()), before);
+    }
+
+    #[test]
+    fn set_unassign_removes_an_entry_without_proxies() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut session, journal) = session(root.path());
+        let mut config = session.state.load_config().unwrap();
+        config.nodes = vec![node(1, "de", Auth::Key)];
+        config.connections = vec![Connection { node: "de".into(), groups: vec![group("PC", &[]), group("ROUTER", &["r"])] }];
+        session.state.save_config(&config).unwrap();
+        let run = |session: &mut Session, assign: &str| set(session, &invocation(&["conn", "set", "--name", "de", "--assign", assign])).unwrap();
+        // The empty entry still assigns the node to PC: `PC=` removes it.
+        assert_eq!(run(&mut session, "PC=")["changed"], json!([{"group": "PC", "proxies": []}]));
+        assert_eq!(session.state.load_config().unwrap().connections[0].groups, vec![group("ROUTER", &["r"])]);
+        assert_eq!(journal.borrow().last().unwrap().1, "de -> PC: назначение снято");
+        // No entry at all: nothing to change, no write.
+        let before = fingerprint(root.path());
+        assert_eq!(run(&mut session, "PC=")["changed"], json!([]));
         assert_eq!(fingerprint(root.path()), before);
     }
 

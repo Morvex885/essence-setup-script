@@ -838,7 +838,7 @@ mod tests {
         assert_eq!(route(&["daemon", "status"], Network, false, false), "session_closed");
         assert_eq!(route(&["daemon", "stop"], Local, false, false), "Daemon");
         for words in [&["group", "list"][..], &["node", "list"], &["source", "github-accounts"],
-            &["source", "github-replace-with-local"], &["source", "init-local"], &["status"]]
+            &["source", "github-replace-with-local"], &["source", "init-local"], &["status"], &["template", "check", "--name", "t"]]
         {
             assert_eq!(route(words, Local, false, false), "session_closed", "{words:?}");
         }

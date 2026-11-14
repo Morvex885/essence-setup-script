@@ -118,7 +118,7 @@ export function recoveryOptions(code) {
   const outdated = code === 'github_format_outdated';
   const newer = code === 'github_format_newer';
   const options = [];
-  if (outdated) options.push({ id: 'migrate', label: 'Преобразовать конфигурацию', verb: 'github-migrate-format', title: 'Преобразование конфигурации GitHub', question: 'Преобразовать и опубликовать конфигурацию?', tone: 'change' });
+  if (outdated) options.push({ id: 'migrate', label: 'Преобразовать конфигурацию', verb: 'github-migrate-format', title: 'Преобразование конфигурации GitHub', question: 'Преобразовать и опубликовать конфигурацию?' });
   if (!newer) options.push({ id: 'replace', label: 'Заменить конфигурацией с этого устройства', verb: 'github-replace-with-local', title: 'Замена конфигурации GitHub', question: 'Заменить конфигурацию в GitHub?', tone: 'danger' });
   return options;
 }

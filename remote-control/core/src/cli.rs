@@ -9,7 +9,8 @@
 //! `--json --yes --plan-token --secrets-stdin --help` may appear anywhere.
 //! Flag values may not contain a newline; no flag carries a secret value.
 //! An `@name` token declares request input (file contents): the daemon's
-//! parser does not know it, the client's parser reads it as `--name PATH`.
+//! parser does not know it, the client's parser reads it as `--name PATH`;
+//! `@name?` is optional input (the client reads it only when given).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -104,7 +105,7 @@ static CATALOG: &[Spec] = &[
     spec("node", "setup-ssh", "provision-keys= on-failure=", &[], 0),
     spec("node", "shell", "name=", &[], TTY),
     spec("conn", "list", "name= discover", &[], 0),
-    spec("conn", "set", "name= group+ proxy+", &[], 0),
+    spec("conn", "set", "name= assign+", &[], 0),
     spec("conn", "sync", "name=", &[], 0),
     spec("awg", "status", "name=", &[], 0),
     spec("awg", "sync", "name=", &[], 0),
@@ -119,7 +120,7 @@ static CATALOG: &[Spec] = &[
     spec("telegram", "remove-all", TELEGRAM, &[], 0),
     spec("telegram", "menu", "name=", &[], TTY),
     spec("group", "list", "", &[], 0),
-    spec("group", "add", "name=", &[], 0),
+    spec("group", "add", "name= template=", &[], 0),
     spec("group", "delete", "name=", &[], 0),
     spec("group", "set-template", "name= template=", &[], 0),
     spec("template", "list", "", &[], 0),
@@ -127,6 +128,9 @@ static CATALOG: &[Spec] = &[
     spec("template", "create", "name= from= group=", &[], 0),
     spec("template", "export", "name= output=", &[], CLIENT),
     spec("template", "import", "name= @file", &[], 0),
+    spec("template", "delete", "name=", &[], 0),
+    spec("template", "groups", "name= group+", &[], 0),
+    spec("template", "check", "name= @file?", &[], 0),
     spec("client", "list", "group=", &[], 0),
     spec("client", "show", "name=", &[], 0),
     spec("client", "config", "name=", &[], 0),
@@ -178,7 +182,7 @@ static HELP: &[(&str, &[(&str, &str)])] = &[
     ]),
     ("conn", &[
         ("conn list [--name N [--discover]]", "Подключения нод по группам"),
-        ("conn set --name N --group G… [--proxy P…]", "Назначить подключения группам (без --proxy — снять)"),
+        ("conn set --name N --assign G=P…", "Задать подключения групп на ноде: --assign на каждое подключение (G= — снять назначение; другие группы не меняются)"),
         ("conn sync [--name N]", "Обнаружить подключения нод по SSH и убрать устаревшие назначения"),
     ]),
     ("daemon", &[
@@ -192,7 +196,7 @@ static HELP: &[(&str, &[(&str, &str)])] = &[
     ]),
     ("group", &[
         ("group list", "Список групп"),
-        ("group add --name G", "Добавить группу"),
+        ("group add --name G [--template T]", "Добавить группу (с шаблоном T; без него — default.yaml)"),
         ("group delete --name G [--yes]", "Удалить группу"),
         ("group set-template --name G --template T", "Назначить шаблон группе"),
     ]),
@@ -271,6 +275,9 @@ static HELP: &[(&str, &[(&str, &str)])] = &[
         ("template create --name N [--from T] [--group G]", "Создать шаблон на основе другого"),
         ("template export --name T --output PATH [--yes]", "Сохранить шаблон в файл"),
         ("template import --name T --file PATH [--yes]", "Загрузить шаблон из файла"),
+        ("template delete --name T [--yes]", "Удалить пользовательский шаблон"),
+        ("template groups --name T [--group G…] [--yes]", "Задать группы шаблона (остальные его группы — на default.yaml)"),
+        ("template check [--name T] [--file PATH]", "Проверить шаблон (YAML, маркеры, схема mihomo): файл, если указан, иначе шаблон T"),
     ]),
     ("web", &[
         ("web status", "Состояние веб-панели: адрес, TLS, отпечаток сертификата, подключения"),
@@ -337,6 +344,11 @@ impl Invocation {
     /// Request input names (`@name` tokens); the client reads them from `--name PATH`.
     pub fn inputs(&self) -> &[&'static str] {
         &self.inputs
+    }
+
+    /// The input is `@name?`: the client reads it only when `--name` is given.
+    pub fn input_optional(&self, name: &str) -> bool {
+        self.spec.is_some_and(|spec| catalog_tokens(spec).any(|(base, kind)| base == name && kind == '?'))
     }
 
     /// Accepted only from the daemon's local socket.
@@ -450,11 +462,11 @@ fn next_positional(argv: &[String], mut index: usize, help: &mut bool) -> Option
 }
 
 /// Every catalog token of a row as `(name, kind)`: `=` value, `+`
-/// repeatable, `b` boolean, `@` request input.
+/// repeatable, `b` boolean, `@` request input, `?` optional request input.
 fn catalog_tokens(spec: &'static Spec) -> impl Iterator<Item = (&'static str, char)> {
     spec.tokens.split_whitespace().map(|token| {
         if let Some(name) = token.strip_prefix('@') {
-            return (name, '@');
+            return name.strip_suffix('?').map_or((name, '@'), |name| (name, '?'));
         }
         match token.as_bytes().last() {
             Some(b'=') => (&token[..token.len() - 1], '='),
@@ -468,14 +480,14 @@ fn catalog_tokens(spec: &'static Spec) -> impl Iterator<Item = (&'static str, ch
 /// only for the client parser (`client`); the daemon's parser skips it.
 fn tokens(spec: &'static Spec, client: bool) -> impl Iterator<Item = (&'static str, char)> {
     catalog_tokens(spec).filter_map(move |(name, kind)| match kind {
-        '@' => client.then_some((name, '=')),
+        '@' | '?' => client.then_some((name, '=')),
         _ => Some((name, kind)),
     })
 }
 
-/// Request input names (`@name` tokens) of a row.
+/// Request input names (`@name` / `@name?` tokens) of a row.
 fn inputs(spec: &'static Spec) -> impl Iterator<Item = &'static str> {
-    catalog_tokens(spec).filter_map(|(name, kind)| (kind == '@').then_some(name))
+    catalog_tokens(spec).filter_map(|(name, kind)| matches!(kind, '@' | '?').then_some(name))
 }
 
 fn token_kind(spec: &'static Spec, name: &str, client: bool) -> Option<char> {
@@ -836,6 +848,13 @@ mod tests {
         assert_eq!((bare.inputs(), bare.value("file")), (&["file"][..], None));
         assert!(parse(&args(&["template", "show", "--name", "t"])).unwrap().inputs().is_empty());
         assert!(parse(&args(&["--json"])).unwrap().inputs().is_empty());
+        // `@file?`: optional input — the client reads it only when given.
+        let check = parse_client(&args(&["template", "check", "--name", "t"])).unwrap();
+        assert_eq!((check.inputs(), check.value("file"), check.input_optional("file")), (&["file"][..], None, true));
+        assert!(!bare.input_optional("file"));
+        assert_eq!(code(&["template", "check", "--file", "t.yaml"]), "usage", "the daemon does not know --file");
+        let file = parse_client(&args(&["template", "check", "--file", "t.yaml"])).unwrap();
+        assert_eq!(file.daemon_argv(&args(&["template", "check", "--file", "t.yaml"])), args(&["template", "check"]));
         // Repeated input flags follow the value-flag rule.
         assert_eq!(parse_client(&args(&["template", "import", "--file", "a", "--file", "b"])).err().map(|e| e.code), Some("usage"));
 

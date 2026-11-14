@@ -4,14 +4,14 @@
 // `recovery_run`, `provision`, `github_wizard`). Без DOM: диалоги и запросы —
 // через `ctx` (`app.js::makeContext`), ссылки для ручных действий — `deps.link`.
 import { decisionFlag, setFlag, clearFlag, isFailure } from '../flows.js';
-import { versionLabel, syncState, joined, text } from '../format.js';
+import { versionLabel, syncState, joined, text, openPanel, OPEN_PANEL_WARNING, strings } from '../format.js';
+import { validate } from '../form-model.js';
 
 export const CANCELLED = 'Отменено.';
 export const FILE_UNREADABLE = 'Файл недоступен или не в UTF-8.';
 export const PASSWORDS_DIFFER = 'Пароли не совпадают.';
 export const PASSWORD_EMPTY = 'Пароль не может быть пустым.';
 
-const strings = (value) => (Array.isArray(value) ? value.filter((item) => typeof item === 'string') : []);
 const str = (value) => (typeof value === 'string' ? value : '');
 
 /** Сбой после операции; отказ от плана — не сбой (`source.rs::report`). */
@@ -24,101 +24,160 @@ function cancelled(ctx) {
   ctx.notify('info', CANCELLED);
 }
 
-/** Новый пароль дважды (`system.rs::new_password`); `null` — отмена. */
-export async function newPassword(ctx, title) {
-  const first = await ctx.askSecret({ title, label: 'Новый пароль', allowEmpty: true });
-  if (first === null || first === undefined) return null;
-  if (first === '') { ctx.notify('warn', PASSWORD_EMPTY); return null; }
-  const second = await ctx.askSecret({ title, label: 'Повторите пароль' });
-  if (second === null || second === undefined) return null;
-  if (first !== second) { ctx.notify('warn', PASSWORDS_DIFFER); return null; }
-  return first;
+/**
+ * Новый пароль дважды одной формой (`system.rs::new_password`); с
+ * `current` — ещё и текущий пароль. `{ current, password }` или `null` при
+ * отмене. Значения уходят только в `secrets` вызывающего.
+ */
+export async function passwordForm(ctx, title, { current = false, currentLabel = 'Текущий пароль' } = {}) {
+  const fields = [
+    ...(current ? [{ name: 'current', label: currentLabel, type: 'secret', required: true }] : []),
+    { name: 'password', label: 'Новый пароль', type: 'secret', required: PASSWORD_EMPTY },
+    {
+      name: 'repeat', label: 'Повторите пароль', type: 'secret',
+      validate: (value, values) => (value === values.password ? null : PASSWORDS_DIFFER),
+    },
+  ];
+  const values = await ctx.form({ title, fields, submit: 'Сохранить' });
+  if (values === null || values === undefined) return null;
+  // Форма проверяет поля сама; повторная проверка не пропускает неверный ввод.
+  const errors = Object.values(validate(fields, values));
+  if (errors.length > 0) { ctx.notify('warn', errors[0]); return null; }
+  return { current: current ? values.current : null, password: values.password };
 }
 
 // ─── Сводка ────────────────────────────────────────────────────────────────
 
 /**
- * Разделы сводки в порядке и цветах TUI (`dashboard_view`): создание —
- * `create`, операции над конфигурацией — `change`, просмотр — `view`.
+ * Состояние чтения `group list`, `node list` и `client list` для проверки
+ * назначений на сводке: `pending` — ответа ещё нет, `failed` — хотя бы одно
+ * чтение не удалось, иначе `ready`. «Всё в порядке» сводка показывает только
+ * при `ready`.
  */
-export const DASHBOARD_SECTIONS = [
-  [
-    { route: 'nodes', label: 'Ноды', tone: 'create' },
-    { route: 'clients', label: 'Клиенты', tone: 'create' },
-    { route: 'groups', label: 'Группы', tone: 'create' },
-    { route: 'templates', label: 'Шаблоны', tone: 'create' },
-    { route: 'connections', label: 'Подключения', tone: 'change' },
-    { route: 'generate', label: 'Генерация конфигов', tone: 'change' },
-    { route: 'subscriptions', label: 'Подписки', tone: 'change' },
-    { route: 'awg', label: 'AmneziaWG', tone: 'view' },
-    { route: 'telegram', label: 'Telegram Proxy', tone: 'view' },
-  ],
-  [
-    { route: 'source', label: 'Источник конфигурации', tone: 'view' },
-    { route: 'settings', label: 'Настройки', tone: 'change' },
-  ],
-];
-
-const count = (value) => (Number.isInteger(value) && value >= 0 ? value : 0);
+export function assignmentsRead(groupsReply, nodesReply, clientsReply) {
+  const replies = [groupsReply, nodesReply, clientsReply];
+  if (replies.some((reply) => !reply)) return 'pending';
+  return replies.every((reply) => reply.ok) ? 'ready' : 'failed';
+}
 
 /**
- * Заголовок и контекст сводки только из `status` (`dashboard_view`).
- * Строка контекста: `{ text, tone?, suffix?: { text, tone } }`. Вместо
- * клавиш разделов TUI («раздел o», «n → h») — названия разделов панели.
+ * Клиенты группы, наследующие её ноды (`client list`: `inherit_nodes`);
+ * клиенты со своими нодами и подключениями от нод группы не зависят.
  */
-export function dashboardView(data, helloVersion = '') {
-  const status = data && typeof data === 'object' ? data : {};
-  const version = typeof status.version === 'string' ? status.version : str(helloVersion);
-  const update = status.update && status.update.available === true
-    ? { text: `Доступно обновление ${versionLabel(str(status.update.latest))} — раздел «Настройки»`, tone: 'warn' }
-    : null;
-  const context = [];
-  const source = status.source || {};
+export function inheritingClients(clients, group) {
+  if (!Array.isArray(clients)) return 0;
+  return clients.filter((client) => client && client.group === group && client.inherit_nodes === true).length;
+}
+
+/**
+ * «Требует внимания» на сводке из `status` и `hello`: `[{ id, tone, text,
+ * action }]`; `action` — `{ label, type: 'password'|'ssh-setup'|'group-connections'|'route'|'reload',
+ * node?, group?, route?, param?, tab? }` (экран выполняет действие по `type`).
+ * Третий аргумент — ответы `group list`, `node list` и `client list` (`null`,
+ * если не прочитаны): группы без нод (предупреждение — только если её ноды
+ * наследуют клиенты) и ноды, чьи подключения не назначены ни одной группе;
+ * `read` — `assignmentsRead`: при `failed` — пункт «не удалось прочитать» с
+ * повтором чтения (`reload`).
+ */
+export function attentionItems(status, hello, { groups = null, nodes = null, clients = null, read = 'ready' } = {}) {
+  const data = status && typeof status === 'object' ? status : {};
+  const items = [];
+  for (const node of strings(data.password_missing)) {
+    items.push({
+      id: `password:${node}`, tone: 'warn', text: `Нода «${node}»: пароль SSH не сохранён`,
+      action: { label: 'Задать пароль', type: 'password', node },
+    });
+  }
+  if (data.ssh_setup_pending === true) {
+    items.push({
+      id: 'ssh-setup', tone: 'warn', text: 'Отложена SSH-настройка нод',
+      action: { label: 'Завершить настройку', type: 'ssh-setup' },
+    });
+  }
+  if (!str(data.subscription_host)) {
+    items.push({
+      id: 'subscription-host', tone: 'info', text: 'Хост-нода подписок не задана',
+      action: { label: 'Выбрать хост', type: 'route', route: 'subscriptions' },
+    });
+  }
+  const source = data.source || {};
   if (source.type === 'github') {
     const sync = syncState(source.sync);
-    context.push({ text: `Источник: GitHub ${str(source.repo)} • `, suffix: { text: sync.label, tone: sync.tone } });
-  } else {
-    context.push({ text: 'Источник: локальная' });
+    if (sync.tone === 'warn' || sync.tone === 'error') {
+      items.push({
+        id: 'sync', tone: sync.tone, text: `Источник GitHub: ${sync.label}`,
+        action: { label: 'Источник', type: 'route', route: 'source' },
+      });
+    }
   }
-  const counts = status.counts || {};
-  context.push({ text: `Ноды: ${count(counts.nodes)}  Клиенты: ${count(counts.clients)}  Группы: ${count(counts.groups)}` });
-  const host = str(status.subscription_host);
-  context.push(host ? { text: `Хост подписок: ${host}` } : { text: 'Хост подписок не задан', tone: 'dim' });
-  const missing = strings(status.password_missing);
-  if (missing.length > 0) context.push({ text: `Нет пароля SSH: ${missing.join(', ')}`, tone: 'warn' });
-  if (status.ssh_setup_pending === true) {
-    context.push({ text: 'Отложена SSH-настройка нод — раздел «Ноды» → «Завершить отложенную SSH-настройку»', tone: 'warn' });
+  if (data.update && data.update.available === true) {
+    items.push({
+      id: 'update', tone: 'info', text: `Доступно обновление ${versionLabel(str(data.update.latest))}`,
+      action: { label: 'Настройки', type: 'route', route: 'settings' },
+    });
   }
-  return { title: `Remote Control ${versionLabel(version)}`, update, context, sections: DASHBOARD_SECTIONS };
+  if (openPanel(hello, data, null)) {
+    items.push({
+      id: 'open-panel', tone: 'warn', text: OPEN_PANEL_WARNING,
+      action: { label: 'Настройки', type: 'route', route: 'settings' },
+    });
+  }
+  if (read === 'failed') {
+    items.push({
+      id: 'assignments-unread', tone: 'warn', text: 'Не удалось прочитать группы, ноды или клиентов — назначения подключений не проверены',
+      action: { label: 'Повторить', type: 'reload' },
+    });
+  }
+  if (Array.isArray(groups)) {
+    const nodeNames = Array.isArray(nodes) ? nodes.map((node) => str(node && node.name)).filter(Boolean) : [];
+    for (const group of groups) {
+      const name = str(group && group.name);
+      if (!name || strings(group.nodes).length > 0) continue;
+      const inheriting = inheritingClients(clients, name);
+      items.push({
+        id: `group-nodes:${name}`, tone: inheriting > 0 ? 'warn' : 'info',
+        text: inheriting > 0
+          ? `Группа «${name}»: нет нод — клиенты, наследующие ноды группы (${inheriting}), получат конфиг без подключений`
+          : `Группа «${name}»: нет нод`,
+        action: { label: 'Добавить подключения', type: 'group-connections', group: name },
+      });
+    }
+    if (Array.isArray(nodes)) {
+      const used = new Set(groups.flatMap((group) => strings(group && group.nodes)));
+      for (const name of nodeNames) {
+        if (used.has(name)) continue;
+        items.push({
+          id: `node-groups:${name}`, tone: 'info', text: `Нода «${name}»: подключения не назначены ни одной группе`,
+          action: { label: 'Назначить подключения', type: 'route', route: 'nodes', param: name, tab: 'connections' },
+        });
+      }
+    }
+  }
+  return items;
+}
+
+/** Заголовок сводки (`dashboard_view`): версия из `status`, иначе из `hello`. */
+export function dashboardTitle(data, helloVersion = '') {
+  const status = data && typeof data === 'object' ? data : {};
+  const version = typeof status.version === 'string' ? status.version : str(helloVersion);
+  return `Remote Control ${versionLabel(version)}`;
 }
 
 // ─── Настройки ─────────────────────────────────────────────────────────────
 
+/** Обновление доступно по ответу `self version` (`settings_view`). */
+export function updateAvailable(version) {
+  return Boolean(version && version.ok && version.data && version.data.update_available === true);
+}
+
 /**
- * Контекст и действия настроек (`settings_view`): `version` — ответ
- * `self version` (один раз за визит), `password` — `status.script_password`.
+ * Строка «Обновление» настроек: `available` — есть новая версия, `none` —
+ * проверка прошла, обновлений нет; `unchecked` — проверка не удалась
+ * (`checked !== true`) или ответа нет: «нет» по ней не выводится.
  */
-export function settingsView(version, password) {
-  const ok = Boolean(version && version.ok);
-  const data = ok && version.data ? version.data : {};
-  const available = ok && data.update_available === true;
-  const context = [];
-  if (ok) {
-    context.push({ text: `Версия: ${versionLabel(str(data.current))}` });
-    if (data.checked === true) context.push({ text: `Последняя: ${versionLabel(str(data.latest))}` });
-    else context.push({ text: 'Не удалось проверить обновления', tone: 'dim' });
-  }
-  context.push({ text: password ? 'Пароль запуска: установлен' : 'Пароль запуска: не установлен' });
-  const actions = [];
-  if (available) actions.push({ key: 'u', label: 'Обновить remote-control', tone: 'change' });
-  if (password) {
-    actions.push({ key: 'l', label: 'Сменить пароль запуска', tone: 'change' });
-    actions.push({ key: 'r', label: 'Убрать пароль запуска', tone: 'danger' });
-  } else {
-    actions.push({ key: 'l', label: 'Установить пароль запуска', tone: 'change' });
-  }
-  actions.push({ key: 'x', label: 'Удалить remote-control', tone: 'danger' });
-  return { context, actions, available };
+export function updateState(version) {
+  if (updateAvailable(version)) return 'available';
+  return version && version.ok && version.data && version.data.checked === true ? 'none' : 'unchecked';
 }
 
 /** Объём удаления → argv `self uninstall` (`Settings`, ключ `x`). */
@@ -143,15 +202,11 @@ export async function settingsAction(ctx, key, { password, available }) {
       return null;
     }
     case 'l': {
+      const form = await passwordForm(ctx, 'Пароль запуска', { current: Boolean(password), currentLabel: 'Текущий пароль запуска' });
+      if (form === null) return null;
       const secrets = {};
-      if (password) {
-        const current = await ctx.askSecret({ title: 'Пароль запуска', label: 'Текущий пароль запуска' });
-        if (current === null || current === undefined) return null;
-        secrets['current-password'] = current;
-      }
-      const next = await newPassword(ctx, 'Пароль запуска');
-      if (next === null) return null;
-      secrets.password = next;
+      if (password) secrets['current-password'] = form.current;
+      secrets.password = form.password;
       report(ctx, await ctx.request(['self', 'password-set'], { secrets }));
       return null;
     }
@@ -165,14 +220,20 @@ export async function settingsAction(ctx, key, { password, available }) {
       return null;
     }
     case 'x': {
-      const scope = await ctx.choose({
+      const values = await ctx.form({
         title: 'Удаление remote-control',
-        options: [
-          { value: 'keep', label: 'Сохранить локальные данные', tone: 'view' },
-          { value: 'remove', label: 'Удалить локальные данные', tone: 'view' },
-        ],
+        fields: [{
+          name: 'scope', label: 'Локальные данные', type: 'radio', required: 'Выберите объём удаления.',
+          options: [
+            { value: 'keep', label: 'Сохранить локальные данные' },
+            { value: 'remove', label: 'Удалить локальные данные' },
+          ],
+        }],
+        submit: 'Далее',
+        tone: 'danger',
       });
-      if (scope === null || scope === undefined) return null;
+      if (values === null || values === undefined || !values.scope) return null;
+      const scope = values.scope;
       const reply = await ctx.runConfirmed('Удаление remote-control', 'Удалить remote-control в выбранном объёме?', uninstallArgv(scope));
       if (reply.ok) return 'uninstall';
       report(ctx, reply);
@@ -201,42 +262,17 @@ export function daemonLines(data) {
 
 // ─── Источник конфигурации ─────────────────────────────────────────────────
 
-/** Контекст и группы действий экрана источника (`source_view`). */
+/**
+ * Режим и клавиши действий экрана источника (`source_view`): GitHub —
+ * синхронизация, смена аккаунта, при шифровании пароль, ключ и импорт ключа
+ * восстановления, затем отключение и опасные действия; локальный — только `g`.
+ */
 export function sourceView(data) {
   const status = data && typeof data === 'object' ? data : {};
   const github = status.type === 'github';
   const encrypted = github && status.storage === 'age';
-  const context = [];
-  const sections = [];
-  if (github) {
-    context.push({ text: `GitHub: ${str(status.repo)}` });
-    context.push({ text: `Ветка: ${str(status.branch)}` });
-    context.push({ text: encrypted ? 'Хранение: зашифровано' : 'Хранение: без шифрования' });
-    const sync = syncState(status.sync);
-    context.push({ text: 'Синхронизация: ', suffix: { text: sync.label, tone: sync.tone } });
-    const sync_ = [
-      { key: 'f', label: 'Загрузить из GitHub', tone: 'change' },
-      { key: 'p', label: 'Отправить в GitHub', tone: 'change' },
-      { key: 'c', label: 'Сменить аккаунт', tone: 'change' },
-    ];
-    if (encrypted) {
-      sync_.push(
-        { key: 'r', label: 'Сменить пароль доступа', tone: 'change' },
-        { key: 'v', label: 'Новый ключ шифрования', tone: 'danger' },
-        { key: 'k', label: 'Импортировать ключ восстановления', tone: 'change' },
-      );
-    }
-    sections.push(sync_);
-    sections.push([
-      { key: 'e', label: 'Работать локально без синхронизации', tone: 'change' },
-      { key: 'l', label: 'Заменить GitHub локальной конфигурацией', tone: 'danger' },
-      { key: 'd', label: 'Удалить репозиторий', tone: 'danger' },
-    ]);
-  } else {
-    context.push({ text: 'Источник: локальная' });
-    sections.push([{ key: 'g', label: 'Подключить GitHub', tone: 'create' }]);
-  }
-  return { github, encrypted, context, sections };
+  if (!github) return { github, encrypted, keys: ['g'] };
+  return { github, encrypted, keys: ['f', 'p', 'c', ...(encrypted ? ['r', 'v', 'k'] : []), 'e', 'l', 'd'] };
 }
 
 /** Ссылка для ручного действия (`source.rs::manual_link`). */
@@ -253,7 +289,6 @@ async function provision(ctx, reply, argv) {
     title: 'Переносимый SSH-ключ',
     context: [`Ноды: ${nodes.join(', ')}`],
     question: 'Создать переносимый SSH-ключ для этих нод?',
-    tone: 'create',
   });
   setFlag(argv, decisionFlag('key_provisioning_required'), yes ? 'yes' : 'no');
 }
@@ -313,20 +348,18 @@ export async function sourceAction(ctx, key, data, deps = {}) {
     case 'c': await ctx.wizard('change'); return;
     case 'r': {
       if (!encrypted) return;
-      const current = await ctx.askSecret({ title: 'Смена пароля доступа', label: 'Текущий пароль доступа' });
-      if (current === null || current === undefined) return;
-      const next = await newPassword(ctx, 'Смена пароля доступа');
-      if (next === null) return;
-      const secrets = { 'vault-password': current, 'new-vault-password': next };
+      const form = await passwordForm(ctx, 'Смена пароля доступа', { current: true, currentLabel: 'Текущий пароль доступа' });
+      if (form === null) return;
+      const secrets = { 'vault-password': form.current, 'new-vault-password': form.password };
       report(ctx, await ctx.request(['source', 'github-rewrap-password'], { secrets }));
       return;
     }
     case 'v': {
       if (!encrypted) return;
-      const next = await newPassword(ctx, 'Новый ключ шифрования');
-      if (next === null) return;
+      const form = await passwordForm(ctx, 'Новый ключ шифрования');
+      if (form === null) return;
       const reply = await ctx.runConfirmed('Новый ключ шифрования', 'Создать новый ключ?', ['source', 'github-rotate-key'],
-        { secrets: { 'new-vault-password': next } });
+        { secrets: { 'new-vault-password': form.password } });
       report(ctx, reply);
       return;
     }
@@ -399,7 +432,7 @@ export function targetReplaceContext(error = {}) {
 async function chooseChoice(ctx, title, choices, label) {
   const index = await ctx.choose({
     title,
-    options: choices.map((choice, position) => ({ value: position, label: label(choice), tone: 'view' })),
+    options: choices.map((choice, position) => ({ value: position, label: label(choice) })),
     cancel: 'Отмена',
   });
   return index === null || index === undefined ? null : choices[index];
@@ -419,8 +452,8 @@ export async function githubWizardFlow(ctx, mode, deps = {}) {
   const picked = await ctx.choose({
     title: 'Аккаунт GitHub',
     options: [
-      ...accounts.map((account, index) => ({ value: index, label: account, tone: 'view' })),
-      { value: accounts.length, label: OTHER_LOGIN, tone: 'view' },
+      ...accounts.map((account, index) => ({ value: index, label: account })),
+      { value: accounts.length, label: OTHER_LOGIN },
     ],
   });
   if (picked === null || picked === undefined) { cancelled(ctx); return false; }
@@ -447,7 +480,7 @@ export async function githubWizardFlow(ctx, mode, deps = {}) {
     let decided;
     switch (code) {
       case 'github_auth_required': {
-        decided = await ctx.confirm({ title: 'Вход в GitHub', question: 'Войти в GitHub через браузер сейчас?', yes: 'Войти', tone: 'view' });
+        decided = await ctx.confirm({ title: 'Вход в GitHub', question: 'Войти в GitHub через браузер сейчас?', yes: 'Войти' });
         if (decided) {
           const auth = await ctx.request(['source', 'github-login', '--login', login], { operation: 'Вход в GitHub' });
           if (!auth.ok) { ctx.failed(); return false; }
@@ -455,7 +488,7 @@ export async function githubWizardFlow(ctx, mode, deps = {}) {
         break;
       }
       case 'repo_create_required':
-        decided = await ctx.confirm({ title: 'Создание репозитория', question: `Создать приватный репозиторий ${str(error.repo)}?`, tone: 'create' });
+        decided = await ctx.confirm({ title: 'Создание репозитория', question: `Создать приватный репозиторий ${str(error.repo)}?` });
         if (decided) setFlag(argv, decisionFlag(code));
         break;
       // Приватность подтверждается один раз — планом ядра.
@@ -480,9 +513,9 @@ export async function githubWizardFlow(ctx, mode, deps = {}) {
         break;
       }
       case 'new_vault_password_required': {
-        const password = await newPassword(ctx, title);
-        decided = password !== null;
-        if (decided) secrets['new-vault-password'] = password;
+        const form = await passwordForm(ctx, title);
+        decided = form !== null;
+        if (decided) secrets['new-vault-password'] = form.password;
         break;
       }
       case 'existing_config_action_required': {

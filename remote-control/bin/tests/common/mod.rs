@@ -37,19 +37,23 @@ pub fn endpoint(runtime: &Path, data: &Path) -> Endpoint {
     endpoint_in(runtime, data).expect("endpoint")
 }
 
-/// The daemon listens: the socket file exists (Unix); the pipe can be opened
-/// or is busy (Windows — a pipe is not a file `exists` can see reliably).
+/// The daemon listens: the socket file exists (Unix); a pipe instance exists
+/// (Windows). The Windows probe is `WaitNamedPipeW`, not an open: a
+/// connection would count as a client and keep an on-demand daemon from
+/// ever idling out.
 pub fn alive(endpoint: &Endpoint) -> bool {
     #[cfg(unix)]
     { endpoint.socket.exists() }
     #[cfg(windows)]
     {
         const ERROR_FILE_NOT_FOUND: i32 = 2;
-        match std::fs::OpenOptions::new().read(true).write(true).open(&endpoint.pipe) {
-            Ok(_) => true,
-            // ERROR_PIPE_BUSY and the like: an instance exists.
-            Err(error) => error.raw_os_error() != Some(ERROR_FILE_NOT_FOUND),
+        let name: Vec<u16> = endpoint.pipe.encode_utf16().chain([0]).collect();
+        // SAFETY: `name` is a NUL-terminated wide string.
+        if unsafe { windows_sys::Win32::System::Pipes::WaitNamedPipeW(name.as_ptr(), 1) } != 0 {
+            return true;
         }
+        // ERROR_SEM_TIMEOUT (every instance busy) and the like: an instance exists.
+        io::Error::last_os_error().raw_os_error() != Some(ERROR_FILE_NOT_FOUND)
     }
 }
 
@@ -59,18 +63,27 @@ pub fn wait_gone(endpoint: &Endpoint, timeout: Duration) -> bool {
         if Instant::now() >= deadline {
             return false;
         }
-        // Each Windows probe is a connection: poll gently.
-        thread::sleep(Duration::from_millis(if cfg!(windows) { 100 } else { 20 }));
+        thread::sleep(Duration::from_millis(20));
     }
     true
 }
 
-/// Ask a running daemon to stop and wait for its endpoint to disappear.
+/// Ask a running daemon to stop and wait for its endpoint to disappear. A
+/// busy pipe (every instance connected for a moment) is retried: skipping
+/// the stop would leave the daemon its whole linger time.
 pub fn stop(endpoint: &Endpoint) {
-    if !alive(endpoint) {
-        return;
-    }
-    if let Ok(mut conn) = Raw::connect(endpoint) && conn.hello(Duration::from_secs(10)).is_some() {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let conn = loop {
+        if !alive(endpoint) {
+            return;
+        }
+        match Raw::connect(endpoint) {
+            Ok(conn) => break Some(conn),
+            Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+            Err(_) => break None,
+        }
+    };
+    if let Some(mut conn) = conn && conn.hello(Duration::from_secs(10)).is_some() {
         conn.send(&json!({"id": "stop", "argv": ["daemon", "stop"]}));
         let _ = conn.reply("stop", Duration::from_secs(30));
     }

@@ -1,87 +1,61 @@
 // Telegram Proxy: `#/telegram` (`nodes.rs::Telegram`, `telegram_batch`,
-// `telegram_table`). Пакетные действия: выбор нод без отметок → по одному
-// `--name` на ноду → замороженный план ядра → таблица результатов.
-// «Управление одной нодой» — `telegram menu` в терминальном оверлее.
-import { html } from '../../vendor/preact-htm.js';
-import { Card, Table, Tone } from '../ui.js';
-import { interactive, nodeLabel } from './nodes.js';
-import { useBusy, Action, Actions, Back } from './kit.js';
+// `telegram_table`). Общий статус опрашивает все ноды по SSH, поэтому
+// читается по кнопке. Потоки (выбор нод, план, результаты) —
+// `nodeops-model.js`; здесь — разметка и привязка к кнопкам.
+import { html, useState } from '../../vendor/preact-htm.js';
+import { Page, Card, DataTable, Badge, Empty, MoreMenu, Button } from '../ui.js';
+import { useBusy, useMounted } from './kit.js';
 import {
-  EMPTY, NOTHING_SELECTED, rows, nodeText, telegramArgv, telegramResults,
-  TELEGRAM_TITLE, TELEGRAM_RESULT_TITLE, TELEGRAM_SELECT_TITLE, TELEGRAM_STATUS_ARGV,
-  TELEGRAM_COMPONENT_TITLE, TELEGRAM_COMPONENTS, TELEGRAM_VIEW, TELEGRAM_BATCH,
+  TELEGRAM_TITLE, TELEGRAM_RESULT_TITLE, TELEGRAM_BATCH, telegramMenu, telegramBatch, telegramStatus,
 } from './nodeops-model.js';
 
 const COLUMNS = [
-  { key: 'node', label: 'Нода' },
-  { key: 'status', label: 'Статус', render: (row) => html`<${Tone} tone=${row.tone}>${row.status}<//>` },
+  { key: 'node', label: 'Нода', search: true },
+  { key: 'status', label: 'Статус', render: (row) => html`<${Badge} tone=${row.tone}>${row.status}<//>` },
   { key: 'reason', label: 'Причина' },
 ];
 
-/** Таблица «нода  статус  причина»; `false` — в ответе нет `results`. */
-async function telegramTable(ctx, reply) {
-  const table = telegramResults(reply);
-  if (table === null) return false;
-  await ctx.show({ title: TELEGRAM_RESULT_TITLE, wide: true, body: html`<${Table} columns=${COLUMNS} rows=${table} />` });
-  return true;
-}
-
-/** Список нод (`node list`); отказ — сообщение о сбое и `null`. */
-async function listNodes(ctx) {
-  const listed = await ctx.call('node', 'list');
-  if (!listed.ok) {
-    if (ctx.isFailure(listed)) ctx.failed();
-    return null;
-  }
-  return rows(listed.data).map((row) => ({ value: nodeText(row.name), label: nodeLabel(row) }));
-}
-
-async function telegramBatch(ctx, title, base, component = null) {
-  const nodes = await listNodes(ctx);
-  if (nodes === null) return;
-  const selected = await ctx.toggle({ title, options: nodes, selected: [], empty: EMPTY, submit: 'Далее' });
-  if (selected === null) return;
-  if (selected.length === 0) {
-    ctx.notify('warn', NOTHING_SELECTED);
-    return;
-  }
-  const reply = await ctx.runConfirmed(title, 'Выполнить?', telegramArgv(base, selected, component));
-  if (!(await telegramTable(ctx, reply)) && ctx.isFailure(reply)) ctx.failed();
-}
-
-async function singleNode(ctx) {
-  const nodes = await listNodes(ctx);
-  if (nodes === null) return;
-  const name = await ctx.choose({ title: TELEGRAM_SELECT_TITLE, options: nodes.map((node) => ({ ...node, tone: 'view' })), empty: EMPTY });
-  if (name !== null) await interactive(ctx, name, true);
-}
-
-async function status(ctx) {
-  const reply = await ctx.call(...TELEGRAM_STATUS_ARGV);
-  if (!(await telegramTable(ctx, reply)) && ctx.isFailure(reply)) ctx.failed();
-}
-
-async function batch(ctx, action) {
-  if (!action.component) {
-    await telegramBatch(ctx, action.title, action.argv);
-    return;
-  }
-  const component = await ctx.choose({ title: TELEGRAM_COMPONENT_TITLE, options: TELEGRAM_COMPONENTS.map((item) => ({ ...item, tone: 'view' })) });
-  if (component !== null) await telegramBatch(ctx, action.title, action.argv, component);
+function ResultTable({ table }) {
+  return html`<${DataTable} columns=${COLUMNS} rows=${table} rowKey="node" empty="Нет нод" />`;
 }
 
 export function TelegramScreen({ ctx }) {
   const [busy, run] = useBusy();
-  const view = { node: () => singleNode(ctx), status: () => status(ctx) };
-  return html`<${Card} title=${TELEGRAM_TITLE}>
-    <${Actions} column>
-      ${TELEGRAM_VIEW.map((action) => html`<${Action} key=${action.id} tone=${action.tone} disabled=${busy}
-        onClick=${() => run(view[action.id])}>${action.label}<//>`)}
-    <//>
-    <${Actions} column>
-      ${TELEGRAM_BATCH.map((action) => html`<${Action} key=${action.id} tone=${action.tone} disabled=${busy}
-        onClick=${() => run(() => batch(ctx, action))}>${action.label}<//>`)}
-      <${Back} ctx=${ctx} to="summary" />
-    <//>
+  const [table, setTable] = useState(null);
+  const mounted = useMounted();
+
+  /** Сбой без таблицы — итог сбоя, прежняя таблица остаётся. */
+  const readStatus = async () => {
+    const rows = await telegramStatus(ctx);
+    if (rows !== null && mounted.current) setTable(rows);
+  };
+  const load = () => run(readStatus);
+  const present = (rows) => ctx.show({ title: TELEGRAM_RESULT_TITLE, wide: true, body: html`<${ResultTable} table=${rows} />` });
+  // После пакетного действия и сеанса меню загруженный статус перечитывается:
+  // прежний устарел (сеанс меню — и при его сбое).
+  const runBatch = (action) => run(async () => {
+    if ((await telegramBatch(ctx, action, present)) && table !== null) await readStatus();
+  });
+  const openMenu = () => run(() => telegramMenu(ctx, () => (table !== null ? readStatus() : null)));
+
+  const actions = html`
+    <${Button} icon="terminal" disabled=${busy} onClick=${openMenu}>Управление нодой…<//>
+    <${MoreMenu} label="Действия" items=${TELEGRAM_BATCH.map((action) => ({
+      label: action.label,
+      danger: action.danger === true,
+      disabled: busy,
+      onClick: () => runBatch(action),
+    }))} />
+  `;
+  return html`<${Page} title=${TELEGRAM_TITLE} actions=${actions}>
+    ${table === null
+      ? html`<${Card}>
+          <${Empty} icon="send" title="Статус не загружен" hint="Статус опрашивает все ноды по SSH."
+            action=${html`<${Button} kind="primary" icon="refresh-cw" disabled=${busy} onClick=${load}>Загрузить статус<//>`} />
+        <//>`
+      : html`<${Card} title="Статус нод"
+          actions=${html`<${Button} icon="refresh-cw" disabled=${busy} onClick=${load}>Обновить<//>`}>
+          <${ResultTable} table=${table} />
+        <//>`}
   <//>`;
 }

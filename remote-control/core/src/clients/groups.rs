@@ -23,22 +23,37 @@ pub fn list(session: &mut Session) -> Result<Value> {
     })).collect()))
 }
 
-/// The name is stored upper-cased; it becomes a directory of generated configs.
+/// The name is stored upper-cased; it becomes a directory of generated
+/// configs. `--template T` (`.yaml` optional) assigns an existing template in
+/// the same change; without it the group uses `default.yaml`.
 pub fn add(session: &mut Session, invocation: &Invocation) -> Result<Value> {
     let name = required(invocation, "name")?.to_ascii_uppercase();
     if !v::name_valid(&name) {
         return Err(RcError::new("invalid", "Название группы может содержать только буквы, цифры, точку, - и _"));
     }
-    session.mutate("add_group", |state| {
+    let template = if invocation.has("template") {
+        let template = templates::file_name(required(invocation, "template")?);
+        if !v::template_filename_valid(&template) { return Err(templates::name_invalid()); }
+        Some(template)
+    } else {
+        None
+    };
+    let template = session.mutate("add_group", |state| {
         let mut config = state.load_config()?;
         if config.groups.iter().any(|g| g.name == name) {
             return Err(RcError::new("conflict", format!("Группа «{name}» уже существует.")).with_extra("name", name.clone()));
         }
-        config.groups.push(Group { name: name.clone(), ..Group::default() });
-        state.save_config(&config)
+        let mut group = Group { name: name.clone(), ..Group::default() };
+        if let Some(template) = &template {
+            templates::require(state, template)?;
+            group.template = template.clone();
+        }
+        config.groups.push(group);
+        state.save_config(&config)?;
+        Ok(templates::group_template(&config, &name))
     })?;
-    session.log(Level::Success, &format!("Группа {name} добавлена"));
-    Ok(json!({"name": name}))
+    session.log(Level::Success, &format!("Группа «{name}» добавлена (шаблон «{template}»)"));
+    Ok(json!({"name": name, "template": template}))
 }
 
 fn delete_check(config: &Config, name: &str) -> Result<()> {
@@ -106,7 +121,7 @@ mod tests {
     fn add_upper_cases_and_rejects_unsafe_duplicate_or_missing_names() {
         let root = tempfile::tempdir().unwrap();
         let (mut session, _) = session(root.path());
-        assert_eq!(run(&mut session, &["group", "add", "--name", "lab"]).unwrap(), json!({"name": "LAB"}));
+        assert_eq!(run(&mut session, &["group", "add", "--name", "lab"]).unwrap(), json!({"name": "LAB", "template": "default.yaml"}));
         let config = session.state.load_config().unwrap();
         assert!(config.groups.iter().any(|g| g.name == "LAB" && g.template == "default.yaml"));
         let before = fingerprint(root.path());
@@ -117,6 +132,17 @@ mod tests {
         let error = run(&mut session, &["group", "add"]).unwrap_err();
         assert_eq!((error.code, error.exit), ("usage", 2));
         assert_eq!(fingerprint(root.path()), before);
+        // A template in the same change: checked first, nothing is added without it.
+        for (template, code) in [("ghost", "not_found"), ("../x", "invalid"), ("", "usage")] {
+            let error = run(&mut session, &["group", "add", "--name", "pc2", "--template", template]).unwrap_err();
+            assert_eq!(error.code, code, "{template:?}");
+        }
+        assert_eq!(fingerprint(root.path()), before);
+        std::fs::create_dir_all(session.state.paths().templates()).unwrap();
+        std::fs::write(session.state.paths().templates().join("lab.yaml"), "proxies:\n").unwrap();
+        assert_eq!(run(&mut session, &["group", "add", "--name", "pc2", "--template", "lab"]).unwrap(),
+            json!({"name": "PC2", "template": "lab.yaml"}));
+        assert!(session.state.load_config().unwrap().groups.iter().any(|g| g.name == "PC2" && g.template == "lab.yaml"));
     }
 
     #[test]

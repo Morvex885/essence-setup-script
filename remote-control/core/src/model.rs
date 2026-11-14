@@ -195,7 +195,15 @@ impl Config {
         let require_node = |name: &str| {
             if names.contains(name) { Ok(()) } else { Err(invalid("Ссылка на неизвестную ноду.")) }
         };
-        for connection in &self.connections { require_node(&connection.node)?; }
+        for connection in &self.connections {
+            require_node(&connection.node)?;
+            // `conn set` edits the first group of a name; a repeat would keep
+            // stale proxies that reads still merge in.
+            let mut groups = BTreeSet::new();
+            if !connection.groups.iter().all(|group| groups.insert(group.name.as_str())) {
+                return Err(invalid("Повторяющаяся группа в подключении ноды."));
+            }
+        }
         for client in &self.clients {
             if !v::name_valid(&client.group) {
                 return Err(invalid("Некорректное имя группы клиента."));
@@ -496,6 +504,7 @@ mod tests {
             ("/nodes/0/secret_id", json!("node:11111111111111111111111111111111:ssh-password")),
             ("/nodes/1/secret_id", json!("node:11111111111111111111111111111111:ssh-password")),
             ("/connections/0/node", json!("unknown")),
+            ("/connections/0/groups/1/name", json!("ROUTER")),
             ("/clients/1/nodes/0", json!("unknown")),
             ("/clients/1/connections/0/node", json!("unknown")),
             ("/nodes/1/id", json!("11111111111111111111111111111111")),

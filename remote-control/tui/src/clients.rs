@@ -130,6 +130,20 @@ fn node_request(ctx: &mut Context<'_>, node: &str, words: &[&str]) -> io::Result
         return Ok(None);
     }
 }
+/// Proxies of a node for a form: `conn list --name N --discover` over SSH;
+/// a node that cannot be read (reported) falls back to its saved
+/// assignments (`conn list --name N`, local) — enough to remove one —
+/// with `None` discovered (nothing is marked «not found»). `None` — neither
+/// read.
+fn node_connections(ctx: &mut Context<'_>, node: &str) -> io::Result<Option<(Value, Option<Vec<String>>)>> {
+    if let Some(found) = node_request(ctx, node, &["conn", "list", "--name", node, "--discover"])? {
+        let discovered = strings(&found[0]["discovered"]);
+        return Ok(Some((found, Some(discovered))));
+    }
+    let Some(saved) = fetch(ctx, &["conn", "list", "--name", node])? else { return Ok(None); };
+    ctx.ui.notice(ui::warn(format!("Нода {node} не проверена: показаны сохранённые назначения.")));
+    Ok(Some((saved, None)))
+}
 /// Result frame: empty fields are omitted; failures YELLOW.
 fn summary(ctx: &mut Context<'_>, title: &str, data: &Value, fields: &[(&str, &str)], empty: &str) -> io::Result<()> {
     let mut view = View::new(title);
@@ -181,13 +195,21 @@ fn clients(ctx: &mut Context<'_>) -> io::Result<()> {
         }
     }
 }
+/// Toggle flags of `selected` among `len` items: a failed command reopens
+/// its toggle with the user's choice.
+fn checked(len: usize, selected: &[usize]) -> Vec<bool> { (0..len).map(|i| selected.contains(&i)).collect() }
 fn delete_clients(ctx: &mut Context<'_>, targets: &[String]) -> io::Result<()> {
-    let Some(selected) = ctx.toggle("Удаление клиентов", targets, vec![false; targets.len()], EMPTY)? else { return Ok(()); };
-    if selected.is_empty() { ctx.ui.notice(ui::warn("Ничего не выбрано.")); return Ok(()); }
-    let mut words = vec!["client", "delete"];
-    for i in selected { words.extend(["--name", targets[i].as_str()]); }
-    confirmed(ctx, "Удаление клиентов", "Удалить выбранных клиентов?", &words)?;
-    Ok(())
+    let mut flags = vec![false; targets.len()];
+    loop {
+        let Some(selected) = ctx.toggle("Удаление клиентов", targets, flags, EMPTY)? else { return Ok(()); };
+        if selected.is_empty() { ctx.ui.notice(ui::warn("Ничего не выбрано.")); return Ok(()); }
+        let mut words = vec!["client", "delete"];
+        for &i in &selected { words.extend(["--name", targets[i].as_str()]); }
+        let reply = confirmed(ctx, "Удаление клиентов", "Удалить выбранных клиентов?", &words)?;
+        // `partial` deleted some: the list is re-read.
+        if !crate::confirm::retryable(&reply) { return Ok(()); }
+        flags = checked(targets.len(), &selected);
+    }
 }
 fn subscription_state(row: &Value) -> String {
     let sub = &row["subscription"];
@@ -276,13 +298,15 @@ fn client_nodes(ctx: &mut Context<'_>, name: &str, inherit: bool, current: &[Str
     let targets = names(&data);
     let labels: Vec<String> = rows(&data).iter().map(node_label).collect();
     // The current (effective) nodes are the starting state, like v1.
-    let flags = targets.iter().map(|n| current.contains(n)).collect();
-    let Some(selected) = ctx.toggle(&format!("Свои ноды клиента: {name}"), &labels, flags, EMPTY)? else { return Ok(()); };
-    if selected.is_empty() { ctx.ui.notice(ui::warn("Ничего не выбрано.")); return Ok(()); }
-    let mut words = vec!["client", "nodes", "--name", name];
-    for i in selected { words.extend(["--node", targets[i].as_str()]); }
-    execute(ctx, &words)?;
-    Ok(())
+    let mut flags = targets.iter().map(|n| current.contains(n)).collect();
+    loop {
+        let Some(selected) = ctx.toggle(&format!("Свои ноды клиента: {name}"), &labels, flags, EMPTY)? else { return Ok(()); };
+        if selected.is_empty() { ctx.ui.notice(ui::warn("Ничего не выбрано.")); return Ok(()); }
+        let mut words = vec!["client", "nodes", "--name", name];
+        for &i in &selected { words.extend(["--node", targets[i].as_str()]); }
+        if !crate::confirm::retryable(&execute(ctx, &words)?) { return Ok(()); }
+        flags = checked(labels.len(), &selected);
+    }
 }
 fn client_connections(ctx: &mut Context<'_>, name: &str, own: &[String]) -> io::Result<()> {
     if own.is_empty() { ctx.ui.notice(ui::warn("У клиента нет своих нод.")); return Ok(()); }
@@ -300,15 +324,22 @@ fn client_connections(ctx: &mut Context<'_>, name: &str, own: &[String]) -> io::
     }
     let Some(assigned) = fetch(ctx, &["client", "connections", "--name", name])? else { return Ok(()); };
     let current: Vec<String> = rows(&assigned).iter().filter(|r| r["node"] == node.as_str()).flat_map(|r| strings(&r["proxies"])).collect();
-    let Some(found) = node_request(ctx, &node, &["conn", "list", "--name", &node, "--discover"])? else { return Ok(()); };
-    let proxies = strings(&found[0]["discovered"]);
-    let flags = proxies.iter().map(|p| current.contains(p)).collect();
-    let Some(selected) = ctx.toggle(&format!("Подключения клиента на {node}"), &proxies, flags, EMPTY)? else { return Ok(()); };
-    if selected.is_empty() { ctx.ui.notice(ui::warn("Ничего не выбрано.")); return Ok(()); }
-    let mut words = vec!["client", "connections", "--name", name, "--node", &node];
-    for i in selected { words.extend(["--proxy", proxies[i].as_str()]); }
-    execute(ctx, &words)?;
-    Ok(())
+    let Some((_, discovered)) = node_connections(ctx, &node)? else { return Ok(()); };
+    // `client connections` replaces the list: assigned but unreported ones
+    // (AmneziaWG peers `awg-<peer>`, stale) are listed checked to survive.
+    let (extra, stale) = crate::nodes::unlisted(&current, discovered.as_deref());
+    let proxies: Vec<String> = discovered.unwrap_or_default().into_iter().chain(extra).collect();
+    if proxies.is_empty() { ctx.ui.notice(ui::warn(EMPTY)); return Ok(()); }
+    let labels: Vec<String> = proxies.iter().map(|p| crate::nodes::proxy_label(p, &stale)).collect();
+    let mut flags = proxies.iter().map(|p| current.contains(p)).collect();
+    loop {
+        let Some(selected) = ctx.toggle(&format!("Подключения клиента на {node}"), &labels, flags, EMPTY)? else { return Ok(()); };
+        if selected.is_empty() { ctx.ui.notice(ui::warn("Ничего не выбрано.")); return Ok(()); }
+        let mut words = vec!["client", "connections", "--name", name, "--node", &node];
+        for &i in &selected { words.extend(["--proxy", proxies[i].as_str()]); }
+        if !crate::confirm::retryable(&execute(ctx, &words)?) { return Ok(()); }
+        flags = checked(labels.len(), &selected);
+    }
 }
 
 // ─── Client subscription and headers ─────────────────────────────────────────
@@ -333,17 +364,18 @@ fn client_subscription(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
             ctx.ui.notice(ui::warn(format!("Клиент «{name}» не найден.")));
             return Ok(());
         };
-        // v1 `tui_call sub host || true`: an unreadable host only hides the line.
+        // An unreadable host does not block the menu; it is not «not set».
         let host = ctx.call(&["subscription", "host"])?;
-        let host = if host.ok { host.data["node"].as_str().filter(|s| !s.is_empty()).map(str::to_owned) } else { None };
+        let host = host.ok.then(|| host.data["node"].as_str().filter(|s| !s.is_empty()).map(str::to_owned));
         let mut view = View::menu(format!("Подписка клиента: {name}"), vec![
             Item::new('p', "Опубликовать", ui::GREEN), Item::new('v', "Показать ссылку", ui::CYAN),
             Item::new('i', "Итоговые заголовки", ui::CYAN), Item::new('h', "Заголовки клиента", ui::YELLOW),
             Item::new('r', "Сменить токен", ui::RED), Item::new('x', "Отозвать подписку", ui::RED), back(),
         ]);
         view.context.push(match &host {
-            Some(node) => ui::text(format!("Хост подписок: {node}"), ui::NC),
-            None => ui::text("Хост подписок не задан — раздел s", ui::DIM),
+            Some(Some(node)) => ui::text(format!("Хост подписок: {node}"), ui::NC),
+            Some(None) => ui::text("Хост подписок не задан — раздел s", ui::DIM),
+            None => ui::text("Хост подписок: не удалось прочитать", ui::YELLOW),
         });
         view.context.push(ui::text(format!("Подписка: {}", subscription_state(&row)), ui::NC));
         let Some(choice) = ctx.choose(&view)? else { return Ok(()); };
@@ -477,8 +509,10 @@ fn groups(ctx: &mut Context<'_>) -> io::Result<()> {
         let Some(choice) = ctx.choose(&view)? else { return Ok(()); };
         match choice.to_ascii_lowercase().as_str() {
             "0" => return Ok(()),
-            "a" => if let Some(name) = required(ctx, "Название группы", "Название не указано.")? {
-                execute(ctx, &["group", "add", "--name", &name])?;
+            "a" => if let Some(name) = required(ctx, "Название группы", "Название не указано.")?
+                && let Some(template) = pick_template(ctx, &format!("Шаблон группы {name}"))?
+            {
+                execute(ctx, &["group", "add", "--name", &name, "--template", &template])?;
             },
             _ => match index(&choice, list.len()) { Some(i) => group_card(ctx, &list[i])?, None => ctx.invalid() },
         }
@@ -493,7 +527,8 @@ fn group_card(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
         };
         let template = text(&row["template"]).to_owned();
         let mut view = View::menu(format!("Группа: {name}"), vec![
-            Item::new('t', "Шаблон", ui::YELLOW), Item::new('h', "Заголовки подписки группы", ui::YELLOW),
+            Item::new('t', "Шаблон", ui::YELLOW), Item::new('c', "Подключения нод", ui::YELLOW),
+            Item::new('h', "Заголовки подписки группы", ui::YELLOW),
             Item::new('f', "Сгенерировать конфиги группы", ui::YELLOW), Item::new('d', "Удалить группу", ui::RED), back(),
         ]);
         view.context = vec![
@@ -505,11 +540,43 @@ fn group_card(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
         match choice.to_ascii_lowercase().as_str() {
             "0" => return Ok(()),
             "t" => group_template(ctx, name, &template)?,
+            "c" => group_connections(ctx, name)?,
             "h" => headers(ctx, "group", name)?,
             "f" => generate(ctx, &["--group", name])?,
             "d" => if confirmed(ctx, "Удаление группы", "Удалить группу?", &["group", "delete", "--name", name])?.ok { return Ok(()); },
             _ => ctx.invalid(),
         }
+    }
+}
+/// The group's proxies on one node (the only node is taken without asking):
+/// a toggle of the node's discovered proxies (and assigned ones no longer
+/// discovered) preselected with the group's; a changed set is sent as one
+/// `conn set --assign G=…` (empty — the assignment is removed).
+fn group_connections(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
+    let Some(data) = fetch(ctx, &["node", "list"])? else { return Ok(()); };
+    let node = match rows(&data) {
+        [] => { ctx.ui.notice(ui::warn("Нет нод.")); return Ok(()); }
+        [only] => text(&only["name"]).to_owned(),
+        nodes => {
+            let labels: Vec<String> = nodes.iter().map(node_label).collect();
+            let Some(i) = ctx.select(&format!("Подключения группы {name}: нода"), &labels)? else { return Ok(()); };
+            text(&nodes[i]["name"]).to_owned()
+        }
+    };
+    let Some((found, discovered)) = node_connections(ctx, &node)? else { return Ok(()); };
+    let current: Vec<String> = rows(&found[0]["groups"]).iter().filter(|g| g["name"] == name).flat_map(|g| strings(&g["proxies"])).collect();
+    let (extra, stale) = crate::nodes::unlisted(&current, discovered.as_deref());
+    let proxies: Vec<String> = discovered.unwrap_or_default().into_iter().chain(extra).collect();
+    let labels: Vec<String> = proxies.iter().map(|p| crate::nodes::proxy_label(p, &stale)).collect();
+    let mut flags = proxies.iter().map(|p| current.contains(p)).collect();
+    loop {
+        let Some(selected) = ctx.toggle(&format!("Подключения группы {name} на {node}"), &labels, flags, EMPTY)? else { return Ok(()); };
+        let chosen: Vec<String> = selected.iter().map(|&i| proxies[i].clone()).collect();
+        if crate::nodes::same_set(&chosen, &current) { ctx.ui.notice(ui::warn("Изменений нет.")); return Ok(()); }
+        let words = crate::nodes::conn_set_argv(&node, &[(name, &chosen)]);
+        let words: Vec<&str> = words.iter().map(String::as_str).collect();
+        if !crate::confirm::retryable(&execute(ctx, &words)?) { return Ok(()); }
+        flags = checked(labels.len(), &selected);
     }
 }
 fn group_template(ctx: &mut Context<'_>, name: &str, current: &str) -> io::Result<()> {
@@ -530,6 +597,17 @@ fn group_template(ctx: &mut Context<'_>, name: &str, current: &str) -> io::Resul
 
 // ─── Templates ───────────────────────────────────────────────────────────────
 
+/// A template from `template list`, `default.yaml` first; `None` — cancelled
+/// or the list could not be read (already reported).
+fn pick_template(ctx: &mut Context<'_>, title: &str) -> io::Result<Option<String>> {
+    let Some(data) = fetch(ctx, &["template", "list"])? else { return Ok(None); };
+    let mut labels = names(&data);
+    if let Some(i) = labels.iter().position(|name| name == "default.yaml") {
+        let default = labels.remove(i);
+        labels.insert(0, default);
+    }
+    Ok(ctx.select(title, &labels)?.map(|i| labels.swap_remove(i)))
+}
 fn source_label(row: &Value) -> &'static str { if row["source"] == "builtin" { "встроенный" } else { "пользовательский" } }
 fn templates(ctx: &mut Context<'_>) -> io::Result<()> {
     loop {
@@ -540,8 +618,10 @@ fn templates(ctx: &mut Context<'_>) -> io::Result<()> {
         let Some(choice) = ctx.choose(&view)? else { return Ok(()); };
         match choice.to_ascii_lowercase().as_str() {
             "0" => return Ok(()),
-            "a" => if let Some(name) = required(ctx, "Имя шаблона", "Имя шаблона не указано.")? {
-                let reply = execute(ctx, &["template", "create", "--name", &name])?;
+            "a" => if let Some(name) = required(ctx, "Имя шаблона", "Имя шаблона не указано.")?
+                && let Some(base) = pick_template(ctx, &format!("Шаблон {name}: на основе"))?
+            {
+                let reply = execute(ctx, &["template", "create", "--name", &name, "--from", &base])?;
                 if let Some(created) = reply.data["name"].as_str().filter(|_| reply.ok) { edit_template(ctx, created)?; }
             },
             _ => match index(&choice, list.len()) { Some(i) => template_card(ctx, &list[i])?, None => ctx.invalid() },
@@ -604,10 +684,17 @@ fn template_card(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
             ctx.ui.notice(ui::warn(format!("Шаблон «{name}» не найден.")));
             return Ok(());
         };
-        let mut view = View::menu(format!("Шаблон: {name}"), vec![
+        let custom = row["source"] == "custom";
+        let mut items = vec![
             Item::new('v', "Показать", ui::CYAN), Item::new('x', "Экспорт в файл", ui::CYAN),
-            Item::new('e', "Редактировать", ui::YELLOW), Item::new('i', "Импорт из файла", ui::YELLOW), back(),
-        ]);
+            Item::new('e', "Редактировать", ui::YELLOW), Item::new('i', "Импорт из файла", ui::YELLOW),
+            Item::new('c', "Проверить", ui::CYAN), Item::new('g', "Группы шаблона", ui::YELLOW),
+        ];
+        if custom {
+            items.push(Item::new('d', if row["overrides"] == true { "Сбросить к встроенному" } else { "Удалить шаблон" }, ui::RED));
+        }
+        items.push(back());
+        let mut view = View::menu(format!("Шаблон: {name}"), items);
         view.context = vec![
             ui::text(format!("Источник: {}", source_label(&row)), ui::NC),
             ui::text(format!("Группы: {}", joined(&row["groups"])), ui::NC),
@@ -628,11 +715,57 @@ fn template_card(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
                 if choice == "x" {
                     export_template(ctx, name, &path)?;
                 } else if let Some(input) = file_input(ctx, &path) {
-                    confirmed_with(ctx, "Импорт шаблона", "Перезаписать шаблон?", &["template", "import", "--name", name], &input)?;
+                    confirmed_with(ctx, "Импорт шаблона", "Импортировать шаблон?", &["template", "import", "--name", name], &input)?;
                 }
+            },
+            "c" => if let Some(report) = fetch(ctx, &["template", "check", "--name", name])? {
+                present(ctx, &check_view(name, &report))?;
+            },
+            "g" => template_groups(ctx, name, &strings(&row["groups"]))?,
+            "d" if custom => if confirmed(ctx, "Удаление шаблона", "Удалить шаблон?", &["template", "delete", "--name", name])?.ok {
+                return Ok(());
             },
             _ => ctx.invalid(),
         }
+    }
+}
+/// `template check` result: one line per problem, or «Проблем нет».
+fn check_view(name: &str, report: &Value) -> View {
+    let mut view = View::new(format!("Проверка шаблона: {name}"));
+    let problems = rows(&report["problems"]);
+    if problems.is_empty() { view.context.push(ui::text("Проблем нет", ui::GREEN)); }
+    for problem in problems {
+        let (level, color) = if problem["level"] == "error" { ("ошибка", ui::RED) } else { ("предупреждение", ui::YELLOW) };
+        let variant = match problem["variant"].as_str() {
+            None => String::new(),
+            Some("") => " (без групп)".into(),
+            Some(tag) => format!(" ({tag})"),
+        };
+        view.context.push(ui::text(format!("строка {}: {level} — {}{variant}", scalar(&problem["line"]), text(&problem["message"])), color));
+    }
+    if report["truncated"] == true { view.context.push(ui::text("Показаны не все проблемы.", ui::DIM)); }
+    view
+}
+/// Multi-select of the groups that use the template; the rest of its groups
+/// fall back to `default.yaml` (the core plans both). Nothing falls back
+/// from `default.yaml` itself, so for it only the other groups are offered.
+fn template_groups(ctx: &mut Context<'_>, name: &str, current: &[String]) -> io::Result<()> {
+    let Some(data) = fetch(ctx, &["group", "list"])? else { return Ok(()); };
+    let mut groups = names(&data);
+    let default = name == "default.yaml";
+    if default { groups.retain(|g| !current.contains(g)); }
+    let mut flags = groups.iter().map(|g| current.contains(g)).collect();
+    let title = if default { format!("Назначить шаблон {name} группам") } else { format!("Группы шаблона: {name}") };
+    loop {
+        let Some(selected) = ctx.toggle(&title, &groups, flags, EMPTY)? else { return Ok(()); };
+        let mut words = vec!["template", "groups", "--name", name];
+        for &i in &selected { words.extend(["--group", groups[i].as_str()]); }
+        let reply = confirmed(ctx, "Группы шаблона", "Применить?", &words)?;
+        if reply.ok && strings(&reply.data["assigned"]).is_empty() && strings(&reply.data["reset"]).is_empty() {
+            ctx.ui.notice(ui::text("Изменений нет.", ui::DIM));
+        }
+        if !crate::confirm::retryable(&reply) { return Ok(()); }
+        flags = checked(groups.len(), &selected);
     }
 }
 fn executable(name: &str) -> bool {
@@ -727,8 +860,9 @@ fn edit_file(ctx: &mut Context<'_>, name: &str, editor: &[String], path: &Path, 
             if let Some(input) = file_input(ctx, path) {
                 let reply = confirmed_with(ctx, "Импорт изменений шаблона", "Сохранить изменения шаблона?",
                     &["template", "import", "--name", name], &input)?;
-                // Success, or the plan was refused: the user's decision is final.
-                if reply.ok || matches!(reply.code(), "confirmation_required" | "plan_changed") { return Ok(()); }
+                // Saved; a refused plan (overwrite or problems) keeps the
+                // working copy like a rejected import.
+                if reply.ok { return Ok(()); }
             }
         } else {
             ctx.ui.notice(ui::warn("Редактор завершился с ошибкой."));
@@ -1058,6 +1192,29 @@ mod tests {
         assert!(!core.calls.iter().any(|c| c.contains(&"--yes".to_owned())));
     }
     #[test]
+    fn client_connections_keep_assigned_proxies_the_node_did_not_report() {
+        // AWG discovered: the peer `awg-alice` is listed checked without a
+        // mark, `gone` is marked; both survive an unchanged submit.
+        let (core, ui) = drive(vec![
+            ok(&["node", "list"], nodes()),
+            ok(&["client", "connections", "--name", "alice"], json!([{"node":"de","mode":"own","proxies":["p1","awg-alice","gone"]}])),
+            ok(&["conn", "list", "--name", "de", "--discover"], json!([{"node":"de","groups":[],"discovered":["AWG","p1"]}])),
+            ok(&["client", "connections", "--name", "alice", "--node", "de", "--proxy", "p1", "--proxy", "awg-alice", "--proxy", "gone"], json!({})),
+        ], &["1", "1", ""], |ctx| client_connections(ctx, "alice", &["de".into()]));
+        core.assert_finished();
+        let toggle = view(&ui, "Подключения клиента на de");
+        let labels: Vec<&str> = toggle.sections[0].iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(&labels[..4], ["[ ] AWG", "[x] p1", "[x] awg-alice", "[x] gone (не найдено на ноде)"]);
+        // Nothing discovered and nothing assigned: a warning, no toggle.
+        let (core, ui) = drive(vec![
+            ok(&["node", "list"], nodes()),
+            ok(&["client", "connections", "--name", "alice"], json!([])),
+            ok(&["conn", "list", "--name", "de", "--discover"], json!([{"node":"de","groups":[],"discovered":[]}])),
+        ], &["1", "1"], |ctx| client_connections(ctx, "alice", &["de".into()]));
+        core.assert_finished();
+        assert_eq!(notices(&ui, EMPTY), 1);
+    }
+    #[test]
     fn ttl_menu_maps_values_and_cancellation_never_publishes() {
         for (selection, ttl) in [("1", None), ("2", Some("12h")), ("3", Some("30d")), ("4", Some("2w")), ("5", Some("7d")), ("0", None)] {
             let mut steps = vec![ok(&["client", "list"], alice(true)), ok(&["subscription", "host"], host())];
@@ -1080,6 +1237,11 @@ mod tests {
             ok(&["client", "list"], published), ok(&["subscription", "host"], Value::Null)], &["p", "0", "0"], |ctx| client_subscription(ctx, "alice"));
         assert!(view(&ui, "Срок действия подписки").sections[0][0].label.starts_with("Оставить текущий срок"));
         assert!(content(&ui.views[0]).contains("Хост подписок не задан"));
+        // A failed read is not «not set».
+        let (_, ui) = drive(vec![ok(&["client", "list"], alice(true)), step(&["subscription", "host"], Reply::failure("locked"))],
+            &["0"], |ctx| client_subscription(ctx, "alice"));
+        let shown = content(&ui.views[0]);
+        assert!(shown.contains("Хост подписок: не удалось прочитать") && !shown.contains("не задан"), "{shown}");
     }
     #[test]
     fn failed_publish_shows_no_bundle() {
@@ -1185,19 +1347,68 @@ mod tests {
     fn groups_add_card_set_template_and_confirmed_delete() {
         let templates = json!([{"name":"default.yaml","source":"builtin","groups":["PC"]},{"name":"m.yaml","source":"custom","groups":[]}]);
         let (_, ui) = drive(vec![
-            ok(&["group", "list"], json!([])), ok(&["group", "add", "--name", "pc"], json!({"name":"PC"})),
+            ok(&["group", "list"], json!([])), ok(&["template", "list"], templates.clone()),
+            ok(&["group", "add", "--name", "pc", "--template", "default.yaml"], json!({"name":"PC","template":"default.yaml"})),
             ok(&["group", "list"], group_list()), ok(&["group", "list"], group_list()),
             ok(&["template", "list"], templates),
             ok(&["group", "set-template", "--name", "PC", "--template", "m.yaml"], json!({})),
             ok(&["group", "list"], group_list()),
             step(&["group", "delete", "--name", "PC"], plan()), yes(&["group", "delete", "--name", "PC"], json!({"name":"PC"})),
             ok(&["group", "list"], json!([])),
-        ], &["A", "pc", "1", "T", "2", "D", "y", "0"], groups);
+        ], &["A", "pc", "1", "1", "T", "2", "D", "y", "0"], groups);
         assert_eq!(keys(&ui.views[0]), [("a".into(), ui::GREEN), ("0".into(), ui::NC)]);
         let card = view(&ui, "Группа: PC");
         assert!(content(card).contains("Клиентов: 1"));
         assert_eq!(keys(card).last().unwrap(), &("0".into(), ui::NC));
-        assert_eq!(keys(card)[3], ("d".into(), ui::RED));
+        assert_eq!(keys(card)[1], ("c".into(), ui::YELLOW));
+        assert_eq!(keys(card)[4], ("d".into(), ui::RED));
+    }
+    #[test]
+    fn group_connections_pick_a_node_and_send_only_a_changed_set() {
+        let nodes = json!([{"name":"de","ip":"1.2.3.4","port":22},{"name":"ru","ip":"5.6.7.8","port":22}]);
+        let found = json!([{"node":"ru","groups":[{"name":"PC","proxies":["p1","stale"]},{"name":"X","proxies":["p2"]}],"discovered":["p1","p2"]}]);
+        let discover = ["conn", "list", "--name", "ru", "--discover"];
+        // Two nodes: the second is chosen; the toggle lists stale assigned
+        // proxies too and starts from the group's set.
+        let (core, ui) = drive(vec![
+            ok(&["node", "list"], nodes.clone()), ok(&discover, found.clone()),
+            ok(&["conn", "set", "--name", "ru", "--assign", "PC=p1", "--assign", "PC=p2"], json!({"node":"ru","changed":[{"group":"PC","proxies":["p1","p2"]}]})),
+        ], &["2", "2", "3", ""], |ctx| group_connections(ctx, "PC"));
+        core.assert_finished();
+        let toggle = &ui.views[1];
+        let labels: Vec<&str> = toggle.sections[0].iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(&labels[..3], ["[x] p1", "[ ] p2", "[x] stale (не найдено на ноде)"]);
+        // One node is taken without asking; an unchanged set sends nothing.
+        let (core, ui) = drive(vec![ok(&["node", "list"], json!([nodes[1].clone()])), ok(&discover, found.clone())],
+            &["2", "2", ""], |ctx| group_connections(ctx, "PC"));
+        core.assert_finished();
+        assert!(ui.notices.iter().any(|n| n.to_string().contains("Изменений нет")));
+        // Clearing the set removes the group's assignment on the node.
+        let (core, _) = drive(vec![ok(&["node", "list"], json!([nodes[1].clone()])), ok(&discover, found),
+            ok(&["conn", "set", "--name", "ru", "--assign", "PC="], json!({"node":"ru","changed":[{"group":"PC","proxies":[]}]}))],
+            &["1", "3", ""], |ctx| group_connections(ctx, "PC"));
+        core.assert_finished();
+        let (core, ui) = drive(vec![ok(&["node", "list"], json!([]))], &[], |ctx| group_connections(ctx, "PC"));
+        core.assert_finished();
+        assert!(ui.notices.iter().any(|n| n.to_string().contains("Нет нод")));
+    }
+    #[test]
+    fn group_connections_fall_back_to_saved_assignments_and_keep_the_choice_on_failure() {
+        let node = json!([{"name":"ru","ip":"5.6.7.8","port":22}]);
+        let saved = json!([{"node":"ru","groups":[{"name":"PC","proxies":["p1"]}]}]);
+        let unset = ["conn", "set", "--name", "ru", "--assign", "PC="];
+        // Discovery fails (reported): the saved assignment is listed, not as
+        // «not found», and can be removed; a failed save reopens the toggle
+        // with the choice kept.
+        let (core, ui) = drive(vec![
+            ok(&["node", "list"], node), step(&["conn", "list", "--name", "ru", "--discover"], fail("remote_failed", json!({}))),
+            ok(&["conn", "list", "--name", "ru"], saved),
+            step(&unset, fail("locked", json!({}))), ok(&unset, json!({"node":"ru","changed":[{"group":"PC","proxies":[]}]})),
+        ], &["1", "", ""], |ctx| group_connections(ctx, "PC"));
+        core.assert_finished();
+        assert_eq!(ui.views[0].sections[0][0].label, "[x] p1");
+        assert_eq!(ui.views[1].sections[0][0].label, "[ ] p1");
+        assert!(ui.notices.iter().any(|n| n.to_string().contains("сохранённые назначения")));
     }
     #[test]
     fn group_new_template_choice_creates_bound_template_then_opens_editor() {
@@ -1212,12 +1423,13 @@ mod tests {
     #[test]
     fn templates_list_sources_and_create_opens_editor() {
         let list = json!([{"name":"default.yaml","source":"builtin","groups":["PC"]},{"name":"m.yaml","source":"custom","groups":[]}]);
-        let (_, ui) = drive(vec![
-            ok(&["template", "list"], list.clone()),
-            ok(&["template", "create", "--name", "x"], json!({"name":"x.yaml","based_on":"default.yaml","group":null})),
+        let (core, ui) = drive(vec![
+            ok(&["template", "list"], list.clone()), ok(&["template", "list"], list.clone()),
+            ok(&["template", "create", "--name", "x", "--from", "m.yaml"], json!({"name":"x.yaml","based_on":"m.yaml","group":null})),
             step(&["template", "show", "--name", "x.yaml"], fail("not_found", json!({}))),
             ok(&["template", "list"], list),
-        ], &["a", "x", "0"], templates);
+        ], &["a", "x", "2", "0"], templates);
+        core.assert_finished();
         assert_eq!(ui.views[0].sections[0][0].label, "default.yaml  (встроенный)");
         assert_eq!(ui.views[0].sections[0][1].label, "m.yaml  (пользовательский)");
     }
@@ -1267,6 +1479,74 @@ mod tests {
         assert!(imports.iter().all(|(_, names)| *names == &["file".to_owned()]), "the content travels as input.file");
         assert!(!core.calls.iter().flatten().any(|word| word.contains(dir.path().to_str().unwrap())), "no local path reaches the daemon");
         assert_eq!(expand_home("~other/path"), PathBuf::from("~other/path"));
+    }
+    #[test]
+    fn template_card_checks_sets_groups_and_deletes() {
+        let list = json!([{"name":"m.yaml","source":"custom","overrides":false,"groups":["PC"]}]);
+        let report = json!({"name":"m.yaml","errors":1,"warnings":1,"truncated":false,"problems":[
+            {"line":1,"column":1,"level":"error","code":"proxies","message":"Нет строки «proxies:»","path":null,"variant":null},
+            {"line":7,"column":3,"level":"warning","code":"schema","message":"bad mode","path":"/mode","variant":"PC"}],
+            "variants":[{"tag":null,"dropped":[]}]});
+        let groups = ["template", "groups", "--name", "m.yaml", "--group", "PC", "--group", "ROUTER"];
+        let delete = ["template", "delete", "--name", "m.yaml"];
+        let (core, ui) = drive(vec![
+            ok(&["template", "list"], list.clone()),
+            ok(&["template", "check", "--name", "m.yaml"], report),
+            ok(&["template", "list"], list.clone()),
+            ok(&["group", "list"], json!([{"name":"PC","template":"m.yaml"},{"name":"ROUTER","template":"default.yaml"}])),
+            step(&groups, plan()), yes(&groups, json!({"name":"m.yaml","assigned":["ROUTER"],"reset":[]})),
+            ok(&["template", "list"], list),
+            step(&delete, plan()), yes(&delete, json!({"name":"m.yaml","groups":["PC","ROUTER"],"builtin":false})),
+        ], &["c", "", "G", "2", "", "y", "D", "y"], |ctx| template_card(ctx, "m.yaml"));
+        let card = &ui.views[0];
+        assert_eq!(keys(card), ["v", "x", "e", "i", "c", "g", "d", "0"].iter().map(|k| (k.to_string(), match *k {
+            "v" | "x" | "c" => ui::CYAN, "e" | "i" | "g" => ui::YELLOW, "d" => ui::RED, _ => ui::NC,
+        })).collect::<Vec<_>>());
+        let check = &ui.views[1];
+        assert_eq!(check.context.iter().map(|line| line.style.fg).collect::<Vec<_>>(), [Some(ui::RED), Some(ui::YELLOW)], "a row per problem by level");
+        assert!(check.context[1].to_string().contains("bad mode") && check.context[1].to_string().contains("PC"), "message and variant tag");
+        let toggle = ui.views.iter().find(|v| v.mode == ui::Mode::Toggle).unwrap();
+        assert!(toggle.sections[0][0].label.starts_with("[x]") && toggle.sections[0][1].label.starts_with("[ ]"), "current groups are checked");
+        assert!(sent(&core, &groups) && sent(&core, &delete));
+        assert_eq!(ui.views.iter().filter(|v| v.prompt.contains("(y/N)")).count(), 2);
+        assert!(ui.inputs.is_empty(), "the card returns to the list after deletion");
+    }
+    #[test]
+    fn template_card_offers_deletion_only_for_custom_and_reports_a_clean_check() {
+        let builtin = json!([{"name":"default.yaml","source":"builtin","overrides":false,"groups":[]}]);
+        let clean = json!({"name":"default.yaml","errors":0,"warnings":0,"truncated":false,"problems":[],"variants":[]});
+        let (core, ui) = drive(vec![
+            ok(&["template", "list"], builtin.clone()),
+            ok(&["template", "list"], builtin.clone()),
+            ok(&["template", "check", "--name", "default.yaml"], clean),
+            ok(&["template", "list"], builtin),
+        ], &["d", "c", "", "0"], |ctx| template_card(ctx, "default.yaml"));
+        assert!(keys(&ui.views[0]).iter().all(|(key, _)| key != "d"));
+        assert!(!core.calls.iter().any(|call| call[1] == "delete"));
+        let clean = ui.views.iter().any(|v| v.context.len() == 1 && v.context[0].style.fg == Some(ui::GREEN));
+        assert!(clean, "a clean check is one green row");
+        let label = |row: Value| {
+            let (_, ui) = drive(vec![ok(&["template", "list"], json!([row]))], &["0"], |ctx| template_card(ctx, "default.yaml"));
+            ui.views[0].sections.iter().flatten().find(|i| i.key == "d").unwrap().label.clone()
+        };
+        let (reset, delete) = (label(json!({"name":"default.yaml","source":"custom","overrides":true,"groups":[]})),
+            label(json!({"name":"default.yaml","source":"custom","overrides":false,"groups":[]})));
+        assert_ne!(reset, delete, "an override is reset, not deleted");
+    }
+    #[test]
+    fn default_template_groups_offer_only_the_other_groups() {
+        let list = json!([{"name":"default.yaml","source":"builtin","overrides":false,"groups":["PC"]}]);
+        let assign = ["template", "groups", "--name", "default.yaml", "--group", "ROUTER"];
+        let (core, ui) = drive(vec![
+            ok(&["template", "list"], list.clone()),
+            ok(&["group", "list"], json!([{"name":"PC","template":"default.yaml"},{"name":"ROUTER","template":"r.yaml"}])),
+            step(&assign, plan()), yes(&assign, json!({"name":"default.yaml","assigned":["ROUTER"],"reset":[]})),
+            ok(&["template", "list"], list),
+        ], &["g", "1", "", "y", "0"], |ctx| template_card(ctx, "default.yaml"));
+        let toggle = ui.views.iter().find(|v| v.mode == ui::Mode::Toggle).unwrap();
+        let offered: Vec<_> = toggle.sections.iter().flatten().filter(|i| i.key != "0").map(|i| i.label.clone()).collect();
+        assert_eq!(offered, ["[ ] ROUTER"], "groups already on default.yaml are not offered");
+        assert!(sent(&core, &assign));
     }
     #[test]
     fn file_input_refuses_large_files_and_links() {
@@ -1459,6 +1739,23 @@ mod tests {
             assert_eq!(keys(decision), [("r".into(), ui::YELLOW), ("d".into(), ui::RED)]);
             frames(&ui.inner);
         }
+    }
+    /// A refused plan (overwrite or template problems) is not a discard: the
+    /// working copy stays and can be reopened with the edits.
+    #[test]
+    fn refused_import_plan_keeps_the_working_copy() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(file.path(), b"original").unwrap();
+        let import = ["template", "import", "--name", "m.yaml"];
+        let steps = vec![step(&import, plan()), step(&import, plan()), yes(&import, json!({"name":"m.yaml"}))];
+        let registry = Registry { screens: vec![], github_wizard: None };
+        let mut core = ScriptedClient::new(steps);
+        let mut ui = EditorUi { inner: ScriptedUi::new(&["n", "r", "y"]), replacement: Some(b"changed"), succeeds: true, suspended: 0, seen: vec![] };
+        edit_file(&mut Context::for_test(&mut core, &mut ui, &registry), "m.yaml", &["editor".into()], file.path(), b"original").unwrap();
+        core.assert_finished();
+        assert!(ui.inner.inputs.is_empty());
+        assert_eq!(ui.suspended, 2);
+        assert_eq!(ui.seen[1], b"changed", "the editor reopens the edited copy");
     }
     #[test]
     fn vanished_template_never_opens_the_editor() {

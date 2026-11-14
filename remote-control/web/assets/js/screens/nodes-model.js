@@ -1,7 +1,9 @@
-// Модель экранов нод без DOM — перенос чистой логики `tui/src/nodes.rs`
-// (`node_label`, `node_items`, `card_view`, `delete_node`, `add_node_with`,
-// `harden`, `aliases`, `offer_upload`, `interactive`): подписи, строки
-// контекста, тона действий и argv команд.
+// Модель экранов нод без DOM — перенос логики `tui/src/nodes.rs`
+// (`node_label`, `card_view`, `delete_node`, `add_node_with`, `harden`,
+// `aliases`, `offer_upload`, `interactive`): подписи, состояния, argv команд
+// и потоки добавления и изменения ноды поверх `ctx` (`app.js::makeContext`).
+import { handleNodeCodes, reviewReply, setFlag, decisionFlag } from '../flows.js';
+import { asList, errorMessage } from '../format.js';
 
 /** Строковое значение поля (`nodes.rs::text`): `null`/`undefined` → ''. */
 export function plain(value) {
@@ -10,13 +12,9 @@ export function plain(value) {
   return typeof value === 'object' ? JSON.stringify(value) : String(value);
 }
 
-function list(value) {
-  return Array.isArray(value) ? value : [];
-}
-
 /** Список через запятую (`nodes.rs::joined`); пустой → ''. */
 export function joinedPlain(value) {
-  return list(value).map(plain).join(', ');
+  return asList(value).map(plain).join(', ');
 }
 
 /** «имя  ip:порт» (`nodes.rs::node_label`). */
@@ -24,69 +22,29 @@ export function nodeLabel(node) {
   return `${plain(node.name)}  ${plain(node.ip)}:${plain(node.port)}`;
 }
 
-/** Нода с проблемой: пароль не сохранён при входе по паролю или есть `issues`. */
-export function nodeProblem(node) {
-  return (node.auth === 'password' && node.password !== 'ok') || list(node.issues).length > 0;
-}
-
-/** Пункты списка нод (`nodes.rs::node_items(.., true)`): проблемные — жёлтые. */
-export function nodeItems(data) {
-  return list(data).map((node) => ({
-    name: plain(node.name),
-    label: nodeLabel(node),
-    tone: nodeProblem(node) ? 'change' : 'view',
-  }));
-}
-
-/** Действия списка нод (`Nodes::run`): отложенная настройка — только при `ssh_setup_pending`. */
-export function listActions(status) {
-  const actions = [{ key: 'a', label: 'Добавить ноду', tone: 'create' }];
-  if (status && status.ssh_setup_pending === true) {
-    actions.push({ key: 'h', label: 'Завершить отложенную SSH-настройку', tone: 'change' });
-  }
-  return actions;
-}
-
-/** Строки контекста карточки (`nodes.rs::card_view`): строка или `{ text, tone }`. */
-export function cardContext(node) {
-  const lines = [
-    `Адрес: ${plain(node.ip)}:${plain(node.port)}`,
-    `Пользователь: ${plain(node.user)}`,
-  ];
-  if (node.auth === 'password') {
-    lines.push('Вход: по паролю');
-    lines.push(node.password === 'ok'
-      ? { text: 'Пароль SSH: сохранён', tone: 'ok' }
-      : { text: 'Пароль SSH: нет', tone: 'warn' });
-  } else {
-    lines.push('Вход: по ключу');
-  }
-  lines.push(`Тег: ${plain(node.tag)}`);
+/**
+ * Состояние ноды для списка: `{ tone, label }` — нет пароля SSH, пароль не
+ * прочитан (`password: error` — хранилище секретов недоступно, это не «нет»),
+ * `issues` или «готова».
+ */
+export function nodeStatus(node) {
+  if (node.auth === 'password' && node.password === 'error') return { tone: 'error', label: 'пароль SSH не прочитан' };
+  if (node.auth === 'password' && node.password !== 'ok') return { tone: 'warn', label: 'нет пароля SSH' };
   const issues = joinedPlain(node.issues);
-  if (issues) lines.push({ text: `Требует настройки: ${issues}`, tone: 'warn' });
-  const groups = joinedPlain(node.groups);
-  lines.push(`Группы: ${groups || 'нет'}`);
-  lines.push(`Клиентов: ${plain(node.clients)}`);
-  return lines;
+  if (issues) return { tone: 'warn', label: issues };
+  return { tone: 'ok', label: 'готова' };
 }
 
-/** Действия карточки в порядке и с цветами `card_view` (без «Назад»). */
-export function cardActions(node) {
-  const actions = [
-    { key: 'o', label: 'Меню сервера', tone: 'view' },
-    { key: 't', label: 'Telegram Proxy на ноде', tone: 'view' },
-    { key: 'p', label: 'Подключения ноды', tone: 'view' },
-    { key: 'a', label: 'Клиенты AmneziaWG', tone: 'view' },
-    { key: 'k', label: 'Проверить подключение', tone: 'view' },
-    { key: 'u', label: 'Загрузить скрипты принудительно', tone: 'change' },
-    { key: 'h', label: 'Усилить защиту SSH', tone: 'change' },
-    { key: 'r', label: 'Переименовать', tone: 'change' },
-    { key: 'e', label: 'Тег', tone: 'change' },
-  ];
-  if (node.auth === 'password') actions.push({ key: 'w', label: 'Пароль SSH', tone: 'change' });
-  actions.push({ key: 'l', label: 'Псевдонимы подключений', tone: 'change' });
-  actions.push({ key: 'd', label: 'Удалить ноду', tone: 'danger' });
-  return actions;
+/** Способ входа (`nodes.rs::card_view`). */
+export function authLabel(node) {
+  return node.auth === 'password' ? 'по паролю' : 'по ключу';
+}
+
+/** Отметка пароля SSH карточки (`nodes.rs::card_view`): только при входе по паролю, иначе `null`. */
+export function passwordStatus(node) {
+  if (node.auth !== 'password') return null;
+  if (node.password === 'ok') return { tone: 'ok', label: 'сохранён' };
+  return node.password === 'error' ? { tone: 'error', label: 'не удалось прочитать' } : { tone: 'warn', label: 'нет' };
 }
 
 /** `node shell` / `telegram menu` (`nodes.rs::interactive`). */
@@ -115,7 +73,7 @@ export function uploadOffer(name, state) {
 
 /** Варианты удаления из `node show .delete_options[]` (`nodes.rs::delete_node`). */
 export function deleteOptions(node) {
-  return list(node.delete_options).map((option, index) => ({ value: index, label: plain(option.label), tone: 'danger' }));
+  return asList(node.delete_options).map((option, index) => ({ value: index, label: plain(option.label) }));
 }
 
 /** argv удаления в выбранном объёме; `--revoke-key` — только при `revoke_key: true`. */
@@ -138,6 +96,15 @@ export function hardenAsksPort(argv, reply) {
   return code === 'port_in_use' || (argv.includes('--port') && code === 'invalid');
 }
 
+export const PORT_INVALID = 'Порт должен быть числом от 1 до 65535.';
+
+/** Проверка SSH-порта: пусто — умолчание 22; иначе число 1…65535. Текст ошибки или `null`. */
+export function portError(value) {
+  const port = plain(value);
+  if (port === '') return null;
+  return /^[0-9]+$/.test(port) && Number(port) >= 1 && Number(port) <= 65535 ? null : PORT_INVALID;
+}
+
 /**
  * Проверка формы добавления (`nodes.rs::add_node_with`) с умолчаниями v1.
  * Возвращает `{ warning }` либо `{ argv, password }`; пароль идёт только в
@@ -147,10 +114,8 @@ export function addNodeArgv(form) {
   const name = form.name || 'vps-1';
   const ip = form.ip || '';
   if (!ip) return { warning: 'IP не указан.' };
+  if (portError(form.port)) return { warning: PORT_INVALID };
   const port = form.port || '22';
-  if (!/^[0-9]+$/.test(port) || Number(port) < 1 || Number(port) > 65535) {
-    return { warning: 'Порт должен быть числом от 1 до 65535.' };
-  }
   const user = form.user || 'root';
   const password = form.auth === 'password';
   if (password && !form.password) return { warning: 'Пароль не может быть пустым.' };
@@ -174,9 +139,163 @@ export function addAttemptArgv(base, hostKey, defer) {
 /** Первые флаги ключа сервера при добавлении. */
 export const ACCEPT_HOST_KEY = ['--accept-new-host-key'];
 
-/** Подпись вопроса псевдонима (`nodes.rs::aliases`). */
-export function aliasPrompt(entry) {
-  return `${plain(entry.proxy)} [${plain(entry.alias)}] (- — удалить)`;
+export const ADD_TITLE = 'Добавление ноды';
+
+/** Отказ от плана — не сбой (`nodes.rs::outcome`); сбой — итог «Операция завершилась ошибкой». */
+function outcome(ctx, reply) {
+  if (ctx.isFailure(reply)) ctx.failed();
+}
+
+const errorCode = (reply) => (reply && reply.error ? reply.error.code : null);
+
+/**
+ * Попытки `node add` (`nodes.rs::add_node_with`): первый ключ сервера
+ * принимается, изменённый заменяется только через план, `remote_failed` —
+ * повтор с согласия (и, при входе по паролю, с новым паролем),
+ * `onboarding_failed` — повтор или отложенная настройка. Итог:
+ * `{ status: 'ok', name }`, `{ status: 'failed' }` (сбой или отказ от
+ * повтора — форму стоит показать снова) или `{ status: 'cancel' }`.
+ */
+export async function addNode(ctx, base, password) {
+  const secrets = password ? { password } : undefined;
+  let hostKey = [...ACCEPT_HOST_KEY];
+  let defer = false;
+  for (;;) {
+    const words = addAttemptArgv(base, hostKey, defer);
+    const reply = !defer && hostKey[0] === '--replace-host-key'
+      ? await ctx.runConfirmed('Ключ сервера изменился', 'Обновить ключ ноды?', words, { secrets })
+      : await ctx.request(words, { secrets });
+    if (reply.ok) {
+      if (reply.data && reply.data.needs_setup === true) {
+        ctx.notify('warn', 'Нода сохранена, но требует SSH-настройки: раздел «Ноды» → «Завершить SSH-настройку».');
+      }
+      const saved = reply.data && typeof reply.data.name === 'string' && reply.data.name ? reply.data.name : base[3];
+      return { status: 'ok', name: saved };
+    }
+    switch (errorCode(reply)) {
+      case 'host_key_changed': {
+        if (defer) { outcome(ctx, reply); return { status: 'failed' }; }
+        const fingerprint = asList(reply.error.fingerprints)[0];
+        if (typeof fingerprint !== 'string') { ctx.failed(); return { status: 'failed' }; }
+        hostKey = ['--replace-host-key', fingerprint];
+        break;
+      }
+      case 'remote_failed': {
+        // Отказ от повтора — к форме с прежним вводом (исправить адрес или порт).
+        if (!(await ctx.confirm({ title: ADD_TITLE, question: 'Повторить попытку?' }))) return { status: 'failed' };
+        if (secrets) {
+          const value = await ctx.askSecret({ title: ADD_TITLE, label: 'Новый пароль (пусто — прежний)', allowEmpty: true });
+          if (value === null) return { status: 'cancel' };
+          if (value) secrets.password = value;
+        }
+        break;
+      }
+      case 'onboarding_failed': {
+        const choice = await ctx.choose({
+          title: 'Не удалось настроить переносимый SSH-ключ',
+          options: [
+            { value: 'retry', label: 'Повторить' },
+            { value: 'defer', label: 'Сохранить ноду и настроить позже' },
+          ],
+        });
+        if (choice === null) return { status: 'cancel' };
+        if (choice === 'defer') defer = true;
+        break;
+      }
+      default:
+        if (!ctx.isFailure(reply)) return { status: 'cancel' };
+        ctx.failed();
+        return { status: 'failed' };
+    }
+  }
+}
+
+/** Поля формы добавления (умолчания v1); `values` — прежний ввод без пароля. */
+export function addFields(values = {}) {
+  return [
+    { name: 'name', label: 'Название', type: 'text', placeholder: 'vps-1', value: values.name },
+    { name: 'ip', label: 'IP', type: 'text', required: 'IP не указан.', value: values.ip },
+    { name: 'port', label: 'SSH-порт', type: 'text', placeholder: '22', value: values.port, validate: portError },
+    { name: 'user', label: 'Логин', type: 'text', placeholder: 'root', value: values.user },
+    { name: 'tag', label: 'Тег', type: 'text', required: 'Тег не может быть пустым.', value: values.tag },
+    {
+      name: 'auth',
+      label: 'Способ входа',
+      type: 'radio',
+      value: values.auth || 'key',
+      options: [{ value: 'key', label: 'SSH-ключ' }, { value: 'password', label: 'Пароль' }],
+    },
+    { name: 'password', label: 'Пароль', type: 'secret', required: 'Пароль не может быть пустым.', when: (current) => current.auth === 'password' },
+  ];
+}
+
+/**
+ * Добавление ноды одной формой (`nodes.rs::add_node_with`). Сбой добавления
+ * открывает форму снова с прежним вводом (кроме пароля); отмена — выход.
+ * Сохранённая нода открывается через `go(имя)` — экран вызывает переход,
+ * только пока смонтирован. `true` — нода добавлена.
+ */
+export async function addNodeFlow(ctx, go) {
+  let previous = {};
+  for (;;) {
+    const values = await ctx.form({ title: ADD_TITLE, fields: addFields(previous), submit: 'Добавить' });
+    if (values === null) return false;
+    previous = { ...values, password: undefined };
+    const built = addNodeArgv(values);
+    if (built.warning) {
+      ctx.notify('warn', built.warning);
+      continue;
+    }
+    const result = await addNode(ctx, built.argv, built.password);
+    if (result.status === 'cancel') return false;
+    if (result.status === 'ok') {
+      go(result.name);
+      return true;
+    }
+  }
+}
+
+/**
+ * «Изменить»: название и тег одной формой. Сначала `node rename` (сбой
+ * останавливает), затем `node tag` под новым именем. Итог — текущее имя
+ * ноды или `null` при отмене и сбое переименования.
+ */
+export async function editNode(ctx, node) {
+  const name = plain(node.name);
+  const tag = plain(node.tag);
+  const values = await ctx.form({
+    title: `Изменение ноды: ${name}`,
+    fields: [
+      { name: 'name', label: 'Название', type: 'text', value: name, required: true },
+      { name: 'tag', label: 'Тег', type: 'text', value: tag },
+    ],
+  });
+  if (values === null) return null;
+  let current = name;
+  if (values.name !== name) {
+    const renamed = await ctx.call('node', 'rename', '--name', name, '--new-name', values.name);
+    if (!renamed.ok) {
+      outcome(ctx, renamed);
+      return null;
+    }
+    current = (renamed.data && typeof renamed.data.name === 'string' && renamed.data.name) || values.name;
+  }
+  if (values.tag !== tag) outcome(ctx, await ctx.call('node', 'tag', '--name', current, '--tag', values.tag));
+  return current;
+}
+
+/**
+ * Ответы формы псевдонимов (`a<индекс>` — новое значение) в значения
+ * `aliasArgv`: без изменений → `''`, очищенный → `-`, иначе новое значение.
+ */
+export function aliasValues(entries, form) {
+  return asList(entries).map((entry, index) => {
+    const current = plain(entry.alias);
+    const value = plain(form && form[`a${index}`]);
+    if (value === current) return '';
+    if (value === '') return '-';
+    return value;
+  });
 }
 
 /**
@@ -186,7 +305,7 @@ export function aliasPrompt(entry) {
 export function aliasArgv(name, entries, values) {
   const sets = [];
   const unsets = [];
-  list(entries).forEach((entry, index) => {
+  asList(entries).forEach((entry, index) => {
     const proxy = plain(entry.proxy);
     const current = plain(entry.alias);
     const value = values[index] || '';
@@ -198,4 +317,206 @@ export function aliasArgv(name, entries, values) {
   });
   if (sets.length === 0 && unsets.length === 0) return null;
   return ['node', 'aliases', '--name', name, ...sets, ...unsets];
+}
+
+/**
+ * Псевдонимы подключений ноды одной формой (`nodes.rs::aliases`): чтение
+ * через `nodeRequest`, форма с полем на подключение, запись только изменённых.
+ * Отмена формы ничего не пишет.
+ */
+export async function editAliases(ctx, name) {
+  const reply = await ctx.nodeRequest(name, ['node', 'aliases', '--name', name]);
+  if (!reply.ok) return;
+  const entries = asList(reply.data);
+  if (entries.length === 0) {
+    ctx.notify('info', 'Подключения на ноде не найдены.');
+    return;
+  }
+  const form = await ctx.form({
+    title: `Псевдонимы подключений: ${name}`,
+    fields: entries.map((entry, index) => ({
+      name: `a${index}`,
+      label: plain(entry.proxy),
+      type: 'text',
+      value: plain(entry.alias),
+      hint: 'пусто — без псевдонима',
+    })),
+  });
+  if (form === null) return;
+  const argv = aliasArgv(name, entries, aliasValues(entries, form));
+  if (!argv) {
+    ctx.notify('info', 'Изменений нет.');
+    return;
+  }
+  const saved = await ctx.request(argv);
+  if (ctx.isFailure(saved)) ctx.failed();
+}
+
+// ─── Действия над нодой ──────────────────────────────────────────────────────
+
+/** Зависимости `flows.js` из контекста экрана. */
+function deps(ctx) {
+  return { request: (words, options) => ctx.request(words, options), confirm: ctx.confirm, askSecret: ctx.askSecret, notify: ctx.notify };
+}
+
+/**
+ * `node shell` / `telegram menu` в оверлее терминала (`nodes.rs::interactive`).
+ * Состояния ноды разрешаются и команда повторяется; устаревшие скрипты —
+ * предложение загрузки; `conflict` — терминал этой ноды уже открыт.
+ */
+export async function interactive(ctx, name, telegram) {
+  const argv = interactiveArgv(name, telegram);
+  const title = telegram ? `Telegram Proxy: ${name}` : `Меню сервера: ${name}`;
+  for (;;) {
+    const reply = await ctx.terminal(argv, title, { expect: ['conflict', 'invalid'] });
+    if (reply.ok) return;
+    if (await handleNodeCodes(reply, name, deps(ctx))) continue;
+    if (errorCode(reply) === 'conflict') {
+      ctx.notify('warn', 'Терминал этой ноды уже открыт');
+      return;
+    }
+    if (errorCode(reply) === 'invalid') {
+      if (typeof reply.error.state === 'string') {
+        await offerUpload(ctx, name, reply.error.state);
+        return;
+      }
+      ctx.notify('error', errorMessage(reply));
+    }
+    outcome(ctx, reply);
+    return;
+  }
+}
+
+/** Явная загрузка скриптов (`nodes.rs::offer_upload`); меню заново не открывается. */
+async function offerUpload(ctx, name, state) {
+  const offer = uploadOffer(name, state);
+  const choice = await ctx.choose({
+    title: offer.title,
+    context: [offer.condition],
+    options: [{ value: 'u', label: offer.label }],
+    cancel: 'Назад',
+  });
+  if (choice !== 'u') return;
+  const reply = await ctx.nodeRequest(name, offer.argv, { title: 'Загрузка скриптов', question: 'Загрузить скрипты?' });
+  if (reply.ok) ctx.notify('success', 'Скрипты загружены. Откройте меню снова.');
+}
+
+/** `node setup-ssh` под планом (`nodes.rs::setup_ssh`). */
+export async function setupSsh(ctx) {
+  const words = ['node', 'setup-ssh'];
+  for (;;) {
+    const reply = await ctx.runConfirmed('Завершение SSH-настройки', 'Выполнить?', words);
+    if (reply.ok) {
+      if (reply.data && reply.data.ready === true) {
+        ctx.notify('success', 'SSH-настройка завершена.');
+      } else {
+        for (const node of asList(reply.data && reply.data.deferred)) {
+          ctx.notify('warn', `Отложено: ${plain(node.name)} — ${plain(node.issue)}`);
+        }
+      }
+      return;
+    }
+    switch (errorCode(reply)) {
+      case 'key_provisioning_required': {
+        const provision = await ctx.confirm({
+          title: 'Переносимый SSH-ключ',
+          context: [`Ноды: ${joinedPlain(reply.error.nodes)}`],
+          question: 'Создать переносимый SSH-ключ для этих нод?',
+        });
+        setFlag(words, decisionFlag(errorCode(reply)), provision ? 'yes' : 'no');
+        break;
+      }
+      case 'onboarding_failed': {
+        const choice = await ctx.choose({
+          title: 'Не удалось настроить переносимый SSH-ключ',
+          options: [
+            { value: 'retry', label: 'Повторить' },
+            { value: 'defer', label: 'Отложить проблемные ноды' },
+          ],
+        });
+        if (choice === null) return;
+        if (choice === 'defer') setFlag(words, '--on-failure', 'defer');
+        break;
+      }
+      // Сообщение ядра уже показано; сбоя нет.
+      case 'nothing_pending':
+        return;
+      default:
+        outcome(ctx, reply);
+        return;
+    }
+  }
+}
+
+/** Объём удаления из `delete_options`; `true`, если ноды больше нет (`nodes.rs::delete_node`). */
+export async function deleteNode(ctx, name, node) {
+  const options = deleteOptions(node);
+  if (options.length === 0) {
+    ctx.notify('warn', 'Нет доступных вариантов удаления.');
+    return false;
+  }
+  const values = await ctx.form({
+    title: `Удаление ноды: ${name}`,
+    fields: [{ name: 'scope', label: 'Объём удаления', type: 'radio', options, required: true }],
+    submit: 'Далее',
+    tone: 'danger',
+  });
+  if (values === null) return false;
+  const argv = deleteArgv(name, node.delete_options[values.scope]);
+  const reply = await ctx.nodeRequest(name, argv, { title: 'Удаление ноды', question: 'Удалить ноду в выбранном объёме?' });
+  return reply.ok || (reply.error && reply.error.deleted === true);
+}
+
+/** Удаление из списка: варианты удаления есть только в `node show`. */
+export async function deleteListed(ctx, name) {
+  const shown = await ctx.request(['node', 'show', '--name', name]);
+  if (!shown.ok) return false;
+  return deleteNode(ctx, name, shown.data);
+}
+
+/** Сохранение пароля SSH: значение — только в `secrets` запроса. */
+export async function setNodePassword(ctx, name) {
+  const values = await ctx.form({
+    title: `Пароль SSH: ${name}`,
+    fields: [{ name: 'password', label: 'Пароль SSH', type: 'secret', required: true }],
+  });
+  if (values === null) return;
+  outcome(ctx, await ctx.request(['node', 'password', '--name', name], { secrets: { password: values.password } }));
+}
+
+/** Порт задаётся явно или подбирается ядром; план подтверждается (`nodes.rs::harden`). */
+export async function harden(ctx, name) {
+  const title = 'Усиление защиты SSH';
+  const ask = async () => {
+    const values = await ctx.form({
+      title,
+      fields: [{ name: 'port', label: 'SSH-порт (пусто — подобрать свободный)', type: 'text', validate: portError }],
+      submit: 'Далее',
+    });
+    return values === null ? null : values.port;
+  };
+  const port = await ask();
+  if (port === null) return;
+  let words = hardenArgv(name, port);
+  for (;;) {
+    let reply = await ctx.request(words);
+    // Порт может оказаться занят и до плана, и между планом и подтверждённым
+    // запуском (ядро отказывает до изменений): порт спрашивается снова.
+    if (!hardenAsksPort(words, reply)) reply = await reviewReply(title, 'Усилить защиту SSH?', words, reply, deps(ctx), 2);
+    if (hardenAsksPort(words, reply)) {
+      const again = await ask();
+      if (again === null) return;
+      words = hardenArgv(name, again);
+      continue;
+    }
+    if (reply.ok) return;
+    if (errorCode(reply) === 'hardening_failed') {
+      if (reply.error.console_required === true) ctx.notify('warn', 'Проверьте доступ через консоль провайдера.');
+      ctx.failed();
+      return;
+    }
+    if (await handleNodeCodes(reply, name, deps(ctx))) continue;
+    outcome(ctx, reply);
+    return;
+  }
 }

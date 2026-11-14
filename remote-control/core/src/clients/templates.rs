@@ -142,12 +142,22 @@ pub fn group_template(config: &Config, group: &str) -> String {
 /// v1 `process_template`: `# --- TAG ---` / `# --- A/B ---` blocks are kept
 /// (without markers) for a listed group and dropped otherwise. A marker with
 /// a different tag inside a block is plain content. Every emitted line ends
-/// with a newline; a CRLF marker is recognised like an LF one.
+/// with LF; CRLF line ends are read like LF ones (`lines`).
 pub fn process(content: &str, group: &str) -> String {
     let mut output = String::with_capacity(content.len());
+    for (_, line) in process_lines(content, group) {
+        output.push_str(line);
+        output.push('\n');
+    }
+    output
+}
+
+/// The lines `process` keeps (without the newline), each with its 1-based
+/// line number in `content`.
+pub(crate) fn process_lines<'a>(content: &'a str, group: &str) -> Vec<(usize, &'a str)> {
+    let mut kept = Vec::new();
     let mut block: Option<(&str, bool)> = None;
-    for line in content.split_inclusive('\n') {
-        let line = line.strip_suffix('\n').unwrap_or(line);
+    for (number, line) in lines(content) {
         if let Some(tag) = marker(line) {
             match block {
                 None => {
@@ -162,21 +172,59 @@ pub fn process(content: &str, group: &str) -> String {
             }
         }
         if block.is_none_or(|(_, keep)| keep) {
-            output.push_str(line);
-            output.push('\n');
+            kept.push((number, line));
         }
     }
-    output
+    kept
+}
+
+/// A `# --- TAG ---` block: its group tags, the 1-based lines of the opening
+/// marker and of the closing one (`None` — the block runs to the end).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MarkerBlock {
+    pub tags: Vec<String>,
+    pub open: usize,
+    pub close: Option<usize>,
+}
+
+/// Marker blocks of a template, recognised exactly as `process` does.
+pub(crate) fn marker_blocks(content: &str) -> Vec<MarkerBlock> {
+    let mut blocks = Vec::new();
+    let mut open: Option<(&str, usize)> = None;
+    for (number, line) in lines(content) {
+        let Some(tag) = marker(line) else { continue };
+        match open {
+            None => open = Some((tag, number)),
+            Some((current, line)) if current == tag => {
+                blocks.push(MarkerBlock { tags: tag.split('/').map(str::to_owned).collect(), open: line, close: Some(number) });
+                open = None;
+            }
+            Some(_) => {}
+        }
+    }
+    if let Some((tag, line)) = open {
+        blocks.push(MarkerBlock { tags: tag.split('/').map(str::to_owned).collect(), open: line, close: None });
+    }
+    blocks
+}
+
+/// Lines of a template with their 1-based numbers, without the line end
+/// (`\n` or `\r\n`): the generator and `template check` read a CRLF
+/// template like an LF one.
+fn lines(content: &str) -> impl Iterator<Item = (usize, &str)> {
+    content.split_inclusive('\n').enumerate().map(|(index, line)| {
+        let line = line.strip_suffix('\n').unwrap_or(line);
+        (index + 1, line.strip_suffix('\r').unwrap_or(line))
+    })
 }
 
 fn marker(line: &str) -> Option<&str> {
-    let line = line.strip_suffix('\r').unwrap_or(line);
     let tag = line.strip_prefix("# --- ")?.strip_suffix(" ---")?;
     (!tag.is_empty() && tag.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'/' || b == b'_'))
         .then_some(tag)
 }
 
-fn name_invalid() -> RcError {
+pub(crate) fn name_invalid() -> RcError {
     RcError::new("invalid", "Имя шаблона может содержать только буквы, цифры, точку, - и _")
 }
 
@@ -196,10 +244,15 @@ fn groups_using(config: &Config, name: &str) -> Vec<String> {
     config.groups.iter().filter(|g| group_template(config, &g.name) == name).map(|g| g.name.clone()).collect()
 }
 
+/// A custom file shadows the built-in template of the same name.
+fn overrides(name: &str, source: TemplateSource) -> bool {
+    source == TemplateSource::Custom && builtin(name).is_some()
+}
+
 pub fn list_command(session: &mut Session) -> Result<Value> {
     let config = session.state.load_config()?;
     Ok(Value::Array(list(&session.state)?.into_iter().map(|(name, source)| json!({
-        "name": name, "source": source.as_str(), "groups": groups_using(&config, &name),
+        "name": name, "source": source.as_str(), "overrides": overrides(&name, source), "groups": groups_using(&config, &name),
     })).collect()))
 }
 
@@ -208,7 +261,118 @@ pub fn show(session: &mut Session, invocation: &Invocation) -> Result<Value> {
     let template = require(&session.state, &name)?;
     let path = (template.source == TemplateSource::Custom)
         .then(|| custom_path(&session.state, &name).display().to_string());
-    Ok(json!({"name": name, "source": template.source.as_str(), "path": path, "content": template.content}))
+    Ok(json!({"name": name, "source": template.source.as_str(), "overrides": overrides(&name, template.source),
+        "path": path, "content": template.content}))
+}
+
+/// Plan of `template delete` from the current state: the plan and the groups
+/// that fall back to `default.yaml`.
+fn delete_plan(state: &State, name: &str) -> Result<(Plan, Vec<String>)> {
+    let shadow = builtin(name).is_some();
+    if !custom_exists(state, name)? {
+        return Err(if shadow {
+            RcError::new("invalid", format!("Встроенный шаблон «{name}» удалить нельзя.")).with_extra("name", name)
+        } else {
+            not_found(name)
+        });
+    }
+    let groups = if shadow { Vec::new() } else { groups_using(&state.load_config()?, name) };
+    let mut lines = vec![if shadow {
+        format!("Пользовательский шаблон «{name}» будет удалён; останется встроенный «{name}».")
+    } else {
+        format!("Шаблон «{name}» будет удалён.")
+    }];
+    lines.extend(groups.iter().map(|group| format!("Группа «{group}»: шаблон — «{DEFAULT}»")));
+    Ok((Plan::new(lines, String::new()), groups))
+}
+
+/// Removes a custom template. A custom file shadowing a built-in reverts to
+/// the built-in (groups keep the name); otherwise its groups fall back to
+/// `default.yaml`.
+pub fn delete(session: &mut Session, invocation: &Invocation) -> Result<Value> {
+    let name = file_name(required(invocation, "name")?);
+    if !v::template_filename_valid(&name) { return Err(name_invalid()); }
+    let (plan, _) = delete_plan(&session.state, &name)?;
+    plan.confirm(invocation)?;
+    let groups = session.mutate("template_delete", |state| delete_planned(state, &name, &plan, invocation))?;
+    session.log(Level::Success, &format!("Шаблон «{name}» удалён"));
+    Ok(json!({"name": name, "groups": groups, "builtin": builtin(&name).is_some()}))
+}
+
+/// The confirmed deletion under the mutation lock: the plan is rebuilt from
+/// the state and must not have changed. A failure leaves the configuration
+/// and the file as they were (or reports `partial`).
+fn delete_planned(state: &State, name: &str, planned: &Plan, invocation: &Invocation) -> Result<Vec<String>> {
+    let (plan, groups) = delete_plan(state, name)?;
+    if plan.lines != planned.lines { return Err(plan.changed(invocation)); }
+    let previous = if groups.is_empty() { None } else { Some(state.load_config()?) };
+    if let Some(previous) = &previous {
+        let mut config = previous.clone();
+        config.groups.iter_mut().filter(|g| groups.contains(&g.name)).for_each(|g| g.template = DEFAULT.to_owned());
+        state.save_config(&config)?;
+    }
+    if let Err(error) = fs::remove_file(custom_path(state, name)) {
+        if let Some(previous) = &previous && let Err(restore) = state.save_config(previous) {
+            return Err(RcError::new("partial", format!(
+                "Не удалось удалить шаблон «{name}»: {error}; группы уже переведены на «{DEFAULT}», вернуть их не удалось: {}",
+                restore.message)));
+        }
+        return Err(RcError::new("failed", format!("Не удалось удалить шаблон «{name}»: {error}")));
+    }
+    Ok(groups)
+}
+
+/// Plan of `template groups` from the current state: the plan, the listed
+/// groups that get the template and its unlisted groups that fall back to
+/// `default.yaml` (nothing falls back from `default.yaml` itself).
+fn groups_plan(state: &State, name: &str, listed: &[String]) -> Result<(Plan, Vec<String>, Vec<String>)> {
+    require(state, name)?;
+    let config = state.load_config()?;
+    for group in listed {
+        super::find_group(&config, group)?;
+    }
+    let assigned: Vec<String> = listed.iter().filter(|g| group_template(&config, g) != name).cloned().collect();
+    let reset: Vec<String> = if name == DEFAULT {
+        Vec::new()
+    } else {
+        groups_using(&config, name).into_iter().filter(|g| !listed.contains(g)).collect()
+    };
+    let lines = assigned.iter().map(|g| format!("Группа «{g}»: шаблон — «{name}»"))
+        .chain(reset.iter().map(|g| format!("Группа «{g}»: шаблон — «{DEFAULT}»")))
+        .collect();
+    Ok((Plan::new(lines, String::new()), assigned, reset))
+}
+
+/// Sets the groups of a template: listed groups get it, its other groups
+/// fall back to `default.yaml` (nothing falls back from `default.yaml` itself).
+pub fn groups(session: &mut Session, invocation: &Invocation) -> Result<Value> {
+    let name = file_name(required(invocation, "name")?);
+    if !v::template_filename_valid(&name) { return Err(name_invalid()); }
+    let listed = super::unique_values(invocation, "group");
+    let (plan, assigned, reset) = groups_plan(&session.state, &name, &listed)?;
+    if plan.lines.is_empty() {
+        return Ok(json!({"name": name, "assigned": [], "reset": []}));
+    }
+    plan.confirm(invocation)?;
+    session.mutate("template_groups", |state| groups_planned(state, &name, &listed, &plan, invocation))?;
+    session.log(Level::Success, &format!("Шаблон «{name}»: группы обновлены"));
+    Ok(json!({"name": name, "assigned": assigned, "reset": reset}))
+}
+
+/// The confirmed assignment under the mutation lock: the plan is rebuilt
+/// from the state and must not have changed.
+fn groups_planned(state: &State, name: &str, listed: &[String], planned: &Plan, invocation: &Invocation) -> Result<()> {
+    let (plan, assigned, reset) = groups_plan(state, name, listed)?;
+    if plan.lines != planned.lines { return Err(plan.changed(invocation)); }
+    let mut config = state.load_config()?;
+    for group in &mut config.groups {
+        if assigned.contains(&group.name) {
+            group.template = name.to_owned();
+        } else if reset.contains(&group.name) {
+            group.template = DEFAULT.to_owned();
+        }
+    }
+    state.save_config(&config)
 }
 
 pub fn create(session: &mut Session, invocation: &Invocation) -> Result<Value> {
@@ -238,7 +402,7 @@ pub fn create(session: &mut Session, invocation: &Invocation) -> Result<Value> {
         });
         if let Err(error) = written {
             let _ = fs::remove_file(&path);
-            return Err(RcError::new("failed", format!("Не удалось создать шаблон {name}: {error}")));
+            return Err(RcError::new("failed", format!("Не удалось создать шаблон «{name}»: {error}")));
         }
         if group.is_some() && let Err(error) = state.save_config(&config) {
             let _ = fs::remove_file(&path);
@@ -246,28 +410,77 @@ pub fn create(session: &mut Session, invocation: &Invocation) -> Result<Value> {
         }
         Ok(json!({"name": name, "based_on": base, "group": group}))
     })?;
-    session.log(Level::Success, &format!("Шаблон {name} создан"));
+    session.log(Level::Success, &format!("Шаблон «{name}» создан"));
     Ok(data)
 }
 
+/// Plan of `template import` from the state and the content, `None` — no
+/// confirmation needed. Overwriting a file or errors of the template
+/// (`template check` level `error`) need it; warnings alone do not, but a
+/// shown plan lists every problem. The token covers the content.
+fn import_plan(state: &State, name: &str, content: &str) -> Result<Option<Plan>> {
+    let exists = custom_exists(state, name)?;
+    let group_names: Vec<String> = state.load_config()?.groups.into_iter().map(|g| g.name).collect();
+    let report = super::template_check::check(content, &group_names);
+    if !exists && report.errors == 0 { return Ok(None); }
+    let mut lines = Vec::new();
+    if exists {
+        lines.push(format!("Шаблон «{name}» будет перезаписан."));
+    }
+    lines.extend(problem_lines(&report));
+    Ok(Some(Plan::new(lines, hex::encode(Sha256::digest(content.as_bytes())))))
+}
+
 /// The template text arrives as request input `file`; the client read the
-/// file (or the editor buffer). The overwrite token covers the content: the
-/// path never reaches the daemon, so a token issued for one file must not
-/// consent to another.
+/// file (or the editor buffer). The path never reaches the daemon, so the
+/// plan token covers the content. The plan is rebuilt under the mutation
+/// lock: a changed plan is `plan_changed`, a file that appeared without a
+/// plan is `conflict`.
 pub fn import(session: &mut Session, invocation: &Invocation, input: &Input) -> Result<Value> {
     let name = new_file_name(required(invocation, "name")?)?;
     let content = input.get("file").ok_or_else(|| RcError::new("usage", "Передайте содержимое полем input.file."))?;
-    if custom_exists(&session.state, &name)? {
-        let digest = hex::encode(Sha256::digest(content.as_bytes()));
-        Plan::new(vec![format!("Шаблон {name} будет перезаписан.")], digest).confirm(invocation)?;
+    super::template_check::ready()?;
+    let planned = import_plan(&session.state, &name, content)?;
+    if let Some(plan) = &planned {
+        plan.confirm(invocation)?;
     }
-    session.mutate("template_import", |state| {
-        secure_fs::create_dir_all(state.paths().templates())?;
-        secure_fs::atomic_write(&custom_path(state, &name), content.as_bytes())
-            .map_err(|_| RcError::new("failed", format!("Не удалось сохранить шаблон {name}.")))
-    })?;
-    session.log(Level::Success, &format!("Шаблон {name} импортирован"));
+    session.mutate("template_import", |state| import_planned(state, &name, content, planned.as_ref(), invocation))?;
+    session.log(Level::Success, &format!("Шаблон «{name}» импортирован"));
     Ok(json!({"name": name}))
+}
+
+/// The confirmed import under the mutation lock.
+fn import_planned(state: &State, name: &str, content: &str, planned: Option<&Plan>, invocation: &Invocation) -> Result<()> {
+    match (planned, import_plan(state, name, content)?) {
+        (Some(planned), Some(current)) if planned.lines != current.lines => return Err(current.changed(invocation)),
+        (None, Some(current)) => return Err(if custom_exists(state, name)? {
+            RcError::new("conflict", format!("Шаблон «{name}» появился во время импорта. Повторите команду.")).with_extra("name", name)
+        } else {
+            current.changed(invocation)
+        }),
+        // Consent given for more than is left now (or nothing to consent to).
+        _ => {}
+    }
+    secure_fs::create_dir_all(state.paths().templates())?;
+    secure_fs::atomic_write(&custom_path(state, name), content.as_bytes())
+        .map_err(|error| RcError::new("failed", format!("Не удалось сохранить шаблон «{name}»: {error}")))
+}
+
+/// Plan lines of `template import` for the problems of a template: a problem
+/// of several variants is shown once.
+fn problem_lines(report: &super::template_check::Report) -> Vec<String> {
+    const SHOWN: usize = 10;
+    let total = report.errors + report.warnings;
+    if total == 0 { return Vec::new(); }
+    let mut lines = vec![format!("Проблемы шаблона: ошибок — {}, предупреждений — {}.", report.errors, report.warnings)];
+    let mut seen = std::collections::HashSet::new();
+    let distinct = report.problems.iter().filter(|p| seen.insert((p.line, p.column, p.code, p.message.as_str())));
+    lines.extend(distinct.take(SHOWN).map(|p| format!("  строка {}: {}", p.line, p.message)));
+    let shown = lines.len() - 1;
+    if total > shown {
+        lines.push(format!("  … ещё {}", total - shown));
+    }
+    lines
 }
 
 #[cfg(test)]
@@ -280,8 +493,19 @@ mod tests {
         match invocation.verb.as_str() {
             "list" => list_command(session),
             "show" => show(session, &invocation),
+            "delete" => delete(session, &invocation),
+            "groups" => groups(session, &invocation),
             _ => create(session, &invocation),
         }
+    }
+
+    /// The built-in default with a distinguishing comment: a template without problems.
+    fn clean(mark: &str) -> String {
+        format!("{}# {mark}\n", builtin(DEFAULT).unwrap())
+    }
+
+    fn templates_of(session: &Session) -> Vec<(String, String)> {
+        session.state.load_config().unwrap().groups.into_iter().map(|g| (g.name, g.template)).collect()
     }
 
     fn import_text(session: &mut Session, argv: &[&str], content: Option<&str>) -> Result<Value> {
@@ -319,8 +543,8 @@ mod tests {
             ("# --- MOBILE ---\n# --- PC ---\nhidden\n# --- PC ---\n# --- MOBILE ---\nafter", "PC", "after\n"),
             ("", "PC", ""),
             ("# --- PC ---\nx\n# --- PC ---\n", "", ""),
-            // A CRLF template filters like an LF one; content lines keep their CR.
-            ("a\r\n# --- MOBILE ---\r\nm\r\n# --- MOBILE ---\r\nb\r\n", "PC", "a\r\nb\r\n"),
+            // A CRLF template filters like an LF one and comes out with LF.
+            ("a\r\n# --- MOBILE ---\r\nm\r\n# --- MOBILE ---\r\nb\r\nproxies:\r\n", "PC", "a\nb\nproxies:\n"),
         ];
         for (input, group, expected) in cases {
             assert_eq!(process(input, group), *expected, "{input:?} for {group}");
@@ -372,12 +596,17 @@ mod tests {
         let mut config = session.state.load_config().unwrap();
         config.groups[1].template = "alt.yaml".into();
         session.state.save_config(&config).unwrap();
+        custom(&session, "default.yaml", "proxies:\n");
         assert_eq!(run(&mut session, &["template", "list"]).unwrap(), json!([
-            {"name": "alt.yaml", "source": "custom", "groups": ["PC"]},
-            {"name": "default.yaml", "source": "builtin", "groups": ["ROUTER", "MOBILE"]},
+            {"name": "alt.yaml", "source": "custom", "overrides": false, "groups": ["PC"]},
+            {"name": "default.yaml", "source": "custom", "overrides": true, "groups": ["ROUTER", "MOBILE"]},
         ]));
         assert_eq!(run(&mut session, &["template", "show", "--name", "alt"]).unwrap(), json!({
-            "name": "alt.yaml", "source": "custom", "path": path.display().to_string(), "content": "mode: rule\n"}));
+            "name": "alt.yaml", "source": "custom", "overrides": false, "path": path.display().to_string(), "content": "mode: rule\n"}));
+        assert_eq!(run(&mut session, &["template", "show", "--name", "default"]).unwrap()["overrides"], json!(true));
+        fs::remove_file(session.state.paths().templates().join(DEFAULT)).unwrap();
+        assert_eq!(run(&mut session, &["template", "list"]).unwrap()[1],
+            json!({"name": "default.yaml", "source": "builtin", "overrides": false, "groups": ["ROUTER", "MOBILE"]}));
         let shown = run(&mut session, &["template", "show", "--name", "default.yaml"]).unwrap();
         assert_eq!((shown["source"].clone(), shown["path"].clone()), (json!("builtin"), Value::Null));
         assert_eq!(shown["content"], builtin(DEFAULT).unwrap());
@@ -427,15 +656,16 @@ mod tests {
     fn import_takes_the_input_validates_the_name_and_gates_overwrites() {
         let root = tempfile::tempdir().unwrap();
         let (mut session, journal) = session(root.path());
-        assert_eq!(import_text(&mut session, &["template", "import", "--name", "lab.yaml"], Some("mode: rule\n")).unwrap(),
+        let (first, second, third) = (clean("1"), clean("2"), clean("3"));
+        assert_eq!(import_text(&mut session, &["template", "import", "--name", "lab.yaml"], Some(&first)).unwrap(),
             json!({"name": "lab.yaml"}));
         let stored = session.state.paths().templates().join("lab.yaml");
-        assert_eq!(fs::read_to_string(&stored).unwrap(), "mode: rule\n");
-        assert_eq!(journal.borrow().last().unwrap().1, "Шаблон lab.yaml импортирован");
+        assert_eq!(fs::read_to_string(&stored).unwrap(), first);
+        assert_eq!(journal.borrow().last().unwrap().1, "Шаблон «lab.yaml» импортирован");
         let before = fingerprint(root.path());
-        let error = import_text(&mut session, &["template", "import", "--name", "lab"], Some("mode: global\n")).unwrap_err();
+        let error = import_text(&mut session, &["template", "import", "--name", "lab"], Some(&second)).unwrap_err();
         assert_eq!(error.code, "confirmation_required");
-        assert_eq!(error.extra["plan"], json!(["Шаблон lab.yaml будет перезаписан."]));
+        assert_eq!(error.extra["plan"], json!(["Шаблон «lab.yaml» будет перезаписан."]));
         for (argv, content, code) in [
             (&["template", "import", "--name", "../x"][..], Some("x"), "invalid"),
             (&["template", "import", "--name", "a b"], Some("x"), "invalid"),
@@ -447,17 +677,245 @@ mod tests {
         let missing = import_text(&mut session, &["template", "import", "--name", "new"], None).unwrap_err();
         assert_eq!(missing.message, "Передайте содержимое полем input.file.");
         assert_eq!(fingerprint(root.path()), before);
-        let other = import_text(&mut session, &["template", "import", "--name", "lab"], Some("mode: direct\n")).unwrap_err();
+        let other = import_text(&mut session, &["template", "import", "--name", "lab"], Some(&third)).unwrap_err();
         let token = error.extra["plan_token"].as_str().unwrap();
         assert_ne!(other.extra["plan_token"], error.extra["plan_token"], "the token covers the content");
         let stale = import_text(&mut session, &["template", "import", "--name", "lab", "--yes", "--plan-token", token],
-            Some("mode: direct\n")).unwrap_err();
+            Some(&third)).unwrap_err();
         assert_eq!(stale.code, "plan_changed");
         assert_eq!(fingerprint(root.path()), before);
         import_text(&mut session, &["template", "import", "--name", "lab", "--yes", "--plan-token", token],
-            Some("mode: global\n")).unwrap();
-        assert_eq!(fs::read_to_string(&stored).unwrap(), "mode: global\n");
-        import_text(&mut session, &["template", "import", "--name", "lab", "--yes"], Some("mode: rule\n")).unwrap();
-        assert_eq!(fs::read_to_string(&stored).unwrap(), "mode: rule\n");
+            Some(&second)).unwrap();
+        assert_eq!(fs::read_to_string(&stored).unwrap(), second);
+        import_text(&mut session, &["template", "import", "--name", "lab", "--yes"], Some(&first)).unwrap();
+        assert_eq!(fs::read_to_string(&stored).unwrap(), first);
+    }
+
+    #[test]
+    fn import_of_a_template_with_problems_needs_confirmation() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut session, _) = session(root.path());
+        let before = fingerprint(root.path());
+        let broken = "mode: rule\n# --- GHOST ---\nx: 1\n# --- GHOST ---\n";
+        let error = import_text(&mut session, &["template", "import", "--name", "new"], Some(broken)).unwrap_err();
+        assert_eq!(error.code, "confirmation_required");
+        assert_eq!(error.extra["plan"], json!([
+            "Проблемы шаблона: ошибок — 1, предупреждений — 1.",
+            "  строка 1: Нет строки «proxies:» — конфиг клиента не будет сгенерирован.",
+            "  строка 2: Маркер «GHOST»: группы с таким именем нет.",
+        ]));
+        assert_eq!(fingerprint(root.path()), before);
+        // A check stopped by its budget keeps the error of the variant without groups.
+        let flooded: String = std::iter::once("proxy-groups:\n".to_owned())
+            .chain((0..1005).map(|i| format!("  - {{name: g{i}, type: bogus}}\n"))).collect();
+        let error = import_text(&mut session, &["template", "import", "--name", "new"], Some(&flooded)).unwrap_err();
+        assert_eq!(error.code, "confirmation_required");
+        assert!(error.extra["plan"].as_array().unwrap().iter().any(|line| line.as_str().unwrap().contains("«proxies:»")),
+            "{}", error.extra["plan"]);
+        assert_eq!(fingerprint(root.path()), before);
+        // Warnings alone need no plan.
+        let many: String = (0..12).map(|i| format!("# --- G{i} ---\n# --- G{i} ---\n")).collect();
+        let warned = format!("proxies:\n{many}");
+        import_text(&mut session, &["template", "import", "--name", "new"], Some(&warned)).unwrap();
+        assert!(session.state.paths().templates().join("new.yaml").exists());
+        // A plan for another reason lists the warnings too.
+        let error = import_text(&mut session, &["template", "import", "--name", "new"], Some(&warned)).unwrap_err();
+        let plan = error.extra["plan"].as_array().unwrap();
+        assert_eq!((plan.len(), error.code), (13, "confirmation_required"), "overwrite, the summary, 10 problems and the rest");
+        let token = error.extra["plan_token"].as_str().unwrap();
+        import_text(&mut session, &["template", "import", "--name", "new", "--yes", "--plan-token", token], Some(&warned)).unwrap();
+    }
+
+    #[test]
+    fn import_rechecks_the_plan_under_the_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut session, _) = session(root.path());
+        let content = clean("x");
+        let yes = invocation(&["template", "import", "--name", "lab", "--yes"]);
+        // No plan was needed, but the file appeared meanwhile: conflict.
+        let planned = import_plan(&session.state, "lab.yaml", &content).unwrap();
+        assert!(planned.is_none());
+        let path = custom(&session, "lab.yaml", "proxies:\n");
+        let before = fingerprint(root.path());
+        let error = session.mutate("t", |state| import_planned(state, "lab.yaml", &content, planned.as_ref(), &yes)).unwrap_err();
+        assert_eq!(error.code, "conflict");
+        // The overwrite plan; the template gets an error meanwhile: plan_changed.
+        let broken = "mode: rule\n";
+        let planned = import_plan(&session.state, "lab.yaml", broken).unwrap().unwrap();
+        fs::remove_file(&path).unwrap();
+        let error = session.mutate("t", |state| import_planned(state, "lab.yaml", broken, Some(&planned), &yes)).unwrap_err();
+        assert_eq!(error.code, "plan_changed");
+        assert!(error.extra["plan_token"].is_string());
+        fs::write(&path, "proxies:\n").unwrap();
+        assert_eq!(fingerprint(root.path()), before);
+    }
+
+    #[test]
+    fn delete_removes_a_custom_template_and_moves_its_groups_to_default() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut session, journal) = session(root.path());
+        let path = custom(&session, "lab.yaml", "proxies:\n");
+        let mut config = session.state.load_config().unwrap();
+        config.groups[1].template = "lab.yaml".into();
+        config.groups[2].template = "lab.yaml".into();
+        session.state.save_config(&config).unwrap();
+        let before = fingerprint(root.path());
+        let planned = run(&mut session, &["template", "delete", "--name", "lab"]).unwrap_err();
+        assert_eq!(planned.code, "confirmation_required");
+        assert_eq!(planned.extra["plan"], json!([
+            "Шаблон «lab.yaml» будет удалён.", "Группа «PC»: шаблон — «default.yaml»", "Группа «MOBILE»: шаблон — «default.yaml»"]));
+        assert_eq!(fingerprint(root.path()), before);
+        assert_eq!(run(&mut session, &["template", "delete", "--name", "lab", "--yes"]).unwrap(),
+            json!({"name": "lab.yaml", "groups": ["PC", "MOBILE"], "builtin": false}));
+        assert!(!path.exists());
+        assert!(templates_of(&session).iter().all(|(_, template)| template == DEFAULT));
+        assert_eq!(journal.borrow().last().unwrap().1, "Шаблон «lab.yaml» удалён");
+
+        let before = fingerprint(root.path());
+        let builtin_error = run(&mut session, &["template", "delete", "--name", "default", "--yes"]).unwrap_err();
+        assert_eq!((builtin_error.code, builtin_error.message.as_str()), ("invalid", "Встроенный шаблон «default.yaml» удалить нельзя."));
+        for (argv, code) in [
+            (&["template", "delete", "--name", "ghost", "--yes"][..], "not_found"),
+            (&["template", "delete", "--name", "../x", "--yes"], "invalid"),
+            (&["template", "delete", "--yes"], "usage"),
+        ] {
+            assert_eq!(run(&mut session, argv).unwrap_err().code, code, "{argv:?}");
+        }
+        assert_eq!(fingerprint(root.path()), before);
+    }
+
+    #[test]
+    fn deleting_an_override_reverts_to_the_builtin_and_keeps_groups() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut session, _) = session(root.path());
+        let path = custom(&session, DEFAULT, "proxies:\n");
+        let groups = templates_of(&session);
+        let planned = run(&mut session, &["template", "delete", "--name", "default.yaml"]).unwrap_err();
+        assert_eq!(planned.extra["plan"],
+            json!(["Пользовательский шаблон «default.yaml» будет удалён; останется встроенный «default.yaml»."]));
+        assert_eq!(run(&mut session, &["template", "delete", "--name", "default.yaml", "--yes"]).unwrap(),
+            json!({"name": "default.yaml", "groups": [], "builtin": true}));
+        assert!(!path.exists());
+        assert_eq!(templates_of(&session), groups);
+        assert_eq!(resolve(&session.state, DEFAULT).unwrap().unwrap().source, TemplateSource::Builtin);
+    }
+
+    #[test]
+    fn groups_assigns_listed_groups_and_resets_the_rest() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut session, journal) = session(root.path());
+        custom(&session, "lab.yaml", "proxies:\n");
+        let mut config = session.state.load_config().unwrap();
+        config.groups[0].template = "lab.yaml".into();
+        session.state.save_config(&config).unwrap();
+        let before = fingerprint(root.path());
+        let planned = run(&mut session, &["template", "groups", "--name", "lab", "--group", "PC", "--group", "MOBILE", "--group", "PC"]).unwrap_err();
+        assert_eq!(planned.code, "confirmation_required");
+        assert_eq!(planned.extra["plan"], json!([
+            "Группа «PC»: шаблон — «lab.yaml»", "Группа «MOBILE»: шаблон — «lab.yaml»", "Группа «ROUTER»: шаблон — «default.yaml»"]));
+        assert_eq!(fingerprint(root.path()), before);
+        for (argv, code) in [
+            (&["template", "groups", "--name", "lab", "--group", "NOPE", "--yes"][..], "not_found"),
+            (&["template", "groups", "--name", "ghost", "--group", "PC", "--yes"], "not_found"),
+            (&["template", "groups", "--name", "../x", "--group", "PC", "--yes"], "invalid"),
+            (&["template", "groups", "--group", "PC"], "usage"),
+        ] {
+            assert_eq!(run(&mut session, argv).unwrap_err().code, code, "{argv:?}");
+        }
+        assert_eq!(fingerprint(root.path()), before);
+        assert_eq!(run(&mut session, &["template", "groups", "--name", "lab", "--group", "PC", "--group", "MOBILE", "--yes"]).unwrap(),
+            json!({"name": "lab.yaml", "assigned": ["PC", "MOBILE"], "reset": ["ROUTER"]}));
+        assert_eq!(templates_of(&session), [("ROUTER".into(), DEFAULT.into()), ("PC".into(), "lab.yaml".into()), ("MOBILE".into(), "lab.yaml".into())]);
+        assert_eq!(journal.borrow().last().unwrap().1, "Шаблон «lab.yaml»: группы обновлены");
+
+        // Nothing to change: no plan, no write.
+        let before = fingerprint(root.path());
+        assert_eq!(run(&mut session, &["template", "groups", "--name", "lab", "--group", "MOBILE", "--group", "PC"]).unwrap(),
+            json!({"name": "lab.yaml", "assigned": [], "reset": []}));
+        // default.yaml resets nothing: its unlisted groups keep it.
+        assert_eq!(run(&mut session, &["template", "groups", "--name", "default"]).unwrap(),
+            json!({"name": "default.yaml", "assigned": [], "reset": []}));
+        assert_eq!(fingerprint(root.path()), before);
+        // An empty list resets every group of the template.
+        assert_eq!(run(&mut session, &["template", "groups", "--name", "lab", "--yes"]).unwrap(),
+            json!({"name": "lab.yaml", "assigned": [], "reset": ["PC", "MOBILE"]}));
+        assert!(templates_of(&session).iter().all(|(_, template)| template == DEFAULT));
+    }
+
+    #[test]
+    fn delete_failure_leaves_the_configuration_and_the_file() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut session, _) = session(root.path());
+        // A directory in place of the file: the plan sees it, remove_file fails.
+        let path = session.state.paths().templates().join("lab.yaml");
+        fs::create_dir_all(&path).unwrap();
+        let mut config = session.state.load_config().unwrap();
+        config.groups[1].template = "lab.yaml".into();
+        session.state.save_config(&config).unwrap();
+        let before = fingerprint(root.path());
+        let error = run(&mut session, &["template", "delete", "--name", "lab", "--yes"]).unwrap_err();
+        assert_eq!(error.code, "failed");
+        assert!(error.message.len() > "Не удалось удалить шаблон «lab.yaml»: ".len(), "the io error is reported: {}", error.message);
+        assert_eq!(fingerprint(root.path()), before);
+        assert!(path.is_dir());
+        assert_eq!(templates_of(&session)[1].1, "lab.yaml");
+    }
+
+    #[test]
+    fn delete_and_groups_recheck_the_plan_under_the_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut session, _) = session(root.path());
+        let path = custom(&session, "lab.yaml", "proxies:\n");
+        let delete = invocation(&["template", "delete", "--name", "lab", "--yes"]);
+        let (planned, _) = delete_plan(&session.state, "lab.yaml").unwrap();
+        // A group switches to the template between the plan and the mutation.
+        let mut config = session.state.load_config().unwrap();
+        config.groups[0].template = "lab.yaml".into();
+        session.state.save_config(&config).unwrap();
+        let before = fingerprint(root.path());
+        let changed = session.mutate("t", |state| delete_planned(state, "lab.yaml", &planned, &delete)).unwrap_err();
+        assert_eq!(changed.code, "plan_changed");
+        assert_eq!(changed.extra["plan"].as_array().unwrap().len(), 2, "the current plan: the file and one group");
+        assert!(changed.extra["plan_token"].is_string());
+        assert_eq!(fingerprint(root.path()), before);
+        assert!(path.exists());
+
+        let listed = ["PC".to_owned()];
+        let assign = invocation(&["template", "groups", "--name", "lab", "--group", "PC", "--yes"]);
+        let (planned, ..) = groups_plan(&session.state, "lab.yaml", &listed).unwrap();
+        assert_eq!(planned.lines.len(), 2, "PC gets it, ROUTER falls back");
+        let mut config = session.state.load_config().unwrap();
+        config.groups[0].template = DEFAULT.into();
+        session.state.save_config(&config).unwrap();
+        let before = fingerprint(root.path());
+        let changed = session.mutate("t", |state| groups_planned(state, "lab.yaml", &listed, &planned, &assign)).unwrap_err();
+        assert_eq!(changed.code, "plan_changed");
+        assert_eq!(changed.extra["plan"].as_array().unwrap().len(), 1, "only PC is left in the current plan");
+        assert_eq!(fingerprint(root.path()), before);
+    }
+
+    #[test]
+    fn process_lines_number_the_lines_process_keeps() {
+        let default = builtin(DEFAULT).unwrap();
+        let samples = ["", "a", "a\n", "a\r\nb", "# --- PC ---\nx\n# --- PC ---\ny", "# --- PC ---\n# --- R ---\nz\n# --- R ---\n",
+            "# --- PC/R ---\nq\n", default];
+        for content in samples {
+            for group in ["", "PC", "R", "ROUTER", "MOBILE"] {
+                let lines = process_lines(content, group);
+                let joined: String = lines.iter().map(|(_, line)| format!("{line}\n")).collect();
+                assert_eq!(process(content, group), joined, "{content:?} {group}");
+                let source: Vec<&str> = content.split_inclusive('\n')
+                    .map(|l| l.strip_suffix('\n').unwrap_or(l)).map(|l| l.strip_suffix('\r').unwrap_or(l)).collect();
+                assert!(lines.iter().all(|(number, line)| source[number - 1] == *line));
+            }
+        }
+        assert_eq!(marker_blocks("a\n# --- PC/R ---\n# --- X ---\n# --- PC/R ---\n# --- M ---\nm\n"), [
+            MarkerBlock { tags: vec!["PC".into(), "R".into()], open: 2, close: Some(4) },
+            MarkerBlock { tags: vec!["M".into()], open: 5, close: None },
+        ]);
+        // CRLF: the same numbers and blocks as LF.
+        let crlf = "a\r\n# --- PC ---\r\nb\r\n# --- PC ---\r\nc\r\n";
+        assert_eq!(process_lines(crlf, "PC"), [(1, "a"), (3, "b"), (5, "c")]);
+        assert_eq!(marker_blocks(crlf), [MarkerBlock { tags: vec!["PC".into()], open: 2, close: Some(4) }]);
     }
 }

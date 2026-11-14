@@ -71,16 +71,18 @@ impl Plan {
             ).with_extra("plan", serde_json::json!(&self.lines))
              .with_extra("plan_token", token));
         }
-        if let Some(supplied) = invocation.plan_token.as_deref() {
-            if !supplied.is_empty() && supplied != token {
-                return Err(RcError::new(
-                    "plan_changed",
-                    "План изменился: проверьте его и подтвердите заново.",
-                ).with_extra("plan", serde_json::json!(&self.lines))
-                 .with_extra("plan_token", token));
-            }
+        if let Some(supplied) = invocation.plan_token.as_deref() && !supplied.is_empty() && supplied != token {
+            return Err(self.changed(invocation));
         }
         Ok(())
+    }
+
+    /// `plan_changed` with this (the current) plan: the state changed between
+    /// the confirmed plan and the mutation (re-checked under the lock).
+    pub fn changed(&self, invocation: &Invocation) -> RcError {
+        RcError::new("plan_changed", "План изменился: проверьте его и подтвердите заново.")
+            .with_extra("plan", serde_json::json!(&self.lines))
+            .with_extra("plan_token", self.token(&invocation.noun, &invocation.verb, invocation.confirmation_args()))
     }
 }
 

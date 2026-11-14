@@ -379,11 +379,11 @@ mod windows {
     use std::os::windows::process::CommandExt;
 
     use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeServer, ServerOptions};
-    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, HANDLE, LocalFree};
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, ERROR_PIPE_BUSY, HANDLE, LocalFree};
     use windows_sys::Win32::Security::Authorization::{ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
     use windows_sys::Win32::Security::{EqualSid, GetTokenInformation, PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser};
     use windows_sys::Win32::System::Console::{STD_ERROR_HANDLE, SetStdHandle};
-    use windows_sys::Win32::System::Pipes::{GetNamedPipeClientProcessId, GetNamedPipeServerProcessId};
+    use windows_sys::Win32::System::Pipes::{GetNamedPipeClientProcessId, GetNamedPipeServerProcessId, WaitNamedPipeW};
     use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, GetCurrentProcess, OpenProcess,
         OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION};
 
@@ -507,8 +507,9 @@ mod windows {
     impl Listener {
         /// The first instance (`FILE_FLAG_FIRST_PIPE_INSTANCE`) is the
         /// single-instance check: taken by a daemon of ours → `Running`; by
-        /// another user → `unsafe_path`; otherwise the previous daemon is
-        /// exiting and the name is awaited up to 60 s.
+        /// another user → `unsafe_path`; all instances busy (a start race of
+        /// several clients) → wait for a free one and probe again; otherwise
+        /// the previous daemon is exiting and the name is awaited up to 60 s.
         pub async fn bind(endpoint: &Endpoint) -> io::Result<Bound> {
             let security = Security::owner_only()?;
             let deadline = Instant::now() + TAKEOVER_WAIT;
@@ -520,6 +521,9 @@ mod windows {
                             Ok(()) => return Ok(Bound::Running),
                             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return Err(error),
                             Err(_) if Instant::now() >= deadline => return Err(error),
+                            // A live daemon whose instances are all connected is not
+                            // an exiting one: no polling connections while it is busy.
+                            Err(busy) if busy.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => wait_free_instance(&endpoint.pipe),
                             Err(_) => tokio::time::sleep(RETRY).await,
                         }
                     }
@@ -545,6 +549,14 @@ mod windows {
         pub(super) fn keep(self) -> Kept {
             Kept(self.next)
         }
+    }
+
+    /// Up to 1 s until an instance of `name` accepts a client (or the pipe
+    /// is gone); connects nothing.
+    fn wait_free_instance(name: &str) {
+        let wide: Vec<u16> = name.encode_utf16().chain([0]).collect();
+        // SAFETY: `wide` is a NUL-terminated wide string; failure (timeout, no pipe) is fine.
+        unsafe { WaitNamedPipeW(wide.as_ptr(), 1000) };
     }
 
     /// Ok when the pipe answers and its server runs under our SID.

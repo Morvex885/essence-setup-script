@@ -1,16 +1,16 @@
 // Общие помощники экранов: чтение данных командой с повтором, занятость на
-// время действия, кнопки действий с цветами скилла essence-menus, строки
-// контекста. Экран получает `ctx` (см. `app.js::makeContext`).
+// время действия, строки контекста, «Загрузка…» и «Не удалось получить
+// данные». Экран получает `ctx` (см. `app.js::makeContext`).
 import { html, useEffect, useState, useRef } from '../../vendor/preact-htm.js';
-import { Button, Card } from '../ui.js';
+import { Button, Card, Page } from '../ui.js';
 
 /**
  * Чтение командой при входе и по `reload()`. `argv === null` — не читать.
  * Возвращает `{ reply, data, loading, reload }`. Ошибка уже показана `ctx.request`,
  * кроме кодов `expect` (например, `not_found` карточки, после которого экран
- * возвращается к списку).
+ * возвращается к списку) и `quiet`.
  */
-export function useCommand(ctx, argv, deps = [], { expect = null } = {}) {
+export function useCommand(ctx, argv, deps = [], { expect = null, quiet = false } = {}) {
   const [state, setState] = useState({ reply: null, loading: argv !== null });
   const generation = useRef(0);
   const key = argv === null ? null : JSON.stringify(argv);
@@ -19,7 +19,7 @@ export function useCommand(ctx, argv, deps = [], { expect = null } = {}) {
     generation.current += 1;
     const mine = generation.current;
     setState((current) => ({ ...current, loading: true }));
-    const reply = await ctx.request(argv, { expect });
+    const reply = await ctx.request(argv, { expect, quiet });
     if (mine === generation.current) setState({ reply, loading: false });
     return reply;
   };
@@ -82,16 +82,6 @@ export function useMounted() {
   return mounted;
 }
 
-/** Кнопка действия: `tone` — `view|create|change|danger`. */
-export function Action({ tone = 'view', disabled = false, onClick, children }) {
-  return html`<${Button} kind=${tone} disabled=${disabled} onClick=${onClick}>${children}<//>`;
-}
-
-/** Ряд кнопок; `column` — столбцом. */
-export function Actions({ column = false, children }) {
-  return html`<div class="modal-buttons ${column ? 'column' : ''}">${children}</div>`;
-}
-
 /** Строки контекста; `{ text, tone }` или строка. `tone`: `ok|warn|error|dim|info`. */
 export function Context({ lines }) {
   const items = (lines || []).filter((line) => line !== null && line !== undefined && line !== false);
@@ -99,42 +89,31 @@ export function Context({ lines }) {
   return html`<div class="context">
     ${items.map((line, index) => (typeof line === 'string'
       ? html`<div key=${index}>${line}</div>`
-      : html`<div key=${index} class=${line.tone ? `tone-${line.tone}` : ''}>${line.text}</div>`))}
+      : html`<div key=${index} class=${line.tone ? `t-${line.tone}` : ''}>${line.text}</div>`))}
   </div>`;
-}
-
-/** Заголовок с кнопкой «Назад» (возврат к списку раздела). */
-export function Back({ ctx, to, param = null, label = 'Назад' }) {
-  return html`<${Button} onClick=${() => ctx.navigate(to, param)}>${label}<//>`;
 }
 
 /** «Не удалось получить данные» с текстом ошибки и «Повторить чтение» (`nodes.rs::read_failed`). */
 export function ReadFailed({ reply, loading = false, reload }) {
-  return html`
-    <p class="tone-warn">Не удалось получить данные</p>
+  return html`<div class="read-failed">
+    <p class="t-warn">Не удалось получить данные</p>
     ${reply && reply.error && reply.error.message && html`<p>${reply.error.message}</p>`}
-    <${Actions}><${Action} tone="view" disabled=${loading} onClick=${() => reload()}>Повторить чтение<//><//>
-  `;
+    <div class="row"><${Button} icon="refresh-cw" disabled=${loading} onClick=${() => reload()}>Повторить чтение<//></div>
+  </div>`;
 }
 
 /**
  * Экран чтения: пока нет ответа — «Загрузка…»; ошибка — `ReadFailed`;
- * иначе `children(data)`.
+ * иначе `children(data)`. Без `inline` загрузка и ошибка показываются
+ * страницей (`title`, `back`, `actions`), с `inline` — карточкой.
  */
-export function Loaded({ title, state, actions = null, children }) {
-  if (!state.reply && !state.replies) {
-    return html`<${Card} title=${title} actions=${actions}><p class="dim">Загрузка…</p><//>`;
-  }
-  const failed = state.reply ? (!state.reply.ok ? state.reply : null) : state.failed;
-  if (failed) {
-    return html`<${Card} title=${title} actions=${actions}>
-      <${ReadFailed} reply=${failed} loading=${state.loading} reload=${state.reload} />
-    <//>`;
-  }
-  return children(state.data);
-}
-
-/** Строки массива ответа (`rows` в TUI): не массив → пустой список. */
-export function rows(value) {
-  return Array.isArray(value) ? value : [];
+export function Loaded({ title = null, back = null, state, actions = null, inline = false, children }) {
+  const pending = !state.reply && !state.replies;
+  const failed = pending ? null : state.reply ? (!state.reply.ok ? state.reply : null) : state.failed;
+  if (!pending && !failed) return children(state.data);
+  const body = pending
+    ? html`<p class="t-dim">Загрузка…</p>`
+    : html`<${ReadFailed} reply=${failed} loading=${state.loading} reload=${state.reload} />`;
+  if (inline) return html`<${Card} title=${title}>${body}<//>`;
+  return html`<${Page} title=${title} back=${back} actions=${actions}><${Card}>${body}<//><//>`;
 }

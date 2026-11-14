@@ -1,80 +1,63 @@
-// AmneziaWG: `#/awg` — выбор ноды (`nodes.rs::AmneziaWg`), `#/awg/<нода>` —
-// клиенты AmneziaWG на ноде (`awg_node`). Команды над нодой — `ctx.nodeRequest`.
+// Вкладка «AmneziaWG» карточки ноды (`#/nodes/<нода>/awg`) — перенос
+// `nodes.rs::awg_node`. Команды над нодой — `ctx.nodeRequest`.
 import { html, useEffect, useState } from '../../vendor/preact-htm.js';
-import { Card } from '../ui.js';
-import { nodeLabel } from './nodes.js';
-import { useCommand, useBusy, useMounted, Action, Actions, Context, Back, Loaded } from './kit.js';
+import { Card, DataTable, Badge, Empty, Button } from '../ui.js';
+import { useBusy, useMounted, ReadFailed } from './kit.js';
 import {
-  EMPTY, NO_NODES, rows, nodeText, awgStatusArgv, awgSyncArgv, awgRemovePeerArgv, awgOrphansArgv, awgView,
-  AWG_REMOVE_TITLE, AWG_ORPHANS_TITLE,
+  awgStatusArgv, awgSyncArgv, awgRemovePeerArgv, awgOrphansArgv, awgView, AWG_REMOVE_TITLE, AWG_ORPHANS_TITLE,
 } from './nodeops-model.js';
 
-export function AwgScreen({ ctx, param }) {
-  return param === null || param === undefined
-    ? html`<${AwgNodes} ctx=${ctx} />`
-    : html`<${AwgNode} ctx=${ctx} name=${param} />`;
-}
-
-function AwgNodes({ ctx }) {
-  const state = useCommand(ctx, ['node', 'list']);
-  return html`<${Loaded} title="AmneziaWG" state=${state}>${(data) => html`<${Card} title="AmneziaWG">
-    ${rows(data).length === 0 && html`<${Context} lines=${[{ text: NO_NODES, tone: 'dim' }]} />`}
-    <${Actions} column>
-      ${rows(data).map((node) => html`<${Action} key=${nodeText(node.name)} tone="view"
-        onClick=${() => ctx.navigate('awg', nodeText(node.name))}>${nodeLabel(node)}<//>`)}
-    <//>
-    <${Actions}><${Back} ctx=${ctx} to="summary" /><//>
-  <//>`}<//>`;
-}
-
-function AwgNode({ ctx, name }) {
-  const [view, setView] = useState(null);
+export function NodeAwg({ ctx, name }) {
+  const [reply, setReply] = useState(null);
   const [busy, run] = useBusy();
   const mounted = useMounted();
 
-  /** `awg status`; любой отказ возвращает к выбору ноды (если карточка ещё открыта). */
+  /**
+   * `awg status`; исчезнувшая нода (`not_found`) — к списку нод, пока вкладка
+   * открыта; прочий отказ (уже показан `nodeRequest`) — «Повторить чтение».
+   */
   const load = async () => {
-    const reply = await ctx.nodeRequest(name, awgStatusArgv(name), null);
-    if (!reply.ok) {
-      if (mounted.current) ctx.navigate('awg');
-      return;
-    }
-    setView(awgView(reply.data));
+    const answer = await ctx.nodeRequest(name, awgStatusArgv(name), null, { expect: 'not_found' });
+    if (!mounted.current) return;
+    if (answer.error && answer.error.code === 'not_found') ctx.navigate('nodes');
+    else setReply(answer);
   };
 
   useEffect(() => { run(load); }, [name]);
 
-  const actions = {
-    refresh: load,
-    sync: async () => {
-      await ctx.nodeRequest(name, awgSyncArgv(name), null);
-      await load();
-    },
-    remove: async () => {
-      const peer = await ctx.choose({
-        title: AWG_REMOVE_TITLE,
-        options: view.removable.map((item) => ({ value: item, label: item })),
-        empty: EMPTY,
-      });
-      if (peer !== null) {
-        await ctx.nodeRequest(name, awgRemovePeerArgv(name, peer), { title: AWG_REMOVE_TITLE, question: 'Удалить?' });
-      }
-      await load();
-    },
-    orphans: async () => {
-      await ctx.nodeRequest(name, awgOrphansArgv(name), { title: AWG_ORPHANS_TITLE, question: 'Удалить?' });
-      await load();
-    },
-  };
+  const then = (action) => run(async () => {
+    await action();
+    await load();
+  });
+  const sync = () => then(() => ctx.nodeRequest(name, awgSyncArgv(name), null));
+  const remove = (peer) => then(() => ctx.nodeRequest(name, awgRemovePeerArgv(name, peer), { title: AWG_REMOVE_TITLE, question: 'Удалить?' }));
+  const orphans = () => then(() => ctx.nodeRequest(name, awgOrphansArgv(name), { title: AWG_ORPHANS_TITLE, question: 'Удалить?' }));
 
-  const title = `AmneziaWG: ${name}`;
-  if (!view) return html`<${Card} title=${title}><p class="dim">Загрузка…</p><//>`;
-  return html`<${Card} title=${title}>
-    <${Context} lines=${view.lines} />
-    <${Actions} column>
-      ${view.actions.map((action) => html`<${Action} key=${action.id} tone=${action.tone} disabled=${busy}
-        onClick=${() => run(actions[action.id])}>${action.label}<//>`)}
-      <${Back} ctx=${ctx} to="awg" />
-    <//>
+  if (!reply || !reply.ok) {
+    return html`<${Card} title="AmneziaWG">
+      ${reply
+        ? html`<${ReadFailed} reply=${reply} loading=${busy} reload=${() => run(load)} />`
+        : html`<p class="t-dim">Загрузка…</p>`}
+    <//>`;
+  }
+  const view = awgView(reply.data);
+  const actions = html`<div class="row">
+    ${view.installed && html`<${Button} kind=${view.missing ? 'primary' : 'neutral'} icon="plus" disabled=${busy} onClick=${sync}>Создать недостающих<//>`}
+    ${view.orphans && html`<${Button} kind="danger" icon="trash-2" disabled=${busy} onClick=${orphans}>Удалить неиспользуемых<//>`}
+    <${Button} icon="refresh-cw" disabled=${busy} onClick=${() => run(load)}>Обновить<//>
+  </div>`;
+  if (!view.installed) {
+    return html`<${Card} title="AmneziaWG" actions=${actions}>
+      <${Empty} icon="shield" title="AmneziaWG на ноде не установлен" />
+    <//>`;
+  }
+  const columns = [
+    { key: 'name', label: 'Клиент', search: true },
+    { key: 'label', label: 'Состояние', render: (row) => html`<${Badge} tone=${row.tone}>${row.label}<//>` },
+  ];
+  // У клиента, ещё не созданного на ноде, удалять нечего: пункт недоступен.
+  const menu = (row) => [{ label: 'Удалить', icon: 'trash-2', danger: true, disabled: busy || !row.removable, onClick: () => remove(row.name) }];
+  return html`<${Card} title="AmneziaWG" actions=${actions}>
+    <${DataTable} columns=${columns} rows=${view.table} empty="Нет клиентов" menu=${menu} />
   <//>`;
 }
