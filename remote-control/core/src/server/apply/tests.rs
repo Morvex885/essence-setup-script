@@ -252,7 +252,65 @@ async fn an_incomplete_rollback_is_reported_apart() {
     hosts.finish();
     assert_eq!(error.extra["failed"], json!([{"name": "de", "stage": "config", "code": "rollback_failed",
         "message": "откат на этапе «конфигурация и проверка» не завершён: резервные копии оставлены на ноде"}]));
-    assert!(config(&session).nodes[0].operation.is_none());
+    // First apply: the attempt's files and ports stay ours, the node pending.
+    let saved = config(&session);
+    let node = &saved.nodes[0];
+    assert!(node.operation.is_none());
+    let applied = node.applied.as_ref().expect("the attempt is kept");
+    assert_eq!(applied.digest, render::incomplete_digest());
+    assert!(applied.files.contains_key(render_paths::MIHOMO_CONFIG_PATH) && applied.ports == ["443/tcp"]);
+    assert_eq!(render::status(&saved, node), "pending");
+    // Our own listener on 443 is not busy; the plan says why it runs; the
+    // attempt's hashes are not reported as manual edits.
+    let probe = format!("{DEBIAN}agent=ok\nlisten tcp 0.0.0.0:443\nmissing {}\n", render_paths::MIHOMO_CONFIG_PATH);
+    let hosts = Hosts::new(vec![vec![connect_step(node, Ok(())), probe_step(node, &probe)]]);
+    let error = run(&mut session, &hosts, &["node", "apply", "--name", "de"]).await.unwrap_err();
+    hosts.finish();
+    assert_eq!(error.code, "confirmation_required");
+    let plan = error.extra["plan"].as_array().unwrap();
+    assert!(plan.contains(&json!("de: прошлое применение не завершило откат — следующее применение перезапишет файлы.")));
+    assert!(!plan.iter().any(|line| line.as_str().unwrap().starts_with("Изменено вручную")), "{plan:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_incomplete_rollback_of_a_reapply_keeps_both_sets() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut session, _journal) = fixture(root.path());
+    session.mutate("t", |state| {
+        let mut config = state.load_config()?;
+        config.nodes[0].applied = Some(crate::model::Applied {
+            digest: "b".repeat(64), files: [(render_paths::SYSCTL_PATH.to_owned(), "d".repeat(64))].into(),
+            ports: vec!["2053/tcp".into()], at: "2026-01-01T00:00:00Z".into(),
+        });
+        state.save_config(&config)
+    }).unwrap();
+    let de = config(&session).nodes[0].clone();
+    NEXT_OP_ID.with(|next| *next.borrow_mut() = Some(OP.into()));
+    let hashes = format!("{}  {}\n", "d".repeat(64), render_paths::SYSCTL_PATH);
+    let mut steps = vec![connect_step(&de, Ok(())), probe_step(&de, &format!("{DEBIAN}{hashes}"))];
+    steps.extend(start_steps(OP));
+    steps.push(exec(status_command(OP), "unit=inactive\nstage=config\nresult=rollback_failed\nerror=config\n"));
+    steps.push(exec(log_command(OP), ""));
+    let hosts = Hosts::new(vec![steps]);
+    let error = run(&mut session, &hosts, &["node", "apply", "--name", "de", "--yes"]).await.unwrap_err();
+    hosts.finish();
+    assert_eq!(error.extra["failed"][0]["code"], "rollback_failed");
+    let applied = config(&session).nodes[0].applied.clone().unwrap();
+    assert_eq!(applied.digest, render::incomplete_digest());
+    assert!(applied.files.contains_key(render_paths::SYSCTL_PATH) && applied.files.contains_key(render_paths::MIHOMO_CONFIG_PATH));
+    assert_eq!(applied.ports, ["2053/tcp", "443/tcp"]);
+
+    // Found unwatched, the same settlement is planned and recorded.
+    let root = tempfile::tempdir().unwrap();
+    let (mut session, _journal) = fixture(root.path());
+    set_operation(&mut session, Some(recorded("a")));
+    let de = config(&session).nodes[0].clone();
+    let probe = format!("{DEBIAN}agent=ok\nunit=inactive\nstage=config\nresult=rollback_failed\n");
+    let hosts = Hosts::new(vec![vec![connect_step(&de, Ok(())), probe_step(&de, &probe)]]);
+    let error = run(&mut session, &hosts, &["node", "apply", "--name", "de"]).await.unwrap_err();
+    hosts.finish();
+    assert!(error.extra["plan"].as_array().unwrap().contains(&json!(
+        "de: прошлое применение не завершило откат — его файлы и порты остаются за Essence до следующего применения.")));
 }
 
 #[tokio::test(start_paused = true)]

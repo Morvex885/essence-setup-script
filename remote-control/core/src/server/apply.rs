@@ -322,25 +322,57 @@ fn operation_dir(op_id: &str, desired: &Desired) -> Result<tempfile::TempDir> {
     Ok(dir)
 }
 
+/// How a finished operation ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum End { Committed, Failed, RollbackFailed }
+
+impl End {
+    fn of(result: Option<&str>) -> Self {
+        match result {
+            Some("committed") => End::Committed,
+            Some("rollback_failed") => End::RollbackFailed,
+            _ => End::Failed,
+        }
+    }
+}
+
 /// End the node's operation: a commit records what the operation uploaded.
-fn conclude(node: &mut Node, committed: bool) {
-    if let Some(operation) = node.operation.take()
-        && committed
-    {
-        node.applied = (!operation.teardown).then(|| Applied {
-            digest: operation.digest, files: operation.files, ports: operation.ports, at: crate::github::utc_stamp(),
-        });
+/// An incomplete rollback may have left the attempt's files and listeners
+/// on the node: they stay ours (merged into `applied`) under a digest that
+/// never matches, so the node stays pending until an apply commits.
+fn conclude(node: &mut Node, end: End) {
+    let Some(operation) = node.operation.take() else { return };
+    match end {
+        End::Committed => {
+            node.applied = (!operation.teardown).then(|| Applied {
+                digest: operation.digest, files: operation.files, ports: operation.ports, at: crate::github::utc_stamp(),
+            });
+        }
+        End::Failed => {}
+        End::RollbackFailed => {
+            let applied = node.applied.get_or_insert_with(|| Applied {
+                digest: String::new(), files: BTreeMap::new(), ports: Vec::new(), at: String::new(),
+            });
+            applied.files.extend(operation.files);
+            for port in operation.ports {
+                if !applied.ports.contains(&port) {
+                    applied.ports.push(port);
+                }
+            }
+            applied.digest = render::incomplete_digest();
+            applied.at = crate::github::utc_stamp();
+        }
     }
 }
 
 /// Persist the end of operation `op_id` of node `id` (if it is still the recorded one).
-fn finish_operation(session: &mut Session, id: &str, op_id: &str, committed: bool) -> Result<()> {
+fn finish_operation(session: &mut Session, id: &str, op_id: &str, end: End) -> Result<()> {
     session.mutate("node apply", |state| {
         let mut config = state.load_config()?;
         if let Some(node) = config.nodes.iter_mut()
             .find(|node| node.id == id && node.operation.as_ref().is_some_and(|operation| operation.id == op_id))
         {
-            conclude(node, committed);
+            conclude(node, end);
         }
         state.save_config(&config)
     })
@@ -510,13 +542,15 @@ impl<'t, T: RemoteTransport> Run<'t, T> {
         }
     }
 
-    /// Record the result: `applied` after a commit, the operation cleared
-    /// always except after a timeout (the next `node apply` resumes it).
+    /// Record the result: `applied` after a commit (or the attempt kept as
+    /// ours after an incomplete rollback), the operation cleared always
+    /// except after a timeout (the next `node apply` resumes it).
     fn record(&self, session: &mut Session) -> Result<()> {
         match &self.outcome {
-            Some(Outcome::Committed) => finish_operation(session, &self.node.id, &self.operation.id, true),
+            Some(Outcome::Committed) => finish_operation(session, &self.node.id, &self.operation.id, End::Committed),
             Some(Outcome::Failed(failure)) if failure.code != "timeout" => {
-                finish_operation(session, &self.node.id, &self.operation.id, false)
+                let end = if failure.code == "rollback_failed" { End::RollbackFailed } else { End::Failed };
+                finish_operation(session, &self.node.id, &self.operation.id, end)
             }
             _ => Ok(()),
         }
@@ -544,7 +578,7 @@ async fn launch<T: RemoteTransport>(session: &mut Session, run: &mut Run<'_, T>,
     -> Result<()>
 {
     if let Err(error) = run.start(session, agent_ok, desired).await {
-        finish_operation(session, &run.node.id, &run.operation.id, false)?;
+        finish_operation(session, &run.node.id, &run.operation.id, End::Failed)?;
         return Err(error);
     }
     Ok(())
@@ -560,9 +594,9 @@ struct Planned<T> {
     sshd: Option<u16>,
     /// An unfinished operation to resume instead of starting a new one.
     resume: Option<String>,
-    /// A finished or dead operation to record (`op_id`, committed) once the
-    /// plan is confirmed.
-    settle: Option<(String, bool)>,
+    /// A finished or dead operation to record (`op_id`, how it ended) once
+    /// the plan is confirmed.
+    settle: Option<(String, End)>,
     /// Run the executor (false: only the settlement is recorded).
     run: bool,
 }
@@ -632,15 +666,17 @@ pub async fn apply<T: RemoteTransport>(session: &mut Session, invocation: &Invoc
                 // Finished while nobody watched, or the executor died: the plan
                 // is built on the settled node; the settlement is recorded only
                 // after confirmation, under the lock (`claim`).
-                let committed = result == Some("committed");
+                let end = End::of(result);
                 lines.push(match result {
                     Some("committed") => format!("{name}: прошлое применение завершилось успешно — результат будет записан."),
+                    Some("rollback_failed") => format!(
+                        "{name}: прошлое применение не завершило откат — его файлы и порты остаются за Essence до следующего применения."),
                     Some(_) => format!("{name}: прошлое применение завершилось неудачно — отметка будет снята."),
                     None => format!("{name}: прошлое применение прервано без результата — отметка будет снята."),
                 });
-                extra.push(format!("settle:{name}:{}:{committed}", operation.id));
-                conclude(&mut node, committed);
-                settle = Some((operation.id, committed));
+                extra.push(format!("settle:{name}:{}:{end:?}", operation.id));
+                conclude(&mut node, end);
+                settle = Some((operation.id, end));
                 desired = match render::desired(&config, &node, None) {
                     Ok(desired) => desired,
                     Err(error) if named => return Err(error),
@@ -656,7 +692,10 @@ pub async fn apply<T: RemoteTransport>(session: &mut Session, invocation: &Invoc
             continue;
         }
         let applied = node.applied.as_ref();
-        let drift: Vec<&String> = applied.iter().flat_map(|applied| applied.files.iter())
+        // After an incomplete rollback the recorded hashes are the attempt's,
+        // not a manual edit: everything is rewritten anyway.
+        let incomplete = applied.is_some_and(|applied| applied.digest == render::incomplete_digest());
+        let drift: Vec<&String> = applied.iter().filter(|_| !incomplete).flat_map(|applied| applied.files.iter())
             .filter(|(path, hash)| desired.files.iter().any(|file| file.path == **path)
                 && probe.hashes.get(*path).is_some_and(|remote| remote.as_ref() != Some(hash)))
             .map(|(path, _)| path).collect();
@@ -669,6 +708,9 @@ pub async fn apply<T: RemoteTransport>(session: &mut Session, invocation: &Invoc
             lines.extend(desired.lines.iter().cloned());
             if resume.is_some() {
                 lines.push(format!("{name}: продолжается незавершённое применение."));
+            }
+            if incomplete {
+                lines.push(format!("{name}: прошлое применение не завершило откат — следующее применение перезапишет файлы."));
             }
             if let Some(sshd) = probe.sshd.filter(|port| *port != node.port && !desired.teardown) {
                 lines.push(format!("SSH на ноде слушает порт {sshd}: при включении UFW он тоже будет разрешён."));
@@ -694,11 +736,11 @@ pub async fn apply<T: RemoteTransport>(session: &mut Session, invocation: &Invoc
         for item in &planned {
             let node = config.nodes.iter_mut().find(|node| node.name == item.name)
                 .ok_or_else(|| plan.changed(invocation))?;
-            if let Some((op_id, committed)) = &item.settle {
+            if let Some((op_id, end)) = &item.settle {
                 if node.operation.as_ref().map(|operation| &operation.id) != Some(op_id) {
                     return Err(plan.changed(invocation));
                 }
-                conclude(node, *committed);
+                conclude(node, *end);
             }
             let node = nodes::find(config, &item.name)?;
             let digest = render::desired(config, node, None).map(|desired| desired.digest).ok();

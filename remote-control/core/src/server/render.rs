@@ -666,6 +666,12 @@ fn teardown_digest() -> String {
     digest_of(&json!({"revision": RENDER_REVISION, "teardown": true}))
 }
 
+/// The `applied` digest of a node whose last operation could not roll back:
+/// it never matches a render, so the node stays pending.
+pub fn incomplete_digest() -> String {
+    digest_of(&json!({"revision": RENDER_REVISION, "rollback_failed": true}))
+}
+
 /// Removing everything installed from an applied node: a removed profile or
 /// `node delete --scope server`.
 pub fn teardown(node: &Node) -> Desired {
