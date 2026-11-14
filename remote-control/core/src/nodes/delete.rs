@@ -189,6 +189,24 @@ fn with_outcome(error: RcError, name: &str, scope: &str, deleted: bool, remote_r
         .with_extra("deleted", deleted).with_extra("remote_removed", remote_removed)
 }
 
+/// The deletion plan rebuilt from `config` must equal the confirmed one, else
+/// `plan_changed` and nothing changes. After the teardown committed (`torn_down`)
+/// the node's `applied` is gone by design: the confirmed value stands in.
+fn delete_planned(config: &Config, node: &Node, server: bool, revoke: bool, torn_down: bool, planned: &Plan,
+    invocation: &Invocation) -> Result<()>
+{
+    let mut current = config.nodes.iter().find(|current| current.id == node.id).cloned()
+        .ok_or_else(|| super::not_found(&node.name))?;
+    if torn_down {
+        current.applied = node.applied.clone();
+    }
+    let plan = Plan::new(plan(config, &current, server, revoke), "");
+    if plan.lines != planned.lines {
+        return Err(plan.changed(invocation));
+    }
+    Ok(())
+}
+
 /// `node delete --name N [--scope local|server] [--revoke-key]`.
 pub async fn delete<T: RemoteTransport>(session: &mut Session, invocation: &Invocation, transport: &mut T) -> Result<Value> {
     let name = required(invocation, "name")?;
@@ -212,7 +230,8 @@ pub async fn delete<T: RemoteTransport>(session: &mut Session, invocation: &Invo
                 "На ноде «{name}» уже выполняется применение: дождитесь его завершения (node apply --name {name}).")).with_extra("name", name));
         }
     }
-    Plan::new(plan(&config, &node, server, revoke), "").confirm(invocation)?;
+    let planned = Plan::new(plan(&config, &node, server, revoke), "");
+    planned.confirm(invocation)?;
 
     // Every rollback artifact is ready before anything remote changes.
     let public = if revoke {
@@ -235,6 +254,8 @@ pub async fn delete<T: RemoteTransport>(session: &mut Session, invocation: &Invo
                 .with_extra("reason", error.extra.get("reason").cloned().unwrap_or(Value::Null)),
             _ => error,
         })?;
+        // The configuration may have changed while connecting: nothing remote changes against a stale plan.
+        delete_planned(&session.state.load_config()?, &node, server, revoke, false, &planned, invocation)?;
         if server {
             if node.applied.is_some() {
                 session.log(Level::Info, &format!("Удаляем компоненты Essence на ноде «{name}»..."));
@@ -277,6 +298,7 @@ pub async fn delete<T: RemoteTransport>(session: &mut Session, invocation: &Invo
     }
 
     let outcome = session.mutate("node delete", |state| {
+        delete_planned(&state.load_config()?, &node, server, revoke, remote_removed, &planned, invocation)?;
         let rollback = FileBackup::take(transaction_files(state, Vec::<PathBuf>::new()))?;
         if let Err(error) = remove(state, &node) {
             let restored = rollback.restore().is_ok();
@@ -612,5 +634,96 @@ mod tests {
         transport.0.assert_finished();
         assert_eq!((error.code, error.message.as_str()), ("remote_failed", NO_RECOVERY_LEASE));
         assert_eq!(testing::fingerprint(root.path()), before);
+    }
+
+    /// A [`FakeTransport`] whose `trigger` (`"connect"` or an exec command)
+    /// first adds client `bob` through node `de`, as a concurrent command would.
+    struct Interleaved {
+        inner: FakeTransport,
+        trigger: String,
+        root: PathBuf,
+        fired: std::cell::Cell<bool>,
+    }
+
+    impl Interleaved {
+        fn new(inner: FakeTransport, trigger: impl Into<String>, root: &Path) -> Self {
+            Self { inner, trigger: trigger.into(), root: root.to_path_buf(), fired: Default::default() }
+        }
+
+        fn fire(&self, operation: &str) {
+            if operation != self.trigger || self.fired.replace(true) {
+                return;
+            }
+            let state = State::new(crate::state::StatePaths::new(&self.root));
+            let mut config = state.load_config().unwrap();
+            config.connections.push(Connection { node: "de".into(),
+                groups: vec![ConnectionGroup { name: "g".into(), proxies: vec!["VLESS TCP".into()] }] });
+            config.clients.push(Client { name: "bob".into(), group: "g".into(), inherit_nodes_from_group: true, ..Client::default() });
+            state.save_config(&config).unwrap();
+        }
+    }
+
+    impl RemoteSession for Interleaved {
+        fn exec<'a>(&'a self, command: &'a str, stdin: &'a [u8], timeout: Duration) -> impl Future<Output = Result<ExecResult>> + 'a {
+            self.fire(command);
+            self.inner.exec(command, stdin, timeout)
+        }
+        fn upload<'a>(&'a self, local_dir: &'a Path, remote_dir: &'a str, timeout: Duration) -> impl Future<Output = Result<()>> + 'a {
+            self.inner.upload(local_dir, remote_dir, timeout)
+        }
+        fn upload_private<'a>(&'a self, local_dir: &'a Path, remote_dir: &'a str, timeout: Duration)
+            -> impl Future<Output = Result<()>> + 'a
+        {
+            self.inner.upload_private(local_dir, remote_dir, timeout)
+        }
+    }
+
+    impl RemoteTransport for Interleaved {
+        type Held = <FakeTransport as RemoteTransport>::Held;
+        fn connect(&mut self, options: ConnectOptions) -> impl Future<Output = Result<()>> + '_ {
+            self.fire("connect");
+            self.inner.connect(options)
+        }
+        fn hold(&self) -> Result<Self::Held> {
+            self.inner.hold()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_plan_changed_before_the_teardown_changes_nothing_remote() {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = applied_session(root.path());
+        let mut transport = Interleaved::new(FakeTransport::new(teardown_steps("").into_iter().take(1)), "connect", root.path());
+        let argv = testing::invocation(&["node", "delete", "--name", "de", "--scope", "server", "--yes"]);
+        let error = delete(&mut session, &argv, &mut transport).await.unwrap_err();
+        transport.inner.assert_finished();
+        assert_eq!((error.code, error.exit_code()), ("plan_changed", 2));
+        assert!(error.extra["plan"].as_array().unwrap().contains(&json!("Затронутые клиенты: bob")));
+        let config = session.state.load_config().unwrap();
+        assert!(config.nodes[0].applied.is_some() && config.nodes[0].operation.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_plan_changed_during_the_teardown_keeps_the_node_as_partial() {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = applied_session(root.path());
+        let op = "ab".repeat(16);
+        crate::server::apply::tests::NEXT_OP_ID.with(|next| *next.borrow_mut() = Some(op.clone()));
+        let mut transport = Interleaved::new(FakeTransport::new(teardown_steps("stage=cleanup\nresult=committed\n")),
+            crate::server::apply::status_command(&op), root.path());
+        let argv = testing::invocation(&["node", "delete", "--name", "de", "--scope", "server", "--yes"]);
+        let error = delete(&mut session, &argv, &mut transport).await.unwrap_err();
+        transport.inner.assert_finished();
+        assert_eq!(error.code, "partial");
+        assert!(error.message.starts_with("Компоненты на сервере удалены. План изменился"), "{}", error.message);
+        assert_eq!((error.extra["deleted"].clone(), error.extra["remote_removed"].clone()), (json!(false), json!(true)));
+        assert!(error.extra["plan"].as_array().unwrap().contains(&json!("Затронутые клиенты: bob")));
+        let config = session.state.load_config().unwrap();
+        assert_eq!(config.nodes.len(), 1);
+        assert!(config.nodes[0].applied.is_none(), "the teardown is recorded");
+
+        // Unchanged since: the node goes with the new plan.
+        let data = delete(&mut session, &argv, &mut FakeTransport::new([teardown_steps("").remove(0)])).await.unwrap();
+        assert_eq!(data, json!({"name": "de", "scope": "server"}));
     }
 }

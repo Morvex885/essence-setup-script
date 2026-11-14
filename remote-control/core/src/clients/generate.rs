@@ -314,15 +314,18 @@ fn proxy_type(block: &str) -> Option<&str> {
 /// `_fetch_proxies_for_client`): allowed connections, client credentials,
 /// AmneziaWG display name, aliases and tag. `None` when a node section is
 /// missing, a selected connection (an AmneziaWG peer included) is not in its
-/// node's section or credentials are invalid.
+/// node's section or credentials are missing or invalid.
 fn client_proxies(config: &Config, client: &Client, nodes: &[String], sections: &BTreeMap<String, String>,
     log: &mut dyn FnMut(Level, &str)) -> Option<String>
 {
     let name = client.name.as_str();
     let (uuid, password) = client.credentials.as_ref()
         .map_or(("", ""), |c| (c.vless_uuid.as_str(), c.hy2_password.as_str()));
-    if (!uuid.is_empty() && !validation::vless_uuid_valid(uuid))
-        || (!password.is_empty() && !validation::hy2_password_valid(password)) {
+    if uuid.is_empty() || password.is_empty() {
+        log(Level::Warn, &format!("{name}: нет учётных данных клиента — назначьте ноде профиль заново (node profile), чтобы их создать"));
+        return None;
+    }
+    if !validation::vless_uuid_valid(uuid) || !validation::hy2_password_valid(password) {
         log(Level::Warn, &format!("{name}: недопустимые учётные данные в конфигурации"));
         return None;
     }
@@ -368,12 +371,10 @@ fn client_proxies(config: &Config, client: &Client, nodes: &[String], sections: 
             let kind = proxy_type(&block).map(str::to_owned);
             match kind.as_deref() {
                 Some("vless") => {
-                    if !uuid.is_empty() {
-                        block = set_field(&block, "uuid", uuid);
-                    }
+                    block = set_field(&block, "uuid", uuid);
                     block = trim_newlines(&crate::protocols::vless_xhttp::normalize_proxy_yaml(&block)).to_owned();
                 }
-                Some("hysteria2") if !password.is_empty() => block = set_field(&block, "password", password),
+                Some("hysteria2") => block = set_field(&block, "password", password),
                 _ => {}
             }
             if awg {
@@ -881,6 +882,25 @@ mod tests {
         let (out, log) = proxies(&config, "my-pc", &["de"], &fetched(&[("de", SAMPLE)]));
         assert_eq!(out, None);
         assert_eq!(log, ["my-pc: подключения «AWG» нет в профиле ноды de — выполните conn sync или измените назначение"]);
+    }
+
+    #[test]
+    fn a_client_without_credentials_fails_and_keeps_its_config() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut session, journal) = fixture(root.path());
+        let previous = generated_dir(session.state.paths()).join("PC/my-pc");
+        std::fs::create_dir_all(&previous).unwrap();
+        std::fs::write(previous.join("config.yaml"), "previous\n").unwrap();
+        for credentials in [None, Some(ClientCredentials { vless_uuid: PC_UUID.into(), ..ClientCredentials::default() })] {
+            let mut config = session.state.load_config().unwrap();
+            config.clients[1].credentials = credentials;
+            session.state.save_config(&config).unwrap();
+            let error = generate(&mut session, &invocation(&["generate", "--client", "my-pc"])).unwrap_err();
+            assert_eq!((error.code, error.extra["ok"].clone(), error.extra["failed"].clone()), ("partial", json!([]), json!(["my-pc"])));
+            assert_eq!(std::fs::read_to_string(previous.join("config.yaml")).unwrap(), "previous\n");
+        }
+        assert!(journal.borrow().iter().any(|(_, text)|
+            text == "my-pc: нет учётных данных клиента — назначьте ноде профиль заново (node profile), чтобы их создать"));
     }
 
     #[test]
