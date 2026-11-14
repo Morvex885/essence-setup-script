@@ -265,6 +265,30 @@ fn listeners_without_users_are_not_rendered_and_sections_stay_sequences() {
 }
 
 #[test]
+fn every_listener_routes_through_the_inbound_sub_rule() {
+    // TCP, xHTTP (reality), gRPC and Hysteria2 listeners.
+    let profile = Profile {
+        vless_xhttp: Some(Xhttp { topology: XhttpTopology::Reality, port: Some(2083) }),
+        vless_grpc: Some(PortOnly { port: 2053 }), hysteria2: Some(Hysteria2 { port: 8843, obfs: true }), ..profile()
+    };
+    let mihomo = content(&render(&config(profile)), MIHOMO_CONFIG_PATH).to_owned();
+    let document = yaml(&mihomo);
+    let listeners = document["listeners"].as_vec().unwrap();
+    assert_eq!(listeners.len(), 4);
+    for listener in listeners {
+        assert_eq!(listener["rule"].as_str(), Some("essence-in"), "{mihomo}");
+    }
+    assert!(!mihomo.contains("\n    proxy: "), "no listener bypasses the rules: {mihomo}");
+    let rules: Vec<&str> = document["sub-rules"]["essence-in"].as_vec().unwrap().iter().map(|rule| rule.as_str().unwrap()).collect();
+    assert_eq!(rules, [
+        "IP-CIDR,127.0.0.0/8,REJECT,no-resolve", "IP-CIDR6,::1/128,REJECT,no-resolve", "IP-CIDR,169.254.0.0/16,REJECT,no-resolve",
+        "IP-CIDR,10.0.0.0/8,REJECT,no-resolve", "IP-CIDR,172.16.0.0/12,REJECT,no-resolve", "IP-CIDR,192.168.0.0/16,REJECT,no-resolve",
+        "IP-CIDR,100.64.0.0/10,REJECT,no-resolve", "IP-CIDR6,fc00::/7,REJECT,no-resolve", "IP-CIDR6,fe80::/10,REJECT,no-resolve",
+        "MATCH,outbound",
+    ]);
+}
+
+#[test]
 fn a_client_without_connections_on_the_node_uses_every_listener() {
     let mut config = config(profile());
     config.clients.push(Client { inherit_nodes_from_group: false, nodes: Some(vec!["de".into()]),

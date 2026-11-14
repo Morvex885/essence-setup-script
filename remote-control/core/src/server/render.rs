@@ -19,7 +19,7 @@ use super::paths::{MIHOMO_CONFIG_PATH, MIHOMO_SERVICE_PATH, SITES_AVAILABLE, SIT
 use super::ports::{REALITY_INNER_PORT, SITE_PORT, SUB_INNER_PORT, TG_INNER_PORT, XHTTP_NGINX_PORT};
 
 /// Bumped whenever rendered files change for an unchanged configuration.
-pub const RENDER_REVISION: u32 = 2;
+pub const RENDER_REVISION: u32 = 3;
 
 const MIHOMO_CONFIG: &str = include_str!("assets/mihomo-config.yaml");
 const MIHOMO_SERVICE: &str = include_str!("assets/mihomo.service");
@@ -338,8 +338,14 @@ impl Layout<'_> {
                 })
             }
         };
+        // Inbound goes through the `essence-in` sub-rule instead of straight
+        // to `outbound` (as Bash cascades do: `proxy:` becomes `rule:`).
+        let routed = block.replacen(&format!("\n    proxy: {INBOUND_PROXY}\n"), &format!("\n    rule: {INBOUND_RULE}\n"), 1);
+        if routed == block {
+            return Err(RcError::new("failed", format!("Не удалось собрать листенер {}.", listener.name)));
+        }
         let marker = listener.marker;
-        let wrapped = format!("# --- {marker} ---\n{block}# --- /{marker} ---\n");
+        let wrapped = format!("# --- {marker} ---\n{routed}# --- /{marker} ---\n");
         let users_yaml = if listener.kind == Kind::Hy2 {
             listener_users::hy2_users_yaml(users.iter().copied())
         } else {
@@ -361,7 +367,7 @@ impl Layout<'_> {
         Ok(fill_template(MIHOMO_CONFIG, &[
             ("#@ipv6", ipv6.to_owned()), ("#@tproxy", String::new()), ("#@proxies", String::new()),
             ("#@outbound", String::new()), ("#@groups", String::new()), ("#@listeners", listeners),
-            ("#@sub-rules", String::new()),
+            ("#@sub-rules", inbound_sub_rules()),
         ]))
     }
 
@@ -477,6 +483,28 @@ impl Layout<'_> {
             "awg_peers": [], "cascades": [], "subscription_host": host, "telegram": telegram, "tg_revision": null,
         }))
     }
+}
+
+/// The group every inbound connection ends in.
+const INBOUND_PROXY: &str = "outbound";
+/// The sub-rule every listener routes through (`rule:`).
+pub const INBOUND_RULE: &str = "essence-in";
+/// Destinations no client may reach through the node: its loopback,
+/// link-local (cloud metadata) and private networks. Every inbound sub-rule
+/// (cascades too) starts with these.
+pub const INBOUND_REJECT: [&str; 9] = [
+    "IP-CIDR,127.0.0.0/8", "IP-CIDR6,::1/128", "IP-CIDR,169.254.0.0/16", "IP-CIDR,10.0.0.0/8", "IP-CIDR,172.16.0.0/12",
+    "IP-CIDR,192.168.0.0/16", "IP-CIDR,100.64.0.0/10", "IP-CIDR6,fc00::/7", "IP-CIDR6,fe80::/10",
+];
+
+/// `sub-rules:` with `essence-in`: the rejects, then `outbound`.
+fn inbound_sub_rules() -> String {
+    let mut text = format!("sub-rules:\n  {INBOUND_RULE}:\n");
+    for rule in INBOUND_REJECT {
+        text.push_str(&format!("    - {rule},REJECT,no-resolve\n"));
+    }
+    text.push_str(&format!("    - MATCH,{INBOUND_PROXY}\n"));
+    text
 }
 
 fn file(path: &str, mode: &'static str, content: String) -> RenderedFile {
