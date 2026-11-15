@@ -91,7 +91,7 @@ fn set_link_rotate_tag_and_remove() {
     let before = fingerprint(root.path());
     let error = run(&mut session, &["telegram", "rotate-secret", "--name", "de"], &none()).unwrap_err();
     assert_eq!((error.code, error.extra["plan"].clone()), ("confirmation_required",
-        json!(["Секрет будет заменён: прежние ссылки перестанут работать."])));
+        json!(["Секрет Telegram Proxy ноды «de» будет заменён: прежние ссылки перестанут работать."])));
     assert_eq!(fingerprint(root.path()), before);
     let mark = session.state.load_config().unwrap().telegram[0].secret_mark.clone();
     run(&mut session, &["telegram", "rotate-secret", "--name", "de", "--yes"], &none()).unwrap();
@@ -117,6 +117,36 @@ fn set_link_rotate_tag_and_remove() {
     assert_eq!(fingerprint(root.path()), before);
     assert_eq!(run(&mut session, &["telegram", "remove", "--name", "de", "--yes"], &none()).unwrap(), json!({"node": "de"}));
     assert!(session.state.load_config().unwrap().telegram.is_empty() && stored(&session, "telegram-secret").is_none());
+}
+
+/// `rotate-secret` and `remove` rebuild their plan under the lock: a role
+/// changed after the confirmation (another rotation, a new domain, the role
+/// gone) answers `plan_changed` instead of acting on the old plan.
+#[test]
+fn remove_and_rotate_recheck_the_plan_under_the_lock() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut session, _) = fixture(root.path());
+    run(&mut session, &["telegram", "set", "--name", "de", "--domain", "tg.example.com"], &none()).unwrap();
+    let confirmed = invocation(&["telegram", "rotate-secret", "--name", "de", "--yes"]);
+    let config = session.state.load_config().unwrap();
+    let rotate = rotate_plan(&config, "de").unwrap();
+    let remove = remove_plan(&config, "de").unwrap();
+    planned(&config, "de", &rotate, rotate_plan, &confirmed).unwrap();
+    planned(&config, "de", &remove, remove_plan, &confirmed).unwrap();
+
+    let mut rotated = config.clone();
+    rotated.telegram[0].secret_mark = "other".into();
+    assert_eq!(planned(&rotated, "de", &rotate, rotate_plan, &confirmed).unwrap_err().code, "plan_changed");
+    let mut moved = config.clone();
+    moved.telegram[0].hostname = "tg2.example.com".into();
+    let error = planned(&moved, "de", &remove, remove_plan, &confirmed).unwrap_err();
+    assert_eq!(error.code, "plan_changed");
+    assert!(error.extra["plan"].to_string().contains("tg2.example.com"), "{error:?}");
+    let mut gone = config.clone();
+    gone.telegram.clear();
+    let error = planned(&gone, "de", &remove, remove_plan, &confirmed).unwrap_err();
+    assert_eq!(error.code, "plan_changed");
+    assert!(error.message.contains("не включён"), "{}", error.message);
 }
 
 fn connect_step(index: usize) -> ScriptStep {

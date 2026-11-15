@@ -472,8 +472,8 @@ import`, `template check`, `source github-import-recovery-key`) клиент ч�
 | `key_provisioning_required` | `nodes` | `--provision-keys yes\|no` |
 | `auth_required` / `auth_failed` | `secret` | секрет `script-password` или `access-token` (по полю `secret`) |
 
-Команды, которым нужен живой терминал (`node shell`, `telegram menu`), без
-терминала отвечают `tty_required`.
+Команды, которым нужен живой терминал (`node shell`), без терминала отвечают
+`tty_required`.
 
 Решения не заменяют подтверждение. `source github-connect` и
 `source github-change-account` после всех решений отвечают `confirmation_required`
@@ -656,8 +656,7 @@ essence-rc client --help       # команды одной сущности (т�
 
 Только редактирование шаблона редактором остаётся за меню и веб-панелью
 (редактор в браузере): оно сохраняет изменения командой `template import`. Меню
-сервера (`node shell`) и Telegram одной ноды (`telegram menu`) требуют терминала
-(`tty_required` без него).
+сервера (`node shell`) требует терминала (`tty_required` без него).
 
 ### Каталог команд
 
@@ -766,15 +765,20 @@ AmneziaWG отдельной сущности не имеет: протокол 
 
 | Команда | Описание |
 |---|---|
-| `telegram status [--name N… \| --all]` | Состояние Telegram Proxy |
-| `telegram install (--name N… \| --all) [--yes]` | Действия Telegram Proxy: установить |
-| `telegram refresh-ip (--name N… \| --all) [--yes]` | Действия Telegram Proxy: обновить IP |
-| `telegram web-update (--name N… \| --all) [--yes]` | Действия Telegram Proxy: обновить веб-часть |
-| `telegram web-restart (--name N… \| --all) [--yes]` | Действия Telegram Proxy: перезапустить веб-часть |
-| `telegram backend-restart (--name N… \| --all) [--yes]` | Действия Telegram Proxy: перезапустить backend |
-| `telegram remove --component web\|mtproto (--name N… \| --all) [--yes]` | Удалить компонент Telegram Proxy |
-| `telegram remove-all (--name N… \| --all) [--yes]` | Удалить Telegram Proxy целиком |
-| `telegram menu --name N [--yes]` | Серверное меню Telegram Proxy одной ноды (нужен терминал) |
+| `telegram status [--name N… \| --all]` | Состояние Telegram Web Proxy (по умолчанию — все ноды с ролью) |
+| `telegram set --name N --domain D` | Включить Telegram Web Proxy на ноде или сменить домен (затем `node apply`) |
+| `telegram remove --name N [--yes]` | Убрать Telegram Web Proxy с ноды (затем `node apply`) |
+| `telegram link --name N` | Ссылка подключения `tg://webproxy` (с секретом) |
+| `telegram rotate-secret --name N [--yes]` | Новый секрет: прежние ссылки перестанут работать (затем `node apply`) |
+| `telegram tag --name N [--clear]` | Спонсорский тег (секрет `password`, 32 hex; затем `node apply`) |
+| `telegram restart --name N` | Перезапустить MTProxy и tproxy-server |
+| `telegram diagnostics --name N` | Журналы служб за 30 минут и метрики Web Proxy |
+
+Секрет и спонсорский тег хранятся в хранилище секретов и попадают на ноду
+только файлом `/etc/mtproxy/mtproxy.env` (0640, группа `mtproxy`) в составе
+`node apply`, не через argv или окружение команд. План `remove` и
+`rotate-secret` строится заново под блокировкой мутации: роль, изменённая после
+подтверждения (другой домен, другой секрет, роль убрана), даёт `plan_changed`.
 
 ### Клиенты (`client`)
 
@@ -1096,8 +1100,8 @@ MetaCubeX meta-json-schema встроена в бинарник, `remote-control
 SIGQUIT восстанавливают терминал и завершают процесс с кодом 128+N; аварийное
 завершение меню восстанавливает терминал и выходит с кодом 1.
 
-**Терминальные команды.** `node shell` и `telegram menu` демон готовит в своей
-сессии (поиск ноды, SSH-подключение, скрипты) и передаёт ввод-вывод терминала по
+**Терминальные команды.** `node shell` демон готовит в своей сессии (поиск ноды,
+SSH-подключение) и передаёт ввод-вывод терминала по
 протоколу. Меню на время запроса приостанавливается (обычный режим терминала,
 основной экран) и не читает ввод, Ctrl+C уходит только на удалённый терминал.
 Одна нода — один открытый терминал: второй отвечает `conflict`.
@@ -1162,7 +1166,6 @@ SSH-настройка нод — раздел n → h». Данные — ко�
 | Клавиша | Действие | Команда |
 |---|---|---|
 | `o` | Меню сервера | `node shell --name N` |
-| `t` | Telegram Proxy на ноде | `telegram menu --name N` |
 | `p` | Подключения ноды | экран «Подключения ноды» |
 | `a` | Клиенты AmneziaWG | экран «AmneziaWG: N» |
 | `k` | Проверить подключение | `node check --name N` |
@@ -1178,11 +1181,6 @@ SSH-настройка нод — раздел n → h». Данные — ко�
 `host_key_unknown` — план `node trust-host-key --name N --host-key SHA256:…` и
 вопрос «Доверять новому ключу?»; `needs_setup` — подсказка «раздел n → h». После
 решения команда повторяется.
-
-Если скрипты на ноде отсутствуют, устарели или повреждены, `telegram menu`
-отвечает `confirmation_required` с планом «На ноду «N» (IP:порт) будут загружены
-скрипты vX.». Экран показывает план и после подтверждения повторяет команду с
-`--yes --plan-token`: скрипты загружаются, затем открывается меню.
 
 **Добавление ноды.** Вопросы по порядку: название (по умолчанию `vps-1`), IP,
 SSH-порт (22), логин (`root`), способ входа («SSH-ключ» или «Пароль»), пароль
@@ -1348,21 +1346,15 @@ C`). После команды (в том числе при `partial`) пока�
 
 | Клавиша | Действие | Команда |
 |---|---|---|
-| `o` | Управление одной нодой | `telegram menu --name N` |
-| `s` | Общий статус нод | `telegram status --all` |
-| `i` | Включить MTProto Proxy | `telegram install --name N…` |
-| `p` | Обновить IP-адрес MTProto | `telegram refresh-ip --name N…` |
-| `w` | Обновить Web Proxy | `telegram web-update --name N…` |
-| `r` | Перезапустить Web Proxy | `telegram web-restart --name N…` |
-| `b` | Перезапустить службу MTProxy | `telegram backend-restart --name N…` |
-| `d` | Отключить способ доступа (Web Proxy или MTProto Proxy) | `telegram remove --component web\|mtproto --name N…` |
-| `x` | Отключить Telegram Proxy полностью | `telegram remove-all --name N…` |
+| номер | Карточка ноды с ролью | `node list` |
+| `s` | Статус всех нод с ролью | `telegram status` |
+| `a` | Включить на ноде с профилем без роли | `telegram set --name N --domain D`, затем `node apply --name N` |
 
-Пакетные действия выбирают ноды мультивыбором без предварительных отметок и
-выполняются через подтверждение плана; после ответа показывается таблица
-«нода  статус  причина» по `results` (в том числе при `not_installed` и
-`partial`). Если скрипты на ноде для `o` нужно обновить, предлагается отдельная
-подтверждённая загрузка (см. [Ноды](#ноды-n)).
+Карточка ноды: `l` — ссылка (`telegram link`), `d` — диагностика, `m` — сменить
+домен, `k` — сменить секрет (с планом), `g` — спонсорский тег (скрытый ввод,
+секрет `password`), `u` — убрать тег, `r` — перезапустить, `x` — убрать роль (с
+планом). После изменения роли сразу запускается `node apply --name N`; его план —
+единственный вопрос.
 
 ### Источник конфигурации (`i`)
 
@@ -1421,9 +1413,9 @@ Bash-версии) и вопрос «Заменить их конфигурац�
 | Восстановление GitHub | `source github-migrate-format`, `source github-replace-with-local [--provision-keys yes\|no]` |
 | Сводка | `status`, `subscription list`, `group list`, `node list` |
 | Ноды | `node list`, `status`; `node add --name N --ip IP --port P --user U --auth key\|password --tag T --accept-new-host-key` / `--replace-host-key SHA256:…` / `--defer-ssh-setup`; `node setup-ssh [--provision-keys yes\|no] [--on-failure defer]` |
-| Карточка ноды | `node show`, `node shell`, `telegram menu`, `node check`, `node harden [--port P]`, `node rename`, `node tag`, `node password`, `node aliases [--set …] [--unset …]`, `node warp-reregister`, `node delete --scope … [--revoke-key]`, `node trust-host-key --host-key SHA256:…` |
+| Карточка ноды | `node show`, `node shell`, `node check`, `node harden [--port P]`, `node rename`, `node tag`, `node password`, `node aliases [--set …] [--unset …]`, `node warp-reregister`, `node delete --scope … [--revoke-key]`, `node trust-host-key --host-key SHA256:…` |
 | Подключения | `conn sync [--name N]`, `conn list [--name N]`, `group list`, `conn set --name N --assign G=P…`, `node check` |
-| Telegram Proxy | `node list`, `telegram menu --name N`, `telegram status --all`, `telegram install\|refresh-ip\|web-update\|web-restart\|backend-restart\|remove-all --name N…`, `telegram remove --component web\|mtproto --name N…` |
+| Telegram Proxy | `node list`, `telegram status`, `telegram set\|remove\|link\|rotate-secret\|tag\|restart\|diagnostics --name N`, `node apply --name N` |
 | Клиенты | `client list`, `group list`, `client add`, `client delete --name C…`, `client show`, `client awg-config --name C --node N`, `generate --client C`, `node list`, `client nodes --node N…` / `--inherit`, `client connections [--node N --proxy P… \| --reset]`, `conn list --name N --discover`, `client set-group`, `client rename` |
 | Подписка клиента | `subscription host`, `subscription publish --name C [--ttl T]`, `subscription show`, `subscription headers --client C [--set … \| --unset …]`, `subscription rotate`, `subscription revoke` |
 | Группы | `group list`, `template list`, `group add --name G [--template T]`, `node list`, `conn list --name N --discover`, `conn set --name N --assign G=P…`, `group set-template`, `template create --group G`, `subscription headers --group G [--set … \| --unset …]`, `generate --group G`, `group delete` |
@@ -1661,7 +1653,7 @@ Proxy панель рисует сама, без `qrencode`.
 | Группы | Таблица групп (у группы без нод вместо списка нод — «Добавить подключения»); страница группы: шаблон, ноды, клиенты группы, генерация, заголовки подписки; «Подключения нод…» — выбор ноды (единственная выбирается сама), найденные на ней подключения (`conn list --name N --discover`, назначенные группе отмечены) → `conn set --name N --assign G=P…` (без отметок назначение снимается) |
 | Шаблоны | Таблица шаблонов (встроенный, пользовательский, изменённый встроенный); редактор шаблона |
 | Подписки | Хост подписок (нода, домен, порт, базовый URL или «не задан»), таблица опубликованных подписок; «Обновить все подписки», «Хост подписок…» (`subscription host --name N --domain D [--port P]`, затем `node apply`), «Убрать хост» (`subscription host --remove` с планом) и «Заголовки группы» |
-| Telegram Proxy | Ноды с ролью Telegram Web Proxy из `node list` (домен, тег, состояние применения); «Проверить статус» — `telegram status` с таблицей и сводкой; «Включить на ноде» — нода с профилем без роли и домен одной формой → `telegram set`; у ноды — «Ссылка» (`telegram link`, копирование и QR), «Сменить домен», «Сменить секрет» и «Убрать» (по плану ядра), «Спонсорский тег» (скрытое поле, 32 hex, секрет `password`) и «Убрать тег» (`--clear`), «Перезапустить», «Диагностика» (журнал команды в окне операции); после включения, домена, секрета, тега и удаления — предложение `node apply --name N` |
+| Telegram Proxy | Ноды с ролью Telegram Web Proxy из `node list` (домен, тег, состояние применения); «Проверить статус» — `telegram status` с таблицей и сводкой; «Включить на ноде» — нода с профилем без роли и домен одной формой → `telegram set`; у ноды — «Ссылка» (`telegram link`, копирование и QR), «Сменить домен», «Сменить секрет» и «Убрать» (по плану ядра), «Спонсорский тег» (скрытое поле, 32 hex, секрет `password`) и «Убрать тег» (`--clear`), «Перезапустить», «Диагностика» (журнал команды в окне операции); после включения, домена, секрета, тега и удаления сразу `node apply --name N` (план ядра — единственный вопрос) |
 | Источник | Локальная конфигурация или GitHub: синхронизация, смена аккаунта, пароли и ключи, опасные действия |
 | Настройки | Версия и обновление, пароль запуска, оформление, блок «Демон» (`daemon status`), удаление remote-control |
 | Журнал | Сообщения команд и итоги операций текущей вкладки с фильтром «Все / Ошибки / Предупреждения», копированием и очисткой |
@@ -1736,47 +1728,33 @@ Proxy панель рисует сама, без `qrencode`.
 
 ## Telegram Proxy на нодах
 
-`telegram menu --name N` открывает серверное меню Telegram Proxy одной ноды по
-SSH с терминалом (ссылки, смена секрета, спонсорский тег, диагностика); без
-терминала команда отвечает `tty_required`. Сначала выполняется read-only проверка
-ноды: SSH, ключ сервера, версия скриптов. Если скриптов нет, они старше
-встроенного комплекта или повреждены, загрузка идёт только по плану «На ноду «N»
-(IP:порт) будут загружены скрипты vX.» (в токен входят id и адрес ноды, VERSION и
-SHA-256 комплекта): без
-`--yes` ответ — `confirmation_required`, с `--yes --plan-token` скрипты
-загружаются, версия на ноде сверяется, и открывается меню. Меню TUI и веб-панель
-показывают план и повторяют команду после подтверждения.
+Telegram Web Proxy — роль ноды с профилем (этап 5): `telegram set --name N
+--domain D` включает её (новый случайный секрет) или меняет домен; домен роли не
+совпадает с доменом ноды, её хоста подписок и Web Proxy других нод. Роль ставит и
+снимает `node apply`: RC рендерит `mtproxy.env`, `firewall.nft`, `config.json` и
+`profiles.json` tproxy-server и сайт nginx для домена роли, исполнитель
+(`node-agent/steps/telegram.sh`) собирает MTProxy и tproxy-server закреплённой
+ревизии (Go 1.20+ с ноды или закреплённой версии) и запускает службы. Сбой
+первой активации выключает службы при откате; снятая роль снимает службы и
+файлы. Хук отката возвращает код своих команд: его сбой даёт `rollback_failed`.
 
-Пакетные команды `telegram status|install|refresh-ip|web-update|web-restart|backend-restart|remove|remove-all`
-принимают `--name N…` или `--all` и проходят три фазы:
+Секрет и спонсорский тег не покидают хранилище секретов иначе как файлом
+`/etc/mtproxy/mtproxy.env` (0640, группа `mtproxy`) в составе `node apply`.
+`telegram link` выводит ссылку `tg://webproxy?server=D&port=443&secret=…`;
+меню и веб-панель не пишут её в журнал. `telegram remove` и
+`telegram rotate-secret` идут по плану; план строится заново под блокировкой
+мутации, и роль, изменённая после подтверждения, даёт `plan_changed`.
 
-1. **Read-only preflight** всех выбранных нод (параллельно): SSH-параметры, пароль
-   и пины из одного снимка конфигурации, проверка версии скриптов. Отсутствующие
-   или более старые скрипты отмечаются для загрузки; недоступная, повреждённая или
-   неизвестная установка исключается с причиной, остальные ноды продолжают работу.
-2. **Один план** для всех нод (кроме `status`): действие и пояснение, каждая нода
-   с адресом, пометкой «будут загружены скрипты vX» или причиной исключения. В
-   токен входят SHA-256 встроенного комплекта скриптов и его `VERSION`. Без `--yes`
-   ноды не меняются. План установки напоминает: «В межсетевом экране провайдера
-   разрешите TCP/2398 и запретите TCP/8888.».
-3. **Исполнители** работают на замороженном снимке preflight (уже
-   аутентифицированные соединения), не перечитывают конфигурацию и ничего не
-   спрашивают; одновременно — не больше четырёх нод. Загрузка скриптов, если она
-   есть в плане, выполняется перед действием и проверяется повторной пробой.
-   Установка и удаления передают серверу `--force`: согласием служит план.
-
-`telegram status` только читает: без плана и без загрузок; нода с устаревшими
-скриптами исключается с подсказкой. Статус отдельно показывает состояние на ноде
-и внешнюю доступность (HTTPS Web Proxy по IPv4/IPv6, TCP MTProto), проверяемую с
-вашего компьютера; неполные проверки помечаются «не проверено». Серверный текст
-маскируется до попадания в журнал и данные; пакетные команды не печатают ссылки и
-секреты.
-
-Результаты по нодам — `results`: `{node, code, status, reason}`, где `status` —
-`ok`, `not_installed`, `partial` или `error`. Итог: любая строка `error` →
-`remote_failed` (код выхода 1); иначе `partial` → код 4; иначе `not_installed`
-(хотя бы на части нод) → код 3; иначе успех. Приоритет `1 > 4 > 3 > 0`.
-Автоматического повтора нет.
+`telegram status [--name N… | --all]` только читает (по умолчанию — все ноды с
+ролью, не больше четырёх одновременно): состояние служб, готовность relay, срок
+сертификата домена и внешняя доступность HTTPS Web Proxy по IPv4/IPv6 с вашего
+компьютера; непроверенное помечается «не проверено», серверный текст
+маскируется. Результаты — `results`: `{node, hostname, code, status, reason,
+summary}`, где `status` — `ok`, `not_installed`, `partial` или `error`. Итог:
+любая строка `error` → `remote_failed` (код выхода 1); иначе `partial` → код 4;
+иначе `not_installed` → код 3; иначе успех. `telegram restart` и
+`telegram diagnostics` (журналы служб за 30 минут и метрики, маскированные)
+работают с одной нодой.
 
 ## Концепции
 
@@ -1788,8 +1766,7 @@ SHA-256 комплекта): без
 зашифрованный AES-256-GCM ключом устройства (`secret.key`). Ключи серверов
 закрепляются в `ssh/known-hosts.json` по `[host]:port`. Выбор ноды открывает её
 карточку; SSH-сессия запускается действием «Меню сервера» (`node shell`) —
-интерактивная login-оболочка на ноде. Загрузка серверных скриптов по плану с
-подтверждением относится только к `telegram menu`.
+интерактивная login-оболочка на ноде.
 
 Переименование ноды (`node rename`) обновляет ссылки в подключениях, клиентах и
 хостинге подписок. Удаление (`node delete`) предлагает объём: только локальная

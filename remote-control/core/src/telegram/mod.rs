@@ -164,16 +164,47 @@ fn set(session: &mut Session, invocation: &Invocation) -> Result<Value> {
     Ok(view(&proxy))
 }
 
-/// `telegram remove --name N`: drop the role and its secrets.
+/// The plan of `telegram remove`: the role's node and domain.
+fn remove_plan(config: &Config, name: &str) -> Result<Plan> {
+    let (node, proxy) = role(config, name)?;
+    Ok(Plan::new(vec![
+        format!("Telegram Proxy на ноде «{name}» ({}) будет убран; его службы и файлы удалит node apply.", proxy.hostname),
+        "Ссылки подключения перестанут работать.".to_owned(),
+    ], format!("{}\n{}", node.id, proxy.hostname)))
+}
+
+/// The plan of `telegram rotate-secret`: the role's node and its current
+/// secret (by mark — a concurrent rotation changes the plan).
+fn rotate_plan(config: &Config, name: &str) -> Result<Plan> {
+    let (node, proxy) = role(config, name)?;
+    Ok(Plan::new(vec![format!("Секрет Telegram Proxy ноды «{name}» будет заменён: прежние ссылки перестанут работать.")],
+        format!("{}\n{}", node.id, proxy.secret_mark)))
+}
+
+/// The confirmed plan against `config` (under the lock): the same plan →
+/// `Ok`, a different one → `plan_changed` with it; no plan at all (the role
+/// or the node gone) → `plan_changed` with the cause in its message.
+fn planned(config: &Config, name: &str, planned: &Plan, build: fn(&Config, &str) -> Result<Plan>, invocation: &Invocation) -> Result<()> {
+    match build(config, name) {
+        Ok(plan) if plan.lines == planned.lines && plan.extra == planned.extra => Ok(()),
+        Ok(plan) => Err(plan.changed(invocation)),
+        Err(cause) => {
+            let mut error = planned.changed(invocation);
+            error.message = format!("{} {}", error.message, cause.message);
+            Err(error)
+        }
+    }
+}
+
+/// `telegram remove --name N`: drop the role and its secrets; the plan is
+/// re-checked under the lock.
 fn remove(session: &mut Session, invocation: &Invocation) -> Result<Value> {
     let name = required(invocation, "name")?.to_owned();
-    let hostname = role(&session.state.load_config()?, &name)?.1.hostname.clone();
-    Plan::new(vec![
-        format!("Telegram Proxy на ноде «{name}» ({hostname}) будет убран; его службы и файлы удалит node apply."),
-        "Ссылки подключения перестанут работать.".to_owned(),
-    ], "").confirm(invocation)?;
+    let plan = remove_plan(&session.state.load_config()?, &name)?;
+    plan.confirm(invocation)?;
     session.mutate("telegram remove", |state| {
         let mut config = state.load_config()?;
+        planned(&config, &name, &plan, remove_plan, invocation)?;
         let node = role(&config, &name)?.0.clone();
         config.telegram.retain(|proxy| proxy.node != node.name);
         state.save_config(&config)?;
@@ -195,13 +226,15 @@ fn link(session: &mut Session, invocation: &Invocation) -> Result<Value> {
 }
 
 /// `telegram rotate-secret --name N`: a new secret; old links stop working.
+/// The plan is re-checked under the lock.
 fn rotate_secret(session: &mut Session, invocation: &Invocation) -> Result<Value> {
     let name = required(invocation, "name")?.to_owned();
-    role(&session.state.load_config()?, &name)?;
-    Plan::new(vec!["Секрет будет заменён: прежние ссылки перестанут работать.".to_owned()], "").confirm(invocation)?;
+    let plan = rotate_plan(&session.state.load_config()?, &name)?;
+    plan.confirm(invocation)?;
     let mark = mark()?;
     session.mutate("telegram rotate-secret", |state| {
         let mut config = state.load_config()?;
+        planned(&config, &name, &plan, rotate_plan, invocation)?;
         let node = role(&config, &name)?.0.clone();
         state.secret_store().set(&secret_id(&node), Zeroizing::new(crate::github::random_hex(16)))?;
         if let Some(proxy) = config.telegram.iter_mut().find(|proxy| proxy.node == node.name) {
