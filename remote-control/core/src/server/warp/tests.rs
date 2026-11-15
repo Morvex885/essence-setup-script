@@ -56,11 +56,13 @@ fn bash(dir: &std::path::Path, script: &str, env: &[(&str, &str)]) -> std::proce
 fn the_license_reaches_wgcf_update_only_through_the_account_file() {
     use std::os::unix::fs::PermissionsExt;
     let block = script_part("if [[ -n \"$key\" ]]; then\n", "rm -f wgcf-profile.conf\n");
-    let script = format!("set -u\numask 077\nkey='KEY-1'\nplus=false\n{block}printf '%s' \"$plus\"\n");
+    let script = format!("set -u\numask 077\nkey='KEY-1'\nplus=false\nrestore() {{ echo restore-called >&2; }}\n{block}printf '%s' \"$plus\"\n");
     let account = "access_token = 'a'\nlicense_key = 'OLD'\nprivate_key = 'p'\n";
-    // The fake wgcf fails when the key is in its argv or environment.
+    // The fake wgcf fails when the key is in its argv or environment;
+    // `FAKE_BREAK` puts a directory where the copy was, so moving it back fails.
     let fake = "#!/bin/sh\n[ \"$*\" = update ] || exit 2\nenv | grep -q KEY-1 && exit 3\n\
         [ \"$(grep -c license_key wgcf-account.toml)\" = 1 ] && grep -qx \"license_key = 'KEY-1'\" wgcf-account.toml || exit 4\n\
+        [ -n \"${FAKE_BREAK:-}\" ] && { rm -f wgcf-account.toml.prev; mkdir wgcf-account.toml.prev; }\n\
         exit \"${FAKE_EXIT:-0}\"\n";
     for (exit, plus) in [("0", "true"), ("1", "false")] {
         let dir = tempfile::tempdir().unwrap();
@@ -80,6 +82,17 @@ fn the_license_reaches_wgcf_update_only_through_the_account_file() {
         let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|entry| entry.unwrap().file_name()).collect();
         assert_eq!(names.len(), 2, "{names:?}");
     }
+    // Moving the previous file back fails: the copy stays, the script fails.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("wgcf"), fake).unwrap();
+    std::fs::set_permissions(dir.path().join("wgcf"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(dir.path().join("wgcf-account.toml"), account).unwrap();
+    let output = bash(dir.path(), &script, &[("FAKE_EXIT", "1"), ("FAKE_BREAK", "1")]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success() && output.stdout.is_empty(), "{output:?}");
+    assert!(stderr.contains("Прежний файл аккаунта WARP не восстановлен: копия сохранена в ")
+        && stderr.contains("/wgcf-account.toml.prev") && stderr.contains("restore-called"), "{stderr}");
+    assert!(dir.path().join("wgcf-account.toml.prev").exists());
 }
 
 #[cfg(unix)]
@@ -156,8 +169,21 @@ fn the_reregister_plan_is_bound_to_the_node_and_its_warp_key() {
         assert_eq!(other.lines, plan.lines);
         assert_ne!(other.extra, plan.extra);
     }
+    // Under the lock: the same plan passes, any other — or none — is `plan_changed`.
+    let invocation = crate::nodes::testing::invocation(&["node", "warp-reregister", "--name", "de", "--yes"]);
+    assert!(reregister_planned(&config, "de", &plan, &invocation).is_ok());
+    let mut moved = config.clone();
+    moved.nodes[0].port = 2222;
+    let error = reregister_planned(&moved, "de", &plan, &invocation).unwrap_err();
+    assert_eq!((error.code, error.extra["plan"].clone()), ("plan_changed", serde_json::json!(plan.lines)));
+    let mut gone = config.clone();
+    gone.nodes.clear();
+    assert_eq!(reregister_planned(&gone, "de", &plan, &invocation).unwrap_err().code, "plan_changed");
     config.profiles[0].warp = false;
     assert_eq!(reregister_plan(&config, "de").unwrap_err().code, "invalid");
+    let error = reregister_planned(&config, "de", &plan, &invocation).unwrap_err();
+    assert_eq!(error.code, "plan_changed");
+    assert!(error.message.ends_with("У профиля ноды «de» WARP выключен."), "{}", error.message);
 }
 
 #[test]

@@ -789,7 +789,13 @@ pub async fn apply<T: RemoteTransport>(session: &mut Session, invocation: &Invoc
         }
         let Some(reregister) = node.profile.as_deref().and_then(|name| config.find_profile(name))
             .and_then(|profile| super::warp::registration(profile, &node)) else { continue };
-        match super::warp::register(session, &node, &item.transport, reregister).await {
+        // Under the saving lock the node still renders as confirmed.
+        let confirmed = item.digest.clone();
+        let recheck = |current: &Config| match current.nodes.iter().find(|candidate| candidate.id == node.id) {
+            Some(now) if render::desired(current, now, None).is_ok_and(|desired| desired.digest == confirmed) => Ok(()),
+            _ => Err(plan.changed(invocation)),
+        };
+        match super::warp::register(session, &node, &item.transport, reregister, &recheck).await {
             Ok(()) => {
                 let current = session.state.load_config()?;
                 item.digest = registered_digest(&config, &current, &node.id).ok_or_else(|| plan.changed(invocation))?;

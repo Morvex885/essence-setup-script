@@ -233,13 +233,14 @@ fn delete_plan(config: &Config, name: &str) -> Result<(Plan, Cascade)> {
                 group_connections(&after, group, entry).join(", "))
         });
     }
-    for client in &config.clients {
+    // `deleted` keeps the clients in order: `remaining` is `client` after the deletion.
+    for (client, remaining) in config.clients.iter().zip(&after.clients) {
         if client.connections.iter().flatten().any(|c| c.node == entry && c.proxies.contains(&cascade.name)) {
             lines.push(format!("Клиент «{}»: подключение «{name}» на ноде «{entry}» будет снято.", client.name));
         }
         if effective_connections(config, client, entry).contains(&cascade.name)
-            && on_node(&after, client, entry)
-            && effective_connections(&after, client, entry).is_empty()
+            && on_node(&after, remaining, entry)
+            && effective_connections(&after, remaining, entry).is_empty()
         {
             lines.push(format!("Клиент «{}» останется без выбранных подключений на ноде «{entry}» и получит все её подключения.",
                 client.name));

@@ -141,10 +141,27 @@ fn params(query: &str, error: UriError) -> Result<Vec<(&str, String)>, UriError>
 /// `vless://uuid@server:port?params#fragment` → exit YAML for its transport
 /// (`tcp` by default, `xhttp`, `grpc`).
 pub fn parse_vless_uri(name: &str, uri: &str) -> Result<ExitProxy, UriError> {
+    parse_vless(name, uri, false)
+}
+
+/// The port as rendered: an exit link's (already checked) port in canonical
+/// decimal — YAML reads `00443` as octal 291; the v1 parser keeps it as is.
+fn port(raw: &str, exit: bool) -> std::borrow::Cow<'_, str> {
+    match raw.parse::<u16>() {
+        Ok(port) if exit => port.to_string().into(),
+        _ => raw.into(),
+    }
+}
+
+/// [`parse_vless_uri`]; for an `exit` link the TCP flow defaults to
+/// `xtls-rprx-vision` only with REALITY (`security=reality`, or no
+/// `security` with a `pbk`): a TLS server without flow rejects it. The v1
+/// parser (Bash parity) always defaults it.
+fn parse_vless(name: &str, uri: &str, exit: bool) -> Result<ExitProxy, UriError> {
     let parts = split(uri.strip_prefix("vless://").unwrap_or(uri));
     let uuid = decode_value(parts.userinfo, &UriError::VlessPercent)?;
     let (mut sni, mut public_key, mut short_id, mut flow) = (String::new(), String::new(), String::new(), String::new());
-    let (mut fingerprint, mut transport) = ("chrome".to_owned(), "tcp".to_owned());
+    let (mut fingerprint, mut transport, mut security) = ("chrome".to_owned(), "tcp".to_owned(), String::new());
     let (mut path, mut mode, mut service) = (String::new(), "auto".to_owned(), String::new());
     for (key, value) in params(parts.params, UriError::VlessPercent)? {
         let slot = match key {
@@ -154,6 +171,7 @@ pub fn parse_vless_uri(name: &str, uri: &str) -> Result<ExitProxy, UriError> {
             "flow" => &mut flow,
             "fp" => &mut fingerprint,
             "type" => &mut transport,
+            "security" => &mut security,
             "path" => &mut path,
             "mode" => &mut mode,
             "serviceName" => &mut service,
@@ -162,18 +180,21 @@ pub fn parse_vless_uri(name: &str, uri: &str) -> Result<ExitProxy, UriError> {
         *slot = value;
     }
     let sni = if sni.is_empty() { parts.server } else { &sni };
+    let port = port(parts.port, exit);
     let vless = Vless {
         name,
         server: parts.server,
-        port: parts.port,
+        port: &port,
         uuid: &uuid,
         sni,
         public_key: &public_key,
         short_id: &short_id,
     };
-    let note = format!("VLESS {transport}: {}:{} (SNI: {sni})", parts.server, parts.port);
+    let reality = security == "reality" || (security.is_empty() && !public_key.is_empty());
+    let default_flow = if exit && !reality { "" } else { vless_tcp::FLOW };
+    let note = format!("VLESS {transport}: {}:{port} (SNI: {sni})", parts.server);
     let yaml = match transport.as_str() {
-        "tcp" => vless_tcp::exit_yaml(&vless, super::or(&flow, vless_tcp::FLOW), &fingerprint),
+        "tcp" => vless_tcp::exit_yaml(&vless, super::or(&flow, default_flow), &fingerprint),
         "xhttp" => vless_xhttp::exit_yaml(&vless, super::or(&path, "/"), &mode),
         "grpc" => vless_grpc::exit_yaml(&vless, super::or(&service, "grpc"), &fingerprint),
         _ => return Err(UriError::UnknownTransport { transport, note }),
@@ -184,6 +205,10 @@ pub fn parse_vless_uri(name: &str, uri: &str) -> Result<ExitProxy, UriError> {
 /// `hysteria2://` / `hy2://pass@server:port?params` → exit YAML. Only
 /// `insecure=1` disables certificate verification.
 pub fn parse_hy2_uri(name: &str, uri: &str) -> Result<ExitProxy, UriError> {
+    parse_hy2(name, uri, false)
+}
+
+fn parse_hy2(name: &str, uri: &str, exit: bool) -> Result<ExitProxy, UriError> {
     let uri = uri.strip_prefix("hysteria2://").unwrap_or(uri);
     let parts = split(uri.strip_prefix("hy2://").unwrap_or(uri));
     let password = percent_decode(parts.userinfo)
@@ -198,16 +223,17 @@ pub fn parse_hy2_uri(name: &str, uri: &str) -> Result<ExitProxy, UriError> {
             _ => {}
         }
     }
+    let port = port(parts.port, exit);
     let yaml = hy2::exit_yaml(&Hy2 {
         name,
         server: parts.server,
-        port: parts.port,
+        port: &port,
         password: password.trim_end_matches('\n'),
         sni: &sni,
         skip_cert_verify: insecure == "1",
         obfs_password: &obfs_password,
     });
-    let mut notes = vec![format!("Hysteria2: {}:{}", parts.server, parts.port)];
+    let mut notes = vec![format!("Hysteria2: {}:{port}", parts.server)];
     if !obfs_password.is_empty() {
         notes.push("Obfs: salamander".to_owned());
     }
@@ -216,12 +242,16 @@ pub fn parse_hy2_uri(name: &str, uri: &str) -> Result<ExitProxy, UriError> {
 
 /// First line of `input` (one trailing CR dropped) parsed by its scheme.
 pub fn parse_proxy_uri(name: &str, input: &str) -> Result<ExitProxy, UriError> {
+    parse_line(name, input, false)
+}
+
+fn parse_line(name: &str, input: &str, exit: bool) -> Result<ExitProxy, UriError> {
     let line = input.split('\n').next().unwrap_or_default();
     let line = line.strip_suffix('\r').unwrap_or(line);
     if line.starts_with("vless://") {
-        parse_vless_uri(name, line)
+        parse_vless(name, line, exit)
     } else if line.starts_with("hysteria2://") || line.starts_with("hy2://") {
-        parse_hy2_uri(name, line)
+        parse_hy2(name, line, exit)
     } else {
         Err(UriError::UnknownScheme)
     }
@@ -230,7 +260,8 @@ pub fn parse_proxy_uri(name: &str, input: &str) -> Result<ExitProxy, UriError> {
 /// A cascade exit link: [`parse_proxy_uri`] after a strict check of every
 /// field it renders (the v1 parser above keeps Bash parity and accepts more).
 /// The empty path `/` after the authority (`hy2://p@h:443/?sni=s`, as the
-/// Hysteria2 URI scheme writes it) is dropped first.
+/// Hysteria2 URI scheme writes it) is dropped first; the port is rendered in
+/// canonical decimal; the VLESS TCP flow defaults only with REALITY.
 /// Server — a host name or IP; port — 1–65535; VLESS — a UUID, `security`
 /// `reality` or `tls` (the exit always speaks TLS), `flow`/`fp`/`mode` as
 /// lower-case words, `pbk` as base64, `sid` as hex, `sni` as a host name,
@@ -240,7 +271,7 @@ pub fn parse_exit_uri(name: &str, input: &str) -> Result<ExitProxy, UriError> {
     let line = input.split('\n').next().unwrap_or_default();
     let line = strip_root_path(line.strip_suffix('\r').unwrap_or(line));
     check_exit_fields(&line)?;
-    parse_proxy_uri(name, &line)
+    parse_line(name, &line, true)
 }
 
 /// `scheme://authority/?query#fragment` without the empty path `/`; any other
@@ -393,5 +424,27 @@ mod tests {
         for security in ["reality", "tls"] {
             assert!(parse_exit_uri("x", &format!("vless://{uuid}@h.example:443?security={security}")).is_ok());
         }
+    }
+
+    #[test]
+    fn exit_link_ports_are_canonical_decimal() {
+        let uuid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let parsed = parse_exit_uri("x", &format!("vless://{uuid}@h.example:00443?security=reality&pbk=k")).unwrap();
+        assert!(parsed.yaml.contains("    port: 443\n") && parsed.notes[0].contains("h.example:443 "), "{parsed:?}");
+        let parsed = parse_exit_uri("x", "hy2://p@h.example:00443/?sni=h.example").unwrap();
+        assert!(parsed.yaml.contains("    port: 443\n"), "{}", parsed.yaml);
+        // The v1 parser keeps Bash parity.
+        assert!(parse_hy2_uri("x", "hy2://p@h:00443").unwrap().yaml.contains("    port: 00443\n"));
+    }
+
+    #[test]
+    fn exit_link_tcp_flow_defaults_only_with_reality() {
+        let uuid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let yaml = |query: &str| parse_exit_uri("x", &format!("vless://{uuid}@h.example:443/?{query}")).unwrap().yaml;
+        assert!(!yaml("security=tls&type=tcp").contains("    flow:"));
+        assert!(yaml("security=tls&type=tcp&flow=xtls-rprx-vision").contains("    flow: xtls-rprx-vision\n"));
+        assert!(yaml("security=reality&pbk=k&type=tcp").contains("    flow: xtls-rprx-vision\n"));
+        assert!(yaml("pbk=k").contains("    flow: xtls-rprx-vision\n"));
+        assert!(parse_vless_uri("x", "vless://u@h:443?security=tls&type=tcp").unwrap().yaml.contains("    flow: xtls-rprx-vision\n"));
     }
 }

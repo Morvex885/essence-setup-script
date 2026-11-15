@@ -214,3 +214,24 @@ fn delete_of_the_last_selected_connection_unassigns_the_group_and_names_wider_ac
     assert!(!on_node(&config, &config.clients[0], &de.name));
     assert!(on_node(&config, &config.clients[1], &de.name));
 }
+
+#[test]
+fn delete_names_wider_access_of_a_client_whose_own_selection_was_the_cascade() {
+    let root = tempfile::tempdir().unwrap();
+    let mut session = setup(root.path());
+    run(&mut session, &with(&["--exit-node", "nl", "--exit-proxy", "VLESS TCP"]), None).unwrap();
+    let mut config = session.state.load_config().unwrap();
+    config.connections.clear();
+    config.clients = vec![Client {
+        name: "beta".into(), group: "PC".into(), inherit_nodes_from_group: false, nodes: Some(vec!["de".into()]),
+        connections: Some(vec![ClientConnection { node: "de".into(), proxies: vec!["hop".into()] }]),
+        ..Client::default()
+    }];
+    session.state.save_config(&config).unwrap();
+    let error = run(&mut session, &["cascade", "delete", "--name", "hop"], None).unwrap_err();
+    assert_eq!(error.extra["plan"], json!([
+        "Каскад «hop» будет удалён: вход — нода «de» (VLESS TCP), выход — нода «nl» (VLESS TCP).",
+        "Клиент «beta»: подключение «hop» на ноде «de» будет снято.",
+        "Клиент «beta» останется без выбранных подключений на ноде «de» и получит все её подключения.",
+    ]));
+}

@@ -119,15 +119,18 @@ plus=false
 # Also on an existing account (re-added node): `update` rebinds only a
 # different key. The key reaches wgcf through its account file (0600 under
 # umask 077; wgcf reads `license_key` from it), not argv or the environment;
-# a failed bind puts the previous file back.
+# a failed bind moves the previous file back (atomically, same directory),
+# and when even that fails the copy stays and the script fails.
 if [[ -n "$key" ]]; then
     if [[ "$key" =~ ^[A-Za-z0-9-]{1,64}$ ]] && cp -a wgcf-account.toml wgcf-account.toml.prev \
         && { printf "license_key = '%s'\n" "$key"; grep -v -E '^[[:space:]]*license_key[[:space:]]*=' wgcf-account.toml.prev || [[ $? -eq 1 ]]; } > wgcf-account.toml.new \
         && mv -f wgcf-account.toml.new wgcf-account.toml; then
         if ./wgcf update >&2; then
             plus=true
-        else
-            cp -a wgcf-account.toml.prev wgcf-account.toml
+        elif ! mv -f wgcf-account.toml.prev wgcf-account.toml; then
+            printf 'Прежний файл аккаунта WARP не восстановлен: копия сохранена в %s\n' "$PWD/wgcf-account.toml.prev" >&2
+            restore
+            exit 1
         fi
     fi
     rm -f wgcf-account.toml.prev wgcf-account.toml.new
@@ -226,8 +229,11 @@ pub fn warp_block(warp: &NodeWarp, private_key: &str) -> String {
 }
 
 /// Register (or recreate) the node's WARP account over a connected
-/// transport and keep its keys: secret `warp-key`, `params.warp`.
-pub async fn register<T: RemoteTransport>(session: &mut Session, node: &Node, transport: &T, reregister: bool) -> Result<()> {
+/// transport and keep its keys: secret `warp-key`, `params.warp`. `recheck`
+/// runs under the lock on the state the result is saved into.
+pub async fn register<T: RemoteTransport>(session: &mut Session, node: &Node, transport: &T, reregister: bool,
+    recheck: &(dyn Fn(&Config) -> Result<()> + Sync)) -> Result<()>
+{
     let config = session.state.load_config()?;
     let profile = node.profile.as_deref().and_then(|name| config.find_profile(name))
         .ok_or_else(|| RcError::new("invalid", format!("У ноды «{}» нет профиля.", node.name)))?;
@@ -258,7 +264,10 @@ pub async fn register<T: RemoteTransport>(session: &mut Session, node: &Node, tr
     // Only a key that was actually tried counts as an attempt.
     let attempt = profile.warp_plus.clone().filter(|_| license.is_some());
     let id = node.id.clone();
-    session.mutate("warp register", |state| store(state, &id, &registered, attempt))?;
+    session.mutate("warp register", |state| {
+        recheck(&state.load_config()?)?;
+        store(state, &id, &registered, attempt)
+    })?;
     session.log(Level::Success, &format!("{}: WARP {}", node.name, if registered.plus { "WARP+" } else { "бесплатный" }));
     Ok(())
 }
@@ -300,20 +309,32 @@ fn reregister_plan(config: &Config, name: &str) -> Result<(Plan, Node)> {
     Ok((plan, node))
 }
 
+/// The confirmed reregister plan against `config`: the same plan → `Ok`, a
+/// different one → `plan_changed` with it; no plan at all (WARP turned off,
+/// the node gone) → `plan_changed` with the cause in its message.
+fn reregister_planned(config: &Config, name: &str, planned: &Plan, invocation: &Invocation) -> Result<()> {
+    match reregister_plan(config, name) {
+        Ok((plan, _)) if plan.lines == planned.lines && plan.extra == planned.extra => Ok(()),
+        Ok((plan, _)) => Err(plan.changed(invocation)),
+        Err(cause) => {
+            let mut error = planned.changed(invocation);
+            error.message = format!("{} {}", error.message, cause.message);
+            Err(error)
+        }
+    }
+}
+
 /// `node warp-reregister --name N [--yes]`: a new account on the node. The
-/// plan is rebuilt right before the remote effect; the result is kept by the
-/// node's id (`store`), so it never lands on another node.
+/// plan is rebuilt right before the remote effect and again under the lock
+/// that saves the result.
 pub async fn reregister<T: RemoteTransport>(session: &mut Session, invocation: &Invocation, transport: &mut T) -> Result<Value> {
     let name = required(invocation, "name")?;
     let (plan, node) = reregister_plan(&session.state.load_config()?, name)?;
     plan.confirm(invocation)?;
     nodes::require_portable(session, &node)?;
     nodes::connect(transport, &session.state, &node).await?;
-    let (current, _) = reregister_plan(&session.state.load_config()?, name)?;
-    if current.lines != plan.lines || current.extra != plan.extra {
-        return Err(current.changed(invocation));
-    }
-    register(session, &node, &*transport, true).await?;
+    reregister_planned(&session.state.load_config()?, name, &plan, invocation)?;
+    register(session, &node, &*transport, true, &|config| reregister_planned(config, name, &plan, invocation)).await?;
     session.log(Level::Info, &format!("Примените изменения: node apply --name {name}"));
     Ok(json!({"name": name}))
 }
