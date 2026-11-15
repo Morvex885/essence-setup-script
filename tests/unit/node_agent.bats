@@ -600,6 +600,48 @@ SH
     ! grep -q "^wget" "$CALLS"
 }
 
+# add_site <имя> — файл сайта и ссылка sites-enabled в files.list.
+add_site() {
+    add_file "/etc/nginx/sites-available/$1" "# Essence site $1"
+    mkdir -p "$OPDIR/files/etc/nginx/sites-enabled"
+    printf '/etc/nginx/sites-available/%s' "$1" >"$OPDIR/files/etc/nginx/sites-enabled/$1"
+    printf 'link root root /etc/nginx/sites-enabled/%s\n' "$1" >>"$OPDIR/files.list"
+}
+
+@test "чужой сайт nginx с тем же именем не заменяется, свой обновляется" {
+    local av="$ROOT/etc/nginx/sites-available" en="$ROOT/etc/nginx/sites-enabled"
+    mkdir -p "$av" "$en"
+    printf 'server { shop }\n' >"$av/shop.example"
+    add_file /etc/mihomo/config.yaml "new"
+    add_site shop.example
+    run_agent
+    assert_failure
+    run status
+    assert_line "result=failed"
+    assert_line "error=config"
+    [[ "$(cat "$av/shop.example")" == "server { shop }" && ! -e "$en/shop.example" && ! -L "$en/shop.example" ]]
+    grep -qF "В /etc/nginx/sites-available/shop.example уже есть сайт nginx без отметки Essence" "$OPDIR/log"
+
+    # Ссылка sites-enabled не на наш сайт — тоже чужая.
+    printf '# Essence site shop.example\nold\n' >"$av/shop.example"
+    ln -s /etc/nginx/sites-available/other "$en/shop.example"
+    : >"$OPDIR/files.list"; rm -f "$OPDIR/status"
+    add_file /etc/mihomo/config.yaml "new"
+    add_site shop.example
+    run_agent
+    assert_failure
+    [[ "$(readlink "$en/shop.example")" == /etc/nginx/sites-available/other ]]
+
+    rm "$en/shop.example"
+    : >"$OPDIR/files.list"; rm -f "$OPDIR/status"
+    add_file /etc/mihomo/config.yaml "new"
+    add_site shop.example
+    run_agent
+    assert_success
+    [[ "$(cat "$av/shop.example")" == "# Essence site shop.example" ]]
+    [[ "$(readlink "$en/shop.example")" == /etc/nginx/sites-available/shop.example ]]
+}
+
 @test "откат возвращает правила UFW: удалённое добавляется, добавленное снимается" {
     # ufw с правилами в файле; delete отказывает только для UFW_DELETE_FAIL_RULE.
     stub ufw 'db="$(dirname "$CALLS")/ufw.db"; touch "$db"
@@ -896,6 +938,37 @@ exit 0'
     [[ "$output" == *"перезагрузите сервер"* ]]
 }
 
+@test "awg: из .sources уходит только строфа Amnezia, поля остальных не разделяются" {
+    local src="$ROOT/etc/apt/sources.list.d/mixed.sources"
+    mkdir -p "$(dirname "$src")"
+    printf '%s\n' 'Types: deb' 'URIs: https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu' 'Suites: noble' \
+        'Components: main' '' 'Types: deb' 'URIs: http://archive.ubuntu.com/ubuntu' 'Suites: noble noble-updates' \
+        'Components: main universe' >"$src"
+    awg_call 'AWG_TMP_BASE="$R"; _awg_repo_begin && _awg_remove_conflicting_sources && _awg_repo_commit'
+    assert_success
+    [[ "$(cat "$src")" == $'Types: deb\nURIs: http://archive.ubuntu.com/ubuntu\nSuites: noble noble-updates\nComponents: main universe' ]]
+}
+
+@test "awg: сигнал посреди транзакции PPA возвращает sources, после неё — прежний обработчик" {
+    local dir="$ROOT/etc/apt/sources.list.d"
+    mkdir -p "$dir"
+    printf 'old amnezia\n' >"$dir/amnezia.sources"
+    # Как в apply.sh: сигнал — exit 1, затем EXIT-обработчик.
+    awg_call 'AWG_TMP_BASE="$R"; trap "exit 1" HUP INT TERM; trap "echo finish" EXIT
+        _awg_repo_begin && _awg_prepare_repository_sources || exit 3
+        [[ ! -e "$R/etc/apt/sources.list.d/amnezia.sources" ]] || exit 4
+        kill -TERM $$; echo "не прервано"'
+    [[ "$status" -eq 1 ]]
+    [[ "$output" == finish ]]
+    [[ "$(cat "$dir/amnezia.sources")" == "old amnezia" ]]
+    [[ -z "$(find "$ROOT" -maxdepth 1 -name 'awg-repo.*')" ]]
+
+    awg_call 'AWG_TMP_BASE="$R"; trap "exit 1" HUP INT TERM
+        _awg_repo_begin && _awg_repo_commit && trap -p TERM'
+    assert_success
+    [[ "$output" == "trap -- 'exit 1' SIGTERM" ]]
+}
+
 @test "подсказка шага попадает в status вместе с ошибкой этапа" {
     printf 'awg_prepare() { HINT=kernel_headers; return 1; }\n' >"$AGENT/steps/zz-hint.sh"
     write_manifest
@@ -979,4 +1052,35 @@ exit 0'
     grep -qx "release sub.example" "$CALLS"
     ! grep -qx "release shop.example" "$CALLS" || return 1
     [[ ! -e "$ROOT/var/www/sub.example" && -d "$ROOT/var/www/shop.example" ]]
+}
+
+@test "essence-sub-cleanup: истёкшая ссылка снимается с YAML и сниппетом, запись срока остаётся" {
+    local sub="$ROOT/var/lib/essence-sub" snip="$ROOT/etc/nginx/snippets/essence-sub" script="$BATS_TEST_TMPDIR/cleanup"
+    local old new list
+    old=$(printf 'a%.0s' {1..64}) new=$(printf 'b%.0s' {1..64})
+    sed -e "s#{{sub_dir}}#$sub#" -e "s#^SNIP_DIR=.*#SNIP_DIR=$snip#" \
+        "$PROJECT_ROOT/remote-control/core/src/server/assets/essence-sub-cleanup.sh" >"$script"
+    stub flock 'exit 0'
+    mkdir -p "$sub" "$snip"
+    list=$(printf '%s 1\n%s 99999999999\nbad 1\n' "$old" "$new")
+    printf '%s\n' "$list" >"$sub/expiry.list"
+    touch "$sub/$old.yaml" "$snip/sub-$old.conf" "$sub/$new.yaml" "$snip/sub-$new.conf"
+    run bash "$script"
+    assert_success
+    [[ ! -e "$sub/$old.yaml" && ! -e "$snip/sub-$old.conf" && -e "$sub/$new.yaml" && -e "$snip/sub-$new.conf" ]]
+    [[ "$(cat "$sub/expiry.list")" == "$list" ]]
+    [[ "$(grep -c '^nginx -t$' "$CALLS")" -eq 1 && "$(grep -cx 'systemctl reload nginx' "$CALLS")" -eq 1 ]]
+
+    # Снимать нечего — nginx не трогается.
+    : >"$CALLS"
+    run bash "$script"
+    assert_success
+    ! grep -q nginx "$CALLS" || return 1
+
+    # Повторная публикация без нового срока снова снимается; сбой nginx — код 1.
+    touch "$sub/$old.yaml"
+    stub nginx 'exit 1'
+    run bash "$script"
+    assert_failure
+    [[ ! -e "$sub/$old.yaml" ]]
 }

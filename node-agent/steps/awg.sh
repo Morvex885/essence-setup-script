@@ -115,15 +115,33 @@ _awg_repo_rollback() {
     return "$failed"
 }
 
+# Сигнал посреди транзакции PPA: apply.sh превращает HUP/INT/TERM в `exit 1`,
+# а finish о транзакции не знает (до этапа config TX_OPEN=false). Пока она
+# открыта, обработчик сначала возвращает sources/keyring, затем выходит так же.
+AWG_REPO_SIGNALS=false
+
+_awg_repo_trap_signals() {
+    trap '_awg_repo_abort; exit 1' HUP INT TERM
+    AWG_REPO_SIGNALS=true
+}
+
+_awg_repo_release_signals() {
+    [[ "$AWG_REPO_SIGNALS" == true ]] || return 0
+    trap 'exit 1' HUP INT TERM
+    AWG_REPO_SIGNALS=false
+}
+
 _awg_repo_abort() {
     local tx_dir="${AWG_REPO_TX_DIR:-}"
     if ! _awg_repo_rollback; then
         warn "Откат sources/keyring выполнен не полностью. Резервные копии сохранены в $tx_dir"
         AWG_REPO_TX_DIR=""
+        _awg_repo_release_signals
         return 1
     fi
     [[ -n "$tx_dir" ]] && rm -rf -- "$tx_dir"
     AWG_REPO_TX_DIR=""
+    _awg_repo_release_signals
     return 0
 }
 
@@ -131,6 +149,7 @@ _awg_repo_abort() {
 _awg_repo_commit() {
     [[ -n "${AWG_REPO_TX_DIR:-}" ]] && rm -rf -- "$AWG_REPO_TX_DIR"
     AWG_REPO_TX_DIR=""
+    _awg_repo_release_signals
     return 0
 }
 
@@ -143,6 +162,7 @@ _awg_repo_begin() {
         umask "$old_umask"
         return 1
     }
+    _awg_repo_trap_signals
     : > "$AWG_REPO_TX_DIR/manifest" || {
         umask "$old_umask"
         _awg_repo_abort
@@ -188,8 +208,11 @@ _awg_render_deb822_source() {
                     else lines[i]="URIs: " kept
                 }
             }
+            # Поля строфы — по строке; пустая строка (ORS) только после строфы.
             if (!drop) {
-                for (i=1; i<=count; i++) print lines[i]
+                stanza=lines[1]
+                for (i=2; i<=count; i++) stanza=stanza "\n" lines[i]
+                print stanza
             }
         }
     ' "$source_file"
