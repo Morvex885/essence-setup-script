@@ -270,6 +270,29 @@ async fn host_sets_shows_and_removes_the_record_without_connecting() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn removing_the_host_rechecks_the_plan_under_the_lock() {
+    let root = tempfile::tempdir().unwrap();
+    let (session, _) = fixture(root.path(), "https://old.example");
+    let remove = invocation(&["subscription", "host", "--remove", "--yes"]);
+    let (planned, _) = commands::remove_host_plan(&config(&session)).unwrap();
+    // Another request moved the host to `new` after the confirmation.
+    let mut moved = config(&session);
+    moved.subscription_host = Some(SubscriptionHost {
+        node: "new".into(), hostname: "sub.example.com".into(), port: 443, base_url: "https://sub.example.com".into(),
+        sub_dir: SUB_DIR.into(), nginx_group: "www-data".into(),
+    });
+    session.state.save_config(&moved).unwrap();
+    let before = fingerprint(root.path());
+    let error = commands::remove_host_planned(&session.state, &planned, &remove).unwrap_err();
+    assert_eq!(error.code, "plan_changed");
+    assert_eq!(error.extra["plan"][0], "Хост подписок https://sub.example.com на ноде «new» будет убран; его файлы удалит node apply.");
+    assert_eq!(fingerprint(root.path()), before);
+    let (current, _) = commands::remove_host_plan(&config(&session)).unwrap();
+    commands::remove_host_planned(&session.state, &current, &remove).unwrap();
+    assert!(config(&session).subscription_host.is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn list_hides_links_and_show_exposes_them() {
     let root = tempfile::tempdir().unwrap();
     let (mut session, _) = fixture(root.path(), "https://old.example");
@@ -369,14 +392,31 @@ async fn publish_uploads_then_saves_token_ttl_and_verifies_the_link() {
     assert!(journal.borrow().iter().all(|(_, line)| !line.contains(&token)));
     assert_eq!(saved.subscription_default_headers, Some(Vec::new()));
 
-    // Republishing without a TTL keeps the token, expiry and creation time.
+    // Republishing without a TTL keeps the token, expiry and creation time; the
+    // saved expiry goes to the host's list as well.
     let mut steps = vec![connect_step(1)];
     steps.extend(upload_steps(OLD_DIR, 1, 0));
+    steps.push(exec_ok(remote::expiry_command(OLD_DIR), 76, ""));
     let hosts = Hosts::new(vec![steps]);
     let data = run(&mut session, &hosts, &["subscription", "publish", "--name", "beta"]).await.unwrap();
     hosts.finish(&[&token]);
     assert_eq!(client(&config(&session), "beta").subscription.as_ref().unwrap(), &subscription);
     assert_eq!(data["expires_at"], json!(subscription.expires_at));
+
+    // An expired subscription is not uploaded again without a new TTL.
+    session.mutate("t", |state| {
+        let mut config = state.load_config()?;
+        let beta = config.clients.iter_mut().find(|client| client.name == "beta").unwrap();
+        beta.subscription.as_mut().unwrap().expires_at = Some("2020-01-01T00:00:00Z".into());
+        state.save_config(&config)
+    }).unwrap();
+    let before = fingerprint(root.path());
+    let none = Hosts::new(vec![]);
+    let error = run(&mut session, &none, &["subscription", "publish", "--name", "beta"]).await.unwrap_err();
+    none.finish(&[]);
+    assert_eq!((error.code, error.message.as_str()),
+        ("invalid", "Срок подписки «beta» истёк: опубликуйте её с новым сроком (--ttl, например 30d)."));
+    assert_eq!(fingerprint(root.path()), before);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -642,6 +682,8 @@ async fn publish_all_plans_orphans_and_reports_partial_sweep() {
     // Published, but the planned sweep fails.
     let mut steps = plan_steps();
     steps.extend(upload_steps(OLD_DIR, 2, 0));
+    // The saved expiry of alpha goes to the host's list (a moved host has none).
+    steps.push(exec_ok(remote::expiry_command(OLD_DIR), 76, ""));
     steps.push(exec_status(remote::prune_command(OLD_DIR), 65, "0 1\n", 1));
     let hosts = Hosts::new(vec![steps]);
     let error = run(&mut session, &hosts, &["subscription", "publish-all", "--yes"]).await.unwrap_err();
@@ -654,6 +696,17 @@ async fn publish_all_plans_orphans_and_reports_partial_sweep() {
     assert!(subscription_token_valid(beta.token.as_deref().unwrap()) && beta.expires_at.is_none());
     assert!(journal.borrow().iter().any(|(level, line)| *level == Level::Success && line == "Опубликовано: 2"));
     assert_eq!(client(&config(&session), "alpha").subscription.as_ref().unwrap().token.as_deref(), Some(alpha.as_str()));
+
+    // The expiry list cannot be written: partial before the success report and the sweep.
+    let mut steps = plan_steps();
+    steps.extend(upload_steps(OLD_DIR, 2, 0));
+    steps.push(exec_status(remote::expiry_command(OLD_DIR), 76, "", 1));
+    let hosts = Hosts::new(vec![steps]);
+    let error = run(&mut session, &hosts, &["subscription", "publish-all", "--yes"]).await.unwrap_err();
+    hosts.finish(&[&alpha, &orphan, beta.token.as_deref().unwrap()]);
+    assert_eq!(error.code, "partial");
+    assert!(error.message.starts_with("Подписки опубликованы, но сроки действия на хост-ноде не записаны"));
+    assert_eq!((error.extra["published"].clone(), error.extra["removed"].clone()), (json!(["alpha", "beta"]), json!(0)));
 }
 
 #[tokio::test(flavor = "current_thread")]

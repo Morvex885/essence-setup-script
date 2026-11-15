@@ -147,7 +147,7 @@ Cargo workspace `remote-control/` (edition 2024):
 
 | Путь | Назначение | Зависит от |
 |---|---|---|
-| `remote-control/core` (`rc-core`) | Ядро без вопросов пользователю: модель и локальное состояние, блокировки, секреты, каталог команд и справка (`cli.rs`), диспетчер `dispatch`, подтверждение планом, SSH-транспорт (russh), источник GitHub, домены `nodes`, `clients`, `subscription`, `awg`, `telegram`, самоуправление `self` | — |
+| `remote-control/core` (`rc-core`) | Ядро без вопросов пользователю: модель и локальное состояние, блокировки, секреты, каталог команд и справка (`cli.rs`), диспетчер `dispatch`, подтверждение планом, SSH-транспорт (russh), источник GitHub, домены `nodes`, `clients`, `subscription`, `server` (профили, `node apply`, AmneziaWG, WARP, каскады), `telegram`, самоуправление `self` | — |
 | `remote-control/client` (`essence-rc-client`) | Типы протокола v3, `Client`, `DaemonClient` (локальный сокет и WebSocket), `ScriptedClient`, точка подключения, запуск демона | — (`essence-rc-web` только для тестов) |
 | `remote-control/web` (`essence-rc-web`) | HTTP/TLS/WebSocket-слушатель и вшитые ассеты веб-панели | — |
 | `remote-control/tui` (`essence-rc-tui`) | Библиотека экранов терминального меню (ratatui); с ядром общается только по протоколу через `client` | `client` |
@@ -555,9 +555,9 @@ essence-rc client --help       # команды одной сущности (т�
   задаются повторением флага (`--name a --name b`); повтор одиночного флага —
   `usage` («Флаг --name указан дважды.»). Неизвестная сущность или флаг, лишний
   аргумент, `--`, значение с переводом строки или NUL — `usage`. Объект команды
-  везде выбирается флагом `--name` (у `conn`, `awg`, `telegram`,
-  `subscription host|migrate` — нода, у `subscription show|publish|rotate|revoke` —
-  клиент); связи задают `--node`, `--group`, `--client`.
+  везде выбирается флагом `--name` (у `conn`, `telegram`, `subscription host` —
+  нода, у `subscription show|publish|rotate|revoke` и `client awg-config` —
+  клиент, у `cascade delete` — каскад); связи задают `--node`, `--group`, `--client`.
 - **Глобальные флаги** допустимы в любом месте и у любой команды: `--json`,
   `--yes`, `--plan-token T` (только вместе с `--yes`), `--secrets-stdin`,
   `--help`/`-h`. Значение флага (`--name -h`) справкой не считается.
@@ -726,6 +726,7 @@ GitHub и пароль доступа; при недоступной сети �
 | `node domain --name N --domain D` | Домен ноды для сайта-заглушки и сертификата (пустой D — убрать) |
 | `node port --name N --protocol vless-xhttp\|vless-grpc\|hysteria2\|amneziawg --port P` | Порт протокола на ноде вместо порта профиля (пустой P — как в профиле) |
 | `node apply (--name N… \| --profile P \| --pending) [--yes]` | Применить профиль и роли на нодах |
+| `node warp-reregister --name N [--yes]` | Перерегистрировать аккаунт WARP ноды |
 | `node harden --name N [--port P] [--yes]` | Усилить защиту SSH: ключ, отключение пароля, новый порт (без --port — детерминированный свободный порт из плана) |
 | `node setup-ssh [--provision-keys yes\|no] [--on-failure rollback\|defer] [--yes]` | Завершить отложенную SSH-настройку нод (GitHub) |
 | `node shell --name N` | Открыть оболочку на ноде по SSH (нужен терминал) |
@@ -749,13 +750,17 @@ GitHub и пароль доступа; при недоступной сети �
 | `conn set --name N --assign G=P…` | Задать подключения групп на ноде: --assign на каждое подключение (G= — снять назначение; другие группы не меняются) |
 | `conn sync [--name N]` | Убрать назначения подключений, которых профили нод больше не дают |
 
-### AmneziaWG (`awg`)
+### Каскады (`cascade`)
 
 | Команда | Описание |
 |---|---|
-| `awg status --name N` | Клиенты AmneziaWG на ноде |
-| `awg sync --name N` | Создать недостающих клиентов AmneziaWG |
-| `awg remove --name N (--peer P… \| --orphans) [--yes]` | Удалить клиентов AmneziaWG |
+| `cascade list` | Каскады |
+| `cascade add --name C --entry N --listener vless-tcp\|vless-xhttp\|vless-grpc\|hysteria2 (--exit-node M --exit-proxy P \| --file PATH)` | Добавить каскад: клиенты входной ноды выходят через другую ноду или внешний сервер (файл с URI vless://, hysteria2://) |
+| `cascade delete --name C [--yes]` | Удалить каскад и снять его назначения |
+
+AmneziaWG отдельной сущности не имеет: протокол включается в профиле
+(`profile add|set --amneziawg on`), пиры клиентов на ноде записывает `node apply`,
+родной конфиг клиента выдаёт `client awg-config` (см. [Клиенты AmneziaWG](#клиенты-amneziawg)).
 
 ### Telegram Proxy (`telegram`)
 
@@ -780,7 +785,8 @@ GitHub и пароль доступа; при недоступной сети �
 | `client config --name C` | Содержимое готового конфига клиента (с секретами) |
 | `client connections --name C [--node N (--proxy P… \| --reset [--yes])]` | Подключения клиента |
 | `client add --name C --group G` | Добавить клиента |
-| `client rename --name C --new-name D [--yes]` | Переименовать клиента |
+| `client rename --name C --new-name D` | Переименовать клиента |
+| `client awg-config --name C --node N` | Родной конфиг AmneziaWG клиента на ноде (с секретами) |
 | `client nodes --name C (--inherit [--yes] \| --node N…)` | Ноды клиента |
 | `client set-group --name C --group G [--yes]` | Сменить группу клиента |
 | `client delete --name C… [--yes]` | Удалить клиентов |
@@ -929,7 +935,7 @@ MetaCubeX meta-json-schema встроена в бинарник, `remote-control
 
 | Команда | Описание |
 |---|---|
-| `subscription host [--name N]` | Хост-нода подписок (с --name — задать) |
+| `subscription host [--name N --domain D [--port P] \| --remove [--yes]]` | Хост подписок: без флагов — показать; --name — задать ноду и домен (порт 443 по умолчанию), затем node apply |
 | `subscription list` | Список подписок |
 | `subscription show --name C` | Ссылка и заголовки подписки |
 | `subscription headers (--client C \| --group G \| --default) [--set NAME=VALUE…] [--unset NAME…]` | Заголовки подписки |
@@ -937,7 +943,6 @@ MetaCubeX meta-json-schema встроена в бинарник, `remote-control
 | `subscription publish-all [--yes]` | Опубликовать все готовые подписки и удалить с хоста подписки без клиента |
 | `subscription rotate --name C [--yes]` | Перевыпустить ссылку |
 | `subscription revoke --name C [--yes]` | Отозвать подписку |
-| `subscription migrate --name N [--yes]` | Перенести подписки на другую ноду |
 
 Проверки имён и секретов клиентов:
 
@@ -1077,9 +1082,9 @@ MetaCubeX meta-json-schema встроена в бинарник, `remote-control
 **CYAN** — переход и просмотр, **GREEN** — создание, **YELLOW** — изменение,
 **RED** — удаление и отзыв; названия пунктов и навигационный `0` — без окраски.
 Разделы корневого меню группируются по смыслу цветом главного действия раздела:
-создание сущностей (Ноды, Клиенты, Группы, Шаблоны) — GREEN, операции над
-конфигурацией и обслуживание (Подключения, Генерация конфигов, Подписки,
-Настройки) — YELLOW, просмотр и инфраструктура (AmneziaWG, Telegram Proxy,
+создание сущностей (Ноды, Профили нод, Каскады, Клиенты, Группы, Шаблоны) — GREEN,
+операции над конфигурацией и обслуживание (Подключения, Генерация конфигов,
+Подписки, Настройки) — YELLOW, просмотр и инфраструктура (Telegram Proxy,
 Источник конфигурации) — CYAN.
 
 **Ctrl+C и сигналы.** В меню Ctrl+C (клавиша или SIGINT ОС) закрывает соединение
@@ -1320,23 +1325,24 @@ C`). После команды (в том числе при `partial`) пока�
 
 ### Подписки (`s`)
 
-Хост-нода и базовый URL (`subscription host`). `h` — выбрать хост-ноду
-(`subscription host --name N`; исправимые ошибки ноды предлагается решить на
-месте), `l` — список подписок (`subscription list`: клиент, срок, «действует»,
+Хост подписок и базовый URL (`subscription host`). `h` — задать хост: нода с
+профилем, домен и порт (Enter — 443) → `subscription host --name N --domain D
+[--port P]`, затем предлагается `node apply` на новой и прежней хост-ноде; `x` —
+убрать хост (`subscription host --remove` с планом, затем `node apply` на прежней
+ноде); `l` — список подписок (`subscription list`: клиент, срок, «действует»,
 «истекла», «без срока», «срок неизвестен»), `u` — обновить все подписки
-(`subscription publish-all` с планом, затем «Итог публикации подписок»), `m` —
-перенос на другую ноду (`subscription migrate --name N` с планом), `c` — подписка
-клиента, `g` — заголовки группы. Если опубликованных подписок нет, перенос
-сообщает об этом и не меняет хост.
+(`subscription publish-all` с планом, затем «Итог публикации подписок»), `c` —
+подписка клиента, `g` — заголовки группы. После смены хоста ссылки
+восстанавливает `u` (после `node apply`).
 
-### AmneziaWG (`a`)
+### Каскады (`k`)
 
-Список нод → экран ноды (`awg status --name N`): используемые клиенты,
-неиспользуемые («не используется») и ещё не созданные («не создан»); если
-AmneziaWG не установлен — пояснение. `r` — обновить; при установленном AmneziaWG:
-`c` — создать недостающих (`awg sync --name N`), `d` — удалить клиента
-(`awg remove --name N --peer P`), `x` — удалить неиспользуемых
-(`awg remove --name N --orphans`) — оба с планом и подтверждением.
+Список каскадов (`cascade list`: имя, входная нода и её подключение → выход).
+`a` — добавить: имя → входная нода с профилем → её подключение-листенер → выход
+(другая нода с профилем и её подключение или URI внешнего сервера, вводимый
+скрыто и передаваемый входными данными `file`) → `cascade add`; `d` — удалить
+(`cascade delete --name C` с планом). После изменения предлагается `node apply`
+на входной ноде и ноде выхода.
 
 ### Telegram Proxy (`t`)
 
@@ -1415,11 +1421,10 @@ Bash-версии) и вопрос «Заменить их конфигурац�
 | Восстановление GitHub | `source github-migrate-format`, `source github-replace-with-local [--provision-keys yes\|no]` |
 | Сводка | `status`, `subscription list`, `group list`, `node list` |
 | Ноды | `node list`, `status`; `node add --name N --ip IP --port P --user U --auth key\|password --tag T --accept-new-host-key` / `--replace-host-key SHA256:…` / `--defer-ssh-setup`; `node setup-ssh [--provision-keys yes\|no] [--on-failure defer]` |
-| Карточка ноды | `node show`, `node shell`, `telegram menu`, `node check`, `node harden [--port P]`, `node rename`, `node tag`, `node password`, `node aliases [--set …] [--unset …]`, `node delete --scope … [--revoke-key]`, `node trust-host-key --host-key SHA256:…` |
+| Карточка ноды | `node show`, `node shell`, `telegram menu`, `node check`, `node harden [--port P]`, `node rename`, `node tag`, `node password`, `node aliases [--set …] [--unset …]`, `node warp-reregister`, `node delete --scope … [--revoke-key]`, `node trust-host-key --host-key SHA256:…` |
 | Подключения | `conn sync [--name N]`, `conn list [--name N]`, `group list`, `conn set --name N --assign G=P…`, `node check` |
-| AmneziaWG | `node list`, `awg status`, `awg sync`, `awg remove --peer P` / `--orphans` |
 | Telegram Proxy | `node list`, `telegram menu --name N`, `telegram status --all`, `telegram install\|refresh-ip\|web-update\|web-restart\|backend-restart\|remove-all --name N…`, `telegram remove --component web\|mtproto --name N…` |
-| Клиенты | `client list`, `group list`, `client add`, `client delete --name C…`, `client show`, `generate --client C`, `node list`, `client nodes --node N…` / `--inherit`, `client connections [--node N --proxy P… \| --reset]`, `conn list --name N --discover`, `client set-group`, `client rename` |
+| Клиенты | `client list`, `group list`, `client add`, `client delete --name C…`, `client show`, `client awg-config --name C --node N`, `generate --client C`, `node list`, `client nodes --node N…` / `--inherit`, `client connections [--node N --proxy P… \| --reset]`, `conn list --name N --discover`, `client set-group`, `client rename` |
 | Подписка клиента | `subscription host`, `subscription publish --name C [--ttl T]`, `subscription show`, `subscription headers --client C [--set … \| --unset …]`, `subscription rotate`, `subscription revoke` |
 | Группы | `group list`, `template list`, `group add --name G [--template T]`, `node list`, `conn list --name N --discover`, `conn set --name N --assign G=P…`, `group set-template`, `template create --group G`, `subscription headers --group G [--set … \| --unset …]`, `generate --group G`, `group delete` |
 | Шаблоны | `template list`, `template create`, `template show` (и экспорт), `template import --name T` (+`input.file`), `template check --name T`, `group list`, `template groups --name T --group G…`, `template delete --name T` |
@@ -1638,24 +1643,24 @@ unit-файл на Linux без systemd), — `failed`, и ничего не у�
 
 ### Экраны
 
-Меню панели слева: Сводка, Ноды, Клиенты, Группы, Шаблоны, Подписки, Telegram
-Proxy, затем Источник, Настройки и Журнал. Действия — те же команды, планы и
+Меню панели слева: Сводка, Ноды, Профили нод, Каскады, Клиенты, Группы, Шаблоны,
+Подписки, Telegram Proxy, затем Источник, Настройки и Журнал. Действия — те же команды, планы и
 коды решений, что в меню; вместо цепочки вопросов значения собираются одной
 формой, опасные действия по-прежнему подтверждаются планом ядра. `node shell`
 и `telegram menu` открываются терминалом в браузере (xterm). QR-код подписки
 панель рисует сама, без `qrencode`.
 
-Адрес экрана — `#/раздел/объект/вкладка`, например `#/nodes/vps-1/awg`;
+Адрес экрана — `#/раздел/объект/вкладка`, например `#/nodes/vps-1/connections`;
 неизвестный раздел ведёт на сводку, исчезнувший объект — к списку раздела.
 
 | Раздел | Что на экране |
 |---|---|
 | Сводка | Счётчики нод, клиентов, групп и подписок; «Требует внимания» (нет пароля SSH, отложенная SSH-настройка, не задан хост подписок, рассинхронизация GitHub, обновление, открытая панель, группа без нод — по `group list`; предупреждение о конфигах без подключений — только при клиентах, наследующих ноды группы (`client list`, `inherit_nodes`), клиенты со своими нодами не считаются; нода, чьи подключения не назначены ни одной группе — по `group list` и `node list`, со ссылкой на вкладку «Подключения» ноды); «Добавить ноду», «Добавить клиента», «Сгенерировать конфиги» |
-| Ноды | Таблица нод с состоянием; «Синхронизировать все» — `conn sync` по всем нодам и `conn list`, ниже — обзор «Подключения по группам» (назначено группе / найдено на ноде, недоступные ноды отмечены), как экран меню «Подключения»; страница ноды с вкладками «Обзор», «Подключения» (`conn sync --name`/`conn list --name`; назначение группам — форма с полем на каждое подключение, текущие группы отмечены, снятая отметка снимает назначение; одна `conn set --name N --assign G=P …` только для изменённых групп (без изменений команды нет); назначенные, но не найденные на ноде подключения показаны с отметкой «не найдено на ноде», их можно снять и при недоступной ноде; псевдонимы), «AmneziaWG» (`awg status\|sync\|remove`), «Обслуживание» (проверка, загрузка скриптов, усиление SSH, Telegram Proxy ноды, удаление) |
-| Клиенты | Таблица с отметками для удаления нескольких («Выбрать все» при поиске отмечает только найденные строки); страница клиента с вкладками «Обзор», «Доступ» (ноды и подключения по нодам; удалённая нода отмечена), «Подписка» (публикация, ссылка, заголовки, токен; нечитаемый хост подписок — «не удалось прочитать») |
+| Ноды | Таблица нод с состоянием; «Синхронизировать все» — `conn sync` по всем нодам и `conn list`, ниже — обзор «Подключения по группам» (назначено группе / найдено на ноде, недоступные ноды отмечены), как экран меню «Подключения»; страница ноды с вкладками «Обзор», «Подключения» (`conn sync --name`/`conn list --name`; назначение группам — форма с полем на каждое подключение, текущие группы отмечены, снятая отметка снимает назначение; одна `conn set --name N --assign G=P …` только для изменённых групп (без изменений команды нет); назначенные, но не найденные на ноде подключения показаны с отметкой «не найдено на ноде», их можно снять и при недоступной ноде; псевдонимы), «Обслуживание» (проверка, загрузка скриптов, усиление SSH, Telegram Proxy ноды, удаление); при включённом в профиле WARP — действие «Перерегистрировать WARP» (`node warp-reregister` с планом) |
+| Клиенты | Таблица с отметками для удаления нескольких («Выбрать все» при поиске отмечает только найденные строки); страница клиента с вкладками «Обзор», «Доступ» (ноды и подключения по нодам; удалённая нода отмечена), «Подписка» (публикация, ссылка, заголовки, токен; нечитаемый хост подписок — «не удалось прочитать»); действие «Конфиг AmneziaWG» — выбор ноды и `client awg-config --name C --node N` |
 | Группы | Таблица групп (у группы без нод вместо списка нод — «Добавить подключения»); страница группы: шаблон, ноды, клиенты группы, генерация, заголовки подписки; «Подключения нод…» — выбор ноды (единственная выбирается сама), найденные на ней подключения (`conn list --name N --discover`, назначенные группе отмечены) → `conn set --name N --assign G=P…` (без отметок назначение снимается) |
 | Шаблоны | Таблица шаблонов (встроенный, пользовательский, изменённый встроенный); редактор шаблона |
-| Подписки | Хост-нода и базовый URL (или «не задана»), таблица опубликованных подписок; «Обновить все подписки», «Хост-нода…», «Заголовки группы» и перенос на другую ноду доступны и без хоста — сбой объясняет ядро |
+| Подписки | Хост подписок (нода, домен, порт, базовый URL или «не задан»), таблица опубликованных подписок; «Обновить все подписки», «Хост подписок…» (`subscription host --name N --domain D [--port P]`, затем `node apply`), «Убрать хост» (`subscription host --remove` с планом) и «Заголовки группы» |
 | Telegram Proxy | Статус нод загружается кнопкой (опрос по SSH) и перечитывается после пакетного действия; пакетные действия по выбранным нодам |
 | Источник | Локальная конфигурация или GitHub: синхронизация, смена аккаунта, пароли и ключи, опасные действия |
 | Настройки | Версия и обновление, пароль запуска, оформление, блок «Демон» (`daemon status`), удаление remote-control |
@@ -1844,13 +1849,22 @@ de-vps
 
 ### Клиенты AmneziaWG
 
-Команды `awg` (раздел **a** меню):
+AmneziaWG — протокол профиля ноды: `profile add|set --amneziawg on
+[--amneziawg-port P] [--amneziawg-dns DNS]`, порт отдельной ноды —
+`node port --name N --protocol amneziawg --port P`. Отдельных команд управления
+пирами нет: серверный `awg0.conf` строится из локальной конфигурации и
+записывается на ноду `node apply`.
 
-- `awg status --name N` — по ноде: установлен ли AmneziaWG и список клиентов (используемые `used`, неиспользуемые `orphan`, отсутствующие `missing`) относительно ожидаемого набора;
-- `awg sync --name N` — создать недостающих клиентов одной пакетной операцией;
-- `awg remove --name N (--peer P… | --orphans)` — удалить клиентов (с планом и подтверждением).
-
-Ожидаемый набор определяется клиентами, которым на ноде назначено подключение AmneziaWG. Клиентов создаёт и удаляет серверный модуль `amneziawg.sh`; локальная конфигурация не меняется.
+- Пир на ноде получает клиент, назначенный на ноду, если его подключения там
+  (собственные, иначе группы) включают AmneziaWG; клиент без подключений на ноде
+  использует все её подключения, как и для остальных листенеров.
+- У клиента один ключ на все ноды; адрес — из его `awg_index` в `10.10.0.0/16`,
+  поэтому на серверах нет собственного состояния.
+- Изменение клиентов, групп, подключений или профиля оставляет ноду в состоянии
+  «ожидает применения»; пиры обновляются следующим `node apply`.
+- Родной конфиг клиента для приложения AmneziaWG —
+  `client awg-config --name C --node N` (с секретами; в меню и веб-панели —
+  «Конфиг AmneziaWG» на странице клиента).
 
 ### Шаблоны
 
@@ -1934,28 +1948,29 @@ tun:
 
 | Команда | Действие |
 |---|---|
-| `subscription host [--name N]` | Показать или назначить хост-ноду с установленным серверным модулем подписок; читаются технические `base_url`, `sub_dir`, `nginx_group` |
-| `subscription publish --name C [--ttl 30d]` | Создать токен, загрузить YAML и сниппет nginx, проверить ссылку по HTTP |
+| `subscription host [--name N --domain D [--port P] \| --remove [--yes]]` | Без флагов — показать хост (`node`, `hostname`, `port`, `base_url`, `sub_dir`, `nginx_group`); `--name N --domain D [--port P]` — сделать ноду с профилем хостом подписок на домене D (порт 443 по умолчанию; 80 и служебные порты заняты), файлы хоста ставит `node apply`; `--remove` — убрать хост по плану |
+| `subscription publish --name C [--ttl 30d]` | Создать токен, загрузить YAML и сниппет nginx, проверить ссылку по HTTP; без `--ttl` сохраняется прежний срок (истёкший — `invalid`, нужен новый `--ttl`) |
 | `subscription publish-all [--yes]` | Пакетно обновить подписки и удалить осиротевшие файлы (по плану с подтверждением) |
 | `subscription show --name C` | URL, срок действия и итоговые HTTP-заголовки |
 | `subscription list` | Клиенты, сроки и состояния (`active`, `expired`, `unlimited`, `unknown`); токены скрыты |
 | `subscription rotate --name C [--yes]` | Создать новый токен и удалить старую ссылку |
 | `subscription revoke --name C [--yes]` | Удалить файлы с хоста, токен и срок из `config.json`; заголовки клиента сохраняются |
-| `subscription migrate --name N [--yes]` | Перенести все подписки на другую ноду |
 | `subscription headers (--client C \| --group G \| --default) [--set NAME=VALUE…] [--unset NAME…]` | Просмотр и изменение HTTP-заголовков |
 
-Смена токена, отзыв, перенос и пакетная публикация — с планом и подтверждением
-(`--yes --plan-token`). Токен (64 строчных hex) сохраняется локально только после
+Смена токена, отзыв, снятие хоста и пакетная публикация — с планом и
+подтверждением (`--yes --plan-token`). Токен (64 строчных hex) сохраняется локально только после
 загрузки; на сервер он передаётся только через stdin. TTL — `12h`, `30d`, `2w` и
 вообще 1–6 цифр без ведущего нуля с единицей `h`, `d` или `w`; сроки хранятся на
-хосте в `expiry.list`.
+хосте в `expiry.list`: `publish` и `publish-all` записывают туда сохранённый срок
+каждого опубликованного токена.
 
-Если хост уже задан и существуют опубликованные токены, `subscription host --name N`
-не разрешает выбрать другую ноду: ответ `conflict` направляет в
-`subscription migrate --name N`, конфигурация и публикации не меняются. Начальное
-назначение хоста, повторное назначение той же ноды и смена хоста без опубликованных
-токенов допустимы. Перенос удаляет старые ссылки только после загрузки всех
-подписок на новую ноду.
+Хост подписок — роль ноды. `subscription host --name N --domain D [--port P]`
+меняет хост и при опубликованных токенах: токены сохраняются, ответ напоминает
+применить новую и прежнюю ноду (`node apply`), после чего
+`subscription publish-all` загружает подписки на новый хост вместе со сроками,
+а прежняя нода снимает файлы хоста при своём `node apply`. Адреса ссылок меняются,
+если меняется `base_url`. `subscription host --remove` перепроверяет план под
+блокировкой: если хост успел смениться — `plan_changed`.
 
 ### Наследование заголовков
 

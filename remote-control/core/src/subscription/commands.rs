@@ -97,6 +97,28 @@ async fn verify(data: Value) -> Result<Value> {
 
 // ─── host / list / show ──────────────────────────────────────────────────────
 
+/// The plan of `subscription host --remove`: the record and how many links stop.
+pub(super) fn remove_host_plan(config: &Config) -> Result<(Plan, SubscriptionHost)> {
+    let old = config.subscription_host.clone().ok_or_else(not_configured)?;
+    let published = config.clients.iter().filter(|client| has_token(client)).count();
+    let mut lines = vec![format!("Хост подписок {} на ноде «{}» будет убран; его файлы удалит node apply.", old.base_url, old.node)];
+    if published > 0 {
+        lines.push(format!("Опубликованные ссылки ({published}) перестанут открываться до нового хоста и subscription publish-all."));
+    }
+    Ok((Plan::new(lines, ""), old))
+}
+
+/// Under the mutation lock: a host changed since the agreed plan is `plan_changed`.
+pub(super) fn remove_host_planned(state: &crate::state::State, planned: &Plan, invocation: &Invocation) -> Result<()> {
+    let mut config = state.load_config()?;
+    let (plan, _) = remove_host_plan(&config)?;
+    if plan.lines != planned.lines {
+        return Err(plan.changed(invocation));
+    }
+    config.subscription_host = None;
+    state.save_config(&config)
+}
+
 /// `subscription host`: without flags the configured host; `--name N
 /// --domain D [--port P]` makes the node the host (rendered by `node apply`);
 /// `--remove` drops the record. Tokens stay: after moving the host,
@@ -107,18 +129,9 @@ pub(super) fn host(session: &mut Session, invocation: &Invocation) -> Result<Val
         if invocation.has("name") || invocation.has("domain") || invocation.has("port") {
             return Err(RcError::new("usage", "--remove используется без --name, --domain и --port."));
         }
-        let old = config.subscription_host.clone().ok_or_else(not_configured)?;
-        let published = config.clients.iter().filter(|client| has_token(client)).count();
-        let mut lines = vec![format!("Хост подписок {} на ноде «{}» будет убран; его файлы удалит node apply.", old.base_url, old.node)];
-        if published > 0 {
-            lines.push(format!("Опубликованные ссылки ({published}) перестанут открываться до нового хоста и subscription publish-all."));
-        }
-        Plan::new(lines, "").confirm(invocation)?;
-        session.mutate("subscription_remove_host", |state| {
-            let mut config = state.load_config()?;
-            config.subscription_host = None;
-            state.save_config(&config)
-        })?;
+        let (plan, old) = remove_host_plan(&config)?;
+        plan.confirm(invocation)?;
+        session.mutate("subscription_remove_host", |state| remove_host_planned(state, &plan, invocation))?;
         session.log(Level::Success, "Хост подписок убран");
         apply_hint(session, &[&old.node]);
         return Ok(Value::Null);
@@ -329,10 +342,18 @@ pub(super) async fn publish_client<T: RemoteTransport>(session: &mut Session, na
         })?),
         None => None,
     };
+    let existing = client_token(client)?;
+    // The saved expiry of an existing token: without a new TTL it stays and goes
+    // to the host's list too (a moved host has none); an expired one needs a TTL.
+    let saved_expiry = existing.as_ref().and_then(|_| client.subscription.as_ref())
+        .and_then(|s| s.expires_at.as_deref()).and_then(parse_iso);
+    if expiry.is_none() && saved_expiry.is_some_and(|epoch| epoch <= now()) {
+        return Err(RcError::new("invalid", format!(
+            "Срок подписки «{name}» истёк: опубликуйте её с новым сроком (--ttl, например 30d).")).with_extra("name", name));
+    }
     let yaml = rendered(session, client)?
         .ok_or_else(|| not_generated(name, &format!("Конфиг для «{name}» не найден или пуст.")))?;
     host_node(&config)?;
-    let existing = client_token(client)?;
     let token = existing.clone().unwrap_or_else(new_token);
     let headers = check_headers(&config, client)?;
 
@@ -343,8 +364,12 @@ pub(super) async fn publish_client<T: RemoteTransport>(session: &mut Session, na
         return Err(RcError::new("remote_failed", "Ошибка загрузки файла на сервер."));
     }
     // The host's expiry list gets the same instant as expires_at.
-    if let Some(expiry) = expiry {
-        if !remote::write_expiry(&host.transport, &host.sub_dir, &[(token.clone(), Some(expiry))]).await {
+    if let Some(epoch) = expiry.or(saved_expiry) {
+        if !remote::write_expiry(&host.transport, &host.sub_dir, &[(token.clone(), Some(epoch))]).await {
+            if expiry.is_none() {
+                return Err(RcError::new("remote_failed", "Конфиг подписки обновлён на хост-ноде, но сохранённый срок \
+                    записать не удалось: ссылка может остаться доступной после срока. Повторите публикацию."));
+            }
             if existing.is_some() {
                 return Err(RcError::new("remote_failed",
                     "Конфиг подписки обновлён на хост-ноде, но новый срок записать не удалось; действует прежний срок."));
@@ -499,6 +524,8 @@ struct Target {
     yaml: Vec<u8>,
     headers: Vec<SubscriptionHeader>,
     token: Option<String>,
+    /// The saved expiry of an existing token (epoch), carried to the host's list.
+    expires: Option<i64>,
 }
 
 fn summary(published: &[String], skipped: &[String], failed: &[String], removed: u64) -> Value {
@@ -522,7 +549,9 @@ pub(super) async fn publish_all<T: RemoteTransport>(session: &mut Session, invoc
             None => skipped.push(client.name.clone()),
             Some(yaml) => {
                 let headers = check_headers(&config, client)?;
-                targets.push(Target { name: client.name.clone(), yaml, headers, token });
+                let expires = token.as_ref().and_then(|_| client.subscription.as_ref())
+                    .and_then(|s| s.expires_at.as_deref()).and_then(parse_iso);
+                targets.push(Target { name: client.name.clone(), yaml, headers, token, expires });
             }
         }
     }
@@ -600,6 +629,14 @@ pub(super) async fn publish_all<T: RemoteTransport>(session: &mut Session, invoc
             return Err(with_data(RcError::new("failed", "Файлы загружены пакетно, но новые токены сохранить не удалось. \
                 Дальнейшие записи и очистка старых файлов остановлены."), &summary(&ok, &skipped, &failed, 0)));
         }
+    }
+    // A moved host has no expiry entries yet: the saved expiries go to its list.
+    let expiries: Vec<(String, Option<i64>)> = targets.iter().zip(&tokens)
+        .filter_map(|(target, token)| target.expires.map(|epoch| (token.clone(), Some(epoch.max(0))))).collect();
+    if !expiries.is_empty() && !remote::write_expiry(&host.transport, &host.sub_dir, &expiries).await {
+        return Err(with_data(RcError::new("partial", "Подписки опубликованы, но сроки действия на хост-ноде не записаны: \
+            ссылки с истёкшим сроком останутся доступными. Повторите subscription publish-all."),
+            &summary(&published, &skipped, &[], 0)));
     }
     for name in &published {
         session.log(Level::Success, &format!("{name}: опубликовано"));

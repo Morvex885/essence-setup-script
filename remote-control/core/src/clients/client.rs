@@ -213,6 +213,21 @@ fn rename_plan(state: &crate::state::State, config: &Config, old: &str, new: &st
     Ok(RenamePlan { old_dir, new_dir })
 }
 
+/// The step under the mutation lock: the plan and its paths come from the state
+/// read under the lock (the group may have changed since the precheck). A moved
+/// directory is recorded in `moved` so a failed save can move it back.
+fn rename_locked(state: &crate::state::State, old: &str, new: &str, moved: &mut Option<RenamePlan>) -> Result<()> {
+    let mut config = state.load_config()?;
+    let plan = rename_plan(state, &config, old, new)?;
+    if fs::symlink_metadata(&plan.old_dir).is_ok_and(|meta| meta.is_dir()) {
+        fs::rename(&plan.old_dir, &plan.new_dir).map_err(|_| RcError::new("failed", format!(
+            "Не удалось перенести каталог конфигов клиента «{old}»; клиент не переименован.")))?;
+        *moved = Some(plan);
+    }
+    config.clients.iter_mut().filter(|c| c.name == old).for_each(|c| c.name = new.to_owned());
+    state.save_config(&config)
+}
+
 /// The checks run again under the mutation lock. The config directory moves
 /// before the record and moves back when the record cannot be saved.
 pub fn rename(session: &mut Session, invocation: &Invocation) -> Result<Value> {
@@ -222,30 +237,21 @@ pub fn rename(session: &mut Session, invocation: &Invocation) -> Result<Value> {
     find_client(&config, &old)?;
     if !v::name_valid(&new) { return Err(name_invalid()); }
     if new == old { return Ok(json!({"name": new})); }
-    let plan = rename_plan(&session.state, &config, &old, &new)?;
-    let (old_dir, new_dir) = (plan.old_dir.clone(), plan.new_dir.clone());
-    let restore = |moved: bool| {
-        if moved && fs::rename(&new_dir, &old_dir).is_err() {
-            return Some(format!("Каталог конфигов не возвращён: перенесите «{}» в «{}» вручную.", new_dir.display(), old_dir.display()));
+    rename_plan(&session.state, &config, &old, &new)?;
+    let restore = |moved: &Option<RenamePlan>| {
+        let plan = moved.as_ref()?;
+        if fs::rename(&plan.new_dir, &plan.old_dir).is_err() {
+            return Some(format!("Каталог конфигов не возвращён: перенесите «{}» в «{}» вручную.",
+                plan.new_dir.display(), plan.old_dir.display()));
         }
         None
     };
-    let mut moved = false;
-    let saved = session.mutate("rename_client", |state| {
-        let mut config = state.load_config()?;
-        rename_plan(state, &config, &old, &new)?;
-        if fs::symlink_metadata(&old_dir).is_ok_and(|meta| meta.is_dir()) {
-            fs::rename(&old_dir, &new_dir).map_err(|_| RcError::new("failed", format!(
-                "Не удалось перенести каталог конфигов клиента «{old}»; клиент не переименован.")))?;
-            moved = true;
-        }
-        config.clients.iter_mut().filter(|c| c.name == old).for_each(|c| c.name = new.clone());
-        state.save_config(&config)
-    });
+    let mut moved: Option<RenamePlan> = None;
+    let saved = session.mutate("rename_client", |state| rename_locked(state, &old, &new, &mut moved));
     if let Err(error) = saved {
         // Also covers a failed GitHub checkpoint, which restores the record.
         let still_old = session.state.load_config().is_ok_and(|config| config.clients.iter().any(|c| c.name == old));
-        if still_old && let Some(warning) = restore(moved) {
+        if still_old && let Some(warning) = restore(&moved) {
             session.log(Level::Warn, &warning);
         }
         return Err(error);
@@ -763,6 +769,23 @@ mod tests {
         assert_eq!(run(&mut session, &["client", "rename", "--name", "renamed", "--new-name", "renamed"], &no_ssh).await.unwrap(),
             json!({"name": "renamed"}));
         assert_eq!(fingerprint(root.path()), before);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rename_moves_the_directory_of_the_group_read_under_the_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let (session, _, generated) = setup(root.path(), config());
+        // Another request moved my-router to PC after the precheck saw ROUTER.
+        let mut changed = session.state.load_config().unwrap();
+        changed.clients[0].group = "PC".into();
+        session.state.save_config(&changed).unwrap();
+        fs::rename(generated.join("ROUTER/my-router"), generated.join("PC/my-router")).unwrap();
+        let mut moved = None;
+        rename_locked(&session.state, "my-router", "r2", &mut moved).unwrap();
+        assert_eq!(moved.map(|plan| plan.new_dir), Some(generated.join("PC/r2")));
+        assert_eq!(fs::read_to_string(generated.join("PC/r2/config.yaml")).unwrap(), "keep router\n");
+        assert!(!generated.join("ROUTER/r2").exists() && !generated.join("PC/my-router").exists());
+        assert_eq!(session.state.load_config().unwrap().clients[0].name, "r2");
     }
 
     #[tokio::test(flavor = "current_thread")]
