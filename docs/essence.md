@@ -428,7 +428,7 @@ node apply (--name N… | --profile P | --pending) [--yes]
 
 ### Снятие и удаление
 
-Сначала снимаются роли и каскады ноды (`telegram remove`, `subscription host --remove`, `cascade delete`): с ними `node profile --profile ""` отвечает `in_use`. Затем `node profile --name N --profile ""` и `node apply --name N` — снятие:
+Сначала снимаются роли и каскады ноды (`telegram remove`, `subscription host --remove`, `cascade delete`): с ними `node profile --profile ""` отвечает `in_use`. Затем `node profile --name N --profile ""` и `node apply --name N --yes` — снятие (без `--yes` команда только показывает план, `confirmation_required`, и на сервере ничего не меняется):
 mihomo отключается и удаляется вместе с `/etc/mihomo` и всеми применёнными
 файлами, роли и AmneziaWG снимаются, свои правила UFW удаляются, сертификаты
 освобождаются. Пакеты, acme.sh и сам UFW остаются. То же выполняет
