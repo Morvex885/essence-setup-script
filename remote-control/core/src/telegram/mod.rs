@@ -1,5 +1,5 @@
-//! `telegram *`: Telegram Web Proxy as a node role (port of
-//! `setup-essence/modules/telegram-proxy.sh` without the menu and without
+//! `telegram *`: Telegram Web Proxy as a node role (port of the v1
+//! `telegram-proxy.sh` module without the menu and without
 //! direct MTProto). `set`, `remove`, `rotate-secret` and `tag` change the
 //! configuration and leave the node `pending`; `node apply` renders the role
 //! (`server::render`) and the executor builds and starts it

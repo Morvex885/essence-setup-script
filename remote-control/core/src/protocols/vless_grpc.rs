@@ -1,4 +1,4 @@
-//! VLESS gRPC + Reality builders (`common/protocols/vless-grpc.sh`).
+//! VLESS gRPC + Reality builders (v1 `vless-grpc.sh`).
 
 use super::uri::percent_encode;
 use super::vless_tcp::{push_reality_opts, reality_config};

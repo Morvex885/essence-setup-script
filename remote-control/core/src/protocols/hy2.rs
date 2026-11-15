@@ -1,4 +1,4 @@
-//! Hysteria2 builders (`common/protocols/hy2.sh`).
+//! Hysteria2 builders (v1 `hy2.sh`).
 
 use super::uri::percent_encode;
 use super::{line, or, uri_host, yaml_escape, yaml_host, yaml_name};

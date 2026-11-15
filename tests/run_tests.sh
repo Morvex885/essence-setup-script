@@ -1,5 +1,5 @@
 #!/bin/bash
-# ─── Test runner for essence-setup ─────────────────────────────────────────────
+# ─── Test runner: BATS (common/, node-agent/) and the Rust workspace ──────────
 if (( BASH_VERSINFO[0] < 3 || ( BASH_VERSINFO[0] == 3 && BASH_VERSINFO[1] < 2) )); then
     printf '  [✗] Требуется Bash 3.2 или новее.\n' >&2
     exit 1

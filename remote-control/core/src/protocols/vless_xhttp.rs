@@ -1,4 +1,4 @@
-//! VLESS xHTTP builders (`common/protocols/vless-xhttp.sh`): Reality, or TLS
+//! VLESS xHTTP builders (v1 `vless-xhttp.sh`): Reality, or TLS
 //! terminated by nginx in front of a plain listener.
 
 use super::uri::percent_encode;

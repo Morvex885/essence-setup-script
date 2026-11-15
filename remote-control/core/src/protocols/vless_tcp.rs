@@ -1,4 +1,4 @@
-//! VLESS TCP + Reality builders (`common/protocols/vless-tcp.sh`).
+//! VLESS TCP + Reality builders (v1 `vless-tcp.sh`).
 
 use super::uri::percent_encode;
 use super::{line, or, uri_host, yaml_escape, yaml_host, yaml_name, yaml_plain, yaml_port, Vless, VlessListener};

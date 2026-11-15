@@ -99,15 +99,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    env:
-      VERSION: ${{ github.ref_name }}
-
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Build and verify source tarball
-        run: bash tests/ci/build_release_tarball.sh "$VERSION"
-
       - name: Download binaries
         uses: actions/download-artifact@v4
         with:
@@ -132,8 +124,6 @@ jobs:
           files: |
             dist/essence-rc-*
             dist/SHA256SUMS
-            essence-setup-${{ github.ref_name }}.tar.gz
-            essence-setup-${{ github.ref_name }}.tar.gz.sha256
           generate_release_notes: true
           body: |
             ## Remote Control (essence-rc)
@@ -146,11 +136,3 @@ jobs:
             Windows: скачайте `essence-rc-x86_64-pc-windows-msvc.zip`
             (или `aarch64`), сверьте хеш с `SHA256SUMS` и положите
             `essence-rc.exe` в каталог из PATH. Подробнее — в README.
-
-            ## Сервер (essence-setup)
-
-            ```bash
-            curl -fsSL https://raw.githubusercontent.com/Morvex885/essence-setup-script/main/setup-essence/install-essence.sh | sudo bash
-            ```
-
-            Обновление: `essence-setup` → пункт **Обновить**, или повторите команду установки.

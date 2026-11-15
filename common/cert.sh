@@ -33,70 +33,6 @@ _acme_ca_conf() {
     printf '%s' "$HOME/.acme.sh/ca/acme-v02.api.letsencrypt.org/directory/ca.conf"
 }
 
-_acme_current_email() {
-    local status ca_conf
-    ACME_CURRENT_EMAIL=""
-    ca_conf=$(_acme_ca_conf)
-    if _acme_conf_value "$ca_conf" CA_EMAIL; then status=0; else status=$?; fi
-    if (( status == 1 )); then
-        if _acme_conf_value "$HOME/.acme.sh/account.conf" ACCOUNT_EMAIL; then status=0; else status=$?; fi
-    fi
-    if (( status == 0 )) && acme_email_valid "$ACME_CONF_VALUE"; then
-        ACME_CURRENT_EMAIL="$ACME_CONF_VALUE"
-        return 0
-    fi
-    warn "Текущий email acme.sh неизвестен или недоступен."
-    return 1
-}
-
-acme_select_email() {
-    local current="" generated="" answer="" registered=false ca_conf
-    ACME_SELECTED_EMAIL=""
-    ca_conf=$(_acme_ca_conf)
-    if [[ -f "$HOME/.acme.sh/acme.sh" ]]; then
-        _acme_current_email && current="$ACME_CURRENT_EMAIL"
-        if _acme_conf_value "$ca_conf" ACCOUNT_URL && [[ -n "$ACME_CONF_VALUE" ]]; then
-            registered=true
-        fi
-    else
-        local user_part domain_part
-        user_part=$(openssl rand -hex 4) && domain_part=$(openssl rand -hex 3) &&
-            [[ "$user_part" =~ ^[[:xdigit:]]{8}$ && "$domain_part" =~ ^[[:xdigit:]]{6}$ ]] || {
-            warn "Не удалось сгенерировать email для acme.sh."
-            return 1
-        }
-        generated="user${user_part}@${domain_part}.com"
-    fi
-    while true; do
-        if [[ -n "$current" ]]; then
-            IFS= read -rp "  Email для acme.sh [Enter = $current]: " answer || return 1
-        elif [[ -n "$generated" ]]; then
-            IFS= read -rp "  Email для acme.sh [Enter = $generated]: " answer || return 1
-        else
-            IFS= read -rp "  Email для acme.sh (введите вручную): " answer || return 1
-        fi
-        answer="${answer%$'\r'}"
-        if [[ -z "$answer" ]]; then
-            answer="${current:-$generated}"
-            if [[ -z "$answer" ]]; then
-                warn "Текущий email неизвестен. Введите email вручную."
-                continue
-            fi
-        fi
-        if ! acme_email_valid "$answer"; then
-            warn "Некорректный ACME email."
-            continue
-        fi
-        if [[ -n "$current" && "$answer" != "$current" ]]; then
-            confirm_yn "Изменить контакт Let's Encrypt с $current на $answer?" N || continue
-        elif [[ -z "$current" && "$registered" == true ]]; then
-            confirm_yn "Текущий email неизвестен. Установить контакт Let's Encrypt: $answer?" N || continue
-        fi
-        ACME_SELECTED_EMAIL="$answer"
-        return 0
-    done
-}
-
 ensure_acme_installed() {
     local email="$1" installer ca_conf old_email="" registered=false
     acme_email_valid "$email" || { warn "Некорректный ACME email."; return 1; }
@@ -426,33 +362,6 @@ _cert_has_consumers() {
     text=$(nginx -T -c "$conf" 2>/dev/null) || return 2
     [[ -n "$text" ]] || return 2
     _cert_scan_nginx "$text" "$identity"
-}
-
-# Rollback may have removed the installing feature's copy while a different
-# cert root still serves this identity. Return a usable live destination using
-# exactly the same conservative nginx parsing as release.
-_cert_find_consumer_directory() {
-    local identity="$1" cert_dir="$2" conf="$3" destination rc is_ip=false
-    local candidates=()
-    CERT_CONSUMER_CERT_DIR="" CERT_CONSUMER_DEST=""
-    if _cert_has_consumers "$identity" "$cert_dir" "$conf"; then rc=0; else rc=$?; fi
-    ((rc == 0)) || return "$rc"
-    [[ "$identity" != *:* && ! "$identity" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || is_ip=true
-    for destination in ${CERT_CONSUMER_DESTINATIONS[@]+"${CERT_CONSUMER_DESTINATIONS[@]}"}; do
-        [[ "$destination" != "$cert_dir/$identity" ]] || candidates+=("$destination")
-    done
-    for destination in ${CERT_CONSUMER_DESTINATIONS[@]+"${CERT_CONSUMER_DESTINATIONS[@]}"}; do
-        [[ "$destination" == "$cert_dir/$identity" ]] || candidates+=("$destination")
-    done
-    for destination in ${candidates[@]+"${candidates[@]}"}; do
-        if cert_is_usable "$identity" "$destination/fullchain.pem" "$destination/privkey.pem" "$is_ip"; then rc=0; else rc=$?; fi
-        ((rc != 2)) || return 2
-        ((rc == 0)) || continue
-        CERT_CONSUMER_DEST="$destination"
-        CERT_CONSUMER_CERT_DIR="${destination%/*}"
-        return 0
-    done
-    return 1
 }
 
 _cert_site_root() {

@@ -1,4 +1,4 @@
-//! Client users inside mihomo listeners (`common/listener-users.sh`): the
+//! Client users inside mihomo listeners (v1 `listener-users.sh`): the
 //! users YAML blocks and the replacement of the `# client-users-start` …
 //! `# client-users-end` section of one listener in `config.yaml`.
 

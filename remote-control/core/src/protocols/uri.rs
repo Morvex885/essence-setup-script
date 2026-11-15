@@ -1,4 +1,4 @@
-//! Share-URI parsing (`common/protocols/uri.sh`): percent coding, server/port
+//! Share-URI parsing (v1 `uri.sh`): percent coding, server/port
 //! extraction and `vless://` / `hy2://` / `hysteria2://` → cascade exit YAML.
 
 use std::fmt::Write as _;
