@@ -5,7 +5,7 @@
 // (`app.js::makeContext`). Применение (`node apply`) — `apply-model.js`.
 import { handleNodeCodes, reviewReply, setFlag, decisionFlag } from '../flows.js';
 import { asList } from '../format.js';
-import { applyFlow, applyNamesArgv } from './apply-model.js';
+import { applyFlow, applyNamesArgv, offerApplyNodes } from './apply-model.js';
 import { needsDomain, profileRows, domainError, portError as profilePortError } from './profiles-model.js';
 
 /** Строковое значение поля (`nodes.rs::text`): `null`/`undefined` → ''. */
@@ -394,10 +394,19 @@ export const nodeProfileArgv = (name, profile) => ['node', 'profile', '--name', 
 export const nodeDomainArgv = (name, domain) => ['node', 'domain', '--name', name, '--domain', domain];
 export const nodePortArgv = (name, protocol, port) => ['node', 'port', '--name', name, '--protocol', protocol, '--port', port];
 
-/** Подпись WARP ноды (`node list .warp`: `none|free|plus`). */
+/**
+ * Строка WARP карточки и действие «Перерегистрировать WARP» (`node show .warp`:
+ * `off|none|free|plus`, правило ядра, как в TUI): `null` — WARP в профиле ноды
+ * выключен, строки и действия нет.
+ */
 export function warpLabel(node) {
-  return { free: 'бесплатный', plus: 'WARP+' }[node && node.warp] || 'не зарегистрирован';
+  return { none: 'не зарегистрирован', free: 'бесплатный', plus: 'WARP+' }[node && node.warp] || null;
 }
+
+/** «Перерегистрировать WARP» в меню карточки: для `none|free|plus`, не для `off` (как в TUI). */
+export const warpReregisterOffered = (node) => warpLabel(node) !== null;
+
+export const warpReregisterArgv = (name) => ['node', 'warp-reregister', '--name', name];
 
 /**
  * Протоколы профиля с настраиваемым портом: `{ key, label, port }` — ключ
@@ -490,6 +499,17 @@ export async function nodePortsFlow(ctx, name, node) {
 /** «Применить»: `node apply --name N` под планом. */
 export function applyNode(ctx, name) {
   return applyFlow(ctx, applyNamesArgv([name]), name);
+}
+
+/**
+ * «Перерегистрировать WARP»: `node warp-reregister` под планом; нода после
+ * него ожидает применения — `node apply --name N` под планом ядра. `true` — выполнено.
+ */
+export async function warpReregister(ctx, name) {
+  const reply = await ctx.nodeRequest(name, warpReregisterArgv(name), { title: 'Перерегистрация WARP', question: 'Перерегистрировать WARP?' });
+  if (!reply.ok) return false;
+  await offerApplyNodes(ctx, [name]);
+  return true;
 }
 
 /** `node setup-ssh` под планом (`nodes.rs::setup_ssh`). */

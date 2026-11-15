@@ -1,7 +1,7 @@
 //! `client *` commands (v1 `clients.sh` and the client handlers of
-//! `cmd_clients.sh`). Local changes go through `Session::mutate`; server
-//! effects are delegated: AmneziaWG clients to `crate::awg`, listener users
-//! and config rendering to `generate`, subscriptions to `crate::subscription`.
+//! `cmd_clients.sh`). Local changes go through `Session::mutate`; config
+//! rendering is delegated to `generate`, subscriptions to `crate::subscription`.
+//! Server listener users and AmneziaWG peers follow the clients with `node apply`.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -20,9 +20,8 @@ use crate::transport::RemoteTransport;
 use crate::validation as v;
 
 use super::{
-    awg_capable_nodes, client_awg_nodes, client_dir, client_nodes, client_not_found, entry_exists, find_client,
-    find_group, generate, generated_guard, generated_path_safe, group_nodes, node_line, remove_entry, require_one,
-    templates, unique_values,
+    client_dir, client_nodes, client_not_found, entry_exists, find_client, find_group, generate, generated_guard,
+    generated_path_safe, group_nodes, node_line, remove_entry, require_one, templates, unique_values,
 };
 
 fn name_invalid() -> RcError {
@@ -90,6 +89,8 @@ pub fn show(session: &mut Session, invocation: &Invocation) -> Result<Value> {
         "hy2_password": client.credentials.as_ref().map(|c| &c.hy2_password),
     }));
     object.insert("connections".into(), connections_view(&config, client));
+    // Nodes where `client awg-config` serves the client: the one rule for every front end.
+    object.insert("awg_nodes".into(), json!(crate::server::render::awg_nodes(&config, client)));
     object.insert("config".into(), json!({"path": path.display().to_string(), "exists": path.is_file()}));
     object.insert("subscription".into(), subscription.unwrap_or(Value::Null));
     Ok(data)
@@ -186,15 +187,13 @@ pub fn add(session: &mut Session, invocation: &Invocation) -> Result<Value> {
     Ok(json!({"name": name, "group": group}))
 }
 
+/// The client's generated directory before and after the rename.
 struct RenamePlan {
     old_dir: PathBuf,
     new_dir: PathBuf,
-    awg_nodes: Vec<String>,
-    lines: Vec<String>,
 }
 
-/// v1 `core_client_rename_plan`: checks only; plan lines exist only when an
-/// AmneziaWG client with the old name is removed on servers.
+/// v1 `core_client_rename_plan`: checks only, nothing to confirm.
 fn rename_plan(state: &crate::state::State, config: &Config, old: &str, new: &str) -> Result<RenamePlan> {
     let client = find_client(config, old)?;
     if config.clients.iter().any(|c| c.name == new) {
@@ -211,83 +210,53 @@ fn rename_plan(state: &crate::state::State, config: &Config, old: &str, new: &st
         return Err(RcError::new("conflict", format!(
             "Каталог конфигов «{}» уже существует — удалите его или выберите другое имя.", new_dir.display())));
     }
-    let awg_nodes = client_awg_nodes(config, client, None);
-    let mut lines = Vec::new();
-    if !awg_nodes.is_empty() {
-        lines.push(format!("Клиент: {old} → {new}"));
-        lines.push(format!("Клиент AmneziaWG «{old}» будет удалён на нодах:"));
-        lines.extend(awg_nodes.iter().map(|node| node_line(config, node)));
-        lines.push(format!("Клиент AmneziaWG «{new}» будет создан при следующей генерации конфигов."));
-    }
-    Ok(RenamePlan { old_dir, new_dir, awg_nodes, lines })
+    Ok(RenamePlan { old_dir, new_dir })
 }
 
-/// `rename_plan` again under the mutation lock: a different plan (other
-/// AmneziaWG nodes, another directory) is `plan_changed` with the current one.
-fn rename_recheck(state: &crate::state::State, config: &Config, old: &str, new: &str, planned: &RenamePlan,
-    invocation: &Invocation) -> Result<()>
-{
-    let current = rename_plan(state, config, old, new)?;
-    if current.lines != planned.lines || current.new_dir != planned.new_dir {
-        return Err(Plan::new(current.lines, "").changed(invocation));
+/// The step under the mutation lock: the plan and its paths come from the state
+/// read under the lock (the group may have changed since the precheck). A moved
+/// directory is recorded in `moved` so a failed save can move it back.
+fn rename_locked(state: &crate::state::State, old: &str, new: &str, moved: &mut Option<RenamePlan>) -> Result<()> {
+    let mut config = state.load_config()?;
+    let plan = rename_plan(state, &config, old, new)?;
+    if fs::symlink_metadata(&plan.old_dir).is_ok_and(|meta| meta.is_dir()) {
+        fs::rename(&plan.old_dir, &plan.new_dir).map_err(|_| RcError::new("failed", format!(
+            "Не удалось перенести каталог конфигов клиента «{old}»; клиент не переименован.")))?;
+        *moved = Some(plan);
     }
-    Ok(())
+    config.clients.iter_mut().filter(|c| c.name == old).for_each(|c| c.name = new.to_owned());
+    state.save_config(&config)
 }
 
-/// The plan is rebuilt under the mutation lock (`plan_changed` when it
-/// differs). The config directory moves before the record and moves back when the
-/// record cannot be saved; AmneziaWG removal failures afterwards → partial.
-pub async fn rename<T: RemoteTransport>(session: &mut Session, invocation: &Invocation, connect: &dyn Fn() -> T) -> Result<Value> {
+/// The checks run again under the mutation lock. The config directory moves
+/// before the record and moves back when the record cannot be saved.
+pub fn rename(session: &mut Session, invocation: &Invocation) -> Result<Value> {
     let old = required(invocation, "name")?.to_owned();
     let new = required(invocation, "new-name")?.to_owned();
     let config = session.state.load_config()?;
     find_client(&config, &old)?;
     if !v::name_valid(&new) { return Err(name_invalid()); }
     if new == old { return Ok(json!({"name": new})); }
-    let plan = rename_plan(&session.state, &config, &old, &new)?;
-    if !plan.lines.is_empty() {
-        Plan::new(plan.lines.clone(), "").confirm(invocation)?;
-    }
-    let (old_dir, new_dir) = (plan.old_dir.clone(), plan.new_dir.clone());
-    let restore = |moved: bool| {
-        if moved && fs::rename(&new_dir, &old_dir).is_err() {
-            return Some(format!("Каталог конфигов не возвращён: перенесите «{}» в «{}» вручную.", new_dir.display(), old_dir.display()));
+    rename_plan(&session.state, &config, &old, &new)?;
+    let restore = |moved: &Option<RenamePlan>| {
+        let plan = moved.as_ref()?;
+        if fs::rename(&plan.new_dir, &plan.old_dir).is_err() {
+            return Some(format!("Каталог конфигов не возвращён: перенесите «{}» в «{}» вручную.",
+                plan.new_dir.display(), plan.old_dir.display()));
         }
         None
     };
-    let mut moved = false;
-    let saved = session.mutate("rename_client", |state| {
-        let mut config = state.load_config()?;
-        rename_recheck(state, &config, &old, &new, &plan, invocation)?;
-        if fs::symlink_metadata(&old_dir).is_ok_and(|meta| meta.is_dir()) {
-            fs::rename(&old_dir, &new_dir).map_err(|_| RcError::new("failed", format!(
-                "Не удалось перенести каталог конфигов клиента «{old}»; клиент не переименован.")))?;
-            moved = true;
-        }
-        config.clients.iter_mut().filter(|c| c.name == old).for_each(|c| c.name = new.clone());
-        state.save_config(&config)
-    });
+    let mut moved: Option<RenamePlan> = None;
+    let saved = session.mutate("rename_client", |state| rename_locked(state, &old, &new, &mut moved));
     if let Err(error) = saved {
         // Also covers a failed GitHub checkpoint, which restores the record.
         let still_old = session.state.load_config().is_ok_and(|config| config.clients.iter().any(|c| c.name == old));
-        if still_old && let Some(warning) = restore(moved) {
+        if still_old && let Some(warning) = restore(&moved) {
             session.log(Level::Warn, &warning);
         }
         return Err(error);
     }
     session.log(Level::Success, &format!("Клиент «{old}» переименован в «{new}»"));
-    let mut failed = Vec::new();
-    for node in &plan.awg_nodes {
-        if let Err(error) = crate::awg::remove_peers(session, node, std::slice::from_ref(&old), connect).await {
-            session.log(Level::Warn, &error.message);
-            failed.push(node.clone());
-        }
-    }
-    if !failed.is_empty() {
-        return Err(RcError::new("partial", format!(
-            "Клиент переименован, но клиента AmneziaWG «{old}» не удалось удалить на нодах: {}. Удалите его через awg remove.",
-            failed.join(", "))).with_extra("name", new).with_extra("nodes", failed));
-    }
     Ok(json!({"name": new}))
 }
 
@@ -346,7 +315,6 @@ pub fn nodes(session: &mut Session, invocation: &Invocation) -> Result<Value> {
 
 struct SetGroupPlan {
     lines: Vec<String>,
-    awg_drop: Vec<String>,
     old_dir: PathBuf,
     published: bool,
 }
@@ -373,8 +341,6 @@ fn set_group_plan(session: &Session, config: &Config, name: &str, group: &str) -
     if !client.inherit_nodes_from_group {
         push_unique(&mut affected, client.nodes.clone().unwrap_or_default());
     }
-    let keep = client_awg_nodes(config, client, Some(group));
-    let awg_drop: Vec<String> = client_awg_nodes(config, client, None).into_iter().filter(|n| !keep.contains(n)).collect();
     let paths = session.state.paths();
     let old_dir = client_dir(paths, client)?;
     if entry_exists(&old_dir)? {
@@ -408,13 +374,10 @@ fn set_group_plan(session: &Session, config: &Config, name: &str, group: &str) -
     lines.push("Старый каталог конфигов (удаляется после генерации нового):".into());
     lines.push(format!(" {}", old_dir.display()));
     if published { lines.push("Подписка клиента будет обновлена.".into()); }
-    if !awg_drop.is_empty() {
-        lines.push(format!("Клиент AmneziaWG «{name}» будет удалён на нодах: {}", awg_drop.join(", ")));
-    }
     if !affected.is_empty() {
         lines.push("Пользователи на затронутых нодах обновит node apply.".into());
     }
-    Ok(SetGroupPlan { lines, awg_drop, old_dir, published })
+    Ok(SetGroupPlan { lines, old_dir, published })
 }
 
 /// Effective subscription header differences (default → group → client)
@@ -435,9 +398,9 @@ fn header_changes(config: &Config, client: &Client, group: &str) -> Vec<String> 
     }).collect()
 }
 
-/// Moves the client, regenerates the new group's configs, syncs the affected
-/// nodes, drops AmneziaWG clients that lose access and republishes the
-/// subscription. Any failure after the record changed → partial.
+/// Moves the client, regenerates the new group's configs and republishes
+/// the subscription; servers follow with `node apply`. Any failure after the
+/// record changed → partial.
 pub async fn set_group<T: RemoteTransport>(session: &mut Session, invocation: &Invocation, connect: &dyn Fn() -> T) -> Result<Value> {
     let name = required(invocation, "name")?.to_owned();
     let group = required(invocation, "group")?.to_owned();
@@ -467,12 +430,6 @@ pub async fn set_group<T: RemoteTransport>(session: &mut Session, invocation: &I
             false
         }
     };
-    for node in &plan.awg_drop {
-        if let Err(error) = crate::awg::remove_peers(session, node, std::slice::from_ref(&name), connect).await {
-            session.log(Level::Warn, &error.message);
-            failed = true;
-        }
-    }
     // The old directory goes only once this regeneration wrote the client's
     // new config (even when other clients or nodes failed): a stale
     // config.yaml in the new directory is no proof, a failed or skipped
@@ -511,16 +468,14 @@ pub async fn set_group<T: RemoteTransport>(session: &mut Session, invocation: &I
 
 struct DeleteScan {
     targets: Vec<String>,
-    peer_nodes: Vec<String>,
     affected: Vec<String>,
     dirs: Vec<PathBuf>,
     subscriptions: Vec<String>,
 }
 
-/// v1 `_client_delete_scan`. Every node with AmneziaWG in any connection is
-/// scanned: an AmneziaWG client may remain there after a group change.
+/// v1 `_client_delete_scan`.
 fn delete_scan(session: &Session, config: &Config, names: Vec<String>) -> Result<DeleteScan> {
-    let mut scan = DeleteScan { targets: names, peer_nodes: awg_capable_nodes(config), affected: Vec::new(), dirs: Vec::new(), subscriptions: Vec::new() };
+    let mut scan = DeleteScan { targets: names, affected: Vec::new(), dirs: Vec::new(), subscriptions: Vec::new() };
     let paths = session.state.paths();
     for name in &scan.targets {
         let client = find_client(config, name)?;
@@ -542,9 +497,6 @@ fn delete_plan(config: &Config, scan: &DeleteScan) -> Vec<String> {
     lines.push("Затронутые ноды:".into());
     if scan.affected.is_empty() { lines.push(" нет".into()); }
     lines.extend(scan.affected.iter().map(|node| node_line(config, node)));
-    lines.push(format!("Клиенты AmneziaWG ({targets}) удаляются на нодах:"));
-    if scan.peer_nodes.is_empty() { lines.push(" нет".into()); }
-    lines.extend(scan.peer_nodes.iter().map(|node| format!(" {node}")));
     let subscriptions = if scan.subscriptions.is_empty() { "нет".to_owned() } else { scan.subscriptions.join(", ") };
     let host = config.subscription_host.as_ref().map_or("нет", |h| h.node.as_str());
     lines.extend([
@@ -552,19 +504,17 @@ fn delete_plan(config: &Config, scan: &DeleteScan) -> Vec<String> {
         format!("Хост подписок: {host}"),
         "Локальные записи и сгенерированные конфиги будут удалены.".into(),
         "Подписки будут отозваны.".into(),
-        "Клиенты AmneziaWG будут удалены; доступ в mihomo будет убран.".into(),
-        "Пользователи на затронутых нодах обновит node apply.".into(),
+        "Доступ клиентов на затронутых нодах (mihomo и AmneziaWG) уберёт node apply.".into(),
     ]);
     lines
 }
 
-fn delete_outcome(error: RcError, deleted: &[String], revoked: &[String], awg_nodes: &[String]) -> RcError {
-    error.with_extra("deleted", deleted).with_extra("revoked", revoked).with_extra("awg_nodes", awg_nodes)
+fn delete_outcome(error: RcError, deleted: &[String], revoked: &[String]) -> RcError {
+    error.with_extra("deleted", deleted).with_extra("revoked", revoked)
 }
 
-/// Access is revoked first (subscriptions, then AmneziaWG clients); a failure
-/// there keeps the local clients. Then the records and directories go and
-/// the listener users of the affected nodes are synchronized.
+/// Subscriptions are revoked first; a failure there keeps the local clients.
+/// Then the records and directories go; servers follow with `node apply`.
 pub async fn delete<T: RemoteTransport>(session: &mut Session, invocation: &Invocation, connect: &dyn Fn() -> T) -> Result<Value> {
     let names = unique_values(invocation, "name");
     if names.is_empty() {
@@ -583,40 +533,20 @@ pub async fn delete<T: RemoteTransport>(session: &mut Session, invocation: &Invo
             } else {
                 RcError::new("partial", format!("Удаление клиентов не завершено: подписка «{name}» не отозвана; отозваны: {}. Локальные клиенты сохранены.", revoked.join(", ")))
             };
-            return Err(delete_outcome(error, &[], &revoked, &[]));
+            return Err(delete_outcome(error, &[], &revoked));
         }
         revoked.push(name.clone());
     }
-    let mut awg_done: Vec<String> = Vec::new();
-    let mut awg_failed = false;
-    for node in &scan.peer_nodes {
-        match crate::awg::remove_peers(session, node, &scan.targets, connect).await {
-            Ok(()) => awg_done.push(node.clone()),
-            Err(error) => {
-                session.log(Level::Warn, &error.message);
-                awg_failed = true;
-            }
-        }
-    }
-    if awg_failed {
-        let error = if revoked.is_empty() && awg_done.is_empty() {
-            RcError::new("remote_failed", "Удаление клиентов не завершено: клиентов AmneziaWG не удалось удалить. Локальные клиенты сохранены.")
-        } else {
-            RcError::new("partial", "Удаление клиентов не завершено: клиентов AmneziaWG удалось удалить не на всех нодах. Локальные клиенты сохранены.")
-        };
-        return Err(delete_outcome(error, &[], &revoked, &awg_done));
-    }
-
     let removed = session.mutate("delete_client", |state| {
         let mut config = state.load_config()?;
         config.clients.retain(|c| !scan.targets.contains(&c.name));
         state.save_config(&config)
     });
     if let Err(error) = removed {
-        let error = if revoked.is_empty() && awg_done.is_empty() { error } else {
-            RcError::new("partial", format!("Доступ клиентов отозван, но локальные записи удалить не удалось: {}", error.message))
+        let error = if revoked.is_empty() { error } else {
+            RcError::new("partial", format!("Подписки отозваны, но локальные записи удалить не удалось: {}", error.message))
         };
-        return Err(delete_outcome(error, &[], &revoked, &awg_done));
+        return Err(delete_outcome(error, &[], &revoked));
     }
     let mut failed = false;
     for dir in &scan.dirs {
@@ -631,10 +561,21 @@ pub async fn delete<T: RemoteTransport>(session: &mut Session, invocation: &Invo
     }
     if failed {
         return Err(delete_outcome(RcError::new("partial", "Локальные клиенты удалены, но очистка завершена не полностью."),
-            &scan.targets, &revoked, &awg_done));
+            &scan.targets, &revoked));
     }
     session.log(Level::Success, &format!("Удалено клиентов: {} ({})", scan.targets.len(), scan.targets.join(", ")));
     Ok(json!({"deleted": scan.targets}))
+}
+
+/// `client awg-config --name C --node N`: the native AmneziaWG `.conf` of a
+/// peer (with secrets); the text never reaches the journal.
+pub fn awg_config(session: &mut Session, invocation: &Invocation) -> Result<Value> {
+    let name = required(invocation, "name")?;
+    let node = required(invocation, "node")?;
+    let config = session.state.load_config()?;
+    let client = find_client(&config, name)?;
+    let node = crate::nodes::find(&config, node)?;
+    Ok(json!({"config": crate::server::render::awg_client_config(&config, node, client)?}))
 }
 
 #[cfg(test)]
@@ -668,7 +609,7 @@ mod tests {
             "config" => super::config(session, &invocation),
             "connections" => connections(session, &invocation),
             "add" => add(session, &invocation),
-            "rename" => rename(session, &invocation, connect).await,
+            "rename" => rename(session, &invocation),
             "nodes" => nodes(session, &invocation),
             "set-group" => set_group(session, &invocation, connect).await,
             _ => delete(session, &invocation, connect).await,
@@ -681,7 +622,7 @@ mod tests {
         config.nodes.iter_mut().filter(|node| node.name == "de-vps").for_each(|node| node.profile = Some("main".into()));
         config.subscription_host = Some(SubscriptionHost {
             node: "de-vps".into(), hostname: "sub.example".into(), port: 443, base_url: "https://sub.example".into(),
-            sub_dir: "/srv/sub".into(), nginx_group: "www-data".into(),
+            sub_dir: crate::model::SUB_DIR.into(), nginx_group: "www-data".into(),
         });
         config
     }
@@ -831,37 +772,30 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn rename_with_amneziawg_is_gated_and_a_failed_removal_is_partial() {
+    async fn rename_moves_the_directory_of_the_group_read_under_the_lock() {
         let root = tempfile::tempdir().unwrap();
-        let (mut session, _, generated) = setup(root.path(), with_awg(config()));
-        let before = fingerprint(root.path());
-        let argv = ["client", "rename", "--name", "my-router", "--new-name", "r3"];
-        let error = run(&mut session, &argv, &no_ssh).await.unwrap_err();
-        assert_eq!((error.code, error.exit), ("confirmation_required", 2));
-        assert_eq!(error.extra["plan"], json!(["Клиент: my-router → r3", "Клиент AmneziaWG «my-router» будет удалён на нодах:",
-            " ru-vps  5.6.7.8:2222", "Клиент AmneziaWG «r3» будет создан при следующей генерации конфигов."]));
-        assert_eq!(fingerprint(root.path()), before);
-        let failing = || FakeTransport::default();
-        let error = run(&mut session, &[&argv[..], &["--yes"]].concat(), &failing).await.unwrap_err();
-        assert_eq!(error.code, "partial");
-        assert_eq!((error.extra["name"].clone(), error.extra["nodes"].clone()), (json!("r3"), json!(["ru-vps"])));
-        assert_eq!(session.state.load_config().unwrap().clients[0].name, "r3");
-        assert!(generated.join("ROUTER/r3/config.yaml").is_file());
+        let (session, _, generated) = setup(root.path(), config());
+        // Another request moved my-router to PC after the precheck saw ROUTER.
+        let mut changed = session.state.load_config().unwrap();
+        changed.clients[0].group = "PC".into();
+        session.state.save_config(&changed).unwrap();
+        fs::rename(generated.join("ROUTER/my-router"), generated.join("PC/my-router")).unwrap();
+        let mut moved = None;
+        rename_locked(&session.state, "my-router", "r2", &mut moved).unwrap();
+        assert_eq!(moved.map(|plan| plan.new_dir), Some(generated.join("PC/r2")));
+        assert_eq!(fs::read_to_string(generated.join("PC/r2/config.yaml")).unwrap(), "keep router\n");
+        assert!(!generated.join("ROUTER/r2").exists() && !generated.join("PC/my-router").exists());
+        assert_eq!(session.state.load_config().unwrap().clients[0].name, "r2");
     }
 
-    #[test]
-    fn rename_rechecks_the_plan_under_the_lock() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn rename_with_amneziawg_needs_no_server_work() {
         let root = tempfile::tempdir().unwrap();
-        let (session, _, _) = setup(root.path(), config());
-        let invocation = invocation(&["client", "rename", "--name", "my-router", "--new-name", "r3", "--yes"]);
-        let planned = rename_plan(&session.state, &config(), "my-router", "r3").unwrap();
-        assert!(planned.lines.is_empty());
-        rename_recheck(&session.state, &config(), "my-router", "r3", &planned, &invocation).unwrap();
-        // An AmneziaWG client appears meanwhile: the plan now removes it on a node.
-        let error = rename_recheck(&session.state, &with_awg(config()), "my-router", "r3", &planned, &invocation).unwrap_err();
-        assert_eq!(error.code, "plan_changed");
-        assert_eq!(error.extra["plan"].as_array().unwrap().len(), 4);
-        assert!(error.extra["plan_token"].is_string());
+        let (mut session, _, generated) = setup(root.path(), with_awg(config()));
+        let argv = ["client", "rename", "--name", "my-router", "--new-name", "r3"];
+        assert_eq!(run(&mut session, &argv, &no_ssh).await.unwrap(), json!({"name": "r3"}));
+        assert_eq!(session.state.load_config().unwrap().clients[0].name, "r3");
+        assert!(generated.join("ROUTER/r3/config.yaml").is_file());
     }
 
     #[cfg(unix)]
@@ -924,7 +858,7 @@ mod tests {
         let error = run(&mut session, &["client", "set-group", "--name", "my-router", "--group", "PC"], &no_ssh).await.unwrap_err();
         let plan: Vec<String> = serde_json::from_value(error.extra["plan"].clone()).unwrap();
         for line in ["Шаблон: default.yaml → alt.yaml", "Заголовки подписки изменятся:", " profile-update-interval: 24 → 6",
-            " - X-Old: o", "Подписка клиента будет обновлена.", "Клиент AmneziaWG «my-router» будет удалён на нодах: ru-vps"] {
+            " - X-Old: o", "Подписка клиента будет обновлена.", "Пользователи на затронутых нодах обновит node apply."] {
             assert!(plan.iter().any(|l| l == line), "{line} in {plan:?}");
         }
         assert!(plan.iter().all(|l| !l.contains(&"a".repeat(64))));
@@ -959,10 +893,9 @@ mod tests {
             format!(" my-router: {}", generated.join("ROUTER").join("my-router").display()),
             format!(" my-pc: {}", generated.join("PC").join("my-pc").display()),
             "Затронутые ноды:", " ru-vps  5.6.7.8:2222", " de-vps  1.2.3.4:22",
-            "Клиенты AmneziaWG (my-router, my-pc) удаляются на нодах:", " ru-vps",
             "Подписки: my-router", "Хост подписок: de-vps",
             "Локальные записи и сгенерированные конфиги будут удалены.", "Подписки будут отозваны.",
-            "Клиенты AmneziaWG будут удалены; доступ в mihomo будет убран.", "Пользователи на затронутых нодах обновит node apply.",
+            "Доступ клиентов на затронутых нодах (mihomo и AmneziaWG) уберёт node apply.",
         ]));
         assert!(!serde_json::to_string(&error.extra).unwrap().contains(&"a".repeat(64)));
         assert_eq!(run(&mut session, &["client", "delete", "--name", ""], &no_ssh).await.unwrap_err().code, "usage");
@@ -971,16 +904,12 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn a_failed_amneziawg_removal_keeps_local_clients() {
+    async fn deleting_an_amneziawg_client_needs_no_server_work() {
         let root = tempfile::tempdir().unwrap();
         let (mut session, _, generated) = setup(root.path(), with_awg(config()));
-        let before = fingerprint(root.path());
-        let error = run(&mut session, &["client", "delete", "--name", "my-router", "--yes"], &|| FakeTransport::default()).await.unwrap_err();
-        assert_eq!(error.code, "remote_failed");
-        assert_eq!((error.extra["deleted"].clone(), error.extra["revoked"].clone(), error.extra["awg_nodes"].clone()),
-            (json!([]), json!([]), json!([])));
-        assert_eq!(fingerprint(root.path()), before);
-        assert!(generated.join("ROUTER/my-router/config.yaml").is_file());
+        let data = run(&mut session, &["client", "delete", "--name", "my-router", "--yes"], &no_ssh).await.unwrap();
+        assert_eq!(data, json!({"deleted": ["my-router"]}));
+        assert!(!generated.join("ROUTER/my-router").exists());
     }
 
     #[tokio::test(flavor = "current_thread")]

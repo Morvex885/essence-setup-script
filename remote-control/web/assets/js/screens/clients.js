@@ -6,7 +6,7 @@ import { html, useEffect, useState } from '../../vendor/preact-htm.js';
 import { Page, Card, DataTable, MoreMenu, Facts, Badge, Chips, Empty, Button, downloadText } from '../ui.js';
 import { asList, strings } from '../format.js';
 import { useCommand, useBusy, useMounted, Context, Loaded } from './kit.js';
-import { showShare } from './share.js';
+import { showShare, showAwgConfig } from './share.js';
 import * as model from './clients-model.js';
 import { confirmed, fetchData } from './clients-model.js';
 
@@ -139,7 +139,10 @@ function ClientOverview({ ctx, name, row, busy, act, leave }) {
     <${Button} kind="primary" icon="file-code" disabled=${busy} onClick=${() => act(() => model.generateFlow(ctx, { client: name }))}>Сгенерировать конфиг<//>
     <${Button} icon="pencil" disabled=${busy} onClick=${() => act(edit)}>Изменить<//>
     <${Button} icon="key-round" disabled=${busy} onClick=${() => act(() => showClient(ctx, name))}>Данные подключения<//>
-    <${MoreMenu} items=${[{ label: 'Удалить клиента', icon: 'trash-2', danger: true, disabled: busy, onClick: () => act(remove) }]} />`;
+    <${MoreMenu} items=${[
+      { label: 'Конфиг AmneziaWG', icon: 'shield', disabled: busy, onClick: () => act(() => showAwgConfig(ctx, name)) },
+      { label: 'Удалить клиента', icon: 'trash-2', danger: true, disabled: busy, onClick: () => act(remove) },
+    ]} />`;
   return html`<${Card} title="Обзор" actions=${actions}>
     <${Facts} items=${[
       { label: 'Группа', value: html`<${GroupLink} ctx=${ctx} group=${row.group} />` },

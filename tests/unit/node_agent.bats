@@ -80,8 +80,8 @@ HY2_CERT='false'
 HY2_CN=''
 UFW_RULES='${RULES-443/tcp}'
 RELEASE_CERTS='${RELEASE-}'
-FEATURES=''
-REMOVE_FEATURES=''
+FEATURES='${FEATURES_SPEC-}'
+REMOVE_FEATURES='${REMOVE_SPEC-}'
 EOF
 }
 
@@ -600,6 +600,48 @@ SH
     ! grep -q "^wget" "$CALLS"
 }
 
+# add_site <имя> — файл сайта и ссылка sites-enabled в files.list.
+add_site() {
+    add_file "/etc/nginx/sites-available/$1" "# Essence site $1"
+    mkdir -p "$OPDIR/files/etc/nginx/sites-enabled"
+    printf '/etc/nginx/sites-available/%s' "$1" >"$OPDIR/files/etc/nginx/sites-enabled/$1"
+    printf 'link root root /etc/nginx/sites-enabled/%s\n' "$1" >>"$OPDIR/files.list"
+}
+
+@test "чужой сайт nginx с тем же именем не заменяется, свой обновляется" {
+    local av="$ROOT/etc/nginx/sites-available" en="$ROOT/etc/nginx/sites-enabled"
+    mkdir -p "$av" "$en"
+    printf 'server { shop }\n' >"$av/shop.example"
+    add_file /etc/mihomo/config.yaml "new"
+    add_site shop.example
+    run_agent
+    assert_failure
+    run status
+    assert_line "result=failed"
+    assert_line "error=config"
+    [[ "$(cat "$av/shop.example")" == "server { shop }" && ! -e "$en/shop.example" && ! -L "$en/shop.example" ]]
+    grep -qF "В /etc/nginx/sites-available/shop.example уже есть сайт nginx без отметки Essence" "$OPDIR/log"
+
+    # Ссылка sites-enabled не на наш сайт — тоже чужая.
+    printf '# Essence site shop.example\nold\n' >"$av/shop.example"
+    ln -s /etc/nginx/sites-available/other "$en/shop.example"
+    : >"$OPDIR/files.list"; rm -f "$OPDIR/status"
+    add_file /etc/mihomo/config.yaml "new"
+    add_site shop.example
+    run_agent
+    assert_failure
+    [[ "$(readlink "$en/shop.example")" == /etc/nginx/sites-available/other ]]
+
+    rm "$en/shop.example"
+    : >"$OPDIR/files.list"; rm -f "$OPDIR/status"
+    add_file /etc/mihomo/config.yaml "new"
+    add_site shop.example
+    run_agent
+    assert_success
+    [[ "$(cat "$av/shop.example")" == "# Essence site shop.example" ]]
+    [[ "$(readlink "$en/shop.example")" == /etc/nginx/sites-available/shop.example ]]
+}
+
 @test "откат возвращает правила UFW: удалённое добавляется, добавленное снимается" {
     # ufw с правилами в файле; delete отказывает только для UFW_DELETE_FAIL_RULE.
     stub ufw 'db="$(dirname "$CALLS")/ufw.db"; touch "$db"
@@ -715,4 +757,330 @@ exit 0'
     assert_line "result=rolled_back"
     assert_line "error=config"
     ! grep -qF "Служба mihomo работала до операции" "$OPDIR/log"
+}
+
+# ─── Фича awg: awg_activate ─────────────────────────────────────────────────
+
+# awg_call <код> — функции исполнителя с $R, $OP в окружении теста.
+awg_call() {
+    run bash -c 'R="$1"; OP="$2"; source "$3/common/common.sh"; for f in "$3"/steps/*.sh; do source "$f"; done; eval "$4"' \
+        _ "$ROOT" "$OPDIR" "$AGENT" "$1"
+}
+
+awg_files() {
+    stub ip '[[ "$*" == "link show awg0" ]] && exit "${AWG_DOWN:-0}"; exit 0'
+    stub awg 'exit 0'
+    stub awg-quick '[[ "$1" == strip ]] && echo stripped; exit 0'
+    mkdir -p "$ROOT/etc/amnezia/amneziawg" "$OPDIR/backup/etc/amnezia/amneziawg"
+    printf '[Interface]\nListenPort = %s\n# peer: b\n[Peer]\nPublicKey = B\n' "$1" >"$ROOT/etc/amnezia/amneziawg/awg0.conf"
+    printf '[Interface]\nListenPort = 40000\n# peer: a\n[Peer]\nPublicKey = A\n' >"$OPDIR/backup/etc/amnezia/amneziawg/awg0.conf"
+}
+
+@test "awg_activate: изменились только пиры — syncconf без перезапуска" {
+    awg_files 40000
+    awg_call awg_activate
+    assert_success
+    grep -qx "awg syncconf awg0 /dev/fd/63" "$CALLS" || grep -q "^awg syncconf awg0" "$CALLS"
+    ! grep -q "restart awg-quick@awg0" "$CALLS" || return 1
+    grep -qx "sysctl -w net.ipv4.ip_forward=1" "$CALLS"
+}
+
+@test "awg_activate: изменился интерфейс или он не поднят — перезапуск" {
+    awg_files 41000
+    awg_call awg_activate
+    assert_success
+    grep -qx "systemctl restart awg-quick@awg0" "$CALLS"
+    ! grep -q "^awg syncconf" "$CALLS" || return 1
+    : >"$CALLS"
+    awg_files 40000
+    AWG_DOWN=1 awg_call awg_activate
+    grep -qx "systemctl restart awg-quick@awg0" "$CALLS"
+    ! grep -q "^awg syncconf" "$CALLS"
+}
+
+@test "awg_rollback: перезапуск только при изменённом транзакцией awg0.conf; awg_remove удаляет каталог" {
+    awg_files 41000
+    mkdir -p "$OPDIR/files/etc/amnezia/amneziawg"
+    cp "$ROOT/etc/amnezia/amneziawg/awg0.conf" "$OPDIR/files/etc/amnezia/amneziawg/awg0.conf"
+    # awg0.conf вне транзакции — AWG не трогается.
+    awg_call 'TX_PATHS=(/etc/mihomo/config.yaml); TX_DEACTIVATED=""; awg_rollback'
+    assert_success
+    ! grep -q "awg-quick@awg0" "$CALLS" || return 1
+    # В транзакции и изменён (порт 41000 против копии с 40000) — прежний конфиг перезапускается.
+    awg_call 'TX_PATHS=(/etc/amnezia/amneziawg/awg0.conf); TX_DEACTIVATED=""; awg_rollback'
+    grep -qx "systemctl enable awg-quick@awg0" "$CALLS"
+    grep -qx "systemctl restart awg-quick@awg0" "$CALLS"
+    # В транзакции, но совпадает с копией — перезапуска нет.
+    : >"$CALLS"
+    cp "$OPDIR/backup/etc/amnezia/amneziawg/awg0.conf" "$OPDIR/files/etc/amnezia/amneziawg/awg0.conf"
+    awg_call 'TX_PATHS=(/etc/amnezia/amneziawg/awg0.conf); TX_DEACTIVATED=""; awg_rollback'
+    ! grep -q "awg-quick@awg0" "$CALLS" || return 1
+    awg_call awg_remove
+    assert_success
+    [[ ! -e "$ROOT/etc/amnezia" ]]
+}
+
+@test "откат по чужой причине не перезапускает работающий awg0" {
+    awg_real_stubs
+    printf 'awg_prepare() { :; }\n' >>"$AGENT/steps/awg.sh"
+    write_manifest
+    mkdir -p "$ROOT/etc/amnezia/amneziawg"
+    printf '[Interface]\n' >"$ROOT/etc/amnezia/amneziawg/awg0.conf"
+    add_file /etc/mihomo/config.yaml "new"
+    add_file /etc/amnezia/amneziawg/awg0.conf "[Interface]"
+    FEATURES_SPEC=awg write_spec
+    MIHOMO_T_RC=1 run_agent
+    assert_failure
+    run status
+    assert_line "result=rolled_back"
+    ! grep -q "awg-quick@awg0" "$CALLS" || return 1
+    [[ -e "$AWG_UP" ]]
+}
+
+@test "откат после awg_deactivate поднимает AmneziaWG с восстановленным конфигом" {
+    awg_real_stubs
+    mkdir -p "$ROOT/etc/amnezia/amneziawg"
+    printf '[Interface]\nListenPort = 40000\n' >"$ROOT/etc/amnezia/amneziawg/awg0.conf"
+    printf '/etc/amnezia/amneziawg/awg0.conf\n' >"$OPDIR/remove.list"
+    add_file /etc/mihomo/config.yaml "new"
+    RULES="" REMOVE_SPEC=awg write_spec
+    # mihomo -t отклоняет конфиг уже после снятия и удаления awg0.conf.
+    MIHOMO_T_RC=1 run_agent
+    assert_failure
+    run status
+    assert_line "result=rolled_back"
+    assert_line "error=config"
+    [[ "$(cat "$ROOT/etc/amnezia/amneziawg/awg0.conf")" == $'[Interface]\nListenPort = 40000' ]]
+    local down restart
+    down=$(line_of "systemctl disable --now awg-quick@awg0")
+    restart=$(line_of "systemctl restart awg-quick@awg0")
+    [[ -n "$down" && -n "$restart" && "$down" -lt "$restart" ]]
+    grep -qx "systemctl enable awg-quick@awg0" "$CALLS"
+}
+
+# awg_real_stubs — awg-quick, как настоящий, без конфига в /etc не находит
+# интерфейс; ExecStop юнита (`disable --now`) — тот же `awg-quick down awg0`.
+awg_real_stubs() {
+    export AWG_UP="$BATS_TEST_TMPDIR/awg0-up"
+    stub awg-quick 'conf="$2"; [[ "$conf" == */* ]] || conf="$ESSENCE_NODE_ROOT/etc/amnezia/amneziawg/$conf.conf"
+[[ -f "$conf" ]] || { echo "FAILED $*" >>"$CALLS"; exit 1; }
+rm -f "$AWG_UP"; exit 0'
+    stub ip '[[ "$*" == "link show awg0" && -e "$AWG_UP" ]]'
+    stub systemctl 'if [[ "$*" == "disable --now awg-quick@awg0" && -e "$AWG_UP" ]]; then awg-quick down awg0 || true; fi
+exit 0'
+    : >"$AWG_UP"
+}
+
+@test "снятие awg: интерфейс опускается до удаления awg0.conf (apply и teardown)" {
+    local mode
+    for mode in apply teardown; do
+        : >"$CALLS"
+        rm -rf "$OPDIR"; mkdir -p "$OPDIR/files"
+        awg_real_stubs
+        mkdir -p "$ROOT/etc/amnezia/amneziawg"
+        printf '[Interface]\nListenPort = 40000\n' >"$ROOT/etc/amnezia/amneziawg/awg0.conf"
+        printf '/etc/amnezia/amneziawg/awg0.conf\n' >"$OPDIR/remove.list"
+        [[ "$mode" == apply ]] && add_file /etc/mihomo/config.yaml "new"
+        MODE=$mode RULES="" REMOVE_SPEC=awg write_spec
+        run_agent
+        assert_success
+        run status
+        assert_line "result=committed"
+        ! grep -q "^FAILED" "$CALLS" || return 1
+        grep -qx "awg-quick down awg0" "$CALLS"
+        [[ ! -e "$AWG_UP" && ! -e "$ROOT/etc/amnezia" ]]
+    done
+}
+
+@test "сбой первой установки awg опускает интерфейс по конфигу операции" {
+    awg_real_stubs
+    # Пакеты и подъём интерфейса — вне теста; интерфейс уже поднят.
+    printf 'awg_prepare() { :; }\nawg_activate() { :; }\n' >>"$AGENT/steps/awg.sh"
+    write_manifest
+    add_file /etc/mihomo/config.yaml "new"
+    add_file /etc/amnezia/amneziawg/awg0.conf "[Interface]"
+    FEATURES_SPEC=awg write_spec
+    # Готовность (ss) не прошла: откат.
+    SS_OMIT=8443 AGENT_LISTEN_WAIT_SECONDS=1 run_agent
+    assert_failure
+    run status
+    assert_line "result=rolled_back"
+    ! grep -q "^FAILED" "$CALLS" || return 1
+    grep -q "^awg-quick down .*/files/etc/amnezia/amneziawg/awg0.conf$" "$CALLS"
+    grep -qx "systemctl disable --now awg-quick@awg0" "$CALLS"
+    [[ ! -e "$AWG_UP" && ! -e "$ROOT/etc/amnezia/amneziawg/awg0.conf" ]]
+}
+
+@test "ключ PPA: в keyring попадает только ключ с закреплённым отпечатком" {
+    command -v gpg >/dev/null || skip "нет gpg"
+    local home="$BATS_TEST_TMPDIR/gpg" fpr
+    mkdir -m 700 "$home"
+    gpg --batch --homedir "$home" --passphrase '' --quick-gen-key 'Pinned <p@example.com>' ed25519 sign never 2>/dev/null
+    gpg --batch --homedir "$home" --passphrase '' --quick-gen-key 'Extra <e@example.com>' ed25519 sign never 2>/dev/null
+    fpr=$(gpg --batch --homedir "$home" --with-colons --list-keys p@example.com | awk -F: '$1 == "fpr" { print $10; exit }')
+    gpg --batch --homedir "$home" --armor --export >"$BATS_TEST_TMPDIR/both.asc"
+    gpg --batch --homedir "$home" --armor --export e@example.com >"$BATS_TEST_TMPDIR/extra.asc"
+    mkdir -p "$BATS_TEST_TMPDIR/tx"
+    awg_call "AWG_PPA_FINGERPRINT=$fpr; _awg_pinned_keyring '$BATS_TEST_TMPDIR/both.asc' '$BATS_TEST_TMPDIR/out.gpg' '$BATS_TEST_TMPDIR/tx'"
+    assert_success
+    [[ "$(gpg --batch --show-keys --with-colons "$BATS_TEST_TMPDIR/out.gpg" | awk -F: '$1 == "pub"' | wc -l)" -eq 1 ]]
+    gpg --batch --show-keys --with-colons "$BATS_TEST_TMPDIR/out.gpg" | grep -q "^fpr:::::::::$fpr:"
+    [[ -z "$(ls -A "$BATS_TEST_TMPDIR/tx")" ]]
+    awg_call "AWG_PPA_FINGERPRINT=$fpr; _awg_pinned_keyring '$BATS_TEST_TMPDIR/extra.asc' '$BATS_TEST_TMPDIR/out.gpg' '$BATS_TEST_TMPDIR/tx'"
+    assert_failure
+}
+
+@test "awg: в репозиториях нет headers текущего ядра — подсказка kernel_headers в status" {
+    stub gpg 'exit 0'
+    stub apt-cache 'echo "  Candidate: (none)"'
+    awg_call 'AWG_KERNEL=9.9.9-test; _awg_bootstrap_dependencies; echo "rc=$? hint=$HINT"'
+    [[ "$output" == *"rc=1 hint=kernel_headers"* ]]
+    [[ "$output" == *"перезагрузите сервер"* ]]
+}
+
+@test "awg: из .sources уходит только строфа Amnezia, поля остальных не разделяются" {
+    local src="$ROOT/etc/apt/sources.list.d/mixed.sources"
+    mkdir -p "$(dirname "$src")"
+    printf '%s\n' 'Types: deb' 'URIs: https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu' 'Suites: noble' \
+        'Components: main' '' 'Types: deb' 'URIs: http://archive.ubuntu.com/ubuntu' 'Suites: noble noble-updates' \
+        'Components: main universe' >"$src"
+    awg_call 'AWG_TMP_BASE="$R"; _awg_repo_begin && _awg_remove_conflicting_sources && _awg_repo_commit'
+    assert_success
+    [[ "$(cat "$src")" == $'Types: deb\nURIs: http://archive.ubuntu.com/ubuntu\nSuites: noble noble-updates\nComponents: main universe' ]]
+}
+
+@test "awg: сигнал посреди транзакции PPA возвращает sources, после неё — прежний обработчик" {
+    local dir="$ROOT/etc/apt/sources.list.d"
+    mkdir -p "$dir"
+    printf 'old amnezia\n' >"$dir/amnezia.sources"
+    # Как в apply.sh: сигнал — exit 1, затем EXIT-обработчик.
+    awg_call 'AWG_TMP_BASE="$R"; trap "exit 1" HUP INT TERM; trap "echo finish" EXIT
+        _awg_repo_begin && _awg_prepare_repository_sources || exit 3
+        [[ ! -e "$R/etc/apt/sources.list.d/amnezia.sources" ]] || exit 4
+        kill -TERM $$; echo "не прервано"'
+    [[ "$status" -eq 1 ]]
+    [[ "$output" == finish ]]
+    [[ "$(cat "$dir/amnezia.sources")" == "old amnezia" ]]
+    [[ -z "$(find "$ROOT" -maxdepth 1 -name 'awg-repo.*')" ]]
+
+    awg_call 'AWG_TMP_BASE="$R"; trap "exit 1" HUP INT TERM
+        _awg_repo_begin && _awg_repo_commit && trap -p TERM'
+    assert_success
+    [[ "$output" == "trap -- 'exit 1' SIGTERM" ]]
+}
+
+@test "подсказка шага попадает в status вместе с ошибкой этапа" {
+    printf 'awg_prepare() { HINT=kernel_headers; return 1; }\n' >"$AGENT/steps/zz-hint.sh"
+    write_manifest
+    FEATURES_SPEC=awg write_spec
+    run_agent
+    run status
+    assert_line "result=failed"
+    assert_line "error=prepare"
+    assert_line "hint=kernel_headers"
+}
+
+# ─── Фича sub: хост подписок ────────────────────────────────────────────────
+
+@test "sub_prepare: каталоги данных, сниппетов и webroot; без SUB_HOST — отказ" {
+    stub chown 'exit 0'
+    stub setfacl 'exit 0'
+    awg_call 'SUB_HOST=sub.example.com; sub_prepare'
+    assert_success
+    [[ -d "$ROOT/var/www/sub.example.com" && -d "$ROOT/etc/nginx/snippets/essence-sub" ]]
+    [[ "$(stat -c %a "$ROOT/var/lib/essence-sub")" == 2750 ]]
+    [[ "$(stat -c %a "$ROOT/etc/nginx/snippets/essence-sub")" == 755 ]]
+    grep -qx "chown root:www-data $ROOT/var/lib/essence-sub" "$CALLS"
+    grep -qx "setfacl -d -m g:www-data:r $ROOT/var/lib/essence-sub" "$CALLS"
+    awg_call 'SUB_HOST=; sub_prepare'
+    assert_failure
+}
+
+# sub_timer_stub — systemctl, как настоящий, не включает и не отключает таймер
+# без файла юнита.
+sub_timer_stub() {
+    stub systemctl 'if [[ "$*" == *able*essence-sub-cleanup.timer && ! -f "$ESSENCE_NODE_ROOT/etc/systemd/system/essence-sub-cleanup.timer" ]]; then
+    echo "FAILED $*" >>"$CALLS"; exit 1
+fi
+exit 0'
+}
+
+@test "sub_activate включает таймер; откат первой установки останавливает его и убирает ссылку" {
+    sub_timer_stub
+    mkdir -p "$ROOT/etc/systemd/system/timers.target.wants"
+    : >"$ROOT/etc/systemd/system/essence-sub-cleanup.timer"
+    awg_call sub_activate
+    assert_success
+    grep -qx "systemctl enable --now essence-sub-cleanup.timer" "$CALLS"
+    # Транзакция уже удалила новый юнит.
+    rm "$ROOT/etc/systemd/system/essence-sub-cleanup.timer"
+    ln -s /etc/systemd/system/essence-sub-cleanup.timer "$ROOT/etc/systemd/system/timers.target.wants/essence-sub-cleanup.timer"
+    : >"$CALLS"
+    awg_call sub_rollback
+    grep -qx "systemctl stop essence-sub-cleanup.timer" "$CALLS"
+    ! grep -q "^FAILED" "$CALLS" || return 1
+    [[ ! -L "$ROOT/etc/systemd/system/timers.target.wants/essence-sub-cleanup.timer" ]]
+}
+
+@test "снятие sub: таймер отключается до удаления юнитов, каталоги удаляются" {
+    sub_timer_stub
+    mkdir -p "$ROOT/var/lib/essence-sub" "$ROOT/etc/nginx/snippets/essence-sub" "$ROOT/etc/systemd/system"
+    : >"$ROOT/etc/systemd/system/essence-sub-cleanup.timer"
+    : >"$ROOT/etc/systemd/system/essence-sub-cleanup.service"
+    printf '%s\n' /etc/systemd/system/essence-sub-cleanup.timer /etc/systemd/system/essence-sub-cleanup.service >"$OPDIR/remove.list"
+    add_file /etc/mihomo/config.yaml "new"
+    REMOVE_SPEC=sub write_spec
+    run_agent
+    assert_success
+    run status
+    assert_line "result=committed"
+    ! grep -q "^FAILED" "$CALLS" || return 1
+    grep -qx "systemctl disable --now essence-sub-cleanup.timer" "$CALLS"
+    [[ ! -e "$ROOT/etc/systemd/system/essence-sub-cleanup.timer" ]]
+    [[ ! -e "$ROOT/var/lib/essence-sub" && ! -e "$ROOT/etc/nginx/snippets/essence-sub" ]]
+}
+
+@test "отметка .essence-sub не удаляется в config и подтверждает снятие сертификата хоста подписок" {
+    mkdir -p "$ROOT/var/www/sub.example" "$ROOT/var/www/shop.example"
+    : >"$ROOT/var/www/sub.example/.essence-sub"
+    awg_call 'removable /var/www/sub.example/.essence-sub'
+    assert_failure
+    awg_call 'release_cert() { printf "release %s\n" "$1" >>"$CALLS"; }
+        AGENT_DIR="$3"; NODE_DIR="$R/root/essence-node"; OP_MODE=apply; HY2_CERT=true; WARP=""; REMOVE_FEATURES=""
+        RELEASE_CERTS="sub.example:/var/www/sub.example shop.example:/var/www/shop.example"; stage_cleanup && cleanup_committed'
+    assert_success
+    grep -qx "release sub.example" "$CALLS"
+    ! grep -qx "release shop.example" "$CALLS" || return 1
+    [[ ! -e "$ROOT/var/www/sub.example" && -d "$ROOT/var/www/shop.example" ]]
+}
+
+@test "essence-sub-cleanup: истёкшая ссылка снимается с YAML и сниппетом, запись срока остаётся" {
+    local sub="$ROOT/var/lib/essence-sub" snip="$ROOT/etc/nginx/snippets/essence-sub" script="$BATS_TEST_TMPDIR/cleanup"
+    local old new list
+    old=$(printf 'a%.0s' {1..64}) new=$(printf 'b%.0s' {1..64})
+    sed -e "s#{{sub_dir}}#$sub#" -e "s#^SNIP_DIR=.*#SNIP_DIR=$snip#" \
+        "$PROJECT_ROOT/remote-control/core/src/server/assets/essence-sub-cleanup.sh" >"$script"
+    stub flock 'exit 0'
+    mkdir -p "$sub" "$snip"
+    list=$(printf '%s 1\n%s 99999999999\nbad 1\n' "$old" "$new")
+    printf '%s\n' "$list" >"$sub/expiry.list"
+    touch "$sub/$old.yaml" "$snip/sub-$old.conf" "$sub/$new.yaml" "$snip/sub-$new.conf"
+    run bash "$script"
+    assert_success
+    [[ ! -e "$sub/$old.yaml" && ! -e "$snip/sub-$old.conf" && -e "$sub/$new.yaml" && -e "$snip/sub-$new.conf" ]]
+    [[ "$(cat "$sub/expiry.list")" == "$list" ]]
+    [[ "$(grep -c '^nginx -t$' "$CALLS")" -eq 1 && "$(grep -cx 'systemctl reload nginx' "$CALLS")" -eq 1 ]]
+
+    # Снимать нечего — nginx не трогается.
+    : >"$CALLS"
+    run bash "$script"
+    assert_success
+    ! grep -q nginx "$CALLS" || return 1
+
+    # Повторная публикация без нового срока снова снимается; сбой nginx — код 1.
+    touch "$sub/$old.yaml"
+    stub nginx 'exit 1'
+    run bash "$script"
+    assert_failure
+    [[ ! -e "$sub/$old.yaml" ]]
 }

@@ -7,10 +7,11 @@ import { asList, strings, proxyLabel, unlisted } from '../format.js';
 import { isFailure, retryable } from '../flows.js';
 import { refill } from '../form-model.js';
 import { assignArgv } from './nodeops-model.js';
-import { offersApply, offerApply } from './apply-model.js';
+import { offersApply, offerApply, offerApplyNodes, profiledNodes } from './apply-model.js';
+import { domainError, portError } from './profiles-model.js';
 import {
-  DEFAULT_TEMPLATE, generateGroup, generateClient, generateScope,
-  PUBLISH_FIELDS, SUBSCRIPTION_PUBLISH_ALL, subscriptionSetHost, subscriptionMigrate, publishSummary,
+  DEFAULT_TEMPLATE, generateGroup, generateClient, generateScope, PUBLISH_FIELDS, SUBSCRIPTION_PUBLISH_ALL,
+  SUBSCRIPTION_DEFAULT_PORT, SUBSCRIPTION_REMOVE_HOST, subscriptionSetHost, publishSummary,
 } from './catalog-model.js';
 
 /** Пустое состояние мультивыбора (`clients.rs::EMPTY`). */
@@ -380,6 +381,36 @@ export async function readClientConfig(ctx, name) {
   const data = read.data || {};
   if (data.exists === false || typeof data.content !== 'string') { ctx.notify('warn', CONFIG_MISSING); return null; }
   return data.content;
+}
+
+// ─── Конфиг AmneziaWG ───────────────────────────────────────────────────────
+
+export const awgConfigArgv = (name, node) => ['client', 'awg-config', '--name', name, '--node', node];
+/** Имя файла конфига AmneziaWG: `<клиент>-<нода>.conf`. */
+export const awgConfigFile = (name, node) => `${name}-${node}.conf`;
+
+/** Ноды, где клиент — пир AmneziaWG: `client show .awg_nodes` (правило ядра). */
+export const awgNodes = (data) => strings(data && data.awg_nodes);
+
+/**
+ * «Конфиг AmneziaWG»: ноды из `client show`, выбор (одна — без вопроса) и
+ * `client awg-config`. `{ node, config }` или `null` (отмена, нет нод, сбой —
+ * текст ошибки ядра, например `invalid`, показан). Текст конфига — секрет: не логируется.
+ */
+export async function awgConfigFlow(ctx, name) {
+  const read = await fetchData(ctx, ['client', 'show', '--name', name]);
+  if (!read) return null;
+  const nodes = awgNodes(read.data);
+  if (nodes.length === 0) { ctx.notify('info', 'Клиент не подключён к AmneziaWG ни на одной ноде.'); return null; }
+  const node = nodes.length === 1
+    ? nodes[0]
+    : await ctx.choose({ title: `Конфиг AmneziaWG: ${name}`, options: nodes.map((item) => ({ value: item, label: item })) });
+  if (node === null || node === undefined) return null;
+  const got = await fetchData(ctx, awgConfigArgv(name, node));
+  if (!got) return null;
+  const config = got.data && typeof got.data.config === 'string' ? got.data.config : null;
+  if (config === null) { ctx.failed(); return null; }
+  return { node, config };
 }
 
 /**
@@ -773,21 +804,58 @@ export async function publishFlow(ctx, name, row, share) {
 
 // ─── Подписки ────────────────────────────────────────────────────────────────
 
-/** Выбор ноды одной формой: `null` — сбой чтения (сообщён) или отмена. */
-export async function chooseNode(ctx, title, submit, current = null) {
-  const read = await fetchData(ctx, ['node', 'list']);
-  if (!read) return null;
-  const values = await ctx.form({
-    title, submit,
-    fields: [{ name: 'node', label: 'Нода', type: 'select', value: current, options: nameOptions(read.data, nodeLabel), required: true }],
-  });
-  return values ? values.node : null;
+/** Нет нод с профилем: хост подписок размещается только на них. */
+export const NO_PROFILED_NODES = 'Нет нод с профилем — сначала назначьте ноде профиль.';
+
+/** Поля «Хост подписок»: нода с профилем, домен, порт (по умолчанию 443); `current` — `subscriptionHost` или `null`. */
+export function hostFields(nodes, current, previous = null) {
+  const values = previous || (current ? { node: current.node, domain: current.hostname, port: current.port } : {});
+  return [
+    { name: 'node', label: 'Нода', type: 'select', value: values.node ?? null, options: nameOptions(nodes, nodeLabel), required: true },
+    { name: 'domain', label: 'Домен подписок', type: 'text', value: values.domain ?? '', placeholder: 'sub.example.com',
+      required: 'Домен не указан.', validate: domainError, autofocus: true },
+    { name: 'port', label: 'Порт', type: 'text', value: values.port ?? SUBSCRIPTION_DEFAULT_PORT, placeholder: SUBSCRIPTION_DEFAULT_PORT,
+      hint: 'Пусто — 443', validate: portError },
+  ];
 }
 
-/** Хост-нода подписок: выбор ноды → `subscription host --name` через `nodeRequest` (сбой сообщает он). */
+/** Ноды для применения после смены хоста: новая и прежняя, если она другая. */
+export function hostApplyNodes(node, current) {
+  return current && current.node !== node ? [node, current.node] : [node];
+}
+
+/**
+ * «Хост подписок»: нода с профилем, домен и порт одной формой →
+ * `subscription host --name N --domain D [--port P]`; сбой ядра возвращает
+ * форму с прежним вводом. Затем — предложение `node apply` на новой и прежней
+ * ноде. `true` — хост задан.
+ */
 export async function subscriptionHostFlow(ctx, current) {
-  const node = await chooseNode(ctx, 'Хост-нода подписок', 'Выбрать', current);
-  if (node !== null) await ctx.nodeRequest(node, subscriptionSetHost(node), null);
+  const read = await fetchData(ctx, ['node', 'list']);
+  if (!read) return false;
+  const nodes = profiledNodes(read.data);
+  if (nodes.length === 0) { ctx.notify('warn', NO_PROFILED_NODES); return false; }
+  let previous = null;
+  for (;;) {
+    const values = await ctx.form({ title: 'Хост подписок', submit: 'Сохранить', fields: hostFields(nodes, current, previous) });
+    if (values === null || values === undefined) return false;
+    previous = values;
+    const reply = await ctx.request(subscriptionSetHost(values.node, values.domain, values.port));
+    if (reply.ok) {
+      await offerApplyNodes(ctx, hostApplyNodes(values.node, current));
+      return true;
+    }
+    ctx.failed();
+  }
+}
+
+/** «Убрать хост»: `subscription host --remove` по плану, затем предложение `node apply` на прежней ноде. `true` — убран. */
+export async function removeHostFlow(ctx, current) {
+  const reply = await ctx.runConfirmed('Хост подписок', 'Убрать хост подписок?', SUBSCRIPTION_REMOVE_HOST);
+  if (ctx.isFailure(reply)) ctx.failed();
+  if (!reply.ok) return false;
+  if (current) await offerApplyNodes(ctx, [current.node]);
+  return true;
 }
 
 /** `subscription publish-all` по плану и итог публикации. */
@@ -796,14 +864,6 @@ export async function publishAllFlow(ctx) {
   if (ctx.isFailure(reply)) ctx.failed();
   const data = publishSummary(reply);
   if (data) await ctx.show({ title: 'Итог публикации подписок', context: summaryLines(data, PUBLISH_FIELDS, 'Нечего публиковать.') });
-}
-
-/** Перенос подписок на выбранную ноду (`subscription migrate`) по плану. */
-export async function migrateFlow(ctx) {
-  const node = await chooseNode(ctx, 'Перенос подписок на ноду', 'Далее');
-  if (node === null) return;
-  const reply = await ctx.runConfirmed('Перенос подписок', 'Перенести подписки?', subscriptionMigrate(node));
-  if (ctx.isFailure(reply)) ctx.failed();
 }
 
 /** Заголовки группы: выбор группы одной формой → `showHeaders`. */

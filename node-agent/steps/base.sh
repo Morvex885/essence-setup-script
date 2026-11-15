@@ -368,11 +368,13 @@ managed_path() {
     [[ "$path/" != */../* && "$path/" != */./* ]] || return 1
     [[ ! "$path" =~ [[:space:][:cntrl:]] ]] || return 1
     case "$path" in
-        /etc/mihomo|/etc/mihomo/*|/etc/systemd/system/mihomo.service|/etc/sysctl.d/99-vpn-speedup.conf)
+        /etc/mihomo|/etc/mihomo/*|/etc/systemd/system/mihomo.service|/etc/sysctl.d/99-vpn-speedup.conf|/etc/amnezia/amneziawg/awg0.conf)
+            return 0 ;;
+        /etc/nginx/conf.d/essence-sub-limit.conf|/usr/local/bin/essence-sub-cleanup|/etc/systemd/system/essence-sub-cleanup.service|/etc/systemd/system/essence-sub-cleanup.timer)
             return 0 ;;
     esac
     [[ "$path" == /etc/nginx/modules-enabled/90-essence-stream.conf ||
-       "$path" =~ ^/etc/nginx/(sites-available|sites-enabled)/[^/]+$ ]]
+       "$path" =~ ^/etc/nginx/(sites-available|sites-enabled)/[^/]+$ || "$path" =~ ^/var/www/[^/]+/\.essence-sub$ ]]
 }
 
 check_path() {
@@ -381,26 +383,49 @@ check_path() {
     return 1
 }
 
-# removable <путь> — удалять ли путь из remove.list (отсутствующий — нечего).
-# Сайты nginx удаляются, только если они наши: файл sites-available/<имя> с
-# первой строкой «# Essence site <имя>», ссылка sites-enabled/<имя> на
-# /etc/nginx/sites-available/<имя>. Чужие пропускаются с предупреждением.
-removable() {
+# site_owned <путь> — существующий сайт nginx наш: файл sites-available/<имя>
+# с первой строкой «# Essence site <имя>», ссылка sites-enabled/<имя> на
+# /etc/nginx/sites-available/<имя>. Прочие пути не проверяет (код 0).
+site_owned() {
     local path="$1" dest="$R$1" name="${1##*/}" first=""
-    [[ -e "$dest" || -L "$dest" ]] || return 1
     case "$path" in
         /etc/nginx/sites-available/*)
             if [[ -f "$dest" && ! -L "$dest" ]]; then
                 IFS= read -r first <"$dest" || true
             fi
-            [[ "$first" == "# Essence site $name" ]] && return 0
-            warn "Пропускаю $path: нет отметки Essence."
-            return 1 ;;
+            [[ "$first" == "# Essence site $name" ]] ;;
         /etc/nginx/sites-enabled/*)
-            [[ -L "$dest" && "$(readlink -- "$dest")" == "/etc/nginx/sites-available/$name" ]] && return 0
-            warn "Пропускаю $path: это не ссылка на сайт Essence."
+            [[ -L "$dest" && "$(readlink -- "$dest")" == "/etc/nginx/sites-available/$name" ]] ;;
+    esac
+}
+
+# replaceable <путь> — файл из files.list можно записать: его нет, либо это не
+# сайт nginx, либо сайт наш. Чужой сайт с тем же именем — сбой этапа.
+replaceable() {
+    [[ -e "$R$1" || -L "$R$1" ]] || return 0
+    site_owned "$1" && return 0
+    warn "В $1 уже есть сайт nginx без отметки Essence — не заменяю."
+    return 1
+}
+
+# removable <путь> — удалять ли путь из remove.list (отсутствующий — нечего).
+# Сайты nginx удаляются, только если они наши (site_owned); чужие
+# пропускаются с предупреждением.
+removable() {
+    local path="$1" dest="$R$1"
+    [[ -e "$dest" || -L "$dest" ]] || return 1
+    case "$path" in
+        /var/www/*/.essence-sub)
+            # Отметка хоста подписок уходит вместе с webroot в cleanup
+            # (RELEASE_CERTS): до этого она подтверждает, что webroot наш.
             return 1 ;;
     esac
+    site_owned "$path" && return 0
+    case "$path" in
+        /etc/nginx/sites-available/*) warn "Пропускаю $path: нет отметки Essence." ;;
+        /etc/nginx/sites-enabled/*) warn "Пропускаю $path: это не ссылка на сайт Essence." ;;
+    esac
+    return 1
 }
 
 # tx_backup <абсолютный путь> — копия в <op>/backup/<путь> либо отметка .absent.
@@ -509,7 +534,7 @@ tx_rollback() {
     fi
     port_handover "$nginx_action"
     sysctl --system >/dev/null
-    for feature in $FEATURES; do
+    for feature in $FEATURES $TX_DEACTIVATED; do
         if ! feature_hook "$feature" rollback; then
             warn "Откат фичи $feature не удался."
             rc=1
@@ -562,12 +587,22 @@ wait_active() {
     systemctl is-active --quiet "$unit"
 }
 
+# tx_deactivate — снятые фичи останавливаются, пока их файлы на месте
+# (awg-quick down и ExecStop юнитов читают конфиг, disable требует юнит).
+tx_deactivate() {
+    local feature
+    for feature in $REMOVE_FEATURES; do
+        TX_DEACTIVATED+="$feature "
+        feature_hook "$feature" deactivate || return 1
+    done
+}
+
 stage_config() {
     local mode owner group path feature code nginx_action=none
     local entries=() removes=()
     while read -r mode owner group path; do
         [[ -n "${mode:-}" ]] || continue
-        check_path "$path" || return 1
+        check_path "$path" && replaceable "$path" || return 1
         entries+=("$mode $owner $group $path")
     done < <(read_list "$OP/files.list")
     while IFS= read -r path; do
@@ -592,6 +627,7 @@ stage_config() {
         read -r mode owner group path <<<"$path"
         install_file "$mode" "$owner" "$group" "$path" || return 1
     done
+    tx_deactivate || return 1
     for path in "${removes[@]}"; do
         rm -rf -- "$R$path" || return 1
     done
@@ -632,6 +668,7 @@ stage_teardown_config() {
     for path in "${removes[@]}" "$MIHOMO_BIN_REL"; do
         tx_backup "$path" || return 1
     done
+    tx_deactivate || return 1
     # Сначала disable: без файла юнита systemctl disable отказывает. Юнита нет,
     # если первое применение прервалось до этапа config, — тогда снимать нечего.
     if [[ -e "$R/etc/systemd/system/mihomo.service" ]]; then
@@ -770,7 +807,7 @@ cleanup_committed() {
     for entry in "${CERT_ENTRIES[@]}"; do
         name="${entry%%:*}"
         webroot="${entry#*:}"
-        if [[ ! -e "$R$webroot/.essence-site" ]]; then
+        if [[ ! -e "$R$webroot/.essence-site" && ! -e "$R$webroot/.essence-sub" ]]; then
             warn "Пропускаю сертификат $name: в $webroot нет отметки Essence."
             continue
         fi

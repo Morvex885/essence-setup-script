@@ -314,6 +314,29 @@ async fn an_incomplete_rollback_of_a_reapply_keeps_both_sets() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_recognised_failure_tells_what_to_do() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut session, _journal) = fixture(root.path());
+    let de = node(1, "de");
+    for (hint, tail) in [("kernel_headers", Some("обновите ядро")), ("unknown_id", None)] {
+        NEXT_OP_ID.with(|next| *next.borrow_mut() = Some(OP.into()));
+        let mut steps = vec![connect_step(&de, Ok(())), probe_step(&de, DEBIAN)];
+        steps.extend(start_steps(OP));
+        steps.push(exec(status_command(OP), &format!("unit=inactive\nstage=prepare\nresult=failed\nerror=prepare\nhint={hint}\n")));
+        steps.push(exec(log_command(OP), ""));
+        let hosts = Hosts::new(vec![steps]);
+        let error = run(&mut session, &hosts, &["node", "apply", "--name", "de", "--yes"]).await.unwrap_err();
+        hosts.finish();
+        let message = error.extra["failed"][0]["message"].as_str().unwrap();
+        match tail {
+            Some(tail) => assert!(message.starts_with("ошибка на этапе «подготовка компонентов»: ") && message.contains(tail)
+                && message.contains("перезагрузите сервер"), "{message}"),
+            None => assert_eq!(message, "ошибка на этапе «подготовка компонентов»"),
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_dropped_connection_is_reestablished_while_polling() {
     let root = tempfile::tempdir().unwrap();
     let (mut session, _journal) = fixture(root.path());
@@ -641,6 +664,178 @@ async fn a_missing_reality_key_fails_the_node_with_the_way_back() {
     assert!(config(&session).nodes[0].operation.is_none());
 }
 
+fn warp_output(plus: bool) -> String {
+    let key = |seed: char| format!("{}=", seed.to_string().repeat(43));
+    format!("private_key={}\npublic_key={}\nipv4=172.16.0.2\nipv6=\nplus={plus}\n", key('A'), key('B'))
+}
+
+#[tokio::test(start_paused = true)]
+async fn warp_is_registered_before_the_render_and_with_a_new_key_again() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut session, journal) = fixture(root.path());
+    session.mutate("t", |state| {
+        let mut config = state.load_config()?;
+        config.profiles[0].warp = true;
+        state.save_config(&config)
+    }).unwrap();
+    let de = node(1, "de");
+    let hosts = Hosts::new(vec![vec![connect_step(&de, Ok(())), probe_step(&de, DEBIAN)]]);
+    let error = run(&mut session, &hosts, &["node", "apply", "--name", "de"]).await.unwrap_err();
+    assert!(error.extra["plan"].as_array().unwrap().contains(&json!("WARP: будет зарегистрирован аккаунт Cloudflare.")));
+
+    NEXT_OP_ID.with(|next| *next.borrow_mut() = Some(OP.into()));
+    let mut steps = vec![connect_step(&de, Ok(())), probe_step(&de, DEBIAN),
+        ScriptStep::exec(super::super::warp::register_command(false), 1, LONG_TIMEOUT, ok(&warp_output(false)))];
+    steps.extend(start_steps(OP));
+    steps.push(exec(status_command(OP), "stage=cleanup\nresult=committed\n"));
+    let hosts = Hosts::new(vec![steps]);
+    let data = run(&mut session, &hosts, &["node", "apply", "--name", "de", "--yes"]).await.unwrap();
+    hosts.finish();
+    assert_eq!(data["applied"], json!(["de"]));
+    let saved = config(&session);
+    let warp = saved.nodes[0].params.warp.clone().unwrap();
+    assert_eq!((warp.ipv4.as_str(), warp.plus, warp.plus_attempt), ("172.16.0.2", false, None));
+    assert!(session.state.secret_store().get(&format!("node:{}:warp-key", saved.nodes[0].id)).unwrap().is_some());
+    assert_eq!(render::status(&saved, &saved.nodes[0]), "applied");
+
+    // A WARP+ key appears: one re-registration (stdin carries the key), it does not bind.
+    session.mutate("t", |state| {
+        let mut config = state.load_config()?;
+        config.profiles[0].warp_plus = Some("0123abcd".into());
+        state.secret_store().set("profile:main:warp-license", Zeroizing::new("KEY-123".into()))?;
+        state.save_config(&config)
+    }).unwrap();
+    let node = config(&session).nodes[0].clone();
+    NEXT_OP_ID.with(|next| *next.borrow_mut() = Some(OP.into()));
+    let applied: String = node.applied.as_ref().unwrap().files.iter().map(|(path, hash)| format!("{hash}  {path}\n")).collect();
+    let mut steps = vec![connect_step(&node, Ok(())), probe_step(&node, &format!("{DEBIAN}agent=ok\n{applied}")),
+        ScriptStep::exec(super::super::warp::register_command(true), "KEY-123\n".len(), LONG_TIMEOUT, ok(&warp_output(false)))];
+    steps.extend(start_steps(OP).into_iter().skip(2));
+    steps.push(exec(status_command(OP), "stage=cleanup\nresult=committed\n"));
+    let hosts = Hosts::new(vec![steps]);
+    run(&mut session, &hosts, &["node", "apply", "--name", "de", "--yes"]).await.unwrap();
+    hosts.finish();
+    let saved = config(&session);
+    assert_eq!(saved.nodes[0].params.warp.as_ref().unwrap().plus_attempt.as_deref(), Some("0123abcd"));
+    assert!(journal.borrow().iter().any(|(level, text)| *level == Level::Warn && text.contains("ключ WARP+ не привязан")));
+    assert!(super::super::warp::registration(&saved.profiles[0], &saved.nodes[0]).is_none(), "the same key is not retried");
+
+    // A failed registration fails the node at stage `warp`.
+    session.mutate("t", |state| {
+        let mut config = state.load_config()?;
+        config.nodes[0].params.warp = None;
+        state.save_config(&config)
+    }).unwrap();
+    let node = config(&session).nodes[0].clone();
+    let hosts = Hosts::new(vec![vec![connect_step(&node, Ok(())), probe_step(&node, DEBIAN),
+        ScriptStep::exec(super::super::warp::register_command(false), "KEY-123\n".len(), LONG_TIMEOUT,
+            Ok(ExecResult { exit_status: 1, stderr: b"E: Unable to fetch some archives\n".to_vec(), ..ExecResult::default() }))]]);
+    let error = run(&mut session, &hosts, &["node", "apply", "--name", "de", "--yes"]).await.unwrap_err();
+    assert_eq!(error.extra["failed"][0]["stage"], "warp");
+    assert_eq!(error.extra["failed"][0]["message"], "Не удалось зарегистрировать WARP.");
+    assert!(journal.borrow().contains(&(Level::Output, "E: Unable to fetch some archives".into())), "the script's diagnostics reach the journal");
+    assert_eq!(hosts.uploads(), 0);
+}
+
+/// A node transport during whose WARP registration another local process
+/// saves a new domain of the node (`config save`).
+struct Racing {
+    inner: FakeTransport,
+    root: std::path::PathBuf,
+}
+
+impl crate::transport::RemoteSession for Racing {
+    async fn exec(&self, command: &str, stdin: &[u8], timeout: std::time::Duration) -> Result<ExecResult> {
+        if command.contains("essence-warp") {
+            let state = crate::state::State::new(crate::state::StatePaths::new(&self.root));
+            let mut config = state.load_config()?;
+            config.nodes[0].domain = Some("other.example.com".into());
+            state.save_config(&config)?;
+        }
+        self.inner.exec(command, stdin, timeout).await
+    }
+
+    async fn upload(&self, local_dir: &std::path::Path, remote_dir: &str, timeout: std::time::Duration) -> Result<()> {
+        self.inner.upload(local_dir, remote_dir, timeout).await
+    }
+
+    async fn upload_private(&self, local_dir: &std::path::Path, remote_dir: &str, timeout: std::time::Duration) -> Result<()> {
+        self.inner.upload_private(local_dir, remote_dir, timeout).await
+    }
+}
+
+impl crate::transport::RemoteTransport for Racing {
+    type Held = crate::fake_transport::FakeHeldSession;
+
+    async fn connect(&mut self, options: crate::transport::ConnectOptions) -> Result<()> {
+        self.inner.connect(options).await
+    }
+
+    fn hold(&self) -> Result<Self::Held> {
+        self.inner.hold()
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_change_during_the_warp_registration_is_a_changed_plan_of_the_command() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut session, _journal) = fixture(root.path());
+    session.mutate("t", |state| {
+        let mut config = state.load_config()?;
+        config.profiles[0].warp = true;
+        state.save_config(&config)
+    }).unwrap();
+    let de = node(1, "de");
+    let script = |register: bool| {
+        let mut steps = vec![connect_step(&de, Ok(())), probe_step(&de, DEBIAN)];
+        if register {
+            steps.push(ScriptStep::exec(super::super::warp::register_command(false), 1, LONG_TIMEOUT, ok(&warp_output(false))));
+        }
+        FakeTransport::new(steps)
+    };
+    let racing = RefCell::new(Some(Racing { inner: script(false), root: root.path().to_path_buf() }));
+    let connect = || racing.borrow_mut().take().unwrap();
+    let error = apply(&mut session, &invocation(&["node", "apply", "--name", "de"]), &connect).await.unwrap_err();
+    let token = error.extra["plan_token"].as_str().unwrap().to_owned();
+
+    let transport = script(true);
+    let finished = transport.script();
+    let racing = RefCell::new(Some(Racing { inner: transport, root: root.path().to_path_buf() }));
+    let connect = || racing.borrow_mut().take().unwrap();
+    let error = apply(&mut session, &invocation(&["node", "apply", "--name", "de", "--yes", "--plan-token", &token]), &connect)
+        .await.unwrap_err();
+    finished.assert_finished();
+    assert_eq!((error.code, error.exit), ("plan_changed", 2));
+    assert!(error.extra["plan"].is_array() && error.extra["plan_token"].is_string() && error.extra.get("failed").is_none(), "{error:?}");
+    // The registration saved nothing under the lock: the other change stays alone.
+    let saved = config(&session);
+    assert_eq!(saved.nodes[0].domain.as_deref(), Some("other.example.com"));
+    assert!(saved.nodes[0].params.warp.is_none() && saved.nodes[0].operation.is_none());
+}
+
+#[test]
+fn a_warp_registration_may_change_only_the_warp_parameters_of_the_confirmed_state() {
+    let root = tempfile::tempdir().unwrap();
+    let (session, _journal) = fixture(root.path());
+    let mut confirmed = config(&session);
+    confirmed.profiles[0].warp = true;
+    let id = confirmed.nodes[0].id.clone();
+    let mut registered = confirmed.clone();
+    registered.nodes[0].params.warp = Some(crate::model::NodeWarp {
+        public_key: format!("{}=", "B".repeat(43)), ipv4: "172.16.0.2".into(), ipv6: None, plus: false, plus_attempt: None,
+    });
+    let digest = render::desired(&registered, &registered.nodes[0], None).unwrap().digest;
+    assert_ne!(digest, render::desired(&confirmed, &confirmed.nodes[0], None).unwrap().digest);
+    assert_eq!(registered_digest(&confirmed, &registered, &id), Some(digest));
+    // `config save` of another domain while the registration ran: a new plan.
+    let mut changed = registered.clone();
+    changed.nodes[0].domain = Some("other.example.com".into());
+    assert_eq!(registered_digest(&confirmed, &changed, &id), None);
+    let mut gone = registered;
+    gone.nodes.clear();
+    assert_eq!(registered_digest(&confirmed, &gone, &id), None);
+}
+
 #[test]
 fn probe_output_parses() {
     let probe = parse_probe("os=\"ubuntu\"\r\nsystemd=yes\nsshd=2222\nagent=ok\nlisten udp 0.0.0.0:51820\nlisten tcp [::]:443\n\
@@ -655,4 +850,16 @@ fn probe_output_parses() {
     assert!(unit_gone(&parse_status("unit=failed\nstage=config\n")));
     // systemd re-executing itself (needrestart in `packages`): no answer is not an exit.
     assert!(!unit_gone(&parse_status("unit=\nstage=packages\n")) && !unit_gone(&parse_status("unit=unknown\nstage=packages\n")));
+}
+
+#[test]
+fn a_foreign_listener_on_the_tproxy_port_is_busy_until_it_is_ours() {
+    let probe = parse_probe("listen tcp 127.0.0.1:23456\n");
+    let desired = Desired { teardown: false, files: Vec::new(), remove: Vec::new(), spec: Vec::new(), ports: vec!["443/tcp".into()],
+        listen: vec!["443/tcp".into(), "23456/tcp".into(), "23456/udp".into()], lines: Vec::new(), digest: String::new() };
+    let mut node = Node::default();
+    let failure = busy_port(&probe, &node, &desired).unwrap();
+    assert_eq!((failure.code.as_str(), failure.port), ("port_busy", Some(23456)));
+    node.applied = Some(Applied { digest: String::new(), files: Default::default(), ports: desired.listen.clone(), at: String::new() });
+    assert!(busy_port(&probe, &node, &desired).is_none(), "our own mihomo holds it");
 }

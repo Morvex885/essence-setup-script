@@ -4,6 +4,7 @@
 //! Nothing here touches the network or the data directory.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::IpAddr;
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -11,15 +12,25 @@ use zeroize::Zeroizing;
 
 use crate::clients::generate::{User, effective_connections, node_users};
 use crate::error::{RcError, Result};
-use crate::model::{Config, Ipv6, Node, Profile, RealityMode, SiteSource, XhttpTopology};
+use crate::model::{
+    AmneziaWg, Cascade, CascadeExit, Client, Config, Ipv6, Node, NodeWarp, Profile, RealityMode, SUB_DIR, SiteSource,
+    SubscriptionHost, XhttpTopology,
+};
+use crate::protocols::uri::parse_exit_uri;
 use crate::protocols::vless_xhttp::NginxListener;
-use crate::protocols::{Vless, VlessListener, hy2, listener_users, vless_grpc, vless_tcp, vless_xhttp, yaml_escape};
+use crate::protocols::{Vless, VlessListener, hy2, listener_users, vless_grpc, vless_tcp, vless_xhttp, yaml_escape, yaml_name};
 
-use super::paths::{MIHOMO_CONFIG_PATH, MIHOMO_SERVICE_PATH, SITES_AVAILABLE, SITES_ENABLED, STREAM_PATH, SYSCTL_PATH};
+use super::awg;
+use super::cascade;
+use super::keys::{cascade_password, cascade_uuid};
+use super::paths::{
+    AWG_CONF_PATH, MIHOMO_CONFIG_PATH, MIHOMO_SERVICE_PATH, SITES_AVAILABLE, SITES_ENABLED, STREAM_PATH, SUB_CLEANUP_PATH,
+    SUB_CLEANUP_SERVICE_PATH, SUB_CLEANUP_TIMER_PATH, SUB_LIMIT_PATH, SUB_SITE, SYSCTL_PATH, sub_marker, sub_marker_host,
+};
 use super::ports::{REALITY_INNER_PORT, SITE_PORT, SUB_INNER_PORT, TG_INNER_PORT, XHTTP_NGINX_PORT};
 
 /// Bumped whenever rendered files change for an unchanged configuration.
-pub const RENDER_REVISION: u32 = 4;
+pub const RENDER_REVISION: u32 = 5;
 
 const MIHOMO_CONFIG: &str = include_str!("assets/mihomo-config.yaml");
 const MIHOMO_SERVICE: &str = include_str!("assets/mihomo.service");
@@ -29,6 +40,12 @@ const SYSCTL_IPV6_ENABLED: &str = include_str!("assets/sysctl-ipv6-enabled.txt")
 const SYSCTL_IPV6_FORWARDING: &str = "net.ipv6.conf.all.forwarding = 1";
 const NGINX_SITE: &str = include_str!("assets/nginx-site.conf");
 const NGINX_XHTTP: &str = include_str!("assets/nginx-xhttp-location.conf");
+const NGINX_SUB: &str = include_str!("assets/nginx-sub.conf");
+const SUB_CLEANUP: &str = include_str!("assets/essence-sub-cleanup.sh");
+const SUB_CLEANUP_SERVICE: &str = include_str!("assets/essence-sub-cleanup.service");
+const SUB_CLEANUP_TIMER: &str = include_str!("assets/essence-sub-cleanup.timer");
+
+const SUB_LIMIT: &str = "limit_req_zone $binary_remote_addr zone=sub:1m rate=10r/m;\n";
 
 /// Credentials of the client blocks; `generate` replaces them per client.
 pub const PLACEHOLDER_UUID: &str = "00000000-0000-0000-0000-000000000000";
@@ -59,6 +76,22 @@ pub struct NodeSecrets {
     pub telegram_tag: Option<Zeroizing<String>>,
 }
 
+/// The private keys a render uses (empty without secrets).
+struct Keys<'a> {
+    reality: &'a str,
+    awg: &'a str,
+    warp: &'a str,
+}
+
+impl<'a> Keys<'a> {
+    fn of(secrets: Option<&'a NodeSecrets>) -> Self {
+        let key = |pick: fn(&NodeSecrets) -> &Option<Zeroizing<String>>| {
+            secrets.and_then(|s| pick(s).as_deref()).map(String::as_str).unwrap_or_default()
+        };
+        Keys { reality: key(|s| &s.reality_key), awg: key(|s| &s.awg_key), warp: key(|s| &s.warp_key) }
+    }
+}
+
 /// Everything `node apply` needs for one node.
 pub struct Desired {
     /// The profile was removed: everything installed goes.
@@ -68,6 +101,9 @@ pub struct Desired {
     pub spec: Vec<(&'static str, String)>,
     /// Firewall rules (`443/tcp`, `8843/udp`).
     pub ports: Vec<String>,
+    /// Sockets our services take (`443/tcp`): the firewall rules and the
+    /// AmneziaWG TPROXY inlet. `node apply` needs them free unless already ours.
+    pub listen: Vec<String>,
     pub lines: Vec<String>,
     pub digest: String,
 }
@@ -136,15 +172,61 @@ fn needs_site(profile: &Profile) -> bool {
         && (profile.has_reality() || profile.vless_xhttp.is_some() || profile.hysteria2.is_some())
 }
 
-/// Clients of a listener: assigned to the node and using the listener (a
-/// client without connections on the node uses all of them), with the
-/// credential the listener needs. A listener without them is not rendered.
-fn listener_users<'u>(config: &Config, node: &Node, users: &'u [User<'u>], listener: &Listener) -> Vec<(&'u str, &'u str)> {
-    users.iter().filter(|user| {
-        let connections = effective_connections(config, user.client, &node.name);
-        connections.is_empty() || connections.iter().any(|name| name == listener.name)
-    }).map(|user| (user.name, if listener.kind == Kind::Hy2 { user.password } else { user.uuid }))
+/// Whether a client uses `connection` on the node: a client without
+/// connections on the node uses all of them.
+fn uses(config: &Config, node: &Node, user: &User<'_>, connection: &str) -> bool {
+    let connections = effective_connections(config, user.client, &node.name);
+    connections.is_empty() || connections.iter().any(|name| name == connection)
+}
+
+/// Cascades entering at the node through `listener`.
+fn entry_cascades<'c>(config: &'c Config, node: &Node, listener: &Listener) -> Vec<&'c Cascade> {
+    config.cascades.iter()
+        .filter(|c| c.entry == node.name && cascade::listener_name(c.listener) == listener.name).collect()
+}
+
+/// Cascades leaving through `listener` of the node.
+fn exit_cascades<'c>(config: &'c Config, node: &Node, listener: &Listener) -> Vec<&'c Cascade> {
+    config.cascades.iter().filter(|c| matches!(&c.exit, CascadeExit::Node(exit)
+        if exit.node == node.name && cascade::exit_proxy_name(exit.proxy) == listener.name)).collect()
+}
+
+/// `<client>--<C>` users of the cascade on its entry listener, with the
+/// credential derived from the client's own.
+fn cascade_users(config: &Config, node: &Node, users: &[User<'_>], listener: &Listener, cascade: &Cascade) -> Vec<(String, String)> {
+    users.iter().filter(|user| uses(config, node, user, &cascade.name)).filter_map(|user| {
+        let credential = match listener.kind {
+            Kind::Hy2 if !user.password.is_empty() => cascade_password(user.password, &cascade.name),
+            Kind::Hy2 => return None,
+            _ if !user.uuid.is_empty() => cascade_uuid(user.uuid, &cascade.name),
+            _ => return None,
+        };
+        Some((format!("{}--{}", user.name, cascade.name), credential))
+    }).collect()
+}
+
+/// Clients of a listener: assigned to the node and using the listener, with
+/// the credential the listener needs.
+fn client_users<'u>(config: &Config, node: &Node, users: &'u [User<'u>], listener: &Listener) -> Vec<(&'u str, &'u str)> {
+    users.iter().filter(|user| uses(config, node, user, listener.name))
+        .map(|user| (user.name, if listener.kind == Kind::Hy2 { user.password } else { user.uuid }))
         .filter(|(_, credential)| !credential.is_empty()).collect()
+}
+
+/// Every user of a listener: its clients, cascade users entering here and
+/// the `cascade--<C>` users of cascades leaving here. A listener without them
+/// is not rendered.
+fn listener_users(config: &Config, node: &Node, users: &[User<'_>], listener: &Listener) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = client_users(config, node, users, listener).into_iter()
+        .map(|(name, credential)| (name.to_owned(), credential.to_owned())).collect();
+    for cascade in entry_cascades(config, node, listener) {
+        out.extend(cascade_users(config, node, users, listener, cascade));
+    }
+    for cascade in exit_cascades(config, node, listener) {
+        let credential = if listener.kind == Kind::Hy2 { &cascade.password } else { &cascade.uuid };
+        out.push((format!("cascade--{}", cascade.name), credential.clone()));
+    }
+    out
 }
 
 /// Reality takes the 443 front only when one of its rendered listeners (with
@@ -227,7 +309,12 @@ impl Layout<'_> {
     }
 
     fn nginx(&self) -> bool {
-        self.site.is_some() || self.front == Front::Stream || role_on_443(self.config, self.node)
+        self.site.is_some() || self.front == Front::Stream || role_on_443(self.config, self.node) || self.sub_host().is_some()
+    }
+
+    /// The subscription host when this node serves it.
+    fn sub_host(&self) -> Option<&SubscriptionHost> {
+        self.config.subscription_host.as_ref().filter(|host| host.node == self.node.name)
     }
 
     /// `(port, protocol)` rules of the firewall, in listener order.
@@ -248,7 +335,18 @@ impl Layout<'_> {
                 _ => {}
             }
         }
+        if let Some((_, port)) = self.awg() {
+            push(format!("{port}/udp"));
+        }
+        if let Some(host) = self.sub_host().filter(|host| host.port != 443) {
+            push(format!("{}/tcp", host.port));
+        }
         rules
+    }
+
+    /// The profile's AmneziaWG and its effective port on this node.
+    fn awg(&self) -> Option<(&AmneziaWg, u16)> {
+        self.profile.amneziawg.as_ref().map(|awg| (awg, effective(self.node, "amneziawg", awg.port)))
     }
 
     /// Listening ports must not collide with SSH or the AmneziaWG tproxy port.
@@ -259,6 +357,14 @@ impl Layout<'_> {
         }
         if self.site.is_some() && self.front == Front::SelfSteal {
             tcp.insert(SITE_PORT);
+        }
+        if let Some(host) = self.sub_host() {
+            if host.port != 443 && tcp.contains(&host.port) {
+                return Err(invalid(format!("Порт {} хоста подписок на ноде «{}» занят подключением профиля.", host.port, self.node.name))
+                    .with_extra("port", host.port));
+            }
+            // On 443 the vhost may sit behind the front on an internal port.
+            tcp.insert(self.sub_port(host));
         }
         if tcp.contains(&self.node.port) {
             return Err(invalid(format!("Порт {} ноды «{}» занят SSH.", self.node.port, self.node.name)).with_extra("port", self.node.port));
@@ -304,7 +410,21 @@ impl Layout<'_> {
         }
     }
 
-    fn users<'u>(&self, users: &'u [User<'u>], listener: &Listener) -> Vec<(&'u str, &'u str)> {
+    /// Cascades entering at this node through `listener`.
+    fn entry_cascades(&self, listener: &Listener) -> Vec<&Cascade> {
+        entry_cascades(self.config, self.node, listener)
+    }
+
+    /// Cascades leaving through `listener` of this node.
+    fn exit_cascades(&self, listener: &Listener) -> Vec<&Cascade> {
+        exit_cascades(self.config, self.node, listener)
+    }
+
+    fn cascade_users(&self, users: &[User<'_>], listener: &Listener, cascade: &Cascade) -> Vec<(String, String)> {
+        cascade_users(self.config, self.node, users, listener, cascade)
+    }
+
+    fn listener_users(&self, users: &[User<'_>], listener: &Listener) -> Vec<(String, String)> {
         listener_users(self.config, self.node, users, listener)
     }
 
@@ -313,9 +433,10 @@ impl Layout<'_> {
             "Недопустимое имя или учётные данные клиента ноды «{}» в конфигурации.", self.node.name)))
     }
 
-    /// One wrapped listener block with all its users.
-    fn listener_block(&self, listener: &Listener, users: &[(&str, &str)], private_key: &str) -> Result<String> {
-        let (username, credential) = users[0];
+    /// One wrapped listener block with all its users. A listener with
+    /// cascades routes by its `<marker>-shared` sub-rule instead of `outbound`.
+    fn listener_block(&self, listener: &Listener, users: &[(String, String)], private_key: &str) -> Result<String> {
+        let (username, credential) = (users[0].0.as_str(), users[0].1.as_str());
         let port = listener.port.to_string();
         // The shared builders write these inside double quotes as given (Bash
         // parity); the server config escapes them. Generated values are
@@ -345,36 +466,93 @@ impl Layout<'_> {
                 })
             }
         };
-        // Inbound goes through the `essence-in` sub-rule instead of straight
-        // to `outbound` (as Bash cascades do: `proxy:` becomes `rule:`).
-        let routed = block.replacen(&format!("\n    proxy: {INBOUND_PROXY}\n"), &format!("\n    rule: {INBOUND_RULE}\n"), 1);
+        // Inbound goes through a sub-rule instead of straight to `outbound`
+        // (as Bash cascades do: `proxy:` becomes `rule:`): `essence-in`, or
+        // the listener's own `<marker>-shared` when it carries cascades.
+        let rule = if self.entry_cascades(listener).is_empty() { INBOUND_RULE.to_owned() } else { format!("{}-shared", listener.marker) };
+        let routed = block.replacen(&format!("\n    proxy: {INBOUND_PROXY}\n"), &format!("\n    rule: {rule}\n"), 1);
         if routed == block {
             return Err(RcError::new("failed", format!("Не удалось собрать листенер {}.", listener.name)));
         }
         let marker = listener.marker;
         let wrapped = format!("# --- {marker} ---\n{routed}# --- /{marker} ---\n");
+        let pairs = users.iter().map(|(name, credential)| (name.as_str(), credential.as_str()));
         let users_yaml = if listener.kind == Kind::Hy2 {
-            listener_users::hy2_users_yaml(users.iter().copied())
+            listener_users::hy2_users_yaml(pairs)
         } else {
-            listener_users::vless_users_yaml(marker, users.iter().copied())
+            listener_users::vless_users_yaml(marker, pairs)
         };
         listener_users::sync(&wrapped, marker, &users_yaml)
             .ok_or_else(|| RcError::new("failed", format!("Не удалось собрать листенер {}.", listener.name)))
     }
 
-    fn mihomo_config(&self, users: &[User<'_>], private_key: &str) -> Result<String> {
+    /// WARP of the node: enabled in the profile and registered.
+    fn warp(&self) -> Option<&NodeWarp> {
+        self.node.params.warp.as_ref().filter(|_| self.profile.warp)
+    }
+
+    /// Exit proxies of the cascades entering through an enabled listener.
+    fn cascade_exits(&self) -> Result<Vec<(&Cascade, String)>> {
+        let mut out = Vec::new();
+        for listener in &self.listeners {
+            for cascade in self.entry_cascades(listener) {
+                out.push((cascade, exit_yaml(self.config, cascade)?));
+            }
+        }
+        Ok(out)
+    }
+
+    /// `sub-rules:`: `essence-in` for plain listeners and `<marker>-shared`
+    /// per listener with cascades; each starts with the inbound rejects.
+    fn sub_rules(&self, users: &[User<'_>]) -> String {
+        let rejects = self.inbound_rejects();
+        let mut out = format!("sub-rules:\n  {INBOUND_RULE}:\n{rejects}    - MATCH,{INBOUND_PROXY}\n");
+        for listener in &self.listeners {
+            let cascades = self.entry_cascades(listener);
+            if cascades.is_empty() || self.listener_users(users, listener).is_empty() {
+                continue;
+            }
+            out.push_str(&format!("  {}-shared:\n", listener.marker));
+            out.push_str(&rejects);
+            for cascade in cascades {
+                for (user, _) in self.cascade_users(users, listener, cascade) {
+                    out.push_str(&format!("    - IN-USER,{user},{}-outbound\n", cascade.name));
+                }
+            }
+            out.push_str(&format!("    - MATCH,{INBOUND_PROXY}\n"));
+        }
+        out
+    }
+
+    fn mihomo_config(&self, users: &[User<'_>], keys: &Keys<'_>, exits: &[(&Cascade, String)]) -> Result<String> {
         let mut listeners = String::new();
         for listener in &self.listeners {
-            let listener_users = self.users(users, listener);
+            let listener_users = self.listener_users(users, listener);
             if !listener_users.is_empty() {
-                listeners.push_str(&self.listener_block(listener, &listener_users, private_key)?);
+                listeners.push_str(&self.listener_block(listener, &listener_users, keys.reality)?);
             }
         }
         let ipv6 = if self.profile.ipv6 == Ipv6::Enabled { "ipv6: true" } else { "ipv6: false" };
+        // AmneziaWG traffic arrives through TPROXY: a tproxy listener (not the
+        // top-level `tproxy-port`, which uses `rules:`) so it passes the same
+        // inbound rejects as every other listener.
+        if let (Some(_), Some(awg)) = (self.awg(), &self.node.params.awg) {
+            listeners.push_str(&format!("  - name: awg-tproxy\n    type: tproxy\n    listen: 0.0.0.0\n    port: {}\n    udp: true\n    rule: {INBOUND_RULE}\n",
+                awg.tproxy_port));
+        }
+        let (mut proxies, outbound) = match self.warp() {
+            Some(warp) => (super::warp::warp_block(warp, keys.warp), "      - warp-wg".to_owned()),
+            None => (String::new(), String::new()),
+        };
+        let mut groups = String::new();
+        for (cascade, yaml) in exits {
+            proxies.push_str(yaml);
+            groups.push_str(&cascade_group(&cascade.name));
+        }
         Ok(fill_template(MIHOMO_CONFIG, &[
-            ("#@ipv6", ipv6.to_owned()), ("#@tproxy", String::new()), ("#@proxies", String::new()),
-            ("#@outbound", String::new()), ("#@groups", String::new()), ("#@listeners", listeners),
-            ("#@sub-rules", inbound_sub_rules()),
+            ("#@ipv6", ipv6.to_owned()), ("#@tproxy", String::new()), ("#@proxies", proxies),
+            ("#@outbound", outbound), ("#@groups", groups), ("#@listeners", listeners),
+            ("#@sub-rules", self.sub_rules(users)),
         ]))
     }
 
@@ -421,15 +599,12 @@ impl Layout<'_> {
         text
     }
 
-    /// Managed files; contents only with `secrets` (users and the Reality
-    /// key), otherwise just the paths and modes.
-    fn files(&self, secrets: Option<(&[User<'_>], &str)>) -> Result<Vec<RenderedFile>> {
-        let text = |render: &dyn Fn() -> Result<String>| if secrets.is_some() { render() } else { Ok(String::new()) };
+    /// Managed files; contents only with `keys` (users and private keys),
+    /// otherwise just the paths and modes.
+    fn files(&self, users: &[User<'_>], keys: Option<&Keys<'_>>, exits: &[(&Cascade, String)]) -> Result<Vec<RenderedFile>> {
+        let text = |render: &dyn Fn() -> Result<String>| if keys.is_some() { render() } else { Ok(String::new()) };
         let mut files = vec![
-            file(MIHOMO_CONFIG_PATH, "0600", text(&|| {
-                let (users, private_key) = secrets.unwrap_or_default();
-                self.mihomo_config(users, private_key)
-            })?),
+            file(MIHOMO_CONFIG_PATH, "0600", keys.map_or(Ok(String::new()), |keys| self.mihomo_config(users, keys, exits))?),
             file(MIHOMO_SERVICE_PATH, "0644", text(&|| Ok(MIHOMO_SERVICE.to_owned()))?),
             file(SYSCTL_PATH, "0644", text(&|| Ok(self.sysctl()))?),
         ];
@@ -440,13 +615,29 @@ impl Layout<'_> {
         if self.front == Front::Stream {
             files.push(file(STREAM_PATH, "0644", text(&|| Ok(self.stream_config()))?));
         }
+        if let Some((_, port)) = self.awg() {
+            let params = self.node.params.awg.as_ref().ok_or_else(|| self.missing_params())?;
+            let conf = keys.map_or(Ok(String::new()), |keys| awg::server_conf(self.config, &self.node.name, params, port, keys.awg))?;
+            files.push(file(AWG_CONF_PATH, "0600", conf));
+        }
+        if let Some(host) = self.sub_host() {
+            files.extend([
+                file(&format!("{SITES_AVAILABLE}{SUB_SITE}"), "0644", text(&|| Ok(self.sub_site(host)))?),
+                file(&format!("{SITES_ENABLED}{SUB_SITE}"), "link", text(&|| Ok(format!("{SITES_AVAILABLE}{SUB_SITE}")))?),
+                file(SUB_LIMIT_PATH, "0644", text(&|| Ok(SUB_LIMIT.to_owned()))?),
+                file(SUB_CLEANUP_PATH, "0755", text(&|| Ok(SUB_CLEANUP.replace("{{sub_dir}}", SUB_DIR)))?),
+                file(SUB_CLEANUP_SERVICE_PATH, "0644", text(&|| Ok(SUB_CLEANUP_SERVICE.to_owned()))?),
+                file(SUB_CLEANUP_TIMER_PATH, "0644", text(&|| Ok(SUB_CLEANUP_TIMER.to_owned()))?),
+                file(&sub_marker(&host.hostname), "0644", String::new()),
+            ]);
+        }
         Ok(files)
     }
 
     /// Every rendered listener has the generated parameters it needs (the
     /// same checks the file render makes, without rendering).
     fn check_params(&self, users: &[User<'_>]) -> Result<()> {
-        for listener in self.listeners.iter().filter(|listener| !self.users(users, listener).is_empty()) {
+        for listener in self.listeners.iter().filter(|listener| !self.listener_users(users, listener).is_empty()) {
             if matches!(listener.kind, Kind::Tcp | Kind::Xhttp | Kind::Grpc) {
                 self.reality()?;
             }
@@ -463,7 +654,7 @@ impl Layout<'_> {
     /// TCP ports that must listen once the configuration is active.
     fn listen_tcp(&self, users: &[User<'_>]) -> Vec<u16> {
         let mut ports: BTreeSet<u16> = self.listeners.iter()
-            .filter(|listener| listener.kind != Kind::Hy2 && !self.users(users, listener).is_empty())
+            .filter(|listener| listener.kind != Kind::Hy2 && !self.listener_users(users, listener).is_empty())
             .map(|listener| listener.port).collect();
         if self.site.is_some() {
             ports.insert(if self.front == Front::SelfSteal { SITE_PORT } else { 443 });
@@ -471,29 +662,83 @@ impl Layout<'_> {
         if self.front == Front::Stream || self.nginx_on_443() {
             ports.insert(443);
         }
+        // mihomo's TPROXY inlet of AmneziaWG traffic.
+        if let (Some(_), Some(awg)) = (self.awg(), &self.node.params.awg) {
+            ports.insert(awg.tproxy_port);
+        }
+        if let Some(host) = self.sub_host() {
+            ports.insert(self.sub_port(host));
+        }
         ports.into_iter().collect()
     }
 
+    /// TCP port of the subscription vhost: an internal one behind the 443
+    /// front, otherwise its own.
+    fn sub_port(&self, host: &SubscriptionHost) -> u16 {
+        match (host.port, self.front) {
+            (443, Front::SelfSteal) => SITE_PORT,
+            (443, Front::Stream) => SUB_INNER_PORT,
+            (port, _) => port,
+        }
+    }
+
+    /// The subscription vhost: on 443 behind the node's front, otherwise on
+    /// its own port.
+    fn sub_site(&self, host: &SubscriptionHost) -> String {
+        let listen = match (host.port, self.front) {
+            (443, Front::SelfSteal | Front::Stream) => format!("    listen 127.0.0.1:{} ssl http2;", self.sub_port(host)),
+            (443, _) => "    listen 443 ssl http2;\n    listen [::]:443 ssl http2;".to_owned(),
+            (port, _) => format!("    listen 0.0.0.0:{port} ssl http2;"),
+        };
+        fill_template(&NGINX_SUB.replace("{{hostname}}", &host.hostname).replace("{{sub_dir}}", SUB_DIR), &[("{{listen}}", listen)])
+    }
+
     /// Canonical digest input: everything the rendered files depend on.
-    fn digest(&self, users: &[User<'_>]) -> String {
+    fn digest(&self, users: &[User<'_>], exits: &[(&Cascade, String)]) -> String {
         let mut profile = serde_json::to_value(self.profile).unwrap_or(Value::Null);
         if let Some(object) = profile.as_object_mut() {
             object.remove("name");
         }
         let mut listener_users = serde_json::Map::new();
         for listener in &self.listeners {
-            let users = self.users(users, listener);
+            let users = self.listener_users(users, listener);
             if !users.is_empty() {
-                listener_users.insert(listener.marker.into(), json!(users.iter().map(|(n, c)| [n, c]).collect::<Vec<_>>()));
+                listener_users.insert(listener.marker.into(), json!(users));
             }
         }
+        let cascades: Vec<Value> = exits.iter().map(|(cascade, yaml)| json!([cascade.name, cascade.listener, yaml])).collect();
+        // A WARP account that the profile no longer uses does not count.
+        let mut params = self.node.params.clone();
+        if !self.profile.warp {
+            params.warp = None;
+        }
+        let peers: Vec<Value> = if self.awg().is_some() {
+            awg::expected_peers(self.config, &self.node.name).iter().filter_map(|client| client.credentials.as_ref()
+                .map(|c| json!([client.name, c.awg_index, c.awg_private_key, c.awg_preshared_key]))).collect()
+        } else {
+            Vec::new()
+        };
         let host = self.config.subscription_host.as_ref().filter(|host| host.node == self.node.name);
         let telegram = self.config.telegram.iter().find(|proxy| proxy.node == self.node.name);
         digest_of(&json!({
             "revision": RENDER_REVISION, "profile": profile, "ip": self.node.ip, "port": self.node.port,
-            "domain": self.node.domain, "ports": self.node.ports, "params": self.node.params, "users": listener_users,
-            "awg_peers": [], "cascades": [], "subscription_host": host, "telegram": telegram, "tg_revision": null,
+            "domain": self.node.domain, "ports": self.node.ports, "params": params, "users": listener_users,
+            "awg_peers": peers, "cascades": cascades, "subscription_host": host, "telegram": telegram, "tg_revision": null,
         }))
+    }
+
+    /// The reject lines every inbound sub-rule starts with: [`INBOUND_REJECT`]
+    /// and the node's own address (`DIRECT` would reach it over `lo`, past the
+    /// firewall). Without `no-resolve`, so a domain that resolves into these
+    /// ranges is rejected too.
+    fn inbound_rejects(&self) -> String {
+        let own = match self.node.ip.parse::<IpAddr>() {
+            Ok(IpAddr::V4(ip)) => Some(format!("IP-CIDR,{ip}/32")),
+            Ok(IpAddr::V6(ip)) => Some(format!("IP-CIDR6,{ip}/128")),
+            Err(_) => None,
+        };
+        INBOUND_REJECT.iter().map(|rule| (*rule).to_owned()).chain(own)
+            .map(|rule| format!("    - {rule},REJECT\n")).collect()
     }
 }
 
@@ -510,14 +755,51 @@ pub const INBOUND_REJECT: [&str; 9] = [
     "IP-CIDR,192.168.0.0/16", "IP-CIDR,100.64.0.0/10", "IP-CIDR6,fc00::/7", "IP-CIDR6,fe80::/10",
 ];
 
-/// `sub-rules:` with `essence-in`: the rejects, then `outbound`.
-fn inbound_sub_rules() -> String {
-    let mut text = format!("sub-rules:\n  {INBOUND_RULE}:\n");
-    for rule in INBOUND_REJECT {
-        text.push_str(&format!("    - {rule},REJECT\n"));
-    }
-    text.push_str(&format!("    - MATCH,{INBOUND_PROXY}\n"));
-    text
+/// The `<C>-outbound` group of a cascade: its exit, else direct. The exit
+/// proxy is named after the cascade and quoted like its `name:` (`-`, `null`).
+fn cascade_group(name: &str) -> String {
+    format!("  - name: {name}-outbound\n    type: fallback\n    proxies:\n      - {}\n      - DIRECT\n\
+        \x20   url: https://www.gstatic.com/generate_204\n    interval: 10\n    timeout: 3000\n    lazy: false\n", yaml_name(name))
+}
+
+/// The exit proxy (named after the cascade) on its entry node: the external
+/// URI, or the exit node's listener as its clients see it with the cascade
+/// credentials.
+fn exit_yaml(config: &Config, cascade: &Cascade) -> Result<String> {
+    let broken = |reason: String| invalid(format!("Выход каскада «{}»: {reason}", cascade.name)).with_extra("name", cascade.name.clone());
+    let exit = match &cascade.exit {
+        CascadeExit::Uri(exit) => {
+            return parse_exit_uri(&cascade.name, &exit.uri).map(|proxy| proxy.yaml).map_err(|error| broken(error.to_string()));
+        }
+        CascadeExit::Node(exit) => exit,
+    };
+    let node = config.nodes.iter().find(|node| node.name == exit.node).ok_or_else(|| broken(format!("нода «{}» не найдена.", exit.node)))?;
+    let layout = layout(config, node)?.ok_or_else(|| broken(format!("у ноды «{}» нет профиля.", node.name)))?;
+    let proxy = cascade::exit_proxy_name(exit.proxy);
+    let listener = layout.listeners.iter().find(|listener| listener.name == proxy)
+        .ok_or_else(|| broken(format!("подключение «{proxy}» не включено на ноде «{}».", node.name)))?;
+    let port = listener.client_port.to_string();
+    let (name, server, uuid) = (cascade.name.as_str(), layout.server, cascade.uuid.as_str());
+    Ok(match listener.kind {
+        Kind::Hy2 => {
+            let (_, _, sni, skip_cert_verify) = layout.hy2_tls();
+            hy2::exit_yaml(&hy2::Hy2 {
+                name, server, port: &port, password: &cascade.password, sni, skip_cert_verify, obfs_password: layout.hy2_obfs()?,
+            })
+        }
+        Kind::XhttpNginx => vless_xhttp::exit_yaml(&Vless {
+            name, server, port: &port, uuid, sni: layout.site.unwrap_or_default(), public_key: "", short_id: "",
+        }, layout.xhttp_path()?, "auto"),
+        kind => {
+            let (public_key, short_id) = layout.reality()?;
+            let vless = Vless { name, server, port: &port, uuid, sni: layout.sni, public_key, short_id };
+            match kind {
+                Kind::Tcp => vless_tcp::exit_yaml(&vless, "xtls-rprx-vision", "chrome"),
+                Kind::Xhttp => vless_xhttp::exit_yaml(&vless, layout.xhttp_path()?, "auto"),
+                _ => vless_grpc::exit_yaml(&vless, layout.grpc_service()?, "chrome"),
+            }
+        }
+    })
 }
 
 fn file(path: &str, mode: &'static str, content: String) -> RenderedFile {
@@ -565,10 +847,12 @@ fn site_source(source: SiteSource) -> &'static str {
 
 fn bool_text(value: bool) -> String { if value { "true" } else { "false" }.to_owned() }
 
-/// Site names of an applied file set (`sites-available/<name>`).
-fn applied_sites(node: &Node) -> Vec<String> {
-    node.applied.iter().flat_map(|applied| applied.files.keys())
-        .filter_map(|path| path.strip_prefix(SITES_AVAILABLE)).map(str::to_owned).collect()
+/// Certificate names of an applied file set: sites (`sites-available/<name>`)
+/// and the subscription hostname (its webroot marker).
+fn applied_certs(node: &Node) -> Vec<String> {
+    node.applied.iter().flat_map(|applied| applied.files.keys()).filter_map(|path| {
+        path.strip_prefix(SITES_AVAILABLE).filter(|site| *site != SUB_SITE).or_else(|| sub_marker_host(path))
+    }).map(str::to_owned).collect()
 }
 
 /// Paths of the previous set that the new one no longer has, with the
@@ -605,16 +889,30 @@ pub fn desired(config: &Config, node: &Node, secrets: Option<&NodeSecrets>) -> R
     };
     let users = layout.node_users()?;
     layout.check_params(&users)?;
-    let contents = secrets.map(|s| (users.as_slice(), s.reality_key.as_deref().map(String::as_str).unwrap_or_default()));
-    let files = layout.files(contents)?;
+    let exits = layout.cascade_exits()?;
+    let keys = secrets.map(|secrets| Keys::of(Some(secrets)));
+    let files = layout.files(&users, keys.as_ref(), &exits)?;
     let keep: BTreeSet<&str> = files.iter().map(|f| f.path.as_str()).collect();
     let remove = removed(node, &keep);
-    let release: Vec<String> = applied_sites(node).into_iter().filter(|site| layout.site != Some(site.as_str())).collect();
+    let sub_host = layout.sub_host().map(|host| host.hostname.as_str());
+    let certs: Vec<&str> = layout.site.into_iter().chain(sub_host).collect();
+    let release: Vec<String> = applied_certs(node).into_iter().filter(|name| !certs.contains(&name.as_str())).collect();
     let ports = layout.rules();
+    let mut listen = ports.clone();
+    if let (Some(_), Some(awg)) = (layout.awg(), &node.params.awg) {
+        listen.extend([format!("{}/tcp", awg.tproxy_port), format!("{}/udp", awg.tproxy_port)]);
+    }
     let profile = layout.profile;
     let (_, _, hy2_cn, hy2_cert) = layout.hy2_tls();
     let hy2_cert = hy2_cert && profile.hysteria2.is_some();
     let site = layout.site.unwrap_or_default();
+    let applied_has = |path: &str| node.applied.as_ref().is_some_and(|applied| applied.files.contains_key(path));
+    let had_awg = applied_has(AWG_CONF_PATH);
+    let had_sub = applied_has(&format!("{SITES_AVAILABLE}{SUB_SITE}"));
+    let awg_port = layout.awg().map(|(_, port)| port);
+    let features: Vec<&str> = [awg_port.is_some().then_some("awg"), sub_host.map(|_| "sub")].into_iter().flatten().collect();
+    let remove_features: Vec<&str> = [(had_awg && awg_port.is_none()).then_some("awg"), (had_sub && sub_host.is_none()).then_some("sub")]
+        .into_iter().flatten().collect();
     let spec = vec![
         ("OP_MODE", "apply".to_owned()),
         ("SSH_PORTS", node.port.to_string()),
@@ -625,15 +923,18 @@ pub fn desired(config: &Config, node: &Node, secrets: Option<&NodeSecrets>) -> R
         ("SITE_NAME", site.to_owned()),
         ("SITE_SOURCE", if site.is_empty() { String::new() } else { site_source(profile.site_source).to_owned() }),
         ("SITE_REQUIRE_200", bool_text(!site.is_empty() && layout.front == Front::SelfSteal)),
-        ("CERTS", if site.is_empty() { String::new() } else { format!("{site}:/var/www/{site}") }),
+        ("CERTS", certs.iter().map(|name| format!("{name}:/var/www/{name}")).collect::<Vec<_>>().join(" ")),
         ("ACME_EMAIL", profile.acme_email.clone()),
-        ("DNS_DOMAINS", site.to_owned()),
+        ("DNS_DOMAINS", certs.join(" ")),
         ("HY2_CERT", bool_text(hy2_cert)),
         ("HY2_CN", if hy2_cert { hy2_cn.to_owned() } else { String::new() }),
         ("UFW_RULES", ports.join(" ")),
         ("RELEASE_CERTS", release.iter().map(|name| format!("{name}:/var/www/{name}")).collect::<Vec<_>>().join(" ")),
-        ("FEATURES", String::new()),
-        ("REMOVE_FEATURES", String::new()),
+        ("FEATURES", features.join(" ")),
+        ("REMOVE_FEATURES", remove_features.join(" ")),
+        ("AWG_PORT", awg_port.map(|port| port.to_string()).unwrap_or_default()),
+        ("WARP", bool_text(profile.warp)),
+        ("SUB_HOST", sub_host.unwrap_or_default().to_owned()),
     ];
 
     let mut lines = vec![
@@ -647,19 +948,51 @@ pub fn desired(config: &Config, node: &Node, secrets: Option<&NodeSecrets>) -> R
         },
     ];
     for listener in &layout.listeners {
-        let count = layout.users(&users, listener).len();
-        lines.push(if count == 0 {
+        let count = client_users(config, node, &users, listener).len();
+        lines.push(if layout.listener_users(&users, listener).is_empty() {
             format!("{}: нет клиентов — входное подключение не создаётся.", listener.name)
         } else {
             format!("{}: порт {}, клиентов {count}", listener.name, listener.client_port)
         });
+    }
+    for cascade in config.cascades.iter().filter(|cascade| cascade.entry == node.name) {
+        let name = cascade::listener_name(cascade.listener);
+        let line = match layout.listeners.iter().find(|listener| listener.name == name) {
+            None => format!("Каскад «{}»: подключение «{name}» не включено в профиле — каскад не работает.", cascade.name),
+            Some(listener) => {
+                let exit = match &cascade.exit {
+                    CascadeExit::Node(exit) => format!("нода {} ({})", exit.node, cascade::exit_proxy_name(exit.proxy)),
+                    CascadeExit::Uri(_) => "внешний сервер".to_owned(),
+                };
+                format!("Каскад «{}»: вход {name}, выход — {exit}, клиентов {}", cascade.name,
+                    layout.cascade_users(&users, listener, cascade).len())
+            }
+        };
+        lines.push(line);
+    }
+    for listener in &layout.listeners {
+        for cascade in layout.exit_cascades(listener) {
+            lines.push(format!("Каскад «{}»: выход через {} этой ноды.", cascade.name, listener.name));
+        }
+    }
+    if let Some((_, port)) = layout.awg() {
+        let peers = awg::expected_peers(config, &node.name).len();
+        lines.push(format!("AWG: порт {port}, клиентов {peers}"));
+    }
+    match super::warp::registration(profile, node) {
+        Some(reregister) => lines.push(super::warp::plan_line(reregister).to_owned()),
+        None if layout.warp().is_some() => lines.push("WARP: исходящий трафик через Cloudflare.".to_owned()),
+        None => {}
+    }
+    if let Some(host) = layout.sub_host() {
+        lines.push(format!("Хост подписок: {}", host.base_url));
     }
     lines.extend(remove.iter().map(|path| format!("Будет удалено: {path}")));
     lines.extend(release.iter().map(|name| format!("Будет удалён сертификат и сайт: {name}")));
     if node.applied.is_none() {
         lines.push(format!("Первая установка: UFW будет включён, если выключен (SSH TCP/{} разрешён).", node.port));
     }
-    Ok(Desired { teardown: false, digest: layout.digest(&users), files, remove, spec, ports, lines })
+    Ok(Desired { teardown: false, digest: layout.digest(&users, &exits), files, remove, spec, ports, listen, lines })
 }
 
 fn teardown_digest() -> String {
@@ -683,7 +1016,7 @@ pub fn teardown(node: &Node) -> Desired {
         }
     }
     let remove: Vec<String> = remove.into_iter().collect();
-    let release = applied_sites(node);
+    let release = applied_certs(node);
     let mut lines = vec![
         format!("Нода: {}  {}:{}", node.name, node.ip, node.port),
         "Профиль снят: всё установленное Essence будет удалено.".to_owned(),
@@ -697,8 +1030,9 @@ pub fn teardown(node: &Node) -> Desired {
         ("RELEASE_CERTS", release.iter().map(|name| format!("{name}:/var/www/{name}")).collect::<Vec<_>>().join(" ")),
         ("FEATURES", String::new()),
         ("REMOVE_FEATURES", "awg sub telegram".to_owned()),
+        ("WARP", "false".to_owned()),
     ];
-    Desired { teardown: true, files: Vec::new(), remove, spec, ports: Vec::new(), lines, digest: teardown_digest() }
+    Desired { teardown: true, files: Vec::new(), remove, spec, ports: Vec::new(), listen: Vec::new(), lines, digest: teardown_digest() }
 }
 
 /// `none` (no profile, nothing applied), `running`, `applied` or `pending`
@@ -728,31 +1062,29 @@ pub fn proxies(config: &Config, node: &Node) -> Vec<String> {
 }
 
 /// The node's client proxies in the `proxies:` … `---` form `generate`
-/// parses, with placeholder credentials. `None` when the node has no profile,
-/// lacks a needed domain or generated parameters.
+/// parses, with placeholder credentials: listeners, then the cascades
+/// entering through them (named after the cascade), then AmneziaWG peers.
+/// `None` when the node has no profile, lacks a needed domain or generated
+/// parameters.
 pub fn client_section(config: &Config, node: &Node) -> Option<String> {
     let layout = layout(config, node).ok()??;
-    let mut out = String::from("proxies:\n");
-    for listener in &layout.listeners {
+    let block = |listener: &Listener, name: &str| -> Option<String> {
         let port = listener.client_port.to_string();
         let block = match listener.kind {
             Kind::Hy2 => {
                 let (_, _, sni, skip_cert_verify) = layout.hy2_tls();
                 hy2::client_yaml(&hy2::Hy2 {
-                    name: listener.name, server: layout.server, port: &port, password: PLACEHOLDER_PASSWORD,
+                    name, server: layout.server, port: &port, password: PLACEHOLDER_PASSWORD,
                     sni, skip_cert_verify, obfs_password: layout.hy2_obfs().ok()?,
                 })
             }
             Kind::XhttpNginx => vless_xhttp::client_yaml(&Vless {
-                name: listener.name, server: layout.server, port: &port, uuid: PLACEHOLDER_UUID,
+                name, server: layout.server, port: &port, uuid: PLACEHOLDER_UUID,
                 sni: layout.site.unwrap_or_default(), public_key: "", short_id: "",
             }, layout.xhttp_path().ok()?),
             kind => {
                 let (public_key, short_id) = layout.reality().ok()?;
-                let vless = Vless {
-                    name: listener.name, server: layout.server, port: &port, uuid: PLACEHOLDER_UUID,
-                    sni: layout.sni, public_key, short_id,
-                };
+                let vless = Vless { name, server: layout.server, port: &port, uuid: PLACEHOLDER_UUID, sni: layout.sni, public_key, short_id };
                 match kind {
                     Kind::Tcp => vless_tcp::client_yaml(&vless),
                     Kind::Xhttp => vless_xhttp::client_yaml(&vless, layout.xhttp_path().ok()?),
@@ -760,10 +1092,63 @@ pub fn client_section(config: &Config, node: &Node) -> Option<String> {
                 }
             }
         };
-        out.push_str(block.split_once('\n').map_or("", |(_, rest)| rest));
+        Some(block.split_once('\n').map_or("", |(_, rest)| rest).to_owned())
+    };
+    let mut out = String::from("proxies:\n");
+    for listener in &layout.listeners {
+        out.push_str(&block(listener, listener.name)?);
+    }
+    for listener in &layout.listeners {
+        for cascade in layout.entry_cascades(listener) {
+            out.push_str(&block(listener, &cascade.name)?);
+        }
+    }
+    if let (Some((profile, port)), Some(params)) = (layout.awg(), node.params.awg.as_ref()) {
+        for client in awg::expected_peers(config, &node.name) {
+            out.push_str(&awg::proxy_block(client, layout.server, port, profile, params)?);
+        }
     }
     out.push_str("---\n");
     Some(out)
+}
+
+/// `client awg-config`: the native AmneziaWG config of a peer of the node.
+pub fn awg_client_config(config: &Config, node: &Node, client: &Client) -> Result<String> {
+    let layout = layout(config, node)?.ok_or_else(|| invalid(format!("У ноды «{}» нет профиля.", node.name)))?;
+    let (Some((profile, port)), Some(params)) = (layout.awg(), node.params.awg.as_ref()) else {
+        return Err(invalid(format!("На ноде «{}» нет AmneziaWG.", node.name)).with_extra("name", node.name.clone()));
+    };
+    if !awg::expected_peers(config, &node.name).iter().any(|peer| peer.name == client.name) {
+        return Err(invalid(format!("Клиент «{}» не использует AmneziaWG на ноде «{}».", client.name, node.name))
+            .with_extra("name", client.name.clone()).with_extra("node", node.name.clone()));
+    }
+    awg::client_conf(client, layout.server, port, profile, params)
+        .ok_or_else(|| invalid(format!("У клиента «{}» нет учётных данных AmneziaWG.", client.name)))
+}
+
+/// Nodes where `client awg-config` serves the client: AmneziaWG is on in the
+/// node's profile, its parameters exist and the client is one of its peers.
+pub fn awg_nodes(config: &Config, client: &Client) -> Vec<String> {
+    config.nodes.iter().filter(|node| {
+        matches!(layout(config, node), Ok(Some(layout)) if layout.awg().is_some())
+            && node.params.awg.is_some()
+            && awg::expected_peers(config, &node.name).iter().any(|peer| peer.name == client.name)
+    }).map(|node| node.name.clone()).collect()
+}
+
+/// The subscription role of the node is installed as configured, whatever
+/// else is pending there: the applied state holds the hostname's webroot
+/// marker and the vhost the configuration renders now (hostname, listen,
+/// data directory), and a running operation, if any, keeps both.
+pub fn sub_role_applied(config: &Config, node: &Node) -> bool {
+    let Ok(Some(layout)) = layout(config, node) else { return false };
+    let Some(host) = layout.sub_host() else { return false };
+    let site = format!("{SITES_AVAILABLE}{SUB_SITE}");
+    let hash = hex::encode(Sha256::digest(layout.sub_site(host).as_bytes()));
+    let marker = sub_marker(&host.hostname);
+    let installed = |files: &BTreeMap<String, String>| files.get(&site) == Some(&hash) && files.contains_key(&marker);
+    node.applied.as_ref().is_some_and(|applied| installed(&applied.files))
+        && node.operation.as_ref().is_none_or(|operation| installed(&operation.files))
 }
 
 /// SHA-256 of rendered file contents by path (links are not recorded).

@@ -1,7 +1,7 @@
-// Модель обзора подключений нод, вкладок ноды «Подключения», «AmneziaWG» и
+// Модель обзора подключений нод, вкладки ноды «Подключения» и
 // экрана «Telegram Proxy» — перенос чистой логики `tui/src/nodes.rs`
 // (`Connections::run`, `synced_node`, `sync_problem`, `assign_connections`,
-// `awg_node`, argv команд, таблица `telegram_table`) и потоки Telegram
+// argv команд, таблица `telegram_table`) и потоки Telegram
 // (`telegram_batch`) поверх `ctx`. Без DOM и вендоренных файлов: окно
 // результатов экран передаёт функцией. Тоны: `ok` (GREEN), `warn` (YELLOW),
 // `error` (RED), `neutral` (DIM).
@@ -232,43 +232,6 @@ export async function syncConnections(ctx, name) {
     }
     return { synced };
   }
-}
-
-// ─── AmneziaWG ───────────────────────────────────────────────────────────────
-
-export const AWG_REMOVE_TITLE = 'Удаление клиента AmneziaWG';
-export const AWG_ORPHANS_TITLE = 'Удаление неиспользуемых клиентов AmneziaWG';
-
-export const awgStatusArgv = (name) => ['awg', 'status', '--name', name];
-export const awgSyncArgv = (name) => ['awg', 'sync', '--name', name];
-export const awgRemovePeerArgv = (name, peer) => ['awg', 'remove', '--name', name, '--peer', peer];
-export const awgOrphansArgv = (name) => ['awg', 'remove', '--name', name, '--orphans'];
-
-/** Состояния клиентов AmneziaWG (`awg_node`). */
-const AWG_STATES = {
-  used: { tone: 'ok', label: 'используется' },
-  orphan: { tone: 'warn', label: 'не используется' },
-  missing: { tone: 'neutral', label: 'не создан' },
-};
-
-/**
- * Вкладка AmneziaWG ноды (`awg_node`) по ответу `awg status`: строки
- * клиентов, признаки недостающих и неиспользуемых. `removable` — клиент
- * существует на ноде (не `missing`).
- */
-export function awgView(data) {
-  const installed = Boolean(data) && data.installed === true;
-  const peers = installed ? asList(data.peers) : [];
-  const table = peers.map((peer) => {
-    const state = AWG_STATES[peer.status] || AWG_STATES.missing;
-    return { name: nodeText(peer.name), status: peer.status, tone: state.tone, label: state.label, removable: peer.status !== 'missing' };
-  });
-  return {
-    installed,
-    table,
-    missing: table.some((row) => row.status === 'missing'),
-    orphans: table.some((row) => row.status === 'orphan'),
-  };
 }
 
 // ─── Telegram ────────────────────────────────────────────────────────────────

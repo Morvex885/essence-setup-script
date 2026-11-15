@@ -1,7 +1,7 @@
 // Профили нод (`#/profiles`, `#/profiles/<имя>`) — паритет с экраном TUI
 // `Profiles` (`tui/src/nodes.rs`): список, добавление одной формой, карточка
 // (`profile show`) с действиями «Изменить», «Применить на нодах профиля»,
-// «Удалить». Логика — `profiles-model.js`.
+// «Ключ WARP+», «Убрать ключ WARP+», «Удалить». Логика — `profiles-model.js`.
 import { html, useEffect } from '../../vendor/preact-htm.js';
 import { Page, Card, DataTable, MoreMenu, Facts, Badge, Chips, Empty, Button } from '../ui.js';
 import { useCommand, useBusy, useMounted, Loaded } from './kit.js';
@@ -82,7 +82,13 @@ function ProfileCard({ ctx, name }) {
         <${Button} kind="primary" icon="check" disabled=${busy || nodes.length === 0}
           onClick=${() => act(() => model.applyProfile(ctx, name))}>Применить на нодах профиля<//>
         <${Button} icon="pencil" disabled=${busy} onClick=${() => act(() => model.editProfileFlow(ctx, profile))}>Изменить<//>
-        <${MoreMenu} items=${[{ label: 'Удалить профиль', icon: 'trash-2', danger: true, disabled: busy, onClick: remove }]} />`;
+        <${MoreMenu} items=${[
+          { label: 'Ключ WARP+', icon: 'key-round', disabled: busy, onClick: () => act(() => model.warpLicenseFlow(ctx, name)) },
+          ...(profile.warp_plus === true
+            ? [{ label: 'Убрать ключ WARP+', icon: 'trash-2', disabled: busy, onClick: () => act(() => model.clearWarpLicense(ctx, name)) }]
+            : []),
+          { label: 'Удалить профиль', icon: 'trash-2', danger: true, disabled: busy, onClick: remove },
+        ]} />`;
       return html`<${Page} title=${name} back=${back} actions=${actions}
         badge=${model.needsDomain(profile) && html`<${Badge} tone="info">нужен домен ноды<//>`}>
         <${Card}>

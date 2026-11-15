@@ -280,14 +280,27 @@ fn every_listener_routes_through_the_inbound_sub_rule() {
     }
     assert!(!mihomo.contains("\n    proxy: "), "no listener bypasses the rules: {mihomo}");
     let rules: Vec<&str> = document["sub-rules"]["essence-in"].as_vec().unwrap().iter().map(|rule| rule.as_str().unwrap()).collect();
-    // Without `no-resolve`: a domain pointing into these networks is rejected too.
+    // Without `no-resolve`: a domain that resolves into a rejected range is
+    // rejected too. The node's own address comes last.
     assert_eq!(rules, [
         "IP-CIDR,127.0.0.0/8,REJECT", "IP-CIDR6,::1/128,REJECT", "IP-CIDR,169.254.0.0/16,REJECT",
         "IP-CIDR,10.0.0.0/8,REJECT", "IP-CIDR,172.16.0.0/12,REJECT", "IP-CIDR,192.168.0.0/16,REJECT",
         "IP-CIDR,100.64.0.0/10,REJECT", "IP-CIDR6,fc00::/7,REJECT", "IP-CIDR6,fe80::/10,REJECT",
-        "MATCH,outbound",
+        "IP-CIDR,198.51.100.7/32,REJECT", "MATCH,outbound",
     ]);
-    assert!(!mihomo.contains("no-resolve"));
+    assert!(!mihomo.contains("no-resolve"), "{mihomo}");
+}
+
+#[test]
+fn the_node_rejects_its_own_address() {
+    let mut config = config(profile());
+    config.nodes[0].ip = "2001:db8::7".into();
+    let mihomo = content(&render(&config), MIHOMO_CONFIG_PATH).to_owned();
+    assert!(mihomo.contains("    - IP-CIDR6,2001:db8::7/128,REJECT\n"), "{mihomo}");
+    // A host name cannot be matched by address.
+    config.nodes[0].ip = "de.example.com".into();
+    let mihomo = content(&render(&config), MIHOMO_CONFIG_PATH).to_owned();
+    assert!(!mihomo.contains("de.example.com/"), "{mihomo}");
 }
 
 #[test]
@@ -486,4 +499,362 @@ fn proxies_list_enabled_protocols_and_cascades() {
     assert_eq!(proxies(&config, &config.nodes[0]), ["VLESS TCP", "VLESS gRPC", "Hysteria2", "AWG", "hop"]);
     config.nodes[0].profile = None;
     assert!(proxies(&config, &config.nodes[0]).is_empty());
+}
+
+/// A profile with AmneziaWG; clients alpha (index 3) and beta (index 2) are peers.
+fn awg_config() -> Config {
+    let mut profile = profile();
+    profile.amneziawg = Some(AmneziaWg { port: 51820, dns: "1.1.1.1, 1.0.0.1".into() });
+    let mut config = config(profile);
+    config.nodes[0].params.awg = Some(NodeAwg { public_key: "SERVERPUB".into(), header_protection_key: "HPK".into(),
+        tproxy_port: 23456, jc: 5, s1: 20, s2: 30, s3: 40 });
+    config.clients.push(client("beta", "beta-pass"));
+    let keys = [("alpha", 3, [7u8; 32]), ("beta", 2, [9u8; 32])];
+    for (name, index, key) in keys {
+        let credentials = config.clients.iter_mut().find(|c| c.name == name).unwrap().credentials.as_mut().unwrap();
+        credentials.awg_index = index;
+        credentials.awg_private_key = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key);
+        credentials.awg_preshared_key = format!("PSK-{name}");
+    }
+    config
+}
+
+fn awg_secrets() -> NodeSecrets {
+    NodeSecrets { reality_key: Some(Zeroizing::new("PRIVKEY".into())), awg_key: Some(Zeroizing::new("SERVERPRIV".into())), ..NodeSecrets::default() }
+}
+
+#[test]
+fn amneziawg_renders_the_server_config_peers_and_tproxy() {
+    let config = awg_config();
+    let desired = desired(&config, &config.nodes[0], Some(&awg_secrets())).unwrap();
+    let conf = content(&desired, AWG_CONF_PATH);
+    assert!(conf.starts_with("[Interface]\nPrivateKey = SERVERPRIV\nAddress = 10.10.0.1/16\nListenPort = 51820\nJc = 5\nJmin = 10\nJmax = 50\n\
+        S1 = 20\nS2 = 30\nS3 = 40\nS4 = 12\nH1 = 1\nH2 = 2\nH3 = 3\nH4 = 4\nHeaderProtectionKey = HPK\nContentPaddingAddition = 10-100\n\
+        RekeyAfterTime = 100-120\nRekeyTimeout = 3-7\nRejectAfterTime = 150-180\nKeepaliveTimeout = 5-15\nMaxHandshakeAttempts = 15-20\n\
+        RandomTrailers = on\nDisableCookies = on\nPostUp = "), "{conf}");
+    assert!(conf.contains("--on-port 23456 --tproxy-mark 1") && !conf.contains("10.10.8"));
+    // Peers are isolated: no forward between them, and only the server's own
+    // address skips TPROXY (other peers go through mihomo's rejects).
+    let (up, down) = conf.split_once("\nPostDown = ").unwrap();
+    assert!(up.contains("PostUp = iptables -I FORWARD -i %i -o %i -j DROP; "), "{conf}");
+    assert!(down.starts_with("iptables -D FORWARD -i %i -o %i -j DROP || true; "), "{conf}");
+    assert!(up.contains("-d 10.10.0.1/32 -j RETURN") && !conf.contains("-d 10.10.0.0/16"), "{conf}");
+    let beta = conf.find("# peer: beta").unwrap();
+    let alpha = conf.find("# peer: alpha").unwrap();
+    assert!(beta < alpha, "peers by ascending index");
+    assert!(conf.contains("\n# peer: beta\n[Peer]\nPublicKey = ") && conf.contains("PresharedKey = PSK-beta\nAllowedIPs = 10.10.0.2/32\n"));
+    assert!(conf.contains("AllowedIPs = 10.10.0.3/32\n"));
+    let public = crate::server::keys::wg_public(&config.clients[0].credentials.as_ref().unwrap().awg_private_key).unwrap();
+    assert!(conf.contains(&format!("# peer: alpha\n[Peer]\nPublicKey = {public}\n")));
+    let mihomo = content(&desired, MIHOMO_CONFIG_PATH);
+    assert!(!mihomo.contains("tproxy-port:"), "the top-level tproxy port would bypass the inbound rejects");
+    assert!(mihomo.contains("  - name: awg-tproxy\n    type: tproxy\n    listen: 0.0.0.0\n    port: 23456\n    udp: true\n    rule: essence-in\n"), "{mihomo}");
+    assert_eq!((spec(&desired, "FEATURES"), spec(&desired, "AWG_PORT")), ("awg", "51820"));
+    assert_eq!(spec(&desired, "UFW_RULES"), "443/tcp 51820/udp");
+    assert_eq!(spec(&desired, "LISTEN_TCP"), "443 8443 23456");
+    assert!(desired.lines.contains(&"AWG: порт 51820, клиентов 2".to_owned()));
+    assert_eq!(awg::peer_ip(258), "10.10.1.2");
+
+    // A client without AWG in its connections is no peer.
+    let mut config = config;
+    config.connections[0].groups[0].proxies = vec!["VLESS TCP".into()];
+    assert!(!content(&self::desired(&config, &config.nodes[0], Some(&awg_secrets())).unwrap(), AWG_CONF_PATH).contains("# peer:"));
+}
+
+#[test]
+fn amneziawg_client_blocks_and_native_config() {
+    let config = awg_config();
+    let section = client_section(&config, &config.nodes[0]).unwrap();
+    let alpha_key = config.clients[0].credentials.as_ref().unwrap().awg_private_key.clone();
+    assert!(section.contains(&format!("  - name: awg-alpha\n    type: wireguard\n    private-key: {alpha_key}\n    server: de.example.com\n    port: 51820\n\
+        \x20   ip: 10.10.0.3\n    mtu: 1280\n    dns: ['1.1.1.1', '1.0.0.1']\n    public-key: SERVERPUB\n    pre-shared-key: PSK-alpha\n\
+        \x20   allowed-ips: ['0.0.0.0/0', '::/0']\n    udp: true\n    persistent-keepalive: 25\n    amnezia-wg-option:\n      version: 3\n      jc: 5\n")), "{section}");
+    assert!(section.contains("      random-trailers: true\n      disable-cookies: true\n") && section.ends_with("---\n"));
+    let native = awg_client_config(&config, &config.nodes[0], &config.clients[0]).unwrap();
+    assert!(native.starts_with(&format!("[Interface]\nAddress = 10.10.0.3/32\nDNS = 1.1.1.1, 1.0.0.1\nMTU = 1280\nPrivateKey = {alpha_key}\nJc = 5\n")));
+    assert!(native.ends_with("\n[Peer]\nPublicKey = SERVERPUB\nPresharedKey = PSK-alpha\nAllowedIPs = 0.0.0.0/0, ::/0\nEndpoint = de.example.com:51820\nPersistentKeepalive = 25\n"));
+    let mut other = config.clone();
+    other.connections[0].groups[0].proxies = vec!["VLESS TCP".into()];
+    assert_eq!(awg_client_config(&other, &other.nodes[0], &other.clients[0]).unwrap_err().code, "invalid");
+    let plain = self::config(profile());
+    assert_eq!(awg_client_config(&plain, &plain.nodes[0], &plain.clients[0]).unwrap_err().code, "invalid");
+}
+
+#[test]
+fn awg_nodes_follow_the_peer_rule() {
+    let mut config = awg_config();
+    assert_eq!(awg_nodes(&config, &config.clients[0]), ["de"]);
+    // No connections on the node: the client uses every one, AmneziaWG too.
+    config.connections[0].groups[0].proxies.clear();
+    assert_eq!(awg_nodes(&config, &config.clients[0]), ["de"]);
+    assert!(awg_client_config(&config, &config.nodes[0], &config.clients[0]).is_ok());
+    config.connections[0].groups[0].proxies = vec!["VLESS TCP".into()];
+    assert!(awg_nodes(&config, &config.clients[0]).is_empty());
+    let plain = self::config(profile());
+    assert!(awg_nodes(&plain, &plain.clients[0]).is_empty());
+}
+
+#[test]
+fn warp_adds_the_proxy_and_outbound_member() {
+    let mut config = config(profile());
+    config.profiles[0].warp = true;
+    let pending = render(&config);
+    assert!(pending.lines.contains(&"WARP: будет зарегистрирован аккаунт Cloudflare.".to_owned()));
+    assert!(!content(&pending, MIHOMO_CONFIG_PATH).contains("warp-wg"), "no block before registration");
+    config.nodes[0].params.warp = Some(crate::model::NodeWarp { public_key: "WPUB".into(), ipv4: "172.16.0.2".into(), ipv6: None,
+        plus: false, plus_attempt: None });
+    let secrets = NodeSecrets { reality_key: Some(Zeroizing::new("PRIVKEY".into())), warp_key: Some(Zeroizing::new("WPRIV".into())), ..NodeSecrets::default() };
+    let desired = desired(&config, &config.nodes[0], Some(&secrets)).unwrap();
+    let mihomo = content(&desired, MIHOMO_CONFIG_PATH);
+    assert!(mihomo.contains("proxies:\n  - name: warp-wg\n    type: wireguard\n    private-key: \"WPRIV\"\n"), "{mihomo}");
+    assert!(mihomo.contains("    proxies:\n      - warp-wg\n      - DIRECT\n"));
+    assert_eq!(spec(&desired, "WARP"), "true");
+    let document = yaml(mihomo);
+    assert_eq!(document["proxies"].as_vec().map(Vec::len), Some(1));
+    // Switching WARP off drops the block; the stored account does not count.
+    let digest_on = desired.digest.clone();
+    config.profiles[0].warp = false;
+    let off = render(&config);
+    assert!(!content(&off, MIHOMO_CONFIG_PATH).contains("warp-wg") && spec(&off, "WARP") == "false");
+    let mut forgotten = config.clone();
+    forgotten.nodes[0].params.warp = None;
+    assert_eq!(render(&forgotten).digest, off.digest);
+    assert_ne!(off.digest, digest_on);
+}
+
+const CASCADE_UUID: &str = "11111111-2222-4333-8444-555555555555";
+
+/// `de` enters cascade `hop` through VLESS TCP and leaves through `nl`'s
+/// `exit` connection; alpha uses `hop`.
+fn cascade_config(exit: crate::model::ExitProxy) -> Config {
+    use crate::model::{Cascade, CascadeExit, CascadeListener, NodeExit};
+    let mut config = config(Profile { hysteria2: Some(Hysteria2 { port: 20443, obfs: false }), ..profile() });
+    let mut nl = node();
+    nl.id = "b".repeat(32);
+    nl.name = "nl".into();
+    nl.domain = Some("nl.example.com".into());
+    nl.params.reality = Some(NodeReality { public_key: "NLPUB".into(), short_id: "fedcba9876543210".into() });
+    config.nodes.push(nl);
+    config.connections[0].groups[0].proxies.push("hop".into());
+    config.cascades.push(Cascade {
+        name: "hop".into(), entry: "de".into(), listener: CascadeListener::VlessTcp,
+        exit: CascadeExit::Node(NodeExit { node: "nl".into(), proxy: exit }), uuid: CASCADE_UUID.into(), password: "c".repeat(32),
+    });
+    config
+}
+
+#[test]
+fn cascade_names_and_short_ids_stay_yaml_strings() {
+    for name in ["-", "null", "1e5"] {
+        let mut config = cascade_config(crate::model::ExitProxy::VlessTcp);
+        config.nodes[1].params.reality.as_mut().unwrap().short_id = "0123456789012345".into();
+        config.cascades[0].name = name.into();
+        *config.connections[0].groups[0].proxies.last_mut().unwrap() = name.into();
+        let entry = render(&config);
+        let mihomo = content(&entry, MIHOMO_CONFIG_PATH);
+        let document = yaml(mihomo);
+        let exit = document["proxies"].as_vec().unwrap().iter().find(|proxy| proxy["server"].as_str() == Some("nl.example.com")).unwrap();
+        assert_eq!(exit["name"].as_str(), Some(name), "{mihomo}");
+        assert_eq!(exit["reality-opts"]["short-id"].as_str(), Some("0123456789012345"), "{mihomo}");
+        let group = document["proxy-groups"].as_vec().unwrap().iter()
+            .find(|group| group["name"].as_str() == Some(format!("{name}-outbound").as_str())).unwrap();
+        assert_eq!(group["proxies"][0].as_str(), Some(name), "{mihomo}");
+    }
+}
+
+#[test]
+fn a_cascade_routes_its_users_on_the_entry_node_to_the_exit_node() {
+    let mut config = cascade_config(crate::model::ExitProxy::VlessTcp);
+    let entry = render(&config);
+    let mihomo = content(&entry, MIHOMO_CONFIG_PATH);
+    let user = super::super::keys::cascade_uuid(UUID, "hop");
+    assert!(mihomo.contains(&format!("      - username: alpha\n        uuid: {UUID}\n        flow: xtls-rprx-vision\n\
+        \x20     - username: alpha--hop\n        uuid: {user}\n        flow: xtls-rprx-vision\n")), "{mihomo}");
+    let tcp = mihomo.split("# --- vless-tcp ---").nth(1).unwrap().split("# --- /vless-tcp ---").next().unwrap();
+    assert!(tcp.contains("    rule: vless-tcp-shared\n") && !tcp.contains("    proxy: outbound"));
+    let hy2 = mihomo.split("# --- hy2 ---").nth(1).unwrap().split("# --- /hy2 ---").next().unwrap();
+    assert!(hy2.contains("    rule: essence-in\n") && !hy2.contains("alpha--hop"), "other listeners keep the plain inbound rule");
+    assert!(mihomo.contains(&format!("proxies:\n  - name: hop\n    type: vless\n    server: nl.example.com\n    port: 443\n    uuid: {CASCADE_UUID}\n\
+        \x20   network: tcp\n    udp: true\n    flow: xtls-rprx-vision\n    tls: true\n    servername: \"nl.example.com\"\n\
+        \x20   reality-opts:\n      public-key: NLPUB\n      short-id: fedcba9876543210\n    client-fingerprint: chrome\n")), "{mihomo}");
+    assert!(mihomo.contains("      - DIRECT\n    url: https://www.gstatic.com/generate_204\n    interval: 10\n    timeout: 3000\n    lazy: false\n\
+        \x20 - name: hop-outbound\n    type: fallback\n    proxies:\n      - hop\n      - DIRECT\n"));
+    // The shared sub-rule rejects as `essence-in` does: no `no-resolve`, the node's own address.
+    let rejects: String = INBOUND_REJECT.iter().map(|rule| format!("    - {rule},REJECT\n"))
+        .chain([format!("    - IP-CIDR,{}/32,REJECT\n", config.nodes[0].ip)]).collect();
+    assert!(mihomo.contains(&format!("sub-rules:\n  essence-in:\n{rejects}    - MATCH,outbound\n  vless-tcp-shared:\n{rejects}\
+        \x20   - IN-USER,alpha--hop,hop-outbound\n    - MATCH,outbound\nrule-providers:")), "{mihomo}");
+    assert!(!mihomo.contains("no-resolve"), "{mihomo}");
+    let document = yaml(mihomo);
+    assert_eq!(document["sub-rules"]["vless-tcp-shared"].as_vec().map(Vec::len), Some(INBOUND_REJECT.len() + 3));
+    assert!(entry.lines.contains(&"Каскад «hop»: вход VLESS TCP, выход — нода nl (VLESS TCP), клиентов 1".to_owned()), "{:?}", entry.lines);
+    let section = client_section(&config, &config.nodes[0]).unwrap();
+    assert!(section.contains(&format!("  - name: \"hop\"\n    type: vless\n    server: de.example.com\n    port: 443\n    uuid: {PLACEHOLDER_UUID}\n")));
+
+    let exit = desired(&config, &config.nodes[1], Some(&secrets())).unwrap();
+    let mihomo = content(&exit, MIHOMO_CONFIG_PATH);
+    assert!(mihomo.contains(&format!("      - username: cascade--hop\n        uuid: {CASCADE_UUID}\n        flow: xtls-rprx-vision\n")), "{mihomo}");
+    assert!(!mihomo.contains("-shared") && !mihomo.contains("hop-outbound"));
+    assert!(exit.lines.contains(&"Каскад «hop»: выход через VLESS TCP этой ноды.".to_owned()));
+    // Only the cascade uses the exit node's Reality listener on 443: it is
+    // rendered, so Reality takes the 443 front with the site behind it.
+    assert!(exit.lines.contains(&"VLESS TCP: порт 443, клиентов 0".to_owned()), "{:?}", exit.lines);
+    assert_eq!(spec(&exit, "SITE_REQUIRE_200"), "true");
+
+    // The exit node's client parameters are part of the entry digest.
+    config.nodes[1].params.reality.as_mut().unwrap().public_key = "NEWPUB".into();
+    assert_ne!(render(&config).digest, entry.digest);
+}
+
+#[test]
+fn hysteria2_and_uri_exits_and_broken_cascades() {
+    use crate::model::{CascadeExit, CascadeListener, UriExit};
+    let mut config = cascade_config(crate::model::ExitProxy::Hysteria2);
+    let mihomo = content(&render(&config), MIHOMO_CONFIG_PATH).to_owned();
+    assert!(mihomo.contains(&format!("  - name: hop\n    type: hysteria2\n    server: nl.example.com\n    port: 20443\n    password: \"{}\"\n", "c".repeat(32))), "{mihomo}");
+    let exit = content(&desired(&config, &config.nodes[1], Some(&secrets())).unwrap(), MIHOMO_CONFIG_PATH).to_owned();
+    assert!(exit.contains(&format!("      cascade--hop: \"{}\"\n", "c".repeat(32))), "{exit}");
+
+    // An entry through Hysteria2 derives the client password.
+    config.cascades[0].listener = CascadeListener::Hysteria2;
+    let mihomo = content(&render(&config), MIHOMO_CONFIG_PATH).to_owned();
+    assert!(mihomo.contains(&format!("      alpha--hop: \"{}\"\n", super::super::keys::cascade_password("alpha-pass", "hop"))));
+    let rejects: String = INBOUND_REJECT.iter().map(|rule| format!("    - {rule},REJECT\n"))
+        .chain([format!("    - IP-CIDR,{}/32,REJECT\n", config.nodes[0].ip)]).collect();
+    assert!(mihomo.contains("    rule: hy2-shared\n") && mihomo.contains(&format!("  hy2-shared:\n{rejects}    - IN-USER,alpha--hop,hop-outbound\n")));
+
+    config.cascades[0].exit = CascadeExit::Uri(UriExit { uri: "hysteria2://secret@203.0.113.5:443?sni=exit.example.com#x".into() });
+    let mihomo = content(&render(&config), MIHOMO_CONFIG_PATH).to_owned();
+    assert!(mihomo.contains("  - name: hop\n    type: hysteria2\n    server: 203.0.113.5\n    port: 443\n"), "{mihomo}");
+
+    config.cascades[0].exit = CascadeExit::Uri(UriExit { uri: "ftp://203.0.113.5".into() });
+    assert_eq!(desired(&config, &config.nodes[0], None).err().map(|e| e.code), Some("invalid"));
+    assert_eq!(status(&config, &config.nodes[0]), "pending");
+
+    // A listener the profile no longer enables leaves the cascade idle.
+    config.cascades[0].listener = CascadeListener::VlessGrpc;
+    let idle = render(&config);
+    assert!(idle.lines.contains(&"Каскад «hop»: подключение «VLESS gRPC» не включено в профиле — каскад не работает.".to_owned()));
+    assert!(!content(&idle, MIHOMO_CONFIG_PATH).contains("hop"));
+    assert!(!client_section(&config, &config.nodes[0]).unwrap().contains("\"hop\""));
+}
+
+fn sub_host(port: u16) -> SubscriptionHost {
+    SubscriptionHost { node: "de".into(), hostname: "sub.example.com".into(), port,
+        base_url: SubscriptionHost::base_url_for("sub.example.com", port), sub_dir: SUB_DIR.into(), nginx_group: "www-data".into() }
+}
+
+fn sub_listen(desired: &Desired) -> Vec<&str> {
+    content(desired, "/etc/nginx/sites-available/essence-sub").lines().filter(|line| line.trim_start().starts_with("listen ")).collect()
+}
+
+#[test]
+fn subscription_host_behind_self_steal_with_its_files_and_spec() {
+    let mut config = config(profile());
+    config.subscription_host = Some(sub_host(443));
+    let desired = render(&config);
+    let site = content(&desired, "/etc/nginx/sites-available/essence-sub");
+    assert!(site.starts_with("# Essence site essence-sub\nserver {\n    listen 127.0.0.1:8443 ssl http2;\n    server_name sub.example.com;\n\n\
+        \x20   ssl_certificate     /etc/nginx/ssl/sub.example.com/fullchain.pem;\n"), "{site}");
+    assert!(site.contains("    location ~ \"^/sub/([a-f0-9]{64})$\" {\n        alias /var/lib/essence-sub/$1.yaml;\n"));
+    assert!(site.contains("    include /etc/nginx/snippets/essence-sub/sub-*.conf;\n") && !site.contains("{{"));
+    assert_eq!(content(&desired, "/etc/nginx/sites-enabled/essence-sub"), "/etc/nginx/sites-available/essence-sub");
+    assert_eq!(content(&desired, "/etc/nginx/conf.d/essence-sub-limit.conf"), "limit_req_zone $binary_remote_addr zone=sub:1m rate=10r/m;\n");
+    let cleanup = desired.files.iter().find(|file| file.path == "/usr/local/bin/essence-sub-cleanup").unwrap();
+    assert_eq!(cleanup.mode, "0755");
+    assert!(cleanup.content.starts_with("#!/bin/bash\nSUB_DIR=/var/lib/essence-sub\nLIST=\"${SUB_DIR}/expiry.list\"\n"));
+    assert!(content(&desired, "/etc/systemd/system/essence-sub-cleanup.timer").contains("OnUnitActiveSec=5min\n"));
+    assert!(content(&desired, "/etc/systemd/system/essence-sub-cleanup.service").contains("ExecStart=/usr/local/bin/essence-sub-cleanup\n"));
+    assert_eq!(content(&desired, "/var/www/sub.example.com/.essence-sub"), "");
+    assert_eq!(spec(&desired, "CERTS"), "de.example.com:/var/www/de.example.com sub.example.com:/var/www/sub.example.com");
+    assert_eq!(spec(&desired, "DNS_DOMAINS"), "de.example.com sub.example.com");
+    assert_eq!((spec(&desired, "FEATURES"), spec(&desired, "SUB_HOST"), spec(&desired, "UFW_RULES")), ("sub", "sub.example.com", "443/tcp"));
+    assert!(desired.lines.contains(&"Хост подписок: https://sub.example.com".to_owned()));
+
+    // Its own port opens in the firewall and must not clash with a listener.
+    config.subscription_host = Some(sub_host(2096));
+    let own = render(&config);
+    assert_eq!(sub_listen(&own), ["    listen 0.0.0.0:2096 ssl http2;"]);
+    assert_eq!(spec(&own, "UFW_RULES"), "443/tcp 2096/tcp");
+    assert_eq!(spec(&own, "LISTEN_TCP"), "443 2096 8443");
+    config.subscription_host = Some(sub_host(443 + 1));
+    config.profiles[0].hysteria2 = Some(Hysteria2 { port: 444, obfs: false });
+    let error = desired_error(&config);
+    assert_eq!((error.code, error.extra["port"].clone()), ("invalid", json!(444)));
+}
+
+fn desired_error(config: &Config) -> RcError {
+    desired(config, &config.nodes[0], None).err().unwrap()
+}
+
+#[test]
+fn subscription_host_behind_the_stream_and_on_a_free_443() {
+    let mut config = config(sni(profile()));
+    config.nodes[0].domain = None;
+    config.subscription_host = Some(sub_host(443));
+    let stream = render(&config);
+    assert_eq!(sub_listen(&stream), ["    listen 127.0.0.1:8445 ssl http2;"]);
+    assert!(content(&stream, STREAM_PATH).contains("        sub.example.com subscription;\n"));
+    assert!(content(&stream, MIHOMO_CONFIG_PATH).contains("    listen: 127.0.0.1\n    port: 8444\n"));
+    assert_eq!((spec(&stream, "NGINX_STREAM"), spec(&stream, "CERTS")), ("true", "sub.example.com:/var/www/sub.example.com"));
+    assert_eq!(spec(&stream, "LISTEN_TCP"), "443 8444 8445");
+    // The vhost's internal port is taken by SSH: refused before apply.
+    config.nodes[0].port = 8445;
+    let error = desired_error(&config);
+    assert_eq!((error.code, error.extra["port"].clone()), ("invalid", json!(8445)));
+    config.nodes[0].port = 22;
+
+    // Without Reality nginx owns 443 itself.
+    config.profiles[0].vless_tcp = false;
+    config.profiles[0].hysteria2 = Some(Hysteria2 { port: 20443, obfs: false });
+    let free = render(&config);
+    assert_eq!(sub_listen(&free), ["    listen 443 ssl http2;", "    listen [::]:443 ssl http2;"]);
+    assert_eq!((spec(&free, "NGINX"), spec(&free, "NGINX_STREAM")), ("true", "false"));
+    assert!(spec(&free, "UFW_RULES").starts_with("443/tcp "));
+}
+
+#[test]
+fn a_moved_subscription_host_releases_its_certificate() {
+    let mut config = config(profile());
+    config.subscription_host = Some(sub_host(443));
+    let applied = render(&config);
+    config.nodes[0].applied = Some(Applied { digest: applied.digest.clone(), files: file_hashes(&applied.files), ports: applied.ports.clone(), at: "t".into() });
+    config.subscription_host.as_mut().unwrap().hostname = "subs.example.com".into();
+    let renamed = render(&config);
+    assert_eq!(spec(&renamed, "RELEASE_CERTS"), "sub.example.com:/var/www/sub.example.com");
+    assert!(renamed.remove.contains(&"/var/www/sub.example.com/.essence-sub".to_owned()));
+    assert_eq!(spec(&renamed, "REMOVE_FEATURES"), "");
+    config.subscription_host = None;
+    let gone = render(&config);
+    assert_eq!((spec(&gone, "REMOVE_FEATURES"), spec(&gone, "RELEASE_CERTS"), spec(&gone, "SUB_HOST")),
+        ("sub", "sub.example.com:/var/www/sub.example.com", ""));
+    assert!(gone.remove.contains(&"/etc/nginx/sites-enabled/essence-sub".to_owned()));
+    assert!(gone.lines.contains(&"Будет удалён сертификат и сайт: sub.example.com".to_owned()));
+    assert_eq!(spec(&teardown(&config.nodes[0]), "RELEASE_CERTS"), "de.example.com:/var/www/de.example.com sub.example.com:/var/www/sub.example.com");
+}
+
+#[test]
+fn the_subscription_role_stays_applied_while_other_changes_are_pending() {
+    let mut config = config(profile());
+    config.subscription_host = Some(sub_host(443));
+    assert!(!sub_role_applied(&config, &config.nodes[0]), "not applied yet");
+    let applied = render(&config);
+    config.nodes[0].applied = Some(Applied { digest: applied.digest.clone(), files: file_hashes(&applied.files), ports: applied.ports.clone(), at: "t".into() });
+    assert!(sub_role_applied(&config, &config.nodes[0]));
+    // A new client of the node makes it pending; the role is still in place.
+    config.clients.push(Client { inherit_nodes_from_group: false, nodes: Some(vec!["de".into()]), ..client("beta", "beta-pass") });
+    assert_eq!(status(&config, &config.nodes[0]), "pending");
+    assert!(sub_role_applied(&config, &config.nodes[0]));
+    // A running operation that keeps the vhost does not block; teardown does.
+    config.nodes[0].operation = Some(crate::model::Operation { id: "0".repeat(32), digest: "d".repeat(64),
+        files: file_hashes(&applied.files), ..Default::default() });
+    assert!(sub_role_applied(&config, &config.nodes[0]));
+    config.nodes[0].operation = Some(crate::model::Operation { id: "0".repeat(32), digest: "d".repeat(64), teardown: true, ..Default::default() });
+    assert!(!sub_role_applied(&config, &config.nodes[0]));
+    config.nodes[0].operation = None;
+    // A new hostname or listen port is not applied until `node apply`.
+    config.subscription_host.as_mut().unwrap().hostname = "subs.example.com".into();
+    assert!(!sub_role_applied(&config, &config.nodes[0]));
+    config.subscription_host = Some(sub_host(2096));
+    assert!(!sub_role_applied(&config, &config.nodes[0]));
 }

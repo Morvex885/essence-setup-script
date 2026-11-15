@@ -5,8 +5,12 @@
 
 use std::path::{Path, PathBuf};
 
-/// Removed with stage 2 (`node apply` owns the server state).
-const REMOVED: [&str; 1] = [concat!("upload", "-scripts")];
+/// Removed with stage 2 (`node apply` owns the server state), stage 3
+/// (AmneziaWG peers are rendered) and stage 4 (the host moves by `node apply`).
+const REMOVED: [&str; 5] = [
+    concat!("upload", "-scripts"), concat!("awg", " status"), concat!("awg", " sync"), concat!("awg", " remove"),
+    concat!("subscription", " migrate"),
+];
 
 fn files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).unwrap() {

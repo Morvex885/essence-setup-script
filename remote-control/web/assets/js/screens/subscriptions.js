@@ -1,12 +1,12 @@
 // Подписки (`tui/src/clients.rs::subscriptions`, `subscription_list`):
-// `subscription host|list|publish-all|migrate`; потоки — `clients-model.js`,
-// подписка клиента — вкладка карточки клиента.
+// `subscription host [--name N --domain D [--port P] | --remove]|list|publish-all`;
+// потоки — `clients-model.js`, подписка клиента — вкладка карточки клиента.
 import { html } from '../../vendor/preact-htm.js';
 import { Page, Card, DataTable, MoreMenu, Facts, Badge, Empty, Button } from '../ui.js';
 import { asList } from '../format.js';
 import { useCommand, useBusy, Loaded } from './kit.js';
 import { SUBSCRIPTION_HOST, SUBSCRIPTION_LIST, subscriptionHost, subscriptionRow } from './catalog-model.js';
-import { subscriptionHostFlow, publishAllFlow, migrateFlow, groupHeadersFlow } from './clients-model.js';
+import { subscriptionHostFlow, removeHostFlow, publishAllFlow, groupHeadersFlow } from './clients-model.js';
 
 const BADGE_TONES = { ok: 'ok', warn: 'warn', dim: 'neutral' };
 
@@ -21,27 +21,29 @@ export function SubscriptionsScreen({ ctx }) {
     await Promise.all([hostState.reload(), listState.reload()]);
   });
 
-  const setHost = act(() => subscriptionHostFlow(ctx, host ? host.node : null));
+  const setHost = act(() => subscriptionHostFlow(ctx, host));
+  const removeHost = act(() => removeHostFlow(ctx, host));
   const publishAll = act(() => publishAllFlow(ctx));
-  const migrate = act(() => migrateFlow(ctx));
   const groupHeaders = act(() => groupHeadersFlow(ctx));
 
   // Действия — как в меню, и без хоста: сбой объясняет ядро. Сбой чтения
   // хоста ограничен его карточкой: список и действия остаются.
   const actions = html`
     <${Button} kind=${host ? 'primary' : 'neutral'} icon="refresh-cw" disabled=${busy} onClick=${publishAll}>Обновить все подписки<//>
-    <${Button} kind=${host ? 'neutral' : 'primary'} icon="server" disabled=${busy} onClick=${setHost}>Хост-нода…<//>
+    <${Button} kind=${host ? 'neutral' : 'primary'} icon="server" disabled=${busy} onClick=${setHost}>Хост подписок…<//>
     <${Button} icon="folders" disabled=${busy} onClick=${groupHeaders}>Заголовки группы<//>
-    <${MoreMenu} items=${[{ label: 'Перенос на другую ноду', icon: 'send', disabled: busy, onClick: migrate }]} />`;
+    ${host && html`<${MoreMenu} items=${[{ label: 'Убрать хост', icon: 'trash-2', danger: true, disabled: busy, onClick: removeHost }]} />`}`;
   return html`<${Page} title="Подписки" actions=${actions}>
-    <${Loaded} title="Хост-нода" state=${hostState} inline>
+    <${Loaded} title="Хост подписок" state=${hostState} inline>
       ${() => html`<${Card}>
         ${host
           ? html`<${Facts} items=${[
-              { label: 'Хост-нода', value: html`<a class="link" href=${ctx.href('nodes', host.node)}>${host.node}</a>` },
+              { label: 'Нода', value: html`<a class="link" href=${ctx.href('nodes', host.node)}>${host.node}</a>` },
+              { label: 'Домен', value: html`<span class="mono">${host.hostname}</span>` },
+              { label: 'Порт', value: host.port },
               { label: 'Базовый URL', value: html`<span class="mono">${host.baseUrl}</span>` },
             ]} />`
-          : html`<${Empty} icon="rss" title="Хост-нода подписок не задана" hint="Подписки публикуются на хост-ноде: выберите её кнопкой «Хост-нода…»." />`}
+          : html`<${Empty} icon="rss" title="Хост подписок не задан" hint="Подписки публикуются на ноде с профилем: задайте её и домен кнопкой «Хост подписок…», затем примените ноду." />`}
       <//>`}
     <//>
     <${Loaded} title="Опубликованные подписки" state=${listState} inline>

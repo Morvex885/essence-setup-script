@@ -3,18 +3,16 @@
 //! bytes and rc must match, and stderr for the URI parsers' notes and warnings.
 
 use std::path::Path;
-use std::process::Command;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
-use rc_core::protocols::dnat::{Dnat, PERSIST_SCRIPT};
 use rc_core::protocols::hy2::{self, Hy2, Hy2Listener};
 use rc_core::protocols::uri::{self, ExitProxy, UriError};
 use rc_core::protocols::vless_xhttp::{self, NginxListener};
 use rc_core::protocols::{listener_users, vless_grpc, vless_tcp, Vless, VlessListener};
 use serde_json::Value;
 
-const MODULES: [&str; 7] = ["uri", "hy2", "vless-tcp", "vless-grpc", "vless-xhttp", "iptables-dnat", "listener-users"];
+const MODULES: [&str; 6] = ["uri", "hy2", "vless-tcp", "vless-grpc", "vless-xhttp", "listener-users"];
 
 struct Case {
     function: String,
@@ -103,42 +101,6 @@ fn parsed(result: Result<ExitProxy, UriError>, stderr_prefix: &str) -> Outcome {
             Outcome { stdout: stdout.into_bytes(), rc: 1, stderr: Some(stderr.into_bytes()) }
         }
     }
-}
-
-/// Runs node shell text with the capture script's stubs (argv logged as
-/// `cmd [arg]...`) and returns the log, as the `w_*_dnat` wrappers do.
-fn stubbed(script: &str) -> Outcome {
-    let program = format!(
-        r#"DNAT_LOG=$(mktemp) || exit 99
-dnat_rec() {{ printf '%s' "$1"; shift; local a; for a in "$@"; do printf ' [%s]' "$a"; done; printf '\n'; }}
-iptables() {{ dnat_rec iptables "$@" >> "$DNAT_LOG"; }}
-ip6tables() {{ dnat_rec ip6tables "$@" >> "$DNAT_LOG"; }}
-sysctl() {{ dnat_rec sysctl "$@" >> "$DNAT_LOG"; }}
-netfilter-persistent() {{ dnat_rec netfilter-persistent "$@" >> "$DNAT_LOG"; }}
-apt-get() {{ dnat_rec apt-get "$@" >> "$DNAT_LOG"; }}
-grep() {{
-    if [[ "$*" == *"/etc/sysctl.conf"* ]]; then
-        dnat_rec grep "$@" >> "$DNAT_LOG"
-        [[ "$1" == "-q" ]]
-        return
-    fi
-    command grep "$@"
-}}
-sed() {{
-    if [[ "$*" == *"/etc/sysctl.conf"* ]]; then dnat_rec sed "$@" >> "$DNAT_LOG"; return 0; fi
-    command sed "$@"
-}}
-node_script() {{
-{script}}}
-node_script
-rc=$?
-cat "$DNAT_LOG"
-rm -f "$DNAT_LOG"
-exit "$rc"
-"#
-    );
-    let output = Command::new("bash").arg("-c").arg(program).env("LANG", "C.UTF-8").output().expect("bash");
-    Outcome { stdout: output.stdout, rc: output.status.code().unwrap_or(-1).into(), stderr: Some(output.stderr) }
 }
 
 /// `Vless` from argument positions `[name, server, port, uuid, sni, public_key, short_id]`.
@@ -260,10 +222,6 @@ fn replay(case: &Case) -> Outcome {
         ("_build_vless_xhttp_exit_yaml", _) => ok(vless_xhttp::exit_yaml(&vless(case, [0, 1, 2, 3, 4, 7, 8]), a(5), a(6))),
         ("_normalize_vless_xhttp_proxy_yaml", _) => ok(vless_xhttp::normalize_proxy_yaml(&case.stdin)),
 
-        ("_apply_dnat_rules", "w_apply_dnat") => dnat_script(dnat(case).apply_script()),
-        ("_remove_dnat_rules", "w_remove_dnat") => dnat_script(dnat(case).remove_script()),
-        ("_persist_dnat_rules", "w_persist_dnat") => stubbed(PERSIST_SCRIPT),
-
         ("_build_vless_users_yaml", _) => ok(listener_users::vless_users_yaml(a(0), listener_users::parse_user_lines(&case.stdin))),
         ("_build_hy2_users_yaml", _) => ok(listener_users::hy2_users_yaml(listener_users::parse_user_lines(&case.stdin))),
         ("_sync_listener_users", "w_sync") => match case.globals["config_yaml"].as_str() {
@@ -278,25 +236,11 @@ fn replay(case: &Case) -> Outcome {
     }
 }
 
-fn dnat(case: &Case) -> Dnat<'_> {
-    Dnat { name: case.arg(0), remote: case.arg(1), remote_port: case.arg(2), local_port: case.arg(3) }
-}
-
-fn dnat_script(script: Option<String>) -> Outcome {
-    match script {
-        Some(script) => stubbed(&script),
-        None => Outcome { stdout: Vec::new(), rc: 1, stderr: Some(Vec::new()) },
-    }
-}
-
 #[test]
 fn rust_port_matches_bash_goldens() {
     let mut failures = Vec::new();
     let mut total = 0;
     for module in MODULES {
-        // DNAT cases run the generated script under a POSIX bash; on Windows
-        // `bash` is the WSL launcher. The scripts only ever run on Linux nodes.
-        if cfg!(windows) && module == "iptables-dnat" { continue; }
         for case in load(module) {
             total += 1;
             let outcome = replay(&case);

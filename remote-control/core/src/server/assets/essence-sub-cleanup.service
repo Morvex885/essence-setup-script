@@ -1,0 +1,6 @@
+[Unit]
+Description=Cleanup expired subscription configs
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/essence-sub-cleanup

@@ -52,6 +52,7 @@ pub async fn route<T: RemoteTransport>(noun: &str, verb: &str, invocation: &Invo
         ("node", "profile") => basic::profile(session, invocation),
         ("node", "domain") => basic::domain(session, invocation),
         ("node", "port") => basic::port(session, invocation),
+        ("node", "warp-reregister") => crate::server::warp::reregister(session, invocation, transport).await,
         ("node", "harden") => harden::harden(session, invocation, transport).await,
         ("node", "setup-ssh") => setup::setup_ssh(session, invocation, transport).await,
         ("conn", "list") => conn::list(session, invocation),

@@ -109,3 +109,19 @@ export async function offerApply(ctx) {
   if (!listed.ok || pendingNodes(listed.data).length === 0) return;
   await applyFlow(ctx, APPLY_PENDING_ARGV);
 }
+
+/** Ноды с профилем из `node list` (только их рендерит `node apply`). */
+export function profiledNodes(list) {
+  return asList(list).filter((node) => node && typeof node.name === 'string' && typeof node.profile === 'string' && node.profile !== '');
+}
+
+/**
+ * Применение на названных нодах после правки, которая их затрагивает
+ * (WARP, каскад, хост подписок): сразу `node apply --name N…` с планом
+ * ядра (его подтверждение — единственный вопрос).
+ */
+export async function offerApplyNodes(ctx, names) {
+  const nodes = [...new Set(strings(names))];
+  if (nodes.length === 0) return;
+  await applyFlow(ctx, applyNamesArgv(nodes), nodes.length === 1 ? nodes[0] : null);
+}

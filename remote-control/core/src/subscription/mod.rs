@@ -29,7 +29,7 @@ pub async fn route<T: RemoteTransport>(noun: &str, verb: &str, invocation: &Invo
 {
     let _ = (noun, secrets);
     match verb {
-        "host" => commands::host(session, invocation, connect).await,
+        "host" => commands::host(session, invocation),
         "list" => commands::list(session),
         "show" => commands::show(session, invocation),
         "headers" => commands::headers(session, invocation),
@@ -37,7 +37,6 @@ pub async fn route<T: RemoteTransport>(noun: &str, verb: &str, invocation: &Invo
         "publish-all" => commands::publish_all(session, invocation, connect).await,
         "rotate" => commands::rotate(session, invocation, connect).await,
         "revoke" => commands::revoke(session, invocation, connect).await,
-        "migrate" => commands::migrate(session, invocation, connect).await,
         _ => Err(RcError::new("usage", "Неизвестная команда subscription.")),
     }
 }
@@ -65,7 +64,7 @@ pub async fn revoke_quiet<T: RemoteTransport>(session: &mut Session, client: &st
 
 // ─── Shared rules ────────────────────────────────────────────────────────────
 
-const NOT_SET: &str = "Хост-нода подписок не задана: subscription host --name NAME.";
+const NOT_SET: &str = "Хост-нода подписок не задана: subscription host --name N --domain D.";
 
 fn default_headers() -> Vec<SubscriptionHeader> {
     vec![

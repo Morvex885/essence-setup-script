@@ -167,6 +167,8 @@ fn persist(state: &State, node: &Node, port: u16, key: &PortableKey, pins: &[Fin
         entry.auth = Auth::Key;
         entry.identity = Some(node.id.clone());
         entry.secret_id = None;
+        // The new SSH port moves an AmneziaWG TPROXY port it would collide with.
+        crate::server::keys::ensure_generated(state, &mut config)?;
         state.save_config(&config)
     })();
     if let Err(error) = saved {

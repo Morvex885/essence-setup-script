@@ -2,14 +2,12 @@
 // `tui/src/nodes.rs`: `Nodes`, `NodeCard`. Действия (`delete_node`,
 // `add_node_with`, `harden`, `setup_ssh`, `interactive`, профиль, домен,
 // порты) — `nodes-model.js`, применение — `apply-model.js`. Вкладки
-// карточки: обзор, подключения (`connections.js`), AmneziaWG (`awg.js`),
-// обслуживание.
+// карточки: обзор, подключения (`connections.js`), обслуживание.
 import { html, useEffect, useState } from '../../vendor/preact-htm.js';
 import { Page, Card, DataTable, MoreMenu, Facts, Badge, Chips, Empty, Button } from '../ui.js';
 import { asList } from '../format.js';
 import { useCommand, useBusy, useMounted, Loaded } from './kit.js';
 import { NodeConnections } from './connections.js';
-import { NodeAwg } from './awg.js';
 import { syncAll, nodeCheckArgv } from './nodeops-model.js';
 import { applyState, applyFlow, pendingNodes, APPLY_PENDING_ARGV } from './apply-model.js';
 import * as model from './nodes-model.js';
@@ -106,7 +104,6 @@ function NodeList({ ctx }) {
 const TABS = [
   { id: 'overview', label: 'Обзор' },
   { id: 'connections', label: 'Подключения' },
-  { id: 'awg', label: 'AmneziaWG' },
   { id: 'maintenance', label: 'Обслуживание' },
 ];
 
@@ -211,13 +208,15 @@ function NodeCard({ ctx, name, tab }) {
         { label: 'Изменить', icon: 'pencil', disabled: busy, onClick: edit },
         ...(password ? [{ label: 'Пароль SSH', icon: 'key-round', disabled: busy, onClick: () => then(() => model.setNodePassword(ctx, name)) }] : []),
         { label: 'Проверить подключение', icon: 'refresh-cw', disabled: busy, onClick: act.check },
+        ...(model.warpReregisterOffered(node)
+          ? [{ label: 'Перерегистрировать WARP', icon: 'refresh-cw', disabled: busy, onClick: () => then(() => model.warpReregister(ctx, name)) }]
+          : []),
         { label: 'Удалить ноду', icon: 'trash-2', danger: true, disabled: busy, onClick: remove },
       ]} />
     `;
     let body;
     switch (active) {
       case 'connections': body = html`<${NodeConnections} ctx=${ctx} name=${name} />`; break;
-      case 'awg': body = html`<${NodeAwg} ctx=${ctx} name=${name} />`; break;
       case 'maintenance': body = html`<${Maintenance} busy=${busy} act=${act} remove=${remove} />`; break;
       default: body = html`<${Overview} ctx=${ctx} node=${node} />`;
     }

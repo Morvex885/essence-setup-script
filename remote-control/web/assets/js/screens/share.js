@@ -1,11 +1,12 @@
-// Окно ссылки подписки (`clients.rs::share`, `share_view`): URL, срок,
-// заголовки, curl, JSON и QR-код. Разметка окна — здесь; данные — `shareModel`.
+// Окна с QR-кодом: ссылка подписки (`clients.rs::share`, `share_view`): URL,
+// срок, заголовки, curl, JSON и QR-код; конфиг AmneziaWG клиента на ноде.
+// Разметка окон — здесь; данные — `shareModel`, `awgConfigFlow`.
 import { html, useEffect, useRef, useState } from '../../vendor/preact-htm.js';
-import { CopyButton } from '../ui.js';
-import { fetchData, shareModel } from './clients-model.js';
+import { Button, CopyButton, downloadText } from '../ui.js';
+import { awgConfigFile, awgConfigFlow, fetchData, shareModel } from './clients-model.js';
 
-/** QR-код ссылки на `<canvas>`; без `window.qrcode` или при сбое — не рисуется. */
-function QrCode({ text }) {
+/** QR-код текста на `<canvas>`; без `window.qrcode` или при сбое — не рисуется. */
+function QrCode({ text, label = 'QR-код ссылки подписки' }) {
   const canvas = useRef(null);
   const [drawn, setDrawn] = useState(true);
   useEffect(() => {
@@ -35,7 +36,7 @@ function QrCode({ text }) {
       setDrawn(false);
     }
   }, [text]);
-  return html`<canvas ref=${canvas} class="qr" hidden=${!drawn} aria-label="QR-код ссылки подписки"></canvas>`;
+  return html`<canvas ref=${canvas} class="qr" hidden=${!drawn} aria-label=${label}></canvas>`;
 }
 
 /** Окно ссылки (`clients.rs::share_view`): URL, срок, заголовки, curl, JSON, QR. */
@@ -66,4 +67,26 @@ export async function showShare(ctx, name) {
   if (!read) return;
   const share = shareModel(read.data || {});
   await ctx.show({ title: share.title, wide: true, body: html`<${ShareView} share=${share} />` });
+}
+
+/** Окно конфига AmneziaWG: текст, копирование, скачивание `<клиент>-<нода>.conf` и QR. */
+function AwgConfigView({ name, node, config }) {
+  return html`<div class="share">
+    <pre class="plan mono">${config}</pre>
+    <div class="row">
+      <${Button} kind="primary" icon="download" onClick=${() => downloadText(awgConfigFile(name, node), config)}>Скачать .conf<//>
+      <${CopyButton} text=${config} label="Копировать" />
+    </div>
+    <${QrCode} text=${config} label="QR-код конфига AmneziaWG" />
+  </div>`;
+}
+
+/** «Конфиг AmneziaWG»: выбор ноды, `client awg-config` и окно конфига. */
+export async function showAwgConfig(ctx, name) {
+  const result = await awgConfigFlow(ctx, name);
+  if (result === null) return;
+  await ctx.show({
+    title: `AmneziaWG: ${name} — ${result.node}`, wide: true,
+    body: html`<${AwgConfigView} name=${name} node=${result.node} config=${result.config} />`,
+  });
 }

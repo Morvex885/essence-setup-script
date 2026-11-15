@@ -333,8 +333,44 @@ test('argv профиля, домена и портов ноды', () => {
     ['node', 'port', '--name', 'n', '--protocol', 'hysteria2', '--port', ''],
     ['node', 'port', '--name', 'n', '--protocol', 'amneziawg', '--port', '41000'],
   ]);
-  assert.equal(model.warpLabel({ warp: 'plus' }) !== model.warpLabel({ warp: 'free' }), true);
-  assert.equal(model.warpLabel({ warp: 'none' }), model.warpLabel({}));
+});
+
+test('WARP ноды: строка и действие по node.warp (правило ядра), argv перерегистрации', () => {
+  // Не зарегистрирован, но WARP в профиле включён — строка и перерегистрация есть;
+  // у `none|free|plus` подписи есть и различаются (тексты — дело модели).
+  const labels = ['none', 'free', 'plus'].map((warp) => model.warpLabel({ warp }));
+  assert.ok(labels.every((label) => typeof label === 'string' && label !== ''));
+  assert.equal(new Set(labels).size, labels.length);
+  // WARP в профиле выключен — ни строки, ни действия.
+  assert.equal(model.warpLabel({ warp: 'off' }), null);
+  assert.equal(model.warpLabel({}), null);
+  assert.equal(model.warpLabel(null), null);
+  // Действие в меню карточки — по тому же правилу: при `off` его нет.
+  assert.deepEqual(['off', 'none', 'free', 'plus'].map((warp) => model.warpReregisterOffered({ warp })), [false, true, true, true]);
+  assert.equal(model.warpReregisterOffered({}), false);
+  assert.deepEqual(model.warpReregisterArgv('n'), ['node', 'warp-reregister', '--name', 'n']);
+});
+
+test('перерегистрация WARP: под планом, затем сразу node apply --name под планом; отказ — без отчёта, сбой — без применения', async () => {
+  let s = scripted([
+    [['node', 'warp-reregister', '--name', 'n'], ok({ name: 'n' })],
+    [['node', 'apply', '--name', 'n'], ok({ applied: ['n'], failed: [], unchanged: [] })],
+  ], [undefined]);
+  assert.equal(await model.warpReregister(s.ctx, 'n'), true);
+  // Своего вопроса перед node apply нет: единственное подтверждение — план ядра.
+  assert.deepEqual(s.record.dialogs.map((d) => d.kind), ['show']);
+  s.done();
+  s = scripted([
+    [['node', 'warp-reregister', '--name', 'n'], ok({ name: 'n' })],
+    [['node', 'apply', '--name', 'n'], fail('confirmation_required')],
+  ], []);
+  assert.equal(await model.warpReregister(s.ctx, 'n'), true);
+  assert.deepEqual(s.record.dialogs, []);
+  s.done();
+  s = scripted([[['node', 'warp-reregister', '--name', 'n'], fail('confirmation_required')]], []);
+  assert.equal(await model.warpReregister(s.ctx, 'n'), false);
+  assert.deepEqual(s.record.dialogs, []);
+  s.done();
 });
 
 test('порты ноды: форма по протоколам профиля, команды только для изменённых', async () => {

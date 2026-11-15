@@ -19,7 +19,7 @@ description: "Правила команд ядра remote-control на Rust: к�
 |---|---|
 | `remote-control/core/src/cli.rs` | Каталог `CATALOG`: существительное → глагол → токены флагов, разрешённые секреты, флаги (`NOSESSION`, `TTY`, `LOCAL`, `CLIENT`) и входные данные `@имя`. Один каталог служит парсеру, справке `--help` и проверке грамматики |
 | `remote-control/core/src/dispatch.rs` | `dispatch(argv, secrets, input, agent_socket, &mut Session)` — единый диспетчер команд демона; `prepare_terminal` — подготовка терминальных команд (`TerminalJob`); маршрутизация по (noun, verb); `Session::mutate` |
-| `remote-control/core/src/nodes/`, `clients/`, `subscription/`, `telegram/`, `awg.rs` | Обработчики по доменам: `node`, `conn`; `group`, `template`, `client`, `generate`; `subscription`; `telegram`; `awg` |
+| `remote-control/core/src/nodes/`, `clients/`, `subscription/`, `telegram/`, `server/` | Обработчики по доменам: `node`, `conn`; `group`, `template`, `client`, `generate`; `subscription`; `telegram`; `profile`, `cascade`, `node apply` |
 | `remote-control/core/src/github/commands.rs` | `source *` (локальный источник и GitHub) |
 | `remote-control/core/src/self_manage.rs` | `self *` |
 | `remote-control/core/src/request_input.rs` | `Input` — входные данные запроса (содержимое файлов, `Zeroizing`) |
@@ -30,7 +30,7 @@ description: "Правила команд ядра remote-control на Rust: к�
 | `remote-control/bin/src/webcmd.rs`, `service.rs` | `web run`/`web open`, автозапуск веб-панели |
 | `remote-control/client/` | Протокол v3, `DaemonClient`, `ScriptedClient` |
 
-Новая команда = строка `spec(...)` в `CATALOG` (+ строка `HELP`, если новый флаг или команда меняют справку) + `match`-ветвь в `route` + обработчик. Алиасы не заводятся: `--name` — единый селектор объекта (`conn`/`awg`/`telegram` — нода, `subscription show|publish|rotate|revoke` — клиент, `subscription host|migrate` — нода), связи остались `--node` (у `client connections|nodes`), `--group`, `--client`. `generate` — bare-noun. Глобальные `--json --yes --plan-token --help` разрешены каждой команде неявно.
+Новая команда = строка `spec(...)` в `CATALOG` (+ строка `HELP`, если новый флаг или команда меняют справку) + `match`-ветвь в `route` + обработчик. Алиасы не заводятся: `--name` — единый селектор объекта (`conn`/`telegram` — нода, `profile` — профиль, `cascade` — каскад, `subscription show|publish|rotate|revoke` — клиент, `subscription host` — нода), связи остались `--node` (у `client connections|nodes|awg-config`), `--group`, `--client`. `generate` — bare-noun. Глобальные `--json --yes --plan-token --help` разрешены каждой команде неявно.
 
 Токены каталога: `name=` — флаг со значением (повтор → `usage`); `name` — булев; `name+` — повторяемый; `provision-keys=` и т.п. — значение-выбор; `@имя` — входные данные (клиент читает файл `--имя PATH`, флаг обязателен; демон получает содержимое `input.имя`); `@имя?` — необязательные входные данные (без флага клиент не передаёт поле, `Invocation::input_optional`; так `template check`, где вместо файла можно указать `--name`). Секреты команды перечислены отдельным полем spec. Флаги: `NOSESSION` — выполняется без открытой сессии; `TTY` — нужна консоль (`node shell`, `telegram menu`; без неё — `tty_required`); `LOCAL` — принимается только с локального сокета (сетевым соединениям → `local_only`); `CLIENT` — выполняет клиент (запрос демону → `usage` «Команда выполняется на стороне клиента.»). Правило выбора: эффект на файлах машины пользователя → `@`-вход или `CLIENT`; управление машиной демона (слушатель, остановка) → `LOCAL`.
 

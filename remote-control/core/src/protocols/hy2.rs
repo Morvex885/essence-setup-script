@@ -1,7 +1,7 @@
 //! Hysteria2 builders (`common/protocols/hy2.sh`).
 
 use super::uri::percent_encode;
-use super::{line, or, uri_host, yaml_escape, yaml_host};
+use super::{line, or, uri_host, yaml_escape, yaml_host, yaml_name};
 
 /// SNI used when none is given.
 pub const DEFAULT_SNI: &str = "www.google.de";
@@ -89,9 +89,9 @@ pub fn uri(hy2: &Hy2) -> String {
     )
 }
 
-/// Cascade exit proxy item (unquoted name).
+/// Cascade exit proxy item (name unquoted unless YAML needs quotes).
 pub fn exit_yaml(hy2: &Hy2) -> String {
-    let mut out = format!("  - name: {}\n", hy2.name);
+    let mut out = format!("  - name: {}\n", yaml_name(hy2.name));
     proxy_body(&mut out, hy2);
     out
 }

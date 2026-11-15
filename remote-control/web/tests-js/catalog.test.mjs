@@ -7,7 +7,7 @@ import {
   templateCheck, templateDelete, templateGroups, templateKind, groupOptions, problemCounts, annotations,
   droppedRanges, variantOptions, effectiveVariant, problemVariant, inVariant, NO_GROUP,
   PUBLISH_FIELDS, GENERATE_ALL, generateGroup, generateClient, generateScope, SUBSCRIPTION_HOST,
-  subscriptionSetHost, SUBSCRIPTION_LIST, SUBSCRIPTION_PUBLISH_ALL, subscriptionMigrate, subscriptionHost,
+  subscriptionSetHost, SUBSCRIPTION_REMOVE_HOST, SUBSCRIPTION_LIST, SUBSCRIPTION_PUBLISH_ALL, subscriptionHost,
   subscriptionState, subscriptionRow, publishSummary,
 } from '../assets/js/screens/catalog-model.js';
 import { summaryLines, GENERATE_FIELDS, generateFlow } from '../assets/js/screens/clients-model.js';
@@ -141,11 +141,15 @@ test('генерация: пресет без формы, сбой чтения 
 
 test('подписки: argv и хост-нода', () => {
   assert.deepEqual(SUBSCRIPTION_HOST, ['subscription', 'host']);
-  assert.deepEqual(subscriptionSetHost('de'), ['subscription', 'host', '--name', 'de']);
+  assert.deepEqual(subscriptionSetHost('de', ' sub.example.com '), ['subscription', 'host', '--name', 'de', '--domain', 'sub.example.com']);
+  assert.deepEqual(subscriptionSetHost('de', 'sub.example.com', '443'), ['subscription', 'host', '--name', 'de', '--domain', 'sub.example.com']);
+  assert.deepEqual(subscriptionSetHost('de', 'sub.example.com', '8443'),
+    ['subscription', 'host', '--name', 'de', '--domain', 'sub.example.com', '--port', '8443']);
+  assert.deepEqual(SUBSCRIPTION_REMOVE_HOST, ['subscription', 'host', '--remove']);
   assert.deepEqual(SUBSCRIPTION_LIST, ['subscription', 'list']);
   assert.deepEqual(SUBSCRIPTION_PUBLISH_ALL, ['subscription', 'publish-all']);
-  assert.deepEqual(subscriptionMigrate('ru'), ['subscription', 'migrate', '--name', 'ru']);
-  assert.deepEqual(subscriptionHost({ node: 'de', base_url: 'https://h' }), { node: 'de', baseUrl: 'https://h' });
+  assert.deepEqual(subscriptionHost({ node: 'de', hostname: 'sub.example.com', port: 8443, base_url: 'https://h' }),
+    { node: 'de', hostname: 'sub.example.com', port: '8443', baseUrl: 'https://h' });
   assert.equal(subscriptionHost({ node: '' }), null);
   assert.equal(subscriptionHost(null), null);
 });

@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use tokio::time::Instant;
+use zeroize::Zeroizing;
 
 use crate::cli::Invocation;
 use crate::clients::require_one;
@@ -21,7 +22,7 @@ use crate::confirmation::Plan;
 use crate::dispatch::Session;
 use crate::error::{RcError, Result};
 use crate::log::Level;
-use crate::model::{Applied, Config, Node, Operation};
+use crate::model::{Applied, Config, Node, Operation, Profile};
 use crate::nodes::{self, COMMAND_TIMEOUT, LONG_TIMEOUT, required, sh_quote};
 use crate::state::State;
 use crate::transport::RemoteTransport;
@@ -61,7 +62,18 @@ fn stage_label(stage: &str) -> &str {
         "firewall" => "правила UFW",
         "cleanup" => "очистка",
         "init" => "запуск исполнителя",
+        "warp" => "регистрация WARP",
         other => other,
+    }
+}
+
+/// What the user does about a failure the executor recognised (`hint=` in
+/// its status); an unknown id adds nothing.
+fn hint_text(hint: &str) -> Option<&'static str> {
+    match hint {
+        "kernel_headers" => Some("в репозиториях нет заголовков текущего ядра для AmneziaWG: обновите ядро \
+            (apt-get install linux-image-amd64 на Debian, linux-image-generic на Ubuntu), перезагрузите сервер и повторите node apply"),
+        _ => None,
     }
 }
 
@@ -274,10 +286,14 @@ fn targets(config: &Config, invocation: &Invocation) -> Result<Vec<String>> {
 
 /// Secrets the node's files need; a missing one fails the node.
 fn node_secrets(state: &State, config: &Config, node: &Node) -> Result<NodeSecrets> {
-    let needs_reality = node.profile.as_deref().and_then(|name| config.find_profile(name)).is_some_and(|p| p.has_reality());
+    let profile = node.profile.as_deref().and_then(|name| config.find_profile(name));
     let store = state.secret_store();
+    let read = |suffix: &str, what: &str| -> Result<Zeroizing<String>> {
+        store.get(&format!("node:{}:{suffix}", node.id))?.ok_or_else(|| RcError::new("missing_secret",
+            format!("{what} ноды «{}» не сохранён.", node.name)).with_extra("name", node.name.clone()))
+    };
     let mut secrets = NodeSecrets::default();
-    if needs_reality {
+    if profile.is_some_and(Profile::has_reality) {
         let id = format!("node:{}:reality-key", node.id);
         let missing = || RcError::new("missing_secret", missing_reality_key(&node.name)).with_extra("name", node.name.clone());
         secrets.reality_key = Some(match store.get(&id) {
@@ -286,6 +302,12 @@ fn node_secrets(state: &State, config: &Config, node: &Node) -> Result<NodeSecre
             Err(error) if error.code == "missing_secret" => return Err(missing()),
             Err(error) => return Err(error),
         });
+    }
+    if profile.is_some_and(|profile| profile.amneziawg.is_some()) {
+        secrets.awg_key = Some(read("awg-key", "Ключ AmneziaWG")?);
+    }
+    if profile.is_some_and(|profile| profile.warp) && node.params.warp.is_some() {
+        secrets.warp_key = Some(read("warp-key", "Ключ WARP")?);
     }
     Ok(secrets)
 }
@@ -406,7 +428,7 @@ fn claim(session: &mut Session, label: &str, recheck: impl FnOnce(&State, &mut C
                 Ok(desired) => {
                     let operation = Operation {
                         id: new_op_id(), digest: desired.digest.clone(), files: render::file_hashes(&desired.files),
-                        ports: desired.ports.clone(), teardown: desired.teardown,
+                        ports: desired.listen.clone(), teardown: desired.teardown,
                     };
                     node.operation = Some(operation.clone());
                     Ok((operation, desired))
@@ -534,7 +556,10 @@ impl<'t, T: RemoteTransport> Run<'t, T> {
                     ("rolled_back", _) => Failure::new(&stage, "rolled_back", format!("откат на этапе «{}»", stage_label(&stage))),
                     ("rollback_failed", _) => Failure::new(&stage, "rollback_failed",
                         format!("откат на этапе «{}» не завершён: резервные копии оставлены на ноде", stage_label(&stage))),
-                    _ => Failure::new(&stage, "failed", format!("ошибка на этапе «{}»", stage_label(&stage))),
+                    _ => Failure::new(&stage, "failed", match status.get("hint").and_then(|hint| hint_text(hint)) {
+                        Some(hint) => format!("ошибка на этапе «{}»: {hint}", stage_label(&stage)),
+                        None => format!("ошибка на этапе «{}»", stage_label(&stage)),
+                    }),
                 };
                 self.end = End::of(Some(result));
                 self.fail(failure);
@@ -621,16 +646,29 @@ async fn probe<T: RemoteTransport>(session: &Session, transport: &mut T, node: &
     Ok(probe)
 }
 
-/// A port the node does not listen on for us yet is taken by someone else.
+/// A socket the node does not hold for us yet (firewall ports and the
+/// AmneziaWG TPROXY inlet) is taken by someone else.
 fn busy_port(probe: &Probe, node: &Node, desired: &Desired) -> Option<Failure> {
     let ours: Vec<&String> = node.applied.iter().flat_map(|applied| &applied.ports)
         .chain(node.operation.iter().flat_map(|operation| &operation.ports)).collect();
-    desired.ports.iter().filter(|rule| !ours.contains(rule)).find_map(|rule| {
+    desired.listen.iter().filter(|rule| !ours.contains(rule)).find_map(|rule| {
         let (port, proto) = rule.split_once('/').and_then(|(port, proto)| Some((port.parse::<u16>().ok()?, proto)))?;
         probe.listening.iter().any(|(listening, busy)| listening == proto && *busy == port).then(|| Failure {
             port: Some(port), ..Failure::new("probe", "port_busy", format!("порт {port} уже занят"))
         })
     })
+}
+
+/// The node's digest after its WARP registration (outside the lock), when the
+/// registration — the node's `params.warp` — is the only change of the node's
+/// render since the `confirmed` state; `None` — the plan changed.
+fn registered_digest(confirmed: &Config, current: &Config, id: &str) -> Option<String> {
+    let registered = current.nodes.iter().find(|node| node.id == id)?;
+    let mut expected = confirmed.clone();
+    expected.nodes.iter_mut().find(|node| node.id == id)?.params.warp = registered.params.warp.clone();
+    let digest = |config: &Config| config.nodes.iter().find(|node| node.id == id)
+        .and_then(|node| render::desired(config, node, None).ok()).map(|desired| desired.digest);
+    digest(current).filter(|now| Some(now) == digest(&expected).as_ref())
 }
 
 /// `node apply (--name N… | --profile P | --pending) [--yes]`.
@@ -738,6 +776,40 @@ pub async fn apply<T: RemoteTransport>(session: &mut Session, invocation: &Invoc
     extra.sort();
     let plan = Plan::new(lines, extra.join("\n"));
     plan.confirm(invocation)?;
+
+    // WARP accounts the nodes still need, before anything is recorded: a
+    // registration changes the node's parameters and so its digest. A failed
+    // registration fails only its node.
+    let mut excluded = Vec::new();
+    for item in planned.iter_mut().filter(|item| item.resume.is_none()) {
+        let config = session.state.load_config()?;
+        let node = nodes::find(&config, &item.name)?.clone();
+        if render::desired(&config, &node, None).map(|desired| desired.digest).ok().as_deref() != Some(item.digest.as_str()) {
+            return Err(plan.changed(invocation));
+        }
+        let Some(reregister) = node.profile.as_deref().and_then(|name| config.find_profile(name))
+            .and_then(|profile| super::warp::registration(profile, &node)) else { continue };
+        // Under the saving lock the node still renders as confirmed.
+        let confirmed = item.digest.clone();
+        let recheck = |current: &Config| match current.nodes.iter().find(|candidate| candidate.id == node.id) {
+            Some(now) if render::desired(current, now, None).is_ok_and(|desired| desired.digest == confirmed) => Ok(()),
+            _ => Err(plan.changed(invocation)),
+        };
+        match super::warp::register(session, &node, &item.transport, reregister, &recheck).await {
+            Ok(()) => {
+                let current = session.state.load_config()?;
+                item.digest = registered_digest(&config, &current, &node.id).ok_or_else(|| plan.changed(invocation))?;
+            }
+            // A changed plan is the whole command's answer (code 2, plan and
+            // token), not a failure of this node.
+            Err(error) if error.code == "plan_changed" => return Err(error),
+            Err(error) => {
+                report.fail(session, &item.name, &Failure::of("warp", error));
+                excluded.push(item.name.clone());
+            }
+        }
+    }
+    planned.retain(|item| !excluded.contains(&item.name));
 
     let mut claims = claim(session, "node apply start", |state, config| {
         let mut claims = Vec::new();

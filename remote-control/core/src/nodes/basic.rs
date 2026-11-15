@@ -30,9 +30,13 @@ fn password_state(state: &State, node: &Node) -> Option<&'static str> {
     })
 }
 
-/// WARP state of a node: `none`, `free` or `plus`.
-fn warp_state(node: &Node) -> &'static str {
+/// `off` — the node's profile has no WARP (or the node no profile), else the
+/// account: `none` (not registered yet), `free` or `plus`. Front ends show the
+/// WARP line and «Перерегистрировать WARP» for every state but `off`.
+fn warp_state(config: &Config, node: &Node) -> &'static str {
+    let on = node.profile.as_deref().and_then(|name| config.find_profile(name)).is_some_and(|profile| profile.warp);
     match &node.params.warp {
+        _ if !on => "off",
         None => "none",
         Some(warp) if warp.plus => "plus",
         Some(_) => "free",
@@ -53,7 +57,7 @@ fn node_view(session: &Session, config: &Config, node: &Node, issues: &[crate::m
         "password": password_state(&session.state, node), "issues": reasons,
         "profile": node.profile, "domain": node.domain, "ports": node.ports,
         "status": crate::server::render::status(config, node),
-        "proxies": crate::server::render::proxies(config, node), "warp": warp_state(node),
+        "proxies": crate::server::render::proxies(config, node), "warp": warp_state(config, node),
     })
 }
 
@@ -298,6 +302,8 @@ pub fn port(session: &mut Session, invocation: &Invocation) -> Result<Value> {
             None => { node.ports.remove(&protocol); }
         }
         let ports = node.ports.clone();
+        // A port that now takes the AmneziaWG TPROXY port moves the latter.
+        crate::server::keys::ensure_generated(state, &mut config)?;
         state.save_config(&config)?;
         Ok(ports)
     })?;
@@ -476,7 +482,7 @@ mod tests {
                 uuid: "11111111-2222-4333-8444-555555555555".into(), password: "0123456789abcdef".into() }],
             telegram: vec![TelegramProxy { node: "a".into(), hostname: "tg.example".into(), secret_mark: "0123abcd".into(), tag_mark: None }],
             subscription_host: Some(SubscriptionHost { node: "a".into(), hostname: "s.example".into(), port: 443,
-                base_url: "https://s.example".into(), sub_dir: "sub".into(), nginx_group: "www-data".into() }),
+                base_url: "https://s.example".into(), sub_dir: crate::model::SUB_DIR.into(), nginx_group: "www-data".into() }),
             ..Config::default()
         });
         assert_eq!(rename(&mut session, &invocation(&["node", "rename", "--name", "a", "--new-name", "b"])).unwrap(), json!({"name": "b"}));
@@ -629,8 +635,15 @@ mod tests {
         assert_eq!(data, json!([{"proxy": "VLESS TCP", "alias": "Fast"}]));
         let listed = list(&mut session).unwrap();
         assert_eq!((listed[0]["profile"].clone(), listed[0]["status"].clone(), listed[0]["proxies"].clone(), listed[0]["warp"].clone()),
-            (json!("main"), json!("pending"), json!(["VLESS TCP"]), json!("none")));
-        assert_eq!((listed[1]["status"].clone(), listed[1]["profile"].clone()), (json!("none"), Value::Null));
+            (json!("main"), json!("pending"), json!(["VLESS TCP"]), json!("off")));
+        assert_eq!((listed[1]["status"].clone(), listed[1]["profile"].clone(), listed[1]["warp"].clone()), (json!("none"), Value::Null, json!("off")));
+        // WARP on in the profile, no account yet: `none`.
+        session.mutate("t", |state| {
+            let mut config = state.load_config()?;
+            config.profiles[0].warp = true;
+            state.save_config(&config)
+        }).unwrap();
+        assert_eq!(list(&mut session).unwrap()[0]["warp"], json!("none"));
 
         let shown = show(&mut session, &invocation(&["node", "show", "--name", "key"])).unwrap();
         assert_eq!(shown["delete_options"].as_array().unwrap().iter().map(|o| o["scope"].as_str().unwrap()).collect::<Vec<_>>(), ["local", "server"]);

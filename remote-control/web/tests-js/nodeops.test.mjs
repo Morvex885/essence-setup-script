@@ -1,11 +1,10 @@
-// Тесты модели обзора подключений, вкладок ноды «Подключения», «AmneziaWG» и
+// Тесты модели обзора подключений, вкладки ноды «Подключения» и
 // экрана «Telegram Proxy» (эталон — `#[cfg(test)]` в `remote-control/tui/src/nodes.rs`).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   EMPTY, nodeText, syncedNode, syncProblem, syncData, overviewNodes, syncAll,
   connectionView, assignmentChanges, assignArgv, assignConnections, connSyncArgv, connListArgv, nodeCheckArgv, syncConnections,
-  awgStatusArgv, awgSyncArgv, awgRemovePeerArgv, awgOrphansArgv, awgView,
   TELEGRAM_BATCH, TELEGRAM_COMPONENTS, TELEGRAM_STATUS_ARGV, telegramArgv, telegramResults,
   telegramMenu, telegramBatch, telegramStatus,
 } from '../assets/js/screens/nodeops-model.js';

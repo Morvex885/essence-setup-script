@@ -220,9 +220,9 @@ fn first_run_init_local_add_group_generate_and_exit() {
 }
 
 /// Menus driven by arrows: bare Enter picks the highlighted first item, ←
-/// does nothing on the dashboard, ↓↓→ opens «Группы»; Esc answers «нет» to
+/// does nothing on the dashboard, ↓↓↓↓→ opens «Группы»; Esc answers «нет» to
 /// the delete question and leaves the card, ← leaves the list; the
-/// dashboard remembers «Группы» so ↑↑↑ wraps around to «Выход».
+/// dashboard remembers «Группы» so ↑↑↑↑↑ wraps around to «Выход».
 #[test]
 fn arrow_keys_navigate_menus() {
     let mut session = PtySession::start();
@@ -230,7 +230,7 @@ fn arrow_keys_navigate_menus() {
     session.send("\n");
     session.expect("Remote Control v");
     session.send("\x1b[D");
-    session.send("\x1b[B\x1b[B\x1b[B\x1b[C");
+    session.send("\x1b[B\x1b[B\x1b[B\x1b[B\x1b[C");
     session.send("a\n");
     session.expect("Название группы");
     session.send("ARROWS\n");
@@ -247,7 +247,7 @@ fn arrow_keys_navigate_menus() {
     session.expect("Добавить группу");
     session.send("\x1b[D");
     session.expect("Remote Control v");
-    session.send("\x1b[A\x1b[A\x1b[A\x1b[A\n");
+    session.send("\x1b[A\x1b[A\x1b[A\x1b[A\x1b[A\n");
     session.finish(0);
     let config = std::fs::read_to_string(session.data().join("config.json")).unwrap();
     let config: serde_json::Value = serde_json::from_str(&config).unwrap();
@@ -355,10 +355,10 @@ fn screens_speak_the_real_v2_grammar() {
     assert!(ui.inputs.is_empty(), "walk derailed");
     let rejected: Vec<_> = client.calls.iter().filter(|(_, code)| code == "usage").collect();
     assert!(rejected.is_empty(), "grammar rejected: {rejected:?}");
-    // Node-scoped screens (card, awg, per-node telegram) need a reachable SSH
+    // Node-scoped screens (card, per-node telegram) need a reachable SSH
     // node; their argv are checked against the catalog in nodes.rs tests.
     // Settings is skipped: `self version` would query GitHub (no network).
-    for noun in ["session", "source", "status", "group", "client", "template", "generate", "subscription", "node", "conn", "telegram", "profile"] {
+    for noun in ["session", "source", "status", "group", "client", "template", "generate", "subscription", "node", "conn", "telegram", "profile", "cascade"] {
         assert!(client.calls.iter().any(|(argv, _)| argv[0] == noun), "walk never reached {noun}");
     }
     // The profile wizard: Self-Steal, random site, VLESS TCP, IPv6 as is, random email, pinned mihomo (no GitHub query).
@@ -377,7 +377,7 @@ const WALK: &str = "1 \
     g a LAB 1 4 t 1 f _ h 0 0 0 \
     c a alice 4 1 v _ f _ s 0 r bob 0 0 \
     m 1 v _ c _ g x EXPORT 0 0 \
-    n 0 r a edge 1 1 _ 1 _ v1.19.18 0 0 p 0 a 0 t s 0 \
+    n 0 r a edge 1 1 _ 1 _ v1.19.18 0 0 k 0 p 0 t s 0 \
     f a _ 0 \
     s l _ 0 \
     i 0 \

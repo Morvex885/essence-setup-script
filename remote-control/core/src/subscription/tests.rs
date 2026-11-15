@@ -6,17 +6,18 @@ use std::collections::VecDeque;
 
 use serde_json::{json, Value};
 
-use super::remote::{self, CONF_COMMAND, SNIPPETS_DIR};
+use super::remote::{self, SNIPPETS_DIR};
 use super::*;
 use crate::fake_transport::{AuthMethod, ConnectExpectation, FakeScript, FakeTransport, Operation, ScriptStep};
 use crate::log::Level;
-use crate::model::{Auth, Fingerprint, Group, Node, Subscription, SubscriptionHost};
+use crate::model::{Applied, Auth, Fingerprint, Group, Node, SUB_DIR, Subscription, SubscriptionHost};
 use crate::nodes::testing::{self, Journal, fingerprint, invocation};
+use crate::server::render;
 use crate::nodes::{COMMAND_TIMEOUT, CONNECT_TIMEOUT, pin};
 use crate::transport::{ExecResult, HostKeyPolicy};
 
-const OLD_DIR: &str = "/srv/old-sub";
-const NEW_DIR: &str = "/srv/new-sub";
+/// The host's files directory (fixed: `SUB_DIR` reaches root commands).
+const OLD_DIR: &str = crate::model::SUB_DIR;
 
 fn alpha_token() -> String { "a1".repeat(32) }
 fn orphan_token() -> String { "c".repeat(64) }
@@ -30,12 +31,12 @@ fn node(index: u8, name: &str) -> Node {
     Node {
         id: format!("{index:032x}"), name: name.into(), ip: format!("192.0.2.{index}"), port: 22, user: "root".into(),
         auth: Auth::Key, identity: Some("system".into()), secret_id: None, tag: None, aliases: Default::default(),
-        profile: Some("main".into()), ..Node::default()
+        profile: Some("main".into()), domain: Some(format!("{name}.example.com")), ..Node::default()
     }
 }
 
-/// Nodes `old` (host) and `new`; client `alpha` published with a TTL and its
-/// own header, `beta` unpublished; both have generated configs.
+/// Nodes `old` (host, applied) and `new`; client `alpha` published with a
+/// TTL and its own header, `beta` unpublished; both have generated configs.
 fn fixture(root: &std::path::Path, base_url: &str) -> (Session, Journal) {
     let (session, journal) = testing::session(root);
     let nodes = vec![node(1, "old"), node(2, "new")];
@@ -55,9 +56,16 @@ fn fixture(root: &std::path::Path, base_url: &str) -> (Session, Journal) {
     ];
     config.subscription_host = Some(SubscriptionHost {
         node: "old".into(), hostname: "old.example".into(), port: 443, base_url: base_url.into(),
-        sub_dir: "/stale/cache".into(), nginx_group: "www-data".into(),
+        sub_dir: OLD_DIR.into(), nginx_group: "www-data".into(),
     });
     config.subscription_default_headers = Some(Vec::new());
+    crate::server::keys::ensure_generated(&session.state, &mut config).unwrap();
+    // The host role is applied: the vhost and marker hashes as `node apply` records them.
+    let secrets = render::NodeSecrets { reality_key: Some("PRIVKEY".to_owned().into()), awg_key: Some("AWGKEY".to_owned().into()),
+        ..render::NodeSecrets::default() };
+    let desired = render::desired(&config, &config.nodes[0], Some(&secrets)).unwrap();
+    config.nodes[0].applied = Some(Applied { digest: desired.digest, files: render::file_hashes(&desired.files), ports: Vec::new(),
+        at: "2026-01-01T00:00:00Z".into() });
     session.state.save_config(&config).unwrap();
     for client in ["alpha", "beta"] {
         let dir = root.join("generated/MOBILE").join(client);
@@ -81,10 +89,6 @@ fn exec_ok(command: String, stdin_len: usize, stdout: &str) -> ScriptStep {
 fn exec_status(command: String, stdin_len: usize, stdout: &str, status: u32) -> ScriptStep {
     ScriptStep::exec(command, stdin_len, COMMAND_TIMEOUT,
         Ok(ExecResult { stdout: stdout.as_bytes().to_vec(), stderr: b"nginx: [emerg] secret path".to_vec(), exit_status: status }))
-}
-
-fn conf_step(dir: &str, base_url: &str) -> ScriptStep {
-    exec_ok(CONF_COMMAND.into(), 0, &format!("SUB_HOSTNAME=h\nSUB_BASE_URL={base_url}\nSUB_DIR={dir}\nNGINX_GROUP=www-data\n"))
 }
 
 /// Upload of `count` subscriptions: YAML, snippets, then the apply script
@@ -214,58 +218,78 @@ fn snippet_headers_ttl_and_time_follow_v1() {
     for bad in ["2023-02-29T00:00:00Z", "2030-13-01T00:00:00Z", "2030-01-01 00:00:00Z", "2030-01-01T00:00:00", "2030-01-01T00:00:00+3"] {
         assert_eq!(parse_iso(bad), None, "{bad}");
     }
-    assert_eq!(remote::HostConf::parse("SUB_DIR=/a/b\r\nSUB_BASE_URL=https://h:2096\nX=1\n").sub_dir(), Some("/a/b"));
-    assert_eq!(remote::HostConf::parse("SUB_DIR=/a/../b\n").sub_dir(), None);
 }
 
 // ─── host / list / show / headers ────────────────────────────────────────────
 
 #[tokio::test(flavor = "current_thread")]
-async fn host_requires_migration_with_published_tokens_and_reads_the_node() {
+async fn host_sets_shows_and_removes_the_record_without_connecting() {
     let root = tempfile::tempdir().unwrap();
     let (mut session, journal) = fixture(root.path(), "https://old.example");
-    let before = fingerprint(root.path());
     let none = Hosts::new(vec![]);
-    let error = run(&mut session, &none, &["subscription", "host", "--name", "new"]).await.unwrap_err();
-    assert_eq!((error.code, error.message.as_str()),
-        ("conflict", "Есть опубликованные подписки. Для смены хост-ноды используйте subscription migrate --name new."));
-    assert_eq!(fingerprint(root.path()), before);
     assert_eq!(run(&mut session, &none, &["subscription", "host"]).await.unwrap()["node"], "old");
-
-    // Not installed: not_installed, nothing written.
-    let hosts = Hosts::new(vec![vec![connect_step(1), exec_status(CONF_COMMAND.into(), 0, "", 3)]]);
-    let error = run(&mut session, &hosts, &["subscription", "host", "--name", "old"]).await.unwrap_err();
-    hosts.finish(&[]);
-    assert_eq!((error.code, error.message.as_str()), ("not_installed", "На ноде «old» не установлен хостинг подписок."));
+    let before = fingerprint(root.path());
+    let set = ["subscription", "host", "--name", "new", "--domain"];
+    for (argv, code) in [
+        (vec!["subscription", "host", "--name", "new"], "usage"),
+        (vec!["subscription", "host", "--domain", "sub.example.com"], "usage"),
+        (vec!["subscription", "host", "--remove", "--name", "new"], "usage"),
+        ([&set[..], &["bad domain"]].concat(), "invalid"),
+        ([&set[..], &["sub.example.com", "--port", "0"]].concat(), "invalid"),
+        ([&set[..], &["sub.example.com", "--port", "8445"]].concat(), "invalid"),
+        ([&set[..], &["new.example.com"]].concat(), "invalid"),
+        (vec!["subscription", "host", "--name", "ghost", "--domain", "sub.example.com"], "not_found"),
+    ] {
+        assert_eq!(run(&mut session, &none, &argv).await.unwrap_err().code, code, "{argv:?}");
+    }
     assert_eq!(fingerprint(root.path()), before);
 
-    // A base URL with a path: refused, nothing written.
-    let hosts = Hosts::new(vec![vec![connect_step(1), conf_step(OLD_DIR, "https://old.example/path")]]);
-    let error = run(&mut session, &hosts, &["subscription", "host", "--name", "old"]).await.unwrap_err();
-    hosts.finish(&[]);
-    assert_eq!((error.code, error.message.as_str()), ("invalid", "Некорректный адрес хостинга подписок: https://old.example/path."));
+    let data = run(&mut session, &none, &[&set[..], &["sub.example.com", "--port", "2096"]].concat()).await.unwrap();
+    assert_eq!(data, json!({"node": "new", "hostname": "sub.example.com", "port": 2096,
+        "base_url": "https://sub.example.com:2096", "sub_dir": SUB_DIR, "nginx_group": "www-data"}));
+    assert!(journal.borrow().iter().any(|(_, line)| line == "Примените изменения: node apply --name new --name old"));
+    assert!(warned(&journal, "Адреса подписок изменятся: после node apply выполните subscription publish-all."));
+    let saved = config(&session);
+    assert_eq!((render::status(&saved, &saved.nodes[0]), render::status(&saved, &saved.nodes[1])), ("pending", "pending"));
+
+    // Uploads wait for `node apply` on the host.
+    let error = run(&mut session, &none, &["subscription", "publish", "--name", "alpha"]).await.unwrap_err();
+    assert_eq!((error.code, error.message.as_str()), ("not_installed", "Хост подписок не применён: выполните node apply."));
+    none.finish(&[]);
+
+    let before = fingerprint(root.path());
+    let error = run(&mut session, &none, &["subscription", "host", "--remove"]).await.unwrap_err();
+    assert_eq!((error.code, error.extra["plan"].clone()), ("confirmation_required", json!([
+        "Хост подписок https://sub.example.com:2096 на ноде «new» будет убран; его файлы удалит node apply.",
+        "Опубликованные ссылки (1) перестанут открываться до нового хоста и subscription publish-all.",
+    ])));
     assert_eq!(fingerprint(root.path()), before);
+    assert_eq!(run(&mut session, &none, &["subscription", "host", "--remove", "--yes"]).await.unwrap(), Value::Null);
+    assert!(config(&session).subscription_host.is_none());
+    assert_eq!(run(&mut session, &none, &["subscription", "host", "--remove", "--yes"]).await.unwrap_err().code, "not_configured");
+}
 
-    // Same host: refreshes the cached settings from the node.
-    let hosts = Hosts::new(vec![vec![connect_step(1), conf_step(OLD_DIR, "https://fresh.example")]]);
-    let data = run(&mut session, &hosts, &["subscription", "host", "--name", "old"]).await.unwrap();
-    hosts.finish(&[]);
-    assert_eq!(data, json!({"node": "old", "hostname": "fresh.example", "port": 443, "base_url": "https://fresh.example",
-        "sub_dir": OLD_DIR, "nginx_group": "www-data"}));
-    assert_eq!(journal.borrow().last().unwrap().1, "Хост-нода подписок: old (https://fresh.example)");
-
-    // Without published tokens the host may change.
-    session.mutate("t", |state| {
-        let mut config = state.load_config()?;
-        config.clients.iter_mut().for_each(|client| client.subscription = None);
-        state.save_config(&config)
-    }).unwrap();
-    let hosts = Hosts::new(vec![vec![connect_step(2), conf_step(NEW_DIR, "https://new.example")]]);
-    run(&mut session, &hosts, &["subscription", "host", "--name", "new"]).await.unwrap();
-    hosts.finish(&[]);
-    assert_eq!(config(&session).subscription_host.unwrap().node, "new");
-    let error = run(&mut session, &none, &["subscription", "host", "--name", "ghost"]).await.unwrap_err();
-    assert_eq!(error.code, "not_found");
+#[tokio::test(flavor = "current_thread")]
+async fn removing_the_host_rechecks_the_plan_under_the_lock() {
+    let root = tempfile::tempdir().unwrap();
+    let (session, _) = fixture(root.path(), "https://old.example");
+    let remove = invocation(&["subscription", "host", "--remove", "--yes"]);
+    let (planned, _) = commands::remove_host_plan(&config(&session)).unwrap();
+    // Another request moved the host to `new` after the confirmation.
+    let mut moved = config(&session);
+    moved.subscription_host = Some(SubscriptionHost {
+        node: "new".into(), hostname: "sub.example.com".into(), port: 443, base_url: "https://sub.example.com".into(),
+        sub_dir: SUB_DIR.into(), nginx_group: "www-data".into(),
+    });
+    session.state.save_config(&moved).unwrap();
+    let before = fingerprint(root.path());
+    let error = commands::remove_host_planned(&session.state, &planned, &remove).unwrap_err();
+    assert_eq!(error.code, "plan_changed");
+    assert_eq!(error.extra["plan"][0], "Хост подписок https://sub.example.com на ноде «new» будет убран; его файлы удалит node apply.");
+    assert_eq!(fingerprint(root.path()), before);
+    let (current, _) = commands::remove_host_plan(&config(&session)).unwrap();
+    commands::remove_host_planned(&session.state, &current, &remove).unwrap();
+    assert!(config(&session).subscription_host.is_none());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -287,10 +311,10 @@ async fn list_hides_links_and_show_exposes_them() {
         state.save_config(&config)
     }).unwrap();
     for argv in [&["subscription", "show", "--name", "alpha"][..], &["subscription", "publish-all"][..],
-        &["subscription", "publish", "--name", "alpha"][..], &["subscription", "migrate", "--name", "new"][..]] {
+        &["subscription", "publish", "--name", "alpha"][..], &["subscription", "host", "--remove", "--yes"][..]] {
         let error = run(&mut session, &none, argv).await.unwrap_err();
         assert_eq!((error.code, error.message.as_str()),
-            ("not_configured", "Хост-нода подписок не задана: subscription host --name NAME."), "{argv:?}");
+            ("not_configured", "Хост-нода подписок не задана: subscription host --name N --domain D."), "{argv:?}");
     }
     none.finish(&[]);
 }
@@ -350,7 +374,7 @@ async fn publish_uploads_then_saves_token_ttl_and_verifies_the_link() {
     let root = tempfile::tempdir().unwrap();
     let base = http(200).await;
     let (mut session, journal) = fixture(root.path(), &base);
-    let mut steps = vec![connect_step(1), conf_step(OLD_DIR, &base)];
+    let mut steps = vec![connect_step(1)];
     steps.extend(upload_steps(OLD_DIR, 1, 0));
     steps.push(exec_ok(remote::expiry_command(OLD_DIR), 76, ""));
     let hosts = Hosts::new(vec![steps]);
@@ -368,14 +392,65 @@ async fn publish_uploads_then_saves_token_ttl_and_verifies_the_link() {
     assert!(journal.borrow().iter().all(|(_, line)| !line.contains(&token)));
     assert_eq!(saved.subscription_default_headers, Some(Vec::new()));
 
-    // Republishing without a TTL keeps the token, expiry and creation time.
-    let mut steps = vec![connect_step(1), conf_step(OLD_DIR, &base)];
+    // Republishing without a TTL keeps the token, expiry and creation time; the
+    // saved expiry goes to the host's list as well.
+    let mut steps = vec![connect_step(1)];
     steps.extend(upload_steps(OLD_DIR, 1, 0));
+    steps.push(exec_ok(remote::expiry_command(OLD_DIR), 76, ""));
     let hosts = Hosts::new(vec![steps]);
     let data = run(&mut session, &hosts, &["subscription", "publish", "--name", "beta"]).await.unwrap();
     hosts.finish(&[&token]);
     assert_eq!(client(&config(&session), "beta").subscription.as_ref().unwrap(), &subscription);
     assert_eq!(data["expires_at"], json!(subscription.expires_at));
+
+    // An expired subscription is not uploaded again without a new TTL.
+    session.mutate("t", |state| {
+        let mut config = state.load_config()?;
+        let beta = config.clients.iter_mut().find(|client| client.name == "beta").unwrap();
+        beta.subscription.as_mut().unwrap().expires_at = Some("2020-01-01T00:00:00Z".into());
+        state.save_config(&config)
+    }).unwrap();
+    let before = fingerprint(root.path());
+    let none = Hosts::new(vec![]);
+    let error = run(&mut session, &none, &["subscription", "publish", "--name", "beta"]).await.unwrap_err();
+    none.finish(&[]);
+    assert_eq!((error.code, error.message.as_str()),
+        ("invalid", "Срок подписки «beta» истёк: опубликуйте её с новым сроком (--ttl, например 30d)."));
+    assert_eq!(fingerprint(root.path()), before);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn publish_works_while_the_host_node_is_pending_for_another_reason() {
+    let root = tempfile::tempdir().unwrap();
+    let base = http(200).await;
+    let (mut session, _journal) = fixture(root.path(), &base);
+    // A node port override: the host node is `pending`, its subscription role is not touched.
+    session.mutate("t", |state| {
+        let mut config = state.load_config()?;
+        config.nodes[0].ports.insert("hysteria2".into(), 20443);
+        state.save_config(&config)
+    }).unwrap();
+    let saved = config(&session);
+    assert_eq!(render::status(&saved, &saved.nodes[0]), "pending");
+    let mut steps = vec![connect_step(1)];
+    steps.extend(upload_steps(OLD_DIR, 1, 0));
+    steps.push(exec_ok(remote::expiry_command(OLD_DIR), 76, ""));
+    let hosts = Hosts::new(vec![steps]);
+    run(&mut session, &hosts, &["subscription", "publish", "--name", "beta", "--ttl", "30d"]).await.unwrap();
+    let token = client(&config(&session), "beta").subscription.clone().unwrap().token.unwrap();
+    hosts.finish(&[&token]);
+
+    // A running teardown of the host node blocks uploads before any connection.
+    session.mutate("t", |state| {
+        let mut config = state.load_config()?;
+        config.nodes[0].operation = Some(crate::model::Operation { id: "0".repeat(32), digest: "d".repeat(64), teardown: true,
+            ..Default::default() });
+        state.save_config(&config)
+    }).unwrap();
+    let none = Hosts::new(vec![]);
+    let error = run(&mut session, &none, &["subscription", "publish", "--name", "beta"]).await.unwrap_err();
+    assert_eq!(error.code, "not_installed");
+    none.finish(&[]);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -386,7 +461,7 @@ async fn publish_failures_keep_local_state() {
     let before = fingerprint(root.path());
 
     // Snippet upload fails: temporary files are removed, nothing is saved.
-    let hosts = Hosts::new(vec![vec![connect_step(1), conf_step(OLD_DIR, &base),
+    let hosts = Hosts::new(vec![vec![connect_step(1),
         ScriptStep::upload_any_local(OLD_DIR, COMMAND_TIMEOUT, Ok(())),
         ScriptStep::upload_any_local(SNIPPETS_DIR, COMMAND_TIMEOUT, Err(RcError::new("remote_failed", "x"))),
         exec_ok(remote::cleanup_command(OLD_DIR), 17, "")]]);
@@ -397,7 +472,7 @@ async fn publish_failures_keep_local_state() {
     assert_eq!(fingerprint(root.path()), before);
 
     // nginx rejects the snippet.
-    let mut steps = vec![connect_step(1), conf_step(OLD_DIR, &base)];
+    let mut steps = vec![connect_step(1)];
     steps.extend(upload_steps(OLD_DIR, 1, 1));
     let hosts = Hosts::new(vec![steps]);
     let error = run(&mut session, &hosts, &["subscription", "publish", "--name", "beta"]).await.unwrap_err();
@@ -407,7 +482,7 @@ async fn publish_failures_keep_local_state() {
     assert_eq!(fingerprint(root.path()), before);
 
     // A new subscription whose expiry cannot be written is removed again.
-    let mut steps = vec![connect_step(1), conf_step(OLD_DIR, &base)];
+    let mut steps = vec![connect_step(1)];
     steps.extend(upload_steps(OLD_DIR, 1, 0));
     steps.push(exec_status(remote::expiry_command(OLD_DIR), 76, "", 1));
     steps.push(exec_ok(remote::remove_command(OLD_DIR), 66, "removed\n"));
@@ -446,7 +521,7 @@ async fn failed_http_check_after_saving_is_partial_with_the_link() {
     let root = tempfile::tempdir().unwrap();
     let base = http(502).await;
     let (mut session, _) = fixture(root.path(), &base);
-    let mut steps = vec![connect_step(1), conf_step(OLD_DIR, &base)];
+    let mut steps = vec![connect_step(1)];
     steps.extend(upload_steps(OLD_DIR, 1, 0));
     let hosts = Hosts::new(vec![steps]);
     let error = run(&mut session, &hosts, &["subscription", "publish", "--name", "beta"]).await.unwrap_err();
@@ -501,7 +576,7 @@ async fn rotate_replaces_the_link_or_restores_the_old_one() {
     let old = alpha_token();
 
     // Old link removal rolls back: the new copy is removed, local data unchanged.
-    let mut steps = vec![connect_step(1), conf_step(OLD_DIR, &base)];
+    let mut steps = vec![connect_step(1)];
     steps.extend(upload_steps(OLD_DIR, 1, 0));
     steps.push(exec_status(remote::remove_command(OLD_DIR), 130, "restored\n", 1));
     steps.push(exec_ok(remote::remove_command(OLD_DIR), 66, "removed\n"));
@@ -513,7 +588,7 @@ async fn rotate_replaces_the_link_or_restores_the_old_one() {
     assert_eq!(fingerprint(root.path()), before);
 
     // An uncertain rollback keeps the replacement on the host.
-    let mut steps = vec![connect_step(1), conf_step(OLD_DIR, &base)];
+    let mut steps = vec![connect_step(1)];
     steps.extend(upload_steps(OLD_DIR, 1, 0));
     steps.push(exec_status(remote::remove_command(OLD_DIR), 130, "uncertain:uncertain:restored:restored\n", 1));
     let hosts = Hosts::new(vec![steps]);
@@ -523,7 +598,7 @@ async fn rotate_replaces_the_link_or_restores_the_old_one() {
         Резервная копия сохранена в каталоге подписок."));
     assert_eq!(fingerprint(root.path()), before);
 
-    let mut steps = vec![connect_step(1), conf_step(OLD_DIR, &base)];
+    let mut steps = vec![connect_step(1)];
     steps.extend(upload_steps(OLD_DIR, 1, 0));
     steps.push(exec_ok(remote::remove_command(OLD_DIR), 130, "removed\n"));
     let hosts = Hosts::new(vec![steps]);
@@ -542,7 +617,7 @@ async fn revoke_removes_the_link_before_dropping_the_token() {
     let (mut session, journal) = fixture(root.path(), "https://old.example");
     let before = fingerprint(root.path());
     let token = alpha_token();
-    let hosts = Hosts::new(vec![vec![connect_step(1), conf_step(OLD_DIR, "https://old.example"),
+    let hosts = Hosts::new(vec![vec![connect_step(1),
         exec_status(remote::remove_command(OLD_DIR), 66, "unchanged\n", 1)]]);
     let error = run(&mut session, &hosts, &["subscription", "revoke", "--name", "alpha", "--yes"]).await.unwrap_err();
     hosts.finish(&[&token]);
@@ -560,7 +635,7 @@ async fn revoke_removes_the_link_before_dropping_the_token() {
     assert!(warned(&journal, "Подписка «alpha» не отозвана: ссылка может оставаться действующей."));
     assert_eq!(fingerprint(root.path()), before);
 
-    let hosts = Hosts::new(vec![vec![connect_step(1), conf_step(OLD_DIR, "https://old.example"),
+    let hosts = Hosts::new(vec![vec![connect_step(1),
         exec_ok(remote::remove_command(OLD_DIR), 66, "removed\n")]]);
     let data = run(&mut session, &hosts, &["subscription", "revoke", "--name", "alpha", "--yes"]).await.unwrap();
     hosts.finish(&[&token]);
@@ -582,7 +657,7 @@ async fn publish_all_plans_orphans_and_reports_partial_sweep() {
     let before = fingerprint(root.path());
     let (alpha, orphan) = (alpha_token(), orphan_token());
     let listing = format!("{alpha}\n{orphan}\nnot-a-token\n");
-    let plan_steps = || vec![connect_step(1), conf_step(OLD_DIR, base),
+    let plan_steps = || vec![connect_step(1),
         exec_ok(remote::list_command(OLD_DIR), 0, &listing)];
 
     let hosts = Hosts::new(vec![plan_steps()]);
@@ -607,6 +682,8 @@ async fn publish_all_plans_orphans_and_reports_partial_sweep() {
     // Published, but the planned sweep fails.
     let mut steps = plan_steps();
     steps.extend(upload_steps(OLD_DIR, 2, 0));
+    // The saved expiry of alpha goes to the host's list (a moved host has none).
+    steps.push(exec_ok(remote::expiry_command(OLD_DIR), 76, ""));
     steps.push(exec_status(remote::prune_command(OLD_DIR), 65, "0 1\n", 1));
     let hosts = Hosts::new(vec![steps]);
     let error = run(&mut session, &hosts, &["subscription", "publish-all", "--yes"]).await.unwrap_err();
@@ -619,6 +696,17 @@ async fn publish_all_plans_orphans_and_reports_partial_sweep() {
     assert!(subscription_token_valid(beta.token.as_deref().unwrap()) && beta.expires_at.is_none());
     assert!(journal.borrow().iter().any(|(level, line)| *level == Level::Success && line == "Опубликовано: 2"));
     assert_eq!(client(&config(&session), "alpha").subscription.as_ref().unwrap().token.as_deref(), Some(alpha.as_str()));
+
+    // The expiry list cannot be written: partial before the success report and the sweep.
+    let mut steps = plan_steps();
+    steps.extend(upload_steps(OLD_DIR, 2, 0));
+    steps.push(exec_status(remote::expiry_command(OLD_DIR), 76, "", 1));
+    let hosts = Hosts::new(vec![steps]);
+    let error = run(&mut session, &hosts, &["subscription", "publish-all", "--yes"]).await.unwrap_err();
+    hosts.finish(&[&alpha, &orphan, beta.token.as_deref().unwrap()]);
+    assert_eq!(error.code, "partial");
+    assert!(error.message.starts_with("Подписки опубликованы, но сроки действия на хост-ноде не записаны"));
+    assert_eq!((error.extra["published"].clone(), error.extra["removed"].clone()), (json!(["alpha", "beta"]), json!(0)));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -632,7 +720,7 @@ async fn publish_all_refuses_to_sweep_without_local_tokens_and_skips_without_con
         state.save_config(&config)
     }).unwrap();
     let before = fingerprint(root.path());
-    let hosts = Hosts::new(vec![vec![connect_step(1), conf_step(OLD_DIR, base),
+    let hosts = Hosts::new(vec![vec![connect_step(1),
         exec_ok(remote::list_command(OLD_DIR), 0, &format!("{}\n", orphan_token()))]]);
     let error = run(&mut session, &hosts, &["subscription", "publish-all", "--yes"]).await.unwrap_err();
     hosts.finish(&[]);
@@ -644,80 +732,3 @@ async fn publish_all_refuses_to_sweep_without_local_tokens_and_skips_without_con
     assert_eq!(data, json!({"published": [], "skipped": ["alpha", "beta"], "failed": [], "removed": 0}));
 }
 
-// ─── migrate ─────────────────────────────────────────────────────────────────
-
-#[tokio::test(flavor = "current_thread")]
-async fn migrate_plans_copies_switches_and_then_removes_old_links() {
-    let root = tempfile::tempdir().unwrap();
-    let (mut session, journal) = fixture(root.path(), "https://old.example");
-    let before = fingerprint(root.path());
-    let token = alpha_token();
-    let prepare = || (vec![connect_step(1), conf_step(OLD_DIR, "https://old.example")],
-        vec![connect_step(2), conf_step(NEW_DIR, "https://new.example")]);
-
-    let (old, new) = prepare();
-    let hosts = Hosts::new(vec![old, new]);
-    let error = run(&mut session, &hosts, &["subscription", "migrate", "--name", "new"]).await.unwrap_err();
-    hosts.finish(&[]);
-    assert_eq!(error.code, "confirmation_required");
-    assert_eq!(error.extra["plan"], json!(["Старая хост-нода: old", "Базовый URL: https://old.example",
-        "Новая хост-нода: new", "Базовый URL: https://new.example", "alpha",
-        "Все адреса подписок изменятся.", "Старые ссылки будут удалены только после загрузки всех подписок."]));
-    assert_eq!(fingerprint(root.path()), before);
-
-    // Upload failure on the new node: old host and links untouched.
-    let (old, mut new) = prepare();
-    new.push(exec_ok(remote::expiry_command(NEW_DIR), 76, ""));
-    new.extend(upload_steps(NEW_DIR, 1, 1));
-    let hosts = Hosts::new(vec![old, new]);
-    let error = run(&mut session, &hosts, &["subscription", "migrate", "--name", "new", "--yes"]).await.unwrap_err();
-    hosts.finish(&[&token]);
-    assert_eq!((error.code, error.message.as_str()), ("remote_failed", "На новой ноде могли остаться копии подписок."));
-    assert!(warned(&journal, "Перенос не завершён: старый хост и старые ссылки сохранены."));
-    assert_eq!(fingerprint(root.path()), before);
-
-    // A base URL with a path is refused before any remote change.
-    let hosts = Hosts::new(vec![vec![connect_step(1), conf_step(OLD_DIR, "https://old.example")],
-        vec![connect_step(2), conf_step(NEW_DIR, "https://new.example/path")]]);
-    let error = run(&mut session, &hosts, &["subscription", "migrate", "--name", "new", "--yes"]).await.unwrap_err();
-    hosts.finish(&[]);
-    assert_eq!((error.code, error.message.as_str(), error.extra["name"].as_str()),
-        ("invalid", "Некорректный адрес хостинга подписок: https://new.example/path.", Some("new")));
-    assert_eq!(fingerprint(root.path()), before);
-
-    // Local refusals before any connection.
-    let none = Hosts::new(vec![]);
-    let error = run(&mut session, &none, &["subscription", "migrate", "--name", "old", "--yes"]).await.unwrap_err();
-    assert_eq!((error.code, error.message.as_str()), ("invalid", "Выбрана текущая хост-нода. Перенос не выполнен."));
-    std::fs::write(root.path().join("generated/MOBILE/alpha/config.yaml"), "\n").unwrap();
-    let error = run(&mut session, &none, &["subscription", "migrate", "--name", "new", "--yes"]).await.unwrap_err();
-    assert_eq!((error.code, error.message.as_str()), ("needs_setup",
-        "alpha: конфиг отсутствует или пуст. Перенос отменён. Сгенерируйте его: generate --client alpha."));
-    std::fs::write(root.path().join("generated/MOBILE/alpha/config.yaml"), "proxies: []\n").unwrap();
-    none.finish(&[]);
-    assert_eq!(fingerprint(root.path()), before);
-
-    // Success: expiry and copies first, host switch, old links removed (one fails → partial).
-    let (mut old, mut new) = prepare();
-    new.push(exec_ok(remote::expiry_command(NEW_DIR), 76, ""));
-    new.extend(upload_steps(NEW_DIR, 1, 0));
-    old.push(exec_status(remote::remove_command(OLD_DIR), 66, "restored\n", 1));
-    let hosts = Hosts::new(vec![old, new]);
-    let error = run(&mut session, &hosts, &["subscription", "migrate", "--name", "new", "--yes"]).await.unwrap_err();
-    hosts.finish(&[&token]);
-    assert_eq!(error.code, "partial");
-    assert_eq!((error.extra["node"].clone(), error.extra["migrated"].clone()), (json!("new"), json!(1)));
-    let saved = config(&session);
-    assert_eq!(saved.subscription_host, Some(SubscriptionHost { node: "new".into(), hostname: "new.example".into(), port: 443,
-        base_url: "https://new.example".into(), sub_dir: NEW_DIR.into(), nginx_group: "www-data".into() }));
-    assert_eq!(client(&saved, "alpha").subscription.as_ref().unwrap().token.as_deref(), Some(token.as_str()));
-
-    // Nothing published: no work, no connection.
-    session.mutate("t", |state| {
-        let mut config = state.load_config()?;
-        config.clients[0].subscription = None;
-        state.save_config(&config)
-    }).unwrap();
-    let data = run(&mut session, &none, &["subscription", "migrate", "--name", "old"]).await.unwrap();
-    assert_eq!(data, json!({"node": "old", "base_url": null, "migrated": 0}));
-}

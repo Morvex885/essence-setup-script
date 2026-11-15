@@ -7,7 +7,7 @@ Captured from the Bash builders and parsers in `common/` by
 ## Layout
 
 One file per source module (`uri`, `hy2`, `vless-tcp`, `vless-grpc`,
-`vless-xhttp`, `iptables-dnat`, `listener-users`):
+`vless-xhttp`, `listener-users`):
 
 ```
 {"module": "...", "cases": [
@@ -19,9 +19,8 @@ One file per source module (`uri`, `hy2`, `vless-tcp`, `vless-grpc`,
 - `stdin_b64`: `null` when the function is called without stdin.
 - `stdout_b64` / `stderr_b64`: raw bytes, base64 (CRLF and non-UTF-8 survive).
 - `invoke` differs from `function` only for wrappers: `w_server_port`
-  (prints `server=`/`port=` from `URI_SERVER`/`URI_PORT`), `w_sync` (stdout is
-  the resulting config file), `w_apply_dnat` / `w_remove_dnat` /
-  `w_persist_dnat` (stdout is the recorded command log).
+  (prints `server=`/`port=` from `URI_SERVER`/`URI_PORT`) and `w_sync`
+  (stdout is the resulting config file).
 - `globals` for `_sync_listener_users` holds the input config under
   `config_yaml` (`null` when the file is absent).
 
@@ -89,5 +88,3 @@ variation that were removed or pinned:
 ## Not captured
 
 - `_ask_*` interactive prompts (tty-driven).
-- `_persist_dnat_rules` without `netfilter-persistent` (would call `apt`).
-- Real `iptables` / `sysctl` effects.

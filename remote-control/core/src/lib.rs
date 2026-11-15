@@ -6,7 +6,6 @@
 pub const VERSION: &str = env!("ESSENCE_RC_VERSION");
 
 pub mod auth;
-pub mod awg;
 pub mod cli;
 pub mod clients;
 pub mod confirmation;

@@ -429,16 +429,22 @@ impl SubscriptionHost {
     pub fn base_url_for(hostname: &str, port: u16) -> String {
         if port == 443 { format!("https://{hostname}") } else { format!("https://{hostname}:{port}") }
     }
+}
 
-    /// `(hostname, port)` of an `https://host[:port][/]` base URL.
-    pub fn parse_base_url(url: &str) -> Option<(String, u16)> {
-        let rest = url.strip_prefix("https://")?;
-        let rest = rest.strip_suffix('/').unwrap_or(rest);
-        match rest.rsplit_once(':') {
-            Some((host, port)) => Some((host.to_owned(), v::parse_ssh_port(port).ok()?)),
-            None => Some((rest.to_owned(), 443)),
-        }
-    }
+/// Names a cascade cannot take: the node's connections, mihomo's built-in
+/// policies, the proxies and groups the render adds (`outbound`, `warp-wg`,
+/// `<C>-outbound`), AmneziaWG peer blocks (`awg-<client>`) and the `--`
+/// separator of cascade users.
+pub fn cascade_name_reserved(name: &str) -> bool {
+    CONNECTION_NAMES.contains(&name)
+        || ["DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE", "GLOBAL", "outbound", "warp-wg"].contains(&name)
+        || name.ends_with("-outbound") || name.starts_with("awg-") || name.contains("--")
+}
+
+/// A client named `<x>--<C>` would share its listener user name with client
+/// `<x>` routed through cascade `C` (and `cascade--<C>`, the exit user).
+pub fn cascade_user_clash(client: &str, cascade: &str) -> bool {
+    client.strip_suffix(cascade).is_some_and(|rest| rest.ends_with("--"))
 }
 
 impl Config {
@@ -529,8 +535,12 @@ impl Config {
         }
         unique_names(self.cascades.iter().map(|c| c.name.as_str()))?;
         for cascade in &self.cascades {
-            if CONNECTION_NAMES.contains(&cascade.name.as_str()) {
-                return Err(invalid("Имя каскада совпадает с именем подключения ноды."));
+            if cascade_name_reserved(&cascade.name) {
+                return Err(invalid("Имя каскада совпадает с именем подключения ноды или служебным именем mihomo."));
+            }
+            if let Some(client) = self.clients.iter().find(|client| cascade_user_clash(&client.name, &cascade.name)) {
+                return Err(RcError::new("invalid", format!("Имя клиента «{}» совпадает с пользователем каскада «{}».", client.name, cascade.name))
+                    .with_extra("name", client.name.clone()));
             }
             require_profiled(&cascade.entry)?;
             // The entry node's credentials on the exit node; unused for a URI exit.
@@ -546,7 +556,11 @@ impl Config {
                     }
                 }
                 CascadeExit::Uri(exit) => {
-                    if exit.uri.is_empty() || exit.uri.chars().any(|c| c.is_control() || c.is_whitespace()) {
+                    // The exit becomes a proxy in the entry node's mihomo config:
+                    // only a single supported share link is accepted.
+                    if exit.uri.is_empty() || exit.uri.len() > 4096 || exit.uri.chars().any(|c| c.is_control() || c.is_whitespace())
+                        || crate::protocols::uri::parse_exit_uri(&cascade.name, &exit.uri).is_err()
+                    {
                         return Err(invalid("Некорректная ссылка выхода каскада."));
                     }
                     if !credentials_valid && !(cascade.uuid.is_empty() && cascade.password.is_empty()) {
@@ -570,7 +584,13 @@ impl Config {
         }
         if let Some(host) = &self.subscription_host {
             require_profiled(&host.node)?;
-            if !v::domain_valid(&host.hostname) || host.port == 0 {
+            // `sub_dir` and `nginx_group` reach root commands on the host
+            // node; `base_url` goes into client links.
+            let url_ok = (host.base_url.starts_with("https://") || host.base_url.starts_with("http://"))
+                && host.base_url.len() <= 512 && !host.base_url.contains(|c: char| c.is_control() || c.is_whitespace() || "\"'`\\<>".contains(c));
+            // Port 80 belongs to the persistent ACME vhost (HTTP-01).
+            if !v::domain_valid(&host.hostname) || host.port == 0 || host.port == 80 || !url_ok
+                || host.sub_dir != SUB_DIR || host.nginx_group != default_nginx_group() {
                 return Err(invalid("Некорректный адрес хостинга подписок."));
             }
         }
@@ -1009,7 +1029,7 @@ mod tests {
         raw["cascades"] = json!([
             {"name": "via-ru", "entry": "de-vps", "listener": "vless-tcp", "exit": {"node": "ru-vps", "proxy": "VLESS TCP"},
              "uuid": "11111111-2222-4333-8444-555555555555", "password": "0123456789abcdef0123456789abcdef"},
-            {"name": "outside", "entry": "ru-vps", "listener": "hysteria2", "exit": {"uri": "vless://u@h:443"},
+            {"name": "outside", "entry": "ru-vps", "listener": "hysteria2", "exit": {"uri": "vless://11111111-2222-4333-8444-555555555555@h:443"},
              "uuid": "", "password": ""}]);
         raw["telegram"] = json!([{"node": "de-vps", "hostname": "tg.example.com", "secret_mark": "0123abcd"}]);
         raw["subscription_host"] = json!({"node": "ru-vps", "hostname": "sub.example.com", "port": 8444 + 1000,
@@ -1149,16 +1169,32 @@ mod tests {
             ("/nodes/0/profile", json!("ghost"), "Ссылка на неизвестный профиль."),
             ("/cascades/0/entry", json!("ghost"), "Ссылка на неизвестную ноду."),
             ("/cascades/0/exit/node", json!("de-vps"), "Входная и выходная ноды каскада совпадают."),
-            ("/cascades/0/name", json!("Hysteria2"), "Имя каскада совпадает с именем подключения ноды."),
+            ("/cascades/0/name", json!("Hysteria2"), "Имя каскада совпадает с именем подключения ноды или служебным именем mihomo."),
+            ("/cascades/0/name", json!("DIRECT"), "Имя каскада совпадает с именем подключения ноды или служебным именем mihomo."),
+            ("/cascades/0/name", json!("outbound"), "Имя каскада совпадает с именем подключения ноды или служебным именем mihomo."),
+            ("/cascades/0/name", json!("x-outbound"), "Имя каскада совпадает с именем подключения ноды или служебным именем mihomo."),
+            ("/cascades/0/name", json!("awg-hop"), "Имя каскада совпадает с именем подключения ноды или служебным именем mihomo."),
+            ("/cascades/0/name", json!("a--b"), "Имя каскада совпадает с именем подключения ноды или служебным именем mihomo."),
+            ("/cascades/1/exit/uri", json!("vless://11111111-2222-4333-8444-555555555555@203.0.113.5:443?flow=x%3A%20y&pbk=k%20%23c"),
+                "Некорректная ссылка выхода каскада."),
+            ("/cascades/1/exit/uri", json!("vless://11111111-2222-4333-8444-555555555555@203.0.113.5:notaport"), "Некорректная ссылка выхода каскада."),
+            ("/cascades/1/exit/uri", json!("vless://u@203.0.113.5:443"), "Некорректная ссылка выхода каскада."),
+            ("/subscription_host/port", json!(80), "Некорректный адрес хостинга подписок."),
             ("/cascades/1/name", json!("via-ru"), "Повторяющееся имя в конфигурации."),
             ("/cascades/0/uuid", json!(""), "Некорректные учётные данные каскада."),
             ("/cascades/1/uuid", json!("bad"), "Некорректные учётные данные каскада."),
             ("/cascades/1/exit/uri", json!("vless://a b"), "Некорректная ссылка выхода каскада."),
+            ("/cascades/1/exit/uri", json!("ftp://203.0.113.5"), "Некорректная ссылка выхода каскада."),
+            ("/cascades/1/exit/uri", json!(format!("vless://u@h:443?{}", "a".repeat(4096))), "Некорректная ссылка выхода каскада."),
             ("/telegram/0/node", json!("ghost"), "Ссылка на неизвестную ноду."),
             ("/telegram/0/hostname", json!("tg"), "Некорректный домен Telegram Proxy."),
             ("/telegram/0/secret_mark", json!("x"), "Некорректная метка секрета Telegram Proxy."),
             ("/subscription_host/node", json!("ghost"), "Ссылка на неизвестную ноду."),
             ("/subscription_host/hostname", json!("sub"), "Некорректный адрес хостинга подписок."),
+            ("/subscription_host/base_url", json!("https://a\"b.example"), "Некорректный адрес хостинга подписок."),
+            ("/subscription_host/base_url", json!("javascript:alert(1)"), "Некорректный адрес хостинга подписок."),
+            ("/subscription_host/sub_dir", json!("/etc"), "Некорректный адрес хостинга подписок."),
+            ("/subscription_host/nginx_group", json!("root"), "Некорректный адрес хостинга подписок."),
         ] {
             let mut raw = profiled();
             set(&mut raw, pointer, value);
@@ -1236,10 +1272,6 @@ mod tests {
     fn subscription_base_urls() {
         assert_eq!(SubscriptionHost::base_url_for("sub.example.com", 443), "https://sub.example.com");
         assert_eq!(SubscriptionHost::base_url_for("sub.example.com", 2096), "https://sub.example.com:2096");
-        assert_eq!(SubscriptionHost::parse_base_url("https://h.example:2096/"), Some(("h.example".into(), 2096)));
-        assert_eq!(SubscriptionHost::parse_base_url("https://h.example"), Some(("h.example".into(), 443)));
-        assert_eq!(SubscriptionHost::parse_base_url("http://h.example"), None);
-        assert_eq!(SubscriptionHost::parse_base_url("https://h.example:0"), None);
     }
 
     #[test]

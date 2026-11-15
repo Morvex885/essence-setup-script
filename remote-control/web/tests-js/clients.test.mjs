@@ -497,24 +497,55 @@ test('публикация подписки: срок формой, ссылка
   assert.equal(shared.length, 2);
 });
 
-test('подписки: хост-нода через nodeRequest, перенос по плану, заголовки группы', async () => {
-  const listed = okReply(nodes);
-  const host = fakeCtx({ replies: [listed, okReply()], answers: [{ node: 'ru' }] });
-  await m.subscriptionHostFlow(host, 'de');
-  assert.equal(host.calls[1][1].fields[0].value, 'de');
-  assert.deepEqual(host.calls.at(-1), ['node', ['subscription', 'host', '--name', 'ru']]);
-  const noHost = fakeCtx({ replies: [listed], answers: [null] });
-  await m.subscriptionHostFlow(noHost, null);
-  assert.deepEqual(kinds(noHost), ['request', 'form']);
+test('хост подписок: ноды с профилем, домен и порт одной формой, затем node apply на новой и прежней ноде', async () => {
+  const profiled = okReply([...nodes.map((n) => ({ ...n, profile: 'edge' })), { name: 'bare', ip: '192.0.2.9', port: 22, profile: null }]);
+  const current = { node: 'de', hostname: 'old.example.com', port: '8443', baseUrl: 'https://old.example.com:8443' };
+  const applied = okReply({ applied: ['ru', 'de'], failed: [], unchanged: [] });
+  const moved = fakeCtx({ replies: [profiled, okReply({ node: 'ru' }), applied],
+    answers: [{ node: 'ru', domain: 'sub.example.com', port: '443' }] });
+  assert.equal(await m.subscriptionHostFlow(moved, current), true);
+  const form = moved.calls[1][1];
+  assert.deepEqual(form.fields[0].options.map((o) => o.value), ['de', 'ru'], 'только ноды с профилем');
+  assert.deepEqual(form.fields.map((f) => f.value), ['de', 'old.example.com', '8443']);
+  // Своего вопроса перед node apply нет: единственное подтверждение — план ядра.
+  assert.deepEqual(kinds(moved), ['request', 'form', 'request', 'node', 'show']);
+  assert.deepEqual(commands(moved), [['node', 'list'], ['subscription', 'host', '--name', 'ru', '--domain', 'sub.example.com'],
+    ['node', 'apply', '--name', 'ru', '--name', 'de']]);
 
-  const moved = fakeCtx({ replies: [listed, failure('remote_failed')], answers: [{ node: 'ru' }] });
-  await m.migrateFlow(moved);
-  assert.deepEqual(moved.calls.filter((c) => c[0] === 'run').map((c) => c[1]), [['subscription', 'migrate', '--name', 'ru']]);
-  assert.equal(kinds(moved).at(-1), 'failed');
-  const declined = fakeCtx({ replies: [listed, PLAN], answers: [{ node: 'ru' }] });
-  await m.migrateFlow(declined);
-  assert.notEqual(kinds(declined).at(-1), 'failed', 'отказ от плана — не сбой');
+  // Сбой ядра — та же форма с прежним вводом; отказ от плана применения — без отчёта.
+  const retried = fakeCtx({ replies: [profiled, failure('invalid'), okReply({ node: 'de' }), PLAN],
+    answers: [{ node: 'de', domain: 'x.example.com', port: '8443' }, { node: 'de', domain: 'y.example.com', port: '8443' }] });
+  assert.equal(await m.subscriptionHostFlow(retried, current), true);
+  assert.deepEqual(kinds(retried), ['request', 'form', 'request', 'failed', 'form', 'request', 'node']);
+  assert.equal(retried.calls[4][1].fields[1].value, 'x.example.com');
+  assert.deepEqual(commands(retried).at(-2), ['subscription', 'host', '--name', 'de', '--domain', 'y.example.com', '--port', '8443']);
+  assert.deepEqual(commands(retried).at(-1), ['node', 'apply', '--name', 'de']);
 
+  const fresh = fakeCtx({ replies: [profiled], answers: [null] });
+  assert.equal(await m.subscriptionHostFlow(fresh, null), false);
+  assert.deepEqual(fresh.calls[1][1].fields.map((f) => f.value), [null, '', '443']);
+  const none = fakeCtx({ replies: [okReply(nodes)] });
+  assert.equal(await m.subscriptionHostFlow(none, null), false);
+  assert.deepEqual(kinds(none), ['request', 'notify']);
+
+  assert.deepEqual(m.hostApplyNodes('de', current), ['de']);
+  assert.deepEqual(m.hostApplyNodes('ru', null), ['ru']);
+});
+
+test('убрать хост подписок: по плану, затем node apply на прежней ноде; отказ от плана — не сбой', async () => {
+  const current = { node: 'de', hostname: 'sub.example.com', port: '443', baseUrl: 'https://sub.example.com' };
+  const removed = fakeCtx({ replies: [okReply(null), okReply({ applied: ['de'], failed: [], unchanged: [] })] });
+  assert.equal(await m.removeHostFlow(removed, current), true);
+  assert.deepEqual(commands(removed), [['subscription', 'host', '--remove'], ['node', 'apply', '--name', 'de']]);
+  const declined = fakeCtx({ replies: [PLAN] });
+  assert.equal(await m.removeHostFlow(declined, current), false);
+  assert.deepEqual(kinds(declined), ['run']);
+  const refused = fakeCtx({ replies: [failure('not_configured')] });
+  assert.equal(await m.removeHostFlow(refused, current), false);
+  assert.deepEqual(kinds(refused), ['run', 'failed']);
+});
+
+test('подписки: обновление всех и заголовки группы', async () => {
   const published = fakeCtx({ replies: [okReply({ published: ['alice'], failed: [] })] });
   await m.publishAllFlow(published);
   assert.deepEqual(kinds(published), ['run', 'show']);
@@ -576,4 +607,34 @@ test('генерация: nodes_pending в итоге и предложение 
   const clean = fakeCtx({ replies: [{ ok: true, data: { ok: ['c'] } }] });
   await m.runGenerate(clean, ['--all']);
   assert.deepEqual(clean.offers, []);
+});
+
+test('конфиг AmneziaWG: argv, имя файла и ноды-пиры из client show .awg_nodes', () => {
+  assert.deepEqual(m.awgConfigArgv('alice', 'de'), ['client', 'awg-config', '--name', 'alice', '--node', 'de']);
+  assert.equal(m.awgConfigFile('alice', 'de'), 'alice-de.conf');
+  // Ядро решает, где клиент — пир: клиент без подключений на ноде (`proxies: []`)
+  // пользуется всеми, и нода приходит в `awg_nodes`; строки подключений не разбираются.
+  const data = { connections: [{ node: 'de', mode: 'group', proxies: [] }, { node: 'ru', mode: 'own', proxies: ['AWG'] }], awg_nodes: ['de', 7, 'nl'] };
+  assert.deepEqual(m.awgNodes(data), ['de', 'nl']);
+  assert.deepEqual(m.awgNodes({}), []);
+  assert.deepEqual(m.awgNodes(null), []);
+});
+
+test('конфиг AmneziaWG: одна нода — без выбора, несколько — выбор, нет нод и сбой — null', async () => {
+  const show = (nodes) => okReply({ connections: [], awg_nodes: nodes });
+  let ctx = fakeCtx({ replies: [show(['de']), okReply({ config: '[Interface]\n' })] });
+  assert.deepEqual(await m.awgConfigFlow(ctx, 'alice'), { node: 'de', config: '[Interface]\n' });
+  assert.deepEqual(commands(ctx), [['client', 'show', '--name', 'alice'], m.awgConfigArgv('alice', 'de')]);
+  ctx = fakeCtx({ replies: [show(['de', 'nl']), okReply({ config: 'x' })], answers: ['nl'] });
+  assert.deepEqual(await m.awgConfigFlow(ctx, 'alice'), { node: 'nl', config: 'x' });
+  assert.deepEqual(kinds(ctx), ['request', 'choose', 'request']);
+  ctx = fakeCtx({ replies: [show(['de', 'nl'])], answers: [null] });
+  assert.equal(await m.awgConfigFlow(ctx, 'alice'), null);
+  assert.deepEqual(kinds(ctx), ['request', 'choose']);
+  ctx = fakeCtx({ replies: [show([])] });
+  assert.equal(await m.awgConfigFlow(ctx, 'alice'), null);
+  assert.deepEqual(kinds(ctx), ['request', 'notify']);
+  ctx = fakeCtx({ replies: [show(['de']), failure('invalid')] });
+  assert.equal(await m.awgConfigFlow(ctx, 'alice'), null);
+  assert.deepEqual(kinds(ctx), ['request', 'request', 'failed']);
 });

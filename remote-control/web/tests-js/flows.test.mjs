@@ -244,7 +244,7 @@ test('nodeRequest: оставшийся сбой — OPERATION_FAILED, отка�
 });
 
 test('nodeRequest expect: ожидаемый код — ответ экрану без OPERATION_FAILED, request получает expect', async () => {
-  const words = ['awg', 'status', '--name', 'de'];
+  const words = ['node', 'show', '--name', 'de'];
   const sent = [];
   const notices = [];
   const deps = {

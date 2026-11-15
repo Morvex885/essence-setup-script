@@ -1,4 +1,4 @@
-//! Node, node profile, SSH, connection, AmneziaWG and Telegram screens (v1
+//! Node, node profile, cascade, SSH, connection and Telegram screens (v1
 //! `tui/nodes.sh`) over the daemon protocol only.
 //!
 //! Lists keep their own menu section; dangerous actions consume the core's
@@ -8,14 +8,14 @@
 use std::io;
 use serde_json::Value;
 use ratatui::style::Color;
-use essence_rc_client::{argv, Reply, Secrets};
+use essence_rc_client::{argv, Input, Reply, Secrets};
 use crate::{app::{Context, Navigation, Screen}, confirm::{self, set_flag}, ui::{self, Item, View}};
 
 pub struct Nodes;
 pub struct Connections;
-pub struct AmneziaWg;
 pub struct Telegram;
 pub struct Profiles;
+pub struct Cascades;
 struct NodeCard(String);
 struct ProfileCard(String);
 
@@ -227,7 +227,7 @@ fn card_view(name: &str, node: &Value, password: bool) -> View {
         view.context.push(plain(format!("Порты ноды: {}", list.join(", "))));
     }
     if let Some((state, color)) = apply_state(node) { view.context.push(ui::text(format!("Применение: {state}"), color)); }
-    if !profile.is_empty() { view.context.push(plain(format!("WARP: {}", warp_label(node)))); }
+    if let Some(label) = warp_label(node) { view.context.push(plain(format!("WARP: {label}"))); }
     let issues = joined(&node["issues"]);
     if !issues.is_empty() { view.context.push(ui::text(format!("Требует настройки: {issues}"), ui::YELLOW)); }
     let groups = joined(&node["groups"]);
@@ -236,13 +236,13 @@ fn card_view(name: &str, node: &Value, password: bool) -> View {
     view.sections.push(vec![
         Item::new('y', "Применить", ui::GREEN),
         Item::new('o', "Оболочка", ui::CYAN), Item::new('t', "Telegram Proxy на ноде", ui::CYAN),
-        Item::new('p', "Подключения ноды", ui::CYAN), Item::new('a', "Клиенты AmneziaWG", ui::CYAN),
-        Item::new('k', "Проверить подключение", ui::CYAN),
+        Item::new('p', "Подключения ноды", ui::CYAN), Item::new('k', "Проверить подключение", ui::CYAN),
     ]);
     let mut actions = vec![
         Item::new('f', "Профиль", ui::YELLOW), Item::new('m', "Домен", ui::YELLOW), Item::new('i', "Порты", ui::YELLOW),
         Item::new('h', "Усилить защиту SSH", ui::YELLOW), Item::new('r', "Переименовать", ui::YELLOW), Item::new('e', "Тег", ui::YELLOW),
     ];
+    if warp_label(node).is_some() { actions.push(Item::new('g', "Перерегистрировать WARP", ui::YELLOW)); }
     if password { actions.push(Item::new('w', "Пароль SSH", ui::YELLOW)); }
     actions.extend([Item::new('l', "Псевдонимы подключений", ui::YELLOW), Item::new('d', "Удалить ноду", ui::RED), Item::new(0, "Назад", ui::NC)]);
     view.sections.push(actions);
@@ -264,7 +264,7 @@ impl Screen for NodeCard {
                 "o" | "O" => interactive(ctx, &name, false)?,
                 "t" | "T" => interactive(ctx, &name, true)?,
                 "p" | "P" => connection_node(ctx, &name)?,
-                "a" | "A" => awg_node(ctx, &name)?,
+                "g" | "G" if warp_label(node).is_some() => warp_reregister(ctx, &name)?,
                 "k" | "K" => { node_request(ctx, &name, &argv(&["node", "check", "--name", &name]), None)?; }
                 "y" | "Y" => { apply(ctx, &argv(&["node", "apply", "--name", &name]), &name)?; }
                 "f" | "F" => node_profile(ctx, &name, node)?,
@@ -305,6 +305,14 @@ fn delete_node(ctx: &mut Context<'_>, name: &str, node: &Value) -> io::Result<bo
     if options[i]["revoke_key"] == true { words.push("--revoke-key".into()); }
     let reply = node_request(ctx, name, &words, Some(("Удаление ноды", "Удалить ноду в выбранном объёме?")))?;
     Ok(reply.ok || reply.error["deleted"] == true)
+}
+/// «Перерегистрировать WARP»: the core's plan → `node warp-reregister`; the
+/// node then waits for `node apply`, offered right away.
+fn warp_reregister(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
+    let words = argv(&["node", "warp-reregister", "--name", name]);
+    let reply = node_request(ctx, name, &words, Some(("Перерегистрация WARP", "Перерегистрировать аккаунт WARP?")))?;
+    if reply.ok { offer_apply_on(ctx, &[name.to_owned()])?; }
+    Ok(())
 }
 
 // ─── Добавление ──────────────────────────────────────────────────────────────
@@ -770,80 +778,6 @@ pub(crate) fn conn_set_argv(node: &str, assignments: &[(&str, &[String])]) -> Ve
     words
 }
 
-// ─── AmneziaWG ───────────────────────────────────────────────────────────────
-
-impl Screen for AmneziaWg {
-    fn run(&mut self, ctx: &mut Context<'_>) -> io::Result<Navigation> {
-        loop {
-            let reply = ctx.call(&["node", "list"])?;
-            if !reply.ok {
-                if read_failed(ctx, "AmneziaWG")? { continue; }
-                return Ok(Navigation::Back);
-            }
-            let mut view = View::new("AmneziaWG");
-            view.prompt = "Выберите ноду или действие: ".into();
-            let items = node_items(&reply.data, false);
-            if items.is_empty() { view.context.push(ui::text("Нет нод", ui::DIM)); } else { view.sections.push(items); }
-            view.sections.push(vec![Item::new(0, "Назад", ui::NC)]);
-            let Some(choice) = ctx.choose(&view)? else { return Ok(Navigation::Back); };
-            if choice == "0" { return Ok(Navigation::Back); }
-            match index(&choice, rows(&reply.data).len()) {
-                Some(i) => awg_node(ctx, &text(&reply.data[i]["name"]))?,
-                None => ctx.invalid(),
-            }
-        }
-    }
-}
-fn awg_node(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
-    loop {
-        let reply = node_request(ctx, name, &argv(&["awg", "status", "--name", name]), None)?;
-        if !reply.ok { return Ok(()); }
-        let installed = reply.data["installed"] == true;
-        let peers = rows(&reply.data["peers"]);
-        let mut view = View::new(format!("AmneziaWG: {name}"));
-        view.prompt = "Выберите действие: ".into();
-        if !installed {
-            view.context.push(ui::text("AmneziaWG на ноде не установлен", ui::DIM));
-        } else if peers.is_empty() {
-            view.context.push(ui::text("Нет клиентов", ui::DIM));
-        }
-        if installed {
-            for peer in peers {
-                let (suffix, color) = match peer["status"].as_str() {
-                    Some("used") => ("", ui::GREEN),
-                    Some("orphan") => ("  не используется", ui::YELLOW),
-                    _ => ("  не создан", ui::DIM),
-                };
-                view.context.push(ui::text(format!("{}{suffix}", text(&peer["name"])), color));
-            }
-        }
-        let mut items = vec![Item::new('r', "Обновить", ui::CYAN)];
-        if installed {
-            items.extend([Item::new('c', "Создать недостающих", ui::GREEN), Item::new('d', "Удалить клиента", ui::RED), Item::new('x', "Удалить неиспользуемых", ui::RED)]);
-        }
-        items.push(Item::new(0, "Назад", ui::NC));
-        view.sections.push(items);
-        let Some(choice) = ctx.choose(&view)? else { return Ok(()); };
-        match choice.as_str() {
-            "r" | "R" => {}
-            "c" | "C" if installed => { node_request(ctx, name, &argv(&["awg", "sync", "--name", name]), None)?; }
-            "d" | "D" if installed => {
-                let removable: Vec<String> = peers.iter().filter(|p| p["status"] != "missing").map(|p| text(&p["name"])).collect();
-                if let Some(i) = ctx.select("Удаление клиента AmneziaWG", &removable)? {
-                    let words = argv(&["awg", "remove", "--name", name, "--peer", &removable[i]]);
-                    node_request(ctx, name, &words, Some(("Удаление клиента AmneziaWG", "Удалить?")))?;
-                }
-            }
-            "x" | "X" if installed => {
-                let words = argv(&["awg", "remove", "--name", name, "--orphans"]);
-                node_request(ctx, name, &words, Some(("Удаление неиспользуемых клиентов AmneziaWG", "Удалить?")))?;
-            }
-            "0" => return Ok(()),
-            _ => ctx.invalid(),
-        }
-    }
-}
-
 // ─── Telegram ────────────────────────────────────────────────────────────────
 
 /// «нода  статус  причина» from `results` (data on success, error otherwise).
@@ -946,8 +880,10 @@ fn apply_state(node: &Value) -> Option<(&'static str, Color)> {
     }
 }
 fn pending_count(list: &Value) -> usize { rows(list).iter().filter(|node| node["status"] == "pending").count() }
-fn warp_label(node: &Value) -> &'static str {
-    match node["warp"].as_str() { Some("free") => "бесплатный", Some("plus") => "WARP+", _ => "не зарегистрирован" }
+/// `node show .warp`: `None` — WARP is off in the node's profile (no line, no
+/// reregistration); the core's rule, shared with the web.
+fn warp_label(node: &Value) -> Option<&'static str> {
+    match node["warp"].as_str() { Some("free") => Some("бесплатный"), Some("plus") => Some("WARP+"), Some("none") => Some("не зарегистрирован"), _ => None }
 }
 /// `node apply …` under its plan; `name` — the node of `--name` (node codes
 /// and the top-level `domain_required` are resolved, then the command is
@@ -1006,6 +942,18 @@ pub(crate) fn offer_apply(ctx: &mut Context<'_>) -> io::Result<()> {
     let listed = ctx.call(&["node", "list"])?;
     if !listed.ok || pending_count(&listed.data) == 0 { return Ok(()); }
     apply(ctx, &argv(&["node", "apply", "--pending"]), "")?;
+    Ok(())
+}
+/// After a change that leaves `nodes` waiting for `node apply`: one
+/// `node apply --name …` for all of them under the core's plan (its
+/// confirmation is the only question; nothing without a node).
+pub(crate) fn offer_apply_on(ctx: &mut Context<'_>, nodes: &[String]) -> io::Result<()> {
+    let mut targets: Vec<&str> = vec![];
+    for node in nodes { if !node.is_empty() && !targets.contains(&node.as_str()) { targets.push(node); } }
+    let Some(&first) = targets.first() else { return Ok(()); };
+    let mut words = argv(&["node", "apply"]);
+    for node in &targets { words.extend(argv(&["--name", node])); }
+    apply(ctx, &words, if targets.len() == 1 { first } else { "" })?;
     Ok(())
 }
 
@@ -1375,11 +1323,26 @@ fn profile_view(name: &str, profile: &Value) -> View {
     let nodes = joined(&profile["nodes"]);
     view.context.push(plain(format!("Ноды: {}", if nodes.is_empty() { "нет" } else { &nodes })));
     if needs_domain(profile) { view.context.push(ui::text("Ноде этого профиля нужен домен", ui::YELLOW)); }
-    view.sections.push(vec![
+    let mut actions = vec![
         Item::new('y', "Применить на нодах профиля", ui::GREEN), Item::new('e', "Изменить", ui::YELLOW),
-        Item::new('d', "Удалить профиль", ui::RED), Item::new(0, "Назад", ui::NC),
-    ]);
+        Item::new('w', "Ключ WARP+", ui::YELLOW),
+    ];
+    if profile["warp_plus"] == true { actions.push(Item::new('u', "Убрать ключ WARP+", ui::RED)); }
+    actions.extend([Item::new('d', "Удалить профиль", ui::RED), Item::new(0, "Назад", ui::NC)]);
+    view.sections.push(actions);
     view
+}
+/// «Ключ WARP+»: hidden entry (Enter/EOF — cancel) → `profile warp-license`
+/// with the key only in the `password` secret, wiped on any outcome.
+fn warp_license(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
+    let Some(key) = ctx.secret(&format!("Профиль: {name}"), "Ключ WARP+ (Enter — отмена)")? else { return Ok(()); };
+    if key.is_empty() { return Ok(()); }
+    let mut secrets = Secrets::default();
+    secrets.insert_hidden("password", key);
+    let reply = ctx.request(&argv(&["profile", "warp-license", "--name", name]), &secrets);
+    secrets.clear();
+    outcome(ctx, &reply?);
+    Ok(())
 }
 impl Screen for ProfileCard {
     fn run(&mut self, ctx: &mut Context<'_>) -> io::Result<Navigation> {
@@ -1398,6 +1361,11 @@ impl Screen for ProfileCard {
                     apply(ctx, &argv(&["node", "apply", "--profile", &name]), "")?;
                 }
                 "e" | "E" => edit_profile(ctx, &name, profile)?,
+                "w" | "W" => warp_license(ctx, &name)?,
+                "u" | "U" if profile["warp_plus"] == true => {
+                    let reply = ctx.call(&["profile", "warp-license", "--name", &name, "--clear"])?;
+                    outcome(ctx, &reply);
+                }
                 "d" | "D" => {
                     let words = argv(&["profile", "delete", "--name", &name]);
                     let reply = confirm::run_confirmed(ctx, "Удаление профиля", "Удалить профиль?", &words, &Secrets::default())?;
@@ -1409,6 +1377,116 @@ impl Screen for ProfileCard {
             }
         }
     }
+}
+
+// ─── Каскады ─────────────────────────────────────────────────────────────────
+
+/// (`cascade add --listener` value, connection name) of the cascade listeners and exits.
+const CASCADE_PROXIES: [(&str, &str); 4] = [
+    ("vless-tcp", "VLESS TCP"), ("vless-xhttp", "VLESS xHTTP"), ("vless-grpc", "VLESS gRPC"), ("hysteria2", "Hysteria2"),
+];
+/// The cascade-capable connections of a node (`node list .proxies`).
+fn cascade_proxies(node: &Value) -> Vec<(&'static str, &'static str)> {
+    CASCADE_PROXIES.iter().copied().filter(|(_, proxy)| rows(&node["proxies"]).iter().any(|p| p.as_str() == Some(*proxy))).collect()
+}
+/// «имя  вход (подключение) → выход»; a URI exit is never returned, only marked.
+fn cascade_line(cascade: &Value) -> String {
+    let id = text(&cascade["listener"]);
+    let listener = CASCADE_PROXIES.iter().find(|(value, _)| *value == id).map_or(id.as_str(), |&(_, label)| label);
+    let exit = &cascade["exit"];
+    let exit = if exit["uri"] == true { "внешний сервер".to_owned() } else { format!("{} ({})", text(&exit["node"]), text(&exit["proxy"])) };
+    format!("{}  {} ({listener}) → {exit}", text(&cascade["name"]), text(&cascade["entry"]))
+}
+/// The nodes a cascade change leaves waiting for `node apply`: the entry and a node exit.
+fn cascade_nodes(cascade: &Value) -> Vec<String> {
+    let mut nodes = vec![text(&cascade["entry"])];
+    if let Some(exit) = cascade["exit"]["node"].as_str() { nodes.push(exit.to_owned()); }
+    nodes
+}
+/// `cascade list` with add and delete; every change offers `node apply` on its nodes.
+impl Screen for Cascades {
+    fn run(&mut self, ctx: &mut Context<'_>) -> io::Result<Navigation> {
+        loop {
+            let reply = ctx.call(&["cascade", "list"])?;
+            if !reply.ok {
+                if read_failed(ctx, "Каскады")? { continue; }
+                return Ok(Navigation::Back);
+            }
+            let list = rows(&reply.data["cascades"]);
+            let mut view = View::new("Каскады");
+            view.prompt = "Выберите действие: ".into();
+            if list.is_empty() { view.context.push(ui::text("Нет каскадов", ui::DIM)); }
+            view.context.extend(list.iter().map(|cascade| ui::text(cascade_line(cascade), ui::NC)));
+            let mut actions = vec![Item::new('a', "Добавить каскад", ui::GREEN)];
+            if !list.is_empty() { actions.push(Item::new('d', "Удалить каскад", ui::RED)); }
+            actions.push(Item::new(0, "Назад", ui::NC));
+            view.sections.push(actions);
+            let Some(choice) = ctx.choose(&view)? else { return Ok(Navigation::Back); };
+            match choice.as_str() {
+                "a" | "A" => add_cascade(ctx)?,
+                "d" | "D" if !list.is_empty() => delete_cascade(ctx, list)?,
+                "0" => return Ok(Navigation::Back),
+                _ => ctx.invalid(),
+            }
+        }
+    }
+}
+/// Name → entry node (with a profile) → its listener → exit: another profiled
+/// node and its connection, or a hidden external-server URI sent as input `file`.
+fn add_cascade(ctx: &mut Context<'_>) -> io::Result<()> {
+    const TITLE: &str = "Добавление каскада";
+    let Some(name) = ask(ctx, TITLE, "Имя каскада (Enter — отмена)")? else { return Ok(()); };
+    let name = name.trim().to_owned();
+    if name.is_empty() { return Ok(()); }
+    let listed = ctx.call(&["node", "list"])?;
+    if !listed.ok { ctx.failed(); return Ok(()); }
+    // Entry and exit nodes serve at least one listener connection (the web's `entryNodes`/`exitNodes`).
+    let profiled: Vec<&Value> = rows(&listed.data).iter()
+        .filter(|node| !text(&node["profile"]).is_empty() && !cascade_proxies(node).is_empty()).collect();
+    if profiled.is_empty() {
+        ctx.ui.notice(ui::warn("Нет нод с профилем и включёнными VLESS или Hysteria2 — сначала назначьте ноде профиль."));
+        return Ok(());
+    }
+    let labels: Vec<String> = profiled.iter().map(|node| node_label(node)).collect();
+    let Some(i) = ctx.select("Входная нода каскада", &labels)? else { return Ok(()); };
+    let entry = text(&profiled[i]["name"]);
+    let listeners = cascade_proxies(profiled[i]);
+    let labels: Vec<String> = listeners.iter().map(|(_, label)| (*label).to_owned()).collect();
+    let Some(i) = ctx.select(&format!("Подключение входа: {entry}"), &labels)? else { return Ok(()); };
+    let mut words = argv(&["cascade", "add", "--name", &name, "--entry", &entry, "--listener", listeners[i].0]);
+    let kinds: [String; 2] = ["Нода из списка".into(), "URI внешнего сервера".into()];
+    let Some(kind) = ctx.select("Выход каскада", &kinds)? else { return Ok(()); };
+    let reply = if kind == 0 {
+        let exits: Vec<&Value> = profiled.iter().copied().filter(|node| text(&node["name"]) != entry).collect();
+        let labels: Vec<String> = exits.iter().map(|node| node_label(node)).collect();
+        let Some(i) = ctx.select("Выходная нода каскада", &labels)? else { return Ok(()); };
+        let exit = text(&exits[i]["name"]);
+        let proxies = cascade_proxies(exits[i]);
+        let labels: Vec<String> = proxies.iter().map(|(_, label)| (*label).to_owned()).collect();
+        let Some(j) = ctx.select(&format!("Подключение выхода: {exit}"), &labels)? else { return Ok(()); };
+        words.extend(argv(&["--exit-node", &exit, "--exit-proxy", proxies[j].1]));
+        ctx.request(&words, &Secrets::default())?
+    } else {
+        let Some(uri) = ctx.secret(TITLE, "URI внешнего сервера vless:// или hysteria2:// (Enter — отмена)")? else { return Ok(()); };
+        if uri.trim().is_empty() { return Ok(()); }
+        let mut input = Input::default();
+        input.insert("file", uri);
+        let reply = ctx.request_with(&words, &Secrets::default(), &input);
+        input.clear();
+        reply?
+    };
+    if !reply.ok { outcome(ctx, &reply); return Ok(()); }
+    offer_apply_on(ctx, &cascade_nodes(&reply.data))
+}
+/// A cascade of the list → `cascade delete` under its plan; `node apply` on
+/// the nodes of the cascade actually deleted (the reply, not the list row).
+fn delete_cascade(ctx: &mut Context<'_>, list: &[Value]) -> io::Result<()> {
+    let labels: Vec<String> = list.iter().map(cascade_line).collect();
+    let Some(i) = ctx.select("Удаление каскада", &labels)? else { return Ok(()); };
+    let words = argv(&["cascade", "delete", "--name", &text(&list[i]["name"])]);
+    let reply = confirm::run_confirmed(ctx, "Удаление каскада", "Удалить каскад?", &words, &Secrets::default())?;
+    if !reply.ok { outcome(ctx, &reply); return Ok(()); }
+    offer_apply_on(ctx, &cascade_nodes(&reply.data))
 }
 
 #[cfg(test)]
@@ -1445,7 +1523,8 @@ mod tests {
         ("node", "apply", "name+ profile= pending"),
         ("profile", "list", ""), ("profile", "show", "name="), ("profile", "add", PROFILE), ("profile", "set", PROFILE), ("profile", "delete", "name="),
         ("node", "shell", "name="), ("conn", "list", "name= discover"), ("conn", "set", "name= assign+"), ("conn", "sync", "name="),
-        ("awg", "status", "name="), ("awg", "sync", "name="), ("awg", "remove", "name= peer+ orphans"),
+        ("node", "warp-reregister", "name="), ("profile", "warp-license", "name= clear"),
+        ("cascade", "list", ""), ("cascade", "add", "name= entry= listener= exit-node= exit-proxy="), ("cascade", "delete", "name="),
         ("telegram", "status", TG), ("telegram", "install", TG), ("telegram", "refresh-ip", TG), ("telegram", "web-update", TG),
         ("telegram", "web-restart", TG), ("telegram", "backend-restart", TG), ("telegram", "remove", TG), ("telegram", "remove-all", TG),
         ("telegram", "menu", "name="),
@@ -1729,13 +1808,12 @@ mod tests {
         assert!(noticed(&ui, "консоль провайдера"));
     }
     #[test]
-    fn card_routes_harden_awg_and_connections_both_cases() {
-        for key in ["h", "H", "a", "A", "p", "P"] {
+    fn card_routes_harden_and_connections_both_cases() {
+        for key in ["h", "H", "p", "P"] {
             let mut steps = vec![show()];
             let mut inputs = vec![key];
             match key.to_ascii_lowercase().as_str() {
                 "h" => { inputs.push(""); steps.push(step(&["node", "harden", "--name", "n"], ok(json!({"name": "n", "port": 50000, "auth": "key"})))); }
-                "a" => { inputs.push("0"); steps.push(step(&["awg", "status", "--name", "n"], ok(json!({"installed": false, "peers": []})))); }
                 _ => {
                     inputs.push("0");
                     steps.push(step(&["conn", "sync", "--name", "n"], ok(json!({"nodes": [{"name": "n", "status": "synced", "discovered": []}]}))));
@@ -1746,6 +1824,44 @@ mod tests {
             inputs.push("0");
             screen(&mut NodeCard("n".into()), &inputs, steps);
         }
+    }
+    #[test]
+    fn card_warp_line_reregistration_and_apply_offer() {
+        let shown = |warp: &str| {
+            let mut node = node();
+            node["profile"] = json!("edge");
+            node["warp"] = json!(warp);
+            step(&["node", "show", "--name", "n"], ok(node))
+        };
+        let words = argv(&["node", "warp-reregister", "--name", "n"]);
+        let apply_words = argv(&["node", "apply", "--name", "n"]);
+        // Consent → reregistration → the node waits: `node apply --name n` under its plan at once
+        // (no own question); a refused plan sends nothing more and offers no apply.
+        let (client, ui) = screen(&mut NodeCard("n".into()), &["G", "y", "y", "g", "n", "0"], vec![
+            shown("plus"),
+            (words.clone(), plan("confirmation_required", "w")), (with_yes(&words, "w"), ok(json!({"name": "n"}))),
+            (apply_words.clone(), plan("confirmation_required", "a")), (with_yes(&apply_words, "a"), ok(json!({"applied": ["n"], "failed": [], "unchanged": []}))),
+            shown("free"),
+            (words.clone(), plan("confirmation_required", "w")),
+            shown("free"),
+        ]);
+        assert_eq!(client.calls.iter().filter(|call| call[..2] == ["node", "warp-reregister"]).count(), 3);
+        assert!(noticed(&ui, "Применено: n"));
+        assert!(ui.views[0].context.iter().any(|l| l.to_string() == "WARP: WARP+"));
+        let item = ui.views[0].sections.iter().flatten().find(|i| i.key == "g").unwrap();
+        assert_eq!(item.color, ui::YELLOW);
+        assert!(ui.views.iter().any(|v| v.context.iter().any(|l| l.to_string() == "WARP: бесплатный")));
+        // Not registered yet: the line says so and reregistration registers it.
+        let (client, ui) = screen(&mut NodeCard("n".into()), &["g", "n", "0"], vec![
+            shown("none"), (words.clone(), plan("confirmation_required", "w")), shown("none"),
+        ]);
+        assert_eq!(client.calls.iter().filter(|call| call[..2] == ["node", "warp-reregister"]).count(), 1);
+        assert!(ui.views[0].context.iter().any(|l| l.to_string() == "WARP: не зарегистрирован"));
+        // WARP off in the profile: no line and no action.
+        let (_, ui) = screen(&mut NodeCard("n".into()), &["g", "0"], vec![shown("off"), shown("off")]);
+        assert!(noticed(&ui, "Неверный выбор."));
+        assert!(!ui.views[0].context.iter().any(|l| l.to_string().starts_with("WARP:")));
+        assert!(!ui.views[0].sections.iter().flatten().any(|i| i.key == "g"));
     }
 
     // ─── Коды нод, SSH-настройка ─────────────────────────────────────────────
@@ -1943,51 +2059,6 @@ mod tests {
         // A refused resolution is not retried; the screen stays with the node's state.
         run(vec![(sync, row("load_failed", "missing_secret")), (check, err("missing_secret", json!({"name": "n"}))), node_list()],
             &["", "0"], |ctx| connection_node(ctx, "n"));
-    }
-
-    // ─── AmneziaWG ───────────────────────────────────────────────────────────
-
-    fn awg() -> Value { json!({"installed": true, "peers": [{"name": "used", "status": "used"}, {"name": "orphan", "status": "orphan"}, {"name": "missing", "status": "missing"}]}) }
-    #[test]
-    fn awg_keys_both_cases_and_peer_colours() {
-        for key in ["c", "C", "d", "D", "x", "X", "r", "R"] {
-            let status = || step(&["awg", "status", "--name", "n"], ok(awg()));
-            let mut inputs = vec![key];
-            let mut steps = vec![status()];
-            match key.to_ascii_lowercase().as_str() {
-                "c" => steps.push(step(&["awg", "sync", "--name", "n"], ok(json!({"created": ["missing"]})))),
-                "d" => {
-                    let words = argv(&["awg", "remove", "--name", "n", "--peer", "orphan"]);
-                    inputs.extend(["2", "y"]);
-                    steps.extend([(words.clone(), plan("confirmation_required", "p")), (with_yes(&words, "p"), ok(json!({"removed": ["orphan"]})))]);
-                }
-                "x" => {
-                    let words = argv(&["awg", "remove", "--name", "n", "--orphans"]);
-                    inputs.push("y");
-                    steps.extend([(words.clone(), plan("confirmation_required", "o")), (with_yes(&words, "o"), ok(json!({"removed": ["orphan"]})))]);
-                }
-                _ => {}
-            }
-            steps.push(status());
-            inputs.push("0");
-            let (_, _, ui) = run(steps, &inputs, |ctx| awg_node(ctx, "n"));
-            assert_eq!(colors(&ui.views[0]), [Some(ui::GREEN), Some(ui::YELLOW), Some(ui::DIM)]);
-            if key.eq_ignore_ascii_case("d") { assert_eq!(ui.views[1].sections[0].len(), 3); }
-        }
-    }
-    #[test]
-    fn awg_not_installed_hides_management_and_node_codes_do_not_retry() {
-        let absent = || step(&["awg", "status", "--name", "n"], ok(json!({"installed": false, "peers": []})));
-        let (_, _, ui) = run(vec![absent(), absent(), absent(), absent()], &["c", "d", "x", "0"], |ctx| awg_node(ctx, "n"));
-        assert_eq!(ui.notices.len(), 3);
-        assert_eq!(ui.views[0].sections[0].iter().map(|i| i.key.as_str()).collect::<Vec<_>>(), ["r", "0"]);
-        assert_eq!(colors(&ui.views[0]), [Some(ui::DIM)]);
-        let (_, _, ui) = run(vec![step(&["awg", "status", "--name", "n"], Reply::failure("needs_setup"))], &[], |ctx| awg_node(ctx, "n"));
-        assert!(noticed(&ui, "раздел n → h"));
-        screen(&mut AmneziaWg, &["2", "0", "0"], vec![
-            step(&["node", "list"], ok(json!([{"name": "n1", "ip": "192.0.2.1", "port": 22}, {"name": "n2", "ip": "192.0.2.2", "port": 22}]))),
-            step(&["awg", "status", "--name", "n2"], ok(json!({"installed": false, "peers": []}))), step(&["node", "list"], ok(json!([]))),
-        ]);
     }
 
     // ─── Telegram ────────────────────────────────────────────────────────────
@@ -2226,6 +2297,32 @@ mod tests {
         assert!(crate::app::registrations().screens.iter().any(|entry| entry.key == 'r'));
     }
     #[test]
+    fn profile_warp_license_is_a_hidden_secret_and_clear_needs_a_key() {
+        let show = |plus: bool| {
+            let mut profile = edge();
+            profile["warp"] = json!(true);
+            profile["warp_plus"] = json!(plus);
+            step(&["profile", "show", "--name", "edge"], ok(profile))
+        };
+        // Key → `password` secret; Enter cancels; «Убрать» only with a key (U then invalid).
+        let (client, ui) = screen(&mut ProfileCard("edge".into()), &["w", "WARP-PLUS-KEY", "W", "", "u", "U", "0"], vec![
+            show(false), step(&["profile", "warp-license", "--name", "edge"], ok(json!({"name": "edge", "warp_plus": true}))),
+            show(true), show(true),
+            step(&["profile", "warp-license", "--name", "edge", "--clear"], ok(json!({"name": "edge", "warp_plus": false}))),
+            show(false), show(false),
+        ]);
+        assert_eq!(client.secret_names[1], ["password"]);
+        assert!(client.secret_names[4].is_empty());
+        assert!(!client.calls.iter().flatten().any(|w| w.contains("WARP-PLUS-KEY")));
+        assert!(!ui.views.iter().flat_map(View::lines).any(|l| l.to_string().contains("WARP-PLUS-KEY")));
+        assert!(noticed(&ui, "Неверный выбор."));
+        let keys = |view: &View| view.sections.iter().flatten().map(|i| i.key.clone()).collect::<Vec<_>>();
+        assert_eq!(keys(&ui.views[0]), ["y", "e", "w", "d", "0"]);
+        let with_key = ui.views.iter().find(|v| keys(v).contains(&"u".to_owned())).unwrap();
+        assert_eq!(with_key.sections.iter().flatten().find(|i| i.key == "u").unwrap().color, ui::RED);
+        assert!(with_key.context.iter().any(|l| l.to_string() == "WARP: вкл., ключ WARP+ задан"));
+    }
+    #[test]
     fn domain_required_asks_the_domain_and_repeats_apply() {
         let words = argv(&["node", "apply", "--name", "n"]);
         let (reply, client, ui) = run(vec![
@@ -2323,6 +2420,106 @@ mod tests {
         assert!(noticed(&ui, "У ноды нет профиля."));
     }
 
+    // ─── Каскады ─────────────────────────────────────────────────────────────
+
+    fn cascade_nodes_list() -> (Vec<String>, Reply) {
+        step(&["node", "list"], ok(json!([
+            {"name": "de", "ip": "192.0.2.1", "port": 22, "profile": "edge", "proxies": ["VLESS TCP", "Hysteria2", "eu"]},
+            {"name": "bare", "ip": "192.0.2.2", "port": 22, "profile": null, "proxies": []},
+            {"name": "ru", "ip": "192.0.2.3", "port": 22, "profile": "edge", "proxies": ["VLESS gRPC", "VLESS xHTTP"]},
+            {"name": "aw", "ip": "192.0.2.4", "port": 22, "profile": "awg", "proxies": ["AWG"]}])))
+    }
+    fn cascades(list: Value) -> (Vec<String>, Reply) { step(&["cascade", "list"], ok(json!({"cascades": list}))) }
+    fn via_ru() -> Value { json!({"name": "eu", "entry": "de", "listener": "hysteria2", "exit": {"node": "ru", "proxy": "VLESS gRPC"}}) }
+    fn via_uri() -> Value { json!({"name": "ext", "entry": "de", "listener": "vless-tcp", "exit": {"uri": true}}) }
+    fn labels(view: &View) -> Vec<String> { view.sections.iter().flatten().map(|item| item.label.clone()).collect() }
+    #[test]
+    fn cascade_add_through_a_node_exit_offers_apply_on_both_nodes() {
+        let add = argv(&["cascade", "add", "--name", "eu", "--entry", "de", "--listener", "hysteria2", "--exit-node", "ru", "--exit-proxy", "VLESS gRPC"]);
+        let apply = argv(&["node", "apply", "--name", "de", "--name", "ru"]);
+        // Name, entry de, listener Hysteria2, «Нода из списка», exit ru, VLESS gRPC, the apply plan (no own question).
+        let (client, ui) = screen(&mut Cascades, &["a", "eu", "1", "2", "1", "1", "2", "y", "0"], vec![
+            cascades(json!([])), cascade_nodes_list(), (add, ok(via_ru())),
+            (apply.clone(), plan("confirmation_required", "a")), (with_yes(&apply, "a"), ok(json!({"applied": ["de", "ru"], "failed": [], "unchanged": []}))),
+            cascades(json!([via_ru()])),
+        ]);
+        assert!(client.input_names.iter().all(Vec::is_empty));
+        assert!(noticed(&ui, "Применено: de, ru"));
+        let titled = |title: &str| ui.views.iter().find(|v| v.title == title).unwrap();
+        // Only profiled nodes; only the four listener connections (not a cascade name); never the entry as exit.
+        assert_eq!(labels(titled("Входная нода каскада")), ["de  192.0.2.1:22", "ru  192.0.2.3:22", "Отмена"]);
+        assert_eq!(labels(titled("Подключение входа: de")), ["VLESS TCP", "Hysteria2", "Отмена"]);
+        assert_eq!(labels(titled("Выходная нода каскада")), ["ru  192.0.2.3:22", "Отмена"]);
+        assert_eq!(labels(titled("Подключение выхода: ru")), ["VLESS xHTTP", "VLESS gRPC", "Отмена"]);
+        assert!(!ui.views.iter().any(|v| v.prompt.contains("сейчас?")), "no question before the core's plan");
+        let last = ui.views.last().unwrap();
+        assert!(last.context.iter().any(|l| l.to_string() == "eu  de (Hysteria2) → ru (VLESS gRPC)"));
+    }
+    #[test]
+    fn cascade_uri_exit_is_hidden_input_file_and_applies_only_the_entry() {
+        const URI: &str = "vless://SECRET-UUID@203.0.113.1:443?security=reality";
+        let add = argv(&["cascade", "add", "--name", "ext", "--entry", "de", "--listener", "vless-tcp"]);
+        let apply = argv(&["node", "apply", "--name", "de"]);
+        let registry = Registry { screens: vec![], github_wizard: None };
+        let mut client = ScriptedClient::new([
+            cascade_nodes_list(), (add, ok(via_uri())),
+            (apply.clone(), plan("confirmation_required", "a")), (with_yes(&apply, "a"), ok(json!({"applied": ["de"], "failed": [], "unchanged": []}))),
+        ]);
+        let mut ui = HiddenUi { script: ScriptedUi::new(&["ext", "1", "1", "2", URI, "y"]), hidden: vec![] };
+        add_cascade(&mut Context::for_test(&mut client, &mut ui, &registry)).unwrap();
+        client.assert_finished();
+        assert_eq!(ui.hidden, [false, false, false, false, true, false]);
+        assert_eq!(client.input_names[1], ["file"]);
+        assert!(client.secret_names.iter().all(Vec::is_empty));
+        assert!(!client.calls.iter().flatten().any(|w| w.contains("SECRET-UUID")));
+        assert!(!ui.script.views.iter().flat_map(View::lines).any(|l| l.to_string().contains("SECRET-UUID")));
+        assert!(noticed(&ui.script, "Применено: de"));
+        // Enter at the URI cancels without a request.
+        let (_, client, _) = run(vec![cascade_nodes_list()], &["ext", "1", "1", "2", ""], add_cascade);
+        assert_eq!(client.calls.len(), 1);
+    }
+    #[test]
+    fn cascade_add_without_listener_nodes_warns_and_asks_nothing_more() {
+        let list = step(&["node", "list"], ok(json!([{"name": "aw", "ip": "192.0.2.4", "port": 22, "profile": "awg", "proxies": ["AWG"]},
+            {"name": "bare", "ip": "192.0.2.2", "port": 22, "profile": null, "proxies": []}])));
+        let (_, client, ui) = run(vec![list], &["ext"], add_cascade);
+        assert_eq!(client.calls.len(), 1);
+        assert!(noticed(&ui, "Нет нод с профилем и включёнными VLESS или Hysteria2"));
+        assert!(!ui.views.iter().any(|v| v.title == "Входная нода каскада"));
+    }
+    #[test]
+    fn cascade_delete_is_plan_gated_and_applies_on_the_nodes_of_the_deleted_cascade() {
+        let delete = argv(&["cascade", "delete", "--name", "eu"]);
+        // Recreated after the list was read: the deleted cascade (the reply) runs fr → nl, not de → ru.
+        let deleted = json!({"name": "eu", "entry": "fr", "listener": "hysteria2", "exit": {"node": "nl", "proxy": "VLESS gRPC"}});
+        let apply = argv(&["node", "apply", "--name", "fr", "--name", "nl"]);
+        // A refused plan deletes nothing; a confirmed one goes straight to the apply plan (refused here).
+        let (client, ui) = screen(&mut Cascades, &["D", "2", "n", "d", "2", "y", "n", "0"], vec![
+            cascades(json!([via_uri(), via_ru()])), (delete.clone(), plan("confirmation_required", "d")),
+            cascades(json!([via_uri(), via_ru()])), (delete.clone(), plan("confirmation_required", "d")), (with_yes(&delete, "d"), ok(deleted)),
+            (apply, plan("confirmation_required", "a")),
+            cascades(json!([via_uri()])),
+        ]);
+        assert!(!client.calls.iter().any(|call| call.contains(&"--yes".to_owned()) && call[0] == "node"), "a refused plan applies nothing");
+        assert!(!ui.views.iter().any(|v| v.prompt.contains("сейчас?")), "no question before the core's plan");
+        assert_eq!(confirms(&ui), 3);
+        assert!(ui.views[0].context.iter().any(|l| l.to_string() == "ext  de (VLESS TCP) → внешний сервер"));
+        let actions: Vec<_> = ui.views[0].sections.iter().flatten().map(|i| (i.key.clone(), i.color)).collect();
+        assert_eq!(actions, [("a".to_owned(), ui::GREEN), ("d".to_owned(), ui::RED), ("0".to_owned(), ui::NC)]);
+    }
+    #[test]
+    fn empty_cascades_offer_only_add_and_no_profiled_node_ends_the_add() {
+        let (client, ui) = screen(&mut Cascades, &["d", "A", "eu", "0"], vec![
+            cascades(json!([])), cascades(json!([])),
+            step(&["node", "list"], ok(json!([{"name": "bare", "ip": "192.0.2.2", "port": 22, "profile": null, "proxies": []}]))),
+            cascades(json!([])),
+        ]);
+        assert!(noticed(&ui, "Неверный выбор."));
+        assert!(!client.calls.iter().any(|call| call[..2] == ["cascade", "add"]));
+        assert_eq!(labels(&ui.views[0]), ["Добавить каскад", "Назад"]);
+        assert!(ui.views[0].context.iter().any(|l| l.to_string() == "Нет каскадов"));
+    }
+
     // ─── Пустые и ошибочные состояния, кадры ─────────────────────────────────
 
     #[test]
@@ -2337,7 +2534,6 @@ mod tests {
         assert_eq!(ui.notices.len(), 1);
         let (_, ui) = screen(&mut NodeCard("n".into()), &[], vec![step(&["node", "show", "--name", "n"], Reply::failure("not_found"))]);
         assert!(ui.notices.is_empty() && ui.views.is_empty());
-        screen(&mut AmneziaWg, &["0"], vec![step(&["node", "list"], ok(json!([])))]);
         let (selected, _, ui) = run(none(), &[], |ctx| ctx.toggle("empty", &[], vec![], EMPTY));
         assert_eq!(selected, None);
         assert_eq!(ui.views.len(), 1);
@@ -2407,6 +2603,7 @@ mod tests {
     #[test]
     fn root_factories_are_registered() {
         let registry = crate::app::registrations();
-        for key in ['n', 'a', 't', 'p'] { assert!(registry.screens.iter().any(|entry| entry.key == key)); }
+        for key in ['n', 't', 'p', 'k'] { assert!(registry.screens.iter().any(|entry| entry.key == key)); }
+        assert!(!registry.screens.iter().any(|entry| entry.key == 'a'), "the AmneziaWG screen is gone");
     }
 }

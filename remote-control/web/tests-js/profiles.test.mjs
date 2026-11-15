@@ -200,3 +200,32 @@ test('удаление и применение профиля', async () => {
   assert.deepEqual(s.record.dialogs.map((d) => d.kind), ['show']);
   s.done();
 });
+
+test('ключ WARP+: argv без ключа, ключ — секретом password; --clear; отмена — без команды', async () => {
+  assert.deepEqual(model.warpLicenseArgv('edge'), ['profile', 'warp-license', '--name', 'edge']);
+  assert.deepEqual(model.warpLicenseClearArgv('edge'), ['profile', 'warp-license', '--name', 'edge', '--clear']);
+  let s = scripted([[model.warpLicenseArgv('edge'), ok({ name: 'edge', warp_plus: true })]], [{ password: 'KEY-1' }]);
+  assert.equal(await model.warpLicenseFlow(s.ctx, 'edge'), true);
+  assert.equal(s.record.dialogs[0].fields[0].type, 'secret');
+  assert.deepEqual(s.record.calls[0][1], { secrets: { password: 'KEY-1' } });
+  assert.ok(!s.record.calls[0][0].includes('KEY-1'));
+  // Формат ключа — проверкой поля (как `warp_license_valid` ядра), не сбоем после закрытия формы.
+  const validate = s.record.dialogs[0].fields[0].validate;
+  assert.equal(validate, model.warpLicenseError);
+  assert.equal(validate('KEY-1'), null);
+  assert.equal(validate('a'.repeat(64)), null);
+  assert.equal(validate('KEY!'), model.WARP_LICENSE_INVALID);
+  assert.equal(validate('a'.repeat(65)), model.WARP_LICENSE_INVALID);
+  assert.equal(validate(' KEY-1'), model.WARP_LICENSE_INVALID);
+  s.done();
+  s = scripted([], [null]);
+  assert.equal(await model.warpLicenseFlow(s.ctx, 'edge'), false);
+  s.done();
+  s = scripted([[model.warpLicenseArgv('edge'), fail('invalid')]], [{ password: 'bad' }]);
+  assert.equal(await model.warpLicenseFlow(s.ctx, 'edge'), false);
+  assert.equal(s.record.failed, 1);
+  s.done();
+  s = scripted([[model.warpLicenseClearArgv('edge'), ok({ name: 'edge', warp_plus: false })]], []);
+  assert.equal(await model.clearWarpLicense(s.ctx, 'edge'), true);
+  s.done();
+});
