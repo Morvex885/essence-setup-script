@@ -6,9 +6,18 @@
 export const PROTOCOL = 3;
 /** Шаги паузы перед повторным подключением, мс; последний повторяется. */
 export const RECONNECT_DELAYS = [1000, 2000, 5000];
-/** Ключ токена возобновления в `sessionStorage`. */
+/** Ключ токена возобновления в `localStorage`. */
 export const RESUME_KEY = 'essence-rc-resume';
 export const DISCONNECTED_MESSAGE = 'Соединение с демоном потеряно. Повторите действие.';
+
+/**
+ * Хранилище токена возобновления окна `win` — `localStorage`: вход помнят
+ * новые вкладки и адрес без `#ticket=`, пока жив демон. Недоступное (режим
+ * приватности) — `null`: токен живёт только в памяти соединения.
+ */
+export function resumeStorage(win) {
+  try { return win.localStorage || null; } catch { return null; }
+}
 
 const OPEN = 1;
 
@@ -82,7 +91,7 @@ function hasKeys(value) {
  *   с командой `label` («noun verb»);
  * - `close()` — закрыть без переподключения.
  *
- * `storage` (`sessionStorage`) хранит токен возобновления под `RESUME_KEY`:
+ * `storage` (`localStorage`, `resumeStorage`) хранит токен возобновления под `RESUME_KEY`:
  * начальное значение берётся оттуда, событие `access` записывает новый токен,
  * отказ при возобновлении и `forget()` стирают. `resume` — начальный токен
  * вместо хранилища.

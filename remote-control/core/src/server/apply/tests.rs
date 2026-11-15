@@ -83,7 +83,7 @@ fn exec(command: String, stdout: &str) -> ScriptStep {
     ScriptStep::exec(command, 0, COMMAND_TIMEOUT, ok(stdout))
 }
 
-const DEBIAN: &str = "os=debian\nsystemd=yes\nsshd=22\nlisten tcp 0.0.0.0:22\n";
+const DEBIAN: &str = "os=debian\nversion=12\nsystemd=yes\nsshd=22\nlisten tcp 0.0.0.0:22\n";
 /// The executor unit is still running.
 const LIVE: &str = "unit=active\n";
 
@@ -378,12 +378,12 @@ async fn unreachable_unsupported_and_busy_nodes_are_excluded() {
     assert_eq!(error.extra["failed"], json!([{"name": "de", "stage": "probe", "code": "remote_failed",
         "message": "Не удалось подключиться к «de»."}]));
 
-    let hosts = Hosts::new(vec![vec![connect_step(&de, Ok(())), probe_step(&de, "os=centos\nsystemd=yes\n")]]);
+    let hosts = Hosts::new(vec![vec![connect_step(&de, Ok(())), probe_step(&de, "os=centos\nversion=\"9\"\nsystemd=yes\n")]]);
     let error = run(&mut session, &hosts, &["node", "apply", "--name", "de"]).await.unwrap_err();
     assert_eq!(error.extra["failed"], json!([{"name": "de", "stage": "probe", "code": "unsupported_os",
-        "message": "нужна Debian или Ubuntu с systemd"}]));
+        "message": "ОС ноды «centos 9» не поддерживается: нужна Debian 12/13 или Ubuntu 22.04/24.04/26.04 с systemd"}]));
 
-    let hosts = Hosts::new(vec![vec![connect_step(&de, Ok(())), probe_step(&de, "os=ubuntu\nsystemd=yes\nlisten tcp [::]:443\n")]]);
+    let hosts = Hosts::new(vec![vec![connect_step(&de, Ok(())), probe_step(&de, "os=ubuntu\nversion=26.04\nsystemd=yes\nlisten tcp [::]:443\n")]]);
     let error = run(&mut session, &hosts, &["node", "apply", "--name", "de"]).await.unwrap_err();
     assert_eq!(error.extra["failed"], json!([{"name": "de", "stage": "probe", "code": "port_busy",
         "message": "порт 443 уже занят", "port": 443}]));
@@ -436,7 +436,7 @@ async fn a_missing_domain_fails_only_its_node_in_bulk() {
     hosts.finish();
     assert_eq!(error.code, "confirmation_required");
 
-    let hosts = Hosts::new(vec![vec![connect_step(&nl, Ok(())), probe_step(&nl, "os=ubuntu\nsystemd=yes\nlisten tcp [::]:443\n")]]);
+    let hosts = Hosts::new(vec![vec![connect_step(&nl, Ok(())), probe_step(&nl, "os=ubuntu\nversion=24.04\nsystemd=yes\nlisten tcp [::]:443\n")]]);
     let error = run(&mut session, &hosts, &["node", "apply", "--profile", "main"]).await.unwrap_err();
     assert_eq!(error.code, "partial");
     assert_eq!(error.extra["failed"][0], json!({"name": "de", "stage": "probe", "code": "domain_required",
@@ -844,9 +844,9 @@ fn a_warp_registration_may_change_only_the_warp_parameters_of_the_confirmed_stat
 
 #[test]
 fn probe_output_parses() {
-    let probe = parse_probe("os=\"ubuntu\"\r\nsystemd=yes\nsshd=2222\nagent=ok\nlisten udp 0.0.0.0:51820\nlisten tcp [::]:443\n\
+    let probe = parse_probe("os=\"ubuntu\"\r\nversion=\"26.04\"\nsystemd=yes\nsshd=2222\nagent=ok\nlisten udp 0.0.0.0:51820\nlisten tcp [::]:443\n\
         missing /etc/x\nabababababababababababababababababababababababababababababababab  /etc/y\nunit=active\nstage=config\n");
-    assert_eq!((probe.os.as_str(), probe.systemd, probe.agent_ok, probe.sshd), ("ubuntu", true, true, Some(2222)));
+    assert_eq!((probe.os.as_str(), probe.version.as_str(), probe.systemd, probe.agent_ok, probe.sshd), ("ubuntu", "26.04", true, true, Some(2222)));
     assert_eq!(probe.listening, [("udp".to_owned(), 51820), ("tcp".to_owned(), 443)]);
     assert_eq!(probe.hashes["/etc/x"], None);
     assert_eq!(probe.hashes["/etc/y"].as_deref(), Some("ab".repeat(32).as_str()));
@@ -856,6 +856,65 @@ fn probe_output_parses() {
     assert!(unit_gone(&parse_status("unit=failed\nstage=config\n")));
     // systemd re-executing itself (needrestart in `packages`): no answer is not an exit.
     assert!(!unit_gone(&parse_status("unit=\nstage=packages\n")) && !unit_gone(&parse_status("unit=unknown\nstage=packages\n")));
+}
+
+/// An unsupported version or a missing systemd fails the node in the probe,
+/// before any plan, naming what was found and what is supported.
+#[tokio::test(start_paused = true)]
+async fn an_unsupported_os_version_is_refused_before_the_plan() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut session, _journal) = fixture(root.path());
+    let de = node(1, "de");
+    let wanted = "нужна Debian 12/13 или Ubuntu 22.04/24.04/26.04 с systemd";
+    for (stdout, message) in [
+        ("os=ubuntu\nversion=\"25.10\"\nsystemd=yes\n", format!("ОС ноды «ubuntu 25.10» не поддерживается: {wanted}")),
+        ("os=debian\nversion=11\nsystemd=yes\n", format!("ОС ноды «debian 11» не поддерживается: {wanted}")),
+        ("os=debian\nversion=\nsystemd=yes\n", format!("ОС ноды «debian» не поддерживается: {wanted}")),
+        ("", format!("не удалось определить ОС ноды: {wanted}")),
+        ("os=ubuntu\nversion=26.04\n", format!("на ноде «ubuntu 26.04» нет systemd: {wanted}")),
+    ] {
+        let hosts = Hosts::new(vec![vec![connect_step(&de, Ok(())), probe_step(&de, stdout)]]);
+        let error = run(&mut session, &hosts, &["node", "apply", "--name", "de"]).await.unwrap_err();
+        hosts.finish();
+        assert_eq!(error.code, "partial", "no plan for {stdout:?}");
+        assert_eq!(error.extra["failed"], json!([{"name": "de", "stage": "probe", "code": "unsupported_os", "message": message}]));
+    }
+    for (id, version, _) in crate::server::os::SUPPORTED_OS {
+        let hosts = Hosts::new(vec![vec![connect_step(&de, Ok(())), probe_step(&de, &format!("os={id}\nversion={version}\nsystemd=yes\n"))]]);
+        let error = run(&mut session, &hosts, &["node", "apply", "--name", "de"]).await.unwrap_err();
+        hosts.finish();
+        assert_eq!(error.code, "confirmation_required", "{id} {version}");
+    }
+}
+
+/// The failure tail drops PEM blocks (also one cut by the start of the read
+/// or never closed), ANSI colours and blank lines and puts the executor's
+/// warnings and errors first.
+#[test]
+fn the_log_tail_is_cleaned_and_problems_come_first() {
+    let raw = "MIIBcut+off+pem+line\n-----END CERTIFICATE-----\n\
+        \u{1b}[36m  [*]\u{1b}[0m Этап: certificate\n\
+        [Sat Nov 14] Your cert is in: /root/.acme.sh/x/x.cer\n\
+        -----BEGIN CERTIFICATE-----\nMIIFsecret\nAAAA==\n-----END CERTIFICATE-----\n\
+        \n\u{1b}[33m  [!]\u{1b}[0m Порт 80 занят\n\
+        progress 10%\rprogress 100%\n\
+        \u{1b}]8;;https://x\u{7}ссылка\u{1b}]8;;\u{1b}\\\n\
+        -----BEGIN RSA PRIVATE KEY-----\nKEYDATA\n\
+        \u{1b}[31m  [✗]\u{1b}[0m mihomo -t: ошибка\n\
+        [✗] выпуск сертификата не удался\n";
+    let tail = log_tail(raw);
+    assert_eq!(tail, [
+        "[!] Порт 80 занят", "[✗] mihomo -t: ошибка", "[✗] выпуск сертификата не удался",
+        "[*] Этап: certificate", "[Sat Nov 14] Your cert is in: /root/.acme.sh/x/x.cer", "progress 100%", "ссылка",
+    ]);
+    assert!(!tail.iter().any(|line| line.contains("MII") || line.contains("KEYDATA") || line.contains("AAAA")));
+    let many: String = (0..60).map(|index| format!("line {index}\n")).collect::<String>()
+        + &(0..12).map(|index| format!("  [!] warn {index}\n")).collect::<String>();
+    let tail = log_tail(&many);
+    assert_eq!(tail.len(), LOG_SHOWN);
+    assert_eq!((tail[0].as_str(), tail[9].as_str()), ("[!] warn 2", "[!] warn 11"));
+    // Older problems beyond the first ten stay among the last lines, in order.
+    assert_eq!((tail[10].as_str(), tail[22].as_str(), tail[24].as_str()), ("line 47", "line 59", "[!] warn 1"));
 }
 
 #[test]
@@ -936,7 +995,7 @@ fn several_nodes_share_one_live_line() {
     assert!(live_line(&runs, started).unwrap().1.contains("nl 71 % нет связи"));
     // A failed node is «ошибка»: neither done nor in the mean.
     runs[1].lost = None;
-    runs[2].outcome = Some(Outcome::Failed(Failure { stage: "packages".into(), code: "start".into(), message: String::new(), port: None }));
+    runs[2].outcome = Some(Outcome::Failed(Failure { stage: "packages".into(), code: "start".into(), message: String::new(), port: None, extra: Vec::new() }));
     let (percent, text) = live_line(&runs, started + Duration::from_secs(102)).unwrap();
     assert_eq!(percent, 54);
     assert_eq!(text, "Ноды: 54 % · готово 0/3 · ошибка: fi · de 37 % «установка пакетов» · nl 71 % «сертификаты» · 1:42");

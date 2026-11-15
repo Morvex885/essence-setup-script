@@ -28,7 +28,7 @@ use crate::terminal;
 const MAX_SECRET_ATTEMPTS: u8 = 3;
 /// Секреты неявного `session open`; разовый вызов принимает их для любой
 /// команды, которой предшествует открытие сессии. `access-token` — код
-/// доступа сетевого демона (одноразовый: после принятия не повторяется).
+/// доступа сетевого демона (после принятия не повторяется).
 const SESSION_SECRETS: [&str; 3] = ["script-password", "vault-password", "access-token"];
 const ACCESS_TOKEN: &str = "access-token";
 
@@ -452,8 +452,8 @@ fn open_session(client: &mut DaemonClient, secrets: &mut Secrets, env: Option<&B
     let argv = vec!["session".to_owned(), "open".to_owned()];
     let open = cli::parse(&argv).map_err(local)?;
     let input = client::Input::default();
-    // Принятый код доступа погашен демоном: повтор (после вопроса о пароле)
-    // идёт без него — соединение уже допущено.
+    // Принятый код доступа уже допустил соединение: повтор (после вопроса о
+    // пароле) идёт без него.
     let mut token_spent = false;
     loop {
         let names: &[&str] = if token_spent { &SESSION_SECRETS[..2] } else { &SESSION_SECRETS };

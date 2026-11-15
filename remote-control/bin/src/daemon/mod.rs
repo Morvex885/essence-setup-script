@@ -612,7 +612,7 @@ mod tests {
     fn a_password_change_voids_codes_and_resume_tokens() {
         let (shared, _jobs) = shared();
         let now = Instant::now();
-        let code = lock(&shared.tokens).issue_ticket(now);
+        let code = lock(&shared.tokens).ticket(false);
         let resume = lock(&shared.tokens).issue_resume(now);
         shared.password_changed(0);
         assert_eq!(lock(&shared.tokens).check(&code, now), access::Token::Invalid);

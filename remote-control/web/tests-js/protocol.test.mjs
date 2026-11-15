@@ -2,7 +2,7 @@
 // событие access и переподключение с токеном возобновления.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { connect, socketUrl, toBase64, fromBase64, RECONNECT_DELAYS, RESUME_KEY } from '../assets/js/protocol.js';
+import { connect, socketUrl, toBase64, fromBase64, resumeStorage, RECONNECT_DELAYS, RESUME_KEY } from '../assets/js/protocol.js';
 
 const location = { protocol: 'http:', host: '127.0.0.1:8377' };
 
@@ -243,7 +243,7 @@ test('переподключение с токеном возобновлени�
   assert.equal(connection.state, 'open');
 });
 
-/** Поддельный `sessionStorage`. */
+/** Поддельный `localStorage`. */
 function memoryStorage(initial = {}) {
   const values = new Map(Object.entries(initial));
   return {
@@ -270,7 +270,7 @@ test('access: токен записывается в переданное хра
 });
 
 test('начальный токен возобновления: из хранилища, явный `resume` приоритетнее', () => {
-  // Одноразовый код из ссылки сюда не передаётся: его отправляет только первый
+  // Код из ссылки сюда не передаётся: его отправляет только первый
   // `session open` (session.js), а не переподключение.
   const storage = memoryStorage({ [RESUME_KEY]: 'c'.repeat(64) });
   FakeSocket.instances = [];
@@ -280,6 +280,29 @@ test('начальный токен возобновления: из храни�
   assert.equal(explicit.resume, 'd'.repeat(64));
   const empty = connect({ WebSocket: FakeSocket, location, storage: memoryStorage(), setTimeout: manualTimers().setTimeout });
   assert.equal(empty.resume, null);
+});
+
+test('токен возобновления — в localStorage: новая вкладка входит без кода из ссылки', async () => {
+  const local = memoryStorage();
+  const tab = { localStorage: local, sessionStorage: memoryStorage() };
+  assert.equal(resumeStorage(tab), local);
+  FakeSocket.instances = [];
+  const first = connect({ WebSocket: FakeSocket, location, storage: resumeStorage(tab), setTimeout: manualTimers().setTimeout });
+  const socket = FakeSocket.instances[0];
+  hello(socket);
+  await first.ready;
+  const reply = first.request(['session', 'open'], {});
+  socket.receive({ id: 1, event: 'access', resume: 'e'.repeat(64) });
+  socket.ok(1, {});
+  await reply;
+  assert.equal(local.values.get(RESUME_KEY), 'e'.repeat(64));
+  assert.equal(tab.sessionStorage.values.size, 0, 'sessionStorage не используется');
+  // Другая вкладка того же адреса: общий localStorage, свой sessionStorage.
+  const other = connect({ WebSocket: FakeSocket, location, storage: resumeStorage({ localStorage: local, sessionStorage: memoryStorage() }), setTimeout: manualTimers().setTimeout });
+  assert.equal(other.resume, 'e'.repeat(64));
+  // Недоступный localStorage (режим приватности) — без хранилища.
+  assert.equal(resumeStorage({}), null);
+  assert.equal(resumeStorage({ get localStorage() { throw new Error('denied'); } }), null);
 });
 
 test('обрыв: очередь прерванных запросов не отправляется после переподключения', async () => {

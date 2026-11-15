@@ -39,8 +39,10 @@ sub_rollback() {
     if [[ -f "$SUB_TIMER_UNIT" ]]; then
         systemctl enable --now essence-sub-cleanup.timer
     else
-        systemctl stop essence-sub-cleanup.timer
+        local rc=0
+        systemctl stop essence-sub-cleanup.timer || rc=$?
         rm -f -- "$R/etc/systemd/system/timers.target.wants/essence-sub-cleanup.timer"
+        return "$rc"
     fi
 }
 

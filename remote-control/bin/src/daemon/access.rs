@@ -1,6 +1,6 @@
-//! Network admission (П4): one-time codes, resume tokens, steps 1–3 of a
-//! network `session open`, the throttle of failed attempts and the limits
-//! of not yet authorized connections.
+//! Network admission (П4): the panel's access code, resume tokens, steps
+//! 1–3 of a network `session open`, the throttle of failed attempts and the
+//! limits of not yet authorized connections.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -11,8 +11,6 @@ use rc_core::error::{RcError, Result};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-/// Lifetime of a one-time code (`web link`).
-pub const TICKET_TTL: Duration = Duration::from_secs(300);
 /// A resume token unused this long expires.
 pub const RESUME_IDLE: Duration = Duration::from_secs(12 * 3600);
 /// Resume tokens kept at once; the least recently used one goes first.
@@ -29,8 +27,9 @@ pub const PREAUTH_TIMEOUT: Duration = Duration::from_secs(60);
 /// After authorization: requests in flight per network connection.
 pub const IN_FLIGHT: usize = 32;
 
-/// Tokens are looked up by their SHA-256: the secret itself is neither kept
-/// nor compared byte by byte.
+/// Tokens are looked up by their SHA-256: the secret itself is not compared
+/// byte by byte. Only the panel's code is also kept as is, so that `web link`
+/// can repeat it.
 type Digest32 = [u8; 32];
 
 fn digest(token: &str) -> Digest32 {
@@ -56,19 +55,28 @@ pub enum Token {
     Invalid,
 }
 
-/// One-time codes (issue time) and resume tokens (last use), in memory only.
+/// The panel's access code and resume tokens (last use), in memory only.
 #[derive(Default)]
 pub struct Tokens {
-    tickets: HashMap<Digest32, Instant>,
+    /// The code of the running panel and its SHA-256: reusable until the
+    /// listener stops (`web stop`, the end of `web run`) or the daemon exits.
+    ticket: Option<(Zeroizing<String>, Digest32)>,
     resume: HashMap<Digest32, Instant>,
 }
 
 impl Tokens {
-    pub fn issue_ticket(&mut self, now: Instant) -> Zeroizing<String> {
-        self.expire(now);
-        let (token, digest) = new_token();
-        self.tickets.insert(digest, now);
-        token
+    /// The panel's code: the current one, or a new one when there is none
+    /// or `rotate` (`web link --new`; the old one stops working).
+    pub fn ticket(&mut self, rotate: bool) -> Zeroizing<String> {
+        if rotate {
+            self.ticket = None;
+        }
+        self.ticket.get_or_insert_with(new_token).0.clone()
+    }
+
+    /// The listener stopped: its code is void.
+    pub fn drop_ticket(&mut self) {
+        self.ticket = None;
     }
 
     pub fn issue_resume(&mut self, now: Instant) -> Zeroizing<String> {
@@ -82,7 +90,7 @@ impl Tokens {
         token
     }
 
-    /// Classifies a token: a resume token is refreshed, a code is spent.
+    /// Classifies a token: a resume token is refreshed; the code stays valid.
     pub fn check(&mut self, token: &str, now: Instant) -> Token {
         self.expire(now);
         let digest = digest(token);
@@ -90,7 +98,7 @@ impl Tokens {
             *used = now;
             return Token::Resume;
         }
-        if self.tickets.remove(&digest).is_some() {
+        if self.ticket.as_ref().is_some_and(|(_, ticket)| *ticket == digest) {
             return Token::Ticket;
         }
         Token::Invalid
@@ -98,12 +106,11 @@ impl Tokens {
 
     /// The password changed (or every authorization was reset).
     pub fn clear(&mut self) {
-        self.tickets.clear();
+        self.ticket = None;
         self.resume.clear();
     }
 
     fn expire(&mut self, now: Instant) {
-        self.tickets.retain(|_, issued| now.saturating_duration_since(*issued) < TICKET_TTL);
         self.resume.retain(|_, used| now.saturating_duration_since(*used) < RESUME_IDLE);
     }
 }
@@ -234,17 +241,23 @@ mod tests {
     }
 
     #[test]
-    fn codes_are_single_use_and_expire() {
+    fn the_code_is_reusable_until_dropped_or_rotated() {
         let start = Instant::now();
         let mut tokens = Tokens::default();
-        let code = tokens.issue_ticket(start);
+        let code = tokens.ticket(false);
         assert_eq!(code.len(), 64);
         assert!(code.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert_eq!(tokens.check(&code, start), Token::Ticket);
-        assert_eq!(tokens.check(&code, start), Token::Invalid, "spent");
-        let late = tokens.issue_ticket(start);
-        assert_eq!(tokens.check(&late, start + TICKET_TTL), Token::Invalid, "expired");
-        assert_ne!(tokens.issue_ticket(start).as_str(), tokens.issue_ticket(start).as_str());
+        assert_eq!(tokens.check(&code, start + RESUME_IDLE * 3), Token::Ticket, "used again, no expiry");
+        assert_eq!(tokens.ticket(false).as_str(), code.as_str(), "web link repeats it");
+        assert_eq!(tokens.check(&"0".repeat(64), start), Token::Invalid, "a wrong code");
+        let rotated = tokens.ticket(true);
+        assert_ne!(rotated.as_str(), code.as_str());
+        assert_eq!(tokens.check(&code, start), Token::Invalid, "the old code after --new");
+        assert_eq!(tokens.check(&rotated, start), Token::Ticket);
+        tokens.drop_ticket();
+        assert_eq!(tokens.check(&rotated, start), Token::Invalid, "the listener stopped");
+        assert_ne!(tokens.ticket(false).as_str(), rotated.as_str(), "a new listener, a new code");
     }
 
     #[test]

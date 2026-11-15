@@ -3,7 +3,7 @@
 // всплывающие сообщения. Экраны разделов — `screens/`; каждый получает `ctx`
 // (`makeContext`), параметр и вкладку маршрута.
 import { html, render, useEffect, useState, useRef } from '../vendor/preact-htm.js';
-import { connect } from './protocol.js';
+import { connect, resumeStorage } from './protocol.js';
 import * as session from './session.js';
 import * as router from './router.js';
 import * as fmt from './format.js';
@@ -63,7 +63,7 @@ const menuEntries = (active) => MENU.map((item) => (item.divider ? item : {
 /** Событие очереди демона: «Ожидание: выполняется «noun verb».». */
 const WAITING = /^Ожидание: выполняется «(.+)»\.$/;
 
-const ACCESS_CODE_HINT = "Откройте панель ссылкой из «essence-rc web open». Ссылка одноразовая: если она уже открыта в другой вкладке, перейдите в ту вкладку или получите новую ссылку командой «essence-rc web open».";
+const ACCESS_CODE_HINT = "Откройте панель ссылкой, которую печатают «essence-rc web run» и «essence-rc web open»: она действует, пока панель запущена.";
 
 /** Локальное хранилище темы; недоступное (режим приватности) — `null`. */
 function localStore(win) {
@@ -71,7 +71,7 @@ function localStore(win) {
 }
 
 export function App({ win = window, deps = {} }) {
-  const storage = deps.storage || (win.sessionStorage || new Map());
+  const storage = deps.storage || resumeStorage(win);
   const themeStore = localStore(win);
   const connectionRef = useRef(null);
   const [phase, setPhase] = useState('connecting'); // connecting | gate | app
@@ -103,8 +103,8 @@ export function App({ win = window, deps = {} }) {
   // сразу отменяются (`flows.js::screenDialogs`).
   const screenEpoch = useRef(0);
 
-  // Одноразовый код из `#ticket=…`: фрагмент стирается сразу, код уходит
-  // только с первым `session open` и до отправки ждёт в `ticketRef`.
+  // Код панели из `#ticket=…`: фрагмент стирается сразу, код уходит только с
+  // первым `session open` и до отправки ждёт в `ticketRef`.
   const ticketRef = useRef(undefined);
   if (ticketRef.current === undefined) ticketRef.current = router.consumeTicket(win);
   if (!connectionRef.current) {

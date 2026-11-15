@@ -6,7 +6,8 @@
 # Конфиг /etc/amnezia/amneziawg/awg0.conf рендерит RC и ставит транзакция.
 # Перенос `setup-essence/modules/amneziawg.sh:55-560` без меню и без
 # проверок базовой установки mihomo (её ставят этапы этого же применения).
-# Spec: AWG_PORT.
+# Spec: AWG_PORT, SUPPORTED_OS («ID:VERSION_ID:suite PPA» через пробел — единый
+# список RC, `remote-control/core/src/server/os.rs`).
 
 AWG_DIR="$R/etc/amnezia/amneziawg"
 AWG_CONF="$AWG_DIR/awg0.conf"
@@ -32,20 +33,21 @@ _awg_fail() {
 # Блокировка apt — общий неинтерактивный `agent_apt_wait` (до 300 с).
 _awg_apt_wait() { agent_apt_wait; }
 
+# Suite PPA Amnezia для ОС ноды — из SUPPORTED_OS; своего списка ОС здесь нет.
 _awg_detect_platform() {
-    local os_id version_id arch
+    local os_id version_id arch entry known=()
     [[ -r "$AWG_OS_RELEASE" ]] || _awg_fail "Не найден $AWG_OS_RELEASE." || return 1
     os_id=$(. "$AWG_OS_RELEASE"; printf '%s' "${ID:-}")
     version_id=$(. "$AWG_OS_RELEASE"; printf '%s' "${VERSION_ID:-}")
-    case "${os_id}:${version_id}" in
-        debian:12|debian:13) AWG_APT_SUITE="jammy" ;;
-        ubuntu:22.04) AWG_APT_SUITE="jammy" ;;
-        ubuntu:24.04) AWG_APT_SUITE="noble" ;;
-        *)
-            _awg_fail "Поддерживаются Debian 12/13 и Ubuntu 22.04/24.04 (обнаружено: ${os_id:-?} ${version_id:-?})."
-            return 1
-            ;;
-    esac
+    AWG_APT_SUITE=""
+    for entry in ${SUPPORTED_OS:-}; do
+        known+=("${entry%:*}")
+        [[ "${entry%:*}" == "${os_id}:${version_id}" ]] && AWG_APT_SUITE="${entry##*:}"
+    done
+    if [[ -z "$AWG_APT_SUITE" ]]; then
+        _awg_fail "ОС ${os_id:-?} ${version_id:-?} не поддерживается (поддерживаются: ${known[*]:-список SUPPORTED_OS не задан})."
+        return 1
+    fi
 
     arch=$(dpkg --print-architecture 2>/dev/null) || {
         _awg_fail "Не удалось определить архитектуру через dpkg."
@@ -444,8 +446,8 @@ _awg_show_module_diagnostics() {
     echo "  dmesg (amneziawg/dkms/module):"
     dmesg 2>&1 | grep -Ei 'amnezia|awg|dkms|module|secure boot' | tail -n 80 || true
     if [[ -n "$log" ]] && grep -q 'setup_udp_tunnel_sock' "$log" 2>/dev/null; then
-        warn "Известная несовместимость: текущий amneziawg-dkms не собирается на ядрах Ubuntu 7.0.0-38+ (в т.ч. HWE-ядро 24.04)."
-        warn "Исправление ещё не опубликовано в PPA: https://github.com/amnezia-vpn/amneziawg-linux-kernel-module/issues/259 — дождитесь обновления PPA или загрузитесь в более старое ядро."
+        warn "amneziawg-dkms старше исправления 2026-11-13 не собирается на ядрах Ubuntu 7.0.0-38+ (26.04 и HWE-ядро 24.04)."
+        warn "Обновите amneziawg-dkms (apt-get update && apt-get install --only-upgrade amneziawg-dkms) и повторите применение: https://github.com/amnezia-vpn/amneziawg-linux-kernel-module/issues/259"
     else
         warn "Проверьте Secure Boot, ограничения OpenVZ/LXC и совместимость нестандартного ядра."
     fi

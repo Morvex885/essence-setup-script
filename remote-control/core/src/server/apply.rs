@@ -39,6 +39,11 @@ const APPLY_STAGES: [&str; 10] = ["packages", "system", "mihomo", "dns", "site",
 const TEARDOWN_STAGES: [&str; 3] = ["config", "firewall", "cleanup"];
 /// Longest `detail=` shown (the executor already cuts it to this).
 const DETAIL_MAX: usize = 120;
+/// Log lines read after a failure, and the most of them shown.
+const LOG_READ: usize = 400;
+const LOG_SHOWN: usize = 25;
+/// The executor's warnings and errors shown first, at most.
+const LOG_PROBLEMS: usize = 10;
 const RECONNECT_PAUSES: [u64; 5] = [1, 2, 4, 8, 15];
 const OFFLINE_LIMIT: Duration = Duration::from_secs(10 * 60);
 const OPERATION_LIMIT: Duration = Duration::from_secs(60 * 60);
@@ -99,12 +104,12 @@ fn agent_check() -> String {
         sh_quote(&agent_dir()), agent_sha())
 }
 
-/// One read-only command: OS, systemd, sshd's own port, executor integrity,
-/// listening sockets, hashes of the applied files and the state of a
-/// recorded operation.
+/// One read-only command: OS and its version, systemd, sshd's own port,
+/// executor integrity, listening sockets, hashes of the applied files and
+/// the state of a recorded operation.
 pub fn probe_command(node: &Node) -> String {
     let mut command = format!(
-        ". /etc/os-release; printf 'os=%s\\n' \"$ID\"\n\
+        ". /etc/os-release; printf 'os=%s\\nversion=%s\\n' \"$ID\" \"$VERSION_ID\"\n\
          [ -d /run/systemd/system ] && echo systemd=yes\n\
          printf 'sshd=%s\\n' \"${{SSH_CONNECTION##* }}\"\n\
          ({}) && echo agent=ok\n\
@@ -129,7 +134,77 @@ pub fn status_command(op_id: &str) -> String {
 }
 
 pub fn log_command(op_id: &str) -> String {
-    format!("tail -n 40 {}", sh_quote(&format!("{}/log", ops_dir(op_id))))
+    format!("tail -n {LOG_READ} {}", sh_quote(&format!("{}/log", ops_dir(op_id))))
+}
+
+/// The executor log as shown after a failure: ANSI sequences stripped, PEM
+/// blocks (acme.sh prints the issued certificate) and blank lines dropped,
+/// a `\r`-redrawn line reduced to its last state; then the last
+/// [`LOG_PROBLEMS`] `[!]`/`[✗]` lines followed by the last other lines, up to
+/// [`LOG_SHOWN`] in all. A PEM block ends at its `-----END` line or at the
+/// first line that is not base64, so a cut block hides nothing after it.
+fn log_tail(raw: &str) -> Vec<String> {
+    let base64 = |text: &str| !text.is_empty() && text.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '='));
+    let mut lines: Vec<String> = Vec::new();
+    let mut in_pem = false;
+    for line in raw.lines() {
+        let line = strip_ansi(line.rsplit('\r').find(|part| !part.trim().is_empty()).unwrap_or(""));
+        let line = crate::log::sanitize(&line);
+        let text = line.trim();
+        if text.starts_with("-----BEGIN ") {
+            in_pem = true;
+        } else if text.starts_with("-----END ") {
+            // A block cut by the start of the read: its body is already in.
+            if !in_pem {
+                while lines.last().is_some_and(|last| base64(last)) {
+                    lines.pop();
+                }
+            }
+            in_pem = false;
+        } else if !(in_pem && base64(text)) {
+            in_pem = false;
+            if !text.is_empty() {
+                lines.push(text.to_owned());
+            }
+        }
+    }
+    let problem = |line: &str| line.starts_with("[!]") || line.starts_with("[✗]");
+    let problems: Vec<usize> = lines.iter().enumerate().filter(|(_, line)| problem(line)).map(|(index, _)| index).collect();
+    let problems = &problems[problems.len().saturating_sub(LOG_PROBLEMS)..];
+    let rest: Vec<usize> = (0..lines.len()).filter(|index| !problems.contains(index)).collect();
+    let rest = &rest[rest.len().saturating_sub(LOG_SHOWN - problems.len())..];
+    problems.iter().chain(rest).map(|index| lines[*index].clone()).collect()
+}
+
+/// `text` without ANSI escape sequences (CSI `ESC [ … final`, OSC
+/// `ESC ] … BEL|ESC \`, and two-byte `ESC x`).
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('[') => {
+                for c in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                while let Some(c) = chars.next() {
+                    if c == '\u{7}' || (c == '\u{1b}' && chars.next_if_eq(&'\\').is_some()) {
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Start the executor if its directory is still intact.
@@ -146,6 +221,8 @@ pub fn agent_reset_command() -> String {
 #[derive(Debug, Default)]
 struct Probe {
     os: String,
+    /// `VERSION_ID` of `/etc/os-release`.
+    version: String,
     systemd: bool,
     /// The port sshd accepted this session on (differs from the dialed one behind NAT).
     sshd: Option<u16>,
@@ -161,6 +238,8 @@ fn parse_probe(stdout: &str) -> Probe {
     for line in stdout.lines().map(|line| line.trim_end_matches('\r')) {
         if let Some(os) = line.strip_prefix("os=") {
             probe.os = os.trim_matches('"').to_owned();
+        } else if let Some(version) = line.strip_prefix("version=") {
+            probe.version = version.trim_matches('"').to_owned();
         } else if line == "systemd=yes" {
             probe.systemd = true;
         } else if let Some(port) = line.strip_prefix("sshd=") {
@@ -541,11 +620,11 @@ impl<T: RemoteTransport> Run<'_, T> {
         }
     }
 
-    /// Print the tail of the executor log.
+    /// Print the cleaned tail of the executor log ([`log_tail`]).
     async fn show_log(&mut self, session: &mut Session) {
         if let Ok(log) = self.transport.exec(&log_command(&self.operation.id), b"", COMMAND_TIMEOUT).await {
-            for line in String::from_utf8_lossy(&log.stdout).lines() {
-                session.log(Level::Output, line);
+            for line in log_tail(&String::from_utf8_lossy(&log.stdout)) {
+                session.log(Level::Output, &line);
             }
         }
     }
@@ -741,17 +820,34 @@ struct Planned<T> {
     run: bool,
 }
 
-/// Connect and probe one node.
+/// Connect and probe one node; an OS outside [`super::os::SUPPORTED_OS`] or
+/// without systemd fails it here, before the plan.
 async fn probe<T: RemoteTransport>(session: &Session, transport: &mut T, node: &Node) -> std::result::Result<Probe, Failure> {
     let fail = |error: RcError| Failure::of("probe", error);
     nodes::require_portable(session, node).map_err(fail)?;
     nodes::connect_retrying(transport, &session.state, node).await.map_err(fail)?;
     let result = transport.exec(&probe_command(node), b"", COMMAND_TIMEOUT).await.map_err(fail)?;
     let probe = parse_probe(&String::from_utf8_lossy(&result.stdout));
-    if !matches!(probe.os.as_str(), "debian" | "ubuntu") || !probe.systemd {
-        return Err(Failure::new("probe", "unsupported_os", "нужна Debian или Ubuntu с systemd"));
+    match os_failure(&probe) {
+        Some(failure) => Err(failure),
+        None => Ok(probe),
     }
-    Ok(probe)
+}
+
+/// `unsupported_os` naming what the node runs and what is supported.
+fn os_failure(probe: &Probe) -> Option<Failure> {
+    let wanted = super::os::supported_text();
+    let detected: String = crate::log::sanitize(&format!("{} {}", probe.os, probe.version)).trim().chars().take(40).collect();
+    let message = if detected.is_empty() {
+        format!("не удалось определить ОС ноды: нужна {wanted} с systemd")
+    } else if !super::os::supported(&probe.os, &probe.version) {
+        format!("ОС ноды «{detected}» не поддерживается: нужна {wanted} с systemd")
+    } else if !probe.systemd {
+        format!("на ноде «{detected}» нет systemd: нужна {wanted} с systemd")
+    } else {
+        return None;
+    };
+    Some(Failure::new("probe", "unsupported_os", message))
 }
 
 /// A socket the node does not hold for us yet (firewall ports and the

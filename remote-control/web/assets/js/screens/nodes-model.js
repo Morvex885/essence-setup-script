@@ -508,10 +508,13 @@ export const ROLE_TELEGRAM = 'отдельный домен, через кото
 export const ROLE_SUBSCRIPTION = 'домен, с которого приложения клиентов скачивают подписки';
 export const DOMAIN_TAKEN = 'Этот домен уже занят другой ролью ноды — нужен отдельный домен (поддомен).';
 
-/** Домен роли совпадает с другим доменом ноды (`taken`): текст ошибки или `null`. */
+/**
+ * Домен роли совпадает с другим доменом ноды (`taken`): текст ошибки или
+ * `null`. Имена DNS сравниваются без учёта регистра, как в ядре.
+ */
 export function roleDomainError(value, taken) {
-  const domain = plain(value).trim();
-  return domain !== '' && strings(taken).map((d) => d.trim()).includes(domain) ? DOMAIN_TAKEN : null;
+  const domain = plain(value).trim().toLowerCase();
+  return domain !== '' && strings(taken).map((d) => d.trim().toLowerCase()).includes(domain) ? DOMAIN_TAKEN : null;
 }
 
 /**
@@ -632,8 +635,7 @@ export async function subscriptionRoleFlow(ctx, name, node) {
   if (values === null || values === undefined) return false;
   const result = await setSubscriptionHost(ctx, name, subscriptionSetHost(name, values.domain, values.port));
   if (result.status !== 'saved') return false;
-  const old = result.old;
-  await offerApplyNodes(ctx, [name, old]);
+  await offerApplyNodes(ctx, result.old ? [name, result.old] : [name]);
   return true;
 }
 

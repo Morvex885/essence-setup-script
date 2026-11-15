@@ -31,7 +31,7 @@ use super::paths::{
 use super::ports::{REALITY_INNER_PORT, SITE_PORT, SUB_INNER_PORT, TG_INNER_PORT, XHTTP_NGINX_PORT};
 
 /// Bumped whenever rendered files change for an unchanged configuration.
-pub const RENDER_REVISION: u32 = 7;
+pub const RENDER_REVISION: u32 = 8;
 
 const MIHOMO_CONFIG: &str = include_str!("assets/mihomo-config.yaml");
 const MIHOMO_SERVICE: &str = include_str!("assets/mihomo.service");
@@ -1021,6 +1021,7 @@ pub fn desired(config: &Config, node: &Node, secrets: Option<&NodeSecrets>) -> R
         ("FEATURES", features.join(" ")),
         ("REMOVE_FEATURES", remove_features.join(" ")),
         ("AWG_PORT", awg_port.map(|port| port.to_string()).unwrap_or_default()),
+        ("SUPPORTED_OS", super::os::spec_value()),
         ("WARP", bool_text(profile.warp)),
         ("SUB_HOST", sub_host.unwrap_or_default().to_owned()),
         ("TG_HOST", tg_host.unwrap_or_default().to_owned()),

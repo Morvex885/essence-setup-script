@@ -777,6 +777,25 @@ awg_files() {
     printf '[Interface]\nListenPort = 40000\n# peer: a\n[Peer]\nPublicKey = A\n' >"$OPDIR/backup/etc/amnezia/amneziawg/awg0.conf"
 }
 
+@test "awg: suite PPA берётся из SUPPORTED_OS spec, своего списка ОС нет" {
+    stub dpkg '[[ "$1" == --print-architecture ]] && echo amd64; exit 0'
+    local list="debian:12:jammy ubuntu:24.04:noble ubuntu:26.04:resolute"
+    printf 'ID=ubuntu\nVERSION_ID="26.04"\n' >"$ROOT/etc/os-release"
+    SUPPORTED_OS="$list" awg_call '_awg_detect_platform && echo "suite=$AWG_APT_SUITE arch=$AWG_ARCH"'
+    assert_success
+    assert_output "suite=resolute arch=amd64"
+    printf 'ID=debian\nVERSION_ID="12"\n' >"$ROOT/etc/os-release"
+    SUPPORTED_OS="$list" awg_call '_awg_detect_platform && echo "suite=$AWG_APT_SUITE"'
+    assert_output "suite=jammy"
+    printf 'ID=ubuntu\nVERSION_ID="22.04"\n' >"$ROOT/etc/os-release"
+    SUPPORTED_OS="$list" awg_call '_awg_detect_platform'
+    assert_failure
+    assert_output --partial "ОС ubuntu 22.04 не поддерживается (поддерживаются: debian:12 ubuntu:24.04 ubuntu:26.04)"
+    SUPPORTED_OS="" awg_call '_awg_detect_platform'
+    assert_failure
+    assert_output --partial "список SUPPORTED_OS не задан"
+}
+
 @test "awg_activate: изменились только пиры — syncconf без перезапуска" {
     awg_files 40000
     awg_call awg_activate
@@ -857,6 +876,25 @@ awg_files() {
     restart=$(line_of "systemctl restart awg-quick@awg0")
     [[ -n "$down" && -n "$restart" && "$down" -lt "$restart" ]]
     grep -qx "systemctl enable awg-quick@awg0" "$CALLS"
+    # Хук отката вернул код своих команд: предупреждения о сбое отката нет.
+    ! grep -q "Откат фичи" "$OPDIR/log" || return 1
+}
+
+@test "сбой перезапуска AmneziaWG при откате — rollback_failed, а не rolled_back" {
+    awg_real_stubs
+    stub systemctl 'if [[ "$*" == "disable --now awg-quick@awg0" && -e "$AWG_UP" ]]; then awg-quick down awg0 || true; fi
+[[ "$*" == "restart awg-quick@awg0" ]] && exit 1
+exit 0'
+    mkdir -p "$ROOT/etc/amnezia/amneziawg"
+    printf '[Interface]\nListenPort = 40000\n' >"$ROOT/etc/amnezia/amneziawg/awg0.conf"
+    printf '/etc/amnezia/amneziawg/awg0.conf\n' >"$OPDIR/remove.list"
+    add_file /etc/mihomo/config.yaml "new"
+    RULES="" REMOVE_SPEC=awg write_spec
+    MIHOMO_T_RC=1 run_agent
+    assert_failure
+    run status
+    assert_line "result=rollback_failed"
+    grep -q "Откат фичи awg не удался" "$OPDIR/log"
 }
 
 # awg_real_stubs — awg-quick, как настоящий, без конфига в /etc не находит

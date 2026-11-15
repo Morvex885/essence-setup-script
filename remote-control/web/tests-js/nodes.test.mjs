@@ -386,16 +386,17 @@ test('порты ноды: форма по протоколам профиля, 
   assert.equal(await model.nodePortsFlow(none.ctx, 'n', { name: 'n', profile: null }), false);
 });
 
-test('профиль и домен ноды: без изменений команды нет, после изменения — предложение применить', async () => {
+test('профиль и домен ноды: без изменений команды нет, после изменения — node apply --name под планом', async () => {
   const node = { name: 'n', profile: 'edge', domain: 'a.example.com' };
-  let s = scripted([[['profile', 'list'], ok({ profiles: [edge, sni] })], [['node', 'profile', '--name', 'n', '--profile', 'sni'], ok({})]], [{ profile: 'sni' }, false]);
+  const declined = [['node', 'apply', '--name', 'n'], fail('confirmation_required')];
+  let s = scripted([[['profile', 'list'], ok({ profiles: [edge, sni] })], [['node', 'profile', '--name', 'n', '--profile', 'sni'], ok({})], declined],
+    [{ profile: 'sni' }]);
   assert.equal(await model.nodeProfileFlow(s.ctx, 'n', node), true);
-  assert.equal(s.record.dialogs[1].kind, 'confirm');
   s.done();
   s = scripted([[['profile', 'list'], ok({ profiles: [edge] })]], [{ profile: 'edge' }]);
   assert.equal(await model.nodeProfileFlow(s.ctx, 'n', node), false);
   s.done();
-  s = scripted([[['node', 'domain', '--name', 'n', '--domain', ''], ok({})]], [{ domain: '' }, false]);
+  s = scripted([[['node', 'domain', '--name', 'n', '--domain', ''], ok({})], declined], [{ domain: '' }]);
   assert.equal(await model.nodeDomainFlow(s.ctx, 'n', node), true);
   s.done();
   s = scripted([], [{ domain: 'a.example.com' }]);
@@ -409,11 +410,11 @@ test('«Указать профиль» без профилей: предлож�
   const s = scripted([
     [['profile', 'list'], ok({ profiles: [] })], [['profile', 'mihomo-versions'], ok(versions)],
     [profiles.profileAddArgv(form), ok({ name: 'edge' })], [['node', 'profile', '--name', 'n', '--profile', 'edge'], ok({})],
-  ], [true, form, true]);
-  // Согласие применить запускает `node apply --name n`; план здесь отклонён.
+  ], [true, form]);
+  // Затем сразу `node apply --name n`; план здесь отклонён.
   s.ctx.nodeRequest = async (_n, argv) => { assert.deepEqual(argv, ['node', 'apply', '--name', 'n']); return fail('confirmation_required'); };
   assert.equal(await model.nodeProfileFlow(s.ctx, 'n', { name: 'n', profile: null }), true);
-  assert.deepEqual(s.record.dialogs.map((d) => d.kind), ['confirm', 'form', 'confirm']);
+  assert.deepEqual(s.record.dialogs.map((d) => d.kind), ['confirm', 'form']);
   assert.equal(s.record.dialogs[1].fields.find((f) => f.name === 'mihomo_choice').options[0].label, 'Последняя (v1.19.20)');
   s.done();
   // Отказ — ничего не создаётся.
@@ -435,6 +436,8 @@ test('роли и домены: строки карточки, argv ролей �
   });
   assert.deepEqual(model.roleArgvs('n', {}), { telegram: null, subscription: null });
   assert.equal(model.roleDomainError('de.example.com', ['de.example.com', '']), model.DOMAIN_TAKEN);
+  // Как в ядре: имена DNS без учёта регистра.
+  assert.equal(model.roleDomainError('DE.Example.COM', ['de.example.com']), model.DOMAIN_TAKEN);
   assert.equal(model.roleDomainError('', ['']), null);
   // Форма добавления: домены ролей — только с профилем, проверяются по мере ввода и не повторяют домен ноды.
   const fields = Object.fromEntries(model.addFields({}, [edge]).map((f) => [f.name, f]));
@@ -515,15 +518,15 @@ test('имя новой ноды: предложение не совпадает
   assert.equal(model.portError('0'), model.PORT_INVALID);
 });
 
-test('«Сделать хостом подписок» в карточке: домен и порт → subscription host, затем предложение применить', async () => {
+test('«Сделать хостом подписок» в карточке: домен и порт → subscription host, затем node apply --name', async () => {
   const node = { name: 'n', profile: 'edge', domain: 'de.example.com' };
   const s = scripted([
     [['subscription', 'host'], ok(null)], [['subscription', 'host', '--name', 'n', '--domain', 'sub.example.com', '--port', '8443'], ok({})],
-  ], [{ domain: 'sub.example.com', port: '8443' }, false]);
+    [['node', 'apply', '--name', 'n'], fail('confirmation_required')],
+  ], [{ domain: 'sub.example.com', port: '8443' }]);
   assert.equal(await model.subscriptionRoleFlow(s.ctx, 'n', node), true);
   const domain = s.record.dialogs[0].fields[0];
   assert.equal(domain.validate('de.example.com'), model.DOMAIN_TAKEN);
-  assert.equal(s.record.dialogs[1].kind, 'confirm');
   s.done();
 });
 
@@ -554,7 +557,7 @@ test('применение: состояние, подписи сбоев, от�
     {"name":"de","stage":"config","code":"rolled_back","message":"откат на этапе «конфигурация и проверка»"},
     {"name":"de","stage":"probe","code":"port_busy","message":"порт 443 уже занят","port":443},
     {"name":"de","stage":"probe","code":"remote_failed","message":"Не удалось подключиться к «de»."},
-    {"name":"de","stage":"probe","code":"unsupported_os","message":"нужна Debian или Ubuntu с systemd"},
+    {"name":"de","stage":"probe","code":"unsupported_os","message":"ОС ноды «ubuntu 25.10» не поддерживается: нужна Debian 12/13 или Ubuntu 22.04/24.04/26.04 с systemd"},
   ];
   const partial = fail('partial', { message: 'Применение завершено с ошибками.', applied: ['a'], failed: entries, unchanged: ['c'] });
   const lines = apply.applyLines(apply.applyReport(partial));

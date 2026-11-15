@@ -1,5 +1,5 @@
 //! Network access to `essence-rc daemon run --web --port 0` (П4): admission
-//! by one-time code, script password and resume token, the message limit of
+//! by the panel's code, script password and resume token, the message limit of
 //! unauthorized connections (the in-flight limits are unit tests in
 //! `daemon/conn.rs`), certificate pinning of `--connect` and the one-shot
 //! CLI against a remote daemon.
@@ -116,9 +116,11 @@ fn a_loopback_panel_without_a_password_admits_by_code_then_by_resume_token() {
     assert!(resume_token(&events).is_none());
 
     let (_, link) = daemon.conn().request("link", &["web", "link"], json!({}));
-    assert_eq!(link["data"]["expires_in"], 300, "{link}");
+    assert!(link["data"].get("expires_in").is_none(), "no expiry while the panel runs: {link}");
     let code_value = ticket(&link);
     assert_eq!(code_value.len(), 64);
+    let (_, again) = daemon.conn().request("link2", &["web", "link"], json!({}));
+    assert_eq!(ticket(&again), code_value, "web link repeats the code");
     let (events, opened) = open(&mut first, "code", json!({"access-token": code_value}));
     assert!(ok(&opened), "{opened}");
     let resume = resume_token(&events).expect("an access event before the reply");
@@ -127,13 +129,51 @@ fn a_loopback_panel_without_a_password_admits_by_code_then_by_resume_token() {
     let (_, status) = daemon.conn().request("web2", &["web", "status"], json!({}));
     assert_eq!(status["data"]["clients"], 1, "{status}");
 
-    // The code is spent; the resume token admits a new connection.
+    // The code is reusable (the link opened again); the resume token admits too.
     let mut second = network(&web);
-    let (_, spent) = open(&mut second, "again", json!({"access-token": code_value}));
-    assert_eq!((code(&spent), spent["error"]["secret"].as_str()), ("auth_failed", Some("access-token")), "{spent}");
-    let (_, resumed) = open(&mut second, "resume", json!({"access-token": resume}));
-    assert!(ok(&resumed), "{resumed}");
+    let (_, reused) = open(&mut second, "again", json!({"access-token": code_value}));
+    assert!(ok(&reused), "{reused}");
     assert!(ok(&second.request("groups", &["group", "list"], json!({})).1));
+    let mut third = network(&web);
+    let (_, resumed) = open(&mut third, "resume", json!({"access-token": resume}));
+    assert!(ok(&resumed), "{resumed}");
+    // A wrong code is still refused.
+    let mut stranger = network(&web);
+    let (_, wrong) = open(&mut stranger, "wrong", json!({"access-token": "0".repeat(64)}));
+    assert_eq!((code(&wrong), wrong["error"]["secret"].as_str()), ("auth_failed", Some("access-token")), "{wrong}");
+}
+
+#[test]
+fn the_code_ends_with_web_stop_with_the_daemon_and_on_web_link_new() {
+    let env = Env::new();
+    let ctx = env.ctx();
+    configured(&ctx, None);
+    let refused = |web: &Value, code_value: &str| {
+        let mut raw = network(web);
+        let (_, reply) = open(&mut raw, "old", json!({"access-token": code_value}));
+        code(&reply) == "auth_failed" && reply["error"]["secret"] == "access-token"
+    };
+    let (mut daemon, web) = networked(&ctx, &[]);
+    let old = ticket(&daemon.conn().request("link", &["web", "link"], json!({})).1);
+    let (_, renewed) = daemon.conn().request("new", &["web", "link", "--new"], json!({}));
+    let new = ticket(&renewed);
+    assert_ne!(new, old);
+    assert!(refused(&web, &old), "--new replaces the code");
+    assert!(ok(&open(&mut network(&web), "new", json!({"access-token": new})).1));
+
+    // `web stop` voids it; the panel started again gets a new one.
+    assert!(ok(&daemon.conn().request("stop", &["web", "stop"], json!({})).1));
+    let (_, started) = daemon.conn().request("start", &["web", "start", "--port", "0"], json!({}));
+    assert!(ok(&started), "{started}");
+    let web = started["data"].clone();
+    assert!(refused(&web, &new), "after web stop");
+    let current = ticket(&daemon.conn().request("link", &["web", "link"], json!({})).1);
+    assert_ne!(current, new);
+
+    // A restarted daemon knows no code of the previous one.
+    drop(daemon);
+    let (_daemon, web) = networked(&ctx, &[]);
+    assert!(refused(&web, &current), "after the daemon restart");
 }
 
 #[test]

@@ -43,7 +43,8 @@ tx_touches_nginx() {
 
 # ─── packages ───────────────────────────────────────────────────────────────
 stage_packages() {
-    local pkgs=(curl wget unzip ufw openssl dnsutils cron)
+    # bind9-dnsutils: в Debian 13 и Ubuntu 26.04 dnsutils — только виртуальный пакет.
+    local pkgs=(curl wget unzip ufw openssl bind9-dnsutils cron)
     [[ "$NGINX" == true ]] && pkgs+=(nginx)
     [[ "$NGINX_STREAM" == true ]] && pkgs+=(libnginx-mod-stream)
     agent_apt_wait || return 1

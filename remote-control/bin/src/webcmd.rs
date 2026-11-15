@@ -1,11 +1,11 @@
 //! `web run` и `web open` (план 2.4, П8, П9): клиент локального демона.
 //!
-//! Открытие панели: `web link` → браузер без `--no-open` → ссылка в stdout.
-//! Одноразовая ссылка не попадает в аргументы внешних программ: в каталог
+//! Открытие панели: `web link` → ссылка в stdout → без `--no-open` браузер.
+//! Ссылка с кодом не попадает в аргументы внешних программ: в каталог
 //! времени выполнения пишется `<h>-open-<16 hex>.html` (только владелец) с
 //! `<meta http-equiv="refresh">`, браузер открывает путь к этому файлу;
-//! файл удаляется через 30 с либо при выходе CLI. Код открытой браузером
-//! ссылки он и израсходует: печатается адрес без кода и подсказка.
+//! файл удаляется через 30 с либо при выходе CLI. Код многоразовый до
+//! остановки панели: напечатанную ссылку можно открыть снова.
 
 use std::fs;
 use std::io::{self, Write};
@@ -32,8 +32,6 @@ const UPDATE_RECONNECT: Duration = Duration::from_secs(30);
 const RECONNECT_RETRY: Duration = Duration::from_millis(500);
 /// Период проверки сигнала остановки между событиями демона.
 const POLL: Duration = Duration::from_millis(200);
-/// Подсказка после открытия браузером ссылки с одноразовым кодом.
-const OPENED_HINT: &str = "Браузер открыт. Новая одноразовая ссылка: essence-rc web open --no-open";
 
 // ─── Чистые части ────────────────────────────────────────────────────────────
 
@@ -85,16 +83,6 @@ fn opener(path: &Path) -> (&'static str, Vec<String>) {
 /// Событие конца чужого (или своего) `self update`.
 fn update_finished(event: &Value) -> bool {
     event["event"] == "activity" && event["state"] == "end" && event["command"] == "self update"
-}
-
-/// Ссылка для вывода. Открытая браузером ссылка с кодом `#ticket=…` его
-/// израсходует: остаётся адрес без кода (`true` — код убран).
-fn shown_link(link: Value, opened: bool) -> (Value, bool) {
-    let base = link["url"].as_str().and_then(|url| url.split_once("#ticket=")).map(|(base, _)| base.to_owned());
-    match base {
-        Some(base) if opened => (json!({"url": base}), true),
-        _ => (link, false),
-    }
 }
 
 // ─── Файл перенаправления ────────────────────────────────────────────────────
@@ -196,22 +184,17 @@ fn words(list: &[&str]) -> Vec<String> {
     list.iter().map(|word| (*word).to_owned()).collect()
 }
 
-/// `web link` → браузер без `--no-open` → ссылка (stdout или конверт). Код
-/// ссылки, открытой браузером, не печатается: он уже израсходован.
+/// `web link` → ссылка (stdout или конверт) → браузер без `--no-open`.
 fn open_panel(client: &mut DaemonClient, endpoint: &Endpoint, invocation: &Invocation, keep: bool) -> Outcome<(Value, Option<OpenFile>)> {
     let link = ok(call(client, words(&["web", "link"]))?)?;
     let url = link["url"].as_str().unwrap_or_default().to_owned();
-    let launched = if invocation.has("no-open") { None } else { launch(endpoint, &url, keep).ok() };
-    let (link, spent) = shown_link(link, launched.is_some());
     if !invocation.json {
         let mut stdout = io::stdout().lock();
-        let _ = writeln!(stdout, "{}", link["url"].as_str().unwrap_or_default());
+        let _ = writeln!(stdout, "{url}");
         let _ = stdout.flush();
-        if spent {
-            print_line(&format!("  [*] {OPENED_HINT}"));
-        }
     }
-    Ok((link, launched.flatten()))
+    let file = if invocation.has("no-open") { None } else { launch(endpoint, &url, keep).ok().flatten() };
+    Ok((link, file))
 }
 
 fn print_line(text: &str) {
@@ -490,16 +473,6 @@ mod tests {
         assert!(update_finished(&json!({"event":"activity","state":"end","command":"self update","origin":"local"})));
         assert!(!update_finished(&json!({"event":"activity","state":"start","command":"self update"})));
         assert!(!update_finished(&json!({"event":"activity","state":"end","command":"node list"})));
-    }
-
-    #[test]
-    fn a_link_opened_by_the_browser_is_shown_without_its_spent_code() {
-        let ticket = json!({"url": "http://127.0.0.1:8377/#ticket=ab12", "expires_in": 300});
-        assert_eq!(shown_link(ticket.clone(), true), (json!({"url": "http://127.0.0.1:8377/"}), true));
-        assert_eq!(shown_link(ticket.clone(), false), (ticket, false), "--no-open or no browser: the code stays");
-        let password = json!({"url": "https://[::1]:8443/"});
-        assert_eq!(shown_link(password.clone(), true), (password, false), "no code, no hint");
-        assert!(OPENED_HINT.contains("essence-rc web open --no-open"));
     }
 
     #[cfg(unix)]

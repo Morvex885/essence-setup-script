@@ -296,6 +296,11 @@ fn set_subscription_host(ctx: &mut Context<'_>, name: &str, domain: &str, port: 
     if !reply.ok { outcome(ctx, &reply); return Ok(HostSet::Failed); }
     Ok(HostSet::Saved(old))
 }
+/// `domain` is one of the node's other domains; DNS names compare
+/// case-insensitively, as in the core.
+fn domain_taken(taken: &[impl AsRef<str>], domain: &str) -> bool {
+    taken.iter().any(|other| other.as_ref().eq_ignore_ascii_case(domain))
+}
 const DOMAIN_TAKEN: &str = "Этот домен уже занят другой ролью ноды — нужен отдельный домен (поддомен).";
 /// «Сделать хостом подписок» / «Хост подписок»: domain and port →
 /// `subscription host`; both the node and a former host then wait for `node apply`.
@@ -309,7 +314,7 @@ fn subscription_role(ctx: &mut Context<'_>, name: &str, node: &Value) -> io::Res
         let Some(domain) = ask_valid(ctx, &title, &prompt, domain_check)? else { return Ok(()); };
         let domain = if domain.is_empty() { keep.clone() } else { domain };
         if domain.is_empty() { return Ok(()); }
-        if taken.contains(&domain) { ctx.ui.notice(ui::warn(DOMAIN_TAKEN)); continue; }
+        if domain_taken(&taken, &domain) { ctx.ui.notice(ui::warn(DOMAIN_TAKEN)); continue; }
         break domain;
     };
     let prompt = if keep_port.is_empty() { "Порт подписок (Enter — 443)".to_owned() } else { format!("Порт подписок [{keep_port}]") };
@@ -401,7 +406,7 @@ fn add_node_among(ctx: &mut Context<'_>, taken: Vec<String>) -> io::Result<()> {
 fn ask_role_domain(ctx: &mut Context<'_>, title: &str, prompt: &str, taken: &[&str]) -> io::Result<Option<String>> {
     loop {
         let Some(value) = ask_valid(ctx, title, prompt, domain_check)? else { return Ok(None); };
-        if value.is_empty() || !taken.contains(&value.as_str()) { return Ok(Some(value)); }
+        if value.is_empty() || !domain_taken(taken, &value) { return Ok(Some(value)); }
         ctx.ui.notice(ui::warn(DOMAIN_TAKEN));
     }
 }
@@ -2768,13 +2773,14 @@ mod tests {
         let mut renamed = edge();
         renamed["name"] = json!("edge2");
         // `exists`: the name is asked again with the old one kept by Enter, the
-        // other answers are kept; the corrected add opens the card.
+        // other answers are kept; the corrected add opens the card. Without
+        // the version list the version is typed (Enter — the latest).
         let (client, ui) = screen(&mut Profiles, &["a", "edge", "1", "1", "", "1", "", "", "edge2", "", "", "", "", "", "", "0", "0"], vec![
-            list(), (profile_add_argv(&first), err("exists", json!({}))), (profile_add_argv(&second), ok(json!({"name": "edge2"}))),
+            list(), no_versions(), (profile_add_argv(&first), err("exists", json!({}))), no_versions(), (profile_add_argv(&second), ok(json!({"name": "edge2"}))),
             step(&["profile", "show", "--name", "edge2"], ok(renamed)), list(),
         ]);
         assert!(ui.views.iter().any(|v| v.prompt.contains("Имя профиля [edge]")));
-        assert_eq!(client.calls.len(), 5);
+        assert_eq!(client.calls.len(), 7);
         // A failed `profile set` reopens the edit wizard with the changed IPv6
         // (now the current item); Enter everywhere repeats the same command.
         let set = argv(&["profile", "set", "--name", "edge", "--ipv6", "enabled"]);
@@ -2783,13 +2789,13 @@ mod tests {
         keys.extend([""; 10]);
         keys.push("0");
         let (_, ui) = screen(&mut ProfileCard("edge".into()), &keys, vec![
-            show(), (set.clone(), err("locked", json!({}))), show(), (set, ok(json!({}))), show(),
+            show(), no_versions(), (set.clone(), err("locked", json!({}))), show(), no_versions(), (set, ok(json!({}))), show(),
         ]);
         let ipv6: Vec<_> = ui.views.iter().filter(|v| v.title == "IPv6").collect();
         assert_eq!(ipv6.iter().map(|v| v.cursor).collect::<Vec<_>>(), [Some(0), Some(1)]);
         // Cancelling the reopened wizard sends nothing more.
         screen(&mut ProfileCard("edge".into()), &["e", "", "", "", "", "", "", "", "2", "", "", "0", "0"], vec![
-            show(), (argv(&["profile", "set", "--name", "edge", "--ipv6", "enabled"]), err("locked", json!({}))), show(), show(),
+            show(), no_versions(), (argv(&["profile", "set", "--name", "edge", "--ipv6", "enabled"]), err("locked", json!({}))), show(), show(),
         ]);
         // The failed set was saved (checkpoint error after the local write):
         // the retry is computed against the re-read profile, so returning
@@ -2799,8 +2805,8 @@ mod tests {
         let mut keys = vec!["e", "", "", "", "", "", "", "", "3", "", ""];
         keys.extend(["", "", "", "", "", "", "", "1", "b@example.com", "", "0"]);
         let (_, ui) = screen(&mut ProfileCard("edge".into()), &keys, vec![
-            show(), (argv(&["profile", "set", "--name", "edge", "--ipv6", "disabled"]), err("checkpoint_failed", json!({}))),
-            step(&["profile", "show", "--name", "edge"], ok(saved)),
+            show(), no_versions(), (argv(&["profile", "set", "--name", "edge", "--ipv6", "disabled"]), err("checkpoint_failed", json!({}))),
+            step(&["profile", "show", "--name", "edge"], ok(saved)), no_versions(),
             (argv(&["profile", "set", "--name", "edge", "--ipv6", "default", "--acme-email", "b@example.com"]), ok(json!({}))), show(),
         ]);
         let ipv6: Vec<_> = ui.views.iter().filter(|v| v.title == "IPv6").collect();
@@ -2905,10 +2911,10 @@ mod tests {
             {"name":"de","stage":"config","code":"rolled_back","message":"откат на этапе «конфигурация и проверка»"},
             {"name":"de","stage":"probe","code":"port_busy","message":"порт 443 уже занят","port":443},
             {"name":"de","stage":"probe","code":"remote_failed","message":"Не удалось подключиться к «de»."},
-            {"name":"de","stage":"probe","code":"unsupported_os","message":"нужна Debian или Ubuntu с systemd"}]}));
+            {"name":"de","stage":"probe","code":"unsupported_os","message":"ОС ноды «ubuntu 25.10» не поддерживается: нужна Debian 12/13 или Ubuntu 22.04/24.04/26.04 с systemd"}]}));
         let (_, _, ui) = run(vec![(words.clone(), plan("confirmation_required", "a")), (with_yes(&words, "a"), partial)], &["y"], |ctx| apply(ctx, &words, ""));
         for line in ["Применено: a", "de: откат на этапе «конфигурация и проверка»", "de: порт 443 уже занят",
-            "de: Не удалось подключиться к «de».", "de: нужна Debian или Ubuntu с systemd"] {
+            "de: Не удалось подключиться к «de».", "de: ОС ноды «ubuntu 25.10» не поддерживается: нужна Debian 12/13 или Ubuntu 22.04/24.04/26.04 с systemd"] {
             assert!(noticed(&ui, line), "{line}");
         }
         // Nothing pending: the core's message only, no report.
@@ -3039,20 +3045,21 @@ mod tests {
     fn card_role_actions_send_the_role_commands_and_offer_apply() {
         let shown = || step(&["node", "show", "--name", "n"], ok(profiled_node()));
         let apply = argv(&["node", "apply", "--name", "n"]);
-        // «Включить Telegram Web Proxy»: domain → telegram set → apply offer.
-        screen(&mut NodeCard("n".into()), &["t", "tg.example.com", "y", "y", "0"], vec![
+        // «Включить Telegram Web Proxy»: domain → telegram set → node apply under its plan.
+        screen(&mut NodeCard("n".into()), &["t", "tg.example.com", "y", "0"], vec![
             shown(), step(&["telegram", "set", "--name", "n", "--domain", "tg.example.com"], ok(json!({}))),
             (apply.clone(), plan("confirmation_required", "a")), (with_yes(&apply, "a"), ok(json!({"applied": ["n"], "failed": [], "unchanged": []}))),
             shown(),
         ]);
-        // «Сделать хостом подписок»: no host yet, domain (the node's own is refused) and port → subscription host.
-        let (_, ui) = screen(&mut NodeCard("n".into()), &["S", "de.example.com", "sub.example.com", "8443", "n", "0"], vec![
+        // «Сделать хостом подписок»: no host yet, domain (the node's own is refused,
+        // in any case) and port → subscription host.
+        let (_, ui) = screen(&mut NodeCard("n".into()), &["S", "de.example.com", "DE.Example.com", "sub.example.com", "8443", "n", "0"], vec![
             shown(), step(&["subscription", "host"], ok(Value::Null)),
             step(&["subscription", "host", "--name", "n", "--domain", "sub.example.com", "--port", "8443"], ok(json!({}))),
-            shown(),
+            (apply.clone(), plan("confirmation_required", "a")), shown(),
         ]);
-        assert!(noticed(&ui, DOMAIN_TAKEN));
-        assert_eq!(confirms(&ui), 1, "the apply offer only");
+        assert_eq!(ui.notices.iter().filter(|l| l.to_string().contains(DOMAIN_TAKEN)).count(), 2);
+        assert_eq!(confirms(&ui), 1, "the apply plan only");
         // The host on another node: the move is confirmed first; refused — nothing sent.
         let (client, ui) = screen(&mut NodeCard("n".into()), &["s", "sub.example.com", "", "n", "0"], vec![
             shown(), step(&["subscription", "host"], ok(json!({"node": "old", "hostname": "sub.old.example.com", "port": 443}))), shown(),
@@ -3065,7 +3072,7 @@ mod tests {
         // The list offers «Указать профиль»: one node without a profile — straight to the profiles.
         let set = argv(&["node", "profile", "--name", "n", "--profile", "edge"]);
         let apply = argv(&["node", "apply", "--name", "n"]);
-        let (_, ui) = screen(&mut Nodes, &["f", "2", "y", "y", "0"], vec![
+        let (_, ui) = screen(&mut Nodes, &["f", "2", "y", "0"], vec![
             step(&["node", "list"], ok(json!([node()]))), step(&["status"], ok(json!({}))),
             step(&["profile", "list"], ok(json!({"profiles": [edge()]}))), (set.clone(), ok(json!({}))),
             (apply.clone(), plan("confirmation_required", "a")), (with_yes(&apply, "a"), ok(json!({"applied": ["n"], "failed": [], "unchanged": []}))),
@@ -3078,7 +3085,8 @@ mod tests {
         let add = argv(&["profile", "add", "--name", "edge", "--reality", "sni", "--sni-domain", "www.example.com", "--vless-tcp", "on", "--xhttp", "off",
             "--grpc", "off", "--hysteria2", "off", "--amneziawg", "off", "--warp", "off", "--ipv6", "default", "--random-acme-email", "--mihomo-version", "v1.19.20"]);
         run(vec![
-            step(&["profile", "list"], ok(json!({"profiles": []}))), versions(), (add, ok(json!({"name": "edge"}))), (set, ok(json!({}))),
+            step(&["profile", "list"], ok(json!({"profiles": []}))), versions(), (add, ok(json!({"name": "edge"}))), (set.clone(), ok(json!({}))),
+            (apply.clone(), plan("confirmation_required", "a")),
         ], &["y", "edge", "2", "www.example.com", "", "1", "", "1", "n"], |ctx| node_profile(ctx, "n", &node()));
         // Refused: nothing is created.
         run(vec![step(&["profile", "list"], ok(json!({"profiles": []})))], &["n"], |ctx| node_profile(ctx, "n", &node()));
@@ -3088,8 +3096,9 @@ mod tests {
         let mut with_profile = node();
         with_profile["profile"] = json!("edge");
         with_profile["ports"] = json!({"hysteria2": 31000});
-        run(vec![step(&["profile", "list"], ok(json!({"profiles": [edge()]}))), step(&["node", "profile", "--name", "n", "--profile", "edge"], ok(json!({})))],
-            &["2"], |ctx| node_profile(ctx, "n", &node()));
+        let apply = || step(&["node", "apply", "--name", "n"], plan("confirmation_required", "a"));
+        run(vec![step(&["profile", "list"], ok(json!({"profiles": [edge()]}))), step(&["node", "profile", "--name", "n", "--profile", "edge"], ok(json!({}))), apply()],
+            &["2", "n"], |ctx| node_profile(ctx, "n", &node()));
         let (_, _, ui) = run(vec![step(&["profile", "list"], ok(json!({"profiles": [edge()]})))], &["2"], |ctx| node_profile(ctx, "n", &with_profile));
         assert!(noticed(&ui, "Изменений нет."));
         run(vec![step(&["node", "domain", "--name", "n", "--domain", "de.example.com"], ok(json!({})))], &["de.example.com"], |ctx| node_domain(ctx, "n", &node()));

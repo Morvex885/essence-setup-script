@@ -6,7 +6,6 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
 
 use essence_rc_client::{Origin, PROTOCOL};
 use essence_rc_web::{Accepted, ListenError, Listener, ListenerConfig, Tls};
@@ -70,7 +69,7 @@ pub async fn web(shared: Arc<Shared>, conn: Arc<Conn>, id: Value, invocation: In
         "status" => Ok(web_status(&shared)),
         "start" => start(&shared, &invocation).await,
         "stop" => Ok(stop(&shared).await),
-        "link" => link(&shared),
+        "link" => link(&shared, &invocation),
         _ => Err(RcError::new("usage", "Неизвестная команда.")),
     };
     match result {
@@ -115,11 +114,13 @@ pub(super) async fn start(shared: &Arc<Shared>, invocation: &Invocation) -> Resu
 
 /// Stops the listener: network connections are closed first (lines they
 /// already sent are not executed), their terminals cancelled, then the
-/// listener closes the sockets. `{"enabled":false}` either way.
+/// listener closes the sockets and the panel's code is void.
+/// `{"enabled":false}` either way.
 pub async fn stop(shared: &Shared) -> Value {
     let mut slot = shared.web.lock().await;
     if let Some(listener) = slot.take() {
         *lock(&shared.web_info) = None;
+        lock(&shared.tokens).drop_ticket();
         for conn in shared.connections().iter().filter(|conn| conn.origin == Origin::Network) {
             shared.disconnect(conn);
         }
@@ -128,7 +129,9 @@ pub async fn stop(shared: &Shared) -> Value {
     json!({"enabled": false})
 }
 
-fn link(shared: &Shared) -> Result<Value> {
+/// `web link [--new]`: the panel's address; without a script password — with
+/// the panel's code, the same until the panel stops (`--new` replaces it).
+fn link(shared: &Shared, invocation: &Invocation) -> Result<Value> {
     let Some(info) = shared.web_info() else {
         return Err(RcError::new("not_configured", "Веб-панель не запущена: essence-rc web run."));
     };
@@ -136,9 +139,9 @@ fn link(shared: &Shared) -> Result<Value> {
     if shared.snapshot.borrow().password_set {
         return Ok(json!({"url": format!("{url}/")}));
     }
-    let ticket = lock(&shared.tokens).issue_ticket(Instant::now());
+    let ticket = lock(&shared.tokens).ticket(invocation.has("new"));
     let link = Zeroizing::new(format!("{url}/#ticket={}", ticket.as_str()));
-    Ok(json!({"url": link.as_str(), "expires_in": super::access::TICKET_TTL.as_secs()}))
+    Ok(json!({"url": link.as_str()}))
 }
 
 // ─── Listener flags ──────────────────────────────────────────────────────────

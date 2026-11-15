@@ -107,6 +107,7 @@ fn self_steal_front_serves_reality_on_443_with_the_node_site() {
     assert_eq!(spec(&desired, "CERTS"), "de.example.com:/var/www/de.example.com");
     assert_eq!(spec(&desired, "DNS_DOMAINS"), "de.example.com");
     assert_eq!((spec(&desired, "UFW_RULES"), spec(&desired, "HY2_CERT")), ("443/tcp", "false"));
+    assert_eq!(spec(&desired, "SUPPORTED_OS"), crate::server::os::spec_value());
     let client = client_section(&config, &config.nodes[0]).unwrap();
     assert!(client.starts_with("proxies:\n  - name: \"VLESS TCP\"\n    type: vless\n    server: de.example.com\n    port: 443\n"), "{client}");
     assert!(client.contains("    servername: \"de.example.com\"\n") && client.ends_with("---\n"));
