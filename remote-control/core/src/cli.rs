@@ -292,7 +292,7 @@ static HELP: &[(&str, &[(&str, &str)])] = &[
         ("telegram link --name N", "Ссылка подключения tg://webproxy (с секретом)"),
         ("telegram rotate-secret --name N [--yes]", "Новый секрет: прежние ссылки перестанут работать (затем node apply)"),
         ("telegram tag --name N [--clear]", "Спонсорский тег (секрет password, 32 hex; затем node apply)"),
-        ("telegram restart --name N", "Перезапустить MTProxy и tproxy-server"),
+        ("telegram restart --name N [--yes]", "Перезапустить MTProxy и tproxy-server"),
         ("telegram diagnostics --name N", "Журналы служб за 30 минут и метрики Web Proxy"),
     ]),
     ("template", &[

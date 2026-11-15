@@ -837,7 +837,7 @@ AmneziaWG отдельной сущности не имеет: протокол 
 | `telegram link --name N` | Ссылка подключения `tg://webproxy` (с секретом) |
 | `telegram rotate-secret --name N [--yes]` | Новый секрет: прежние ссылки перестанут работать (затем `node apply`) |
 | `telegram tag --name N [--clear]` | Спонсорский тег (секрет `password`, 32 hex; затем `node apply`) |
-| `telegram restart --name N` | Перезапустить MTProxy и tproxy-server |
+| `telegram restart --name N [--yes]` | Перезапустить MTProxy и tproxy-server |
 | `telegram diagnostics --name N` | Журналы служб за 30 минут и метрики Web Proxy |
 
 Секрет и спонсорский тег хранятся в хранилище секретов и попадают на ноду
@@ -845,6 +845,8 @@ AmneziaWG отдельной сущности не имеет: протокол 
 `node apply`, не через argv или окружение команд. План `remove` и
 `rotate-secret` строится заново под блокировкой мутации: роль, изменённая после
 подтверждения (другой домен, другой секрет, роль убрана), даёт `plan_changed`.
+`restart` тоже идёт по плану (нода и домен роли; в токене — id и SSH-адрес ноды),
+который подтверждается до подключения к ноде.
 
 ### Клиенты (`client`)
 
