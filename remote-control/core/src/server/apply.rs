@@ -814,11 +814,16 @@ pub async fn apply<T: RemoteTransport>(session: &mut Session, invocation: &Invoc
 
 /// Remove everything Essence installed on a connected node (`node delete
 /// --scope server`). `Ok` only after the executor committed. A node with a
-/// recorded operation is refused (`in_use`).
-pub async fn teardown<T: RemoteTransport>(session: &mut Session, node: &Node, transport: &mut T) -> Result<()> {
+/// recorded operation is refused (`in_use`). `recheck` runs under the claim's
+/// lock before the operation is recorded: the caller's agreed plan against the
+/// state the removal is rendered from (its error is returned as is).
+pub async fn teardown<T: RemoteTransport>(session: &mut Session, node: &Node, transport: &mut T,
+    recheck: impl FnOnce(&Config) -> Result<()>) -> Result<()>
+{
     let output = transport.exec(&probe_command(&Node { applied: None, operation: None, ..node.clone() }), b"", COMMAND_TIMEOUT).await?;
     let probe = parse_probe(&String::from_utf8_lossy(&output.stdout));
     let claims = claim(session, "node delete", |_, config| {
+        recheck(config)?;
         let current = config.nodes.iter().find(|current| current.id == node.id)
             .ok_or_else(|| RcError::new("not_found", format!("Нода «{}» не найдена.", node.name)))?;
         Ok(vec![(current.id.clone(), Ok(render::teardown(current)))])

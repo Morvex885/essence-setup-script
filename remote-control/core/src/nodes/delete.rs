@@ -265,8 +265,12 @@ pub async fn delete<T: RemoteTransport>(session: &mut Session, invocation: &Invo
         if server {
             if node.applied.is_some() {
                 session.log(Level::Info, &format!("Удаляем компоненты Essence на ноде «{name}»..."));
-                crate::server::apply::teardown(session, &node, transport).await
-                    .map_err(|error| remote_failed(SERVER_NOT_REMOVED).with_extra("cause", error.message))?;
+                // Re-checked again under the claim's lock: the removal is rendered from that state.
+                let recheck = |config: &Config| delete_planned(config, &node, server, revoke, false, &planned, invocation);
+                crate::server::apply::teardown(session, &node, transport, recheck).await.map_err(|error| match error.code {
+                    "plan_changed" => error,
+                    _ => remote_failed(SERVER_NOT_REMOVED).with_extra("cause", error.message),
+                })?;
                 remote_removed = true;
             } else {
                 session.log(Level::Info, &format!("Essence на ноду «{name}» не применялся — сервер не изменится."));
@@ -713,6 +717,24 @@ mod tests {
         assert!(error.extra["plan"].as_array().unwrap().contains(&json!("Затронутые клиенты: bob")));
         let config = session.state.load_config().unwrap();
         assert!(config.nodes[0].applied.is_some() && config.nodes[0].operation.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_plan_changed_during_the_probe_is_refused_under_the_claim_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = applied_session(root.path());
+        let probe = crate::server::apply::probe_command(&node("de", ID, Auth::Key));
+        let mut transport = Interleaved::new(FakeTransport::new(teardown_steps("").into_iter().take(2)), probe, root.path(),
+            |config| { config.nodes[0].applied.as_mut().unwrap().files.insert(crate::server::paths::SYSCTL_PATH.into(), "b".repeat(64)); });
+        let argv = testing::invocation(&["node", "delete", "--name", "de", "--scope", "server", "--yes"]);
+        let error = delete(&mut session, &argv, &mut transport).await.unwrap_err();
+        transport.inner.assert_finished();
+        assert_eq!((error.code, error.exit_code()), ("plan_changed", 2));
+        assert!(error.extra["plan"].as_array().unwrap().contains(&json!(format!("Будет удалено: {}", crate::server::paths::SYSCTL_PATH))),
+            "{}", error.extra["plan"]);
+        assert!(error.extra["plan_token"].is_string());
+        let config = session.state.load_config().unwrap();
+        assert!(config.nodes[0].operation.is_none() && config.nodes[0].applied.as_ref().unwrap().files.len() == 2);
     }
 
     #[tokio::test(start_paused = true)]
