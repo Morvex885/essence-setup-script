@@ -1,0 +1,14 @@
+Port 2222
+ListenAddress 0.0.0.0
+HostKey /fixture/host_key
+PidFile /run/sshd/sshd.pid
+AuthorizedKeysFile .ssh/authorized_keys
+PasswordAuthentication yes
+PubkeyAuthentication yes
+KbdInteractiveAuthentication no
+UsePAM no
+PermitRootLogin no
+AllowUsers e2e
+StrictModes yes
+Subsystem sftp internal-sftp
+LogLevel VERBOSE

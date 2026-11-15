@@ -1,0 +1,399 @@
+allow-lan: true
+mode: rule
+log-level: info
+ipv6: false
+tcp-concurrent: true
+unified-delay: true
+keep-alive-interval: 15
+# --- ROUTER ---
+find-process-mode: off
+# --- ROUTER ---
+# --- PC/MOBILE ---
+find-process-mode: strict
+# --- PC/MOBILE ---
+
+# --- НАСТРОЙКИ GEO-ДАННЫХ ---
+geodata-mode: true
+geo-auto-update: true
+geo-update-interval: 24
+geox-url:
+  geoip: "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat"
+  geosite: "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat"
+
+# --- НАСТРОЙКИ СНИФФЕРА ---
+sniffer:
+  enable: true
+  force-dns-mapping: true
+  parse-pure-ip: true
+  sniff:
+    HTTP:
+      override-destination: true
+      ports: [80, 8080-8880]
+    TLS:
+      ports: [443, 8443]
+
+# --- ROUTER ---
+redir-port: 1182
+tproxy-port: 1181
+mixed-port: 1080
+profile:
+  store-selected: true
+external-controller: 0.0.0.0:9090
+external-ui: ./zash
+external-ui-url: "https://github.com/Zephyruso/zashboard/releases/latest/download/dist-cdn-fonts.zip"
+# --- ROUTER ---
+
+dns:
+  enable: true
+  listen: 0.0.0.0:1053
+  ipv6: false
+  cache-algorithm: arc
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+# --- MOBILE ---
+    - "*"
+# --- MOBILE ---
+    - '*.lan'
+    - '*.local'
+    - 'localhost'
+    - +.msftconnecttest.com
+    - +.msftncsi.com
+    - +.connectivitycheck.gstatic.com
+    - +.detectportal.firefox.com
+    - +.pool.ntp.org
+    - +.ntp.org
+    - +.time.windows.com
+    - +.3gppnetwork.org
+  default-nameserver:
+    - 77.88.8.8
+    - 8.8.8.8
+    - 1.1.1.1
+  proxy-server-nameserver:
+    - 77.88.8.8
+    - 1.1.1.1
+  nameserver:
+    - "https://1.1.1.1/dns-query#🚫 Все заблокированное"
+    - "https://dns.google/dns-query#🚫 Все заблокированное"
+  direct-nameserver:
+    - https://common.dot.dns.yandex.net/dns-query
+    - tls://77.88.8.8
+  nameserver-policy:
+    "geosite:category-ru,category-gov-ru": "https://common.dot.dns.yandex.net/dns-query"
+    "+.ru,+.xn--p1ai,+.by,+.su": "https://common.dot.dns.yandex.net/dns-query"
+
+# --- PC/MOBILE ---
+tun:
+  enable: true
+  stack: mixed
+  auto-route: true
+  auto-detect-interface: true
+  dns-hijack:
+    - any:53
+# --- PC/MOBILE ---
+
+proxies:
+
+proxy-groups:
+  - name: '🌍 VPN'
+    type: select
+    proxies:
+      - '🖥️ Мои сервера'
+      - '🏠 Без VPN'
+
+  - name: '🖥️ Мои сервера'
+    type: select
+    include-all-proxies: true
+
+  - name: '🇷🇺 RU сайты'
+    type: select
+    proxies: [ '🏠 Без VPN', '🌍 VPN' ]
+    icon: "https://www.svgrepo.com/show/508628/flag-ru.svg"
+
+  - name: '✨ AI'
+    type: select
+    proxies: [ '🖥️ Мои сервера', '🌍 VPN' ]
+
+# --- PC ---
+  - name: '🧲 Torrent клиенты'
+    type: select
+    proxies: [ '🏠 Без VPN', '🌍 VPN' ]
+    icon: "https://www.svgrepo.com/show/443524/brand-utorrent.svg"
+
+  - name: '🎮 Игры'
+    type: select
+    proxies: [ '🏠 Без VPN', '🌍 VPN' ]
+    icon: "https://www.svgrepo.com/show/491983/game-card.svg"
+# --- PC ---
+
+  - name: '🟥 Youtube'
+    type: select
+    proxies: [ '🌍 VPN', '🏠 Без VPN' ]
+    icon: "https://www.svgrepo.com/show/475700/youtube-color.svg"
+
+  - name: '🌐 Остальной трафик'
+    type: select
+    proxies: [ '🏠 Без VPN', '🌍 VPN' ]
+    icon: "https://www.svgrepo.com/show/293111/maps-and-flags-global.svg"
+
+  # Скрытые
+  - name: '🚫 Все заблокированное'
+    type: select
+    hidden: true
+    proxies: [ '🌍 VPN' ]
+    icon: "https://www.svgrepo.com/show/422669/block-stop-pause.svg"
+
+  - name: '🛑 Блокировка рекламы'
+    type: select
+    hidden: true
+    proxies: [ REJECT ]
+    icon: "https://www.svgrepo.com/show/300290/sign-roadblock.svg"
+
+  - name: '🏠 Без VPN'
+    type: select
+    hidden: true
+    proxies:
+      - DIRECT
+
+  # Скачивание списков правил: сначала напрямую, при неудаче через VPN.
+  # Проверка — по raw.githubusercontent.com: туда github.com/…/raw/… переадресует
+  # почти все списки (Telegram качается сразу через VPN).
+  - name: '📥 Загрузки'
+    type: fallback
+    hidden: true
+    proxies: [ '🏠 Без VPN', '🌍 VPN' ]
+    url: https://raw.githubusercontent.com/legiz-ru/mihomo-rule-sets/main/other/games-direct.yaml
+    interval: 300
+    lazy: false
+
+  - name: GLOBAL
+    type: select
+    hidden: true
+    proxies:
+      - '🌍 VPN'
+      - '🖥️ Мои сервера'
+      - '🇷🇺 RU сайты'
+      - '✨ AI'
+# --- PC ---
+      - '🧲 Torrent клиенты'
+      - '🎮 Игры'
+# --- PC ---
+      - '🟥 Youtube'
+      - '🌐 Остальной трафик'
+      - '🛑 Блокировка рекламы'
+      - DIRECT
+
+# Заготовки для списков правил (YAML-якоря); mihomo этот ключ не использует
+anchors:
+  domain: &domain { type: http, behavior: domain, format: mrs, interval: 86400, proxy: '📥 Загрузки' }
+  ip: &ip { type: http, behavior: ipcidr, format: mrs, interval: 86400, proxy: '📥 Загрузки' }
+  iptxt: &iptxt { type: http, behavior: ipcidr, format: text, interval: 86400, proxy: '📥 Загрузки' }
+  classical: &classical { type: http, behavior: classical, format: yaml, interval: 86400, proxy: '📥 Загрузки' }
+
+rule-providers:
+  # Реклама
+  hagezi_pro:
+    <<: *domain
+    url: "https://github.com/zxc-rv/ad-filter/releases/latest/download/adlist.mrs"
+    path: ./rules/adlist.mrs
+
+  # Бандл из заблокированного РКН + зарубежные сервисы, блокирующие доступ из РФ
+  bundle_domain_blocklist:
+    <<: *domain
+    url: "https://github.com/legiz-ru/mihomo-rule-sets/raw/main/ru-bundle/rule.mrs"
+    path: ./rules/ru-bundle.mrs
+
+  # Сервисы, заблокированные РКН
+  re_filter_domain_blocklist:
+    <<: *domain
+    url: "https://github.com/legiz-ru/mihomo-rule-sets/raw/main/re-filter/domain-rule.mrs"
+    path: ./rules/domain-rule.mrs
+
+  # Сервисы, заблокированные РКН
+  re_filter_ip_blocklist:
+    <<: *ip
+    url: "https://github.com/legiz-ru/mihomo-rule-sets/raw/main/re-filter/ip-rule.mrs"
+    path: ./rules/ip-rule.mrs
+
+  # Дополнительный список блокнутых сервисов в РФ
+  custom_domain_blocklist:
+    type: inline
+    behavior: classical
+    payload:
+      - GEOSITE,telegram
+      - GEOSITE,instagram
+      - GEOSITE,twitter
+      - GEOSITE,facebook
+      - GEOSITE,kinopub
+      - GEOSITE,reddit
+      - GEOSITE,digitalocean
+      - GEOSITE,amazon
+      - GEOSITE,whatsapp
+      - GEOSITE,tiktok
+      - GEOSITE,rutracker
+      - GEOSITE,viber
+      - GEOSITE,category-porn
+      - GEOSITE,cloudflare
+
+  # Дополнительный список блокнутых сервисов в РФ
+  custom_ip_blocklist:
+    type: inline
+    behavior: classical
+    payload:
+      - GEOIP,cloudflare
+      - GEOIP,fastly
+      - GEOIP,telegram
+
+      # ZeroTier: порт + корневые серверы (planet из node/Topology.cpp, ZeroTierOne 1.16.2)
+      - SRC-PORT,9993
+      - DST-PORT,9993
+      - IP-CIDR,104.194.8.134/32
+      - IP-CIDR,103.195.103.66/32
+      - IP-CIDR,50.7.252.138/32
+      - IP-CIDR,84.17.53.155/32
+      - IP-CIDR6,2605:9880:200:1200:30:571:e34:51/128
+      - IP-CIDR6,2605:9880:400:c3:254:f2bc:a1f7:19/128
+      - IP-CIDR6,2001:49f0:d0db:2::2/128
+      - IP-CIDR6,2a02:6ea0:d405::9993/128
+
+  # Российские сервисы
+  ru_ip_whitelist:
+    <<: *iptxt
+    url: "https://github.com/hxehex/russia-mobile-internet-whitelist/raw/refs/heads/main/cidrwhitelist.txt"
+    path: ./rules/cidrwhitelist.txt
+
+  ru_whitelist:
+    type: inline
+    behavior: classical
+    payload:
+      - GEOSITE,category-ru
+      - GEOSITE,category-game-platforms-download
+      - GEOSITE,mailru
+      - GEOSITE,wildberries
+      - GEOSITE,vk
+      - GEOSITE,ozon
+      - GEOSITE,avito
+      - GEOSITE,dzen
+
+  # Российские приложения (android only)
+  ru_apps_whitelist:
+    <<: *classical
+    url: "https://github.com/legiz-ru/mihomo-rule-sets/raw/main/other/ru-app-list.yaml"
+    path: ./rules/ru-app-list.yaml
+
+  discord-voice-ips:
+    <<: *ip
+    url: "https://github.com/legiz-ru/mihomo-rule-sets/raw/main/other/discord-voice-ip-list.mrs"
+    path: ./rules/discord-voice-ips.mrs
+
+# --- PC ---
+  # Игры (windows only)
+  game-clients:
+    <<: *classical
+    url: "https://github.com/legiz-ru/mihomo-rule-sets/raw/main/other/games-direct.yaml"
+    path: ./rules/games-direct.yaml
+
+  # Торрент-клиенты (windows only)
+  torrent-clients:
+    <<: *classical
+    url: "https://github.com/legiz-ru/mihomo-rule-sets/raw/main/other/torrent-clients.yaml"
+    path: ./rules/torrent-clients.yaml
+# --- PC ---
+
+  # QUIC (UDP 443) НЕ в Россию
+  quic:
+    type: inline
+    behavior: classical
+    payload:
+      - AND,((NETWORK,UDP),(DST-PORT,443),(NOT,((GEOIP,RU))))
+
+  # HTTP
+  http:
+    type: inline
+    behavior: classical
+    payload:
+      - AND,((NETWORK,TCP),(DST-PORT,80))
+      - AND,((NETWORK,TCP),(DST-PORT,443))
+
+  # Список AI сервисов (глобальные + китайские)
+  ai_services:
+    type: inline
+    behavior: classical
+    payload:
+      - GEOSITE,category-ai-!cn
+      - GEOSITE,category-ai-cn
+      - DOMAIN-SUFFIX,cometapi.com
+
+  # Официальные подсети Telegram
+  telegram_ips:
+    <<: *iptxt
+    url: "https://core.telegram.org/resources/cidr.txt"
+    path: ./rules/telegram_cidr.txt
+    proxy: '🌍 VPN'
+
+  # Чекеры IP встроенные в клиент FlClash
+  ip-check-domains:
+    type: inline
+    behavior: domain
+    payload:
+      - ipwho.is
+      - api.myip.com
+      - ipapi.co
+      - +.ident.me
+      - +.ip-api.com
+      - api.ip.sb
+      - +.ipinfo.io
+
+rules:
+  # Системные правила
+  - GEOIP,private,DIRECT,no-resolve
+  - GEOSITE,private,DIRECT
+  - RULE-SET,quic,REJECT
+
+  # Блокировка рекламы
+  - RULE-SET,hagezi_pro,🛑 Блокировка рекламы
+
+  # Youtube
+  - GEOSITE,youtube,🟥 Youtube
+
+  # AI
+  - RULE-SET,ai_services,✨ AI
+
+  # Заблокированное
+  - RULE-SET,bundle_domain_blocklist,🚫 Все заблокированное
+  - RULE-SET,re_filter_domain_blocklist,🚫 Все заблокированное
+  - RULE-SET,custom_domain_blocklist,🚫 Все заблокированное
+  - RULE-SET,ip-check-domains,🚫 Все заблокированное
+
+  # Российские домены — до IP-списков
+  - RULE-SET,ru_whitelist,🇷🇺 RU сайты
+# --- MOBILE ---
+#  - RULE-SET,ru_apps_whitelist,🇷🇺 RU сайты
+# --- MOBILE ---
+
+  # Заблокированные IP
+  - RULE-SET,telegram_ips,🚫 Все заблокированное,no-resolve
+  - RULE-SET,re_filter_ip_blocklist,🚫 Все заблокированное
+  - RULE-SET,discord-voice-ips,🚫 Все заблокированное
+  - RULE-SET,custom_ip_blocklist,🚫 Все заблокированное
+
+  # Правила для конкретных сервисов
+  - DOMAIN-SUFFIX,2ip.io,🚫 Все заблокированное
+  - DOMAIN-SUFFIX,rockblack.info,🚫 Все заблокированное
+  - DOMAIN-SUFFIX,cults3d.com,🚫 Все заблокированное
+  - DOMAIN-SUFFIX,rule34video.com,🚫 Все заблокированное
+
+  # Российский трафик
+  - RULE-SET,ru_ip_whitelist,🇷🇺 RU сайты
+  - GEOIP,RU,🇷🇺 RU сайты,no-resolve
+
+# --- PC ---
+  - RULE-SET,game-clients,🎮 Игры
+  - RULE-SET,torrent-clients,🧲 Torrent клиенты
+# --- PC ---
+
+  # Остальные http сайты
+  - RULE-SET,http,🌐 Остальной трафик
+
+  # Все остальное
+  - MATCH,🌐 Остальной трафик

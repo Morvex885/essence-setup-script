@@ -1,0 +1,30 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: ru-RU
+reviews:
+  profile: chill
+  request_changes_workflow: true
+  path_filters:
+    - "!tests/lib/**"
+  auto_review:
+    enabled: true
+    base_branches:
+      - "^develop$"
+  path_instructions:
+    - path: ".github/workflows/**"
+      instructions: |
+        - Клиент выходит бинарниками `essence-rc-<target>.tar.gz|.zip` + `SHA256SUMS` (job `build` в release.yml), их ставит install-essence-rc.sh. Серверного архива нет: исполнитель node-agent/ встроен в бинарник essence-rc.
+        - Job id `test` в tests.yml — обязательная проверка в rulesets protect-main и protect-develop; переименование блокирует мерж.
+        - Минимальные permissions GITHUB_TOKEN; `contents: write` только у job публикации релиза.
+        - Не подставлять `${{ }}`-выражения прямо в `run:`; передавать через `env:`.
+    - path: "install-essence-rc.sh"
+      instructions: |
+        - Имена архивов и target-ы должны совпадать с матрицей job `build` в release.yml; архив проверяется по `SHA256SUMS` до распаковки, при отсутствии записи установка прерывается.
+    - path: "{**/*.sh,tests/helpers/*.bash}"
+      instructions: |
+        - Клиентские скрипты (install-essence-rc.sh, tests/run_tests.sh, tests/helpers/) поддерживают Bash 3.2 (системный bash macOS): без mapfile/readarray, `declare -A`, `${var,,}`/`${var^^}`, `&>>`, `|&`, отрицательных индексов массивов. К исполнителю node-agent/ и common/ (Bash 4+) это правило не относится.
+    - path: "{node-agent/**,common/**}"
+      instructions: |
+        - Серверный исполнитель и его библиотеки: Bash 4+ (Debian/Ubuntu с systemd), кроме node-agent/steps/progress.sh — он совместим с Bash 3.2 (время — `$SECONDS`, без `printf '%(…)T'`); без вопросов и чтения stdin; `error` из common.sh не вызывать; управляемые файлы и бинарник mihomo меняются только в транзакции (от этапа `config` до записи `committed`), необратимое — только в `cleanup_committed`.
+    - path: "tests/unit/{node_agent,telegram}.bats"
+      instructions: |
+        - Тесты исполнителя: Bash 4+ и только Linux; на других системах их пропускает `require_executor_env` из tests/helpers/test_helper.bash с сообщением, а не проваливает.

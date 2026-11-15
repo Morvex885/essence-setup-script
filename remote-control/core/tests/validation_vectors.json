@@ -1,0 +1,40 @@
+{
+  "_comment": "Общие векторы проверок ввода: ядро (validation.rs), меню (tui/src/nodes.rs) и веб-панель (profiles-model.js) проверяют их в своих тестах. Правило меняется здесь и во всех трёх копиях.",
+  "names": {
+    "valid": ["-", "_", "a1._-b", "edge-full", "vps-1", "A.B"],
+    "invalid": ["", ".", "..", "my client", "клиент", "x\n", "../x", "x;id", "édge"]
+  },
+  "suggestions": [
+    { "value": "VLESS TCP HY2", "taken": [], "suggestion": "vless-tcp-hy2" },
+    { "value": "Мой сервер №1", "taken": [], "suggestion": "moy-server-1" },
+    { "value": "  edge//full  ", "taken": [], "suggestion": "edge-full" },
+    { "value": "Щука.ru", "taken": [], "suggestion": "shchuka.ru" },
+    { "value": "Київ", "taken": [], "suggestion": "kiyiv" },
+    { "value": "Єдина ґанок", "taken": [], "suggestion": "yedina-ganok" },
+    { "value": "Мінск ўсход", "taken": [], "suggestion": "minsk-uskhod" },
+    { "value": "İzmir", "taken": [], "suggestion": "izmir" },
+    { "value": "Zürich Straße", "taken": [], "suggestion": "zurich-strasse" },
+    { "value": "Łódź", "taken": [], "suggestion": "lodz" },
+    { "value": "São Paulo", "taken": [], "suggestion": "sao-paulo" },
+    { "value": "VLESS TCP", "taken": ["vless-tcp"], "suggestion": "vless-tcp-2" },
+    { "value": "VLESS TCP", "taken": ["vless-tcp", "vless-tcp-2"], "suggestion": "vless-tcp-3" },
+    { "value": "..", "taken": [], "suggestion": null },
+    { "value": "!!!", "taken": [], "suggestion": null }
+  ],
+  "domains": {
+    "valid": ["node.example.com", "a.b", "xn--80a.example", "a-b.example.com"],
+    "invalid": ["", "nodot", "-a.example.com", "a-.example.com", "a..b", "a_b.example.com", "https://a.example.com", "a.example.com/"]
+  },
+  "ports": {
+    "valid": ["1", "22", "080", "443", "65535", "00001"],
+    "invalid": ["", "0", "00000", "000080", "65536", "70000", "-1", "1.5", "x"]
+  },
+  "emails": {
+    "valid": ["admin@example.com", "a.b+c@sub.example.org", "user12345678@abcdef.com"],
+    "invalid": ["", "admin", "admin@localhost", "@example.com", "a@b..c", "a b@example.com"]
+  },
+  "versions": {
+    "valid": ["v1.19.18", "v1.19.20", "v1.20.0", "v2.0.0"],
+    "invalid": ["", "1.19.20", "v1.19", "v1.19.17", "v0.99.99", "latest", "v1.19.18.1"]
+  }
+}

@@ -1,0 +1,19 @@
+[package]
+name = "essence-rc-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+axum.workspace = true
+hex.workspace = true
+hyper-util.workspace = true
+include_dir.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+zeroize.workspace = true

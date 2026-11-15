@@ -1,0 +1,1962 @@
+//! Clients, groups/templates, generation and subscriptions: daemon-only screens
+//! (v1 `tui/clients.sh` plus the share bundle of `tui/client.sh`).
+//!
+//! Deliberate v1 fixes: the TTL is a cancellable menu (12h/30d/2w, keep/none,
+//! or a custom value) instead of free text; a built-in template shows no
+//! `null` path; EOF while answering a question cancels only that action;
+//! editor changes are imported through the same frozen-plan confirmation as
+//! file imports (v1 passed a blind `--yes`); read failures of a screen offer
+//! an explicit retry. Partial results are read from `error` (the daemon sends
+//! no `data` with a failure). Template files are read and written here; the
+//! daemon gets file contents as request input and never sees a local path.
+use std::{env, fs, io::{self, Write}, path::{Path, PathBuf}, process::{Command, Stdio}};
+use ratatui::{style::Style, text::{Line, Span}};
+use serde_json::Value;
+use unicode_width::UnicodeWidthStr;
+use essence_rc_client::{argv, files::{self, InputFileError}, Input, Reply, Secrets};
+use crate::{app::{Context, Navigation, Screen}, confirm::run_confirmed_with, ui::{self, Item, View}};
+
+pub struct Clients;
+pub struct Groups;
+pub struct Templates;
+pub struct Generate;
+pub struct Subscriptions;
+impl Screen for Clients { fn run(&mut self, ctx: &mut Context<'_>) -> io::Result<Navigation> { clients(ctx)?; Ok(Navigation::Back) } }
+impl Screen for Groups { fn run(&mut self, ctx: &mut Context<'_>) -> io::Result<Navigation> { groups(ctx)?; Ok(Navigation::Back) } }
+impl Screen for Templates { fn run(&mut self, ctx: &mut Context<'_>) -> io::Result<Navigation> { templates(ctx)?; Ok(Navigation::Back) } }
+impl Screen for Generate { fn run(&mut self, ctx: &mut Context<'_>) -> io::Result<Navigation> { generation(ctx)?; Ok(Navigation::Back) } }
+impl Screen for Subscriptions { fn run(&mut self, ctx: &mut Context<'_>) -> io::Result<Navigation> { subscriptions(ctx)?; Ok(Navigation::Back) } }
+
+// ─── Shared helpers ──────────────────────────────────────────────────────────
+
+/// Empty multi-select state of this module's toggles.
+const EMPTY: &str = "Нет вариантов для выбора";
+fn text(v: &Value) -> &str { v.as_str().unwrap_or("—") }
+fn scalar(v: &Value) -> String {
+    match v { Value::String(s) => s.clone(), Value::Null => "—".into(), other => other.to_string() }
+}
+fn rows(v: &Value) -> &[Value] { v.as_array().map(Vec::as_slice).unwrap_or_default() }
+fn names(v: &Value) -> Vec<String> { rows(v).iter().filter_map(|r| r["name"].as_str().map(str::to_owned)).collect() }
+fn strings(v: &Value) -> Vec<String> { rows(v).iter().filter_map(|r| r.as_str().map(str::to_owned)).collect() }
+fn joined(v: &Value) -> String { let items = strings(v); if items.is_empty() { "нет".into() } else { items.join(", ") } }
+fn find_row(data: &Value, name: &str) -> Option<Value> { rows(data).iter().find(|r| r["name"] == name).cloned() }
+fn index(input: &str, count: usize) -> Option<usize> {
+    if input.is_empty() || input.starts_with('0') || !input.bytes().all(|b| b.is_ascii_digit()) { return None; }
+    input.parse::<usize>().ok().filter(|n| *n > 0 && *n <= count).map(|n| n - 1)
+}
+fn back() -> Item { Item::new(0, "Назад", ui::NC) }
+fn colored(label: &str, color: ratatui::style::Color, rest: &str) -> Line<'static> {
+    Line::from(vec![Span::styled(label.to_owned(), Style::default().fg(color)), Span::raw(rest.to_owned())])
+}
+/// One question; `None` on EOF (cancels the action, not the screen).
+fn ask(ctx: &mut Context<'_>, title: &str) -> io::Result<Option<String>> {
+    let mut view = View::new(title);
+    view.prompt = format!("{title}: ");
+    ctx.choose(&view)
+}
+fn required(ctx: &mut Context<'_>, title: &str, missing: &str) -> io::Result<Option<String>> {
+    let answer = ask(ctx, title)?;
+    if answer.as_deref() == Some("") { ctx.ui.notice(ui::warn(missing)); return Ok(None); }
+    Ok(answer)
+}
+/// Read-only frame: kept until Enter/0/EOF, without pseudo-hotkeys.
+pub(crate) fn present(ctx: &mut Context<'_>, view: &View) -> io::Result<()> {
+    let mut view = view.clone();
+    view.prompt = "Enter — продолжить: ".into();
+    loop {
+        match ctx.choose(&view)?.as_deref() {
+            None | Some("") | Some("0") => return Ok(()),
+            _ => ctx.invalid(),
+        }
+    }
+}
+/// A command of an action; a failure warns. After a change of clients or
+/// connections nodes may wait for `node apply` — the shared offer follows.
+fn execute(ctx: &mut Context<'_>, words: &[&str]) -> io::Result<Reply> {
+    let reply = ctx.call(words)?;
+    if !reply.ok { ctx.failed(); } else if crate::nodes::offers_apply(words) { crate::nodes::offer_apply(ctx)?; }
+    Ok(reply)
+}
+fn confirmed(ctx: &mut Context<'_>, title: &str, question: &str, words: &[&str]) -> io::Result<Reply> {
+    confirmed_with(ctx, title, question, words, &Input::default())
+}
+fn confirmed_with(ctx: &mut Context<'_>, title: &str, question: &str, words: &[&str], input: &Input) -> io::Result<Reply> {
+    let reply = run_confirmed_with(ctx, title, question, &argv(words), &Secrets::default(), input)?;
+    if !reply.ok && !matches!(reply.code(), "confirmation_required" | "plan_changed") { ctx.failed(); }
+    if reply.ok && crate::nodes::offers_apply(words) { crate::nodes::offer_apply(ctx)?; }
+    Ok(reply)
+}
+/// One-shot read inside an action: a failure warns and ends the action.
+fn fetch(ctx: &mut Context<'_>, words: &[&str]) -> io::Result<Option<Value>> {
+    let reply = execute(ctx, words)?;
+    Ok(reply.ok.then_some(reply.data))
+}
+/// Screen read: `not_found` leaves the screen; other failures offer a retry.
+fn load(ctx: &mut Context<'_>, title: &str, words: &[&str]) -> io::Result<Option<Value>> {
+    loop {
+        let reply = ctx.call(words)?;
+        if reply.ok { return Ok(Some(reply.data)); }
+        if reply.code() == "not_found" { return Ok(None); }
+        ctx.failed();
+        let mut view = View::menu(title, vec![Item::new('r', "Повторить", ui::YELLOW), back()]);
+        view.context.push(ui::text("Данные недоступны", ui::YELLOW));
+        loop {
+            match ctx.choose(&view)?.map(|s| s.to_ascii_lowercase()).as_deref() {
+                None | Some("0") => return Ok(None),
+                Some("r") => break,
+                _ => ctx.invalid(),
+            }
+        }
+    }
+}
+fn node_label(row: &Value) -> String { format!("{}  {}:{}", text(&row["name"]), text(&row["ip"]), scalar(&row["port"])) }
+/// v1 `tui_pick_node|client|group`: the name of the chosen row.
+fn pick(ctx: &mut Context<'_>, kind: &str, title: &str) -> io::Result<Option<String>> {
+    let Some(data) = fetch(ctx, &[kind, "list"])? else { return Ok(None); };
+    let labels: Vec<_> = rows(&data).iter().map(|r| if kind == "node" { node_label(r) } else { text(&r["name"]).to_owned() }).collect();
+    Ok(ctx.select(title, &labels)?.map(|n| text(&data[n]["name"]).to_owned()))
+}
+/// Numbered list section (or a DIM empty line), then the actions.
+fn list_view(title: &str, labels: &[String], empty: &str, actions: Vec<Item>) -> View {
+    let mut view = View::menu(title, actions);
+    if labels.is_empty() { view.context.push(ui::text(empty, ui::DIM)); }
+    else { view.sections.insert(0, labels.iter().enumerate().map(|(i, s)| Item::new(i + 1, s, ui::CYAN)).collect()); }
+    view
+}
+/// A node command retried only after the shared node-code handler fixed it.
+fn node_request(ctx: &mut Context<'_>, node: &str, words: &[&str]) -> io::Result<Option<Value>> {
+    loop {
+        let reply = ctx.call(words)?;
+        if reply.ok { return Ok(Some(reply.data)); }
+        if crate::nodes::handle_node_codes(ctx, &reply, node)? { continue; }
+        ctx.failed();
+        return Ok(None);
+    }
+}
+/// Proxies of a node for a form: `conn list --name N --discover` over SSH;
+/// a node that cannot be read (reported) falls back to its saved
+/// assignments (`conn list --name N`, local) — enough to remove one —
+/// with `None` discovered (nothing is marked «not found»). `None` — neither
+/// read.
+fn node_connections(ctx: &mut Context<'_>, node: &str) -> io::Result<Option<(Value, Option<Vec<String>>)>> {
+    if let Some(found) = node_request(ctx, node, &["conn", "list", "--name", node, "--discover"])? {
+        let discovered = strings(&found[0]["discovered"]);
+        return Ok(Some((found, Some(discovered))));
+    }
+    let Some(saved) = fetch(ctx, &["conn", "list", "--name", node])? else { return Ok(None); };
+    ctx.ui.notice(ui::warn(format!("Нода {node} не проверена: показаны сохранённые назначения.")));
+    Ok(Some((saved, None)))
+}
+/// Result frame: empty fields are omitted; failures YELLOW.
+fn summary(ctx: &mut Context<'_>, title: &str, data: &Value, fields: &[(&str, &str)], empty: &str) -> io::Result<()> {
+    let mut view = View::new(title);
+    for (field, label) in fields {
+        let value = match &data[*field] {
+            Value::Array(_) => strings(&data[*field]).join(", "),
+            Value::String(s) => s.clone(),
+            Value::Number(n) if n.as_u64() != Some(0) => n.to_string(),
+            _ => String::new(),
+        };
+        if value.is_empty() { continue; }
+        let color = if field.contains("failed") { ui::YELLOW } else { ui::NC };
+        view.context.push(ui::text(format!("{label}: {value}"), color));
+    }
+    if view.context.is_empty() { view.context.push(ui::text(empty, ui::DIM)); }
+    present(ctx, &view)
+}
+/// `generate …`; the summary is shown on success and on `partial` (whose
+/// fields arrive in `error`).
+fn generate(ctx: &mut Context<'_>, scope: &[&str]) -> io::Result<()> {
+    let mut words = vec!["generate"];
+    words.extend_from_slice(scope);
+    let reply = ctx.call(&words)?;
+    let data = if reply.ok { &reply.data } else if reply.code() == "partial" { &reply.error } else { ctx.failed(); return Ok(()); };
+    summary(ctx, "Итог генерации", data,
+        &[("ok", "Готово"), ("skipped", "Пропущено"), ("failed", "Ошибки"), ("nodes_failed", "Ноды с ошибкой"),
+          ("nodes_pending", "Ноды с неприменёнными изменениями"), ("dir", "Каталог")],
+        "Нет результатов")?;
+    // Nodes with changes not applied yet — the same offer to apply.
+    if !strings(&data["nodes_pending"]).is_empty() { crate::nodes::offer_apply(ctx)?; }
+    Ok(())
+}
+
+// ─── Clients ─────────────────────────────────────────────────────────────────
+
+fn clients(ctx: &mut Context<'_>) -> io::Result<()> {
+    loop {
+        let Some(data) = load(ctx, "Клиенты", &["client", "list"])? else { return Ok(()); };
+        let list = names(&data);
+        let labels: Vec<String> = rows(&data).iter().map(|r| format!("{}  ({})", text(&r["name"]), text(&r["group"]))).collect();
+        let view = list_view("Клиенты", &labels, "Нет клиентов",
+            vec![Item::new('a', "Добавить клиента", ui::GREEN), Item::new('d', "Удалить клиентов", ui::RED), back()]);
+        let Some(choice) = ctx.choose(&view)? else { return Ok(()); };
+        match choice.to_ascii_lowercase().as_str() {
+            "0" => return Ok(()),
+            "a" => if let Some(name) = required(ctx, "Имя клиента", "Имя клиента не указано.")? {
+                if let Some(group) = pick(ctx, "group", "Группа клиента")? {
+                    execute(ctx, &["client", "add", "--name", &name, "--group", &group])?;
+                }
+            },
+            "d" => delete_clients(ctx, &list)?,
+            _ => match index(&choice, list.len()) { Some(i) => client_card(ctx, list[i].clone())?, None => ctx.invalid() },
+        }
+    }
+}
+/// Toggle flags of `selected` among `len` items: a failed command reopens
+/// its toggle with the user's choice.
+fn checked(len: usize, selected: &[usize]) -> Vec<bool> { (0..len).map(|i| selected.contains(&i)).collect() }
+fn delete_clients(ctx: &mut Context<'_>, targets: &[String]) -> io::Result<()> {
+    let mut flags = vec![false; targets.len()];
+    loop {
+        let Some(selected) = ctx.toggle("Удаление клиентов", targets, flags, EMPTY)? else { return Ok(()); };
+        if selected.is_empty() { ctx.ui.notice(ui::warn("Ничего не выбрано.")); return Ok(()); }
+        let mut words = vec!["client", "delete"];
+        for &i in &selected { words.extend(["--name", targets[i].as_str()]); }
+        let reply = confirmed(ctx, "Удаление клиентов", "Удалить выбранных клиентов?", &words)?;
+        // `partial` deleted some: the list is re-read.
+        if !crate::confirm::retryable(&reply) { return Ok(()); }
+        flags = checked(targets.len(), &selected);
+    }
+}
+fn subscription_state(row: &Value) -> String {
+    let sub = &row["subscription"];
+    if sub["published"] != true { "нет".into() }
+    else if let Some(expires) = sub["expires_at"].as_str().filter(|s| !s.is_empty()) { format!("опубликована до {expires}") }
+    else { "опубликована, без срока".into() }
+}
+/// v1 `tui_client_card`: reads `client list` (no credentials) each redraw.
+fn client_card(ctx: &mut Context<'_>, mut name: String) -> io::Result<()> {
+    loop {
+        let Some(data) = load(ctx, "Клиент", &["client", "list"])? else { return Ok(()); };
+        let Some(row) = find_row(&data, &name) else {
+            ctx.ui.notice(ui::warn(format!("Клиент «{name}» не найден.")));
+            return Ok(());
+        };
+        let inherit = row["inherit_nodes"] != false;
+        let mut view = View::menu(format!("Клиент: {name}"),
+            vec![Item::new('v', "Показать данные подключения", ui::CYAN), Item::new('s', "Подписка", ui::CYAN), Item::new('a', "Конфиг AmneziaWG", ui::CYAN)]);
+        view.context = vec![
+            ui::text(format!("Группа: {}", text(&row["group"])), ui::NC),
+            ui::text(format!("Ноды: {} ({})", if inherit { "от группы" } else { "свои" }, joined(&row["nodes"])), ui::NC),
+            ui::text(format!("Подписка: {}", subscription_state(&row)), ui::NC),
+        ];
+        view.sections.push(vec![
+            Item::new('f', "Сгенерировать конфиг", ui::YELLOW), Item::new('n', "Ноды клиента", ui::YELLOW),
+            Item::new('p', "Подключения по нодам", ui::YELLOW), Item::new('g', "Сменить группу", ui::YELLOW),
+            Item::new('r', "Переименовать", ui::YELLOW), Item::new('d', "Удалить клиента", ui::RED), back(),
+        ]);
+        let Some(choice) = ctx.choose(&view)? else { return Ok(()); };
+        match choice.to_ascii_lowercase().as_str() {
+            "0" => return Ok(()),
+            "v" => show_client(ctx, &name)?,
+            "s" => client_subscription(ctx, &name)?,
+            "a" => awg_config(ctx, &name)?,
+            "f" => generate(ctx, &["--client", &name])?,
+            "n" => client_nodes(ctx, &name, inherit, &strings(&row["nodes"]))?,
+            "p" => if inherit { ctx.ui.notice(ui::warn("Подключения настраиваются только для клиента со своими нодами.")); }
+                else { client_connections(ctx, &name, &strings(&row["nodes"]))?; },
+            "g" => if let Some(group) = pick(ctx, "group", "Новая группа клиента")? {
+                confirmed(ctx, "Смена группы клиента", "Сменить группу?", &["client", "set-group", "--name", &name, "--group", &group])?;
+            },
+            "r" => if let Some(new) = required(ctx, "Новое имя клиента", "Имя клиента не указано.")? {
+                let reply = confirmed(ctx, "Переименование клиента", "Переименовать клиента?", &["client", "rename", "--name", &name, "--new-name", &new])?;
+                let renamed = if reply.ok { reply.data["name"].as_str() } else if reply.code() == "partial" { reply.error["name"].as_str() } else { None };
+                if let Some(renamed) = renamed { name = renamed.to_owned(); }
+            },
+            "d" => {
+                let reply = confirmed(ctx, "Удаление клиента", "Удалить клиента?", &["client", "delete", "--name", &name])?;
+                if reply.ok || (reply.code() == "partial" && strings(&reply.error["deleted"]).contains(&name)) { return Ok(()); }
+            },
+            _ => ctx.invalid(),
+        }
+    }
+}
+/// Explicit request: credentials are shown here and only here.
+fn show_client(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
+    let Some(data) = fetch(ctx, &["client", "show", "--name", name])? else { return Ok(()); };
+    let mut view = View::new(format!("Данные клиента: {name}"));
+    let subscription = &data["subscription"];
+    let link = if subscription.is_null() { "нет" } else { subscription["url"].as_str().unwrap_or("ссылка недоступна") };
+    for line in [
+        format!("Группа: {}", text(&data["group"])),
+        format!("Ноды: {}", joined(&data["nodes"])),
+        format!("VLESS UUID: {}", text(&data["credentials"]["vless_uuid"])),
+        format!("Hysteria2 пароль: {}", text(&data["credentials"]["hy2_password"])),
+        format!("Конфиг: {} ({})", text(&data["config"]["path"]), if data["config"]["exists"] == true { "создан" } else { "не создан" }),
+        format!("Подписка: {link}"),
+    ] { view.context.push(ui::text(line, ui::NC)); }
+    if !rows(&data["connections"]).is_empty() {
+        view.context.push(ui::text("Подключения по нодам:", ui::CYAN));
+        for row in rows(&data["connections"]) {
+            let mode = if row["mode"] == "own" { "свои" } else { "от группы" };
+            view.context.push(ui::text(format!("  {} ({mode}): {}", text(&row["node"]), joined(&row["proxies"])), ui::NC));
+        }
+    }
+    present(ctx, &view)
+}
+/// «Конфиг AmneziaWG»: a node from `client show .awg_nodes` (the core's peer
+/// rule) → `client awg-config` → a local file (default `<client>-<node>.conf`).
+/// The config holds secrets: it goes only to the file.
+fn awg_config(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
+    let Some(data) = fetch(ctx, &["client", "show", "--name", name])? else { return Ok(()); };
+    let available = strings(&data["awg_nodes"]);
+    if available.is_empty() { ctx.ui.notice(ui::warn("У клиента нет нод с AmneziaWG.")); return Ok(()); }
+    let Some(i) = ctx.select(&format!("Конфиг AmneziaWG: {name}"), &available)? else { return Ok(()); };
+    let node = available[i].clone();
+    let default = format!("{name}-{node}.conf");
+    let Some(path) = ask(ctx, &format!("Путь к файлу (Enter — {default})"))? else { return Ok(()); };
+    let path = expand_home(if path.is_empty() { &default } else { &path });
+    let Some(data) = fetch(ctx, &["client", "awg-config", "--name", name, "--node", &node])? else { return Ok(()); };
+    let Some(config) = data["config"].as_str() else { ctx.failed(); return Ok(()); };
+    save_file(ctx, "Конфиг AmneziaWG", &path, config, &format!("конфигом AmneziaWG {name} ({node})"), &format!("Конфиг AmneziaWG {name} ({node})"))
+}
+fn client_nodes(ctx: &mut Context<'_>, name: &str, inherit: bool, current: &[String]) -> io::Result<()> {
+    let (state, choices) = if inherit { ("от группы", vec!["Назначить свои ноды".to_owned()]) }
+        else { ("свои", vec!["Изменить свои ноды".to_owned(), "Вернуть ноды от группы".to_owned()]) };
+    let Some(choice) = ctx.select(&format!("Ноды клиента: {name} (сейчас {state})"), &choices)? else { return Ok(()); };
+    if choice == 1 {
+        confirmed(ctx, "Ноды клиента", "Вернуть ноды от группы?", &["client", "nodes", "--name", name, "--inherit"])?;
+        return Ok(());
+    }
+    let Some(data) = fetch(ctx, &["node", "list"])? else { return Ok(()); };
+    let targets = names(&data);
+    let labels: Vec<String> = rows(&data).iter().map(node_label).collect();
+    // The current (effective) nodes are the starting state, like v1.
+    let mut flags = targets.iter().map(|n| current.contains(n)).collect();
+    loop {
+        let Some(selected) = ctx.toggle(&format!("Свои ноды клиента: {name}"), &labels, flags, EMPTY)? else { return Ok(()); };
+        if selected.is_empty() { ctx.ui.notice(ui::warn("Ничего не выбрано.")); return Ok(()); }
+        let mut words = vec!["client", "nodes", "--name", name];
+        for &i in &selected { words.extend(["--node", targets[i].as_str()]); }
+        if !crate::confirm::retryable(&execute(ctx, &words)?) { return Ok(()); }
+        flags = checked(labels.len(), &selected);
+    }
+}
+fn client_connections(ctx: &mut Context<'_>, name: &str, own: &[String]) -> io::Result<()> {
+    if own.is_empty() { ctx.ui.notice(ui::warn("У клиента нет своих нод.")); return Ok(()); }
+    let Some(data) = fetch(ctx, &["node", "list"])? else { return Ok(()); };
+    let available: Vec<&Value> = own.iter().filter_map(|n| rows(&data).iter().find(|r| r["name"] == n.as_str())).collect();
+    if available.is_empty() { ctx.ui.notice(ui::warn("Назначенные ноды больше недоступны.")); return Ok(()); }
+    let labels: Vec<String> = available.iter().map(|r| node_label(r)).collect();
+    let Some(i) = ctx.select(&format!("Подключения клиента: {name}"), &labels)? else { return Ok(()); };
+    let node = text(&available[i]["name"]).to_owned();
+    let actions = ["Настроить подключения".to_owned(), "Сбросить на групповые".to_owned()];
+    let Some(action) = ctx.select(&format!("Подключения: {name} на {node}"), &actions)? else { return Ok(()); };
+    if action == 1 {
+        confirmed(ctx, "Сброс подключений", "Сбросить подключения ноды?", &["client", "connections", "--name", name, "--node", &node, "--reset"])?;
+        return Ok(());
+    }
+    let Some(assigned) = fetch(ctx, &["client", "connections", "--name", name])? else { return Ok(()); };
+    let current: Vec<String> = rows(&assigned).iter().filter(|r| r["node"] == node.as_str()).flat_map(|r| strings(&r["proxies"])).collect();
+    let Some((_, discovered)) = node_connections(ctx, &node)? else { return Ok(()); };
+    // `client connections` replaces the list: assigned but unreported ones
+    // (AmneziaWG peers `awg-<peer>`, stale) are listed checked to survive.
+    let (extra, stale) = crate::nodes::unlisted(&current, discovered.as_deref());
+    let proxies: Vec<String> = discovered.unwrap_or_default().into_iter().chain(extra).collect();
+    if proxies.is_empty() { ctx.ui.notice(ui::warn(EMPTY)); return Ok(()); }
+    let labels: Vec<String> = proxies.iter().map(|p| crate::nodes::proxy_label(p, &stale)).collect();
+    let mut flags = proxies.iter().map(|p| current.contains(p)).collect();
+    loop {
+        let Some(selected) = ctx.toggle(&format!("Подключения клиента на {node}"), &labels, flags, EMPTY)? else { return Ok(()); };
+        if selected.is_empty() { ctx.ui.notice(ui::warn("Ничего не выбрано.")); return Ok(()); }
+        let mut words = vec!["client", "connections", "--name", name, "--node", &node];
+        for &i in &selected { words.extend(["--proxy", proxies[i].as_str()]); }
+        if !crate::confirm::retryable(&execute(ctx, &words)?) { return Ok(()); }
+        flags = checked(labels.len(), &selected);
+    }
+}
+
+// ─── Client subscription and headers ─────────────────────────────────────────
+
+/// `Some(None)` publishes without `--ttl` (the core keeps a current expiry).
+fn ttl(ctx: &mut Context<'_>, current: Option<&str>) -> io::Result<Option<Option<String>>> {
+    let keep = current.map_or_else(|| "Без срока".to_owned(), |e| format!("Оставить текущий срок (до {e})"));
+    let labels = [keep, "12 часов (12h)".into(), "30 дней (30d)".into(), "2 недели (2w)".into(), "Другой срок".into()];
+    Ok(match ctx.select("Срок действия подписки", &labels)? {
+        None => None,
+        Some(0) => Some(None),
+        Some(1) => Some(Some("12h".into())),
+        Some(2) => Some(Some("30d".into())),
+        Some(3) => Some(Some("2w".into())),
+        Some(_) => required(ctx, "Срок действия (число и h, d или w, например 7d)", "Срок не указан.")?.map(Some),
+    })
+}
+fn client_subscription(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
+    loop {
+        let Some(data) = load(ctx, "Подписка клиента", &["client", "list"])? else { return Ok(()); };
+        let Some(row) = find_row(&data, name) else {
+            ctx.ui.notice(ui::warn(format!("Клиент «{name}» не найден.")));
+            return Ok(());
+        };
+        // An unreadable host does not block the menu; it is not «not set».
+        let host = ctx.call(&["subscription", "host"])?;
+        let host = host.ok.then(|| host.data["node"].as_str().filter(|s| !s.is_empty()).map(str::to_owned));
+        let mut view = View::menu(format!("Подписка клиента: {name}"), vec![
+            Item::new('p', "Опубликовать", ui::GREEN), Item::new('v', "Показать ссылку", ui::CYAN),
+            Item::new('i', "Итоговые заголовки", ui::CYAN), Item::new('h', "Заголовки клиента", ui::YELLOW),
+            Item::new('r', "Сменить токен", ui::RED), Item::new('x', "Отозвать подписку", ui::RED), back(),
+        ]);
+        view.context.push(match &host {
+            Some(Some(node)) => ui::text(format!("Хост подписок: {node}"), ui::NC),
+            Some(None) => ui::text("Хост подписок не задан — раздел s", ui::DIM),
+            None => ui::text("Хост подписок: не удалось прочитать", ui::YELLOW),
+        });
+        view.context.push(ui::text(format!("Подписка: {}", subscription_state(&row)), ui::NC));
+        let Some(choice) = ctx.choose(&view)? else { return Ok(()); };
+        match choice.to_ascii_lowercase().as_str() {
+            "0" => return Ok(()),
+            "p" => {
+                let sub = &row["subscription"];
+                let current = if sub["published"] == true { sub["expires_at"].as_str().filter(|s| !s.is_empty()) } else { None };
+                if let Some(ttl) = ttl(ctx, current)? {
+                    let mut words = vec!["subscription", "publish", "--name", name];
+                    if let Some(ttl) = &ttl { words.extend(["--ttl", ttl.as_str()]); }
+                    // partial: saved, only the HTTP check failed — the link is still needed.
+                    let reply = ctx.call(&words)?;
+                    if reply.ok || reply.code() == "partial" { share(ctx, name)?; } else { ctx.failed(); }
+                }
+            },
+            "v" => share(ctx, name)?,
+            "i" => resolved_headers(ctx, name)?,
+            "h" => headers(ctx, "client", name)?,
+            "r" => {
+                let reply = confirmed(ctx, "Смена токена подписки", "Сменить токен?", &["subscription", "rotate", "--name", name])?;
+                if reply.ok || reply.code() == "partial" { share(ctx, name)?; }
+            },
+            "x" => { confirmed(ctx, "Отзыв подписки", "Отозвать подписку?", &["subscription", "revoke", "--name", name])?; },
+            _ => ctx.invalid(),
+        }
+    }
+}
+/// QR code lines of `url`, which is passed on stdin (never argv); empty when
+/// the program is missing or fails.
+fn qr_lines(command: &mut Command, url: &str) -> Vec<String> {
+    let Ok(mut child) = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn() else { return vec![]; };
+    if let Some(mut stdin) = child.stdin.take() { let _ = stdin.write_all(url.as_bytes()); }
+    match child.wait_with_output() {
+        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout).lines().map(str::to_owned).collect(),
+        _ => vec![],
+    }
+}
+/// v1 `tui_render_share_bundle` from `subscription show`: link, expiry,
+/// headers, curl and JSON lines, then the QR code when available. QR rows are
+/// never wrapped: a code wider than the frame is replaced by a note (the link
+/// is already shown above), never drawn as a broken grid.
+fn share_view(data: &Value, qr: &[String]) -> View {
+    let url = text(&data["url"]);
+    let mut view = View::new(format!("Подписка: {}", text(&data["client"])));
+    view.context.push(colored("URL: ", ui::GREEN, url));
+    if let Some(expires) = data["expires_at"].as_str().filter(|s| !s.is_empty()) {
+        view.context.push(colored("Срок действия: ", ui::YELLOW, expires));
+    }
+    if !rows(&data["headers"]).is_empty() {
+        view.context.push(ui::text("Сервер отдаст эти заголовки:", ui::DIM));
+        for row in rows(&data["headers"]) {
+            view.context.push(ui::text(format!("  {}: {}", text(&row["name"]), text(&row["value"])), ui::NC));
+        }
+    }
+    view.context.push(Line::default());
+    view.context.push(ui::text(format!("curl '{}'", url.replace('\'', "'\\''")), ui::NC));
+    view.context.push(ui::text(serde_json::json!({ "url": url }).to_string(), ui::NC));
+    push_qr(&mut view, qr);
+    view
+}
+/// The QR code of a share link under it: rows are never wrapped; a code
+/// wider than the frame is replaced by a note (the link is shown above).
+pub(crate) fn push_qr(view: &mut View, qr: &[String]) {
+    if qr.is_empty() { return; }
+    view.context.push(Line::default());
+    if qr.iter().all(|line| line.width() <= ui::CONTENT_WIDTH) {
+        view.context.extend(qr.iter().map(|line| Line::raw(line.clone())));
+    } else {
+        view.context.push(ui::text("QR-код не помещается в рамку — используйте ссылку выше.", ui::YELLOW));
+    }
+}
+/// `qrencode -t UTF8` of `url` when installed; empty otherwise.
+pub(crate) fn qr_code(url: &str) -> Vec<String> {
+    if executable("qrencode") { qr_lines(Command::new("qrencode").args(["-t", "UTF8"]), url) } else { vec![] }
+}
+fn share(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
+    let Some(data) = fetch(ctx, &["subscription", "show", "--name", name])? else { return Ok(()); };
+    let qr = data["url"].as_str().map(qr_code).unwrap_or_default();
+    present(ctx, &share_view(&data, &qr))
+}
+fn header_line(row: &Value, with_source: bool) -> Line<'static> {
+    let source = if with_source {
+        let label = match row["source"].as_str() { Some("default") => "по умолчанию", Some("group") => "группа", Some("client") => "клиент", Some(other) => other, None => "—" };
+        format!("  [{label}]")
+    } else { String::new() };
+    ui::text(format!("{}: {}{source}", text(&row["name"]), text(&row["value"])), ui::NC)
+}
+fn header_lines(view: &mut View, data: &Value, with_source: bool) {
+    if rows(data).is_empty() { view.context.push(ui::text("Нет заголовков", ui::DIM)); }
+    view.context.extend(rows(data).iter().map(|row| header_line(row, with_source)));
+}
+fn resolved_headers(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
+    let Some(data) = fetch(ctx, &["subscription", "headers", "--client", name])? else { return Ok(()); };
+    let mut view = View::new(format!("Итоговые заголовки: {name}"));
+    header_lines(&mut view, &data, true);
+    present(ctx, &view)
+}
+/// v1 `tui_headers client|group NAME`: a client deletes only its own headers.
+fn headers(ctx: &mut Context<'_>, kind: &str, name: &str) -> io::Result<()> {
+    let flag = format!("--{kind}");
+    let client = kind == "client";
+    loop {
+        let Some(data) = load(ctx, "Заголовки подписки", &["subscription", "headers", &flag, name])? else { return Ok(()); };
+        let mut view = View::menu(format!("Заголовки подписки: {name}"),
+            vec![Item::new('a', "Установить", ui::YELLOW), Item::new('d', "Удалить", ui::RED), back()]);
+        header_lines(&mut view, &data, client);
+        let Some(choice) = ctx.choose(&view)? else { return Ok(()); };
+        match choice.to_ascii_lowercase().as_str() {
+            "0" => return Ok(()),
+            "a" => {
+                let Some(header) = ask(ctx, "Имя заголовка")? else { continue; };
+                let Some(value) = ask(ctx, "Значение")? else { continue; };
+                if header.is_empty() || value.is_empty() { ctx.ui.notice(ui::warn("Имя и значение заголовка обязательны.")); continue; }
+                execute(ctx, &["subscription", "headers", &flag, name, "--set", &format!("{header}={value}")])?;
+            },
+            "d" => {
+                let own: Vec<String> = rows(&data).iter().filter(|r| !client || r["source"] == "client").map(|r| text(&r["name"]).to_owned()).collect();
+                if let Some(i) = ctx.select("Удаление заголовка", &own)? {
+                    execute(ctx, &["subscription", "headers", &flag, name, "--unset", &own[i]])?;
+                }
+            },
+            _ => ctx.invalid(),
+        }
+    }
+}
+
+// ─── Groups ──────────────────────────────────────────────────────────────────
+
+fn groups(ctx: &mut Context<'_>) -> io::Result<()> {
+    loop {
+        let Some(data) = load(ctx, "Группы", &["group", "list"])? else { return Ok(()); };
+        let list = names(&data);
+        let labels: Vec<String> = rows(&data).iter().map(|r| format!("{}  ({})", text(&r["name"]), text(&r["template"]))).collect();
+        let view = list_view("Группы", &labels, "Нет групп", vec![Item::new('a', "Добавить группу", ui::GREEN), back()]);
+        let Some(choice) = ctx.choose(&view)? else { return Ok(()); };
+        match choice.to_ascii_lowercase().as_str() {
+            "0" => return Ok(()),
+            "a" => if let Some(name) = required(ctx, "Название группы", "Название не указано.")?
+                && let Some(template) = pick_template(ctx, &format!("Шаблон группы {name}"))?
+            {
+                execute(ctx, &["group", "add", "--name", &name, "--template", &template])?;
+            },
+            _ => match index(&choice, list.len()) { Some(i) => group_card(ctx, &list[i])?, None => ctx.invalid() },
+        }
+    }
+}
+fn group_card(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
+    loop {
+        let Some(data) = load(ctx, "Группа", &["group", "list"])? else { return Ok(()); };
+        let Some(row) = find_row(&data, name) else {
+            ctx.ui.notice(ui::warn(format!("Группа «{name}» не найдена.")));
+            return Ok(());
+        };
+        let template = text(&row["template"]).to_owned();
+        let mut view = View::menu(format!("Группа: {name}"), vec![
+            Item::new('t', "Шаблон", ui::YELLOW), Item::new('c', "Подключения нод", ui::YELLOW),
+            Item::new('h', "Заголовки подписки группы", ui::YELLOW),
+            Item::new('f', "Сгенерировать конфиги группы", ui::YELLOW), Item::new('d', "Удалить группу", ui::RED), back(),
+        ]);
+        view.context = vec![
+            ui::text(format!("Шаблон: {template}"), ui::NC),
+            ui::text(format!("Клиентов: {}", scalar(&row["clients"])), ui::NC),
+            ui::text(format!("Ноды: {}", joined(&row["nodes"])), ui::NC),
+        ];
+        let Some(choice) = ctx.choose(&view)? else { return Ok(()); };
+        match choice.to_ascii_lowercase().as_str() {
+            "0" => return Ok(()),
+            "t" => group_template(ctx, name, &template)?,
+            "c" => group_connections(ctx, name)?,
+            "h" => headers(ctx, "group", name)?,
+            "f" => generate(ctx, &["--group", name])?,
+            "d" => if confirmed(ctx, "Удаление группы", "Удалить группу?", &["group", "delete", "--name", name])?.ok { return Ok(()); },
+            _ => ctx.invalid(),
+        }
+    }
+}
+/// The group's proxies on one node (the only node is taken without asking):
+/// a toggle of the node's discovered proxies (and assigned ones no longer
+/// discovered) preselected with the group's; a changed set is sent as one
+/// `conn set --assign G=…` (empty — the assignment is removed).
+fn group_connections(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
+    let Some(data) = fetch(ctx, &["node", "list"])? else { return Ok(()); };
+    let node = match rows(&data) {
+        [] => { ctx.ui.notice(ui::warn("Нет нод.")); return Ok(()); }
+        [only] => text(&only["name"]).to_owned(),
+        nodes => {
+            let labels: Vec<String> = nodes.iter().map(node_label).collect();
+            let Some(i) = ctx.select(&format!("Подключения группы {name}: нода"), &labels)? else { return Ok(()); };
+            text(&nodes[i]["name"]).to_owned()
+        }
+    };
+    let Some((found, discovered)) = node_connections(ctx, &node)? else { return Ok(()); };
+    let current: Vec<String> = rows(&found[0]["groups"]).iter().filter(|g| g["name"] == name).flat_map(|g| strings(&g["proxies"])).collect();
+    let (extra, stale) = crate::nodes::unlisted(&current, discovered.as_deref());
+    let proxies: Vec<String> = discovered.unwrap_or_default().into_iter().chain(extra).collect();
+    let labels: Vec<String> = proxies.iter().map(|p| crate::nodes::proxy_label(p, &stale)).collect();
+    let mut flags = proxies.iter().map(|p| current.contains(p)).collect();
+    loop {
+        let Some(selected) = ctx.toggle(&format!("Подключения группы {name} на {node}"), &labels, flags, EMPTY)? else { return Ok(()); };
+        let chosen: Vec<String> = selected.iter().map(|&i| proxies[i].clone()).collect();
+        if crate::nodes::same_set(&chosen, &current) { ctx.ui.notice(ui::warn("Изменений нет.")); return Ok(()); }
+        let words = crate::nodes::conn_set_argv(&node, &[(name, &chosen)]);
+        let words: Vec<&str> = words.iter().map(String::as_str).collect();
+        if !crate::confirm::retryable(&execute(ctx, &words)?) { return Ok(()); }
+        flags = checked(labels.len(), &selected);
+    }
+}
+fn group_template(ctx: &mut Context<'_>, name: &str, current: &str) -> io::Result<()> {
+    let Some(data) = fetch(ctx, &["template", "list"])? else { return Ok(()); };
+    let mut labels = names(&data);
+    let count = labels.len();
+    labels.push("Создать новый шаблон".into());
+    let Some(i) = ctx.select(&format!("Шаблон группы: {name} (текущий: {current})"), &labels)? else { return Ok(()); };
+    if i < count {
+        execute(ctx, &["group", "set-template", "--name", name, "--template", &labels[i]])?;
+        return Ok(());
+    }
+    let Some(new) = required(ctx, "Имя нового шаблона", "Имя шаблона не указано.")? else { return Ok(()); };
+    let reply = execute(ctx, &["template", "create", "--name", &new, "--group", name])?;
+    if let Some(created) = reply.data["name"].as_str().filter(|_| reply.ok) { edit_template(ctx, created)?; }
+    Ok(())
+}
+
+// ─── Templates ───────────────────────────────────────────────────────────────
+
+/// A template from `template list`, `default.yaml` first; `None` — cancelled
+/// or the list could not be read (already reported).
+fn pick_template(ctx: &mut Context<'_>, title: &str) -> io::Result<Option<String>> {
+    let Some(data) = fetch(ctx, &["template", "list"])? else { return Ok(None); };
+    let mut labels = names(&data);
+    if let Some(i) = labels.iter().position(|name| name == "default.yaml") {
+        let default = labels.remove(i);
+        labels.insert(0, default);
+    }
+    Ok(ctx.select(title, &labels)?.map(|i| labels.swap_remove(i)))
+}
+fn source_label(row: &Value) -> &'static str { if row["source"] == "builtin" { "встроенный" } else { "пользовательский" } }
+fn templates(ctx: &mut Context<'_>) -> io::Result<()> {
+    loop {
+        let Some(data) = load(ctx, "Шаблоны", &["template", "list"])? else { return Ok(()); };
+        let list = names(&data);
+        let labels: Vec<String> = rows(&data).iter().map(|r| format!("{}  ({})", text(&r["name"]), source_label(r))).collect();
+        let view = list_view("Шаблоны", &labels, "Нет шаблонов", vec![Item::new('a', "Создать шаблон", ui::GREEN), back()]);
+        let Some(choice) = ctx.choose(&view)? else { return Ok(()); };
+        match choice.to_ascii_lowercase().as_str() {
+            "0" => return Ok(()),
+            "a" => if let Some(name) = required(ctx, "Имя шаблона", "Имя шаблона не указано.")?
+                && let Some(base) = pick_template(ctx, &format!("Шаблон {name}: на основе"))?
+            {
+                let reply = execute(ctx, &["template", "create", "--name", &name, "--from", &base])?;
+                if let Some(created) = reply.data["name"].as_str().filter(|_| reply.ok) { edit_template(ctx, created)?; }
+            },
+            _ => match index(&choice, list.len()) { Some(i) => template_card(ctx, &list[i])?, None => ctx.invalid() },
+        }
+    }
+}
+/// Only `~` and `~/…` expand (v1); `~user` stays literal.
+pub(crate) fn expand_home(path: &str) -> PathBuf {
+    if let Some(home) = env::var_os("HOME").or_else(|| env::var_os("USERPROFILE")) {
+        if path == "~" { return PathBuf::from(home); }
+        if let Some(suffix) = path.strip_prefix("~/") { return PathBuf::from(home).join(suffix); }
+    }
+    PathBuf::from(path)
+}
+/// Request input `file`: the text of a local regular file (a link is not
+/// followed) of at most 1 MiB. The daemon never reads client paths. Anything
+/// else → a warning and `None`.
+pub(crate) fn file_input(ctx: &mut Context<'_>, path: &Path) -> Option<Input> {
+    let text = match files::read_input_file(path) {
+        Ok(text) => text,
+        Err(InputFileError::TooLarge) => { ctx.ui.notice(ui::warn("Файл больше 1 МиБ.")); return None; }
+        Err(_) => { ctx.ui.notice(ui::warn("Файл недоступен или не в UTF-8.")); return None; }
+    };
+    let mut input = Input::default();
+    input.insert("file", text);
+    Some(input)
+}
+/// `template show` → the local file (`save_file`).
+fn export_template(ctx: &mut Context<'_>, name: &str, path: &Path) -> io::Result<()> {
+    let Some(data) = fetch(ctx, &["template", "show", "--name", name])? else { return Ok(()); };
+    let Some(content) = data["content"].as_str() else { ctx.failed(); return Ok(()); };
+    save_file(ctx, "Экспорт шаблона", path, content, &format!("шаблоном {name}"), &format!("Шаблон {name}"))
+}
+/// `content` → the local file: an existing entry is replaced only after
+/// consent («будет перезаписан {by}»), by renaming a fresh file over it (a
+/// link is replaced, never followed); an entry that appeared after the check
+/// is kept. Success notice: «{saved} сохранён в …»; the content is never shown.
+fn save_file(ctx: &mut Context<'_>, title: &str, path: &Path, content: &str, by: &str, saved: &str) -> io::Result<()> {
+    let replace = match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => {
+            ctx.ui.notice(ui::warn(format!("Не удалось записать {}: это каталог.", path.display())));
+            return Ok(());
+        }
+        Ok(_) => {
+            let mut view = View::new(title);
+            view.context.push(ui::text(format!("Файл {} будет перезаписан {by}.", path.display()), ui::YELLOW));
+            if !ctx.confirm(view, "Перезаписать файл?")? { return Ok(()); }
+            true
+        }
+        Err(_) => false,
+    };
+    match files::write_file_atomic(path, content.as_bytes(), replace) {
+        Ok(()) => ctx.ui.notice(ui::text(format!("{saved} сохранён в {}", path.display()), ui::GREEN)),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            ctx.ui.notice(ui::warn(format!("Не удалось записать {}: файл появился во время экспорта.", path.display())));
+        }
+        Err(error) => ctx.ui.notice(ui::warn(format!("Не удалось записать {}: {error}", path.display()))),
+    }
+    Ok(())
+}
+fn template_card(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
+    loop {
+        let Some(data) = load(ctx, "Шаблон", &["template", "list"])? else { return Ok(()); };
+        let Some(row) = find_row(&data, name) else {
+            ctx.ui.notice(ui::warn(format!("Шаблон «{name}» не найден.")));
+            return Ok(());
+        };
+        let custom = row["source"] == "custom";
+        let mut items = vec![
+            Item::new('v', "Показать", ui::CYAN), Item::new('x', "Экспорт в файл", ui::CYAN),
+            Item::new('e', "Редактировать", ui::YELLOW), Item::new('i', "Импорт из файла", ui::YELLOW),
+            Item::new('c', "Проверить", ui::CYAN), Item::new('g', "Группы шаблона", ui::YELLOW),
+        ];
+        if custom {
+            items.push(Item::new('d', if row["overrides"] == true { "Сбросить к встроенному" } else { "Удалить шаблон" }, ui::RED));
+        }
+        items.push(back());
+        let mut view = View::menu(format!("Шаблон: {name}"), items);
+        view.context = vec![
+            ui::text(format!("Источник: {}", source_label(&row)), ui::NC),
+            ui::text(format!("Группы: {}", joined(&row["groups"])), ui::NC),
+        ];
+        let Some(choice) = ctx.choose(&view)? else { return Ok(()); };
+        let choice = choice.to_ascii_lowercase();
+        match choice.as_str() {
+            "0" => return Ok(()),
+            "v" => if let Some(data) = fetch(ctx, &["template", "show", "--name", name])? {
+                let mut view = View::new(format!("Содержимое: {name}"));
+                view.context.push(ui::text(format!("Путь: {}", data["path"].as_str().unwrap_or("встроенный шаблон")), ui::DIM));
+                view.context.extend(text(&data["content"]).lines().map(|s| Line::raw(s.to_owned())));
+                present(ctx, &view)?;
+            },
+            "e" => edit_template(ctx, name)?,
+            "x" | "i" => if let Some(path) = required(ctx, "Путь к файлу", "Путь не указан.")? {
+                let path = expand_home(&path);
+                if choice == "x" {
+                    export_template(ctx, name, &path)?;
+                } else if let Some(input) = file_input(ctx, &path) {
+                    confirmed_with(ctx, "Импорт шаблона", "Импортировать шаблон?", &["template", "import", "--name", name], &input)?;
+                }
+            },
+            "c" => if let Some(report) = fetch(ctx, &["template", "check", "--name", name])? {
+                present(ctx, &check_view(name, &report))?;
+            },
+            "g" => template_groups(ctx, name, &strings(&row["groups"]))?,
+            "d" if custom => if confirmed(ctx, "Удаление шаблона", "Удалить шаблон?", &["template", "delete", "--name", name])?.ok {
+                return Ok(());
+            },
+            _ => ctx.invalid(),
+        }
+    }
+}
+/// `template check` result: one line per problem, or «Проблем нет».
+fn check_view(name: &str, report: &Value) -> View {
+    let mut view = View::new(format!("Проверка шаблона: {name}"));
+    let problems = rows(&report["problems"]);
+    if problems.is_empty() { view.context.push(ui::text("Проблем нет", ui::GREEN)); }
+    for problem in problems {
+        let (level, color) = if problem["level"] == "error" { ("ошибка", ui::RED) } else { ("предупреждение", ui::YELLOW) };
+        let variant = match problem["variant"].as_str() {
+            None => String::new(),
+            Some("") => " (без групп)".into(),
+            Some(tag) => format!(" ({tag})"),
+        };
+        view.context.push(ui::text(format!("строка {}: {level} — {}{variant}", scalar(&problem["line"]), text(&problem["message"])), color));
+    }
+    if report["truncated"] == true { view.context.push(ui::text("Показаны не все проблемы.", ui::DIM)); }
+    view
+}
+/// Multi-select of the groups that use the template; the rest of its groups
+/// fall back to `default.yaml` (the core plans both). Nothing falls back
+/// from `default.yaml` itself, so for it only the other groups are offered.
+fn template_groups(ctx: &mut Context<'_>, name: &str, current: &[String]) -> io::Result<()> {
+    let Some(data) = fetch(ctx, &["group", "list"])? else { return Ok(()); };
+    let mut groups = names(&data);
+    let default = name == "default.yaml";
+    if default { groups.retain(|g| !current.contains(g)); }
+    let mut flags = groups.iter().map(|g| current.contains(g)).collect();
+    let title = if default { format!("Назначить шаблон {name} группам") } else { format!("Группы шаблона: {name}") };
+    loop {
+        let Some(selected) = ctx.toggle(&title, &groups, flags, EMPTY)? else { return Ok(()); };
+        let mut words = vec!["template", "groups", "--name", name];
+        for &i in &selected { words.extend(["--group", groups[i].as_str()]); }
+        let reply = confirmed(ctx, "Группы шаблона", "Применить?", &words)?;
+        if reply.ok && strings(&reply.data["assigned"]).is_empty() && strings(&reply.data["reset"]).is_empty() {
+            ctx.ui.notice(ui::text("Изменений нет.", ui::DIM));
+        }
+        if !crate::confirm::retryable(&reply) { return Ok(()); }
+        flags = checked(groups.len(), &selected);
+    }
+}
+fn executable(name: &str) -> bool {
+    env::var_os("PATH").is_some_and(|path| env::split_paths(&path).any(|dir| {
+        let path = dir.join(name);
+        #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0) }
+        #[cfg(not(unix))] { path.is_file() || path.with_extension("exe").is_file() }
+    }))
+}
+/// Split editor arguments without invoking a shell. Quotes/backslashes support
+/// paths with spaces and flags; shell expansions and command substitution are
+/// intentionally not evaluated.
+fn editor_words(value: &str) -> io::Result<Vec<String>> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    let mut started = false;
+    let mut chars = value.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' && quote != Some('\'')
+            && chars.peek().is_some_and(|next| *next == '\\' || *next == '"' || (quote.is_none() && (*next == '\'' || next.is_whitespace())))
+        {
+            word.extend(chars.next());
+            started = true;
+        } else if let Some(q) = quote {
+            if c == q { quote = None; } else { word.push(c); }
+            started = true;
+        } else if c == '\'' || c == '"' {
+            quote = Some(c);
+            started = true;
+        } else if c.is_whitespace() {
+            if started { words.push(std::mem::take(&mut word)); started = false; }
+        } else {
+            word.push(c);
+            started = true;
+        }
+    }
+    if quote.is_some() { return Err(io::Error::new(io::ErrorKind::InvalidInput, "Некорректные кавычки в команде редактора")); }
+    if started { words.push(word); }
+    if words.is_empty() || words[0].is_empty() { return Err(io::Error::new(io::ErrorKind::NotFound, "Редактор не задан")); }
+    Ok(words)
+}
+/// Owner-only (0700) directory; `tempfile` creates its files 0600.
+fn private_editor_dir() -> io::Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("rc-template-");
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir()
+}
+/// `$VISUAL`, `$EDITOR`, then nano/vi (notepad on Windows).
+fn editor() -> io::Result<Vec<String>> {
+    for variable in ["VISUAL", "EDITOR"] {
+        if let Ok(value) = env::var(variable) { if !value.trim().is_empty() { return editor_words(&value); } }
+    }
+    if cfg!(windows) { return Ok(vec!["notepad.exe".into()]); }
+    for name in ["nano", "vi"] { if executable(name) { return Ok(vec![name.into()]); } }
+    Err(io::Error::new(io::ErrorKind::NotFound, "Редактор не найден: установите nano или задайте EDITOR"))
+}
+fn edit_template(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
+    let Some(data) = fetch(ctx, &["template", "show", "--name", name])? else { return Ok(()); };
+    let result = (|| -> io::Result<()> {
+        let content = data["content"].as_str().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Нет содержимого шаблона"))?;
+        let editor = editor()?;
+        let dir = private_editor_dir()?;
+        let mut file = tempfile::Builder::new().suffix(".yaml").tempfile_in(dir.path())?;
+        file.write_all(content.as_bytes())?;
+        file.flush()?;
+        let (handle, path) = file.into_parts();
+        drop(handle);
+        edit_file(ctx, name, &editor, &path, content.as_bytes())
+    })();
+    if let Err(error) = result { ctx.ui.notice(ui::warn(format!("Изменения не сохранены: {error}"))); }
+    Ok(())
+}
+/// Edit on the cooked terminal; unchanged content imports nothing. A rejected
+/// import (core error) or a failed editor after edits keeps the working copy
+/// until the user reopens it or discards it explicitly.
+fn edit_file(ctx: &mut Context<'_>, name: &str, editor: &[String], path: &Path, original: &[u8]) -> io::Result<()> {
+    let mut command = Command::new(&editor[0]);
+    command.args(&editor[1..]).arg(path);
+    loop {
+        let edited = ctx.ui.suspended(&mut command)?.success();
+        if fs::read(path)? == original {
+            ctx.ui.notice(if edited { ui::text("Изменений нет.", ui::DIM) } else { ui::warn("Редактор завершился с ошибкой. Изменения не сохранены.") });
+            return Ok(());
+        }
+        if edited {
+            // A working copy that is not UTF-8 is kept like a rejected import.
+            if let Some(input) = file_input(ctx, path) {
+                let reply = confirmed_with(ctx, "Импорт изменений шаблона", "Сохранить изменения шаблона?",
+                    &["template", "import", "--name", name], &input)?;
+                // Saved; a refused plan (overwrite or problems) keeps the
+                // working copy like a rejected import.
+                if reply.ok { return Ok(()); }
+            }
+        } else {
+            ctx.ui.notice(ui::warn("Редактор завершился с ошибкой."));
+        }
+        if !reopen_editor(ctx, name)? { ctx.ui.notice(ui::text("Изменения шаблона отменены.", ui::DIM)); return Ok(()); }
+    }
+}
+/// The edits are not saved: `r` reopens the kept working copy, `d`/EOF discard it.
+fn reopen_editor(ctx: &mut Context<'_>, name: &str) -> io::Result<bool> {
+    let mut view = View::menu(format!("Изменения шаблона не сохранены: {name}"),
+        vec![Item::new('r', "Открыть рабочую копию в редакторе", ui::YELLOW), Item::new('d', "Отменить изменения", ui::RED)]);
+    view.context.push(ui::text("Рабочая копия сохранена до решения.", ui::YELLOW));
+    loop {
+        match ctx.choose(&view)?.map(|s| s.to_ascii_lowercase()).as_deref() {
+            Some("r") => return Ok(true),
+            None | Some("d") => return Ok(false),
+            _ => ctx.invalid(),
+        }
+    }
+}
+
+// ─── Generation ──────────────────────────────────────────────────────────────
+
+fn generation(ctx: &mut Context<'_>) -> io::Result<()> {
+    loop {
+        let Some(data) = load(ctx, "Генерация конфигов", &["group", "list"])? else { return Ok(()); };
+        let mut view = View::menu("Генерация конфигов", vec![
+            Item::new('a', "Всем клиентам", ui::YELLOW), Item::new('g', "По группе", ui::YELLOW),
+            Item::new('c', "Одному клиенту", ui::YELLOW), back(),
+        ]);
+        if rows(&data).is_empty() { view.context.push(ui::text("Нет групп", ui::DIM)); }
+        view.context.extend(rows(&data).iter().map(|r| ui::text(format!("{} → {}", text(&r["name"]), text(&r["template"])), ui::NC)));
+        let Some(choice) = ctx.choose(&view)? else { return Ok(()); };
+        match choice.to_ascii_lowercase().as_str() {
+            "0" => return Ok(()),
+            "a" => generate(ctx, &["--all"])?,
+            "g" => if let Some(group) = pick(ctx, "group", "Генерация по группе")? { generate(ctx, &["--group", &group])?; },
+            "c" => if let Some(client) = pick(ctx, "client", "Генерация для клиента")? { generate(ctx, &["--client", &client])?; },
+            _ => ctx.invalid(),
+        }
+    }
+}
+
+// ─── Subscriptions ───────────────────────────────────────────────────────────
+
+fn subscriptions(ctx: &mut Context<'_>) -> io::Result<()> {
+    loop {
+        let Some(host) = load(ctx, "Подписки", &["subscription", "host"])? else { return Ok(()); };
+        let current = host["node"].as_str().filter(|s| !s.is_empty()).map(str::to_owned);
+        let mut actions = vec![Item::new('h', "Хост подписок", ui::YELLOW)];
+        if current.is_some() { actions.push(Item::new('x', "Убрать хост", ui::RED)); }
+        actions.extend([
+            Item::new('l', "Список подписок", ui::CYAN), Item::new('u', "Обновить все подписки", ui::YELLOW),
+            Item::new('c', "Подписка клиента", ui::CYAN), Item::new('g', "Заголовки группы", ui::YELLOW), back(),
+        ]);
+        let mut view = View::menu("Подписки", actions);
+        match &current {
+            Some(node) => {
+                view.context.push(Line::from(vec![
+                    Span::raw("Хост подписок: "),
+                    Span::styled(format!("{}:{}", text(&host["hostname"]), scalar(&host["port"])), Style::default().fg(ui::GREEN)),
+                    Span::raw(format!(" (нода {node})")),
+                ]));
+                view.context.push(ui::text(format!("Базовый URL: {}", text(&host["base_url"])), ui::NC));
+            }
+            None => view.context.push(ui::text("Хост подписок не задан", ui::DIM)),
+        }
+        let Some(choice) = ctx.choose(&view)? else { return Ok(()); };
+        match choice.to_ascii_lowercase().as_str() {
+            "0" => return Ok(()),
+            "h" => set_host(ctx, current.as_deref())?,
+            "x" => match &current {
+                Some(node) => remove_host(ctx, node)?,
+                None => ctx.invalid(),
+            },
+            "l" => subscription_list(ctx)?,
+            "u" => {
+                let reply = confirmed(ctx, "Обновление подписок", "Опубликовать подписки?", &["subscription", "publish-all"])?;
+                // Failures after the upload attempt carry the summary in `error`.
+                let data = if reply.ok { Some(&reply.data) } else { reply.error.get("published").map(|_| &reply.error) };
+                if let Some(data) = data {
+                    summary(ctx, "Итог публикации подписок", data,
+                        &[("published", "Опубликовано"), ("skipped", "Пропущено"), ("failed", "Ошибки"), ("removed", "Удалено устаревших")],
+                        "Нечего публиковать.")?;
+                }
+            },
+            "c" => if let Some(name) = pick(ctx, "client", "Подписка клиента")? { client_subscription(ctx, &name)?; },
+            "g" => if let Some(name) = pick(ctx, "group", "Заголовки группы")? { headers(ctx, "group", &name)?; },
+            _ => ctx.invalid(),
+        }
+    }
+}
+/// «Хост подписок»: a node with a profile, the domain and the port (Enter —
+/// 443) → `subscription host`; the new and a replaced host node then wait for
+/// `node apply`, offered right away.
+fn set_host(ctx: &mut Context<'_>, current: Option<&str>) -> io::Result<()> {
+    let Some(data) = fetch(ctx, &["node", "list"])? else { return Ok(()); };
+    let profiled: Vec<&Value> = rows(&data).iter().filter(|node| node["profile"].as_str().is_some_and(|p| !p.is_empty())).collect();
+    let labels: Vec<String> = profiled.iter().map(|node| node_label(node)).collect();
+    let Some(i) = ctx.select("Нода хоста подписок", &labels)? else { return Ok(()); };
+    let node = text(&profiled[i]["name"]).to_owned();
+    let Some(domain) = required(ctx, "Домен подписок", "Домен не указан.")? else { return Ok(()); };
+    let Some(port) = ask(ctx, "Порт подписок [443]")? else { return Ok(()); };
+    let (domain, port) = (domain.trim(), port.trim());
+    let mut words = vec!["subscription", "host", "--name", node.as_str(), "--domain", domain];
+    if !port.is_empty() { words.extend(["--port", port]); }
+    if !execute(ctx, &words)?.ok { return Ok(()); }
+    crate::nodes::offer_apply_on(ctx, &[node, current.unwrap_or_default().to_owned()])
+}
+/// «Убрать хост»: `subscription host --remove` under its plan; the old host
+/// node then waits for `node apply`, offered right away.
+fn remove_host(ctx: &mut Context<'_>, node: &str) -> io::Result<()> {
+    let reply = confirmed(ctx, "Хост подписок", "Убрать хост подписок?", &["subscription", "host", "--remove"])?;
+    if reply.ok { crate::nodes::offer_apply_on(ctx, &[node.to_owned()])?; }
+    Ok(())
+}
+fn subscription_list(ctx: &mut Context<'_>) -> io::Result<()> {
+    let Some(data) = fetch(ctx, &["subscription", "list"])? else { return Ok(()); };
+    let mut view = View::new("Список подписок");
+    if rows(&data).is_empty() { view.context.push(ui::text("Нет опубликованных подписок", ui::DIM)); }
+    for row in rows(&data) {
+        let (state, color) = match row["state"].as_str() {
+            Some("active") => ("действует", ui::GREEN),
+            Some("expired") => ("истекла", ui::YELLOW),
+            Some("unlimited") => ("без срока", ui::DIM),
+            _ => ("срок неизвестен", ui::DIM),
+        };
+        view.context.push(Line::from(vec![
+            Span::raw(format!("{}  {}  ", text(&row["client"]), text(&row["expires_at"]))),
+            Span::styled(state, Style::default().fg(color)),
+        ]));
+    }
+    present(ctx, &view)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::{Registry, ScriptedUi, UserInterface};
+    use essence_rc_client::{Log, ScriptedClient};
+    use ratatui::{backend::TestBackend, style::Color, Terminal};
+    use serde_json::json;
+
+    type Step = (Vec<String>, Reply);
+    fn ok(words: &[&str], data: Value) -> Step { (argv(words), Reply::success(data)) }
+    fn step(words: &[&str], reply: Reply) -> Step { (argv(words), reply) }
+    /// The apply offer reads `node list` after a change; no pending node — no question.
+    fn listed() -> Step { ok(&["node", "list"], json!([])) }
+    fn yes(words: &[&str], data: Value) -> Step {
+        let mut confirmed = argv(words);
+        confirmed.extend(argv(&["--yes", "--plan-token", "T"]));
+        (confirmed, Reply::success(data))
+    }
+    fn plan() -> Reply {
+        Reply { error: json!({"code":"confirmation_required","plan":["Клиент: alice","Последствие: конфиг удалён"],"plan_token":"T"}), ..Reply::default() }
+    }
+    fn fail(code: &str, extra: Value) -> Reply {
+        let mut reply = Reply::failure(code);
+        if let Value::Object(fields) = extra { for (key, value) in fields { reply.error[key] = value; } }
+        reply
+    }
+    fn drive(steps: Vec<Step>, inputs: &[&str], run: impl FnOnce(&mut Context<'_>) -> io::Result<()>) -> (ScriptedClient, ScriptedUi) {
+        let registry = Registry { screens: vec![], github_wizard: None };
+        let mut core = ScriptedClient::new(steps);
+        let mut ui = ScriptedUi::new(inputs);
+        run(&mut Context::for_test(&mut core, &mut ui, &registry)).unwrap();
+        core.assert_finished();
+        frames(&ui);
+        (core, ui)
+    }
+    /// Frame rules: blank line, borders, one separator per non-empty section,
+    /// never two separators in a row or an empty trailing section.
+    fn frames(ui: &ScriptedUi) {
+        for view in &ui.views {
+            let plain: Vec<String> = view.lines().iter().map(ToString::to_string).collect();
+            assert_eq!(plain[0], "");
+            assert!(plain[1].starts_with('┌'));
+            assert!(plain.last().unwrap().starts_with('└'));
+            let sep = |s: &String| s.starts_with('├');
+            assert!(!plain.windows(2).any(|w| sep(&w[0]) && (sep(&w[1]) || w[1].starts_with('└'))), "empty section: {}", view.title);
+            let body = !view.context.is_empty() || view.sections.iter().any(|s| !s.is_empty());
+            assert_eq!(body, plain.iter().any(sep), "header separator: {}", view.title);
+            assert!(view.sections.iter().all(|s| !s.is_empty()), "empty section: {}", view.title);
+            let mut terminal = Terminal::new(TestBackend::new(90, 60)).unwrap();
+            terminal.draw(|f| ui::render(f, view, "", false, &[])).unwrap();
+        }
+    }
+    fn content(view: &View) -> String { view.lines().iter().map(ToString::to_string).collect::<Vec<_>>().join("\n") }
+    fn keys(view: &View) -> Vec<(String, Color)> { view.sections.iter().flatten().map(|i| (i.key.clone(), i.color)).collect() }
+    fn notices(ui: &ScriptedUi, text: &str) -> usize { ui.notices.iter().filter(|l| l.to_string().contains(text)).count() }
+    fn view<'a>(ui: &'a ScriptedUi, title: &str) -> &'a View { ui.views.iter().find(|v| v.title == title).unwrap_or_else(|| panic!("no view {title}")) }
+    fn sent(core: &ScriptedClient, words: &[&str]) -> bool { core.calls.contains(&argv(words)) }
+
+    fn row(name: &str, inherit: bool, subscription: Value) -> Value {
+        json!({"name":name,"group":"PC","inherit_nodes":inherit,"nodes":["de"],"subscription":subscription})
+    }
+    fn unpublished() -> Value { json!({"published":false,"expires_at":null}) }
+    fn alice(inherit: bool) -> Value { json!([row("alice", inherit, unpublished())]) }
+    fn shown() -> Value {
+        json!({"name":"alice","group":"PC","inherit_nodes":false,"nodes":["de"],
+            "subscription":{"url":"https://h/sub/tok","expires_at":null,"headers":[]},
+            "credentials":{"vless_uuid":"UUID-SECRET","hy2_password":"HY2-SECRET"},
+            "connections":[{"node":"de","mode":"own","proxies":["p1"]}],
+            "config":{"path":"/g/PC/alice/config.yaml","exists":true}})
+    }
+    fn nodes() -> Value { json!([{"name":"de","ip":"127.0.0.1","port":22},{"name":"ru","ip":"10.0.0.2","port":2222}]) }
+    fn group_list() -> Value { json!([{"name":"PC","template":"default.yaml","clients":1,"nodes":["de"]}]) }
+    fn host() -> Value { json!({"node":"de","hostname":"sub.de.example","port":443,"base_url":"https://sub.de.example","sub_dir":"/var/www/sub","nginx_group":"www-data"}) }
+    fn bundle(url: &str) -> Value { json!({"client":"alice","url":url,"expires_at":null,"headers":[]}) }
+
+    #[test]
+    fn client_list_add_accepts_both_cases_and_empty_list_is_full_frame() {
+        for key in ["A", "a"] {
+            let (_, ui) = drive(vec![
+                ok(&["client", "list"], json!([])), ok(&["group", "list"], group_list()),
+                ok(&["client", "add", "--name", "new", "--group", "PC"], json!({"name":"new","group":"PC"})), listed(),
+                ok(&["client", "list"], json!([])),
+            ], &[key, "new", "1", "0"], clients);
+            let list = &ui.views[0];
+            assert_eq!(list.context[0].style.fg, Some(ui::DIM));
+            assert_eq!(keys(list), [("a".into(), ui::GREEN), ("d".into(), ui::RED), ("0".into(), ui::NC)]);
+        }
+        let (core, ui) = drive(vec![ok(&["client", "list"], json!([])), ok(&["client", "list"], json!([]))], &["a", "", "0"], clients);
+        assert_eq!(notices(&ui, "Имя клиента не указано."), 1);
+        assert_eq!(core.calls.len(), 2);
+    }
+    #[test]
+    fn client_list_opens_card_by_number() {
+        let data = json!([row("alice", true, unpublished()), row("bob", true, unpublished())]);
+        let (_, ui) = drive(vec![ok(&["client", "list"], data.clone()), ok(&["client", "list"], data.clone()), ok(&["client", "list"], data)],
+            &["2", "0", "0"], clients);
+        assert_eq!(ui.views[0].sections[0][1].label, "bob  (PC)");
+        assert!(ui.views.iter().any(|v| v.title == "Клиент: bob"));
+    }
+    #[test]
+    fn deletion_is_unchecked_enter_does_nothing_and_cancel_discards_flags() {
+        for inputs in [vec!["D", "", "0"], vec!["d", "1", "0", "0"]] {
+            let data = alice(true);
+            let (core, ui) = drive(vec![ok(&["client", "list"], data.clone()), ok(&["client", "list"], data)], &inputs, clients);
+            assert_eq!(core.calls.len(), 2);
+            let toggle = view(&ui, "Удаление клиентов");
+            assert!(toggle.sections[0][0].label.starts_with("[ ]"));
+            assert_eq!(notices(&ui, "Ничего не выбрано."), usize::from(inputs[1].is_empty()));
+        }
+    }
+    #[test]
+    fn deletion_shows_one_frozen_plan_default_no() {
+        let data = json!([row("alice", true, unpublished()), row("bob", true, unpublished())]);
+        let words = ["client", "delete", "--name", "alice", "--name", "bob"];
+        for consent in ["", "n", "N", "y", "Y"] {
+            let mut steps = vec![ok(&["client", "list"], data.clone()), step(&words, plan())];
+            if consent.eq_ignore_ascii_case("y") { steps.extend([yes(&words, json!({"deleted":["alice","bob"]})), listed()]); }
+            steps.push(ok(&["client", "list"], data.clone()));
+            let (_, ui) = drive(steps, &["d", "1", "2", "", consent, "0"], clients);
+            let reviews: Vec<_> = ui.views.iter().filter(|v| v.prompt.contains("(y/N)")).collect();
+            assert_eq!(reviews.len(), 1);
+            assert!(content(reviews[0]).contains("alice"));
+        }
+    }
+    #[test]
+    fn card_reads_list_and_shows_credentials_only_on_request() {
+        let (core, ui) = drive(vec![
+            ok(&["client", "list"], alice(false)), ok(&["client", "show", "--name", "alice"], shown()), ok(&["client", "list"], alice(false)),
+        ], &["V", "", "0"], |ctx| client_card(ctx, "alice".into()));
+        assert_eq!(core.calls[0], argv(&["client", "list"]));
+        let card = &ui.views[0];
+        assert!(!content(card).contains("UUID-SECRET"));
+        assert_eq!(card.sections.len(), 2);
+        assert_eq!(keys(card), [("v".into(), ui::CYAN), ("s".into(), ui::CYAN), ("a".into(), ui::CYAN), ("f".into(), ui::YELLOW), ("n".into(), ui::YELLOW),
+            ("p".into(), ui::YELLOW), ("g".into(), ui::YELLOW), ("r".into(), ui::YELLOW), ("d".into(), ui::RED), ("0".into(), ui::NC)]);
+        let data = view(&ui, "Данные клиента: alice");
+        for expected in ["UUID-SECRET", "HY2-SECRET", "https://h/sub/tok", "/g/PC/alice/config.yaml (создан)", "de (свои): p1"] {
+            assert!(content(data).contains(expected), "{expected}");
+        }
+        assert!(data.sections.is_empty());
+    }
+    #[test]
+    fn awg_config_picks_a_node_from_client_show_and_writes_only_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("alice-de.conf");
+        let target_arg = target.to_str().unwrap().to_owned();
+        let show = ["client", "show", "--name", "alice"];
+        let shown = json!({"name": "alice", "awg_nodes": ["de"]});
+        let config = "[Interface]\nPrivateKey = AWG-SECRET\n";
+        let words = ["client", "awg-config", "--name", "alice", "--node", "de"];
+        // Card key (both cases) → a fresh file; an existing one is kept on refusal;
+        // Enter takes the default name; `invalid` writes nothing.
+        let (core, ui) = drive(vec![
+            ok(&["client", "list"], alice(false)), ok(&show, shown.clone()), ok(&words, json!({"config": config})),
+            ok(&["client", "list"], alice(false)), ok(&show, shown.clone()), ok(&words, json!({"config": "OTHER"})),
+            ok(&["client", "list"], alice(false)), ok(&show, shown), step(&words, fail("invalid", json!({}))),
+            ok(&["client", "list"], alice(false)),
+        ], &["a", "1", &target_arg, "A", "1", &target_arg, "n", "a", "1", "", "0"], |ctx| client_card(ctx, "alice".into()));
+        assert_eq!(core.calls.iter().filter(|call| **call == argv(&words)).count(), 3);
+        assert_eq!(fs::read_to_string(&target).unwrap(), config, "overwritten only after consent");
+        assert_eq!(view(&ui, "Конфиг AmneziaWG: alice").sections[0].iter().filter(|item| item.key != "0").count(), 1, "only the core's AmneziaWG nodes");
+        assert!(ui.views.iter().any(|v| v.title == "Конфиг AmneziaWG" && v.prompt.contains("(y/N)")));
+        assert!(ui.views.iter().any(|v| v.title.contains("alice-de.conf")), "the default file name is offered");
+        assert_eq!(notices(&ui, "Конфиг AmneziaWG alice (de) сохранён в"), 1);
+        assert!(!Path::new("alice-de.conf").exists());
+        assert!(!ui.views.iter().any(|v| content(v).contains("AWG-SECRET")) && !ui.notices.iter().any(|l| l.to_string().contains("AWG-SECRET")));
+        assert!(!core.calls.iter().flatten().any(|word| word.contains(dir.path().to_str().unwrap())), "no local path reaches the daemon");
+        // The client is a peer nowhere: a warning, no question.
+        let (core, ui) = drive(vec![ok(&show, json!({"name": "alice", "awg_nodes": []}))], &[], |ctx| awg_config(ctx, "alice"));
+        assert_eq!(core.calls.len(), 1);
+        assert_eq!(notices(&ui, "нет нод с AmneziaWG"), 1);
+    }
+    #[test]
+    fn client_data_without_connections_or_link_has_no_empty_lines() {
+        let mut data = shown();
+        data["connections"] = json!([]);
+        data["nodes"] = json!([]);
+        data["subscription"] = json!({"url":null,"expires_at":null,"headers":[]});
+        let (_, ui) = drive(vec![ok(&["client", "show", "--name", "alice"], data)], &[""], |ctx| show_client(ctx, "alice"));
+        let text = content(&ui.views[0]);
+        assert!(text.contains("Ноды: нет") && text.contains("ссылка недоступна") && !text.contains("Подключения по нодам"));
+    }
+    #[test]
+    fn card_set_group_rename_partial_and_delete_partial_follow_error_extras() {
+        let renamed = json!([row("alice.2", true, unpublished())]);
+        let delete = ["client", "delete", "--name", "alice.2"];
+        drive(vec![
+            ok(&["client", "list"], alice(true)), ok(&["group", "list"], group_list()),
+            step(&["client", "set-group", "--name", "alice", "--group", "PC"], plan()),
+            yes(&["client", "set-group", "--name", "alice", "--group", "PC"], json!({"name":"alice","group":"PC"})), listed(),
+            ok(&["client", "list"], alice(true)),
+            step(&["client", "rename", "--name", "alice", "--new-name", "requested"], fail("partial", json!({"name":"alice.2","nodes":["de"]}))),
+            ok(&["client", "list"], renamed),
+            step(&delete, plan()),
+            (yes(&delete, Value::Null).0, fail("partial", json!({"deleted":["alice.2"],"revoked":[],"awg_nodes":[]}))),
+        ], &["G", "1", "y", "R", "requested", "D", "y"], |ctx| client_card(ctx, "alice".into()));
+    }
+    #[test]
+    fn card_rename_success_follows_data_and_partial_delete_of_others_stays() {
+        drive(vec![
+            ok(&["client", "list"], alice(true)),
+            ok(&["client", "rename", "--name", "alice", "--new-name", "Bob"], json!({"name":"Bob"})),
+            ok(&["client", "list"], json!([row("Bob", true, unpublished())])),
+            step(&["client", "delete", "--name", "Bob"], fail("remote_failed", json!({"deleted":[]}))),
+            ok(&["client", "list"], json!([row("Bob", true, unpublished())])),
+        ], &["r", "Bob", "d", "0"], |ctx| client_card(ctx, "alice".into()));
+    }
+    #[test]
+    fn vanished_card_returns_without_input_and_inherited_connections_warn() {
+        let (_, ui) = drive(vec![ok(&["client", "list"], json!([]))], &["untouched"], |ctx| client_card(ctx, "alice".into()));
+        assert_eq!(ui.inputs.len(), 1);
+        assert_eq!(notices(&ui, "не найден"), 1);
+        let (_, ui) = drive(vec![ok(&["client", "list"], alice(true)), ok(&["client", "list"], alice(true))], &["P", "0"],
+            |ctx| client_card(ctx, "alice".into()));
+        assert_eq!(notices(&ui, "только для клиента со своими нодами"), 1);
+    }
+    #[test]
+    fn client_nodes_mirror_current_nodes_and_returning_to_group_is_confirmed() {
+        let (core, ui) = drive(vec![
+            ok(&["node", "list"], nodes()),
+            ok(&["client", "nodes", "--name", "alice", "--node", "de", "--node", "ru"], json!({})), listed(),
+            step(&["client", "nodes", "--name", "alice", "--inherit"], plan()),
+            yes(&["client", "nodes", "--name", "alice", "--inherit"], json!({})), listed(),
+            step(&["client", "nodes", "--name", "alice", "--inherit"], plan()),
+        ], &["1", "2", "", "2", "y", "2", "n", "2", "0"], |ctx| {
+            client_nodes(ctx, "alice", false, &["de".into()])?;
+            client_nodes(ctx, "alice", false, &["de".into()])?;
+            client_nodes(ctx, "alice", false, &["de".into()])?;
+            client_nodes(ctx, "alice", true, &["de".into()])
+        });
+        let toggle = view(&ui, "Свои ноды клиента: alice");
+        assert_eq!(toggle.sections[0][0].label, "[x] de  127.0.0.1:22");
+        assert_eq!(toggle.sections[0][1].label, "[ ] ru  10.0.0.2:2222");
+        assert_eq!(notices(&ui, "Неверный выбор."), 1);
+        assert_eq!(core.calls.len(), 7);
+    }
+    #[test]
+    fn client_connections_discover_by_node_name_and_reset_needs_consent() {
+        let (core, ui) = drive(vec![
+            ok(&["node", "list"], nodes()),
+            ok(&["client", "connections", "--name", "alice"], json!([{"node":"de","mode":"own","proxies":["p1"]}])),
+            ok(&["conn", "list", "--name", "de", "--discover"], json!([{"node":"de","groups":[],"discovered":["p1","p2"]}])),
+            ok(&["client", "connections", "--name", "alice", "--node", "de", "--proxy", "p1", "--proxy", "p2"], json!({})), listed(),
+            ok(&["node", "list"], nodes()),
+            step(&["client", "connections", "--name", "alice", "--node", "de", "--reset"], plan()),
+        ], &["1", "1", "2", "", "1", "2", "n"], |ctx| {
+            client_connections(ctx, "alice", &["de".into(), "gone".into()])?;
+            client_connections(ctx, "alice", &["de".into()])?;
+            client_connections(ctx, "alice", &[])
+        });
+        let picker = view(&ui, "Подключения клиента: alice");
+        assert_eq!(picker.sections[0].len(), 2);
+        assert!(ui.views.iter().any(|v| v.sections.iter().flatten().any(|i| i.label == "[x] p1")));
+        assert_eq!(notices(&ui, "У клиента нет своих нод."), 1);
+        assert!(!core.calls.iter().any(|c| c.contains(&"--yes".to_owned())));
+    }
+    #[test]
+    fn client_connections_keep_assigned_proxies_the_node_did_not_report() {
+        // AWG discovered: the peer `awg-alice` is listed checked without a
+        // mark, `gone` is marked; both survive an unchanged submit.
+        let (core, ui) = drive(vec![
+            ok(&["node", "list"], nodes()),
+            ok(&["client", "connections", "--name", "alice"], json!([{"node":"de","mode":"own","proxies":["p1","awg-alice","gone"]}])),
+            ok(&["conn", "list", "--name", "de", "--discover"], json!([{"node":"de","groups":[],"discovered":["AWG","p1"]}])),
+            ok(&["client", "connections", "--name", "alice", "--node", "de", "--proxy", "p1", "--proxy", "awg-alice", "--proxy", "gone"], json!({})), listed(),
+        ], &["1", "1", ""], |ctx| client_connections(ctx, "alice", &["de".into()]));
+        core.assert_finished();
+        let toggle = view(&ui, "Подключения клиента на de");
+        let labels: Vec<&str> = toggle.sections[0].iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(&labels[..4], ["[ ] AWG", "[x] p1", "[x] awg-alice", "[x] gone (не найдено на ноде)"]);
+        // Nothing discovered and nothing assigned: a warning, no toggle.
+        let (core, ui) = drive(vec![
+            ok(&["node", "list"], nodes()),
+            ok(&["client", "connections", "--name", "alice"], json!([])),
+            ok(&["conn", "list", "--name", "de", "--discover"], json!([{"node":"de","groups":[],"discovered":[]}])),
+        ], &["1", "1"], |ctx| client_connections(ctx, "alice", &["de".into()]));
+        core.assert_finished();
+        assert_eq!(notices(&ui, EMPTY), 1);
+    }
+    #[test]
+    fn ttl_menu_maps_values_and_cancellation_never_publishes() {
+        for (selection, ttl) in [("1", None), ("2", Some("12h")), ("3", Some("30d")), ("4", Some("2w")), ("5", Some("7d")), ("0", None)] {
+            let mut steps = vec![ok(&["client", "list"], alice(true)), ok(&["subscription", "host"], host())];
+            let mut inputs = vec!["P", selection];
+            if selection != "0" {
+                let mut words = argv(&["subscription", "publish", "--name", "alice"]);
+                if let Some(ttl) = ttl { words.extend(argv(&["--ttl", ttl])); }
+                steps.push((words, fail("partial", json!({"client":"alice","url":"https://h/sub/tok","expires_at":null}))));
+                steps.push(ok(&["subscription", "show", "--name", "alice"], bundle("https://h/sub/tok")));
+                if selection == "5" { inputs.push("7d"); }
+                inputs.push("");
+            }
+            steps.extend([ok(&["client", "list"], alice(true)), ok(&["subscription", "host"], host())]);
+            inputs.push("0");
+            let (_, ui) = drive(steps, &inputs, |ctx| client_subscription(ctx, "alice"));
+            assert_eq!(view(&ui, "Срок действия подписки").sections[0][0].label, "Без срока");
+        }
+        let published = json!([row("alice", true, json!({"published":true,"expires_at":"2026-12-01T00:00:00Z"}))]);
+        let (_, ui) = drive(vec![ok(&["client", "list"], published.clone()), ok(&["subscription", "host"], Value::Null),
+            ok(&["client", "list"], published), ok(&["subscription", "host"], Value::Null)], &["p", "0", "0"], |ctx| client_subscription(ctx, "alice"));
+        assert!(view(&ui, "Срок действия подписки").sections[0][0].label.starts_with("Оставить текущий срок"));
+        assert!(content(&ui.views[0]).contains("Хост подписок не задан"));
+        // A failed read is not «not set».
+        let (_, ui) = drive(vec![ok(&["client", "list"], alice(true)), step(&["subscription", "host"], Reply::failure("locked"))],
+            &["0"], |ctx| client_subscription(ctx, "alice"));
+        let shown = content(&ui.views[0]);
+        assert!(shown.contains("Хост подписок: не удалось прочитать") && !shown.contains("не задан"), "{shown}");
+    }
+    #[test]
+    fn failed_publish_shows_no_bundle() {
+        let (core, _) = drive(vec![
+            ok(&["client", "list"], alice(true)), ok(&["subscription", "host"], host()),
+            step(&["subscription", "publish", "--name", "alice"], fail("needs_setup", json!({"name":"alice"}))),
+            ok(&["client", "list"], alice(true)), ok(&["subscription", "host"], host()),
+        ], &["p", "1", "0"], |ctx| client_subscription(ctx, "alice"));
+        assert!(!core.calls.iter().any(|c| c[1] == "show"));
+    }
+    #[test]
+    fn share_bundle_has_link_expiry_headers_curl_json_and_qr() {
+        let data = json!({"client":"alice","url":"https://h/sub/tok","expires_at":"2026-12-01T00:00:00Z","headers":[{"name":"profile-title","value":"Essence"}]});
+        let view = share_view(&data, &["QR-ROW".into()]);
+        let text = content(&view);
+        for expected in ["Подписка: alice", "https://h/sub/tok", "curl 'https://h/sub/tok'", r#"{"url":"https://h/sub/tok"}"#, "profile-title: Essence", "QR-ROW"] {
+            assert!(text.contains(expected), "{expected}");
+        }
+        assert!(view.sections.is_empty());
+        let first = |label: &str| view.context.iter().find(|l| l.spans[0].content == label).unwrap().spans[0].style.fg;
+        assert_eq!(first("URL: "), Some(ui::GREEN));
+        assert_eq!(first("Срок действия: "), Some(ui::YELLOW));
+        let plain = share_view(&bundle("https://h/sub/tok"), &[]);
+        assert!(!content(&plain).contains("Срок действия") && !content(&plain).contains("заголовки"));
+        #[cfg(unix)] {
+            let mut qr = Command::new("sh");
+            qr.args(["-c", r#"read -r u; [ $# -eq 0 ] && printf 'QR:%s\n' "$u""#]);
+            assert_eq!(qr_lines(&mut qr, "https://h/sub/tok"), ["QR:https://h/sub/tok"]);
+        }
+        assert!(qr_lines(&mut Command::new("/nonexistent/qrencode"), "u").is_empty());
+    }
+    /// `qrencode -t UTF8` rows: half blocks with space margins, one column each.
+    fn qr_grid(columns: usize) -> Vec<String> {
+        (0..columns / 2).map(|y| (0..columns).map(|x| match (x < 2 || x + 2 >= columns, (x * 7 + y * 3) % 4) {
+            (true, _) => ' ', (_, 0) => '█', (_, 1) => '▀', (_, 2) => '▄', _ => ' ',
+        }).collect()).collect()
+    }
+    /// A fitting QR keeps every row whole (one framed row each, grid
+    /// intact); a QR wider than the frame (long link) is replaced by a note
+    /// while the link itself stays visible.
+    #[test]
+    fn qr_rows_are_never_wrapped_and_a_too_wide_code_falls_back_to_the_link() {
+        let grid = qr_grid(ui::CONTENT_WIDTH);
+        let view = share_view(&bundle("https://h/sub/tok"), &grid);
+        let rows: Vec<String> = view.lines().iter().map(ToString::to_string).collect();
+        let start = rows.iter().position(|row| row == &format!("│{}│", grid[0])).expect("first QR row whole");
+        for (offset, line) in grid.iter().enumerate() { assert_eq!(rows[start + offset], format!("│{line}│")); }
+        let link = format!("https://essence.example/sub/{}", "t".repeat(300));
+        let view = share_view(&bundle(&link), &qr_grid(77));
+        let text = content(&view);
+        assert!(!text.contains('█') && !text.contains('▀'), "no broken grid");
+        assert!(text.contains("QR-код не помещается"));
+        let shown: String = view.lines().iter().map(ToString::to_string).filter(|r| r.starts_with('│')).map(|r| r.trim_matches('│').trim_end().to_owned()).collect();
+        assert!(shown.contains(&link), "the link stays readable");
+        assert!(view.lines().iter().all(|line| line.width() <= usize::from(ui::FRAME_WIDTH)));
+    }
+    #[test]
+    fn rotate_and_revoke_use_plans_and_rotation_shows_the_new_bundle() {
+        let (_, ui) = drive(vec![
+            ok(&["client", "list"], alice(true)), ok(&["subscription", "host"], host()),
+            step(&["subscription", "rotate", "--name", "alice"], plan()),
+            yes(&["subscription", "rotate", "--name", "alice"], json!({"client":"alice","url":"https://h/sub/NEW"})),
+            ok(&["subscription", "show", "--name", "alice"], bundle("https://h/sub/NEW")),
+            ok(&["client", "list"], alice(true)), ok(&["subscription", "host"], host()),
+            step(&["subscription", "revoke", "--name", "alice"], plan()),
+            ok(&["client", "list"], alice(true)), ok(&["subscription", "host"], host()),
+            ok(&["subscription", "headers", "--client", "alice"], json!([{"name":"X-A","value":"1","source":"group"}])),
+            ok(&["client", "list"], alice(true)), ok(&["subscription", "host"], host()),
+        ], &["R", "y", "", "X", "n", "I", "", "0"], |ctx| client_subscription(ctx, "alice"));
+        assert!(ui.views.iter().any(|v| content(v).contains("https://h/sub/NEW")));
+        assert!(content(view(&ui, "Итоговые заголовки: alice")).contains("X-A: 1  [группа]"));
+        assert_eq!(keys(&ui.views[0]), [("p".into(), ui::GREEN), ("v".into(), ui::CYAN), ("i".into(), ui::CYAN), ("h".into(), ui::YELLOW),
+            ("r".into(), ui::RED), ("x".into(), ui::RED), ("0".into(), ui::NC)]);
+    }
+    #[test]
+    fn client_headers_delete_only_own_values_and_require_both_fields() {
+        let data = json!([{"name":"X-Default","value":"a","source":"default"},{"name":"X-Own","value":"b","source":"client"}]);
+        let read = ["subscription", "headers", "--client", "alice"];
+        let (core, ui) = drive(vec![
+            ok(&read, data.clone()),
+            ok(&["subscription", "headers", "--client", "alice", "--set", "X-New=value"], json!({})),
+            ok(&read, data.clone()), ok(&read, data.clone()),
+            ok(&["subscription", "headers", "--client", "alice", "--unset", "X-Own"], json!({})),
+            ok(&read, data),
+        ], &["A", "X-New", "value", "a", "X", "", "D", "1", "0"], |ctx| headers(ctx, "client", "alice"));
+        let picker = view(&ui, "Удаление заголовка");
+        assert_eq!(picker.sections[0].len(), 2);
+        assert_eq!(picker.sections[0][0].label, "X-Own");
+        assert_eq!(notices(&ui, "Имя и значение заголовка обязательны."), 1);
+        assert_eq!(core.calls.len(), 6);
+    }
+    #[test]
+    fn group_headers_list_all_without_source() {
+        let (_, ui) = drive(vec![
+            ok(&["subscription", "headers", "--group", "PC"], json!([{"name":"X-G","value":"1"}])),
+            ok(&["subscription", "headers", "--group", "PC", "--unset", "X-G"], json!({})),
+            ok(&["subscription", "headers", "--group", "PC"], json!([])),
+        ], &["d", "1", "0"], |ctx| headers(ctx, "group", "PC"));
+        let text = content(&ui.views[0]);
+        assert!(text.contains("X-G: 1") && !text.contains('['));
+    }
+    #[test]
+    fn groups_add_card_set_template_and_confirmed_delete() {
+        let templates = json!([{"name":"default.yaml","source":"builtin","groups":["PC"]},{"name":"m.yaml","source":"custom","groups":[]}]);
+        let (_, ui) = drive(vec![
+            ok(&["group", "list"], json!([])), ok(&["template", "list"], templates.clone()),
+            ok(&["group", "add", "--name", "pc", "--template", "default.yaml"], json!({"name":"PC","template":"default.yaml"})),
+            ok(&["group", "list"], group_list()), ok(&["group", "list"], group_list()),
+            ok(&["template", "list"], templates),
+            ok(&["group", "set-template", "--name", "PC", "--template", "m.yaml"], json!({})),
+            ok(&["group", "list"], group_list()),
+            step(&["group", "delete", "--name", "PC"], plan()), yes(&["group", "delete", "--name", "PC"], json!({"name":"PC"})),
+            ok(&["group", "list"], json!([])),
+        ], &["A", "pc", "1", "1", "T", "2", "D", "y", "0"], groups);
+        assert_eq!(keys(&ui.views[0]), [("a".into(), ui::GREEN), ("0".into(), ui::NC)]);
+        let card = view(&ui, "Группа: PC");
+        assert!(content(card).contains("Клиентов: 1"));
+        assert_eq!(keys(card).last().unwrap(), &("0".into(), ui::NC));
+        assert_eq!(keys(card)[1], ("c".into(), ui::YELLOW));
+        assert_eq!(keys(card)[4], ("d".into(), ui::RED));
+    }
+    #[test]
+    fn group_connections_pick_a_node_and_send_only_a_changed_set() {
+        let nodes = json!([{"name":"de","ip":"1.2.3.4","port":22},{"name":"ru","ip":"5.6.7.8","port":22}]);
+        let found = json!([{"node":"ru","groups":[{"name":"PC","proxies":["p1","stale"]},{"name":"X","proxies":["p2"]}],"discovered":["p1","p2"]}]);
+        let discover = ["conn", "list", "--name", "ru", "--discover"];
+        // Two nodes: the second is chosen; the toggle lists stale assigned
+        // proxies too and starts from the group's set.
+        let (core, ui) = drive(vec![
+            ok(&["node", "list"], nodes.clone()), ok(&discover, found.clone()),
+            ok(&["conn", "set", "--name", "ru", "--assign", "PC=p1", "--assign", "PC=p2"], json!({"node":"ru","changed":[{"group":"PC","proxies":["p1","p2"]}]})), listed(),
+        ], &["2", "2", "3", ""], |ctx| group_connections(ctx, "PC"));
+        core.assert_finished();
+        let toggle = &ui.views[1];
+        let labels: Vec<&str> = toggle.sections[0].iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(&labels[..3], ["[x] p1", "[ ] p2", "[x] stale (не найдено на ноде)"]);
+        // One node is taken without asking; an unchanged set sends nothing.
+        let (core, ui) = drive(vec![ok(&["node", "list"], json!([nodes[1].clone()])), ok(&discover, found.clone())],
+            &["2", "2", ""], |ctx| group_connections(ctx, "PC"));
+        core.assert_finished();
+        assert!(ui.notices.iter().any(|n| n.to_string().contains("Изменений нет")));
+        // Clearing the set removes the group's assignment on the node.
+        let (core, _) = drive(vec![ok(&["node", "list"], json!([nodes[1].clone()])), ok(&discover, found),
+            ok(&["conn", "set", "--name", "ru", "--assign", "PC="], json!({"node":"ru","changed":[{"group":"PC","proxies":[]}]})), listed()],
+            &["1", "3", ""], |ctx| group_connections(ctx, "PC"));
+        core.assert_finished();
+        let (core, ui) = drive(vec![ok(&["node", "list"], json!([]))], &[], |ctx| group_connections(ctx, "PC"));
+        core.assert_finished();
+        assert!(ui.notices.iter().any(|n| n.to_string().contains("Нет нод")));
+    }
+    /// After a change with pending nodes `node apply --pending` opens its plan
+    /// at once: the plan's confirmation is the only question; refusal applies
+    /// nothing. Generation with `nodes_pending` offers the same.
+    #[test]
+    fn changes_offer_to_apply_pending_nodes() {
+        let pending = json!([{"name":"de","status":"pending"},{"name":"ru","status":"applied"}]);
+        let add = ["client", "add", "--name", "new", "--group", "PC"];
+        let apply = ["node", "apply", "--pending"];
+        let report = json!({"applied":["de"],"failed":[],"unchanged":[]});
+        let (core, ui) = drive(vec![ok(&add, json!({"name":"new"})), ok(&["node", "list"], pending.clone()), step(&apply, plan()), yes(&apply, report)],
+            &["y"], |ctx| execute(ctx, &add).map(|_| ()));
+        assert!(sent(&core, &["node", "apply", "--pending", "--yes", "--plan-token", "T"]));
+        assert_eq!(notices(&ui, "Применено: de"), 1);
+        assert_eq!(ui.views.iter().filter(|v| v.prompt.contains("(y/N)")).count(), 1);
+        // Refusal of the plan; a read (`client connections --name`) never offers.
+        drive(vec![ok(&add, json!({"name":"new"})), ok(&["node", "list"], pending.clone()), step(&apply, plan())], &["n"], |ctx| execute(ctx, &add).map(|_| ()));
+        drive(vec![ok(&["client", "connections", "--name", "c"], json!([]))], &[], |ctx| execute(ctx, &["client", "connections", "--name", "c"]).map(|_| ()));
+        // `partial`: one journal line `name: message` per failed node.
+        let partial = fail("partial", json!({"applied":[],"unchanged":[],"failed":[
+            {"name":"de","stage":"config","code":"rolled_back","message":"откат на этапе «конфигурация и проверка»"},
+            {"name":"de","stage":"probe","code":"port_busy","message":"порт 443 уже занят","port":443}]}));
+        let (_, ui) = drive(vec![ok(&add, json!({"name":"new"})), ok(&["node", "list"], pending.clone()), step(&apply, plan()), (yes(&apply, Value::Null).0, partial)],
+            &["y"], |ctx| execute(ctx, &add).map(|_| ()));
+        assert_eq!(notices(&ui, "de: откат на этапе «конфигурация и проверка»"), 1);
+        assert_eq!(notices(&ui, "de: порт 443 уже занят"), 1);
+        drive(vec![
+            ok(&["generate", "--all"], json!({"ok":["new"],"nodes_pending":["de"]})), ok(&["node", "list"], pending), step(&apply, plan()),
+        ], &["", "n"], |ctx| generate(ctx, &["--all"]));
+    }
+    #[test]
+    fn group_connections_fall_back_to_saved_assignments_and_keep_the_choice_on_failure() {
+        let node = json!([{"name":"ru","ip":"5.6.7.8","port":22}]);
+        let saved = json!([{"node":"ru","groups":[{"name":"PC","proxies":["p1"]}]}]);
+        let unset = ["conn", "set", "--name", "ru", "--assign", "PC="];
+        // Discovery fails (reported): the saved assignment is listed, not as
+        // «not found», and can be removed; a failed save reopens the toggle
+        // with the choice kept.
+        let (core, ui) = drive(vec![
+            ok(&["node", "list"], node), step(&["conn", "list", "--name", "ru", "--discover"], fail("remote_failed", json!({}))),
+            ok(&["conn", "list", "--name", "ru"], saved),
+            step(&unset, fail("locked", json!({}))), ok(&unset, json!({"node":"ru","changed":[{"group":"PC","proxies":[]}]})), listed(),
+        ], &["1", "", ""], |ctx| group_connections(ctx, "PC"));
+        core.assert_finished();
+        assert_eq!(ui.views[0].sections[0][0].label, "[x] p1");
+        assert_eq!(ui.views[1].sections[0][0].label, "[ ] p1");
+        assert!(ui.notices.iter().any(|n| n.to_string().contains("сохранённые назначения")));
+    }
+    #[test]
+    fn group_new_template_choice_creates_bound_template_then_opens_editor() {
+        let (_, ui) = drive(vec![
+            ok(&["template", "list"], json!([{"name":"default.yaml","source":"builtin","groups":[]}])),
+            ok(&["template", "create", "--name", "new", "--group", "PC"], json!({"name":"new.yaml","based_on":"default.yaml","group":"PC"})),
+            step(&["template", "show", "--name", "new.yaml"], fail("not_found", json!({"name":"new.yaml"}))),
+        ], &["2", "new"], |ctx| group_template(ctx, "PC", "default.yaml"));
+        assert!(ui.views[0].sections[0][1].label.contains("Создать новый"));
+        assert!(ui.views[0].title.contains("текущий: default.yaml"));
+    }
+    #[test]
+    fn templates_list_sources_and_create_opens_editor() {
+        let list = json!([{"name":"default.yaml","source":"builtin","groups":["PC"]},{"name":"m.yaml","source":"custom","groups":[]}]);
+        let (core, ui) = drive(vec![
+            ok(&["template", "list"], list.clone()), ok(&["template", "list"], list.clone()),
+            ok(&["template", "create", "--name", "x", "--from", "m.yaml"], json!({"name":"x.yaml","based_on":"m.yaml","group":null})),
+            step(&["template", "show", "--name", "x.yaml"], fail("not_found", json!({}))),
+            ok(&["template", "list"], list),
+        ], &["a", "x", "2", "0"], templates);
+        core.assert_finished();
+        assert_eq!(ui.views[0].sections[0][0].label, "default.yaml  (встроенный)");
+        assert_eq!(ui.views[0].sections[0][1].label, "m.yaml  (пользовательский)");
+    }
+    #[test]
+    fn template_card_shows_content_and_files_stay_on_the_client() {
+        let list = json!([{"name":"m.yaml","source":"custom","groups":["PC"]}]);
+        let shown = json!({"name":"m.yaml","source":"builtin","path":null,"content":"mode: rule\nproxies:\n"});
+        let dir = tempfile::tempdir().unwrap();
+        let (fresh, existing, source, binary) = (dir.path().join("new.yaml"), dir.path().join("old.yaml"), dir.path().join("in.yaml"), dir.path().join("bin.yaml"));
+        fs::write(&existing, "IMPORTANT\n").unwrap();
+        fs::write(&source, "mode: global\n").unwrap();
+        fs::write(&binary, [0xff, 0xfe]).unwrap();
+        let path = |p: &PathBuf| p.to_str().unwrap().to_owned();
+        let (fresh_arg, existing_arg, source_arg, binary_arg, dir_arg) = (path(&fresh), path(&existing), path(&source), path(&binary), path(&dir.path().to_path_buf()));
+        let import = ["template", "import", "--name", "m.yaml"];
+        let (core, ui) = drive(vec![
+            ok(&["template", "list"], list.clone()),
+            ok(&["template", "show", "--name", "m.yaml"], shown.clone()),
+            ok(&["template", "list"], list.clone()),
+            ok(&["template", "show", "--name", "m.yaml"], shown.clone()),
+            ok(&["template", "list"], list.clone()),
+            ok(&["template", "show", "--name", "m.yaml"], shown.clone()),
+            ok(&["template", "list"], list.clone()),
+            ok(&["template", "show", "--name", "m.yaml"], shown.clone()),
+            ok(&["template", "list"], list.clone()),
+            ok(&["template", "show", "--name", "m.yaml"], shown),
+            ok(&["template", "list"], list.clone()),
+            step(&import, plan()), yes(&import, json!({"name":"m.yaml"})),
+            ok(&["template", "list"], list.clone()),
+            ok(&["template", "list"], list),
+        ], &["V", "", "X", &fresh_arg, "x", &existing_arg, "n", "X", &existing_arg, "y", "x", &dir_arg, "I", &source_arg, "y", "i", &binary_arg, "0"],
+            |ctx| template_card(ctx, "m.yaml"));
+        let shown = content(view(&ui, "Содержимое: m.yaml"));
+        assert!(shown.contains("встроенный шаблон") && shown.contains("mode: rule") && !shown.contains("null"));
+        assert_eq!(fs::read_to_string(&fresh).unwrap(), "mode: rule\nproxies:\n");
+        assert_eq!(fs::read_to_string(&existing).unwrap(), "mode: rule\nproxies:\n", "overwritten only after consent");
+        let overwrite = ui.views.iter().filter(|v| v.title == "Экспорт шаблона").collect::<Vec<_>>();
+        assert_eq!(overwrite.len(), 2);
+        // Текст до переноса по ширине кадра: длинный путь временного каталога (macOS) переносится.
+        let warning = format!("Файл {existing_arg} будет перезаписан шаблоном m.yaml.");
+        assert!(overwrite[0].context.iter().any(|line| line.to_string() == warning), "{:?}", overwrite[0].context);
+        assert_eq!(notices(&ui, "Шаблон m.yaml сохранён в"), 2);
+        assert_eq!(notices(&ui, &format!("Не удалось записать {dir_arg}")), 1);
+        assert_eq!(notices(&ui, "Файл недоступен или не в UTF-8."), 1);
+        let imports: Vec<_> = core.calls.iter().zip(&core.input_names).filter(|(call, _)| call[..2] == ["template", "import"]).collect();
+        assert_eq!(imports.len(), 2);
+        assert!(imports.iter().all(|(_, names)| *names == &["file".to_owned()]), "the content travels as input.file");
+        assert!(!core.calls.iter().flatten().any(|word| word.contains(dir.path().to_str().unwrap())), "no local path reaches the daemon");
+        assert_eq!(expand_home("~other/path"), PathBuf::from("~other/path"));
+    }
+    #[test]
+    fn template_card_checks_sets_groups_and_deletes() {
+        let list = json!([{"name":"m.yaml","source":"custom","overrides":false,"groups":["PC"]}]);
+        let report = json!({"name":"m.yaml","errors":1,"warnings":1,"truncated":false,"problems":[
+            {"line":1,"column":1,"level":"error","code":"proxies","message":"Нет строки «proxies:»","path":null,"variant":null},
+            {"line":7,"column":3,"level":"warning","code":"schema","message":"bad mode","path":"/mode","variant":"PC"}],
+            "variants":[{"tag":null,"dropped":[]}]});
+        let groups = ["template", "groups", "--name", "m.yaml", "--group", "PC", "--group", "ROUTER"];
+        let delete = ["template", "delete", "--name", "m.yaml"];
+        let (core, ui) = drive(vec![
+            ok(&["template", "list"], list.clone()),
+            ok(&["template", "check", "--name", "m.yaml"], report),
+            ok(&["template", "list"], list.clone()),
+            ok(&["group", "list"], json!([{"name":"PC","template":"m.yaml"},{"name":"ROUTER","template":"default.yaml"}])),
+            step(&groups, plan()), yes(&groups, json!({"name":"m.yaml","assigned":["ROUTER"],"reset":[]})),
+            ok(&["template", "list"], list),
+            step(&delete, plan()), yes(&delete, json!({"name":"m.yaml","groups":["PC","ROUTER"],"builtin":false})),
+        ], &["c", "", "G", "2", "", "y", "D", "y"], |ctx| template_card(ctx, "m.yaml"));
+        let card = &ui.views[0];
+        assert_eq!(keys(card), ["v", "x", "e", "i", "c", "g", "d", "0"].iter().map(|k| (k.to_string(), match *k {
+            "v" | "x" | "c" => ui::CYAN, "e" | "i" | "g" => ui::YELLOW, "d" => ui::RED, _ => ui::NC,
+        })).collect::<Vec<_>>());
+        let check = &ui.views[1];
+        assert_eq!(check.context.iter().map(|line| line.style.fg).collect::<Vec<_>>(), [Some(ui::RED), Some(ui::YELLOW)], "a row per problem by level");
+        assert!(check.context[1].to_string().contains("bad mode") && check.context[1].to_string().contains("PC"), "message and variant tag");
+        let toggle = ui.views.iter().find(|v| v.mode == ui::Mode::Toggle).unwrap();
+        assert!(toggle.sections[0][0].label.starts_with("[x]") && toggle.sections[0][1].label.starts_with("[ ]"), "current groups are checked");
+        assert!(sent(&core, &groups) && sent(&core, &delete));
+        assert_eq!(ui.views.iter().filter(|v| v.prompt.contains("(y/N)")).count(), 2);
+        assert!(ui.inputs.is_empty(), "the card returns to the list after deletion");
+    }
+    #[test]
+    fn template_card_offers_deletion_only_for_custom_and_reports_a_clean_check() {
+        let builtin = json!([{"name":"default.yaml","source":"builtin","overrides":false,"groups":[]}]);
+        let clean = json!({"name":"default.yaml","errors":0,"warnings":0,"truncated":false,"problems":[],"variants":[]});
+        let (core, ui) = drive(vec![
+            ok(&["template", "list"], builtin.clone()),
+            ok(&["template", "list"], builtin.clone()),
+            ok(&["template", "check", "--name", "default.yaml"], clean),
+            ok(&["template", "list"], builtin),
+        ], &["d", "c", "", "0"], |ctx| template_card(ctx, "default.yaml"));
+        assert!(keys(&ui.views[0]).iter().all(|(key, _)| key != "d"));
+        assert!(!core.calls.iter().any(|call| call[1] == "delete"));
+        let clean = ui.views.iter().any(|v| v.context.len() == 1 && v.context[0].style.fg == Some(ui::GREEN));
+        assert!(clean, "a clean check is one green row");
+        let label = |row: Value| {
+            let (_, ui) = drive(vec![ok(&["template", "list"], json!([row]))], &["0"], |ctx| template_card(ctx, "default.yaml"));
+            ui.views[0].sections.iter().flatten().find(|i| i.key == "d").unwrap().label.clone()
+        };
+        let (reset, delete) = (label(json!({"name":"default.yaml","source":"custom","overrides":true,"groups":[]})),
+            label(json!({"name":"default.yaml","source":"custom","overrides":false,"groups":[]})));
+        assert_ne!(reset, delete, "an override is reset, not deleted");
+    }
+    #[test]
+    fn default_template_groups_offer_only_the_other_groups() {
+        let list = json!([{"name":"default.yaml","source":"builtin","overrides":false,"groups":["PC"]}]);
+        let assign = ["template", "groups", "--name", "default.yaml", "--group", "ROUTER"];
+        let (core, ui) = drive(vec![
+            ok(&["template", "list"], list.clone()),
+            ok(&["group", "list"], json!([{"name":"PC","template":"default.yaml"},{"name":"ROUTER","template":"r.yaml"}])),
+            step(&assign, plan()), yes(&assign, json!({"name":"default.yaml","assigned":["ROUTER"],"reset":[]})),
+            ok(&["template", "list"], list),
+        ], &["g", "1", "", "y", "0"], |ctx| template_card(ctx, "default.yaml"));
+        let toggle = ui.views.iter().find(|v| v.mode == ui::Mode::Toggle).unwrap();
+        let offered: Vec<_> = toggle.sections.iter().flatten().filter(|i| i.key != "0").map(|i| i.label.clone()).collect();
+        assert_eq!(offered, ["[ ] ROUTER"], "groups already on default.yaml are not offered");
+        assert!(sent(&core, &assign));
+    }
+    #[test]
+    fn file_input_refuses_large_files_and_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, large) = (dir.path().join("in.yaml"), dir.path().join("large.yaml"));
+        fs::write(&source, "mode: rule\n").unwrap();
+        fs::write(&large, vec![b'a'; files::MAX_INPUT + 1]).unwrap();
+        let (_, ui) = drive(vec![], &[], |ctx| {
+            assert!(file_input(ctx, &source).is_some());
+            assert!(file_input(ctx, &large).is_none());
+            #[cfg(unix)]
+            {
+                let link = dir.path().join("link.yaml");
+                std::os::unix::fs::symlink(&source, &link).unwrap();
+                assert!(file_input(ctx, &link).is_none(), "a link is not followed");
+            }
+            Ok(())
+        });
+        assert_eq!(notices(&ui, "Файл больше 1 МиБ."), 1);
+        assert_eq!(notices(&ui, "Файл недоступен или не в UTF-8."), usize::from(cfg!(unix)));
+    }
+    #[test]
+    fn generation_summary_reads_partial_fields_from_error_and_omits_empty_lines() {
+        let partial = fail("partial", json!({"ok":["a"],"skipped":["s"],"failed":["bad"],"nodes_ok":["de"],"nodes_failed":["ru"],"dir":"/g"}));
+        let (_, ui) = drive(vec![
+            ok(&["group", "list"], group_list()), step(&["generate", "--all"], partial),
+            ok(&["group", "list"], group_list()), ok(&["group", "list"], group_list()),
+            step(&["generate", "--group", "PC"], fail("remote_failed", json!({}))),
+            ok(&["group", "list"], group_list()), ok(&["client", "list"], alice(true)),
+            ok(&["generate", "--client", "alice"], json!({"ok":["alice"],"skipped":[],"failed":[],"nodes_ok":[],"nodes_failed":[],"dir":"/g"})),
+            ok(&["group", "list"], group_list()),
+        ], &["A", "", "g", "1", "C", "1", "", "0"], generation);
+        let results: Vec<_> = ui.views.iter().filter(|v| v.title == "Итог генерации").collect();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].context.len(), 5);
+        assert_eq!(results[0].context.iter().filter(|l| l.style.fg == Some(ui::YELLOW)).count(), 2);
+        assert_eq!(results[1].context.len(), 2);
+        assert!(results.iter().all(|v| v.sections.is_empty()));
+        assert!(content(&ui.views[0]).contains("PC → default.yaml"));
+    }
+    #[test]
+    fn subscription_list_colours_states_without_fake_actions() {
+        let (_, ui) = drive(vec![ok(&["subscription", "list"], json!([
+            {"client":"a","expires_at":"2030-01-01T00:00:00Z","state":"active"},{"client":"e","expires_at":"2020-01-01T00:00:00Z","state":"expired"},
+            {"client":"u","expires_at":null,"state":"unlimited"},{"client":"k","expires_at":"bad","state":"unknown"}]))], &[""], subscription_list);
+        let list = &ui.views[0];
+        assert!(list.sections.is_empty());
+        assert_eq!(list.context.iter().map(|l| l.spans[1].style.fg.unwrap()).collect::<Vec<_>>(), [ui::GREEN, ui::YELLOW, ui::DIM, ui::DIM]);
+        assert!(content(list).contains("u  —  без срока"));
+    }
+    #[test]
+    fn publish_all_summary_is_confirmed_and_reads_failures_from_error() {
+        let (_, ui) = drive(vec![
+            ok(&["subscription", "host"], host()), step(&["subscription", "publish-all"], plan()),
+            yes(&["subscription", "publish-all"], json!({"published":["alice"],"skipped":[],"failed":[],"removed":0})),
+            ok(&["subscription", "host"], host()), step(&["subscription", "publish-all"], plan()),
+            (yes(&["subscription", "publish-all"], Value::Null).0, fail("remote_failed", json!({"published":[],"skipped":[],"failed":["alice"],"removed":0}))),
+            ok(&["subscription", "host"], host()),
+        ], &["U", "y", "", "u", "y", "", "0"], subscriptions);
+        let results: Vec<_> = ui.views.iter().filter(|v| v.title == "Итог публикации подписок").map(content).collect();
+        assert_eq!(results.len(), 2);
+        assert!(results[0].contains("Опубликовано: alice") && !results[0].contains("Удалено"));
+        assert!(results[1].contains("Ошибки: alice"));
+        assert_eq!(ui.views[0].context[0].spans[1].style.fg, Some(ui::GREEN));
+        assert!(content(&ui.views[0]).contains("Хост подписок: sub.de.example:443 (нода de)"));
+        let menu: Vec<_> = keys(&ui.views[0]).into_iter().map(|(key, _)| key).collect();
+        assert_eq!(menu, ["h", "x", "l", "u", "c", "g", "0"]);
+    }
+    fn moved(port: u16) -> Value {
+        json!({"node":"ru","hostname":"sub.example.com","port":port,"base_url":format!("https://sub.example.com:{port}"),"sub_dir":"/var/www/sub","nginx_group":"www-data"})
+    }
+    #[test]
+    fn host_is_set_on_a_profiled_node_and_applies_on_the_new_and_old_node() {
+        let profiled = || ok(&["node", "list"], json!([
+            {"name":"de","ip":"127.0.0.1","port":22,"profile":"edge"},{"name":"bare","ip":"10.0.0.3","port":22,"profile":null},
+            {"name":"ru","ip":"10.0.0.2","port":2222,"profile":"edge"}]));
+        let apply = ["node", "apply", "--name", "ru", "--name", "de"];
+        let apply_ru = ["node", "apply", "--name", "ru"];
+        // `node apply` under the core's plan at once (no own question); the second plan is refused.
+        let (core, ui) = drive(vec![
+            ok(&["subscription", "host"], host()), profiled(),
+            ok(&["subscription", "host", "--name", "ru", "--domain", "sub.example.com"], moved(443)),
+            step(&apply, plan()), yes(&apply, json!({"applied":["ru","de"],"failed":[],"unchanged":[]})),
+            ok(&["subscription", "host"], moved(443)), profiled(),
+            ok(&["subscription", "host", "--name", "ru", "--domain", "sub.example.com", "--port", "8443"], moved(8443)),
+            step(&apply_ru, plan()),
+            ok(&["subscription", "host"], moved(8443)),
+        ], &["h", "2", "sub.example.com", "", "y", "H", "2", "sub.example.com", "8443", "n", "0"], subscriptions);
+        assert!(!sent(&core, &["node", "apply", "--name", "ru", "--yes", "--plan-token", "T"]), "the refused plan applies nothing");
+        assert_eq!(notices(&ui, "Применено: ru, de"), 1);
+        assert!(!content(view(&ui, "Нода хоста подписок")).contains("bare"));
+        assert!(!ui.views.iter().any(|v| v.prompt.contains("сейчас?")), "no question before the core's plan");
+        assert!(ui.views.iter().any(|v| content(v).contains("Хост подписок: sub.example.com:8443 (нода ru)")));
+    }
+    #[test]
+    fn host_removal_is_plan_gated_and_applies_on_the_old_node() {
+        let remove = ["subscription", "host", "--remove"];
+        let apply = ["node", "apply", "--name", "de"];
+        let (core, ui) = drive(vec![
+            ok(&["subscription", "host"], host()), step(&remove, plan()), yes(&remove, Value::Null),
+            step(&apply, plan()), yes(&apply, json!({"applied":["de"],"failed":[],"unchanged":[]})),
+            ok(&["subscription", "host"], Value::Null), ok(&["subscription", "host"], Value::Null),
+        ], &["X", "y", "y", "x", "0"], subscriptions);
+        assert!(sent(&core, &["subscription", "host", "--remove", "--yes", "--plan-token", "T"]));
+        assert_eq!(notices(&ui, "Применено: de"), 1);
+        assert_eq!(notices(&ui, "Неверный выбор."), 1, "no host — nothing to remove");
+        let last = ui.views.last().unwrap();
+        assert!(content(last).contains("Хост подписок не задан"));
+        assert!(!keys(last).iter().any(|(key, _)| key == "x"));
+        // A refused plan removes nothing and offers no apply.
+        let (core, _) = drive(vec![ok(&["subscription", "host"], host()), step(&remove, plan()), ok(&["subscription", "host"], host())],
+            &["x", "n", "0"], subscriptions);
+        assert_eq!(core.calls.len(), 3);
+    }
+    #[test]
+    fn host_key_trust_refusal_never_retries_the_node_command() {
+        let changed = fail("host_key_changed", json!({"host":"127.0.0.1","port":22,"fingerprints":["SHA256:key"]}));
+        let discover = ["conn", "list", "--name", "de", "--discover"];
+        let (_, ui) = drive(vec![
+            step(&discover, changed),
+            step(&["node", "trust-host-key", "--name", "de", "--host-key", "SHA256:key"], plan()),
+        ], &["n"], |ctx| { assert!(node_request(ctx, "de", &discover)?.is_none()); Ok(()) });
+        assert_eq!(notices(&ui, "Операция завершилась ошибкой"), 1);
+    }
+    #[test]
+    fn unknown_keys_and_enter_keep_every_menu() {
+        type Run = fn(&mut Context<'_>) -> io::Result<()>;
+        let cases: Vec<(Vec<Step>, Run)> = vec![
+            (vec![ok(&["client", "list"], json!([]))], clients),
+            (vec![ok(&["group", "list"], json!([]))], groups),
+            (vec![ok(&["template", "list"], json!([]))], templates),
+            (vec![ok(&["group", "list"], json!([]))], generation),
+            (vec![ok(&["subscription", "host"], Value::Null)], subscriptions),
+            (vec![ok(&["client", "list"], alice(false))], |ctx| client_card(ctx, "alice".into())),
+            (vec![ok(&["client", "list"], alice(false)), ok(&["subscription", "host"], host())], |ctx| client_subscription(ctx, "alice")),
+            (vec![ok(&["subscription", "headers", "--client", "alice"], json!([]))], |ctx| headers(ctx, "client", "alice")),
+            (vec![ok(&["group", "list"], group_list())], |ctx| group_card(ctx, "PC")),
+            (vec![ok(&["template", "list"], json!([{"name":"m.yaml","source":"custom","groups":[]}]))], |ctx| template_card(ctx, "m.yaml")),
+        ];
+        for (reads, run) in cases {
+            let steps: Vec<Step> = (0..3).flat_map(|_| reads.clone()).collect();
+            let (_, ui) = drive(steps, &["unknown", "", "0"], run);
+            assert_eq!(notices(&ui, "Неверный выбор."), 2);
+        }
+    }
+    #[test]
+    fn failed_screen_read_offers_explicit_retry_only() {
+        let (core, ui) = drive(vec![step(&["client", "list"], fail("remote_failed", json!({}))), ok(&["client", "list"], json!([]))],
+            &["x", "R", "0"], clients);
+        assert_eq!(core.calls.len(), 2);
+        assert_eq!(keys(&ui.views[0]), [("r".into(), ui::YELLOW), ("0".into(), ui::NC)]);
+        assert_eq!(notices(&ui, "Неверный выбор."), 1);
+    }
+    struct EditorUi { inner: ScriptedUi, replacement: Option<&'static [u8]>, succeeds: bool, suspended: usize, seen: Vec<Vec<u8>> }
+    impl UserInterface for EditorUi {
+        fn input(&mut self, view: &View, hidden: bool) -> io::Result<Option<zeroize::Zeroizing<String>>> { self.inner.input(view, hidden) }
+        fn show(&mut self, view: &View) -> io::Result<()> { self.inner.show(view) }
+        fn notice(&mut self, line: Line<'static>) { self.inner.notice(line) }
+        fn log(&mut self, log: &Log) { self.inner.log(log) }
+        fn suspended(&mut self, command: &mut Command) -> io::Result<std::process::ExitStatus> {
+            self.suspended += 1;
+            let file = PathBuf::from(command.get_args().last().unwrap());
+            self.seen.push(fs::read(&file)?);
+            if let Some(content) = self.replacement { fs::write(file, content)?; }
+            #[cfg(unix)] { use std::os::unix::process::ExitStatusExt; Ok(std::process::ExitStatus::from_raw(if self.succeeds { 0 } else { 256 })) }
+            #[cfg(windows)] { use std::os::windows::process::ExitStatusExt; Ok(std::process::ExitStatus::from_raw(if self.succeeds { 0 } else { 1 })) }
+        }
+    }
+    #[test]
+    fn editor_no_change_and_failure_import_nothing_changes_are_plan_confirmed() {
+        let changed = Some(b"changed".as_slice());
+        for (replacement, succeeds, planned, consent, notice) in [
+            (None, true, false, "", "Изменений нет."), (changed, false, false, "d", "Редактор завершился с ошибкой"),
+            (changed, true, true, "y", ""), (changed, true, true, "n", ""), (changed, true, false, "", ""),
+        ] {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            fs::write(file.path(), b"original").unwrap();
+            let path = file.path().to_str().unwrap();
+            let import = ["template", "import", "--name", "m.yaml"];
+            let mut steps = vec![];
+            if replacement.is_some() && succeeds {
+                if planned {
+                    steps.push(step(&import, plan()));
+                    if consent == "y" { steps.push(yes(&import, json!({"name":"m.yaml"}))); }
+                } else { steps.push(ok(&import, json!({"name":"m.yaml"}))); }
+            }
+            let registry = Registry { screens: vec![], github_wizard: None };
+            let mut core = ScriptedClient::new(steps);
+            let mut ui = EditorUi { inner: ScriptedUi::new(&[consent]), replacement, succeeds, suspended: 0, seen: vec![] };
+            edit_file(&mut Context::for_test(&mut core, &mut ui, &registry), "m.yaml", &["editor".into()], file.path(), b"original").unwrap();
+            assert_eq!(ui.suspended, 1);
+            core.assert_finished();
+            assert!(core.input_names.iter().all(|names| names == &["file".to_owned()]));
+            assert!(!core.calls.iter().flatten().any(|word| word == path), "the working copy path stays local");
+            if !notice.is_empty() { assert_eq!(notices(&ui.inner, notice), 1); }
+            assert_eq!(ui.inner.views.iter().filter(|v| v.prompt.contains("(y/N)")).count(), usize::from(planned));
+        }
+    }
+    /// A rejected import keeps the working copy: `r` reopens it with the
+    /// edits intact, `d` discards it; nothing is lost silently.
+    #[test]
+    fn rejected_import_keeps_the_working_copy_until_retry_or_discard() {
+        for (inputs, retried) in [(&["x", "R"][..], true), (&["d"][..], false), (&[][..], false)] {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            fs::write(file.path(), b"original").unwrap();
+            let path = file.path().to_str().unwrap();
+            let import = ["template", "import", "--name", "m.yaml"];
+            let mut steps = vec![step(&import, fail("invalid", json!({"message": "Шаблон не является UTF-8"})))];
+            if retried { steps.push(ok(&import, json!({"name":"m.yaml"}))); }
+            let registry = Registry { screens: vec![], github_wizard: None };
+            let mut core = ScriptedClient::new(steps);
+            let mut ui = EditorUi { inner: ScriptedUi::new(inputs), replacement: Some(b"changed"), succeeds: true, suspended: 0, seen: vec![] };
+            edit_file(&mut Context::for_test(&mut core, &mut ui, &registry), "m.yaml", &["editor".into()], file.path(), b"original").unwrap();
+            core.assert_finished();
+            assert!(!core.calls.iter().flatten().any(|word| word == path), "the working copy path stays local");
+            assert!(ui.inner.inputs.is_empty());
+            assert_eq!(ui.suspended, 1 + usize::from(retried));
+            if retried { assert_eq!(ui.seen[1], b"changed", "the editor reopens the edited copy"); }
+            assert_eq!(fs::read(file.path()).unwrap(), b"changed");
+            let decision = ui.inner.views.iter().find(|v| v.title.starts_with("Изменения шаблона не сохранены")).expect("decision offered");
+            assert_eq!(keys(decision), [("r".into(), ui::YELLOW), ("d".into(), ui::RED)]);
+            frames(&ui.inner);
+        }
+    }
+    /// A refused plan (overwrite or template problems) is not a discard: the
+    /// working copy stays and can be reopened with the edits.
+    #[test]
+    fn refused_import_plan_keeps_the_working_copy() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(file.path(), b"original").unwrap();
+        let import = ["template", "import", "--name", "m.yaml"];
+        let steps = vec![step(&import, plan()), step(&import, plan()), yes(&import, json!({"name":"m.yaml"}))];
+        let registry = Registry { screens: vec![], github_wizard: None };
+        let mut core = ScriptedClient::new(steps);
+        let mut ui = EditorUi { inner: ScriptedUi::new(&["n", "r", "y"]), replacement: Some(b"changed"), succeeds: true, suspended: 0, seen: vec![] };
+        edit_file(&mut Context::for_test(&mut core, &mut ui, &registry), "m.yaml", &["editor".into()], file.path(), b"original").unwrap();
+        core.assert_finished();
+        assert!(ui.inner.inputs.is_empty());
+        assert_eq!(ui.suspended, 2);
+        assert_eq!(ui.seen[1], b"changed", "the editor reopens the edited copy");
+    }
+    #[test]
+    fn vanished_template_never_opens_the_editor() {
+        let (_, ui) = drive(vec![step(&["template", "show", "--name", "gone.yaml"], fail("not_found", json!({})))], &[], |ctx| edit_template(ctx, "gone.yaml"));
+        assert_eq!(ui.suspensions, 0);
+        assert_eq!(notices(&ui, "Операция завершилась ошибкой"), 1);
+    }
+    #[test]
+    fn editor_argument_parser_handles_quotes_and_rejects_unclosed_quotes() {
+        assert_eq!(editor_words("\"/path with spaces/editor\" --wait 'a b'").unwrap(), ["/path with spaces/editor", "--wait", "a b"]);
+        assert_eq!(editor_words(r#""C:\Program Files\Editor\edit.exe" --wait"#).unwrap(), [r"C:\Program Files\Editor\edit.exe", "--wait"]);
+        assert_eq!(editor_words("code -w").unwrap(), ["code", "-w"]);
+        assert!(editor_words("\"unclosed").is_err());
+        assert!(editor_words("").is_err());
+    }
+    #[test]
+    fn editor_directory_and_file_are_private_and_cleaned_on_drop() {
+        let dir = private_editor_dir().unwrap();
+        let file = tempfile::Builder::new().suffix(".yaml").tempfile_in(dir.path()).unwrap();
+        let path = dir.path().to_owned();
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o700);
+            assert_eq!(file.as_file().metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        drop(file);
+        drop(dir);
+        assert!(!path.exists());
+    }
+    #[test]
+    fn selectors_reject_expressions_and_empty_lists_read_nothing() {
+        let (_, ui) = drive(vec![], &["01", "+1", "1+1", "", "1", "0"], |ctx| {
+            assert_eq!(ctx.toggle("Toggle", &["one".into()], vec![false], EMPTY)?, Some(vec![]));
+            Ok(())
+        });
+        assert_eq!(notices(&ui, "Неверный выбор."), 3);
+        assert_eq!(index("01", 1), None);
+        assert_eq!(index(" 1", 1), None);
+        let (_, ui) = drive(vec![ok(&["group", "list"], json!([]))], &["untouched"], |ctx| {
+            assert!(pick(ctx, "group", "Empty")?.is_none());
+            assert!(ctx.toggle("Empty toggle", &[], vec![], EMPTY)?.is_none());
+            Ok(())
+        });
+        assert_eq!(ui.inputs.len(), 1);
+        assert_eq!(ui.views.len(), 2);
+    }
+}
