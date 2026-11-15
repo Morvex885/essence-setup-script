@@ -127,7 +127,7 @@ enum ReleaseError {
     Shape,
 }
 
-fn metadata_client() -> reqwest::Result<reqwest::Client> {
+pub(crate) fn metadata_client() -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(METADATA_TIMEOUT)
         .connect_timeout(METADATA_CONNECT)

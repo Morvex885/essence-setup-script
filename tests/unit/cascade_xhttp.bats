@@ -82,7 +82,7 @@ EOF
     _apply_dnat_rules node 2001:db8::1 443 8443
     _remove_dnat_rules node 2001:db8::1 443 8443
     [ "$(command grep -c 'ip6tables .*--to-destination \[2001:db8::1\]:443' "$log")" -eq 4 ]
-    ! command grep -q '^iptables ' "$log"
+    ! command grep -q '^iptables ' "$log" || return 1
     : > "$log"
     run _apply_dnat_rules node 2001:db8::1 443 ''
     [ "$status" -ne 0 ]

@@ -30,7 +30,7 @@ pub async fn route<T: RemoteTransport>(noun: &str, verb: &str, invocation: &Invo
     input: &Input, session: &mut Session, connect: &dyn Fn() -> T) -> Result<Value>
 {
     match (noun, verb) {
-        ("generate", _) => generate::generate(session, invocation, connect).await,
+        ("generate", _) => generate::generate(session, invocation),
         ("group", "list") => groups::list(session),
         ("group", "add") => groups::add(session, invocation),
         ("group", "delete") => groups::delete(session, invocation),
@@ -190,7 +190,7 @@ pub(crate) mod testing {
     pub fn node(index: u8, name: &str, ip: &str, port: u16) -> Node {
         Node {
             id: format!("{index:032x}"), name: name.into(), ip: ip.into(), port, user: "root".into(),
-            auth: Auth::Key, identity: None, secret_id: None, tag: None, aliases: Default::default(),
+            auth: Auth::Key, identity: None, secret_id: None, tag: None, aliases: Default::default(), ..Node::default()
         }
     }
 
@@ -206,14 +206,14 @@ pub(crate) mod testing {
             clients: vec![
                 Client {
                     name: "my-router".into(), group: "ROUTER".into(),
-                    credentials: Some(ClientCredentials { vless_uuid: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(), hy2_password: "router-hy2-pass-0001".into() }),
+                    credentials: Some(ClientCredentials { vless_uuid: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(), hy2_password: "router-hy2-pass-0001".into(), ..ClientCredentials::default() }),
                     ..Client::default()
                 },
                 Client {
                     name: "my-pc".into(), group: "PC".into(), inherit_nodes_from_group: false,
                     nodes: Some(vec!["de-vps".into()]),
                     connections: Some(vec![ClientConnection { node: "de-vps".into(), proxies: vec!["vless-reality".into()] }]),
-                    credentials: Some(ClientCredentials { vless_uuid: "11111111-2222-3333-4444-555555555555".into(), hy2_password: "pc-hy2-pass-0002".into() }),
+                    credentials: Some(ClientCredentials { vless_uuid: "11111111-2222-3333-4444-555555555555".into(), hy2_password: "pc-hy2-pass-0002".into(), ..ClientCredentials::default() }),
                     ..Client::default()
                 },
             ],

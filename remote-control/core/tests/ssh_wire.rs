@@ -761,3 +761,26 @@ async fn sftp_preserves_nested_bytes_modes_and_publishes_version_last_without_ro
         fixture.finish().await;
     }).await.expect("SFTP publication scenario exceeded its deadline");
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn private_sftp_upload_creates_owner_only_directories_and_files() {
+    timeout(SCENARIO, async {
+        let fixture = Fixture::start(&key()).await;
+        let ssh = fixture.password().await;
+        let source = tempfile::tempdir().unwrap();
+        fs::create_dir_all(source.path().join("files/etc/mihomo")).unwrap();
+        fs::write(source.path().join("spec.sh"), b"OP_ID='x'\n").unwrap();
+        fs::write(source.path().join("files/etc/mihomo/config.yaml"), b"private-key: k\n").unwrap();
+        let remote = "/node/ops/op";
+        ssh.upload_private(source.path(), remote, WAIT).await.unwrap();
+        let modes = fixture.shared.modes.lock().unwrap().clone();
+        for dir in ["/node", "/node/ops", remote, "/node/ops/op/files", "/node/ops/op/files/etc/mihomo"] {
+            assert_eq!(modes[dir], 0o700, "{dir}");
+        }
+        for file in ["/node/ops/op/spec.sh", "/node/ops/op/files/etc/mihomo/config.yaml"] {
+            assert_eq!(modes[file], 0o600, "{file}");
+        }
+        drop(ssh);
+        fixture.finish().await;
+    }).await.expect("private SFTP upload scenario exceeded its deadline");
+}

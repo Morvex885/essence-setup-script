@@ -7,6 +7,7 @@ import { asList, strings, proxyLabel, unlisted } from '../format.js';
 import { isFailure, retryable } from '../flows.js';
 import { refill } from '../form-model.js';
 import { assignArgv } from './nodeops-model.js';
+import { offersApply, offerApply } from './apply-model.js';
 import {
   DEFAULT_TEMPLATE, generateGroup, generateClient, generateScope,
   PUBLISH_FIELDS, SUBSCRIPTION_PUBLISH_ALL, subscriptionSetHost, subscriptionMigrate, publishSummary,
@@ -293,7 +294,8 @@ export function headersArgv(kind, name, ...tail) {
 // ─── Генерация ──────────────────────────────────────────────────────────────
 
 export const GENERATE_FIELDS = [
-  ['ok', 'Готово'], ['skipped', 'Пропущено'], ['failed', 'Ошибки'], ['nodes_failed', 'Ноды с ошибкой'], ['dir', 'Каталог'],
+  ['ok', 'Готово'], ['skipped', 'Пропущено'], ['failed', 'Ошибки'], ['nodes_failed', 'Ноды с ошибкой'],
+  ['nodes_pending', 'Ноды с неприменёнными изменениями'], ['dir', 'Каталог'],
 ];
 
 /** Данные итога: `data` при успехе, `error` при `partial`, иначе `null`. */
@@ -340,10 +342,14 @@ export const groupTemplateCreateArgv = (template, group) => ['template', 'create
 
 // ─── Действия поверх ctx ────────────────────────────────────────────────────
 
-/** Команда действия; неуспех — предупреждение (`clients.rs::execute`). */
+/**
+ * Команда действия; неуспех — предупреждение (`clients.rs::execute`). После
+ * успешной правки клиентов и подключений — предложение применить (`offerApply`).
+ */
 export async function execute(ctx, argv, options) {
   const reply = await ctx.request(argv, options);
   if (!reply.ok) ctx.failed();
+  else if (offersApply(argv)) await offerApply(ctx);
   return reply;
 }
 
@@ -351,6 +357,7 @@ export async function execute(ctx, argv, options) {
 export async function confirmed(ctx, title, question, argv, options) {
   const reply = await ctx.runConfirmed(title, question, argv, options);
   if (isFailure(reply)) ctx.failed();
+  else if (reply.ok && offersApply(argv)) await offerApply(ctx);
   return reply;
 }
 
@@ -584,6 +591,8 @@ export async function runGenerate(ctx, scope) {
   const data = generateResult(reply);
   if (data === null) { ctx.failed(); return; }
   await showSummary(ctx, 'Итог генерации', data, GENERATE_FIELDS, 'Нет результатов');
+  // Ноды с неприменёнными изменениями (`nodes_pending`) — то же предложение применить.
+  if (strings(data.nodes_pending).length > 0) await offerApply(ctx);
 }
 
 const GENERATE_SCOPES = [

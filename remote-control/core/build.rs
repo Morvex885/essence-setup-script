@@ -6,5 +6,6 @@ fn main() {
     // directory listed here reruns this script and rebuilds `bundle.rs`.
     println!("cargo:rerun-if-changed=../../setup-essence");
     println!("cargo:rerun-if-changed=../../common");
+    println!("cargo:rerun-if-changed=../../node-agent");
     println!("cargo:rustc-env=ESSENCE_RC_VERSION={version}");
 }

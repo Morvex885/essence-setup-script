@@ -1,9 +1,12 @@
 // Модель экранов нод без DOM — перенос логики `tui/src/nodes.rs`
 // (`node_label`, `card_view`, `delete_node`, `add_node_with`, `harden`,
-// `aliases`, `offer_upload`, `interactive`): подписи, состояния, argv команд
-// и потоки добавления и изменения ноды поверх `ctx` (`app.js::makeContext`).
+// `aliases`, `interactive`, профиль, домен и порты ноды): подписи, состояния,
+// argv команд и потоки добавления и изменения ноды поверх `ctx`
+// (`app.js::makeContext`). Применение (`node apply`) — `apply-model.js`.
 import { handleNodeCodes, reviewReply, setFlag, decisionFlag } from '../flows.js';
-import { asList, errorMessage } from '../format.js';
+import { asList } from '../format.js';
+import { applyFlow, applyNamesArgv } from './apply-model.js';
+import { needsDomain, profileRows, domainError, portError as profilePortError } from './profiles-model.js';
 
 /** Строковое значение поля (`nodes.rs::text`): `null`/`undefined` → ''. */
 export function plain(value) {
@@ -50,25 +53,6 @@ export function passwordStatus(node) {
 /** `node shell` / `telegram menu` (`nodes.rs::interactive`). */
 export function interactiveArgv(name, telegram) {
   return telegram ? ['telegram', 'menu', '--name', name] : ['node', 'shell', '--name', name];
-}
-
-/** Предложение загрузки скриптов по состоянию (`nodes.rs::offer_upload`). */
-export function uploadOffer(name, state) {
-  const force = state === 'broken' || state === 'unknown';
-  const conditions = {
-    missing: 'скрипты отсутствуют',
-    outdated: 'скрипты устарели',
-    broken: 'установка повреждена',
-  };
-  const argv = ['node', 'upload-scripts', '--name', name];
-  if (force) argv.push('--force');
-  return {
-    force,
-    title: `Скрипты на ноде: ${name}`,
-    condition: `Состояние: ${conditions[state] || 'версия скриптов неизвестна'}`,
-    label: force ? 'Загрузить скрипты принудительно' : 'Загрузить скрипты',
-    argv,
-  };
 }
 
 /** Варианты удаления из `node show .delete_options[]` (`nodes.rs::delete_node`). */
@@ -120,11 +104,11 @@ export function addNodeArgv(form) {
   const password = form.auth === 'password';
   if (password && !form.password) return { warning: 'Пароль не может быть пустым.' };
   if (!form.tag) return { warning: 'Тег не может быть пустым.' };
-  return {
-    argv: ['node', 'add', '--name', name, '--ip', ip, '--port', port, '--user', user,
-      '--auth', password ? 'password' : 'key', '--tag', form.tag],
-    password: password ? form.password : null,
-  };
+  const argv = ['node', 'add', '--name', name, '--ip', ip, '--port', port, '--user', user,
+    '--auth', password ? 'password' : 'key', '--tag', form.tag];
+  if (form.profile) argv.push('--profile', form.profile);
+  if (form.profile && form.domain) argv.push('--domain', form.domain.trim());
+  return { argv, password: password ? form.password : null };
 }
 
 /**
@@ -210,9 +194,13 @@ export async function addNode(ctx, base, password) {
   }
 }
 
-/** Поля формы добавления (умолчания v1); `values` — прежний ввод без пароля. */
-export function addFields(values = {}) {
-  return [
+/**
+ * Поля формы добавления (умолчания v1); `values` — прежний ввод без пароля,
+ * `profiles` — строки `profile list` (нет профилей — вопроса профиля нет;
+ * домен — только если профиль его требует).
+ */
+export function addFields(values = {}, profiles = []) {
+  const fields = [
     { name: 'name', label: 'Название', type: 'text', placeholder: 'vps-1', value: values.name },
     { name: 'ip', label: 'IP', type: 'text', required: 'IP не указан.', value: values.ip },
     { name: 'port', label: 'SSH-порт', type: 'text', placeholder: '22', value: values.port, validate: portError },
@@ -227,18 +215,33 @@ export function addFields(values = {}) {
     },
     { name: 'password', label: 'Пароль', type: 'secret', required: 'Пароль не может быть пустым.', when: (current) => current.auth === 'password' },
   ];
+  const rows = asList(profiles).filter((row) => row && typeof row.name === 'string');
+  if (rows.length > 0) {
+    const byName = (name) => rows.find((row) => row.name === name);
+    fields.push(
+      { name: 'profile', label: 'Профиль', type: 'select', value: values.profile || '',
+        options: [{ value: '', label: 'Без профиля' }, ...rows.map((row) => ({ value: row.name, label: row.name }))] },
+      { name: 'domain', label: 'Домен ноды', type: 'text', placeholder: 'node.example.com', value: values.domain,
+        required: 'Домен не указан.', validate: domainError, when: (current) => needsDomain(byName(current.profile)) },
+    );
+  }
+  return fields;
 }
 
 /**
  * Добавление ноды одной формой (`nodes.rs::add_node_with`). Сбой добавления
  * открывает форму снова с прежним вводом (кроме пароля); отмена — выход.
+ * Нода с профилем сразу применяется (`node apply --name N` под планом).
  * Сохранённая нода открывается через `go(имя)` — экран вызывает переход,
  * только пока смонтирован. `true` — нода добавлена.
  */
 export async function addNodeFlow(ctx, go) {
+  // Профили — фоновое чтение: сбой не мешает добавить ноду без профиля.
+  const listed = await ctx.request(['profile', 'list'], { quiet: true });
+  const profiles = listed.ok ? profileRows(listed.data) : [];
   let previous = {};
   for (;;) {
-    const values = await ctx.form({ title: ADD_TITLE, fields: addFields(previous), submit: 'Добавить' });
+    const values = await ctx.form({ title: ADD_TITLE, fields: addFields(previous, profiles), submit: 'Добавить' });
     if (values === null) return false;
     previous = { ...values, password: undefined };
     const built = addNodeArgv(values);
@@ -249,6 +252,7 @@ export async function addNodeFlow(ctx, go) {
     const result = await addNode(ctx, built.argv, built.password);
     if (result.status === 'cancel') return false;
     if (result.status === 'ok') {
+      if (values.profile) await applyFlow(ctx, applyNamesArgv([result.name]), result.name);
       go(result.name);
       return true;
     }
@@ -356,49 +360,136 @@ export async function editAliases(ctx, name) {
 
 /** Зависимости `flows.js` из контекста экрана. */
 function deps(ctx) {
-  return { request: (words, options) => ctx.request(words, options), confirm: ctx.confirm, askSecret: ctx.askSecret, notify: ctx.notify };
+  return { request: (words, options) => ctx.request(words, options), confirm: ctx.confirm, askSecret: ctx.askSecret, ask: ctx.ask, notify: ctx.notify };
 }
 
 /**
  * `node shell` / `telegram menu` в оверлее терминала (`nodes.rs::interactive`).
- * Состояния ноды разрешаются и команда повторяется; устаревшие скрипты —
- * предложение загрузки; `conflict` — терминал этой ноды уже открыт.
+ * Состояния ноды разрешаются и команда повторяется; `conflict` — терминал
+ * этой ноды уже открыт. `telegram menu` на ноде с отсутствующими или
+ * устаревшими скриптами отвечает планом загрузки: план показывается
+ * (`reviewReply`), после согласия терминал открывается с `--yes --plan-token`.
  */
 export async function interactive(ctx, name, telegram) {
   const argv = interactiveArgv(name, telegram);
-  const title = telegram ? `Telegram Proxy: ${name}` : `Меню сервера: ${name}`;
+  const title = telegram ? `Telegram Proxy: ${name}` : `Оболочка: ${name}`;
+  const open = (words) => ctx.terminal(words, title, { expect: ['conflict'] });
   for (;;) {
-    const reply = await ctx.terminal(argv, title, { expect: ['conflict', 'invalid'] });
+    const reply = await reviewReply(`Нода: ${name}`, 'Продолжить?', argv, await open(argv),
+      { request: open, confirm: ctx.confirm, notify: ctx.notify });
     if (reply.ok) return;
     if (await handleNodeCodes(reply, name, deps(ctx))) continue;
     if (errorCode(reply) === 'conflict') {
       ctx.notify('warn', 'Терминал этой ноды уже открыт');
       return;
     }
-    if (errorCode(reply) === 'invalid') {
-      if (typeof reply.error.state === 'string') {
-        await offerUpload(ctx, name, reply.error.state);
-        return;
-      }
-      ctx.notify('error', errorMessage(reply));
-    }
     outcome(ctx, reply);
     return;
   }
 }
 
-/** Явная загрузка скриптов (`nodes.rs::offer_upload`); меню заново не открывается. */
-async function offerUpload(ctx, name, state) {
-  const offer = uploadOffer(name, state);
-  const choice = await ctx.choose({
-    title: offer.title,
-    context: [offer.condition],
-    options: [{ value: 'u', label: offer.label }],
-    cancel: 'Назад',
+// ─── Профиль, домен и порты ноды ─────────────────────────────────────────────
+
+export const nodeProfileArgv = (name, profile) => ['node', 'profile', '--name', name, '--profile', profile];
+export const nodeDomainArgv = (name, domain) => ['node', 'domain', '--name', name, '--domain', domain];
+export const nodePortArgv = (name, protocol, port) => ['node', 'port', '--name', name, '--protocol', protocol, '--port', port];
+
+/** Подпись WARP ноды (`node list .warp`: `none|free|plus`). */
+export function warpLabel(node) {
+  return { free: 'бесплатный', plus: 'WARP+' }[node && node.warp] || 'не зарегистрирован';
+}
+
+/**
+ * Протоколы профиля с настраиваемым портом: `{ key, label, port }` — ключ
+ * `node port --protocol` и порт профиля. xHTTP через nginx порта не имеет.
+ */
+export function portProtocols(profile) {
+  if (!profile) return [];
+  const list = [];
+  const port = (block) => (block && block.port !== null && block.port !== undefined ? String(block.port) : '');
+  if (profile.vless_xhttp && profile.vless_xhttp.topology !== 'nginx') list.push({ key: 'vless-xhttp', label: 'VLESS xHTTP', port: port(profile.vless_xhttp) });
+  if (profile.vless_grpc) list.push({ key: 'vless-grpc', label: 'VLESS gRPC', port: port(profile.vless_grpc) });
+  if (profile.hysteria2) list.push({ key: 'hysteria2', label: 'Hysteria2', port: port(profile.hysteria2) });
+  if (profile.amneziawg) list.push({ key: 'amneziawg', label: 'AmneziaWG', port: port(profile.amneziawg) });
+  return list;
+}
+
+/** Переопределение порта на ноде (`node .ports[ключ]`) или `''`. */
+export function nodePort(node, key) {
+  const ports = node && node.ports && typeof node.ports === 'object' ? node.ports : {};
+  return ports[key] === undefined || ports[key] === null ? '' : String(ports[key]);
+}
+
+/** argv изменённых портов: пустое значение убирает переопределение. */
+export function portChanges(name, node, protocols, values) {
+  return asList(protocols)
+    .filter((item) => plain(values[item.key]).trim() !== nodePort(node, item.key))
+    .map((item) => nodePortArgv(name, item.key, plain(values[item.key]).trim()));
+}
+
+/** «Профиль»: выбор профиля или «Без профиля» → `node profile`. `true` — изменено. */
+export async function nodeProfileFlow(ctx, name, node) {
+  const listed = await ctx.request(['profile', 'list']);
+  if (!listed.ok) { ctx.failed(); return false; }
+  const options = [{ value: '', label: 'Без профиля' }, ...profileRows(listed.data).map((row) => ({ value: row.name, label: row.name }))];
+  const current = plain(node.profile);
+  const values = await ctx.form({
+    title: `Профиль ноды: ${name}`,
+    fields: [{ name: 'profile', label: 'Профиль', type: 'select', options, value: current }],
   });
-  if (choice !== 'u') return;
-  const reply = await ctx.nodeRequest(name, offer.argv, { title: 'Загрузка скриптов', question: 'Загрузить скрипты?' });
-  if (reply.ok) ctx.notify('success', 'Скрипты загружены. Откройте меню снова.');
+  if (values === null || values === undefined || values.profile === current) return false;
+  const reply = await ctx.request(nodeProfileArgv(name, values.profile));
+  if (ctx.isFailure(reply)) ctx.failed();
+  return reply.ok;
+}
+
+/** «Домен»: пустое значение снимает домен → `node domain`. `true` — изменено. */
+export async function nodeDomainFlow(ctx, name, node) {
+  const current = plain(node.domain);
+  const values = await ctx.form({
+    title: `Домен ноды: ${name}`,
+    fields: [{ name: 'domain', label: 'Домен', type: 'text', value: current, placeholder: 'node.example.com',
+      hint: 'пусто — без домена', validate: domainError }],
+  });
+  if (values === null || values === undefined) return false;
+  const domain = plain(values.domain).trim();
+  if (domain === current) return false;
+  const reply = await ctx.request(nodeDomainArgv(name, domain));
+  if (ctx.isFailure(reply)) ctx.failed();
+  return reply.ok;
+}
+
+/** «Порты»: поле на протокол профиля с портом; пусто — порт профиля. `true` — что-то изменено. */
+export async function nodePortsFlow(ctx, name, node) {
+  const profile = plain(node.profile);
+  if (!profile) { ctx.notify('warn', 'У ноды нет профиля.'); return false; }
+  const shown = await ctx.request(['profile', 'show', '--name', profile]);
+  if (!shown.ok) { ctx.failed(); return false; }
+  const protocols = portProtocols(shown.data);
+  if (protocols.length === 0) { ctx.notify('info', 'В профиле нет протоколов с настраиваемым портом.'); return false; }
+  const values = await ctx.form({
+    title: `Порты ноды: ${name}`,
+    context: [`Профиль: ${profile}`],
+    fields: protocols.map((item) => ({
+      name: item.key, label: item.label, type: 'text', value: nodePort(node, item.key),
+      placeholder: item.port ? `${item.port} (профиль)` : 'порт профиля', hint: 'пусто — порт профиля', validate: profilePortError,
+    })),
+  });
+  if (values === null || values === undefined) return false;
+  const changes = portChanges(name, node, protocols, values);
+  if (changes.length === 0) { ctx.notify('info', 'Изменений нет.'); return false; }
+  let changed = false;
+  for (const argv of changes) {
+    const reply = await ctx.request(argv);
+    if (!reply.ok) { if (ctx.isFailure(reply)) ctx.failed(); break; }
+    changed = true;
+  }
+  return changed;
+}
+
+/** «Применить»: `node apply --name N` под планом. */
+export function applyNode(ctx, name) {
+  return applyFlow(ctx, applyNamesArgv([name]), name);
 }
 
 /** `node setup-ssh` под планом (`nodes.rs::setup_ssh`). */

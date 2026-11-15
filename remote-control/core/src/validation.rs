@@ -50,14 +50,81 @@ pub fn node_id_valid(value: &str) -> bool {
     value.len() == 32 && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// Node secrets suffixes stored under `node:<id>:<suffix>`.
+pub const NODE_SECRET_SUFFIXES: [&str; 6] =
+    ["ssh-password", "reality-key", "awg-key", "warp-key", "telegram-secret", "telegram-tag"];
+
+/// `node:<32 hex>:<suffix>` for [`NODE_SECRET_SUFFIXES`] or `profile:<name>:warp-license`.
 pub fn secret_id_valid(value: &str) -> bool {
-    value.strip_prefix("node:").and_then(|v| v.strip_suffix(":ssh-password"))
-        .is_some_and(node_id_valid)
+    if let Some(rest) = value.strip_prefix("node:") {
+        return rest.split_once(':').is_some_and(|(id, suffix)| node_id_valid(id) && NODE_SECRET_SUFFIXES.contains(&suffix));
+    }
+    value.strip_prefix("profile:").and_then(|v| v.strip_suffix(":warp-license")).is_some_and(name_valid)
+}
+
+/// The owner of a valid secret ID: `Node(id)` or `Profile(name)`.
+pub enum SecretOwner<'a> { Node(&'a str), Profile(&'a str) }
+
+pub fn secret_owner(value: &str) -> Option<SecretOwner<'_>> {
+    if !secret_id_valid(value) { return None; }
+    if let Some(rest) = value.strip_prefix("node:") {
+        return rest.split_once(':').map(|(id, _)| SecretOwner::Node(id));
+    }
+    value.strip_prefix("profile:").and_then(|v| v.strip_suffix(":warp-license")).map(SecretOwner::Profile)
 }
 
 pub fn secret_id_matches(value: &str, node_id: &str) -> bool {
     node_id_valid(node_id)
         && value.strip_prefix("node:").and_then(|v| v.strip_suffix(":ssh-password")) == Some(node_id)
+}
+
+/// The stored value fits its secret: generated keys keep their encodings
+/// (they are written into server configs), Telegram values are 32 hex, a
+/// WARP+ license is a dash-separated alphanumeric key; SSH passwords are any
+/// non-empty text without NUL.
+pub fn secret_value_valid(id: &str, value: &str) -> bool {
+    match id.rsplit_once(':').map(|(_, suffix)| suffix) {
+        // 32 bytes: unpadded base64url / padded standard base64.
+        Some("reality-key") => value.len() == 43
+            && value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+        Some("awg-key" | "warp-key") => wg_key_valid(value),
+        Some("telegram-secret" | "telegram-tag") => value.len() == 32 && value.bytes().all(|b| b.is_ascii_hexdigit()),
+        Some("warp-license") => warp_license_valid(value),
+        _ => !value.is_empty() && !value.contains('\0'),
+    }
+}
+
+/// A WireGuard key: 32 bytes in padded standard base64 (44 characters).
+pub fn wg_key_valid(value: &str) -> bool {
+    value.len() == 44 && value.ends_with('=')
+        && value.as_bytes()[..43].iter().all(|b| b.is_ascii_alphanumeric() || *b == b'+' || *b == b'/')
+}
+
+/// A WARP+ license key: letters, digits and dashes, up to 64 characters.
+pub fn warp_license_valid(value: &str) -> bool {
+    (1..=64).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+/// An IP address with an optional `/prefix` (WARP interface addresses).
+pub fn ip_with_prefix_valid(value: &str, v6: bool) -> bool {
+    let (address, prefix) = match value.split_once('/') {
+        Some((address, prefix)) => (address, Some(prefix)),
+        None => (value, None),
+    };
+    let (parsed, max) = if v6 {
+        (address.parse::<std::net::Ipv6Addr>().is_ok(), 128)
+    } else {
+        (address.parse::<std::net::Ipv4Addr>().is_ok(), 32)
+    };
+    parsed && prefix.is_none_or(|prefix| !prefix.starts_with('+') && prefix.parse::<u8>().is_ok_and(|bits| bits <= max))
+}
+
+/// DNS servers: IP addresses separated by commas (spaces after commas allowed).
+pub fn dns_list_valid(value: &str) -> bool {
+    !value.is_empty() && value.split(',').all(|item| {
+        let item = item.strip_prefix(' ').unwrap_or(item);
+        item.parse::<std::net::IpAddr>().is_ok()
+    })
 }
 
 /// Empty tags are valid; required-tag creation policy belongs to the command.
@@ -108,6 +175,22 @@ pub fn hy2_password_valid(value: &str) -> bool {
 pub fn subscription_token_valid(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
+
+/// `acme_email_valid` (common/cert.sh): `^[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$`.
+pub fn acme_email_valid(value: &str) -> bool {
+    let Some((local, domain)) = value.split_once('@') else { return false; };
+    let label = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    !local.is_empty() && local.bytes().all(|b| b.is_ascii_alphanumeric() || b"._%+-".contains(&b))
+        && domain.contains('.') && domain.split('.').all(label)
+}
+
+/// DNS name: 1–253 characters, labels `[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?`, at least one dot.
+pub fn domain_valid(value: &str) -> bool {
+    let label = |part: &str| (1..=63).contains(&part.len())
+        && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && !part.starts_with('-') && !part.ends_with('-');
+    (1..=253).contains(&value.len()) && value.contains('.') && value.split('.').all(label)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,6 +237,39 @@ mod tests {
         assert!(!github_repo_valid("owner/repo/extra"));
         assert!(github_branch_valid("/a//../b"));
         assert!(!github_branch_valid("branch@{1}"));
+    }
+
+    #[test]
+    fn secret_ids_cover_node_roles_and_profile_licenses() {
+        let id = "ab".repeat(16);
+        for suffix in NODE_SECRET_SUFFIXES {
+            assert!(secret_id_valid(&format!("node:{id}:{suffix}")), "{suffix}");
+        }
+        assert!(secret_id_valid("profile:main-1:warp-license"));
+        for bad in [format!("node:{id}:other"), format!("node:{id}"), "node:abc:ssh-password".into(),
+            "profile::warp-license".into(), "profile:a b:warp-license".into(), "profile:a:b:warp-license".into(),
+            "profile:main:ssh-password".into(), format!("node:{id}:reality-key\n")] {
+            assert!(!secret_id_valid(&bad), "{bad}");
+        }
+        assert!(matches!(secret_owner(&format!("node:{id}:awg-key")), Some(SecretOwner::Node(owner)) if owner == id));
+        assert!(matches!(secret_owner("profile:main:warp-license"), Some(SecretOwner::Profile("main"))));
+        assert!(!secret_id_matches(&format!("node:{id}:reality-key"), &id), "only the SSH password links a node");
+    }
+
+    #[test]
+    fn acme_emails_and_domains_follow_the_bash_rules() {
+        for good in ["a@b.co", "first.last+tag%x_y-z@mail-1.example.org"] { assert!(acme_email_valid(good), "{good}"); }
+        for bad in ["", "a@b", "@b.co", "a@@b.co", "a@b..co", "a@.b.co", "a b@c.de", "a@b_c.de", "a@b.co\n"] {
+            assert!(!acme_email_valid(bad), "{bad}");
+        }
+        for good in ["a.b", "sub-1.example.com", "1.2.3.4", &format!("{}.{}", "a".repeat(63), "b".repeat(63))] {
+            assert!(domain_valid(good), "{good}");
+        }
+        let long = format!("{}.com", ["a".repeat(62), "a".repeat(62), "a".repeat(62), "a".repeat(62)].join("."));
+        assert_eq!(long.len(), 255);
+        for bad in ["", "localhost", "-a.b", "a-.b", "a..b", ".a.b", "a.b.", "a_b.c", "é.com", &format!("{}.b", "a".repeat(64)), &long] {
+            assert!(!domain_valid(bad), "{bad}");
+        }
     }
 
     #[test]

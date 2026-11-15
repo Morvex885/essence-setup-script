@@ -200,6 +200,7 @@ impl Draft<'_> {
             key.store(state)?;
         }
         config.nodes.push(self.node.clone());
+        crate::server::keys::ensure_generated(state, &mut config)?;
         state.save_config(&config)?;
         if !issues.is_empty() {
             let mut manifest = state.load_manifest()?;
@@ -268,6 +269,14 @@ pub async fn add<T: RemoteTransport>(session: &mut Session, invocation: &Invocat
     if !node_tag_valid(tag) {
         return Err(invalid(format!("Недопустимый тег «{tag}»: до 32 символов, без управляющих символов и ;\"'`$\\|&<>{{}}[]#,:/.")));
     }
+    let profile = invocation.value("profile").filter(|profile| !profile.is_empty());
+    if let Some(profile) = profile.filter(|profile| config.find_profile(profile).is_none()) {
+        return Err(RcError::new("not_found", format!("Профиль «{profile}» не найден.")).with_extra("name", profile));
+    }
+    let domain = invocation.value("domain").filter(|domain| !domain.is_empty());
+    if let Some(domain) = domain.filter(|domain| !crate::validation::domain_valid(domain)) {
+        return Err(invalid(format!("Недопустимый домен «{domain}».")));
+    }
     let pins = session.state.load_known_hosts()?.0.get(&endpoint_key(ip, port)?).cloned().unwrap_or_default();
 
     if let HostKeyMode::Replace(fingerprint) = &mode {
@@ -288,6 +297,7 @@ pub async fn add<T: RemoteTransport>(session: &mut Session, invocation: &Invocat
             identity: (auth == Auth::Key).then(|| "system".to_owned()),
             secret_id: (auth == Auth::Password).then(|| format!("node:{id}:ssh-password")),
             tag: Some(tag.to_owned()), aliases: Default::default(),
+            profile: profile.map(str::to_owned), domain: domain.map(str::to_owned), ..Node::default()
         },
         password: password.filter(|_| auth == Auth::Password),
         github,
@@ -474,6 +484,7 @@ mod tests {
         assert_eq!(config.nodes, vec![Node {
             id: id.clone(), name: "de".into(), ip: IP.into(), port: 22, user: "root".into(), auth: Auth::Password,
             identity: None, secret_id: Some(format!("node:{id}:ssh-password")), tag: Some("DE".into()), aliases: Default::default(),
+            ..Node::default()
         }]);
         assert_eq!(session.state.secret_store().get(&format!("node:{id}:ssh-password")).unwrap().as_deref().map(String::as_str), Some("s3cret"));
         assert!(session.state.load_manifest().unwrap().portability.issues.is_empty());

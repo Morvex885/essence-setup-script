@@ -133,12 +133,10 @@ impl State {
     }
 
     pub fn load_config(&self) -> Result<Config> {
-        let config = match read_optional(self.paths.config())? {
-            Some(bytes) => serde_json::from_slice(&bytes)?,
-            None => Config::default(),
-        };
-        config.validate()?;
-        Ok(config)
+        match read_optional(self.paths.config())? {
+            Some(bytes) => Config::parse(&bytes),
+            None => Ok(Config::default()),
+        }
     }
 
     /// Validate and serialize before acquiring the mutation lock or creating files.

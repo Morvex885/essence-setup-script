@@ -20,6 +20,7 @@ import { recoveryRun } from './screens/system-model.js';
 const MENU = [
   { name: 'summary', route: null, label: 'Сводка', icon: 'layout-dashboard' },
   { name: 'nodes', label: 'Ноды', icon: 'server' },
+  { name: 'profiles', label: 'Профили нод', icon: 'layers' },
   { name: 'clients', label: 'Клиенты', icon: 'users' },
   { name: 'groups', label: 'Группы', icon: 'folders' },
   { name: 'templates', label: 'Шаблоны', icon: 'file-code' },
@@ -488,8 +489,9 @@ function silent(reply, expect) {
  *   снэкбара; `operation` — заголовок окна операции со строками журнала;
  * - `confirm`, `askSecret`, `ask`, `choose`, `form`, `show`, `operation` — диалоги;
  *   `dialogOpen()` — открыто ли окно (горячие клавиши экрана поверх окон молчат);
- * - `runConfirmed(title, question, argv, { secrets, input })`,
- *   `nodeRequest(name, argv, review, { expect })` — `flows.js` с этим контекстом;
+ * - `runConfirmed(title, question, argv, { secrets, input, expect, operation })`,
+ *   `nodeRequest(name, argv, review, { expect, operation })` — `flows.js` с этим
+ *   контекстом (`operation` — окно операции у подтверждённого запуска);
  * - `failed()` — «Операция завершилась ошибкой…» для отказов без текста ядра;
  * - `navigate(name, param, tab)`, `href(name, param, tab)`, `terminal(argv, title)` →
  *   ответ после закрытия оверлея (`{ expect }` — как у `request`), `wizard(mode)` →
@@ -534,11 +536,11 @@ function makeContext({ connection, dialogs, notify, record, hello, status, win, 
     call: (...words) => ctx.request(words),
     failed: () => notify('warn', 'Операция завершилась ошибкой. Повторите действие из меню.'),
     isFailure,
-    runConfirmed: (title, question, argv, { secrets, input } = {}) => runConfirmed(title, question, argv, {
-      request: (words, opts) => ctx.request(words, opts), confirm: dialogs.confirm, notify, secrets, input,
+    runConfirmed: (title, question, argv, { secrets, input, expect = null, operation = null } = {}) => runConfirmed(title, question, argv, {
+      request: (words, opts) => ctx.request(words, opts), confirm: dialogs.confirm, notify, secrets, input, expect, operation,
     }),
     nodeRequest: (name, argv, review = null, options = {}) => nodeRequest(name, argv, review, {
-      request: (words, opts) => ctx.request(words, opts), confirm: dialogs.confirm, askSecret: dialogs.askSecret, notify,
+      request: (words, opts) => ctx.request(words, opts), confirm: dialogs.confirm, askSecret: dialogs.askSecret, ask: dialogs.ask, notify,
     }, options),
     navigate: (name, param = null, tab = null) => router.navigate(win, name === 'summary' ? '' : name, param, tab),
     href,

@@ -28,6 +28,9 @@ pub struct Hy2Listener<'a> {
     pub password: &'a str,
     pub proxy: &'a str,
     pub obfs_password: &'a str,
+    /// Certificate and key paths; empty — the self-signed `/etc/mihomo/certs/hy2` pair.
+    pub certificate: &'a str,
+    pub private_key: &'a str,
 }
 
 fn push_obfs(out: &mut String, obfs_password: &str) {
@@ -45,8 +48,8 @@ pub fn listener_yaml(listener: &Hy2Listener) -> String {
         listener.name, listener.port, listener.user, yaml_escape(listener.password)
     );
     push_obfs(&mut out, listener.obfs_password);
-    line(&mut out, "    certificate: /etc/mihomo/certs/hy2/server.crt");
-    line(&mut out, "    private-key: /etc/mihomo/certs/hy2/server.key");
+    line(&mut out, &format!("    certificate: {}", or(listener.certificate, "/etc/mihomo/certs/hy2/server.crt")));
+    line(&mut out, &format!("    private-key: {}", or(listener.private_key, "/etc/mihomo/certs/hy2/server.key")));
     line(&mut out, &format!("    proxy: {}", listener.proxy));
     out
 }

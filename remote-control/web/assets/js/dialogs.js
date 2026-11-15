@@ -256,10 +256,16 @@ function FormControl({ field, value, onChange, invalid, ids }) {
     case 'textarea':
       return html`<textarea ...${common} class="textarea code ${invalid ? 'textarea-error' : ''}" rows="8"
         placeholder=${field.placeholder || ''} value=${value} onInput=${(event) => onChange(event.target.value)}></textarea>`;
-    default:
-      return html`<input ...${common} class="input input-sm ${invalid ? 'input-error' : ''}"
+    default: {
+      const input = html`<input ...${common} class="input input-sm ${invalid ? 'input-error' : ''}"
         type=${field.type === 'secret' ? 'password' : 'text'} autocomplete="off" placeholder=${field.placeholder || ''}
         value=${value} onInput=${(event) => onChange(event.target.value)} />`;
+      // `action: { label, value() }` — кнопка рядом с текстовым полем, подставляющая значение.
+      if (!field.action || field.type === 'secret') return input;
+      return html`<div class="row">${input}
+        <${Button} kind="ghost" onClick=${() => onChange(field.action.value())}>${field.action.label}<//>
+      </div>`;
+    }
   }
 }
 

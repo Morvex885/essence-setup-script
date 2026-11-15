@@ -151,7 +151,12 @@ impl RemoteSession for SshTransport {
 
     async fn upload(&self, local_dir: &Path, remote_dir: &str, timeout: Duration) -> Result<()> {
         let connection = self.connection.as_ref().ok_or_else(|| remote_failure("not_connected"))?;
-        upload(connection, local_dir, remote_dir, timeout).await
+        upload(connection, local_dir, remote_dir, timeout, false).await
+    }
+
+    async fn upload_private(&self, local_dir: &Path, remote_dir: &str, timeout: Duration) -> Result<()> {
+        let connection = self.connection.as_ref().ok_or_else(|| remote_failure("not_connected"))?;
+        upload(connection, local_dir, remote_dir, timeout, true).await
     }
 }
 
@@ -161,7 +166,11 @@ impl RemoteSession for HeldSession {
     }
 
     async fn upload(&self, local_dir: &Path, remote_dir: &str, timeout: Duration) -> Result<()> {
-        upload(&self.connection, local_dir, remote_dir, timeout).await
+        upload(&self.connection, local_dir, remote_dir, timeout, false).await
+    }
+
+    async fn upload_private(&self, local_dir: &Path, remote_dir: &str, timeout: Duration) -> Result<()> {
+        upload(&self.connection, local_dir, remote_dir, timeout, true).await
     }
 }
 
@@ -611,7 +620,8 @@ fn remote_type(metadata: &FileAttributes) -> u32 {
     metadata.permissions.unwrap_or_default() & 0o170000
 }
 
-async fn ensure_remote_dir(session: &RawSftpSession, path: &str) -> Result<()> {
+/// Create missing directories of `path`; `private` ones get mode 0700.
+async fn ensure_remote_dir(session: &RawSftpSession, path: &str, private: bool) -> Result<()> {
     let mut current = if path.starts_with('/') { String::from("/") } else { String::new() };
     for part in path.split('/').filter(|part| !part.is_empty() && *part != ".") {
         if !current.is_empty() && current != "/" { current.push('/'); }
@@ -620,7 +630,8 @@ async fn ensure_remote_dir(session: &RawSftpSession, path: &str) -> Result<()> {
             Some(metadata) if remote_type(&metadata) == 0o040000 => {}
             Some(_) => return Err(remote_failure("remote_path_conflict")),
             None => {
-                if let Err(error) = session.mkdir(current.as_str(), FileAttributes::empty()).await {
+                let attrs = if private { FileAttributes { permissions: Some(0o700), ..Default::default() } } else { FileAttributes::empty() };
+                if let Err(error) = session.mkdir(current.as_str(), attrs).await {
                     // Another uploader may have created the directory meanwhile.
                     if !remote_metadata(session, &current).await?
                         .is_some_and(|metadata| remote_type(&metadata) == 0o040000) {
@@ -654,7 +665,7 @@ impl Drop for UploadSession {
     }
 }
 
-async fn upload(connection: &Connection, local_dir: &Path, remote_dir: &str, timeout: Duration) -> Result<()> {
+async fn upload(connection: &Connection, local_dir: &Path, remote_dir: &str, timeout: Duration, private: bool) -> Result<()> {
     if !remote_path_valid(remote_dir) { return Err(unsafe_path()); }
     timeout_at(Instant::now() + timeout, async {
         let entries = scan_local(local_dir).await?;
@@ -684,11 +695,11 @@ async fn upload(connection: &Connection, local_dir: &Path, remote_dir: &str, tim
         session.set_limits(limits);
         let mut upload = UploadSession { session: Arc::new(session), temporary: None };
         let result = async {
-        ensure_remote_dir(&upload.session, remote_dir).await?;
+        ensure_remote_dir(&upload.session, remote_dir, private).await?;
         for entry in entries {
             let target = join_remote(remote_dir, &entry.relative);
             if entry.directory {
-                ensure_remote_dir(&upload.session, &target).await?;
+                ensure_remote_dir(&upload.session, &target, private).await?;
                 continue;
             }
             if remote_metadata(&upload.session, &target).await?
@@ -701,7 +712,7 @@ async fn upload(connection: &Connection, local_dir: &Path, remote_dir: &str, tim
                 publish_version(&upload.session, temp, &target, posix_rename).await?;
                 upload.temporary = None;
             } else {
-                write_remote_file(&upload.session, &entry, &target, limits).await?;
+                write_remote_file(&upload.session, &entry, &target, limits, private).await?;
             }
         }
         Ok(())
@@ -760,10 +771,14 @@ async fn stage_version(upload: &mut UploadSession, entry: &LocalEntry, remote_di
 }
 
 async fn write_remote_file(session: &RawSftpSession, entry: &LocalEntry, target: &str,
-    limits: Limits) -> Result<()>
+    limits: Limits, private: bool) -> Result<()>
 {
     let local = open_local_file(&entry.local).await?;
-    let mode = if entry.relative.ends_with(".sh") { 0o755 } else { 0o644 };
+    let mode = match (private, entry.relative.ends_with(".sh")) {
+        (true, _) => 0o600,
+        (false, true) => 0o755,
+        (false, false) => 0o644,
+    };
     let attrs = FileAttributes { permissions: Some(mode), ..Default::default() };
     let handle = session.open(target, OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE,
         attrs.clone()).await.map_err(sftp_error)?.handle;

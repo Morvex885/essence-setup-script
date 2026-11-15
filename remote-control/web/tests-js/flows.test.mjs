@@ -3,7 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  decisionFlag, setFlag, clearFlag, runConfirmed, reviewReply, nodeRequest,
+  decisionFlag, setFlag, clearFlag, runConfirmed, reviewReply, nodeRequest, setNodeDomain,
   handleNodeCodes, PLAN_KEEPS_CHANGING, PLAN_CHANGED, BROKEN_PLAN, NODE_CODES, OPERATION_FAILED, screenDialogs, retryable,
 } from '../assets/js/flows.js';
 
@@ -318,4 +318,51 @@ test('retryable: сбой без изменений — да; успех, отк
   for (const reply of [{ ok: true, data: null }, failed('confirmation_required'), failed('plan_changed'), failed('partial')]) {
     assert.equal(retryable(reply), false, JSON.stringify(reply));
   }
+});
+
+test('handleNodeCodes domain_required у node apply --name: node domain и повтор', async () => {
+  const words = ['node', 'apply', '--name', 'de'];
+  const engine = scripted([
+    { argv: words, reply: { ok: false, error: { code: 'domain_required', name: 'de' } } },
+    { argv: ['node', 'domain', '--name', 'de', '--domain', 'de.example.com'], reply: ok() },
+    { argv: words, reply: ok() },
+  ]);
+  const asked = [];
+  const result = await nodeRequest('de', words, null, {
+    request: engine.request, confirm: async () => true, askSecret: async () => null,
+    ask: async (props) => { asked.push(props); return ' de.example.com '; },
+  });
+  assert.equal(result.ok, true);
+  assert.equal(asked.length, 1);
+  engine.assertDone();
+  // Отказ от ввода — без повтора.
+  const refused = scripted([{ argv: words, reply: { ok: false, error: { code: 'domain_required', name: 'de' } } }]);
+  const again = await nodeRequest('de', words, null, { request: refused.request, confirm: async () => true, ask: async () => null });
+  assert.equal(again.error.code, 'domain_required');
+  refused.assertDone();
+});
+
+test('setNodeDomain: пустой ввод и пустое имя — без запроса', async () => {
+  const engine = scripted([{ argv: ['node', 'domain', '--name', 'de', '--domain', 'de.example.com'], reply: ok() }]);
+  assert.equal(await setNodeDomain('de', { request: engine.request, ask: async () => '  ' }), false);
+  assert.equal(await setNodeDomain('', { request: engine.request, ask: async () => 'de.example.com' }), false);
+  assert.equal(await setNodeDomain('de', { request: engine.request, ask: async () => 'de.example.com' }), true);
+  engine.assertDone();
+});
+
+test('nodeRequest под планом: expect и operation — expect у обоих запросов, operation только у подтверждённого', async () => {
+  const words = ['node', 'apply', '--name', 'de'];
+  const sent = [];
+  const replies = [plan('confirmation_required', 't'), { ok: false, error: { code: 'partial', failed: [] } }];
+  const notices = [];
+  const result = await nodeRequest('de', words, { title: 'T', question: 'Q?' }, {
+    request: async (argv, options) => { sent.push([argv, options]); return replies.shift(); },
+    confirm: async () => true, notify: (level, text) => notices.push([level, text]),
+  }, { expect: ['partial'], operation: 'Применение' });
+  assert.equal(result.error.code, 'partial');
+  assert.deepEqual(sent[0][1].expect, ['partial']);
+  assert.equal(sent[0][1].operation, undefined);
+  assert.deepEqual(sent[1][0], [...words, '--yes', '--plan-token', 't']);
+  assert.equal(sent[1][1].operation, 'Применение');
+  assert.deepEqual(notices, []);
 });

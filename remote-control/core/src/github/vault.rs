@@ -34,7 +34,7 @@ use crate::validation as v;
 
 /// Current snapshot format and the oldest essence-rc that reads it.
 pub const FORMAT: u64 = 1;
-pub const FORMAT_MIN_VERSION: &str = "2.0.0";
+pub const FORMAT_MIN_VERSION: &str = "2.1.0";
 
 /// Registered format migrations `(from, step)`; none exist for format 1.
 const MIGRATIONS: &[(u64, fn(Value) -> Option<Value>)] = &[];
@@ -43,7 +43,7 @@ const READ_STAGE: &str = "чтение конфигурации GitHub";
 const FORMAT_STAGE: &str = "проверка формата конфигурации GitHub";
 const TREE_STAGE: &str = "проверка файлов репозитория GitHub";
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Snapshot {
     pub vault_version: u64,
@@ -54,9 +54,13 @@ pub struct Snapshot {
     pub secrets: PortableSecrets,
     pub templates: BTreeMap<String, VaultTemplate>,
     pub ssh: VaultSsh,
+    /// Owned secrets (other than SSH passwords) this machine could not
+    /// decrypt; `checkpoint` keeps their previous vault values. Never written.
+    #[serde(skip)]
+    pub unreadable: Vec<String>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PortableSecrets {
     pub schema_version: u32,
@@ -71,14 +75,14 @@ pub struct VaultTemplate {
     pub sha256: String,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VaultSsh {
     pub identities: BTreeMap<String, VaultIdentity>,
     pub known_hosts: KnownHosts,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VaultIdentity {
     pub private: Zeroizing<String>,
@@ -117,6 +121,15 @@ fn version_gt(left: &str, right: &str) -> bool {
     }
 }
 
+/// A portable secret belongs to an existing node or profile.
+fn secret_owned(config: &Config, id: &str) -> bool {
+    match v::secret_owner(id) {
+        Some(v::SecretOwner::Node(node)) => config.nodes.iter().any(|candidate| candidate.id == node),
+        Some(v::SecretOwner::Profile(name)) => config.find_profile(name).is_some(),
+        None => false,
+    }
+}
+
 impl Snapshot {
     pub fn counts(&self) -> Value {
         json!({"nodes": self.config.nodes.len(), "clients": self.config.clients.len(), "groups": self.config.groups.len()})
@@ -129,7 +142,7 @@ impl Snapshot {
         check(v::version_valid(&self.minimum_remote_control_version))?;
         self.config.validate().map_err(|_| invalid_format())?;
         for (id, password) in &self.secrets.node_passwords {
-            check(v::secret_id_valid(id) && !password.is_empty() && !password.contains('\0'))?;
+            check(secret_owned(&self.config, id) && v::secret_value_valid(id, password))?;
         }
         let issues = &self.portability.issues;
         check(Portability::from_issues(issues.clone()) == self.portability)?;
@@ -206,6 +219,9 @@ pub fn upgrade(mut raw: Value, migrate: bool) -> Result<Snapshot> {
         raw = step.and_then(|step| step(raw.clone())).ok_or_else(|| format_error("invalid", format!(
             "Не удалось преобразовать конфигурацию GitHub из формата v{version}."), Some(version), None))?;
         current += 1;
+    }
+    if let Some(config) = raw.get_mut("config") {
+        Config::upgrade_value(config);
     }
     let snapshot: Snapshot = serde_json::from_value(raw).map_err(|_| invalid_format())?;
     snapshot.validate()?;
@@ -291,6 +307,22 @@ pub fn serialize(state: &State) -> Result<Snapshot> {
             issue(PortabilityReason::MissingHostKey);
         }
     }
+    // Every other machine secret of an existing node or profile travels too.
+    // One this machine cannot decrypt (lost machine key) is not dropped from
+    // the vault: `checkpoint` keeps its previous value. Unlike an SSH password
+    // it cannot be entered again, and the vault may hold the only copy.
+    let mut unreadable = Vec::new();
+    for id in store.ids()? {
+        if !secret_owned(&config, &id) || id.ends_with(":ssh-password") {
+            continue;
+        }
+        match store.get(&id) {
+            Ok(Some(secret)) => { passwords.insert(id, secret); }
+            Ok(None) => {}
+            Err(error) if error.code == "missing_secret" => unreadable.push(id),
+            Err(error) => return Err(error),
+        }
+    }
     let mut templates = BTreeMap::new();
     for name in yaml_names(state.paths().templates())? {
         let content = read_text(&state.paths().templates().join(&name))?.unwrap_or_default();
@@ -306,6 +338,7 @@ pub fn serialize(state: &State) -> Result<Snapshot> {
         secrets: PortableSecrets { schema_version: 2, node_passwords: passwords },
         templates,
         ssh: VaultSsh { identities, known_hosts },
+        unreadable,
     };
     snapshot.validate()?;
     Ok(snapshot)
@@ -322,6 +355,7 @@ pub fn empty_snapshot() -> Snapshot {
         secrets: PortableSecrets { schema_version: 2, node_passwords: BTreeMap::new() },
         templates: BTreeMap::new(),
         ssh: VaultSsh::default(),
+        unreadable: Vec::new(),
     }
 }
 
@@ -732,10 +766,41 @@ pub fn read_recipient(worktree: &Path) -> Result<String> {
 
 // ─── Worktree checkpoint and read ────────────────────────────────────────────
 
+/// `snapshot` with the previous vault values of its unreadable secrets, or
+/// `None` when there is nothing to carry (no unreadable secret, no previous
+/// snapshot, or the previous one lacks them as well).
+fn carry_unreadable(worktree: &Path, keys: Option<&Keys>, snapshot: &Snapshot) -> Result<Option<Snapshot>> {
+    if snapshot.unreadable.is_empty() || read_optional(&worktree.join("storage.json"))?.is_none() {
+        return Ok(None);
+    }
+    let previous = read_storage(worktree).and_then(|storage| read_raw(worktree, storage, keys)).map_err(|error| {
+        fail("сохранение снимка конфигурации GitHub", format!(
+            "Секреты, которые это устройство не может расшифровать, сохранились бы только в прежнем снимке, \
+             но его не удалось прочитать: {}", error.message))
+    })?;
+    let mut merged = snapshot.clone();
+    for id in &snapshot.unreadable {
+        if let Some(value) = previous["secrets"]["node_passwords"][id.as_str()].as_str() {
+            merged.secrets.node_passwords.insert(id.clone(), Zeroizing::new(value.to_owned()));
+        }
+    }
+    Ok((merged.secrets.node_passwords.len() != snapshot.secrets.node_passwords.len()).then_some(merged))
+}
+
 /// v1 `github_config_checkpoint`: write the snapshot into the worktree in the
 /// repository's storage mode, creating `storage.json` on first use. Nothing
-/// is committed here.
+/// is committed here. Secrets this machine could not decrypt
+/// (`snapshot.unreadable`) keep their values from the snapshot already in
+/// the worktree; if that snapshot cannot be read, nothing is written.
 pub fn checkpoint(worktree: &Path, storage: Storage, keys: Option<&Keys>, snapshot: &Snapshot) -> Result<()> {
+    let carried;
+    let snapshot = match carry_unreadable(worktree, keys, snapshot)? {
+        Some(merged) => {
+            carried = merged;
+            &carried
+        }
+        None => snapshot,
+    };
     snapshot.validate()?;
     validate_tree(worktree, TreeMode::Auto)?;
     let created_storage = read_optional(&worktree.join("storage.json"))?.is_none();
@@ -1135,6 +1200,102 @@ mod tests {
         let on_disk = fs::read_to_string(runtime.paths().secrets()).unwrap();
         assert!(!on_disk.contains("fixture-secret-xyz"), "runtime passwords stay machine-encrypted");
         assert_eq!(fs::read_to_string(runtime.paths().templates().join("default.yaml")).unwrap(), "proxies: []\n");
+    }
+
+    #[test]
+    fn every_node_and_profile_secret_travels_and_orphans_stay_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = State::new(StatePaths::new(dir.path().join("data")));
+        let id = "c".repeat(32);
+        let mut config = Config::default();
+        config.profiles.push(crate::model::test_profile("main"));
+        config.nodes.push(serde_json::from_value(json!({
+            "id": id, "name": "n1", "ip": "10.0.0.1", "port": 22, "user": "root", "auth": "key",
+            "identity": null, "secret_id": null, "profile": "main"
+        })).unwrap());
+        local.save_config(&config).unwrap();
+        let carried = ["reality-key", "awg-key", "warp-key", "telegram-secret", "telegram-tag"]
+            .map(|suffix| format!("node:{id}:{suffix}")).into_iter()
+            .chain(["profile:main:warp-license".to_owned()]).collect::<Vec<_>>();
+        let store = local.secret_store();
+        let value = |secret: &str| match secret.rsplit_once(':').map(|(_, suffix)| suffix) {
+            Some("reality-key") => "R".repeat(43),
+            Some("awg-key" | "warp-key") => format!("{}=", "W".repeat(43)),
+            Some("telegram-secret" | "telegram-tag") => "a".repeat(32),
+            _ => "license-1234".to_owned(),
+        };
+        for secret in &carried {
+            store.set(secret, Zeroizing::new(value(secret))).unwrap();
+        }
+        store.set(&format!("node:{}:reality-key", "d".repeat(32)), Zeroizing::new("orphan".into())).unwrap();
+        store.set("profile:gone:warp-license", Zeroizing::new("orphan".into())).unwrap();
+        let snapshot = serialize(&local).unwrap();
+        assert_eq!(snapshot.secrets.node_passwords.keys().cloned().collect::<std::collections::BTreeSet<_>>(),
+            carried.iter().cloned().collect());
+
+        let worktree = dir.path().join("worktree");
+        fs::create_dir(&worktree).unwrap();
+        checkpoint(&worktree, Storage::Plain, None, &snapshot).unwrap();
+        assert!(exec::tree_git(&worktree, &["init".as_ref(), "-q".as_ref()]).unwrap().success);
+        let reread = upgrade(read_plain(&worktree).unwrap(), false).unwrap();
+        materialize(local.paths(), local.locks(), &reread).unwrap();
+        let runtime = State::with_locks(local.paths().runtime(), local.locks().clone());
+        for secret in &carried {
+            assert_eq!(runtime.secret_store().get(secret).unwrap().unwrap().as_str(), value(secret));
+        }
+
+        let mut orphaned = serialize(&local).unwrap();
+        orphaned.secrets.node_passwords.insert(format!("node:{}:awg-key", "e".repeat(32)), Zeroizing::new("x".into()));
+        assert!(orphaned.validate().is_err(), "a secret of an unknown node");
+        let mut orphaned = serialize(&local).unwrap();
+        orphaned.secrets.node_passwords.insert("profile:gone:warp-license".into(), Zeroizing::new("x".into()));
+        assert!(orphaned.validate().is_err(), "a license of an unknown profile");
+        for (suffix, bad) in [("reality-key", "x\"\n  - name: open".to_owned()), ("reality-key", "R".repeat(44)),
+            ("awg-key", "W".repeat(44)), ("warp-key", format!("{}\n=", "W".repeat(42))),
+            ("telegram-secret", "g".repeat(32)), ("telegram-tag", "a".repeat(31))] {
+            let mut forged = serialize(&local).unwrap();
+            forged.secrets.node_passwords.insert(format!("node:{id}:{suffix}"), Zeroizing::new(bad.clone()));
+            assert!(forged.validate().is_err(), "{suffix} {bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_lost_machine_key_keeps_the_vault_copy_of_node_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = State::new(StatePaths::new(dir.path().join("data")));
+        let id = "c".repeat(32);
+        let mut config = Config::default();
+        config.profiles.push(crate::model::test_profile("main"));
+        config.nodes.push(serde_json::from_value(json!({
+            "id": id, "name": "n1", "ip": "10.0.0.1", "port": 22, "user": "root", "auth": "key",
+            "identity": null, "secret_id": null, "profile": "main"
+        })).unwrap());
+        local.save_config(&config).unwrap();
+        let (reality, tag) = (format!("node:{id}:reality-key"), format!("node:{id}:telegram-tag"));
+        let store = local.secret_store();
+        store.set(&reality, Zeroizing::new("R".repeat(43))).unwrap();
+        store.set(&tag, Zeroizing::new("b".repeat(32))).unwrap();
+        let worktree = dir.path().join("worktree");
+        fs::create_dir(&worktree).unwrap();
+        checkpoint(&worktree, Storage::Plain, None, &serialize(&local).unwrap()).unwrap();
+        assert!(exec::tree_git(&worktree, &["init".as_ref(), "-q".as_ref()]).unwrap().success);
+
+        // A deliberately removed secret goes; one this machine can no longer
+        // decrypt (another machine key) keeps its vault value.
+        store.remove(&tag).unwrap();
+        secure_fs::atomic_write(local.paths().secret_key(), &[7u8; 32]).unwrap();
+        let snapshot = serialize(&local).unwrap();
+        assert_eq!(snapshot.unreadable, std::slice::from_ref(&reality));
+        assert!(snapshot.secrets.node_passwords.is_empty());
+        checkpoint(&worktree, Storage::Plain, None, &snapshot).unwrap();
+        let reread = upgrade(read_plain(&worktree).unwrap(), false).unwrap();
+        assert_eq!(reread.secrets.node_passwords.keys().collect::<Vec<_>>(), [&reality]);
+        assert_eq!(reread.secrets.node_passwords[&reality].as_str(), "R".repeat(43));
+
+        // Without a readable previous snapshot nothing is written at all.
+        fs::write(worktree.join("secrets.json"), b"not json").unwrap();
+        assert!(checkpoint(&worktree, Storage::Plain, None, &snapshot).is_err());
+        assert_eq!(fs::read(worktree.join("secrets.json")).unwrap(), b"not json");
     }
 
     #[test]

@@ -61,6 +61,11 @@ impl SecretStore {
         Ok(())
     }
 
+    /// IDs of every stored secret (sorted), without decrypting any.
+    pub fn ids(&self) -> Result<Vec<String>> {
+        Ok(self.load_container()?.map(|container| container.node_passwords.into_keys().collect()).unwrap_or_default())
+    }
+
     /// An absent entry is None; an existing but unusable entry is missing_secret.
     /// Neither case creates a directory, key, or container.
     pub fn get(&self, secret_id: &str) -> Result<Option<Zeroizing<String>>> {

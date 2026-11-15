@@ -375,6 +375,8 @@ async fn route(invocation: &Invocation, secrets: &Secrets, input: &Input, agent_
             session.log(Level::Success, "Пароль убран");
             Ok(json!({"password_set": false}))
         }
+        ("node", "apply") => crate::server::apply::apply(session, invocation, &connect).await,
+        ("profile", verb) => crate::server::profile::route(verb, invocation, secrets, session).await,
         (noun @ ("node" | "conn"), verb) => crate::nodes::route(noun, verb, invocation, secrets, session, &mut connect()).await,
         (noun @ ("group" | "template" | "client" | "generate"), verb) => {
             crate::clients::route(noun, verb, invocation, secrets, input, session, &connect).await

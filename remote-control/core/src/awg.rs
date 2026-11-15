@@ -112,7 +112,7 @@ async fn status_of<T: RemoteTransport>(session: &Session, config: &Config, node:
 async fn change<T: RemoteTransport>(session: &mut Session, transport: &T, node: &Node, command: &str, failure: String) -> Result<()> {
     let _guard = session.state.locks().acquire(LockKind::Mutation, "awg_peers")?;
     let failed = || RcError::new("remote_failed", failure.clone()).with_extra("name", node.name.clone());
-    if let Err(error) = scripts::ensure_current(transport, &node.name, false).await {
+    if let Err(error) = scripts::ensure_current(transport, &node.name).await {
         session.log(Level::Warn, &format!("Не удалось подготовить скрипты для ноды «{}»: {}", node.name, error.message));
         return Err(failed().with_extra("cause", error.code));
     }
@@ -217,7 +217,7 @@ pub async fn remove_peers<T: RemoteTransport>(session: &mut Session, node: &str,
     let mut transport = connect();
     let prepared = match nodes::require_portable(session, stored) {
         Ok(()) => match nodes::connect(&mut transport, &session.state, stored).await {
-            Ok(()) => scripts::ensure_current(&transport, node, false).await.map(drop),
+            Ok(()) => scripts::ensure_current(&transport, node).await.map(drop),
             Err(error) => Err(error),
         },
         Err(error) => Err(error),
@@ -260,6 +260,7 @@ mod tests {
         Node {
             id: "0123456789abcdef0123456789abcdef".into(), name: "de".into(), ip: "198.51.100.7".into(), port: 22,
             user: "root".into(), auth: Auth::Key, identity: Some("system".into()), secret_id: None, tag: None, aliases: Default::default(),
+            ..Node::default()
         }
     }
 

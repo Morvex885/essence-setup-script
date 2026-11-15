@@ -65,8 +65,9 @@ fn uri_host(server: &str) -> std::borrow::Cow<'_, str> {
 
 /// Escapes the contents of a double-quoted YAML scalar (client names, xHTTP
 /// paths, gRPC service names, Hysteria2 passwords, Reality dest), matching
-/// Bash: backslash, double quote, LF and CR.
-fn yaml_escape(name: &str) -> std::borrow::Cow<'_, str> {
+/// Bash: backslash, double quote, LF and CR. Identity (borrowed) for every
+/// value without those characters.
+pub(crate) fn yaml_escape(name: &str) -> std::borrow::Cow<'_, str> {
     if !name.contains(['\\', '"', '\n', '\r']) {
         return name.into();
     }

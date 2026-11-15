@@ -49,6 +49,10 @@ const WEB: &str = "bind= port= tls-cert= tls-key= no-tls";
 /// `daemon run|start`: the listener and the data directory (`--data-dir`
 /// wins over `ESSENCE_RC_DATA_DIR`; services pass it this way).
 const DAEMON_WEB: &str = "web bind= port= tls-cert= tls-key= no-tls data-dir=";
+/// `profile add|set`: every profile field.
+const PROFILE: &str = "name= acme-email= random-acme-email reality= sni-domain= site-source= mihomo-version= \
+    vless-tcp= xhttp= xhttp-port= grpc= grpc-port= hysteria2= hysteria2-port= hysteria2-obfs= \
+    amneziawg= amneziawg-port= amneziawg-dns= warp= ipv6=";
 
 static CATALOG: &[Spec] = &[
     spec("status", "", "", &[], 0),
@@ -95,15 +99,24 @@ static CATALOG: &[Spec] = &[
     spec("node", "tag", "name= tag=", &[], 0),
     spec("node", "password", "name=", &["password"], 0),
     spec("node", "add",
-        "name= ip= port= user= auth= tag= host-key= accept-new-host-key replace-host-key= defer-ssh-setup",
+        "name= ip= port= user= auth= tag= host-key= accept-new-host-key replace-host-key= defer-ssh-setup profile= domain=",
         &["password"], 0),
     spec("node", "trust-host-key", "name= host-key=", &[], 0),
     spec("node", "delete", "name= scope= revoke-key", &[], 0),
     spec("node", "check", "name=", &[], 0),
-    spec("node", "upload-scripts", "name= force", &[], 0),
+    spec("node", "profile", "name= profile=", &[], 0),
+    spec("node", "domain", "name= domain=", &[], 0),
+    spec("node", "port", "name= protocol= port=", &[], 0),
+    spec("node", "apply", "name+ profile= pending", &[], 0),
     spec("node", "harden", "name= port=", &[], 0),
     spec("node", "setup-ssh", "provision-keys= on-failure=", &[], 0),
     spec("node", "shell", "name=", &[], TTY),
+    spec("profile", "list", "", &[], 0),
+    spec("profile", "show", "name=", &[], 0),
+    spec("profile", "add", PROFILE, &[], 0),
+    spec("profile", "set", PROFILE, &[], 0),
+    spec("profile", "delete", "name=", &[], 0),
+    spec("profile", "warp-license", "name= clear", &["password"], 0),
     spec("conn", "list", "name= discover", &[], 0),
     spec("conn", "set", "name= assign+", &[], 0),
     spec("conn", "sync", "name=", &[], 0),
@@ -181,9 +194,9 @@ static HELP: &[(&str, &[(&str, &str)])] = &[
         ("client delete --name C… [--yes]", "Удалить клиентов"),
     ]),
     ("conn", &[
-        ("conn list [--name N [--discover]]", "Подключения нод по группам"),
+        ("conn list [--name N [--discover]]", "Подключения нод по группам (--discover — подключения, которые даёт профиль ноды)"),
         ("conn set --name N --assign G=P…", "Задать подключения групп на ноде: --assign на каждое подключение (G= — снять назначение; другие группы не меняются)"),
-        ("conn sync [--name N]", "Обнаружить подключения нод по SSH и убрать устаревшие назначения"),
+        ("conn sync [--name N]", "Убрать назначения подключений, которых профили нод больше не дают"),
     ]),
     ("daemon", &[
         ("daemon status", "Состояние демона: клиенты, сессия, терминалы"),
@@ -203,18 +216,29 @@ static HELP: &[(&str, &[(&str, &str)])] = &[
     ("node", &[
         ("node list", "Список нод"),
         ("node show --name N", "Подробности ноды и варианты удаления"),
-        ("node aliases --name N [--set ORIG=ALIAS…] [--unset ORIG…]", "Псевдонимы подключений (без --set/--unset — обнаружить по SSH)"),
+        ("node aliases --name N [--set ORIG=ALIAS…] [--unset ORIG…]", "Псевдонимы подключений (без --set/--unset — подключения профиля ноды)"),
         ("node rename --name N --new-name M", "Переименовать ноду (имя: латиница, цифры, «.», «_», «-»)"),
         ("node tag --name N --tag T", "Задать тег ноды (пустой допустим; до 32 символов, без управляющих и служебных символов)"),
         ("node password --name N", "Сохранить пароль SSH (секрет password)"),
-        ("node add --name N --ip IP [--port 22] [--user root] --auth key|password --tag T [--host-key SHA256:… | --accept-new-host-key] [--replace-host-key SHA256:… [--yes]] [--defer-ssh-setup]", "Добавить ноду (для --auth password — секрет password)"),
+        ("node add --name N --ip IP [--port 22] [--user root] --auth key|password --tag T [--host-key SHA256:… | --accept-new-host-key] [--replace-host-key SHA256:… [--yes]] [--defer-ssh-setup] [--profile P] [--domain D]", "Добавить ноду (для --auth password — секрет password)"),
         ("node trust-host-key --name N --host-key SHA256:… [--yes]", "Доверять новому ключу сервера ноды"),
         ("node delete --name N [--scope local|server] [--revoke-key] [--yes]", "Удалить ноду"),
         ("node check --name N", "Проверить SSH-подключение"),
-        ("node upload-scripts --name N [--force [--yes]]", "Загрузить скрипты на ноду"),
+        ("node profile --name N --profile P", "Назначить ноде профиль (пустой P — снять профиль)"),
+        ("node domain --name N --domain D", "Домен ноды для сайта-заглушки и сертификата (пустой D — убрать)"),
+        ("node port --name N --protocol vless-xhttp|vless-grpc|hysteria2|amneziawg --port P", "Порт протокола на ноде вместо порта профиля (пустой P — как в профиле)"),
+        ("node apply (--name N… | --profile P | --pending) [--yes]", "Применить профиль и роли на нодах"),
         ("node harden --name N [--port P] [--yes]", "Усилить защиту SSH: ключ, отключение пароля, новый порт (без --port — детерминированный свободный порт из плана)"),
         ("node setup-ssh [--provision-keys yes|no] [--on-failure rollback|defer] [--yes]", "Завершить отложенную SSH-настройку нод (GitHub)"),
-        ("node shell --name N", "Открыть меню сервера по SSH (нужен терминал)"),
+        ("node shell --name N", "Открыть оболочку на ноде по SSH (нужен терминал)"),
+    ]),
+    ("profile", &[
+        ("profile list", "Профили нод"),
+        ("profile show --name P", "Подробности профиля и его ноды"),
+        ("profile add --name P (--acme-email E | --random-acme-email) [--reality self-steal|sni] [--sni-domain D] [--site-source simple|sni|nothing|random] [--mihomo-version vX.Y.Z] [--vless-tcp on|off] [--xhttp off|reality|nginx] [--xhttp-port P] [--grpc on|off] [--grpc-port P] [--hysteria2 on|off] [--hysteria2-port P] [--hysteria2-obfs on|off] [--amneziawg on|off] [--amneziawg-port P] [--amneziawg-dns DNS] [--warp on|off] [--ipv6 default|enabled|disabled]", "Добавить профиль нод (без порта — случайный; без версии — последняя mihomo)"),
+        ("profile set --name P [флаги profile add]", "Изменить профиль: только переданные поля"),
+        ("profile delete --name P [--yes]", "Удалить профиль без нод"),
+        ("profile warp-license --name P [--clear]", "Ключ WARP+ профиля (секрет password)"),
     ]),
     ("self", &[
         ("self version", "Текущая и последняя версия"),
