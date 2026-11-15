@@ -118,6 +118,7 @@ static CATALOG: &[Spec] = &[
     spec("profile", "set", PROFILE, &[], 0),
     spec("profile", "delete", "name=", &[], 0),
     spec("profile", "warp-license", "name= clear", &["password"], 0),
+    spec("profile", "mihomo-versions", "", &[], 0),
     spec("cascade", "list", "", &[], 0),
     spec("cascade", "add", "name= entry= listener= exit-node= exit-proxy= @file?", &[], 0),
     spec("cascade", "delete", "name=", &[], 0),
@@ -241,6 +242,7 @@ static HELP: &[(&str, &[(&str, &str)])] = &[
         ("profile set --name P [флаги profile add]", "Изменить профиль: только переданные поля"),
         ("profile delete --name P [--yes]", "Удалить профиль без нод"),
         ("profile warp-license --name P [--clear]", "Ключ WARP+ профиля (секрет password)"),
+        ("profile mihomo-versions", "Последние версии mihomo для профиля (GitHub, не ниже v1.19.18)"),
     ]),
     ("self", &[
         ("self version", "Текущая и последняя версия"),

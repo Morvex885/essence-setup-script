@@ -26,7 +26,8 @@ function ProfileList({ ctx }) {
   const act = (action) => run(async () => { await action(); await state.reload(); });
   const add = () => run(async () => {
     let opened = false;
-    await model.addProfileFlow(ctx, (name) => { opened = true; if (mounted.current) ctx.navigate('profiles', name); });
+    await model.addProfileFlow(ctx, (name) => { opened = true; if (mounted.current) ctx.navigate('profiles', name); },
+      model.profileRows(state.data).map((row) => row.name));
     if (!opened) await state.reload();
   });
   const actions = html`<${Button} kind="primary" icon="plus" disabled=${busy || !state.data} onClick=${add}>Добавить профиль<//>`;
@@ -96,7 +97,7 @@ function ProfileCard({ ctx, name }) {
             { label: 'Reality', value: model.realityLabel(profile) },
             { label: 'Сайт-заглушка', value: profile.reality_mode === 'sni' ? '—' : String(profile.site_source || '') },
             { label: 'VLESS TCP', value: onOff(profile.vless_tcp === true) },
-            { label: 'VLESS xHTTP', value: xhttp ? `${xhttp.topology === 'nginx' ? 'через nginx' : 'Reality'}${xhttp.port ? `, порт ${xhttp.port}` : ''}` : 'выкл.' },
+            { label: 'VLESS xHTTP', value: xhttp ? (xhttp.topology === 'nginx' ? 'через ваш сайт (nginx, порт 443)' : `отдельный порт ${xhttp.port ?? ''} (Reality)`) : 'выкл.' },
             { label: 'VLESS gRPC', value: profile.vless_grpc ? `порт ${profile.vless_grpc.port}` : 'выкл.' },
             { label: 'Hysteria2', value: profile.hysteria2 ? `порт ${profile.hysteria2.port}${profile.hysteria2.obfs ? ', obfs' : ''}` : 'выкл.' },
             { label: 'AmneziaWG', value: profile.amneziawg ? `порт ${profile.amneziawg.port}, DNS ${profile.amneziawg.dns || ''}` : 'выкл.' },

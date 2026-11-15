@@ -39,7 +39,7 @@ const JOURNAL_LIMIT = 2000;
 const SNACK_LIMIT = 3;
 
 /** Команда могла изменить состояние: шапка перечитывает `status`. */
-const READ_VERBS = new Set(['status', 'list', 'show', 'accounts', 'version', 'headers', 'aliases', 'check', 'link', 'diagnostics']);
+const READ_VERBS = new Set(['status', 'list', 'show', 'accounts', 'version', 'headers', 'aliases', 'check', 'link', 'diagnostics', 'mihomo-versions']);
 function changes(command) {
   const [noun = '', verb = ''] = String(command || '').split(' ');
   return noun !== 'status' && !READ_VERBS.has(verb);
@@ -63,7 +63,7 @@ const menuEntries = (active) => MENU.map((item) => (item.divider ? item : {
 /** Событие очереди демона: «Ожидание: выполняется «noun verb».». */
 const WAITING = /^Ожидание: выполняется «(.+)»\.$/;
 
-const ACCESS_CODE_HINT = "Откройте панель ссылкой из «essence-rc web open».";
+const ACCESS_CODE_HINT = "Откройте панель ссылкой из «essence-rc web open». Ссылка одноразовая: если она уже открыта в другой вкладке, перейдите в ту вкладку или получите новую ссылку командой «essence-rc web open».";
 
 /** Локальное хранилище темы; недоступное (режим приватности) — `null`. */
 function localStore(win) {
@@ -487,7 +487,8 @@ function silent(reply, expect) {
  *   текст ошибки показывается здесь ровно один раз (кроме планов, `*_required`
  *   и кодов `expect`); с `quiet` — только записью «warn» в журнале (такая же
  *   запись подряд не повторяется: фоновые чтения идут на каждую правку), без
- *   снэкбара; `operation` — заголовок окна операции со строками журнала;
+ *   снэкбара; `operation` — заголовок окна операции со строками журнала и
+ *   живой строкой команды (событие `progress`);
  * - `confirm`, `askSecret`, `ask`, `choose`, `form`, `show`, `operation` — диалоги;
  *   `dialogOpen()` — открыто ли окно (горячие клавиши экрана поверх окон молчат);
  * - `runConfirmed(title, question, argv, { secrets, input, expect, operation })`,
@@ -525,6 +526,7 @@ function makeContext({ connection, dialogs, notify, record, hello, status, win, 
           if (progress) progress.log(entry);
           if (onLog) onLog(entry);
         },
+        onProgress: progress ? (live) => progress.live(live) : undefined,
       });
       if (progress) progress.finish();
       if (!silent(reply, expect)) {

@@ -31,6 +31,14 @@ use super::bundle::{NODE_ROOT, agent_dir, agent_sha, materialize_agent};
 use super::render::{self, Desired, NodeSecrets, RenderedFile};
 
 const POLL_PAUSE: Duration = Duration::from_secs(2);
+/// Between polls the live line (`Session::progress`) is refreshed this often:
+/// its elapsed time ticks even when the status did not change.
+const LIVE_TICK: Duration = Duration::from_secs(1);
+/// Executor stages in order (`stage=` of the status file), for «этап i/n».
+const APPLY_STAGES: [&str; 10] = ["packages", "system", "mihomo", "dns", "site", "certificate", "prepare", "config", "firewall", "cleanup"];
+const TEARDOWN_STAGES: [&str; 3] = ["config", "firewall", "cleanup"];
+/// Longest `detail=` shown (the executor already cuts it to this).
+const DETAIL_MAX: usize = 120;
 const RECONNECT_PAUSES: [u64; 5] = [1, 2, 4, 8, 15];
 const OFFLINE_LIMIT: Duration = Duration::from_secs(10 * 60);
 const OPERATION_LIMIT: Duration = Duration::from_secs(60 * 60);
@@ -457,6 +465,10 @@ struct Run<'t, T> {
     operation: Operation,
     started: Instant,
     stage: String,
+    /// `progress=` of the status file, never lower than the last one seen.
+    percent: u8,
+    /// `detail=` of the status file: the current activity, sanitized.
+    detail: String,
     lost: Option<(Instant, usize, Instant)>,
     outcome: Option<Outcome>,
     /// How the executor ended (recorded with a non-timeout failure).
@@ -465,7 +477,10 @@ struct Run<'t, T> {
 
 impl<'t, T: RemoteTransport> Run<'t, T> {
     fn new(node: Node, transport: &'t mut T, operation: Operation) -> Self {
-        Self { node, transport, operation, started: Instant::now(), stage: String::new(), lost: None, outcome: None, end: End::Failed }
+        Self {
+            node, transport, operation, started: Instant::now(), stage: String::new(), percent: 0, detail: String::new(),
+            lost: None, outcome: None, end: End::Failed,
+        }
     }
 
     fn fail(&mut self, failure: Failure) {
@@ -476,7 +491,26 @@ impl<'t, T: RemoteTransport> Run<'t, T> {
     fn current_stage(&self) -> String {
         if self.stage.is_empty() { "start".to_owned() } else { self.stage.clone() }
     }
+}
 
+impl<T> Run<'_, T> {
+    /// The stage for the live line: `init` until the executor reports one.
+    fn stage_or_init(&self) -> &str {
+        if self.stage.is_empty() { "init" } else { &self.stage }
+    }
+
+    /// «этап 3/10 «установка пакетов»» (or just the label outside the list).
+    fn stage_text(&self) -> String {
+        let stages: &[&str] = if self.operation.teardown { &TEARDOWN_STAGES } else { &APPLY_STAGES };
+        let stage = self.stage_or_init();
+        match stages.iter().position(|known| *known == stage) {
+            Some(index) => format!("этап {}/{} «{}»", index + 1, stages.len(), stage_label(stage)),
+            None => format!("«{}»", stage_label(stage)),
+        }
+    }
+}
+
+impl<T: RemoteTransport> Run<'_, T> {
     /// Upload the executor when needed, the operation directory, then start
     /// it. A failure before `systemd-run` means nothing started (`Err`). A
     /// connection lost during `systemd-run` leaves the start uncertain: the
@@ -552,8 +586,15 @@ impl<'t, T: RemoteTransport> Run<'t, T> {
                 session.log(Level::Info, &format!("{}: {}", self.node.name, stage_label(stage)));
             }
         }
+        if let Some(percent) = status.get("progress").and_then(|percent| percent.trim().parse::<u8>().ok()) {
+            self.percent = self.percent.max(percent.min(100));
+        }
+        self.detail = status.get("detail").map(|detail| clean_detail(detail)).unwrap_or_default();
         match status.get("result").map(String::as_str) {
-            Some("committed") => self.outcome = Some(Outcome::Committed),
+            Some("committed") => {
+                self.percent = 100;
+                self.outcome = Some(Outcome::Committed);
+            }
             Some(result) => {
                 let stage = status.get("error").cloned().unwrap_or_else(|| self.current_stage());
                 self.show_log(session).await;
@@ -595,7 +636,8 @@ impl<'t, T: RemoteTransport> Run<'t, T> {
     }
 }
 
-/// Poll every unfinished run in turn until all finish.
+/// Poll every unfinished run in turn until all finish; between polls the
+/// live line is refreshed every [`LIVE_TICK`].
 async fn drive<T: RemoteTransport>(session: &mut Session, runs: &mut [Run<'_, T>]) {
     loop {
         let mut active = false;
@@ -606,8 +648,68 @@ async fn drive<T: RemoteTransport>(session: &mut Session, runs: &mut [Run<'_, T>
         if !active {
             break;
         }
-        tokio::time::sleep(POLL_PAUSE).await;
+        let mut waited = Duration::ZERO;
+        while waited < POLL_PAUSE {
+            if let Some((percent, text)) = live_line(runs, Instant::now()) {
+                session.progress(percent, &text);
+            }
+            tokio::time::sleep(LIVE_TICK).await;
+            waited += LIVE_TICK;
+        }
     }
+}
+
+/// `detail=` as shown: control characters removed, at most [`DETAIL_MAX`]
+/// characters (the executor promises both; the node is not trusted).
+fn clean_detail(detail: &str) -> String {
+    crate::log::sanitize(detail).trim().chars().take(DETAIL_MAX).collect()
+}
+
+/// `m:ss` of an elapsed time.
+fn clock(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    format!("{}:{:02}", seconds / 60, seconds % 60)
+}
+
+/// The live line of the running operations, `(percent, text)`. One node:
+/// «Нода de: 37 % · этап 1/10 «установка пакетов» · nginx: распаковка · 1:42».
+/// Several nodes share one line (a single replaceable line works the same
+/// in the CLI, the menu status line and the web operation window): the mean
+/// percent of the nodes not failed (a committed node counts as 100), how many
+/// are done (committed only), failed nodes separately as «ошибка» (out of the
+/// mean and of «готово»), then each running node's percent and stage —
+/// «Ноды: 54 % · готово 1/3 · ошибка: fi · de 37 % «установка пакетов» ·
+/// nl 71 % «сертификаты» · 1:42». Details stay in the single-node line: with
+/// several nodes the line would not fit.
+fn live_line<T>(runs: &[Run<'_, T>], now: Instant) -> Option<(u8, String)> {
+    let started = runs.iter().map(|run| run.started).min()?;
+    let time = clock(now.duration_since(started));
+    if let [run] = runs {
+        let mut parts = vec![format!("Нода {}: {} %", run.node.name, run.percent), run.stage_text()];
+        if run.lost.is_some() {
+            parts.push("нет связи, переподключение".to_owned());
+        } else if !run.detail.is_empty() {
+            parts.push(run.detail.clone());
+        }
+        parts.push(time);
+        return Some((run.percent, parts.join(" · ")));
+    }
+    let failed: Vec<&str> = runs.iter().filter(|run| matches!(run.outcome, Some(Outcome::Failed(_)))).map(|run| run.node.name.as_str()).collect();
+    let counted: Vec<usize> = runs.iter().filter_map(|run| match run.outcome {
+        Some(Outcome::Committed) => Some(100),
+        Some(Outcome::Failed(_)) => None,
+        None => Some(usize::from(run.percent)),
+    }).collect();
+    let percent = if counted.is_empty() { 100 } else { (counted.iter().sum::<usize>() / counted.len()) as u8 };
+    let done = runs.iter().filter(|run| matches!(run.outcome, Some(Outcome::Committed))).count();
+    let mut parts = vec![format!("Ноды: {percent} %"), format!("готово {done}/{}", runs.len())];
+    if !failed.is_empty() { parts.push(format!("ошибка: {}", failed.join(", "))); }
+    for run in runs.iter().filter(|run| run.outcome.is_none()) {
+        let state = if run.lost.is_some() { "нет связи".to_owned() } else { format!("«{}»", stage_label(run.stage_or_init())) };
+        parts.push(format!("{} {} % {state}", run.node.name, run.percent));
+    }
+    parts.push(time);
+    Some((percent, parts.join(" · ")))
 }
 
 /// Start a claimed operation; a start that certainly did not happen clears

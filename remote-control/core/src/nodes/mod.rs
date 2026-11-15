@@ -217,24 +217,36 @@ pub(crate) mod testing {
     use crate::state::{State, StatePaths};
 
     pub type Journal = Rc<RefCell<Vec<(Level, String)>>>;
+    /// Live lines (`Session::progress`) with the paused-clock instant they came at.
+    pub type Live = Rc<RefCell<Vec<(tokio::time::Instant, u8, String)>>>;
 
-    struct Recorder(Journal);
+    struct Recorder(Journal, Live);
 
     impl LogSink for Recorder {
         fn log(&mut self, level: Level, text: &str) {
             self.0.borrow_mut().push((level, text.to_owned()));
         }
+
+        fn progress(&mut self, percent: u8, text: &str) {
+            self.1.borrow_mut().push((tokio::time::Instant::now(), percent, text.to_owned()));
+        }
     }
 
     /// An open, authorized local session over `root` (initialized config).
     pub fn session(root: &std::path::Path) -> (Session, Journal) {
-        let journal = Journal::default();
+        let (session, journal, _) = session_live(root);
+        (session, journal)
+    }
+
+    /// [`session`] that also records the live lines.
+    pub fn session_live(root: &std::path::Path) -> (Session, Journal, Live) {
+        let (journal, live) = (Journal::default(), Live::default());
         let state = State::new(StatePaths::new(root));
         state.save_config(&crate::model::Config::default()).unwrap();
-        let mut session = Session::new(state, Box::new(Recorder(journal.clone())));
+        let mut session = Session::new(state, Box::new(Recorder(journal.clone(), live.clone())));
         session.open = true;
         session.authorized = true;
-        (session, journal)
+        (session, journal, live)
     }
 
     pub fn invocation(argv: &[&str]) -> crate::cli::Invocation {

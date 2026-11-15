@@ -2,6 +2,7 @@
 //! Every row is wrapped here — frame body, journal and prompt — so no text
 //! depends on the terminal width or is cut at the frame edge.
 use std::{borrow::Cow, time::Instant};
+use essence_rc_client::Live;
 use ratatui::{Frame, layout::Rect, style::{Color, Modifier, Style}, text::{Line, Span}, widgets::Paragraph};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -44,6 +45,11 @@ pub struct View {
     pub cursor: Option<usize>,
     /// Rows below the frame, above the journal.
     pub footer: Vec<Line<'static>>,
+    /// Live check of a question's typed text (`Problem`): red input, the
+    /// message under the prompt, Enter refused while it fails.
+    pub check: Option<Check>,
+    /// Names already in use, for the check's suggested fix (`-2`, `-3`, …).
+    pub taken: Vec<String>,
 }
 impl View {
     pub fn new(title: impl Into<String>) -> Self { Self { title: title.into(), ..Self::default() } }
@@ -172,19 +178,44 @@ fn framed(line: Line<'static>, centered: bool) -> Line<'static> {
 pub fn warn(message: impl Into<String>) -> Line<'static> { Line::styled(format!("[!] {}", message.into()), Style::default().fg(YELLOW)) }
 pub fn success(message: impl Into<String>) -> Line<'static> { Line::styled(format!("[✓] {}", message.into()), Style::default().fg(GREEN)) }
 pub fn text(message: impl Into<String>, color: Color) -> Line<'static> { Line::styled(message.into(), Style::default().fg(color)) }
+/// What is wrong with typed text and, when one exists, a valid value to put
+/// instead (Tab in the terminal UI).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Problem { pub message: String, pub fix: Option<String> }
+/// A live check of the typed text of a question frame: `Err` keeps Enter from
+/// accepting it and is drawn under the prompt. Empty text is never checked
+/// (it means cancel or the default in every question). The second argument —
+/// the frame's `taken` names, so a suggested fix is not one of them.
+pub type Check = fn(&str, &[String]) -> Result<(), Problem>;
+/// The problem of `input` under the frame's check, if any.
+pub fn problem(view: &View, input: &str) -> Option<Problem> {
+    if input.is_empty() { return None; }
+    view.check.and_then(|check| check(input, &view.taken).err())
+}
 /// A request in flight: drawn instead of the prompt, with a spinner and the
-/// elapsed time, from before the request is sent until its reply.
+/// elapsed time, from before the request is sent until its reply. A live
+/// line of the command (`progress` event) replaces the status text: a bar of
+/// its percent and its text, which carries its own elapsed time.
 #[derive(Clone, Debug)]
-pub struct Busy { pub status: String, started: Instant }
+pub struct Busy { pub status: String, pub live: Option<Live>, started: Instant }
 impl Busy {
-    pub fn new(status: impl Into<String>) -> Self { Self { status: status.into(), started: Instant::now() } }
+    pub fn new(status: impl Into<String>) -> Self { Self { status: status.into(), live: None, started: Instant::now() } }
     pub fn line(&self) -> Line<'static> {
         const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
         let elapsed = self.started.elapsed();
         let frame = FRAMES[(elapsed.as_millis() / 100) as usize % FRAMES.len()];
-        let text = match elapsed.as_secs() { 0 => format!("{frame} {}", self.status), seconds => format!("{frame} {} {seconds} с", self.status) };
+        let text = match (&self.live, elapsed.as_secs()) {
+            (Some(live), _) => format!("{frame} {} {}", bar(live.percent), live.text),
+            (None, 0) => format!("{frame} {}", self.status),
+            (None, seconds) => format!("{frame} {} {seconds} с", self.status),
+        };
         Line::styled(text, Style::default().fg(CYAN))
     }
+}
+/// Ten cells of a percent, whole cells only: 37 → `███░░░░░░░`.
+fn bar(percent: u8) -> String {
+    let filled = usize::from(percent.min(100)) / 10;
+    format!("{}{}", "█".repeat(filled), "░".repeat(10 - filled))
 }
 /// Rows of one screen: the scrollable body (frame + wrapped journal) and the
 /// wrapped prompt (or busy status) pinned to the bottom below a spacer row.
@@ -193,9 +224,20 @@ pub fn layout(view: &View, input: &str, hidden: bool, journal: &[Line<'static>],
     let mut body = view.lines();
     for line in &view.footer { body.extend(wrap_to(line, usize::from(FRAME_WIDTH), 0)); }
     for line in journal { body.extend(journal_rows(line)); }
+    let issue = if hidden { None } else { problem(view, input) };
     let prompt = |hint: &str| match busy {
         Some(busy) => wrap_to(&busy.line(), usize::from(FRAME_WIDTH), 2),
-        None => wrap_to(&Line::raw(format!("{}{}{hint}", view.prompt, if hidden { "" } else { input })), usize::from(FRAME_WIDTH), 0),
+        None => {
+            let typed = if hidden { "" } else { input };
+            let style = if issue.is_some() { Style::default().fg(RED) } else { Style::default() };
+            let line = Line::from(vec![Span::raw(view.prompt.clone()), Span::styled(typed.to_owned(), style), Span::raw(hint.to_owned())]);
+            let mut rows = wrap_to(&line, usize::from(FRAME_WIDTH), 0);
+            if let Some(problem) = &issue {
+                rows.extend(wrap_to(&text(format!("✗ {}", problem.message), RED), usize::from(FRAME_WIDTH), 2));
+                if let Some(fix) = &problem.fix { rows.extend(wrap_to(&text(format!("Tab — подставить «{fix}»"), YELLOW), usize::from(FRAME_WIDTH), 2)); }
+            }
+            rows
+        }
     };
     let fit = |prompt: &[Line<'static>]| {
         let rows = if height > 1 { prompt.len().min(usize::from(height) - 1) } else { 0 };

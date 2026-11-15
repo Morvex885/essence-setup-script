@@ -1192,3 +1192,138 @@ telegram_node() {
     if grep -q "enable --now tproxy-firewall.service\|restart mtproxy.service" "$CALLS"; then return 1; fi
     [[ -f "$ROOT/root/essence-node/features/telegram" ]]
 }
+
+# ─── Прогресс: progress= и detail= в status ─────────────────────────────────
+
+# progress_call <код> — steps/progress.sh с write_status, дописывающим
+# «progress|detail» в $WRITES; spec — по умолчанию без nginx и фич.
+progress_call() {
+    WRITES="$BATS_TEST_TMPDIR/writes"
+    : >"$WRITES"
+    run bash -c 'OP_MODE=apply NGINX=false SITE_NAME= CERTS= HY2_CERT=false FEATURES= WRITES="$2"
+        source "$1/steps/progress.sh"
+        write_status() { printf "%s|%s\n" "$PROGRESS" "$DETAIL" >>"$WRITES"; }
+        progress_plan
+        eval "$3"' _ "$PROJECT_ROOT/node-agent" "$WRITES" "$1"
+}
+
+@test "прогресс: полное применение пишет растущий progress до 100" {
+    REAL_MV="$(command -v mv)"
+    export REAL_MV PROGRESS_LOG="$BATS_TEST_TMPDIR/progress"
+    # Каждая запись status (tmp → status) — снимок progress= в $PROGRESS_LOG.
+    cat >"$STUBS/mv" <<'SH'
+#!/bin/bash
+target="${*: -1}"
+if [[ "$target" == */status ]]; then
+    sed -n 's/^progress=//p' "${*: -2:1}" >>"$PROGRESS_LOG"
+fi
+exec "$REAL_MV" "$@"
+SH
+    chmod +x "$STUBS/mv"
+    add_file /etc/mihomo/config.yaml "new"
+    run_agent
+    assert_success
+    run status
+    assert_line "progress=100"
+    mapfile -t values <"$PROGRESS_LOG"
+    ((${#values[@]} > 10))
+    local previous=0 value
+    for value in "${values[@]}"; do
+        [[ "$value" =~ ^[0-9]+$ ]] && ((value >= previous && value <= 100)) || { echo "не монотонно: ${values[*]}"; return 1; }
+        previous="$value"
+    done
+    [[ "${values[0]}" == 0 && "${values[-1]}" == 100 ]]
+}
+
+@test "прогресс: веса этапов растут с nginx, сертификатами и фичами и дают 0…100" {
+    progress_call 'printf "%s\n" "${PROGRESS_STAGES[*]}" "${PROGRESS_BOUNDS[*]}"'
+    assert_success
+    assert_line --index 0 "packages system mihomo dns site certificate prepare config firewall cleanup"
+    local bounds=(${lines[1]})
+    [[ "${#bounds[@]}" == 11 && "${bounds[0]}" == 0 && "${bounds[10]}" == 100 ]]
+    run bash -c 'OP_MODE=apply NGINX=true SITE_NAME=s CERTS="a:/var/www/a b:/var/www/b" HY2_CERT=true FEATURES="awg telegram"
+        source "$1/steps/progress.sh"; progress_plan
+        packages=$((PROGRESS_BOUNDS[1] - PROGRESS_BOUNDS[0])); prepare=$((PROGRESS_BOUNDS[7] - PROGRESS_BOUNDS[6]))
+        certificate=$((PROGRESS_BOUNDS[6] - PROGRESS_BOUNDS[5])); system=$((PROGRESS_BOUNDS[2] - PROGRESS_BOUNDS[1]))
+        ((prepare > packages && packages > certificate && certificate > system)) && echo ok' _ "$PROJECT_ROOT/node-agent"
+    assert_output ok
+    run bash -c 'OP_MODE=teardown; source "$1/steps/progress.sh"; progress_plan; echo "${PROGRESS_STAGES[*]}|${PROGRESS_BOUNDS[*]}"' \
+        _ "$PROJECT_ROOT/node-agent"
+    assert_output "config firewall cleanup|0 60 80 100"
+}
+
+@test "прогресс: apt Status-Fd ведёт процент этапа и detail «пакет: действие», процент не падает" {
+    # apt-get пишет строки статуса в дескриптор из -o APT::Status-Fd=N.
+    stub apt-get 'fd=""
+for a; do [[ "$a" == APT::Status-Fd=* ]] && fd="${a#APT::Status-Fd=}"; done
+[[ -n "$fd" ]] || exit 3
+emit() { printf "%s\n" "$1" >&"$fd"; sleep 1.1; }
+emit "dlstatus:1:50.0:Retrieving file 1 of 2"
+emit "pmstatus:nginx:20.0:Preparing nginx (amd64)"
+emit "pmstatus:nginx:amd64:60.5:Unpacking nginx (1.24.0-2)"
+emit "pmstatus:amneziawg-dkms:80:Configuring amneziawg-dkms"
+emit "pmstatus:x:10.0:Unpacking x"
+emit "мусор без процента"
+exit 0'
+    progress_call 'progress_stage packages; agent_apt 0 100 install -y -q nginx; echo "rc=$? progress=$PROGRESS hi=$PROGRESS_STAGE_HI"'
+    assert_success
+    # Успех apt доводит процент до конца доли шага (здесь — всего этапа packages).
+    [[ "$output" =~ rc=0\ progress=([0-9]+)\ hi=([0-9]+) ]]
+    local final="${BASH_REMATCH[1]}"
+    [[ "$final" == "${BASH_REMATCH[2]}" && "$final" -gt 0 ]]
+    grep -q -- "^apt-get install -o APT::Status-Fd=3 -y -q nginx$" "$CALLS"
+    local writes
+    writes="$(cat "$WRITES")"
+    [[ "$writes" == *"|загрузка пакетов"* ]]
+    [[ "$writes" == *"|nginx: подготовка"* ]]
+    [[ "$writes" == *"|nginx: распаковка"* ]]
+    [[ "$writes" == *"|сборка модуля ядра amneziawg"* ]]
+    mapfile -t values < <(cut -d'|' -f1 "$WRITES")
+    local previous=0 value
+    for value in "${values[@]}"; do
+        ((value >= previous)) || { echo "не монотонно: ${values[*]}"; return 1; }
+        previous="$value"
+    done
+    # Отложенное (та же секунда) дописывает progress_flush: последняя запись — конец доли.
+    [[ "${values[-1]}" == "$final" ]]
+}
+
+@test "прогресс: сбой apt возвращает его код, процент не доходит до конца доли" {
+    stub apt-get 'exit 100'
+    progress_call 'progress_stage packages; agent_apt 0 100 update -q; echo "rc=$? progress=$PROGRESS lo=$PROGRESS_STAGE_LO"'
+    assert_success
+    [[ "$output" =~ rc=100\ progress=([0-9]+)\ lo=([0-9]+) ]]
+    [[ "${BASH_REMATCH[1]}" == "${BASH_REMATCH[2]}" ]]
+}
+
+@test "прогресс: потомок apt с унаследованным Status-Fd не задерживает шаг" {
+    # Скрипт пакета оставил фоновый процесс с дескриптором статуса (stdout/stderr закрыты, чтобы run не ждал его).
+    stub apt-get 'fd=""
+for a; do [[ "$a" == APT::Status-Fd=* ]] && fd="${a#APT::Status-Fd=}"; done
+printf "%s\n" "pmstatus:nginx:50:Unpacking nginx" >&"$fd"
+sleep 6 >/dev/null 2>&1 &
+exit 7'
+    progress_call 'progress_stage packages; start=$SECONDS; agent_apt 0 100 install -y nginx; rc=$?; echo "rc=$rc elapsed=$((SECONDS - start))"'
+    assert_success
+    [[ "$output" =~ rc=7\ elapsed=([0-9]+) ]]
+    ((BASH_REMATCH[1] <= 3))
+    grep -q "|nginx: распаковка" "$WRITES"
+}
+
+@test "прогресс: detail без управляющих символов и не длиннее 120 символов" {
+    progress_call 'progress_detail "$(printf "nginx:\033[31m распаковка\a\r\n")"; long=$(printf "д%.0s" {1..200}); progress_detail "$long"'
+    assert_success
+    run cat "$WRITES"
+    assert_line --index 0 "0|nginx:[31m распаковка"
+    local second="${lines[1]#0|}"
+    [[ "$(LC_ALL=C.UTF-8 bash -c 'printf %s "${#1}"' _ "$second")" == 120 ]]
+    ! grep -q $'\033' "$WRITES"
+}
+
+@test "прогресс: только проценты пишутся не чаще раза в секунду, flush дописывает отложенное" {
+    progress_call 'progress_stage packages; for i in $(seq 1 60); do progress_in "$i"; done; before=$(wc -l <"$WRITES"); progress_flush; echo "$before $PROGRESS"'
+    assert_success
+    local before="${output% *}" percent="${output#* }"
+    ((before <= 2))
+    [[ "$(tail -n1 "$WRITES" | cut -d'|' -f1)" == "$percent" ]]
+}

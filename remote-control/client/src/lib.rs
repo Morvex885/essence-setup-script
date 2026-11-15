@@ -15,7 +15,7 @@ pub use client::{Client, MAX_AGENT_PATH, Progress, Request, TermEvent, TerminalI
 pub use daemon::DaemonClient;
 pub use endpoint::{Endpoint, endpoint_for, endpoint_in, prepare_runtime_dir, runtime_dir, verify_runtime_dir};
 pub use remote::{ConnectError, RemoteUrl, Trust, certificate_fingerprint, valid_fingerprint};
-pub use protocol::{Hello, Input, ListenerInfo, Log, Origin, PROTOCOL, Reply, Secrets, TICK, TerminalSpec, WindowSize};
+pub use protocol::{Hello, Input, ListenerInfo, Live, Log, Origin, PROTOCOL, Reply, Secrets, TICK, TerminalSpec, WindowSize};
 pub use scripted::{ScriptedClient, Step};
 pub use spawn::SpawnDaemon;
 

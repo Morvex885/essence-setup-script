@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   asList, strings, text, joined, versionLabel, syncState, sourceLabel,
-  activity, activityIndicator, openPanel, OPEN_PANEL_WARNING,
+  activity, activityIndicator, openPanel, OPEN_PANEL_WARNING, operationLive,
   errorMessage, readInputFile, MAX_INPUT, FILE_TOO_LARGE, filterJournal, appendJournal, pushSnack,
 } from '../assets/js/format.js';
 
@@ -145,4 +145,15 @@ test('pushSnack: ошибки не вытесняются, предел — то
   snacks = pushSnack(snacks, snack(5, 'error'), 2);
   snacks = pushSnack(snacks, snack(6, 'error'), 2);
   assert.deepEqual(snacks.map((item) => item.id), [1, 3, 4, 5, 6], 'ошибки остаются до закрытия');
+});
+
+test('operationLive: полоса с процентом, первая часть и остальное (этап, действие, время)', () => {
+  assert.deepEqual(operationLive({ percent: 37, text: 'Нода de: 37 % · этап 3/10 «установка пакетов» · nginx: распаковка · 1:42' }), {
+    percent: 37, head: 'Нода de: 37 %', rest: 'этап 3/10 «установка пакетов» · nginx: распаковка · 1:42',
+  });
+  assert.deepEqual(operationLive({ percent: 120.4, text: 'Ноды: 100 %' }), { percent: 100, head: 'Ноды: 100 %', rest: '' });
+  assert.equal(operationLive({ percent: -3, text: 'a' }).percent, 0);
+  assert.equal(operationLive(null), null);
+  assert.equal(operationLive({ percent: 'x', text: 'a' }), null);
+  assert.equal(operationLive({ percent: 5 }), null);
 });

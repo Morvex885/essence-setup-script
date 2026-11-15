@@ -29,7 +29,9 @@ pub fn list(session: &mut Session) -> Result<Value> {
 pub fn add(session: &mut Session, invocation: &Invocation) -> Result<Value> {
     let name = required(invocation, "name")?.to_ascii_uppercase();
     if !v::name_valid(&name) {
-        return Err(RcError::new("invalid", "Название группы может содержать только буквы, цифры, точку, - и _"));
+        let config = session.state.load_config()?;
+        let taken: Vec<String> = config.groups.iter().map(|group| group.name.to_ascii_lowercase()).collect();
+        return Err(v::name_error("группы", required(invocation, "name")?, &taken.iter().map(String::as_str).collect::<Vec<_>>()));
     }
     let template = if invocation.has("template") {
         let template = templates::file_name(required(invocation, "template")?);

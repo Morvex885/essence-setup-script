@@ -70,7 +70,9 @@ function hasKeys(value) {
 /**
  * Подключение к демону. Возвращает объект соединения:
  * - `ready` — `Promise` первого `hello`; `hello` — последнее приветствие;
- * - `request(argv, { secrets, input, onLog })` → `Promise<{ok,data,error,sync,exit}>`;
+ * - `request(argv, { secrets, input, onLog, onProgress })` → `Promise<{ok,data,error,sync,exit}>`;
+ *   `onProgress({ percent, text })` — живая строка долгой команды (событие
+ *   `progress`): каждая заменяет предыдущую, в журнал не попадает;
  * - `terminal(argv, { term, cols, rows, onOpen, onOutput, onLog })` → `{ id, write, resize, close, done }`;
  * - `watch(onActivity)` → функция отписки;
  * - `on(event, handler)` — события `hello`, `state`, `access`, `log`, `resumed`;
@@ -165,7 +167,7 @@ export function connect({ WebSocket, location, storage = null, setTimeout: later
   function request(argv, options = {}) {
     const id = allocate();
     return new Promise((resolve) => {
-      pending.set(id, { resolve, onLog: options.onLog, argv: [...argv] });
+      pending.set(id, { resolve, onLog: options.onLog, onProgress: options.onProgress, argv: [...argv] });
       send(requestMessage(id, argv, options));
     });
   }
@@ -230,6 +232,11 @@ export function connect({ WebSocket, location, storage = null, setTimeout: later
           emit('log', log);
           break;
         }
+        case 'progress':
+          if (entry.onProgress && Number.isInteger(message.percent) && typeof message.text === 'string') {
+            entry.onProgress({ percent: Math.min(100, Math.max(0, message.percent)), text: message.text });
+          }
+          break;
         case 'terminal':
           if (message.state === 'open' && entry.onOpen) entry.onOpen();
           break;

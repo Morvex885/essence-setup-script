@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 use super::*;
 use crate::fake_transport::{AuthMethod, ConnectExpectation, FakeScript, FakeTransport, Operation, ScriptStep};
 use crate::model::{Client, ClientCredentials, Connection, ConnectionGroup, NodeParams, NodeReality, Profile};
-use crate::nodes::testing::{self, Journal, fingerprint, invocation};
+use crate::nodes::testing::{self, Journal, Live, fingerprint, invocation};
 use crate::nodes::{CONNECT_TIMEOUT, pin};
 use crate::transport::{ExecResult, HostKeyPolicy, remote_failure};
 
@@ -35,7 +35,13 @@ fn node(index: u8, name: &str) -> Node {
 
 /// Nodes `de` and `nl` with profile `main`, client `alpha` on both.
 fn fixture(root: &std::path::Path) -> (Session, Journal) {
-    let (session, journal) = testing::session(root);
+    let (session, journal, _) = fixture_live(root);
+    (session, journal)
+}
+
+/// [`fixture`] that also records the live lines.
+fn fixture_live(root: &std::path::Path) -> (Session, Journal, Live) {
+    let (session, journal, live) = testing::session_live(root);
     let nodes = vec![node(1, "de"), node(2, "nl")];
     for node in &nodes {
         pin(&session.state, &node.ip, node.port, vec![fp(node.id.as_bytes()[31])]).unwrap();
@@ -55,7 +61,7 @@ fn fixture(root: &std::path::Path) -> (Session, Journal) {
         ..Config::default()
     };
     session.state.save_config(&config).unwrap();
-    (session, journal)
+    (session, journal, live)
 }
 
 use zeroize::Zeroizing;
@@ -862,4 +868,93 @@ fn a_foreign_listener_on_the_tproxy_port_is_busy_until_it_is_ours() {
     assert_eq!((failure.code.as_str(), failure.port), ("port_busy", Some(23456)));
     node.applied = Some(Applied { digest: String::new(), files: Default::default(), ports: desired.listen.clone(), at: String::new() });
     assert!(busy_port(&probe, &node, &desired).is_none(), "our own mihomo holds it");
+}
+
+/// Status lines become one live line per second (the time ticks even when
+/// the status repeats), the percent never goes back, the detail is cleaned,
+/// and the journal still gets one line per stage only.
+#[tokio::test(start_paused = true)]
+async fn status_progress_becomes_a_live_line_without_journal_spam() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut session, journal, live) = fixture_live(root.path());
+    let de = node(1, "de");
+    NEXT_OP_ID.with(|next| *next.borrow_mut() = Some(OP.into()));
+    let mut steps = vec![connect_step(&de, Ok(())), probe_step(&de, DEBIAN)];
+    steps.extend(start_steps(OP));
+    for status in [
+        "stage=packages\nprogress=5\ndetail=обновление списков пакетов\n",
+        "stage=packages\nprogress=12\ndetail=nginx: распаковка\n",
+        // A lower percent never moves the line back; controls are cut.
+        "stage=packages\nprogress=9\ndetail=nginx: \u{1b}[31mнастройка\u{7}\n",
+        "stage=packages\nprogress=9\ndetail=nginx: \u{1b}[31mнастройка\u{7}\n",
+        "stage=certificate\nprogress=47\ndetail=выпуск сертификата de.example.com\n",
+    ] {
+        steps.push(exec(status_command(OP), &format!("{LIVE}{status}")));
+    }
+    steps.push(exec(status_command(OP), "unit=inactive\nstage=cleanup\nprogress=100\nresult=committed\n"));
+    let hosts = Hosts::new(vec![steps]);
+    run(&mut session, &hosts, &["node", "apply", "--name", "de", "--yes"]).await.unwrap();
+    hosts.finish();
+
+    let lines = live.borrow().clone();
+    let texts: Vec<&str> = lines.iter().map(|(_, _, text)| text.as_str()).collect();
+    assert_eq!(texts.len(), 10, "two lines per poll until the commit: {texts:#?}");
+    assert_eq!(texts[0], "Нода de: 5 % · этап 1/10 «установка пакетов» · обновление списков пакетов · 0:00");
+    assert_eq!(texts[2], "Нода de: 12 % · этап 1/10 «установка пакетов» · nginx: распаковка · 0:02");
+    assert_eq!(texts[4], "Нода de: 12 % · этап 1/10 «установка пакетов» · nginx: [31mнастройка · 0:04");
+    assert_eq!(texts[8], "Нода de: 47 % · этап 6/10 «сертификаты» · выпуск сертификата de.example.com · 0:08");
+    // The elapsed time ticks every second, also while the status repeats.
+    let clocks: Vec<&str> = texts.iter().map(|text| text.rsplit(" · ").next().unwrap()).collect();
+    assert_eq!(clocks, ["0:00", "0:01", "0:02", "0:03", "0:04", "0:05", "0:06", "0:07", "0:08", "0:09"]);
+    let percents: Vec<u8> = lines.iter().map(|(_, percent, _)| *percent).collect();
+    assert!(percents.windows(2).all(|pair| pair[0] <= pair[1]), "monotonic: {percents:?}");
+
+    let journal = journal.borrow();
+    let stages: Vec<&str> = journal.iter().map(|(_, text)| text.as_str()).filter(|text| text.starts_with("de: ")).collect();
+    assert_eq!(stages, ["de: исполнитель загружен", "de: применение запущено", "de: установка пакетов", "de: сертификаты",
+        "de: очистка", "de: применено"]);
+    assert!(journal.iter().all(|(_, text)| !text.contains('%') && !text.contains("распаковка")), "{journal:?}");
+}
+
+#[test]
+fn several_nodes_share_one_live_line() {
+    let operation = |teardown| crate::model::Operation { id: OP.into(), teardown, ..Default::default() };
+    let (mut first, mut second, mut third) = (FakeTransport::new(vec![]), FakeTransport::new(vec![]), FakeTransport::new(vec![]));
+    let mut runs = vec![
+        Run::new(node(1, "de"), &mut first, operation(false)),
+        Run::new(node(2, "nl"), &mut second, operation(false)),
+        Run::new(node(3, "fi"), &mut third, operation(false)),
+    ];
+    let started = runs[0].started;
+    (runs[0].stage, runs[0].percent, runs[0].detail) = ("packages".into(), 37, "nginx: распаковка".into());
+    (runs[1].stage, runs[1].percent) = ("certificate".into(), 71);
+    runs[2].outcome = Some(Outcome::Committed);
+    let (percent, text) = live_line(&runs, started + Duration::from_secs(102)).unwrap();
+    assert_eq!(percent, 69);
+    assert_eq!(text, "Ноды: 69 % · готово 1/3 · de 37 % «установка пакетов» · nl 71 % «сертификаты» · 1:42");
+    runs[1].lost = Some((started, 0, started));
+    assert!(live_line(&runs, started).unwrap().1.contains("nl 71 % нет связи"));
+    // A failed node is «ошибка»: neither done nor in the mean.
+    runs[1].lost = None;
+    runs[2].outcome = Some(Outcome::Failed(Failure { stage: "packages".into(), code: "start".into(), message: String::new(), port: None }));
+    let (percent, text) = live_line(&runs, started + Duration::from_secs(102)).unwrap();
+    assert_eq!(percent, 54);
+    assert_eq!(text, "Ноды: 54 % · готово 0/3 · ошибка: fi · de 37 % «установка пакетов» · nl 71 % «сертификаты» · 1:42");
+
+    // One node: stage of its own list; teardown counts its three stages.
+    let mut fourth = FakeTransport::new(vec![]);
+    let mut teardown = Run::new(node(1, "de"), &mut fourth, operation(true));
+    teardown.stage = "firewall".into();
+    let line = live_line(std::slice::from_ref(&teardown), teardown.started).unwrap().1;
+    assert_eq!(line, "Нода de: 0 % · этап 2/3 «правила UFW» · 0:00");
+    teardown.stage.clear();
+    assert!(live_line(std::slice::from_ref(&teardown), teardown.started).unwrap().1.contains("«запуск исполнителя»"));
+    assert!(live_line::<FakeTransport>(&[], teardown.started).is_none());
+}
+
+#[test]
+fn details_are_cut_and_cleaned() {
+    assert_eq!(clean_detail(" a\u{0}b\u{9b}c\r "), "abc");
+    let long = "д".repeat(300);
+    assert_eq!(clean_detail(&long).chars().count(), DETAIL_MAX);
 }

@@ -13,9 +13,66 @@ pub fn name_valid(value: &str) -> bool {
     !value.is_empty() && value.bytes().all(component_byte) && value.bytes().any(|b| b != b'.')
 }
 
+/// Latin spelling of a lowercase letter for [`suggest_name`]: Russian,
+/// Ukrainian and Belarusian Cyrillic, common Latin letters with diacritics.
+/// The same table is in `tui/src/nodes.rs` and `web/.../profiles-model.js`;
+/// `core/tests/validation_vectors.json` checks all three.
+const TRANSLIT: &[(char, &str)] = &[
+    ('а', "a"), ('б', "b"), ('в', "v"), ('г', "g"), ('д', "d"), ('е', "e"), ('ё', "e"), ('ж', "zh"), ('з', "z"),
+    ('и', "i"), ('й', "y"), ('к', "k"), ('л', "l"), ('м', "m"), ('н', "n"), ('о', "o"), ('п', "p"), ('р', "r"),
+    ('с', "s"), ('т', "t"), ('у', "u"), ('ф', "f"), ('х', "kh"), ('ц', "ts"), ('ч', "ch"), ('ш', "sh"),
+    ('щ', "shch"), ('ъ', ""), ('ы', "y"), ('ь', ""), ('э', "e"), ('ю', "yu"), ('я', "ya"),
+    ('і', "i"), ('ї', "yi"), ('є', "ye"), ('ґ', "g"), ('ў', "u"),
+    ('à', "a"), ('á', "a"), ('â', "a"), ('ã', "a"), ('ä', "a"), ('å', "a"), ('ā', "a"), ('ą', "a"), ('æ', "ae"),
+    ('ç', "c"), ('ć', "c"), ('č', "c"), ('ď', "d"), ('đ', "d"), ('ð', "d"),
+    ('è', "e"), ('é', "e"), ('ê', "e"), ('ë', "e"), ('ē', "e"), ('ę', "e"), ('ě', "e"), ('ğ', "g"),
+    ('ì', "i"), ('í', "i"), ('î', "i"), ('ï', "i"), ('ī', "i"), ('ı', "i"), ('ł', "l"),
+    ('ñ', "n"), ('ń', "n"), ('ň', "n"), ('ò', "o"), ('ó', "o"), ('ô', "o"), ('õ', "o"), ('ö', "o"), ('ø', "o"),
+    ('ō', "o"), ('ő', "o"), ('œ', "oe"), ('ř', "r"), ('ś', "s"), ('š', "s"), ('ş', "s"), ('ș', "s"), ('ß', "ss"),
+    ('ť', "t"), ('ţ', "t"), ('ț', "t"), ('þ', "th"), ('ù', "u"), ('ú', "u"), ('û', "u"), ('ü', "u"), ('ū', "u"),
+    ('ů', "u"), ('ű', "u"), ('ý', "y"), ('ÿ', "y"), ('ź', "z"), ('ż', "z"), ('ž', "z"),
+];
+
+/// A valid name close to an invalid one, for hints: letters lowercased and
+/// transliterated ([`TRANSLIT`]), combining accents dropped («İ» → «i»), any
+/// other run of characters one `-`, separators trimmed at the edges
+/// («VLESS TCP HY2» → «vless-tcp-hy2»), then made unique against `taken`
+/// with `-2`, `-3`, …. `None` when nothing usable is left. The menu and the
+/// web panel repeat this rule (shared vectors in `core/tests/validation_vectors.json`).
+pub fn suggest_name(value: &str, taken: &[&str]) -> Option<String> {
+    let mut out = String::new();
+    for c in value.chars().flat_map(char::to_lowercase) {
+        if c.is_ascii_alphanumeric() || matches!(c, '.' | '_') {
+            out.push(c);
+        } else if ('\u{300}'..='\u{36f}').contains(&c) {
+            continue;
+        } else if let Some((_, latin)) = TRANSLIT.iter().find(|(letter, _)| *letter == c) {
+            out.push_str(latin);
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let base = out.trim_matches(|c| matches!(c, '-' | '.' | '_')).to_owned();
+    if !name_valid(&base) { return None; }
+    if !taken.contains(&base.as_str()) { return Some(base); }
+    (2..).map(|n| format!("{base}-{n}")).find(|name| !taken.contains(&name.as_str()))
+}
+
+/// `invalid` for a bad name of `kind` («профиля», «ноды», «клиента», …):
+/// what is allowed and a valid name not in `taken` to use instead (extra `suggestion`).
+pub fn name_error(kind: &str, value: &str, taken: &[&str]) -> RcError {
+    let suggestion = suggest_name(value, taken);
+    let example = suggestion.clone().unwrap_or_else(|| "edge-1".to_owned());
+    let mut error = RcError::new("invalid", format!(
+        "Недопустимое имя {kind} «{value}»: только латинские буквы, цифры и символы . _ - без пробелов. Например: «{example}»."))
+        .with_extra("name", value);
+    if let Some(suggestion) = suggestion { error = error.with_extra("suggestion", suggestion); }
+    error
+}
+
 pub fn normalize_group_name(value: &str) -> Result<String> {
     if !name_valid(value) {
-        return Err(RcError::new("invalid", "Недопустимое название группы."));
+        return Err(name_error("группы", value, &[]));
     }
     Ok(value.to_ascii_uppercase())
 }
@@ -208,6 +265,37 @@ mod tests {
             assert!(!name_valid(bad));
         }
         assert_eq!(normalize_group_name("pc-test").unwrap(), "PC-TEST");
+    }
+
+    #[test]
+    fn bad_names_get_a_valid_suggestion() {
+        let error = name_error("профиля", "VLESS TCP", &["vless-tcp"]);
+        assert_eq!((error.code, error.extra["suggestion"].as_str()), ("invalid", Some("vless-tcp-2")));
+        assert!(error.message.contains("без пробелов") && error.message.contains("«vless-tcp-2»"));
+        assert!(name_error("ноды", "..", &[]).extra.get("suggestion").is_none());
+        assert_eq!(normalize_group_name("my group").unwrap_err().extra["suggestion"], "my-group");
+    }
+
+    /// The shared vectors the menu and the web panel check too.
+    #[test]
+    fn shared_validation_vectors() {
+        let vectors: serde_json::Value = serde_json::from_str(include_str!("../tests/validation_vectors.json")).unwrap();
+        let list = |path: &str| -> Vec<String> {
+            vectors.pointer(path).unwrap().as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_owned()).collect()
+        };
+        let check = |kind: &str, rule: &dyn Fn(&str) -> bool| {
+            for value in list(&format!("/{kind}/valid")) { assert!(rule(&value), "{kind} valid: {value:?}"); }
+            for value in list(&format!("/{kind}/invalid")) { assert!(!rule(&value), "{kind} invalid: {value:?}"); }
+        };
+        check("names", &name_valid);
+        check("domains", &domain_valid);
+        check("ports", &|value| parse_ssh_port(value).is_ok());
+        check("emails", &acme_email_valid);
+        check("versions", &|value| crate::model::mihomo_version_parts(value).is_some_and(|parts| parts >= crate::model::MIHOMO_MIN_VERSION));
+        for case in vectors["suggestions"].as_array().unwrap() {
+            let taken: Vec<&str> = case["taken"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+            assert_eq!(suggest_name(case["value"].as_str().unwrap(), &taken).as_deref(), case["suggestion"].as_str(), "{case}");
+        }
     }
 
     #[test]

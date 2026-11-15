@@ -261,17 +261,19 @@ _awg_bootstrap_dependencies() {
     (( need_gpg || need_headers )) || return 0
 
     info "Обновляю индексы активных репозиториев для зависимостей AmneziaWG..."
+    progress_detail "AmneziaWG: обновление списков пакетов"
     _awg_apt_wait || {
         _awg_fail "Bootstrap зависимостей прерван во время ожидания apt lock перед apt-get update."
         return 1
     }
-    DEBIAN_FRONTEND=noninteractive apt-get update || {
+    agent_apt 0 10 update || {
         _awg_fail "apt-get update для bootstrap зависимостей завершился ошибкой."
         return 1
     }
 
     if (( need_gpg )); then
         info "gpg не найден; устанавливаю пакет gnupg..."
+        progress_detail "AmneziaWG: установка gnupg"
         _awg_apt_wait || {
             _awg_fail "Установка gnupg прервана во время ожидания apt lock."
             return 1
@@ -301,13 +303,15 @@ _awg_bootstrap_dependencies() {
         }
         if (( headers_installed )); then
             info "Пакет $AWG_HEADERS_PKG установлен без build-path; переустанавливаю его..."
-            DEBIAN_FRONTEND=noninteractive apt-get install --reinstall -y "$AWG_HEADERS_PKG" || {
+            progress_detail "заголовки ядра $AWG_HEADERS_PKG"
+            agent_apt 10 35 install --reinstall -y "$AWG_HEADERS_PKG" || {
                 _awg_fail "Не удалось переустановить пакет $AWG_HEADERS_PKG."
                 return 1
             }
         else
             info "Устанавливаю заголовочные файлы текущего ядра: $AWG_HEADERS_PKG..."
-            DEBIAN_FRONTEND=noninteractive apt-get install -y "$AWG_HEADERS_PKG" || {
+            progress_detail "заголовки ядра $AWG_HEADERS_PKG"
+            agent_apt 10 35 install -y "$AWG_HEADERS_PKG" || {
                 _awg_fail "Не удалось установить пакет $AWG_HEADERS_PKG."
                 return 1
             }
@@ -476,13 +480,14 @@ _awg_ensure_packages() {
     local candidates=() candidate installed package tools_output tools_version module_version
     local i
 
+    progress_detail "репозиторий AmneziaWG"
     _awg_install_repository || { _awg_repo_abort; return 1; }
     _awg_apt_wait || {
         _awg_fail "Установка AmneziaWG прервана во время ожидания apt lock."
         _awg_repo_abort
         return 1
     }
-    DEBIAN_FRONTEND=noninteractive apt-get update || {
+    agent_apt 35 40 update || {
         _awg_fail "apt-get update завершился ошибкой."
         _awg_repo_abort
         return 1
@@ -507,7 +512,8 @@ _awg_ensure_packages() {
         _awg_repo_abort
         return 1
     }
-    DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}" || {
+    progress_detail "установка AmneziaWG и сборка модуля ядра"
+    agent_apt 40 100 install -y "${packages[@]}" || {
         _awg_fail "Не удалось установить пакеты AmneziaWG 3.1."
         _awg_show_module_diagnostics
         _awg_cleanup_failed_packages "$fresh_install"

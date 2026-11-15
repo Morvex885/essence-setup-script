@@ -54,6 +54,7 @@ impl Client for ScriptedClient {
     fn hello(&self) -> &Hello { &self.hello }
     fn send(&mut self, request: Request<'_>, progress: &mut dyn FnMut(Progress<'_>)) -> io::Result<Reply> {
         let reply = self.take(request, false);
+        for live in &reply.live { progress(Progress::Live(live)); }
         for entry in &reply.logs { progress(Progress::Log(entry)); }
         Ok(reply)
     }

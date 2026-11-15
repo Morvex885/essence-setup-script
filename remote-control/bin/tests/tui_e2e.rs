@@ -361,7 +361,10 @@ fn screens_speak_the_real_v2_grammar() {
     for noun in ["session", "source", "status", "group", "client", "template", "generate", "subscription", "node", "conn", "telegram", "profile", "cascade"] {
         assert!(client.calls.iter().any(|(argv, _)| argv[0] == noun), "walk never reached {noun}");
     }
-    // The profile wizard: Self-Steal, random site, VLESS TCP, IPv6 as is, random email, pinned mihomo (no GitHub query).
+    // The profile wizard: Self-Steal, random site, VLESS TCP, IPv6 as is, random email; mihomo — «1» picks
+    // «Последняя» from `profile mihomo-versions` or, offline, is refused by the manual entry's live check
+    // and the pinned v1.19.18 follows (with the list it is an invalid key of the profile card).
+    assert!(client.calls.iter().any(|(argv, _)| argv == &["profile", "mihomo-versions"]), "mihomo versions");
     assert!(client.calls.iter().any(|(argv, code)| argv.starts_with(&["profile".to_owned(), "add".to_owned()]) && code == "ok"), "profile add");
     assert!(client.calls.iter().any(|(argv, code)| argv.starts_with(&["template".to_owned(), "show".to_owned()]) && code == "ok"));
     // `g` on default.yaml offers only groups on other templates: none here
@@ -377,7 +380,7 @@ const WALK: &str = "1 \
     g a LAB 1 4 t 1 f _ h 0 0 0 \
     c a alice 4 1 v _ f _ s 0 r bob 0 0 \
     m 1 v _ c _ g x EXPORT 0 0 \
-    n 0 r a edge 1 1 _ 1 _ v1.19.18 0 0 k 0 p 0 t s 0 \
+    n 0 r a edge 1 1 _ 1 _ 1 v1.19.18 0 0 k 0 p 0 t s 0 \
     f a _ 0 \
     s l _ 0 \
     i 0 \

@@ -8,7 +8,7 @@ use tokio::{io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt}, sync::mpsc
 use zeroize::Zeroizing;
 use crate::{client::{Client, Progress, Request, TermEvent, TerminalIo, argv},
     endpoint::Endpoint,
-    protocol::{Hello, Input, Log, MAX_MESSAGE, PROTOCOL, Reply, Secrets, TICK, TerminalMessage, TerminalSpec, WindowSize, WireRequest},
+    protocol::{Hello, Input, Live, Log, MAX_MESSAGE, PROTOCOL, Reply, Secrets, TICK, TerminalMessage, TerminalSpec, WindowSize, WireRequest},
     spawn::{SpawnDaemon, journal_tail}};
 
 /// How long `connect_local` keeps retrying while a daemon starts or stops.
@@ -457,6 +457,10 @@ impl DaemonClient {
                     let entry: Log = serde_json::from_value(value).map_err(|_| protocol("Некорректное событие журнала"))?;
                     progress(Progress::Log(&entry));
                     logs.push(entry);
+                }
+                Some("progress") => {
+                    let live: Live = serde_json::from_value(value).map_err(|_| protocol("Некорректное событие прогресса"))?;
+                    progress(Progress::Live(&live));
                 }
                 Some("terminal") if value["state"] == "open" => {
                     let Some(io) = io.as_deref_mut() else { continue };

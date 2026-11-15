@@ -109,6 +109,28 @@ test('журнал: событие log идёт в onLog запроса', async 
   ]);
 });
 
+test('прогресс: событие progress идёт в onProgress запроса, не в журнал', async () => {
+  const { connection } = harness();
+  const socket = FakeSocket.instances[0];
+  hello(socket);
+  await connection.ready;
+  const lives = [];
+  const logs = [];
+  connection.on('log', (entry) => logs.push(entry));
+  const reply = connection.request(['node', 'apply'], { onProgress: (live) => lives.push(live), onLog: (entry) => logs.push(entry) });
+  socket.receive({ id: 1, event: 'progress', percent: 37, text: 'Нода de: 37 % · этап 1/10 «установка пакетов» · 1:42' });
+  socket.receive({ id: 1, event: 'progress', percent: 'x', text: 'испорчено' });
+  socket.receive({ id: 1, event: 'progress', percent: 140, text: 'сверх' });
+  socket.receive({ id: 7, event: 'progress', percent: 50, text: 'чужой запрос' });
+  socket.ok(1, {});
+  await reply;
+  assert.deepEqual(lives, [
+    { percent: 37, text: 'Нода de: 37 % · этап 1/10 «установка пакетов» · 1:42' },
+    { percent: 100, text: 'сверх' },
+  ]);
+  assert.deepEqual(logs, []);
+});
+
 test('терминал: open, output, stdin, resize, close, ответ', async () => {
   const { connection } = harness();
   const socket = FakeSocket.instances[0];

@@ -289,12 +289,16 @@ _tg_ensure_user() {
 _tg_build() {
     local stage go_binary candidate
     stage=$(mktemp -d "${TMPDIR:-/tmp}/tproxy-relay.XXXXXX") || return 1
+    progress_in 20
+    progress_detail "Telegram Proxy: загрузка исходников tproxy-server"
     if ! chmod 0700 "$stage" || ! _tg_clone_upstream "$stage" "$TG_REVISION"; then
         warn "Не удалось получить исходники tproxy-server ревизии $TG_REVISION."
         rm -rf "$stage"
         return 1
     fi
     # До install-mtproxy.sh: тот создаёт mtproxy сам, и Essence не узнал бы, что пользователь его.
+    progress_in 30
+    progress_detail "Telegram Proxy: сборка MTProxy"
     if ! _tg_ensure_user mtproxy || ! _tg_install_backend "$stage"; then
         warn "Не удалось подготовить службу MTProxy."
         rm -rf "$stage"
@@ -304,10 +308,14 @@ _tg_build() {
     mkdir -p "$(dirname "$TG_SOURCE")" || { rm -rf "$stage"; return 1; }
     mv "$stage" "$TG_SOURCE" || { rm -rf "$stage"; return 1; }
     chmod 0700 "$TG_SOURCE" || return 1
+    progress_in 60
+    progress_detail "Telegram Proxy: подготовка Go"
     go_binary=$(_tg_find_go 2>/dev/null || true)
     [[ -n "$go_binary" ]] || go_binary=$(_tg_install_pinned_go 2>/dev/null || true)
     [[ -n "$go_binary" ]] || { warn "Не удалось подготовить Go 1.20+."; return 1; }
     candidate=$(mktemp /tmp/tproxy-server.XXXXXX) || return 1
+    progress_in 70
+    progress_detail "Telegram Proxy: сборка tproxy-server (Go)"
     if ! _tg_build_relay "$TG_SOURCE" "$go_binary" "$candidate"; then
         rm -f "$candidate"
         warn "Не удалось собрать tproxy-server."
@@ -332,7 +340,8 @@ telegram_prepare() {
     # им остаться, если роль так и не будет зафиксирована (см. stage_cleanup).
     mkdir -p "$NODE_DIR/features" && : > "$NODE_DIR/features/telegram" || return 1
     agent_apt_wait || return 1
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -q git curl openssl wget unzip nginx nftables make gcc tar || return 1
+    progress_detail "Telegram Proxy: установка зависимостей"
+    agent_apt 0 20 install -y -q git curl openssl wget unzip nginx nftables make gcc tar || return 1
     _tg_ensure_user tproxy || return 1
     if _tg_revision_installed; then
         info "tproxy-server ревизии $TG_REVISION уже установлен — сборка пропущена."
@@ -345,6 +354,8 @@ telegram_prepare() {
     install -d -o root -g tproxy -m 0750 "$TG_DIR" || return 1
     _tg_ensure_token_key || { warn "Не удалось подготовить ключ токенов tproxy-server."; return 1; }
     if [[ ! -f "$TG_SITE/index.html" ]]; then
+        progress_in 95
+        progress_detail "Telegram Proxy: сайт-заглушка Web Proxy"
         site_fetch random "$TG_SITE" || { warn "Не удалось подготовить сайт-заглушку Web Proxy."; return 1; }
         [[ -f "$TG_SITE/index.html" ]] || { warn "index.html сайта Web Proxy недоступен."; return 1; }
         chmod -R u=rwX,go=rX "$TG_SITE" || return 1

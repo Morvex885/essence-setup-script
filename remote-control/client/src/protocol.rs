@@ -41,6 +41,11 @@ impl Input {
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct Log { pub level: String, pub text: String }
 
+/// `{"id","event":"progress","percent","text"}`: the live status line of a
+/// long request. Each one replaces the previous; it is not journal.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct Live { pub percent: u8, pub text: String }
+
 /// Final answer to a request: `{"id","ok":true,"data","sync"?}` or
 /// `{"id","ok":false,"error","exit"}`.
 #[derive(Clone, Default, Deserialize)]
@@ -51,6 +56,9 @@ pub struct Reply {
     #[serde(default)] pub sync: Value,
     #[serde(default)] pub exit: Option<u8>,
     #[serde(skip)] pub logs: Vec<Log>,
+    /// Live lines a [`crate::ScriptedClient`] replays before its logs; the
+    /// daemon client passes them only to `progress` and keeps none.
+    #[serde(skip)] pub live: Vec<Live>,
 }
 impl Reply {
     pub fn code(&self) -> &str { self.error["code"].as_str().unwrap_or("") }

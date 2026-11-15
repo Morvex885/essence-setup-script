@@ -24,8 +24,11 @@ use super::{
     generated_path_safe, group_nodes, node_line, remove_entry, require_one, templates, unique_values,
 };
 
-fn name_invalid() -> RcError {
-    RcError::new("invalid", "Имя может содержать только буквы, цифры, точку, - и _")
+/// `invalid` for a bad client name, suggesting a name no client has.
+fn client_name_error(session: &Session, name: &str) -> RcError {
+    let config = session.state.load_config().unwrap_or_default();
+    let taken: Vec<&str> = config.clients.iter().map(|client| client.name.as_str()).collect();
+    v::name_error("клиента", name, &taken)
 }
 
 fn token(client: &Client) -> Option<&str> {
@@ -166,7 +169,7 @@ pub(crate) fn uuid_v4() -> String {
 pub fn add(session: &mut Session, invocation: &Invocation) -> Result<Value> {
     let name = required(invocation, "name")?.to_owned();
     let group = required(invocation, "group")?.to_owned();
-    if !v::name_valid(&name) { return Err(name_invalid()); }
+    if !v::name_valid(&name) { return Err(client_name_error(session, &name)); }
     let nodes = session.mutate("add_client", |state| {
         let mut config = state.load_config()?;
         if config.clients.iter().any(|c| c.name == name) {
@@ -235,7 +238,7 @@ pub fn rename(session: &mut Session, invocation: &Invocation) -> Result<Value> {
     let new = required(invocation, "new-name")?.to_owned();
     let config = session.state.load_config()?;
     find_client(&config, &old)?;
-    if !v::name_valid(&new) { return Err(name_invalid()); }
+    if !v::name_valid(&new) { return Err(client_name_error(session, &new)); }
     if new == old { return Ok(json!({"name": new})); }
     rename_plan(&session.state, &config, &old, &new)?;
     let restore = |moved: &Option<RenamePlan>| {

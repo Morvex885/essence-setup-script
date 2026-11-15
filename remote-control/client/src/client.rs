@@ -1,7 +1,7 @@
 //! The front-end view of the daemon: screens and the CLI use [`Client`] exclusively.
 use std::{collections::BTreeMap, ffi::OsString, io, path::{Path, PathBuf}};
 use zeroize::Zeroizing;
-use crate::protocol::{Hello, Input, Log, Reply, Secrets};
+use crate::protocol::{Hello, Input, Live, Log, Reply, Secrets};
 
 /// One request: argv, secrets, input data and, for local connections, the
 /// client environment the daemon may use (`{"SSH_AUTH_SOCK": …}`).
@@ -30,9 +30,10 @@ pub fn agent_env(value: Option<OsString>) -> Option<BTreeMap<String, String>> {
     (path.len() <= MAX_AGENT_PATH).then(|| BTreeMap::from([("SSH_AUTH_SOCK".to_owned(), path)]))
 }
 
-/// Progress of a request in flight: a journal event of the core, or a timer
+/// Progress of a request in flight: a journal event of the core, the live
+/// status line (replaces the previous one, never journaled), or a timer
 /// tick (every [`crate::TICK`] without output) for redraws.
-pub enum Progress<'a> { Log(&'a Log), Tick }
+pub enum Progress<'a> { Log(&'a Log), Live(&'a Live), Tick }
 
 /// Local terminal events forwarded to the daemon during a terminal request.
 #[derive(Clone, Debug, PartialEq, Eq)]

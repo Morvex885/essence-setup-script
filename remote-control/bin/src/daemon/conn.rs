@@ -91,6 +91,16 @@ struct LogEvent<'a> {
     text: &'a str,
 }
 
+/// `{"id","event":"progress","percent","text"}`: the live status line of a
+/// request (replaces the previous one; not journaled).
+#[derive(Serialize)]
+struct ProgressEvent<'a> {
+    id: &'a Value,
+    event: &'static str,
+    percent: u8,
+    text: &'a str,
+}
+
 /// Key of a request id in per-connection maps (ids are scalars).
 fn key(id: &Value) -> String {
     id.to_string()
@@ -156,6 +166,11 @@ impl Conn {
         self.watch.load(Ordering::SeqCst)
     }
 
+    #[cfg(test)]
+    pub fn set_watching(&self, on: bool) {
+        self.watch.store(on, Ordering::SeqCst);
+    }
+
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
     }
@@ -193,6 +208,10 @@ impl Conn {
 
     pub fn log(&self, id: &Value, level: Level, text: &str) {
         self.send(&LogEvent { id, event: "log", level, text });
+    }
+
+    pub fn progress(&self, id: &Value, percent: u8, text: &str) {
+        self.send(&ProgressEvent { id, event: "progress", percent, text });
     }
 
     /// The one reply of a request; errors carry the CLI exit status.

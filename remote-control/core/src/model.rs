@@ -603,14 +603,18 @@ fn mark_valid(value: &str) -> bool {
     value.len() == 8 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// `vMAJOR.MINOR.PATCH` as numbers; `None` for any other shape.
+pub fn mihomo_version_parts(value: &str) -> Option<[u64; 3]> {
+    let rest = value.strip_prefix('v').filter(|rest| v::version_valid(rest))?;
+    let mut parts = rest.split('.').map(|part| part.parse::<u64>().ok());
+    Some([parts.next()??, parts.next()??, parts.next()??])
+}
+
 /// `vMAJOR.MINOR.PATCH` not below [`MIHOMO_MIN_VERSION`].
 fn mihomo_version_check(value: &str) -> Result<()> {
-    let parts: Option<Vec<u64>> = value.strip_prefix('v').filter(|rest| v::version_valid(rest))
-        .map(|rest| rest.split('.').map(|part| part.parse().ok()).collect::<Option<Vec<u64>>>())
-        .unwrap_or(None);
-    match parts {
+    match mihomo_version_parts(value) {
         None => Err(invalid("Некорректная версия mihomo: ожидается vX.Y.Z.")),
-        Some(parts) if parts.as_slice() < MIHOMO_MIN_VERSION.as_slice() => Err(invalid("Нужен mihomo не ниже v1.19.18.")),
+        Some(parts) if parts < MIHOMO_MIN_VERSION => Err(invalid("Нужен mihomo не ниже v1.19.18.")),
         Some(_) => Ok(()),
     }
 }

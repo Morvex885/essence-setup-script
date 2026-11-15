@@ -6,8 +6,8 @@
 import { html, useState, useEffect, useRef } from '../vendor/preact-htm.js';
 import { Button, useModalFocus } from './ui.js';
 import { Icon } from './icons.js';
-import { initialValues, visibleFields, validate, result } from './form-model.js';
-import { asList } from './format.js';
+import { initialValues, visibleFields, validate, liveErrors, suggestion, result } from './form-model.js';
+import { asList, operationLive } from './format.js';
 import { cancelValue } from './flows.js';
 
 /**
@@ -63,18 +63,26 @@ export function useDialogs() {
     /** Окно с содержимым (`lines` или `body`), закрывается кнопкой; итог — `undefined`. */
     show: (props) => push('show', props),
     /**
-     * Окно операции: строки журнала команды (адреса — ссылками). Возвращает
-     * `{ log(entry), finish() }`. После `finish()` окно без строк закрывается
-     * само, со строками — остаётся для чтения с кнопкой «Закрыть». Состояние
-     * хранится вне компонента, поэтому `finish()` до отрисовки не теряется.
+     * Окно операции: строки журнала команды (адреса — ссылками) и живая
+     * строка долгой команды (событие `progress`: полоса с процентом, этап,
+     * текущее действие, время). Возвращает `{ log(entry), live(progress),
+     * finish() }`. После `finish()` окно без строк закрывается само, со
+     * строками — остаётся для чтения с кнопкой «Закрыть». Состояние хранится
+     * вне компонента, поэтому `finish()` до отрисовки не теряется.
      */
     operation: (title) => {
-      const shared = { lines: [], finished: false, update: null };
+      const shared = { lines: [], live: null, finished: false, update: null };
       const handle = open('operation', { title, shared });
-      const refresh = () => { if (shared.update) shared.update({ lines: shared.lines, finished: shared.finished }); };
+      const refresh = () => {
+        if (shared.update) shared.update({ lines: shared.lines, live: shared.live, finished: shared.finished });
+      };
       return {
         log(entry) {
           shared.lines = [...shared.lines, entry];
+          refresh();
+        },
+        live(progress) {
+          shared.live = operationLive(progress);
           refresh();
         },
         finish() {
@@ -292,7 +300,7 @@ function FormDialog({ props, close }) {
   };
   const send = (event) => {
     event.preventDefault();
-    const found = validate(fields, values);
+    const found = { ...validate(fields, values), ...liveErrors(fields, values) };
     setErrors(found);
     const first = visible.find((field) => found[field.name]);
     if (first) {
@@ -302,10 +310,14 @@ function FormDialog({ props, close }) {
     }
     close(result(fields, values));
   };
+  // Живая проверка (`live`): ошибка видна по мере ввода, отправка выключена.
+  const live = liveErrors(fields, values);
+  const blocked = Object.keys(live).length > 0;
   return html`<${Shell} title=${title} context=${context} wide=${wide} onDismiss=${() => close(null)}>
     <form class="form" ref=${body} onSubmit=${send} novalidate>
       ${visible.map((field) => {
-        const error = errors[field.name];
+        const error = errors[field.name] || live[field.name];
+        const fix = error ? suggestion(field, values[field.name]) : null;
         const base = `${prefix}-${field.name}`;
         const described = Boolean(error || field.hint);
         const ids = { control: base, label: `${base}-label`, desc: described ? `${base}-desc` : undefined };
@@ -318,11 +330,12 @@ function FormDialog({ props, close }) {
             onChange=${(value) => update(field.name, value)} />
           ${field.hint && !error && html`<span class="field-hint t-dim" id=${ids.desc}>${field.hint}</span>`}
           ${error && html`<span class="field-error" id=${ids.desc} role="alert">${error}</span>`}
+          ${fix && html`<div class="row"><${Button} kind="ghost" onClick=${() => update(field.name, fix)}>Использовать «${fix}»<//></div>`}
         </div>`;
       })}
       <div class="modal-action">
         <${Button} kind="ghost" onClick=${() => close(null)}>Отмена<//>
-        <${Button} kind=${tone === 'danger' ? 'danger' : 'primary'} type="submit">${submit}<//>
+        <${Button} kind=${tone === 'danger' ? 'danger' : 'primary'} type="submit" disabled=${blocked}>${submit}<//>
       </div>
     </form>
   <//>`;
@@ -349,21 +362,28 @@ export function Linkified({ text }) {
 
 function OperationDialog({ props, close }) {
   const { title, shared } = props;
-  const [view, setView] = useState({ lines: shared.lines, finished: shared.finished });
+  const [view, setView] = useState({ lines: shared.lines, live: shared.live, finished: shared.finished });
   useEffect(() => {
     shared.update = setView;
     // Строки или завершение, пришедшие до подписки.
-    setView({ lines: shared.lines, finished: shared.finished });
+    setView({ lines: shared.lines, live: shared.live, finished: shared.finished });
     return () => { shared.update = null; };
   }, []);
+  const live = view.finished ? null : view.live;
   return html`<${Shell} title=${title} wide=${true} onDismiss=${() => { if (view.finished) close(undefined); }}>
     <div class="operation">
-      ${view.lines.length === 0 && !view.finished && html`<p class="t-dim">Выполняется…</p>`}
+      ${view.lines.length === 0 && !view.finished && !live && html`<p class="t-dim">Выполняется…</p>`}
       ${view.lines.map((entry, index) => html`
         <div key=${index} class="log-line level-${entry.level || 'info'}"><${Linkified} text=${entry.text} /></div>
       `)}
     </div>
-    ${!view.finished && html`<progress class="progress progress-primary"></progress>`}
+    ${live && html`<div class="op-live">
+      <span class="op-live-head">${live.head}</span>
+      ${live.rest && html`<span class="t-dim">${live.rest}</span>`}
+    </div>`}
+    ${!view.finished && (live
+      ? html`<progress class="progress progress-primary" value=${live.percent} max="100" aria-label=${`${live.percent} %`}></progress>`
+      : html`<progress class="progress progress-primary"></progress>`)}
     ${view.finished && html`<div class="modal-action"><${Button} onClick=${() => close(undefined)}>Закрыть<//></div>`}
   <//>`;
 }
