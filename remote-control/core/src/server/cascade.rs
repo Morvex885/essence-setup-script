@@ -144,7 +144,9 @@ fn add(session: &mut Session, invocation: &Invocation, input: &Input) -> Result<
     let listener: CascadeListener = parse(required(invocation, "listener")?,
         "Укажите --listener vless-tcp|vless-xhttp|vless-grpc|hysteria2.")?;
     if !v::name_valid(&name) {
-        return Err(invalid(format!("Недопустимое имя каскада «{name}»: латиница, цифры, «.», «_», «-».")));
+        let config = session.state.load_config()?;
+        let taken: Vec<&str> = config.cascades.iter().map(|cascade| cascade.name.as_str()).collect();
+        return Err(v::name_error("каскада", &name, &taken));
     }
     let exit = match (invocation.value("exit-node"), invocation.value("exit-proxy"), input.get("file")) {
         (Some(node), Some(proxy), None) => CascadeExit::Node(NodeExit {

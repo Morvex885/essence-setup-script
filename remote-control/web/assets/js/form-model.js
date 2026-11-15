@@ -1,7 +1,7 @@
 // Чистая логика форм `ctx.form` (`dialogs.js`): начальные значения, видимые
-// поля, проверка и итог. Поле: `{ name, label, type, value?, options?,
-// required?, validate?, when? }`; `type` — `text|secret|select|radio|multi|
-// checkbox|textarea`.
+// поля, проверка (при отправке и живая — по мере ввода) и итог. Поле:
+// `{ name, label, type, value?, options?, required?, validate?, live?,
+// suggest?, when? }`; `type` — `text|secret|select|radio|multi|checkbox|textarea`.
 import { asList } from './format.js';
 
 export const REQUIRED = 'Заполните поле.';
@@ -66,6 +66,29 @@ export function validate(fields, values) {
     }
   }
   return errors;
+}
+
+/**
+ * Ошибки полей с живой проверкой (`live: true`) при текущем вводе: видимое
+ * непустое поле, не прошедшее `validate`. Пока они есть, форма не
+ * отправляется (кнопка отправки выключена), а поле подсвечено с текстом ошибки.
+ */
+export function liveErrors(fields, values) {
+  const errors = {};
+  for (const field of visibleFields(fields, values)) {
+    const value = values[field.name];
+    if (!field.live || typeof field.validate !== 'function' || empty(field, value)) continue;
+    const message = field.validate(value, values);
+    if (message) errors[field.name] = message;
+  }
+  return errors;
+}
+
+/** Исправленное значение поля (`suggest(value)`) для подсказки при ошибке; `null` — нет. */
+export function suggestion(field, value) {
+  if (typeof field.suggest !== 'function') return null;
+  const fixed = field.suggest(value);
+  return typeof fixed === 'string' && fixed !== '' && fixed !== value ? fixed : null;
 }
 
 /** Итог формы: значения только видимых полей. */

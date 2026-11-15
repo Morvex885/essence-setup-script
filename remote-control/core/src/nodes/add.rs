@@ -22,7 +22,7 @@ use crate::model::{Auth, Fingerprint, Node, PortabilityReason, endpoint_key};
 use crate::request_secrets::Secrets;
 use crate::state::State;
 use crate::transport::{Authentication, ConnectOptions, HostKeyPolicy, RemoteTransport};
-use crate::validation::{name_valid, node_tag_valid, parse_ssh_port, ssh_host_valid, ssh_user_valid};
+use crate::validation::{name_error, name_valid, node_tag_valid, parse_ssh_port, ssh_host_valid, ssh_user_valid};
 
 use super::setup::{self, FileBackup, PortableKey};
 use super::{COMMAND_TIMEOUT, CONNECT_TIMEOUT, is_github, pin, required, set_issue};
@@ -247,10 +247,11 @@ pub async fn add<T: RemoteTransport>(session: &mut Session, invocation: &Invocat
         return Err(usage("Флаг --defer-ssh-setup не сочетается с флагами ключа сервера: ключ закрепит node setup-ssh."));
     }
 
-    if !name_valid(name) {
-        return Err(invalid(format!("Недопустимое имя ноды «{name}»: латиница, цифры, «.», «_», «-».")).with_extra("name", name));
-    }
     let config = session.state.load_config()?;
+    if !name_valid(name) {
+        let taken: Vec<&str> = config.nodes.iter().map(|node| node.name.as_str()).collect();
+        return Err(name_error("ноды", name, &taken));
+    }
     if config.nodes.iter().any(|node| node.name == name) {
         return Err(conflict(name));
     }

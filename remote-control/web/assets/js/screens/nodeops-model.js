@@ -9,8 +9,8 @@ import { asList, proxyLabel, strings, unlisted } from '../format.js';
 import { refill } from '../form-model.js';
 import { NODE_CODES, retryable } from '../flows.js';
 import { nodeLabel } from './nodes-model.js';
-import { domainError } from './profiles-model.js';
 import { applyState, offerApply, offerApplyNodes, profiledNodes } from './apply-model.js';
+import { domainError, domainSuggestion } from './profiles-model.js';
 
 /** Пустой выбор (`nodes.rs::EMPTY`). */
 export const EMPTY = 'Нет объектов для выбора';
@@ -322,8 +322,9 @@ async function changed(ctx, name, reply) {
 
 /** Поле домена: формат — как `validation::domain_valid` ядра, ошибка — под полем, без отправки. */
 const domainField = (value = '') => ({
-  name: 'domain', label: 'Домен', type: 'text', value, required: true, validate: domainError, placeholder: 'tg.example.com',
-  hint: 'Домен, указывающий на ноду.',
+  name: 'domain', label: 'Домен Telegram Web Proxy', type: 'text', value, required: true, placeholder: 'tg.example.com',
+  hint: 'Отдельный домен, через который Telegram подключается к ноде как к прокси; DNS-запись ведёт на IP ноды.',
+  live: true, validate: domainError, suggest: domainSuggestion,
 });
 
 /**

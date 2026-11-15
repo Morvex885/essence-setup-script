@@ -105,7 +105,7 @@ pub fn handle_node_codes(ctx: &mut Context<'_>, reply: &Reply, name: &str) -> io
 /// The domain question of `domain_required` → `node domain`; true when saved.
 fn set_domain(ctx: &mut Context<'_>, name: &str) -> io::Result<bool> {
     if name.is_empty() { return Ok(false); }
-    let Some(domain) = ask_valid(ctx, &format!("Нода: {name}"), "Домен ноды (Enter — отмена)", |d| d.is_empty() || domain_valid(d), DOMAIN_INVALID)? else { return Ok(false); };
+    let Some(domain) = ask_valid(ctx, &format!("Нода: {name}"), "Домен ноды (Enter — отмена)", domain_check)? else { return Ok(false); };
     if domain.is_empty() { return Ok(false); }
     Ok(ctx.call(&["node", "domain", "--name", name, "--domain", &domain])?.ok)
 }
@@ -141,6 +141,7 @@ fn node_items(data: &Value, problems: bool) -> Vec<Item> {
         let problem = problems && ((node["auth"] == "password" && node["password"] != "ok") || !rows(&node["issues"]).is_empty());
         let state = if problems { apply_state(node) } else { None };
         let label = match state { Some((state, _)) => format!("{}  · {state}", node_label(node)), None => node_label(node) };
+        let label = if problems && !profiled(node) { format!("{label}  · профиль не указан") } else { label };
         let pending = state.is_some_and(|(_, color)| color == ui::YELLOW);
         Item::new(i + 1, label, if problem || pending { ui::YELLOW } else { ui::CYAN })
     }).collect()
@@ -163,14 +164,21 @@ impl Screen for Nodes {
             let list = node_items(&reply.data, true);
             if list.is_empty() { view.context.push(ui::text("Нет нод", ui::DIM)); } else { view.sections.push(list); }
             let waiting = pending_count(&reply.data);
+            let unprofiled: Vec<&Value> = rows(&reply.data).iter().filter(|node| !profiled(node)).collect();
             let mut actions = vec![Item::new('a', "Добавить ноду", ui::GREEN)];
+            if !unprofiled.is_empty() { actions.push(Item::new('f', format!("Указать профиль (нод без профиля: {})", unprofiled.len()), ui::GREEN)); }
             if waiting > 0 { actions.push(Item::new('y', format!("Применить на всех ожидающих ({waiting})"), ui::GREEN)); }
             if pending { actions.push(Item::new('h', "Завершить отложенную SSH-настройку", ui::YELLOW)); }
             actions.push(Item::new(0, "Назад", ui::NC));
             view.sections.push(actions);
             let Some(choice) = ctx.choose(&view)? else { return Ok(Navigation::Back); };
             match choice.as_str() {
-                "a" | "A" => add_node(ctx)?,
+                "a" | "A" => add_node_among(ctx, names(&reply.data))?,
+                "f" | "F" if !unprofiled.is_empty() => {
+                    let labels: Vec<String> = unprofiled.iter().map(|node| node_label(node)).collect();
+                    let picked = if unprofiled.len() == 1 { Some(0) } else { ctx.select("Нода без профиля", &labels)? };
+                    if let Some(i) = picked { node_profile(ctx, &text(&unprofiled[i]["name"]), unprofiled[i])?; }
+                }
                 "y" | "Y" if waiting > 0 => { apply(ctx, &argv(&["node", "apply", "--pending"]), "")?; }
                 "h" | "H" if pending => setup_ssh(ctx)?,
                 "0" => return Ok(Navigation::Back),
@@ -181,6 +189,22 @@ impl Screen for Nodes {
             }
         }
     }
+}
+fn profiled(node: &Value) -> bool { !text(&node["profile"]).is_empty() }
+/// One-sentence explanations of the domains of a node («Роли и домены»).
+const ROLE_DOMAIN: &str = "адрес сайта-заглушки; DNS этого домена ведёт на IP ноды";
+const ROLE_TELEGRAM: &str = "отдельный домен, через который Telegram подключается к ноде";
+const ROLE_SUBSCRIPTION: &str = "домен, с которого приложения клиентов скачивают подписки";
+/// «Роли и домены» of a node: (label, value or `None` when unset, unset text, explanation).
+fn node_roles(node: &Value) -> [(&'static str, Option<String>, &'static str, &'static str); 3] {
+    let set = |value: String| (!value.is_empty()).then_some(value);
+    let sub = &node["subscription"];
+    let host = sub.is_object().then(|| if sub["port"] == 443 { text(&sub["hostname"]) } else { format!("{}:{}", text(&sub["hostname"]), text(&sub["port"])) });
+    [
+        ("Домен ноды (сайт-заглушка, Reality)", set(text(&node["domain"])), "не задан", ROLE_DOMAIN),
+        ("Telegram Web Proxy", set(text(&node["telegram"]["hostname"])), "выключен", ROLE_TELEGRAM),
+        ("Хост подписок", host, "не назначен", ROLE_SUBSCRIPTION),
+    ]
 }
 fn card_view(name: &str, node: &Value, password: bool) -> View {
     let mut view = View::new(format!("Нода: {name}"));
@@ -200,10 +224,8 @@ fn card_view(name: &str, node: &Value, password: bool) -> View {
         view.context.push(plain("Вход: по ключу".into()));
     }
     view.context.push(plain(format!("Тег: {}", text(&node["tag"]))));
-    let profile = text(&node["profile"]);
-    view.context.push(plain(format!("Профиль: {}", if profile.is_empty() { "нет" } else { &profile })));
-    let domain = text(&node["domain"]);
-    view.context.push(plain(format!("Домен: {}", if domain.is_empty() { "нет" } else { &domain })));
+    let has_profile = profiled(node);
+    view.context.push(if has_profile { plain(format!("Профиль: {}", text(&node["profile"]))) } else { ui::text("Профиль: не указан — f) Указать профиль", ui::YELLOW) });
     if let Some(ports) = node["ports"].as_object().filter(|ports| !ports.is_empty()) {
         let list: Vec<String> = ports.iter().map(|(key, port)| format!("{key}: {}", text(port))).collect();
         view.context.push(plain(format!("Порты ноды: {}", list.join(", "))));
@@ -215,13 +237,34 @@ fn card_view(name: &str, node: &Value, password: bool) -> View {
     let groups = joined(&node["groups"]);
     view.context.push(plain(format!("Группы: {}", if groups.is_empty() { "нет" } else { &groups })));
     view.context.push(plain(format!("Клиентов: {}", text(&node["clients"]))));
+    view.context.push(plain("Роли и домены:".into()));
+    for (i, (label, value, unset, hint)) in node_roles(node).into_iter().enumerate() {
+        let line = match value {
+            Some(value) => ui::text(format!("• {label}: {value}"), ui::GREEN),
+            // Telegram and subscriptions need the node's profile first.
+            None if i > 0 && !has_profile => ui::text(format!("• {label}: {unset} (сначала укажите профиль)"), ui::DIM),
+            None => ui::text(format!("• {label}: {unset}"), ui::DIM),
+        };
+        view.context.push(line);
+        view.context.push(plain(format!("  {hint}")));
+    }
     view.sections.push(vec![
         Item::new('y', "Применить", ui::GREEN),
         Item::new('o', "Оболочка", ui::CYAN),
         Item::new('p', "Подключения ноды", ui::CYAN), Item::new('k', "Проверить подключение", ui::CYAN),
     ]);
+    let [domain, telegram, subscription] = node_roles(node).map(|(_, value, ..)| value.is_some());
+    let mut roles = vec![
+        if has_profile { Item::new('f', "Профиль", ui::YELLOW) } else { Item::new('f', "Указать профиль", ui::GREEN) },
+        Item::new('m', if domain { "Домен ноды" } else { "Задать домен ноды" }, ui::YELLOW),
+    ];
+    if has_profile {
+        roles.push(if telegram { Item::new('t', "Telegram Web Proxy", ui::CYAN) } else { Item::new('t', "Включить Telegram Web Proxy", ui::GREEN) });
+        roles.push(if subscription { Item::new('s', "Хост подписок: сменить домен или порт", ui::YELLOW) } else { Item::new('s', "Сделать хостом подписок", ui::GREEN) });
+    }
+    view.sections.push(roles);
     let mut actions = vec![
-        Item::new('f', "Профиль", ui::YELLOW), Item::new('m', "Домен", ui::YELLOW), Item::new('i', "Порты", ui::YELLOW),
+        Item::new('i', "Порты", ui::YELLOW),
         Item::new('h', "Усилить защиту SSH", ui::YELLOW), Item::new('r', "Переименовать", ui::YELLOW), Item::new('e', "Тег", ui::YELLOW),
     ];
     if warp_label(node).is_some() { actions.push(Item::new('g', "Перерегистрировать WARP", ui::YELLOW)); }
@@ -229,6 +272,56 @@ fn card_view(name: &str, node: &Value, password: bool) -> View {
     actions.extend([Item::new('l', "Псевдонимы подключений", ui::YELLOW), Item::new('d', "Удалить ноду", ui::RED), Item::new(0, "Назад", ui::NC)]);
     view.sections.push(actions);
     view
+}
+/// What `set_subscription_host` did.
+enum HostSet { Saved(String), Declined, Failed }
+/// Makes `name` the subscription host on `domain` (`port` empty — 443): a
+/// host on another node is named and the move confirmed first. `Saved(old
+/// host node or "")`; `Declined` — the move refused; `Failed` — a command failed.
+fn set_subscription_host(ctx: &mut Context<'_>, name: &str, domain: &str, port: &str) -> io::Result<HostSet> {
+    let host = ctx.call(&["subscription", "host"])?;
+    if !host.ok { outcome(ctx, &host); return Ok(HostSet::Failed); }
+    let old = text(&host.data["node"]);
+    let old = if old == name { String::new() } else { old };
+    if !old.is_empty() {
+        let mut view = View::new(format!("Хост подписок: {name}"));
+        view.context.push(ui::text(format!("Сейчас хост подписок — нода «{old}» ({}).", text(&host.data["hostname"])), ui::YELLOW));
+        view.context.push(ui::text("После переноса обе ноды нужно применить, затем обновить подписки (subscription publish-all).", ui::NC));
+        if !ctx.confirm(view, &format!("Перенести хост подписок на ноду «{name}»?"))? { return Ok(HostSet::Declined); }
+    }
+    let mut words = argv(&["subscription", "host", "--name", name, "--domain", domain]);
+    // The core's default port is not passed (the web's `subscriptionSetHost`).
+    if !port.is_empty() && port != "443" { words.extend(argv(&["--port", port])); }
+    let reply = ctx.request(&words, &Secrets::default())?;
+    if !reply.ok { outcome(ctx, &reply); return Ok(HostSet::Failed); }
+    Ok(HostSet::Saved(old))
+}
+/// `domain` is one of the node's other domains; DNS names compare
+/// case-insensitively, as in the core.
+fn domain_taken(taken: &[impl AsRef<str>], domain: &str) -> bool {
+    taken.iter().any(|other| other.as_ref().eq_ignore_ascii_case(domain))
+}
+const DOMAIN_TAKEN: &str = "Этот домен уже занят другой ролью ноды — нужен отдельный домен (поддомен).";
+/// «Сделать хостом подписок» / «Хост подписок»: domain and port →
+/// `subscription host`; both the node and a former host then wait for `node apply`.
+fn subscription_role(ctx: &mut Context<'_>, name: &str, node: &Value) -> io::Result<()> {
+    let title = format!("Хост подписок: {name}");
+    let own = &node["subscription"];
+    let (keep, keep_port) = (text(&own["hostname"]), text(&own["port"]));
+    let taken = [text(&node["domain"]), text(&node["telegram"]["hostname"])];
+    let domain = loop {
+        let prompt = if keep.is_empty() { "Домен для подписок, например sub.example.com (Enter — отмена)".to_owned() } else { format!("Домен для подписок [{keep}]") };
+        let Some(domain) = ask_valid(ctx, &title, &prompt, domain_check)? else { return Ok(()); };
+        let domain = if domain.is_empty() { keep.clone() } else { domain };
+        if domain.is_empty() { return Ok(()); }
+        if domain_taken(&taken, &domain) { ctx.ui.notice(ui::warn(DOMAIN_TAKEN)); continue; }
+        break domain;
+    };
+    let prompt = if keep_port.is_empty() { "Порт подписок (Enter — 443)".to_owned() } else { format!("Порт подписок [{keep_port}]") };
+    let Some(port) = ask_valid(ctx, &title, &prompt, port_check)? else { return Ok(()); };
+    let port = if port.is_empty() { keep_port } else { port };
+    let HostSet::Saved(old) = set_subscription_host(ctx, name, &domain, &port)? else { return Ok(()); };
+    offer_apply_on(ctx, &[name.to_owned(), old])
 }
 impl Screen for NodeCard {
     fn run(&mut self, ctx: &mut Context<'_>) -> io::Result<Navigation> {
@@ -250,11 +343,13 @@ impl Screen for NodeCard {
                 "y" | "Y" => { apply(ctx, &argv(&["node", "apply", "--name", &name]), &name)?; }
                 "f" | "F" => node_profile(ctx, &name, node)?,
                 "m" | "M" => node_domain(ctx, &name, node)?,
+                "t" | "T" if profiled(node) => if node["telegram"].is_object() { telegram_card(ctx, &name)? } else { telegram_domain(ctx, &name)? },
+                "s" | "S" if profiled(node) => subscription_role(ctx, &name, node)?,
                 "i" | "I" => node_ports(ctx, &name, node)?,
                 "h" | "H" => harden(ctx, &name)?,
                 "r" | "R" => {
                     // Esc/Ctrl+D cancel only the rename; Ctrl+C leaves the card.
-                    let Some(new) = ask(ctx, "Переименование ноды", "Новое имя ноды")? else { if ctx.ui.interrupted() { return Ok(Navigation::Back); } continue; };
+                    let Some(new) = ask_valid(ctx, "Переименование ноды", "Новое имя ноды (Enter — отмена)", name_check)? else { if ctx.ui.interrupted() { return Ok(Navigation::Back); } continue; };
                     if new.is_empty() { continue; }
                     let renamed = ctx.call(&["node", "rename", "--name", &name, "--new-name", &new])?;
                     if renamed.ok { self.0 = renamed.data["name"].as_str().unwrap_or(&new).to_owned(); } else { outcome(ctx, &renamed); }
@@ -298,27 +393,46 @@ fn warp_reregister(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
 
 // ─── Добавление ──────────────────────────────────────────────────────────────
 
-fn add_node(ctx: &mut Context<'_>) -> io::Result<()> {
+#[cfg(test)]
+fn add_node(ctx: &mut Context<'_>) -> io::Result<()> { add_node_among(ctx, Vec::new()) }
+/// The add wizard; the name suggestion avoids the existing node names `taken`.
+fn add_node_among(ctx: &mut Context<'_>, taken: Vec<String>) -> io::Result<()> {
     let mut secrets = Secrets::default();
-    let result = add_node_with(ctx, &mut secrets);
+    let result = add_node_with(ctx, &mut secrets, taken);
     secrets.clear();
     result
 }
-fn add_node_with(ctx: &mut Context<'_>, secrets: &mut Secrets) -> io::Result<()> {
+/// An optional role domain (Enter — none) other than the domains in `taken`.
+fn ask_role_domain(ctx: &mut Context<'_>, title: &str, prompt: &str, taken: &[&str]) -> io::Result<Option<String>> {
+    loop {
+        let Some(value) = ask_valid(ctx, title, prompt, domain_check)? else { return Ok(None); };
+        if value.is_empty() || !domain_taken(taken, &value) { return Ok(Some(value)); }
+        ctx.ui.notice(ui::warn(DOMAIN_TAKEN));
+    }
+}
+const ROLE_TELEGRAM_NAME: &str = "Telegram Web Proxy";
+const ROLE_SUBSCRIPTION_NAME: &str = "хост подписок";
+/// A role command of the add wizard failed (the core's message is in the
+/// journal): «Повторить» asks the domain again (Enter keeps the typed one),
+/// «Пропустить» — `None`, with the place to set it later.
+fn role_retry(ctx: &mut Context<'_>, role: &str, domain: &str) -> io::Result<Option<String>> {
+    ctx.ui.notice(ui::warn(format!("Не удалось задать {role} с доменом «{domain}». Позже: карточка ноды → Роли и домены.")));
+    let choices: [String; 2] = ["Повторить".into(), "Пропустить".into()];
+    if ctx.select(&format!("{role}: не задан"), &choices)? != Some(0) { return Ok(None); }
+    let Some(value) = ask_valid(ctx, "Добавление ноды", &format!("Домен: {role} [{domain}]"), domain_check)? else { return Ok(None); };
+    Ok(Some(if value.is_empty() { domain.to_owned() } else { value }))
+}
+fn add_node_with(ctx: &mut Context<'_>, secrets: &mut Secrets, taken: Vec<String>) -> io::Result<()> {
     const TITLE: &str = "Добавление ноды";
-    let Some(name) = ask(ctx, TITLE, "Название [vps-1]")? else { return Ok(()); };
+    let Some(name) = ask_checked(ctx, TITLE, "Название, например vps-1 [vps-1]", name_check, taken)? else { return Ok(()); };
     let name = if name.is_empty() { "vps-1".to_owned() } else { name };
     let Some(ip) = ask(ctx, TITLE, "IP")? else { return Ok(()); };
     if ip.is_empty() {
         ctx.ui.notice(ui::warn("IP не указан."));
         return Ok(());
     }
-    let port = loop {
-        let Some(port) = ask(ctx, TITLE, "SSH-порт [22]")? else { return Ok(()); };
-        let port = if port.is_empty() { "22".to_owned() } else { port };
-        if port.bytes().all(|b| b.is_ascii_digit()) && port.parse::<u16>().is_ok_and(|p| p > 0) { break port; }
-        ctx.ui.notice(ui::warn("Порт должен быть числом от 1 до 65535."));
-    };
+    let Some(port) = ask_valid(ctx, TITLE, "SSH-порт [22]", port_check)? else { return Ok(()); };
+    let port = if port.is_empty() { "22".to_owned() } else { port };
     let Some(user) = ask(ctx, TITLE, "Логин [root]")? else { return Ok(()); };
     let user = if user.is_empty() { "root".to_owned() } else { user };
     let Some(auth) = ctx.select("Способ входа", &["SSH-ключ".into(), "Пароль".into()])? else { return Ok(()); };
@@ -335,21 +449,26 @@ fn add_node_with(ctx: &mut Context<'_>, secrets: &mut Secrets) -> io::Result<()>
         if !tag.is_empty() { break tag; }
         ctx.ui.notice(ui::warn("Тег не может быть пустым."));
     };
-    // Profile (no profiles — no question) and, when its site needs one, the node domain.
+    // Profile (no profiles — no question), the node domain when its site needs
+    // one, then the optional Telegram Web Proxy and subscription domains.
     let profiles = ctx.call(&["profile", "list"])?;
     let profiles = if profiles.ok { rows(&profiles.data["profiles"]).to_vec() } else { vec![] };
-    let mut profile = String::new();
-    let mut domain = String::new();
+    let (mut profile, mut domain, mut telegram, mut subscription) = (String::new(), String::new(), String::new(), String::new());
     if !profiles.is_empty() {
         let mut labels = vec!["Без профиля".to_owned()];
         labels.extend(profiles.iter().map(|p| text(&p["name"])));
-        let Some(i) = ctx.select("Профиль ноды", &labels)? else { return Ok(()); };
+        let Some(i) = ctx.select_with("Профиль ноды", vec![ui::text(PROFILE_EXPLAINED, ui::NC)], &labels)? else { return Ok(()); };
         if i > 0 {
             profile = text(&profiles[i - 1]["name"]);
             if needs_domain(&profiles[i - 1]) {
-                let Some(value) = ask_valid(ctx, TITLE, "Домен ноды", domain_valid, DOMAIN_INVALID)? else { return Ok(()); };
+                let prompt = "Домен ноды (сайт-заглушка), например node.example.com";
+                let Some(value) = ask_required(ctx, TITLE, prompt, domain_check, "Домен ноды не указан.")? else { return Ok(()); };
                 domain = value;
             }
+            let Some(value) = ask_role_domain(ctx, TITLE, "Домен для Telegram Web Proxy, например tg.example.com (Enter — не нужен)", &[&domain])? else { return Ok(()); };
+            telegram = value;
+            let Some(value) = ask_role_domain(ctx, TITLE, "Домен для подписок, например sub.example.com (Enter — не нужен)", &[&domain, &telegram])? else { return Ok(()); };
+            subscription = value;
         }
     }
     let mut base = argv(&["node", "add", "--name", &name, "--ip", &ip, "--port", &port, "--user", &user,
@@ -369,11 +488,29 @@ fn add_node_with(ctx: &mut Context<'_>, secrets: &mut Secrets) -> io::Result<()>
             ctx.request(&words, secrets)?
         };
         if reply.ok {
-            if reply.data["needs_setup"] == true { ctx.ui.notice(ui::warn("Нода сохранена, но требует SSH-настройки: раздел n → h.")); }
-            // A node with a profile is applied right away, under the plan.
+            let deferred = reply.data["needs_setup"] == true;
+            if deferred { ctx.ui.notice(ui::warn("Нода сохранена, но требует SSH-настройки: раздел n → h.")); }
+            // A node with a profile gets its roles, then one apply under the plan installs everything.
             if !profile.is_empty() {
                 let saved = reply.data["name"].as_str().filter(|s| !s.is_empty()).unwrap_or(&name).to_owned();
-                apply(ctx, &argv(&["node", "apply", "--name", &saved]), &saved)?;
+                let mut words = argv(&["node", "apply", "--name", &saved]);
+                while !telegram.is_empty() {
+                    if ctx.call(&["telegram", "set", "--name", &saved, "--domain", &telegram])?.ok { break; }
+                    telegram = role_retry(ctx, ROLE_TELEGRAM_NAME, &telegram)?.unwrap_or_default();
+                }
+                while !subscription.is_empty() {
+                    match set_subscription_host(ctx, &saved, &subscription, "")? {
+                        HostSet::Saved(old) => { if !old.is_empty() { words.extend(argv(&["--name", &old])); } break; }
+                        HostSet::Declined => break,
+                        HostSet::Failed => subscription = role_retry(ctx, ROLE_SUBSCRIPTION_NAME, &subscription)?.unwrap_or_default(),
+                    }
+                }
+                // Deferred SSH setup: the node is not reachable yet, nothing to apply.
+                if deferred {
+                    ctx.ui.notice(ui::warn("Применение отложено: завершите SSH-настройку (раздел n → h), затем примените ноду (карточка ноды → y)."));
+                } else {
+                    apply(ctx, &words, &saved)?;
+                }
             }
             return Ok(());
         }
@@ -799,7 +936,7 @@ fn telegram_changed(ctx: &mut Context<'_>, name: &str, reply: &Reply) -> io::Res
 /// The Web Proxy domain (Enter — cancel) → `telegram set`.
 fn telegram_domain(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
     let title = format!("Telegram Proxy: {name}");
-    let Some(domain) = ask_valid(ctx, &title, "Домен Web Proxy (Enter — отмена)", |d| d.is_empty() || domain_valid(d), DOMAIN_INVALID)? else { return Ok(()); };
+    let Some(domain) = ask_valid(ctx, &title, "Домен Web Proxy, например tg.example.com (Enter — отмена)", domain_check)? else { return Ok(()); };
     if domain.is_empty() { return Ok(()); }
     let reply = ctx.call(&["telegram", "set", "--name", name, "--domain", &domain])?;
     telegram_changed(ctx, name, &reply)
@@ -1019,8 +1156,12 @@ pub(crate) fn offer_apply_on(ctx: &mut Context<'_>, nodes: &[String]) -> io::Res
 
 // ─── Профиль, домен и порты ноды ─────────────────────────────────────────────
 
-const DOMAIN_INVALID: &str = "Некорректный домен.";
+const DOMAIN_INVALID: &str = "Домен — части из латинских букв, цифр и дефисов через точку, например node.example.com.";
 const PORT_INVALID: &str = "Порт должен быть числом от 1 до 65535.";
+const EMAIL_INVALID: &str = "Email в виде имя@домен, например admin@example.com.";
+const VERSION_INVALID: &str = "Версия в виде vX.Y.Z не ниже v1.19.18, например v1.19.18.";
+/// What a name may contain (`validation::name_valid` of the core: no length limit).
+pub(crate) const NAME_RULE: &str = "Только латинские буквы, цифры и символы . _ - без пробелов. Например: edge-full.";
 /// `validation::domain_valid` of the core: labels, at least one dot.
 pub(crate) fn domain_valid(value: &str) -> bool {
     (1..=253).contains(&value.len()) && value.contains('.') && value.split('.').all(|label| {
@@ -1028,35 +1169,139 @@ pub(crate) fn domain_valid(value: &str) -> bool {
             && !label.starts_with('-') && !label.ends_with('-')
     })
 }
-fn port_valid(value: &str) -> bool { value.is_empty() || (value.bytes().all(|b| b.is_ascii_digit()) && !value.starts_with('0') && value.parse::<u16>().is_ok()) }
-/// A question repeated until `check` accepts the trimmed answer; `None` on cancel.
-fn ask_valid(ctx: &mut Context<'_>, title: &str, prompt: &str, check: impl Fn(&str) -> bool, message: &str) -> io::Result<Option<String>> {
+/// `validation::name_valid` of the core.
+pub(crate) fn name_valid(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')) && value.bytes().any(|b| b != b'.')
+}
+/// `validation::TRANSLIT` of the core (shared vectors: `core/tests/validation_vectors.json`).
+const TRANSLIT: &[(char, &str)] = &[
+    ('а', "a"), ('б', "b"), ('в', "v"), ('г', "g"), ('д', "d"), ('е', "e"), ('ё', "e"), ('ж', "zh"), ('з', "z"),
+    ('и', "i"), ('й', "y"), ('к', "k"), ('л', "l"), ('м', "m"), ('н', "n"), ('о', "o"), ('п', "p"), ('р', "r"),
+    ('с', "s"), ('т', "t"), ('у', "u"), ('ф', "f"), ('х', "kh"), ('ц', "ts"), ('ч', "ch"), ('ш', "sh"),
+    ('щ', "shch"), ('ъ', ""), ('ы', "y"), ('ь', ""), ('э', "e"), ('ю', "yu"), ('я', "ya"),
+    ('і', "i"), ('ї', "yi"), ('є', "ye"), ('ґ', "g"), ('ў', "u"),
+    ('à', "a"), ('á', "a"), ('â', "a"), ('ã', "a"), ('ä', "a"), ('å', "a"), ('ā', "a"), ('ą', "a"), ('æ', "ae"),
+    ('ç', "c"), ('ć', "c"), ('č', "c"), ('ď', "d"), ('đ', "d"), ('ð', "d"),
+    ('è', "e"), ('é', "e"), ('ê', "e"), ('ë', "e"), ('ē', "e"), ('ę', "e"), ('ě', "e"), ('ğ', "g"),
+    ('ì', "i"), ('í', "i"), ('î', "i"), ('ï', "i"), ('ī', "i"), ('ı', "i"), ('ł', "l"),
+    ('ñ', "n"), ('ń', "n"), ('ň', "n"), ('ò', "o"), ('ó', "o"), ('ô', "o"), ('õ', "o"), ('ö', "o"), ('ø', "o"),
+    ('ō', "o"), ('ő', "o"), ('œ', "oe"), ('ř', "r"), ('ś', "s"), ('š', "s"), ('ş', "s"), ('ș', "s"), ('ß', "ss"),
+    ('ť', "t"), ('ţ', "t"), ('ț', "t"), ('þ', "th"), ('ù', "u"), ('ú', "u"), ('û', "u"), ('ü', "u"), ('ū', "u"),
+    ('ů', "u"), ('ű', "u"), ('ý', "y"), ('ÿ', "y"), ('ź', "z"), ('ż', "z"), ('ž', "z"),
+];
+/// `validation::suggest_name` of the core: letters lowercased and
+/// transliterated, combining accents dropped, other runs one `-`, separators
+/// trimmed («VLESS TCP HY2» → «vless-tcp-hy2»), unique against `taken` (`-2`, `-3`, …).
+pub(crate) fn suggest_name(value: &str, taken: &[String]) -> Option<String> {
+    let mut out = String::new();
+    for c in value.chars().flat_map(char::to_lowercase) {
+        if c.is_ascii_alphanumeric() || matches!(c, '.' | '_') { out.push(c); }
+        else if ('\u{300}'..='\u{36f}').contains(&c) { continue; }
+        else if let Some((_, latin)) = TRANSLIT.iter().find(|(letter, _)| *letter == c) { out.push_str(latin); }
+        else if !out.ends_with('-') { out.push('-'); }
+    }
+    let base = out.trim_matches(|c| matches!(c, '-' | '.' | '_')).to_owned();
+    if !name_valid(&base) { return None; }
+    if !taken.contains(&base) { return Some(base); }
+    (2..).map(|n| format!("{base}-{n}")).find(|name| !taken.contains(name))
+}
+/// `validation::parse_ssh_port` of the core: 1–5 digits, 1…65535 (`080` too); empty — the question's default.
+fn port_valid(value: &str) -> bool {
+    value.is_empty() || ((1..=5).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_digit()) && value.parse::<u16>().is_ok_and(|p| p != 0))
+}
+fn problem(message: &str, fix: Option<String>) -> ui::Problem { ui::Problem { message: message.to_owned(), fix } }
+/// Live check of an object name with a valid suggestion not in `taken` (Tab).
+pub(crate) fn name_check(value: &str, taken: &[String]) -> Result<(), ui::Problem> {
+    if name_valid(value) { Ok(()) } else { Err(problem(NAME_RULE, suggest_name(value, taken))) }
+}
+/// Live check of a domain; a pasted address (`https://host/…`) offers its host.
+pub(crate) fn domain_check(value: &str, _: &[String]) -> Result<(), ui::Problem> {
+    let value = value.trim();
+    if domain_valid(value) { return Ok(()); }
+    let host = value.rsplit("://").next().unwrap_or(value).split(['/', ':']).next().unwrap_or("").to_ascii_lowercase();
+    Err(problem(DOMAIN_INVALID, (domain_valid(&host) && host != value).then_some(host)))
+}
+fn port_check(value: &str, _: &[String]) -> Result<(), ui::Problem> {
+    if port_valid(value.trim()) { Ok(()) } else { Err(problem(PORT_INVALID, None)) }
+}
+fn email_check(value: &str, _: &[String]) -> Result<(), ui::Problem> {
+    if email_valid(value.trim()) { Ok(()) } else { Err(problem(EMAIL_INVALID, None)) }
+}
+/// `vX.Y.Z` not below v1.19.18 (the core's minimum); `1.19.20` offers `v1.19.20`.
+fn version_check(value: &str, _: &[String]) -> Result<(), ui::Problem> {
+    let value = value.trim();
+    if version_valid(value) { return Ok(()); }
+    let fixed = format!("v{value}");
+    Err(problem(VERSION_INVALID, (!value.starts_with('v') && version_valid(&fixed)).then_some(fixed)))
+}
+/// A question with a live check of the typed text: the terminal refuses a
+/// failing answer, another UI's answer is checked again here. Returns the
+/// trimmed answer (empty passes: cancel or default for the caller); `None` on cancel.
+fn ask_valid(ctx: &mut Context<'_>, title: &str, prompt: &str, check: ui::Check) -> io::Result<Option<String>> {
+    ask_checked(ctx, title, prompt, check, Vec::new())
+}
+/// `ask_valid` with the names already in use (a name suggestion avoids them).
+fn ask_checked(ctx: &mut Context<'_>, title: &str, prompt: &str, check: ui::Check, taken: Vec<String>) -> io::Result<Option<String>> {
+    let mut view = View::new(title);
+    view.prompt = format!("{prompt}: ");
+    view.check = Some(check);
+    view.taken = taken;
     loop {
-        let Some(value) = ask(ctx, title, prompt)? else { return Ok(None); };
+        let Some(value) = ctx.choose(&view)? else { return Ok(None); };
         let value = value.trim().to_owned();
-        if check(&value) { return Ok(Some(value)); }
-        ctx.ui.notice(ui::warn(message));
+        match check(&value, &view.taken) {
+            Err(problem) if !value.is_empty() => ctx.ui.notice(ui::warn(problem.message)),
+            _ => return Ok(Some(value)),
+        }
     }
 }
-/// «Профиль»: a profile or «Без профиля» → `node profile`.
+/// `ask_valid` that repeats an empty answer with `missing`.
+fn ask_required(ctx: &mut Context<'_>, title: &str, prompt: &str, check: ui::Check, missing: &str) -> io::Result<Option<String>> {
+    loop {
+        let Some(value) = ask_valid(ctx, title, prompt, check)? else { return Ok(None); };
+        if !value.is_empty() { return Ok(Some(value)); }
+        ctx.ui.notice(ui::warn(missing));
+    }
+}
+const PROFILE_EXPLAINED: &str = "Профиль — набор протоколов и настроек сервера; нода с профилем настраивается командой «Применить».";
+/// «Профиль» / «Указать профиль»: a profile or «Без профиля» → `node profile`;
+/// without profiles the profile wizard is offered first. A node given a
+/// profile waits for `node apply`, offered right away.
 fn node_profile(ctx: &mut Context<'_>, name: &str, node: &Value) -> io::Result<()> {
     let listed = ctx.call(&["profile", "list"])?;
     if !listed.ok { ctx.failed(); return Ok(()); }
-    let mut values = vec![String::new()];
-    values.extend(rows(&listed.data["profiles"]).iter().map(|p| text(&p["name"])));
-    let labels: Vec<String> = values.iter().map(|v| if v.is_empty() { "Без профиля".to_owned() } else { v.clone() }).collect();
-    let Some(i) = ctx.select(&format!("Профиль ноды: {name}"), &labels)? else { return Ok(()); };
-    if values[i] == text(&node["profile"]) { ctx.ui.notice(ui::warn("Изменений нет.")); return Ok(()); }
-    let reply = ctx.call(&["node", "profile", "--name", name, "--profile", &values[i]])?;
-    outcome(ctx, &reply);
+    let title = format!("Профиль ноды: {name}");
+    let profiles = names(&listed.data["profiles"]);
+    let chosen = if profiles.is_empty() {
+        let mut view = View::new(title.as_str());
+        view.context.push(ui::text(PROFILE_EXPLAINED, ui::NC));
+        if !ctx.confirm(view, "Профилей ещё нет. Создать профиль сейчас?")? { return Ok(()); }
+        let Some(created) = add_profile(ctx)? else { return Ok(()); };
+        created
+    } else {
+        let mut values = vec![String::new()];
+        values.extend(profiles);
+        let current = text(&node["profile"]);
+        let labels: Vec<String> = values.iter().map(|v| {
+            let label = if v.is_empty() { "Без профиля".to_owned() } else { v.clone() };
+            if *v == current { format!("{label} (сейчас)") } else { label }
+        }).collect();
+        let Some(i) = ctx.select_with(&title, vec![ui::text(PROFILE_EXPLAINED, ui::NC)], &labels)? else { return Ok(()); };
+        if values[i] == current { ctx.ui.notice(ui::warn("Изменений нет.")); return Ok(()); }
+        values.swap_remove(i)
+    };
+    let reply = ctx.call(&["node", "profile", "--name", name, "--profile", &chosen])?;
+    if !reply.ok { outcome(ctx, &reply); return Ok(()); }
+    if !chosen.is_empty() { offer_apply_on(ctx, &[name.to_owned()])?; }
     Ok(())
 }
-/// «Домен»: Enter clears the domain → `node domain`.
+/// «Домен ноды»: Enter clears the domain → `node domain`; the node then waits for `node apply`.
 fn node_domain(ctx: &mut Context<'_>, name: &str, node: &Value) -> io::Result<()> {
-    let Some(domain) = ask_valid(ctx, &format!("Домен ноды: {name}"), "Домен (Enter — без домена)", |d| d.is_empty() || domain_valid(d), DOMAIN_INVALID)? else { return Ok(()); };
+    let Some(domain) = ask_valid(ctx, &format!("Домен ноды: {name}"), "Домен (Enter — без домена)", domain_check)? else { return Ok(()); };
     if domain == text(&node["domain"]) { ctx.ui.notice(ui::warn("Изменений нет.")); return Ok(()); }
     let reply = ctx.call(&["node", "domain", "--name", name, "--domain", &domain])?;
-    outcome(ctx, &reply);
+    if !reply.ok { outcome(ctx, &reply); return Ok(()); }
+    if !text(&node["profile"]).is_empty() { offer_apply_on(ctx, &[name.to_owned()])?; }
     Ok(())
 }
 /// Protocols of a profile with a configurable port: (`node port --protocol` key, label, profile port).
@@ -1082,7 +1327,7 @@ fn node_ports(ctx: &mut Context<'_>, name: &str, node: &Value) -> io::Result<()>
         if own.is_empty() { format!("{label}: {port} (профиль)") } else { format!("{label}: {own} (нода)") }
     }).collect();
     let Some(i) = ctx.select(&format!("Порты ноды: {name}"), &labels)? else { return Ok(()); };
-    let Some(port) = ask_valid(ctx, &format!("Порты ноды: {name}"), "Порт (Enter — порт профиля)", port_valid, PORT_INVALID)? else { return Ok(()); };
+    let Some(port) = ask_valid(ctx, &format!("Порты ноды: {name}"), "Порт (Enter — порт профиля)", port_check)? else { return Ok(()); };
     let reply = ctx.call(&["node", "port", "--name", name, "--protocol", protocols[i].0, "--port", &port])?;
     outcome(ctx, &reply);
     Ok(())
@@ -1095,8 +1340,17 @@ const PROTOCOLS: [(&str, &str, &str); 6] = [
     ("vless-tcp", "VLESS TCP", "TCP"), ("xhttp", "VLESS xHTTP", "xHTTP"), ("grpc", "VLESS gRPC", "gRPC"),
     ("hysteria2", "Hysteria2", "HY2"), ("amneziawg", "AmneziaWG", "AWG"), ("warp", "WARP", "WARP"),
 ];
-const SITE_SOURCES: [(&str, &str); 4] = [("random", "Случайный"), ("simple", "simple-web-templates"), ("sni", "sni-templates"), ("nothing", "nothing-sni")];
-const IPV6: [(&str, &str); 3] = [("default", "Как в системе"), ("enabled", "Включить"), ("disabled", "Отключить")];
+const SITE_SOURCES: [Choice; 4] = [
+    ("random", "Случайный шаблон", "сайт выбирается случайно из всех наборов — подходит почти всегда"),
+    ("simple", "Набор simple-web-templates", "простые сайты-визитки"),
+    ("sni", "Набор sni-templates", "страницы в стиле онлайн-сервисов"),
+    ("nothing", "Набор nothing-sni", "минималистичные страницы-заглушки"),
+];
+const IPV6: [Choice; 3] = [
+    ("default", "Как в системе", "настройки IPv6 сервера не меняются"),
+    ("enabled", "Включить", "нода работает и по IPv6, если провайдер выдал ей IPv6-адрес"),
+    ("disabled", "Отключить", "IPv6 на сервере выключается — если он работает плохо или мешает сайтам верно определять страну"),
+];
 
 fn port_text(block: &Value) -> String { if block["port"].is_null() { String::new() } else { text(&block["port"]) } }
 /// The answers of the profile wizard; the same fields as the web form.
@@ -1210,58 +1464,122 @@ fn email_valid(value: &str) -> bool {
     !local.is_empty() && local.bytes().all(|b| b.is_ascii_alphanumeric() || b"._%+-".contains(&b))
         && domain.split('.').count() >= 2 && domain.split('.').all(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
 }
+/// `vX.Y.Z` not below v1.19.18 (`model::MIHOMO_MIN_VERSION` of the core).
 fn version_valid(value: &str) -> bool {
-    value.strip_prefix('v').is_some_and(|rest| { let parts: Vec<_> = rest.split('.').collect(); parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())) })
+    let Some(rest) = value.strip_prefix('v') else { return false; };
+    let parts: Vec<&str> = rest.split('.').collect();
+    if parts.len() != 3 || !parts.iter().all(|p| !p.is_empty() && p.len() <= 9 && p.bytes().all(|b| b.is_ascii_digit())) { return false; }
+    let numbers: Vec<u64> = parts.iter().map(|p| p.parse().unwrap_or(0)).collect();
+    numbers.as_slice() >= [1, 19, 18].as_slice()
 }
-/// One of `options` (value, label) by number; the current value is marked,
-/// highlighted and kept by Enter.
-fn choose_option(ctx: &mut Context<'_>, title: &str, options: &[(&str, &str)], current: Option<&str>) -> io::Result<Option<String>> {
-    let labels: Vec<String> = options.iter().map(|(value, label)| if current == Some(*value) { format!("{label} (сейчас)") } else { (*label).to_owned() }).collect();
-    let at = options.iter().position(|(value, _)| current == Some(*value));
-    Ok(ctx.select_current(title, &labels, at)?.map(|i| options[i].0.to_owned()))
+/// (value, label, one-sentence explanation for a non-specialist) of a choice.
+type Choice = (&'static str, &'static str, &'static str);
+const REALITY: [Choice; 2] = [
+    ("self-steal", "Self-Steal — свой домен", "нода маскируется под собственный сайт-заглушку на вашем домене; нужен домен, направленный на IP ноды."),
+    ("sni", "SNI — чужой сайт", "нода выдаёт себя за известный чужой сайт (например, www.microsoft.com); свой домен не нужен."),
+];
+const XHTTP_TOPOLOGIES: [Choice; 2] = [
+    ("reality", "Reality — отдельный порт", "xHTTP работает сам по себе на своём порту и маскируется под чужой сайт, как VLESS TCP. Проще и не зависит от вашего сайта."),
+    ("nginx", "Через ваш сайт (nginx, порт 443)", "xHTTP прячется внутри сайта-заглушки на 443 по секретному адресу: снаружи это обычные заходы на ваш сайт. Лучше проходит строгую фильтрацию, но нужен домен ноды."),
+];
+const OBFS: [Choice; 2] = [
+    ("on", "Включить", "Скрывает, что это Hysteria2: помогает, если провайдер режет такой трафик; все клиенты должны поддерживать obfs."),
+    ("off", "Выключить", "Обычный Hysteria2, совместим со всеми клиентами."),
+];
+/// One sentence per protocol of `PROTOCOLS`, in its order.
+const PROTOCOL_HINTS: [&str; 6] = [
+    "основной протокол: быстрый и надёжный, оставьте включённым",
+    "выглядит как обычные HTTP-запросы",
+    "выглядит как gRPC-трафик",
+    "быстрый протокол поверх UDP",
+    "VPN на основе WireGuard с маскировкой",
+    "сайты видят адрес Cloudflare вместо адреса ноды",
+];
+const SITE_EXPLAINED: &str = "Сайт-заглушка — страница, которую увидит обычный посетитель домена ноды: сервер выглядит как обычный сайт.";
+const XHTTP_EXPLAINED: &str = "Как подключение xHTTP будет выглядеть для провайдера:";
+const MIHOMO_EXPLAINED: &str = "mihomo — программа-прокси на сервере; обычно выбирайте последнюю версию.";
+/// One of `options` by number, each explained above the list; the current
+/// value is marked, highlighted and kept by Enter.
+fn choose_option(ctx: &mut Context<'_>, title: &str, intro: Option<&str>, options: &[Choice], current: Option<&str>) -> io::Result<Option<String>> {
+    let mut context: Vec<_> = intro.into_iter().map(|line| ui::text(line, ui::NC)).collect();
+    context.extend(options.iter().map(|(_, label, hint)| ui::text(format!("• {label}: {hint}"), ui::NC)));
+    let labels: Vec<String> = options.iter().map(|(value, label, _)| if current == Some(*value) { format!("{label} (сейчас)") } else { (*label).to_owned() }).collect();
+    let at = options.iter().position(|(value, ..)| current == Some(*value));
+    Ok(ctx.select_with_current(title, context, &labels, at)?.map(|i| options[i].0.to_owned()))
+}
+/// The mihomo version: «Последняя (vX)», the recent versions and «Ввести
+/// вручную» from `profile mihomo-versions`; manual entry (format hint, live
+/// check) also when the list is unavailable. `current` (editing) is marked,
+/// highlighted and kept on Enter. `Some("")` — the latest by the core; `None` — cancelled.
+fn choose_version(ctx: &mut Context<'_>, title: &str, current: Option<&str>) -> io::Result<Option<String>> {
+    let listed = ctx.call(&["profile", "mihomo-versions"])?;
+    let latest = text(&listed.data["latest"]);
+    if listed.ok && !latest.is_empty() {
+        let mut values = vec![latest.clone()];
+        values.extend(rows(&listed.data["versions"]).iter().map(text).filter(|v| *v != latest));
+        if let Some(current) = current.filter(|c| !c.is_empty() && !values.iter().any(|v| v == c)) { values.insert(1, current.to_owned()); }
+        let mut labels: Vec<String> = values.iter().enumerate().map(|(i, value)| {
+            let label = if i == 0 { format!("Последняя ({value})") } else { value.clone() };
+            if current == Some(value.as_str()) { format!("{label} (сейчас)") } else { label }
+        }).collect();
+        labels.push("Ввести вручную".into());
+        let at = values.iter().position(|value| current == Some(value.as_str()));
+        let Some(i) = ctx.select_with_current("Версия mihomo", vec![ui::text(MIHOMO_EXPLAINED, ui::NC)], &labels, at)? else { return Ok(None); };
+        if i < values.len() { return Ok(Some(values.swap_remove(i))); }
+    }
+    let prompt = match current.filter(|c| !c.is_empty()) {
+        Some(current) => format!("Версия mihomo в виде vX.Y.Z, например v1.19.18 [{current}]"),
+        None => "Версия mihomo в виде vX.Y.Z, например v1.19.18 (Enter — последняя)".to_owned(),
+    };
+    let Some(version) = ask_valid(ctx, title, &prompt, version_check)? else { return Ok(None); };
+    Ok(Some(if version.is_empty() { current.unwrap_or_default().to_owned() } else { version }))
 }
 /// The profile wizard (plan order): name → Reality → masking domain or site
 /// source → protocols → xHTTP topology → ports → obfs → AmneziaWG DNS → IPv6 →
-/// email → mihomo version. `current` — the answers to start from (the profile
-/// being edited or a failed attempt), Enter keeps each of them; `rename` asks
-/// the name (adding), editing skips it. `None` — cancelled.
+/// email → mihomo version. Every technical choice explains its options.
+/// `current` — the answers to start from (the profile being edited or a
+/// failed attempt), Enter keeps each of them; `rename` asks the name
+/// (adding), editing skips it; the name suggestion avoids `taken`. `None` — cancelled.
 fn profile_wizard(ctx: &mut Context<'_>, current: Option<&ProfileForm>, rename: bool) -> io::Result<Option<ProfileForm>> {
+    profile_wizard_among(ctx, current, rename, Vec::new())
+}
+/// The wizard with the existing profile names `taken`.
+fn profile_wizard_among(ctx: &mut Context<'_>, current: Option<&ProfileForm>, rename: bool, taken: Vec<String>) -> io::Result<Option<ProfileForm>> {
     let editing = current.is_some();
     let mut form = current.cloned().unwrap_or_default();
     let title = if rename { "Добавление профиля".to_owned() } else { format!("Профиль: {}", form.name) };
     let mark = |value: &str| editing.then_some(value.to_owned());
     if rename {
-        loop {
-            let prompt = if form.name.is_empty() { "Имя профиля".to_owned() } else { format!("Имя профиля [{}]", form.name) };
-            let Some(name) = ask(ctx, &title, &prompt)? else { return Ok(None); };
-            if !name.trim().is_empty() { form.name = name.trim().to_owned(); break; }
-            if !form.name.is_empty() { break; }
-            ctx.ui.notice(ui::warn("Имя профиля не указано."));
-        }
+        // A retried attempt keeps its name on Enter; a new one cancels on Enter.
+        let prompt = if form.name.is_empty() { "Имя профиля, например edge-full (Enter — отмена)".to_owned() } else { format!("Имя профиля [{}]", form.name) };
+        let Some(name) = ask_checked(ctx, &title, &prompt, name_check, taken)? else { return Ok(None); };
+        if !name.is_empty() { form.name = name; }
+        if form.name.is_empty() { return Ok(None); }
     }
-    let reality = [("self-steal", "Self-Steal — у ноды свой домен"), ("sni", "SNI — маскировка под чужой домен, нода без домена")];
-    let Some(mode) = choose_option(ctx, "Режим Reality", &reality, mark(&form.reality).as_deref())? else { return Ok(None); };
+    let Some(mode) = choose_option(ctx, "Режим Reality", Some("Как нода прячет VPN-трафик от провайдера:"), &REALITY, mark(&form.reality).as_deref())? else { return Ok(None); };
     form.reality = mode;
     if form.reality == "sni" {
         let keep = editing && !form.sni_domain.is_empty();
-        let prompt = if keep { format!("Домен-маскировка [{}]", form.sni_domain) } else { "Домен-маскировка".to_owned() };
-        let Some(domain) = ask_valid(ctx, &title, &prompt, |d| domain_valid(d) || (keep && d.is_empty()), DOMAIN_INVALID)? else { return Ok(None); };
+        let prompt = if keep { format!("Чужой сайт для маскировки, например www.microsoft.com [{}]", form.sni_domain) } else { "Чужой сайт для маскировки, например www.microsoft.com".to_owned() };
+        let domain = if keep { ask_valid(ctx, &title, &prompt, domain_check)? } else { ask_required(ctx, &title, &prompt, domain_check, "Домен не указан.")? };
+        let Some(domain) = domain else { return Ok(None); };
         if !domain.is_empty() { form.sni_domain = domain; }
     } else {
-        let Some(source) = choose_option(ctx, "Сайт-заглушка", &SITE_SOURCES, mark(&form.site_source).as_deref())? else { return Ok(None); };
+        let Some(source) = choose_option(ctx, "Сайт-заглушка", Some(SITE_EXPLAINED), &SITE_SOURCES, mark(&form.site_source).as_deref())? else { return Ok(None); };
         form.site_source = source;
     }
     let labels: Vec<String> = PROTOCOLS.iter().map(|(_, label, _)| (*label).to_owned()).collect();
+    let hints: Vec<_> = PROTOCOLS.iter().zip(PROTOCOL_HINTS).map(|((_, label, _), hint)| ui::text(format!("• {label}: {hint}"), ui::NC)).collect();
     loop {
         let flags = PROTOCOLS.iter().map(|(value, ..)| form.on(value)).collect();
-        let Some(chosen) = ctx.toggle("Протоколы профиля", &labels, flags, EMPTY)? else { return Ok(None); };
+        let Some(chosen) = ctx.toggle_with("Протоколы профиля", hints.clone(), &labels, flags, EMPTY)? else { return Ok(None); };
         if chosen.is_empty() { ctx.ui.notice(ui::warn("Выберите хотя бы один протокол.")); continue; }
         form.protocols = chosen.into_iter().map(|i| PROTOCOLS[i].0.to_owned()).collect();
         break;
     }
     if form.on("xhttp") {
         if form.reality == "sni" { form.xhttp = "reality".into(); } else {
-            let Some(topology) = choose_option(ctx, "Топология xHTTP", &[("reality", "Reality"), ("nginx", "Через nginx сайта")], mark(&form.xhttp).as_deref())? else { return Ok(None); };
+            let Some(topology) = choose_option(ctx, "Топология xHTTP", Some(XHTTP_EXPLAINED), &XHTTP_TOPOLOGIES, mark(&form.xhttp).as_deref())? else { return Ok(None); };
             form.xhttp = topology;
         }
     }
@@ -1274,12 +1592,12 @@ fn profile_wizard(ctx: &mut Context<'_>, current: Option<&ProfileForm>, rename: 
         let field = match key { "xhttp" => &mut form.xhttp_port, "grpc" => &mut form.grpc_port, "hysteria2" => &mut form.hysteria2_port, _ => &mut form.amneziawg_port };
         let keep = editing && !field.is_empty();
         let prompt = if keep { format!("Порт {label} [{field}]") } else { format!("Порт {label} (Enter — случайный)") };
-        let Some(port) = ask_valid(ctx, &title, &prompt, port_valid, PORT_INVALID)? else { return Ok(None); };
+        let Some(port) = ask_valid(ctx, &title, &prompt, port_check)? else { return Ok(None); };
         if !port.is_empty() || !keep { *field = port; }
     }
     if form.on("hysteria2") {
         let current = editing.then_some(if form.hysteria2_obfs { "on" } else { "off" });
-        let Some(obfs) = choose_option(ctx, "Hysteria2: обфускация (obfs)", &[("on", "Включить"), ("off", "Выключить")], current)? else { return Ok(None); };
+        let Some(obfs) = choose_option(ctx, "Hysteria2: обфускация (obfs)", None, &OBFS, current)? else { return Ok(None); };
         form.hysteria2_obfs = obfs == "on";
     }
     if form.on("amneziawg") {
@@ -1287,28 +1605,30 @@ fn profile_wizard(ctx: &mut Context<'_>, current: Option<&ProfileForm>, rename: 
         let Some(dns) = ask(ctx, &title, &prompt)? else { return Ok(None); };
         if !dns.trim().is_empty() { form.amneziawg_dns = dns.trim().to_owned(); }
     }
-    let Some(ipv6) = choose_option(ctx, "IPv6", &IPV6, mark(&form.ipv6).as_deref())? else { return Ok(None); };
+    let Some(ipv6) = choose_option(ctx, "IPv6", None, &IPV6, mark(&form.ipv6).as_deref())? else { return Ok(None); };
     form.ipv6 = ipv6;
     let keep = editing && !form.acme_email.is_empty();
-    let prompt = if keep { format!("Email ACME [{}]", form.acme_email) } else { "Email ACME (Enter — случайный адрес)".to_owned() };
-    let Some(email) = ask_valid(ctx, &title, &prompt, |e| e.is_empty() || email_valid(e), "Некорректный email.")? else { return Ok(None); };
+    let prompt = if keep { format!("Email для Let's Encrypt (уведомления о сертификатах) [{}]", form.acme_email) } else { "Email для Let's Encrypt (уведомления о сертификатах; Enter — случайный адрес)".to_owned() };
+    let Some(email) = ask_valid(ctx, &title, &prompt, email_check)? else { return Ok(None); };
     if !email.is_empty() || !keep { form.acme_email = email; }
-    let keep = editing && !form.mihomo_version.is_empty();
-    let prompt = if keep { format!("Версия mihomo [{}]", form.mihomo_version) } else { "Версия mihomo (Enter — последняя)".to_owned() };
-    let Some(version) = ask_valid(ctx, &title, &prompt, |v| v.is_empty() || version_valid(v), "Версия в виде vX.Y.Z.")? else { return Ok(None); };
-    if !version.is_empty() || !keep { form.mihomo_version = version; }
+    let current = editing.then_some(form.mihomo_version.clone());
+    let Some(version) = choose_version(ctx, &title, current.as_deref())? else { return Ok(None); };
+    form.mihomo_version = version;
     Ok(Some(form))
 }
-/// «Добавить профиль»: success opens its card; a failed `profile add`
-/// (`confirm::retryable`) reopens the wizard with the answers, name included.
-fn add_profile(ctx: &mut Context<'_>) -> io::Result<()> {
+/// «Добавить профиль»: the wizard → `profile add`; the saved name, `None`
+/// when cancelled or failed. A failed `profile add` (`confirm::retryable`)
+/// reopens the wizard with the answers, name included.
+fn add_profile(ctx: &mut Context<'_>) -> io::Result<Option<String>> { add_profile_among(ctx, Vec::new()) }
+/// `add_profile` whose name suggestion avoids the existing profile names `taken`.
+fn add_profile_among(ctx: &mut Context<'_>, taken: Vec<String>) -> io::Result<Option<String>> {
     let mut draft = None;
     loop {
-        let Some(form) = profile_wizard(ctx, draft.as_ref(), true)? else { return Ok(()); };
+        let Some(form) = profile_wizard_among(ctx, draft.as_ref(), true, taken.clone())? else { return Ok(None); };
         let added = ctx.request(&profile_add_argv(&form), &Secrets::default())?;
-        if added.ok { ProfileCard(added.data["name"].as_str().unwrap_or(&form.name).to_owned()).run(ctx)?; return Ok(()); }
+        if added.ok { return Ok(Some(added.data["name"].as_str().filter(|s| !s.is_empty()).unwrap_or(&form.name).to_owned())); }
         outcome(ctx, &added);
-        if !confirm::retryable(&added) { return Ok(()); }
+        if !confirm::retryable(&added) { return Ok(None); }
         draft = Some(form);
     }
 }
@@ -1350,7 +1670,7 @@ impl Screen for Profiles {
             view.sections.push(vec![Item::new('a', "Добавить профиль", ui::GREEN), Item::new(0, "Назад", ui::NC)]);
             let Some(choice) = ctx.choose(&view)? else { return Ok(Navigation::Back); };
             match choice.as_str() {
-                "a" | "A" => add_profile(ctx)?,
+                "a" | "A" => if let Some(name) = add_profile_among(ctx, names(&reply.data["profiles"]))? { ProfileCard(name).run(ctx)?; },
                 "0" => return Ok(Navigation::Back),
                 _ => match index(&choice, list.len()) {
                     Some(i) => { ProfileCard(text(&list[i]["name"])).run(ctx)?; }
@@ -1369,7 +1689,7 @@ fn profile_view(name: &str, profile: &Value) -> View {
     if profile["reality_mode"] != "sni" { view.context.push(plain(format!("Сайт-заглушка: {}", text(&profile["site_source"])))); }
     view.context.push(plain(format!("VLESS TCP: {}", if profile["vless_tcp"] == true { "вкл." } else { "выкл." })));
     let xhttp = &profile["vless_xhttp"];
-    view.context.push(plain(format!("VLESS xHTTP: {}", off(xhttp, if xhttp["topology"] == "nginx" { "через nginx".into() } else { format!("Reality, порт {}", port_text(xhttp)) }))));
+    view.context.push(plain(format!("VLESS xHTTP: {}", off(xhttp, if xhttp["topology"] == "nginx" { "через ваш сайт (nginx, порт 443)".into() } else { format!("отдельный порт {} (Reality)", port_text(xhttp)) }))));
     view.context.push(plain(format!("VLESS gRPC: {}", off(&profile["vless_grpc"], format!("порт {}", port_text(&profile["vless_grpc"]))))));
     let hy2 = &profile["hysteria2"];
     view.context.push(plain(format!("Hysteria2: {}", off(hy2, format!("порт {}{}", port_text(hy2), if hy2["obfs"] == true { ", obfs" } else { "" })))));
@@ -1377,7 +1697,7 @@ fn profile_view(name: &str, profile: &Value) -> View {
     view.context.push(plain(format!("AmneziaWG: {}", off(awg, format!("порт {}, DNS {}", port_text(awg), text(&awg["dns"]))))));
     view.context.push(plain(format!("WARP: {}", if profile["warp"] != true { "выкл." } else if profile["warp_plus"] == true { "вкл., ключ WARP+ задан" } else { "вкл." })));
     let ipv6 = text(&profile["ipv6"]);
-    view.context.push(plain(format!("IPv6: {}", IPV6.iter().find(|(v, _)| *v == ipv6).map_or(ipv6.as_str(), |(_, l)| l))));
+    view.context.push(plain(format!("IPv6: {}", IPV6.iter().find(|(v, ..)| *v == ipv6).map_or(ipv6.as_str(), |(_, l, _)| l))));
     view.context.push(plain(format!("Email ACME: {}", text(&profile["acme_email"]))));
     view.context.push(plain(format!("Версия mihomo: {}", text(&profile["mihomo_version"]))));
     let nodes = joined(&profile["nodes"]);
@@ -1495,8 +1815,7 @@ impl Screen for Cascades {
 /// node and its connection, or a hidden external-server URI sent as input `file`.
 fn add_cascade(ctx: &mut Context<'_>) -> io::Result<()> {
     const TITLE: &str = "Добавление каскада";
-    let Some(name) = ask(ctx, TITLE, "Имя каскада (Enter — отмена)")? else { return Ok(()); };
-    let name = name.trim().to_owned();
+    let Some(name) = ask_valid(ctx, TITLE, "Имя каскада, например eu-exit (Enter — отмена)", name_check)? else { return Ok(()); };
     if name.is_empty() { return Ok(()); }
     let listed = ctx.call(&["node", "list"])?;
     if !listed.ok { ctx.failed(); return Ok(()); }
@@ -1587,6 +1906,7 @@ mod tests {
         ("telegram", "status", "name+ all"), ("telegram", "set", "name= domain="), ("telegram", "remove", "name="),
         ("telegram", "link", "name="), ("telegram", "rotate-secret", "name="), ("telegram", "tag", "name= clear"),
         ("telegram", "restart", "name="), ("telegram", "diagnostics", "name="),
+        ("profile", "mihomo-versions", ""), ("subscription", "host", "name= domain= port= remove"),
     ];
     fn parses(words: &[String]) -> bool {
         let Some((noun, rest)) = words.split_first() else { return false; };
@@ -1700,7 +2020,8 @@ mod tests {
         assert!(noticed(&ui, "IP не указан"));
         let (_, _, ui) = run(vec![no_profiles(), (add_words("password", ACCEPT), added(false))],
             &["", "192.0.2.1", "0", "70000", "x", "", "", "2", "", "pw", "", "tag"], add_node);
-        assert_eq!(ui.notices.len(), 5);
+        // The bad ports are refused by the live check, the empty password and tag are warned.
+        assert_eq!((ui.rejected.len(), ui.notices.len()), (3, 2));
         // EOF at any question sends nothing.
         run(none(), &["", "192.0.2.1", "", "", "1"], add_node);
         run(none(), &["", "192.0.2.1", "", ""], add_node);
@@ -2182,7 +2503,7 @@ mod tests {
             ]);
             let select = ui.views.iter().find(|v| v.title == "Включение Telegram Proxy").unwrap();
             assert_eq!(select.sections[0].iter().map(|i| i.label.clone()).collect::<Vec<_>>(), ["n2  192.0.2.2:22", "Отмена"]);
-            assert!(noticed(&ui, DOMAIN_INVALID));
+            assert_eq!(ui.rejected, ["bad"]);
             assert_eq!(confirms(&ui), 0, "node apply runs at once; its plan is the only question");
             assert!(client.secret_names.iter().all(Vec::is_empty));
         }
@@ -2329,24 +2650,88 @@ mod tests {
             "amneziawg": null, "warp": false, "warp_plus": false, "ipv6": "default", "mihomo_version": "v1.19.18",
             "acme_email": "a@example.com", "nodes": ["n"]})
     }
+    fn versions() -> (Vec<String>, Reply) {
+        step(&["profile", "mihomo-versions"], ok(json!({"latest": "v1.19.20", "versions": ["v1.19.20", "v1.19.19", "v1.19.18"]})))
+    }
+    fn no_versions() -> (Vec<String>, Reply) { step(&["profile", "mihomo-versions"], err("failed", json!({"message": "Не удалось получить список версий mihomo."}))) }
     #[test]
     fn profile_wizard_builds_the_add_argv_in_plan_order() {
-        // Self-Steal, random site, + xHTTP (nginx), gRPC (port after an invalid one), Hysteria2 (random port, obfs).
-        let (form, _, ui) = run(none(), &["edge", "1", "1", "2", "3", "4", "", "2", "70000", "20000", "", "1", "1", "", ""],
+        // Self-Steal, random site, + xHTTP (nginx), gRPC (port after an invalid one), Hysteria2 (random port, obfs);
+        // an invalid name and port are refused by the live check; the latest mihomo from the list.
+        let (form, _, ui) = run(vec![versions()], &["VLESS TCP", "edge", "1", "1", "2", "3", "4", "", "2", "70000", "20000", "", "1", "1", "", "1"],
             |ctx| profile_wizard(ctx, None, true));
         assert_eq!(profile_add_argv(&form.unwrap()), argv(&["profile", "add", "--name", "edge", "--reality", "self-steal", "--site-source", "random",
             "--vless-tcp", "on", "--xhttp", "nginx", "--grpc", "on", "--grpc-port", "20000", "--hysteria2", "on", "--hysteria2-obfs", "on",
-            "--amneziawg", "off", "--warp", "off", "--ipv6", "default", "--random-acme-email"]));
-        assert!(noticed(&ui, PORT_INVALID));
-        // SNI: the masking domain is checked; email and version are passed.
-        let (form, _, ui) = run(none(), &["sni", "2", "bad", "www.example.com", "", "3", "me@example.com", "v1.19.20"], |ctx| profile_wizard(ctx, None, true));
+            "--amneziawg", "off", "--warp", "off", "--ipv6", "default", "--random-acme-email", "--mihomo-version", "v1.19.20"]));
+        assert_eq!(ui.rejected, ["VLESS TCP", "70000"]);
+        // Every technical choice explains its options above the list.
+        for title in ["Режим Reality", "Сайт-заглушка", "Протоколы профиля", "Топология xHTTP", "Hysteria2: обфускация (obfs)", "IPv6", "Версия mihomo"] {
+            let view = ui.views.iter().find(|v| v.title == title).unwrap();
+            assert!(!view.context.is_empty(), "{title}");
+        }
+        let topology = ui.views.iter().find(|v| v.title == "Топология xHTTP").unwrap();
+        assert_eq!(topology.sections[0].iter().map(|i| i.label.as_str()).collect::<Vec<_>>(), ["Reality — отдельный порт", "Через ваш сайт (nginx, порт 443)", "Отмена"]);
+        let version = ui.views.iter().find(|v| v.title == "Версия mihomo").unwrap();
+        assert_eq!(version.sections[0].iter().map(|i| i.label.as_str()).collect::<Vec<_>>(),
+            ["Последняя (v1.19.20)", "v1.19.19", "v1.19.18", "Ввести вручную", "Отмена"]);
+        // SNI: the masking domain is checked; no version list — manual entry with its format hint.
+        let (form, _, ui) = run(vec![no_versions()], &["sni", "2", "bad", "www.example.com", "", "3", "me@example.com", "1.19.20", "v1.19.17", "v1.19.20"],
+            |ctx| profile_wizard(ctx, None, true));
         assert_eq!(profile_add_argv(&form.unwrap()), argv(&["profile", "add", "--name", "sni", "--reality", "sni", "--sni-domain", "www.example.com",
             "--vless-tcp", "on", "--xhttp", "off", "--grpc", "off", "--hysteria2", "off", "--amneziawg", "off", "--warp", "off", "--ipv6", "disabled",
             "--acme-email", "me@example.com", "--mihomo-version", "v1.19.20"]));
-        assert!(noticed(&ui, DOMAIN_INVALID));
-        // Cancelled at any question: nothing.
+        assert_eq!(ui.rejected, ["bad", "1.19.20", "v1.19.17"]);
+        let manual = ui.views.last().unwrap();
+        assert!(manual.prompt.contains("vX.Y.Z") && manual.prompt.contains("v1.19.18"));
+        assert_eq!(version_check("1.19.20", &[]).unwrap_err().fix.as_deref(), Some("v1.19.20"));
+        // «Ввести вручную» from the list.
+        let (form, ..) = run(vec![versions()], &["m", "2", "www.example.com", "", "1", "", "4", "v1.19.30"], |ctx| profile_wizard(ctx, None, true));
+        assert_eq!(form.unwrap().mihomo_version, "v1.19.30");
+        // Cancelled at any question (Enter at the name, Esc later): nothing.
+        assert!(run(none(), &[""], |ctx| profile_wizard(ctx, None, true)).0.is_none());
         let (form, _, _) = run(none(), &["edge", "1"], |ctx| profile_wizard(ctx, None, true));
         assert!(form.is_none());
+    }
+    #[test]
+    fn names_are_checked_live_with_a_suggestion() {
+        let problem = name_check("VLESS TCP HY2", &[]).unwrap_err();
+        assert_eq!((problem.message.as_str(), problem.fix.as_deref()), (NAME_RULE, Some("vless-tcp-hy2")));
+        assert!(name_check("edge-full", &[]).is_ok());
+        assert_eq!(domain_check("https://Sub.Example.com/path", &[]).unwrap_err().fix.as_deref(), Some("sub.example.com"));
+        // The frame draws the failing input red with the rule and the Tab fix (not a taken name) under the prompt.
+        let mut view = View::new("Добавление профиля");
+        view.prompt = "Имя профиля: ".into();
+        view.check = Some(name_check);
+        view.taken = vec!["vless-tcp".into()];
+        let layout = ui::layout(&view, "VLESS TCP", false, &[], None, 30);
+        let prompt: Vec<String> = layout.prompt.iter().map(|l| l.to_string()).collect();
+        assert_eq!(prompt[0], "Имя профиля: VLESS TCP");
+        assert_eq!(layout.prompt[0].spans.iter().find(|s| s.content == "VLESS TCP").unwrap().style.fg, Some(ui::RED));
+        assert!(prompt.iter().any(|l| l.contains("без пробелов")) && prompt.iter().any(|l| l.contains("Tab — подставить «vless-tcp-2»")));
+        assert_eq!(ui::layout(&view, "vless-tcp", false, &[], None, 30).prompt.len(), 1);
+        // The profiles screen passes its names: the suggestion avoids them.
+        let (_, ui) = screen(&mut Profiles, &["a", "", "0"], vec![step(&["profile", "list"], ok(json!({"profiles": [edge()]}))),
+            step(&["profile", "list"], ok(json!({"profiles": [edge()]})))]);
+        assert_eq!(ui.views[1].taken, ["edge"]);
+    }
+    /// The core's shared vectors (`core/tests/validation_vectors.json`) hold for the menu's copies.
+    #[test]
+    fn shared_validation_vectors() {
+        let vectors: Value = serde_json::from_str(include_str!("../../core/tests/validation_vectors.json")).unwrap();
+        let list = |path: &str| -> Vec<String> { rows(vectors.pointer(path).unwrap()).iter().map(text).collect() };
+        let check = |kind: &str, rule: &dyn Fn(&str) -> bool| {
+            for value in list(&format!("/{kind}/valid")) { assert!(rule(&value), "{kind} valid: {value:?}"); }
+            for value in list(&format!("/{kind}/invalid")) { assert!(!rule(&value), "{kind} invalid: {value:?}"); }
+        };
+        check("names", &name_valid);
+        check("domains", &domain_valid);
+        check("ports", &|value| !value.is_empty() && port_valid(value));
+        check("emails", &email_valid);
+        check("versions", &version_valid);
+        for case in rows(&vectors["suggestions"]) {
+            let taken: Vec<String> = rows(&case["taken"]).iter().map(text).collect();
+            assert_eq!(suggest_name(&text(&case["value"]), &taken).as_deref(), case["suggestion"].as_str(), "{case}");
+        }
     }
     #[test]
     fn profile_set_sends_only_changed_flags() {
@@ -2362,15 +2747,22 @@ mod tests {
         assert_eq!(profile_set_argv("edge", &sni, &edge()),
             Some(argv(&["profile", "set", "--name", "edge", "--reality", "sni", "--sni-domain", "www.example.com", "--xhttp", "reality"])));
         // The edit wizard keeps every answer on Enter (selectors start at the
-        // current item, the nginx topology is not first): no change, no command.
+        // current item, the nginx topology is not first; the current mihomo
+        // version is marked and highlighted): no change, no command.
         let (_, ui) = screen(&mut ProfileCard("edge".into()), &["e", "", "", "", "", "", "", "", "", "", "", "0"], vec![
-            step(&["profile", "show", "--name", "edge"], ok(edge())), step(&["profile", "show", "--name", "edge"], ok(edge())),
+            step(&["profile", "show", "--name", "edge"], ok(edge())), versions(), step(&["profile", "show", "--name", "edge"], ok(edge())),
         ]);
         assert!(noticed(&ui, "Изменений нет."));
         let topology = ui.views.iter().find(|v| v.title == "Топология xHTTP").unwrap();
         assert_eq!(topology.cursor, Some(1));
-        let (value, _, _) = run(none(), &[""], |ctx| choose_option(ctx, "IPv6", &IPV6, Some("disabled")));
+        let version = ui.views.iter().find(|v| v.title == "Версия mihomo").unwrap();
+        assert_eq!((version.sections[0][2].label.as_str(), version.cursor), ("v1.19.18 (сейчас)", Some(2)));
+        let (value, _, _) = run(none(), &[""], |ctx| choose_option(ctx, "IPv6", None, &IPV6, Some("disabled")));
         assert_eq!(value.as_deref(), Some("disabled"));
+        // A current version no longer listed is offered right after the latest.
+        let (version, ..) = run(vec![step(&["profile", "mihomo-versions"], ok(json!({"latest": "v1.19.30", "versions": ["v1.19.30"]})))], &["2"],
+            |ctx| choose_version(ctx, "t", Some("v1.19.18")));
+        assert_eq!(version.as_deref(), Some("v1.19.18"));
         assert!(needs_domain(&edge()) && !needs_domain(&json!({"reality_mode": "sni", "vless_tcp": true})));
     }
     #[test]
@@ -2381,13 +2773,14 @@ mod tests {
         let mut renamed = edge();
         renamed["name"] = json!("edge2");
         // `exists`: the name is asked again with the old one kept by Enter, the
-        // other answers are kept; the corrected add opens the card.
+        // other answers are kept; the corrected add opens the card. Without
+        // the version list the version is typed (Enter — the latest).
         let (client, ui) = screen(&mut Profiles, &["a", "edge", "1", "1", "", "1", "", "", "edge2", "", "", "", "", "", "", "0", "0"], vec![
-            list(), (profile_add_argv(&first), err("exists", json!({}))), (profile_add_argv(&second), ok(json!({"name": "edge2"}))),
+            list(), no_versions(), (profile_add_argv(&first), err("exists", json!({}))), no_versions(), (profile_add_argv(&second), ok(json!({"name": "edge2"}))),
             step(&["profile", "show", "--name", "edge2"], ok(renamed)), list(),
         ]);
         assert!(ui.views.iter().any(|v| v.prompt.contains("Имя профиля [edge]")));
-        assert_eq!(client.calls.len(), 5);
+        assert_eq!(client.calls.len(), 7);
         // A failed `profile set` reopens the edit wizard with the changed IPv6
         // (now the current item); Enter everywhere repeats the same command.
         let set = argv(&["profile", "set", "--name", "edge", "--ipv6", "enabled"]);
@@ -2396,13 +2789,13 @@ mod tests {
         keys.extend([""; 10]);
         keys.push("0");
         let (_, ui) = screen(&mut ProfileCard("edge".into()), &keys, vec![
-            show(), (set.clone(), err("locked", json!({}))), show(), (set, ok(json!({}))), show(),
+            show(), no_versions(), (set.clone(), err("locked", json!({}))), show(), no_versions(), (set, ok(json!({}))), show(),
         ]);
         let ipv6: Vec<_> = ui.views.iter().filter(|v| v.title == "IPv6").collect();
         assert_eq!(ipv6.iter().map(|v| v.cursor).collect::<Vec<_>>(), [Some(0), Some(1)]);
         // Cancelling the reopened wizard sends nothing more.
         screen(&mut ProfileCard("edge".into()), &["e", "", "", "", "", "", "", "", "2", "", "", "0", "0"], vec![
-            show(), (argv(&["profile", "set", "--name", "edge", "--ipv6", "enabled"]), err("locked", json!({}))), show(), show(),
+            show(), no_versions(), (argv(&["profile", "set", "--name", "edge", "--ipv6", "enabled"]), err("locked", json!({}))), show(), show(),
         ]);
         // The failed set was saved (checkpoint error after the local write):
         // the retry is computed against the re-read profile, so returning
@@ -2412,8 +2805,8 @@ mod tests {
         let mut keys = vec!["e", "", "", "", "", "", "", "", "3", "", ""];
         keys.extend(["", "", "", "", "", "", "", "1", "b@example.com", "", "0"]);
         let (_, ui) = screen(&mut ProfileCard("edge".into()), &keys, vec![
-            show(), (argv(&["profile", "set", "--name", "edge", "--ipv6", "disabled"]), err("checkpoint_failed", json!({}))),
-            step(&["profile", "show", "--name", "edge"], ok(saved)),
+            show(), no_versions(), (argv(&["profile", "set", "--name", "edge", "--ipv6", "disabled"]), err("checkpoint_failed", json!({}))),
+            step(&["profile", "show", "--name", "edge"], ok(saved)), no_versions(),
             (argv(&["profile", "set", "--name", "edge", "--ipv6", "default", "--acme-email", "b@example.com"]), ok(json!({}))), show(),
         ]);
         let ipv6: Vec<_> = ui.views.iter().filter(|v| v.title == "IPv6").collect();
@@ -2487,7 +2880,7 @@ mod tests {
             (words.clone(), plan("confirmation_required", "a")), (with_yes(&words, "a"), ok(json!({"applied": ["n"], "failed": [], "unchanged": []}))),
         ], &["bad", "de.example.com", "y"], |ctx| apply(ctx, &words, "n"));
         assert!(reply.ok);
-        assert!(noticed(&ui, DOMAIN_INVALID));
+        assert_eq!(ui.rejected, ["bad"]);
         assert_eq!(client.calls.len(), 4);
         // Cancelling the domain question stops without repeating.
         run(vec![(words.clone(), err("domain_required", json!({"name": "n"})))], &[""], |ctx| apply(ctx, &words, "n"));
@@ -2518,10 +2911,10 @@ mod tests {
             {"name":"de","stage":"config","code":"rolled_back","message":"откат на этапе «конфигурация и проверка»"},
             {"name":"de","stage":"probe","code":"port_busy","message":"порт 443 уже занят","port":443},
             {"name":"de","stage":"probe","code":"remote_failed","message":"Не удалось подключиться к «de»."},
-            {"name":"de","stage":"probe","code":"unsupported_os","message":"нужна Debian или Ubuntu с systemd"}]}));
+            {"name":"de","stage":"probe","code":"unsupported_os","message":"ОС ноды «ubuntu 25.10» не поддерживается: нужна Debian 12/13 или Ubuntu 22.04/24.04/26.04 с systemd"}]}));
         let (_, _, ui) = run(vec![(words.clone(), plan("confirmation_required", "a")), (with_yes(&words, "a"), partial)], &["y"], |ctx| apply(ctx, &words, ""));
         for line in ["Применено: a", "de: откат на этапе «конфигурация и проверка»", "de: порт 443 уже занят",
-            "de: Не удалось подключиться к «de».", "de: нужна Debian или Ubuntu с systemd"] {
+            "de: Не удалось подключиться к «de».", "de: ОС ноды «ubuntu 25.10» не поддерживается: нужна Debian 12/13 или Ubuntu 22.04/24.04/26.04 с systemd"] {
             assert!(noticed(&ui, line), "{line}");
         }
         // Nothing pending: the core's message only, no report.
@@ -2532,6 +2925,7 @@ mod tests {
     fn node_list_shows_apply_state_and_applies_all_pending() {
         let mut pending = node();
         pending["status"] = json!("pending");
+        pending["profile"] = json!("edge");
         let words = argv(&["node", "apply", "--pending"]);
         let (_, ui) = screen(&mut Nodes, &["y", "y", "0"], vec![
             step(&["node", "list"], ok(json!([pending]))), step(&["status"], ok(json!({}))),
@@ -2552,19 +2946,159 @@ mod tests {
         let (_, client, _) = run(vec![
             step(&["profile", "list"], ok(json!({"profiles": [edge()]}))), (words, added(false)),
             (apply.clone(), plan("confirmation_required", "a")), (with_yes(&apply, "a"), ok(json!({"applied": ["vps-1"], "failed": [], "unchanged": []}))),
-        ], &["", "192.0.2.1", "", "", "1", "tag", "2", "de.example.com", "y"], add_node);
+        ], &["", "192.0.2.1", "", "", "1", "tag", "2", "de.example.com", "", "", "y"], add_node);
         assert_eq!(client.calls.len(), 4);
-        // «Без профиля»: no domain, no apply.
+        // «Без профиля»: no domain, no role questions, no apply.
         run(vec![step(&["profile", "list"], ok(json!({"profiles": [edge()]}))), (add_words("key", ACCEPT), added(false))],
             &["", "192.0.2.1", "", "", "1", "tag", "1"], add_node);
+    }
+    #[test]
+    fn add_with_role_domains_sets_them_before_one_apply() {
+        let words = add_words("key", &["--profile", "edge", "--domain", "de.example.com", "--accept-new-host-key"]);
+        let apply = argv(&["node", "apply", "--name", "vps-1", "--name", "old"]);
+        let host = step(&["subscription", "host"], ok(json!({"node": "old", "hostname": "sub.old.example.com", "port": 443})));
+        // An invalid name is refused live; a role domain equal to the node's is asked again; the host moves after a confirmation.
+        let (_, client, ui) = run(vec![
+            step(&["profile", "list"], ok(json!({"profiles": [edge()]}))), (words, added(false)),
+            step(&["telegram", "set", "--name", "vps-1", "--domain", "tg.example.com"], ok(json!({}))),
+            host, step(&["subscription", "host", "--name", "vps-1", "--domain", "sub.example.com"], ok(json!({}))),
+            (apply.clone(), plan("confirmation_required", "a")), (with_yes(&apply, "a"), ok(json!({"applied": ["vps-1", "old"], "failed": [], "unchanged": []}))),
+        ], &["my vps", "", "192.0.2.1", "", "", "1", "tag", "2", "de.example.com", "de.example.com", "tg.example.com", "bad", "sub.example.com", "y", "y"], add_node);
+        assert_eq!(client.calls.len(), 7);
+        assert_eq!(ui.rejected, ["my vps", "bad"]);
+        assert!(noticed(&ui, DOMAIN_TAKEN));
+        assert!(ui.views.iter().any(|v| v.context.iter().any(|l| l.to_string().contains("нода «old»"))));
+        // A refused move keeps the old host; the node is applied alone.
+        let apply = argv(&["node", "apply", "--name", "vps-1"]);
+        run(vec![
+            step(&["profile", "list"], ok(json!({"profiles": [edge()]}))), (add_words("key", &["--profile", "edge", "--domain", "de.example.com", "--accept-new-host-key"]), added(false)),
+            step(&["subscription", "host"], ok(json!({"node": "old", "hostname": "sub.old.example.com", "port": 443}))),
+            (apply.clone(), plan("confirmation_required", "a")), (with_yes(&apply, "a"), ok(json!({"applied": ["vps-1"], "failed": [], "unchanged": []}))),
+        ], &["", "192.0.2.1", "", "", "1", "tag", "2", "de.example.com", "", "sub.example.com", "n", "y"], add_node);
+    }
+    #[test]
+    fn add_wizard_retries_or_skips_a_failed_role_and_defers_apply_without_ssh() {
+        let words = || add_words("key", &["--profile", "edge", "--domain", "de.example.com", "--accept-new-host-key"]);
+        let apply = argv(&["node", "apply", "--name", "vps-1"]);
+        let applied = || ok(json!({"applied": ["vps-1"], "failed": [], "unchanged": []}));
+        // A failed `telegram set`: «Повторить» with a new domain, then one apply.
+        let (_, client, ui) = run(vec![
+            step(&["profile", "list"], ok(json!({"profiles": [edge()]}))), (words(), added(false)),
+            step(&["telegram", "set", "--name", "vps-1", "--domain", "tg.example.com"], err("invalid", json!({"message": "занят"}))),
+            step(&["telegram", "set", "--name", "vps-1", "--domain", "tg2.example.com"], ok(json!({}))),
+            (apply.clone(), plan("confirmation_required", "a")), (with_yes(&apply, "a"), applied()),
+        ], &["", "192.0.2.1", "", "", "1", "tag", "2", "de.example.com", "tg.example.com", "", "1", "tg2.example.com", "y"], add_node);
+        assert_eq!(client.calls.len(), 6);
+        assert!(noticed(&ui, "Роли и домены"));
+        // A failed `subscription host`: «Пропустить», the node is still applied.
+        run(vec![
+            step(&["profile", "list"], ok(json!({"profiles": [edge()]}))), (words(), added(false)),
+            step(&["subscription", "host"], ok(Value::Null)),
+            step(&["subscription", "host", "--name", "vps-1", "--domain", "sub.example.com"], err("invalid", json!({}))),
+            (apply.clone(), plan("confirmation_required", "a")), (with_yes(&apply, "a"), applied()),
+        ], &["", "192.0.2.1", "", "", "1", "tag", "2", "de.example.com", "", "sub.example.com", "2", "y"], add_node);
+        // Deferred SSH setup: roles are saved, nothing is applied, what is left is said.
+        let (_, _, ui) = run(vec![
+            step(&["profile", "list"], ok(json!({"profiles": [edge()]}))), (words(), added(true)),
+            step(&["telegram", "set", "--name", "vps-1", "--domain", "tg.example.com"], ok(json!({}))),
+        ], &["", "192.0.2.1", "", "", "1", "tag", "2", "de.example.com", "tg.example.com", ""], add_node);
+        assert!(noticed(&ui, "Применение отложено"));
+        // SSH ports follow the core: `080` is accepted, `000080` and `0` are refused live.
+        let (_, _, ui) = run(vec![no_profiles(), (argv(&["node", "add", "--name", "vps-1", "--ip", "192.0.2.1", "--port", "080", "--user", "root",
+            "--auth", "key", "--tag", "tag", "--accept-new-host-key"]), added(false))],
+            &["", "192.0.2.1", "000080", "0", "080", "", "1", "tag"], add_node);
+        assert_eq!(ui.rejected, ["000080", "0"]);
+    }
+    fn profiled_node() -> Value {
+        let mut node = node();
+        node["profile"] = json!("edge");
+        node["domain"] = json!("de.example.com");
+        node["status"] = json!("applied");
+        node
+    }
+    #[test]
+    fn card_lists_roles_and_domains_with_actions() {
+        let card = |node: &Value| card_view("n", node, false);
+        let text_of = |view: &View| view.context.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        // Without a profile: «Указать профиль», roles need the profile first, no role actions.
+        let bare = card(&node());
+        assert!(text_of(&bare).contains("Профиль: не указан"));
+        assert!(text_of(&bare).contains("Telegram Web Proxy: выключен (сначала укажите профиль)"));
+        assert_eq!(bare.sections[1].iter().map(|i| (i.key.as_str(), i.label.as_str())).collect::<Vec<_>>(), [("f", "Указать профиль"), ("m", "Задать домен ноды")]);
+        // With a profile and without roles: each domain explained, each role offered.
+        let view = card(&profiled_node());
+        let context = text_of(&view);
+        for needle in ["Роли и домены:", "Домен ноды (сайт-заглушка, Reality): de.example.com", "Telegram Web Proxy: выключен", "Хост подписок: не назначен",
+            ROLE_DOMAIN, ROLE_TELEGRAM, ROLE_SUBSCRIPTION] {
+            assert!(context.contains(needle), "{needle}");
+        }
+        assert_eq!(view.sections[1].iter().map(|i| i.label.as_str()).collect::<Vec<_>>(),
+            ["Профиль", "Домен ноды", "Включить Telegram Web Proxy", "Сделать хостом подписок"]);
+        // With both roles: their domains (a non-443 port is shown).
+        let mut roles = profiled_node();
+        roles["telegram"] = json!({"hostname": "tg.example.com", "tag": false});
+        roles["subscription"] = json!({"hostname": "sub.example.com", "port": 8443});
+        let context = text_of(&card(&roles));
+        assert!(context.contains("Telegram Web Proxy: tg.example.com") && context.contains("Хост подписок: sub.example.com:8443"));
+    }
+    #[test]
+    fn card_role_actions_send_the_role_commands_and_offer_apply() {
+        let shown = || step(&["node", "show", "--name", "n"], ok(profiled_node()));
+        let apply = argv(&["node", "apply", "--name", "n"]);
+        // «Включить Telegram Web Proxy»: domain → telegram set → node apply under its plan.
+        screen(&mut NodeCard("n".into()), &["t", "tg.example.com", "y", "0"], vec![
+            shown(), step(&["telegram", "set", "--name", "n", "--domain", "tg.example.com"], ok(json!({}))),
+            (apply.clone(), plan("confirmation_required", "a")), (with_yes(&apply, "a"), ok(json!({"applied": ["n"], "failed": [], "unchanged": []}))),
+            shown(),
+        ]);
+        // «Сделать хостом подписок»: no host yet, domain (the node's own is refused,
+        // in any case) and port → subscription host.
+        let (_, ui) = screen(&mut NodeCard("n".into()), &["S", "de.example.com", "DE.Example.com", "sub.example.com", "8443", "n", "0"], vec![
+            shown(), step(&["subscription", "host"], ok(Value::Null)),
+            step(&["subscription", "host", "--name", "n", "--domain", "sub.example.com", "--port", "8443"], ok(json!({}))),
+            (apply.clone(), plan("confirmation_required", "a")), shown(),
+        ]);
+        assert_eq!(ui.notices.iter().filter(|l| l.to_string().contains(DOMAIN_TAKEN)).count(), 2);
+        assert_eq!(confirms(&ui), 1, "the apply plan only");
+        // The host on another node: the move is confirmed first; refused — nothing sent.
+        let (client, ui) = screen(&mut NodeCard("n".into()), &["s", "sub.example.com", "", "n", "0"], vec![
+            shown(), step(&["subscription", "host"], ok(json!({"node": "old", "hostname": "sub.old.example.com", "port": 443}))), shown(),
+        ]);
+        assert!(!client.calls.iter().any(|call| call.len() > 2 && call[..2] == ["subscription", "host"]));
+        assert!(ui.views.iter().any(|v| v.prompt.contains("Перенести хост подписок")));
+    }
+    #[test]
+    fn unprofiled_nodes_get_their_profile_from_the_list_or_a_new_one() {
+        // The list offers «Указать профиль»: one node without a profile — straight to the profiles.
+        let set = argv(&["node", "profile", "--name", "n", "--profile", "edge"]);
+        let apply = argv(&["node", "apply", "--name", "n"]);
+        let (_, ui) = screen(&mut Nodes, &["f", "2", "y", "0"], vec![
+            step(&["node", "list"], ok(json!([node()]))), step(&["status"], ok(json!({}))),
+            step(&["profile", "list"], ok(json!({"profiles": [edge()]}))), (set.clone(), ok(json!({}))),
+            (apply.clone(), plan("confirmation_required", "a")), (with_yes(&apply, "a"), ok(json!({"applied": ["n"], "failed": [], "unchanged": []}))),
+            step(&["node", "list"], ok(json!([profiled_node()]))), step(&["status"], ok(json!({}))),
+        ]);
+        let select = ui.views.iter().find(|v| v.title == "Профиль ноды: n").unwrap();
+        assert_eq!(select.sections[0].iter().map(|i| i.label.as_str()).collect::<Vec<_>>(), ["Без профиля (сейчас)", "edge", "Отмена"]);
+        assert!(!ui.views.last().unwrap().sections.iter().flatten().any(|item| item.key == "f"));
+        // No profiles yet: the wizard is offered, the new profile is set.
+        let add = argv(&["profile", "add", "--name", "edge", "--reality", "sni", "--sni-domain", "www.example.com", "--vless-tcp", "on", "--xhttp", "off",
+            "--grpc", "off", "--hysteria2", "off", "--amneziawg", "off", "--warp", "off", "--ipv6", "default", "--random-acme-email", "--mihomo-version", "v1.19.20"]);
+        run(vec![
+            step(&["profile", "list"], ok(json!({"profiles": []}))), versions(), (add, ok(json!({"name": "edge"}))), (set.clone(), ok(json!({}))),
+            (apply.clone(), plan("confirmation_required", "a")),
+        ], &["y", "edge", "2", "www.example.com", "", "1", "", "1", "n"], |ctx| node_profile(ctx, "n", &node()));
+        // Refused: nothing is created.
+        run(vec![step(&["profile", "list"], ok(json!({"profiles": []})))], &["n"], |ctx| node_profile(ctx, "n", &node()));
     }
     #[test]
     fn card_profile_domain_and_ports_send_only_changes() {
         let mut with_profile = node();
         with_profile["profile"] = json!("edge");
         with_profile["ports"] = json!({"hysteria2": 31000});
-        run(vec![step(&["profile", "list"], ok(json!({"profiles": [edge()]}))), step(&["node", "profile", "--name", "n", "--profile", "edge"], ok(json!({})))],
-            &["2"], |ctx| node_profile(ctx, "n", &node()));
+        let apply = || step(&["node", "apply", "--name", "n"], plan("confirmation_required", "a"));
+        run(vec![step(&["profile", "list"], ok(json!({"profiles": [edge()]}))), step(&["node", "profile", "--name", "n", "--profile", "edge"], ok(json!({}))), apply()],
+            &["2", "n"], |ctx| node_profile(ctx, "n", &node()));
         let (_, _, ui) = run(vec![step(&["profile", "list"], ok(json!({"profiles": [edge()]})))], &["2"], |ctx| node_profile(ctx, "n", &with_profile));
         assert!(noticed(&ui, "Изменений нет."));
         run(vec![step(&["node", "domain", "--name", "n", "--domain", "de.example.com"], ok(json!({})))], &["de.example.com"], |ctx| node_domain(ctx, "n", &node()));
@@ -2731,8 +3265,8 @@ mod tests {
         let view = &ui.views[0];
         assert_eq!(view.sections.len(), 2);
         assert_eq!(view.sections[0].iter().map(|i| i.color).collect::<Vec<_>>(), [ui::CYAN, ui::YELLOW, ui::YELLOW]);
-        assert_eq!(view.sections[0][0].label, "n  192.0.2.1:22");
-        assert_eq!(view.sections[1].iter().map(|i| (i.key.as_str(), i.color)).collect::<Vec<_>>(), [("a", ui::GREEN), ("h", ui::YELLOW), ("0", ui::NC)]);
+        assert_eq!(view.sections[0][0].label, "n  192.0.2.1:22  · профиль не указан");
+        assert_eq!(view.sections[1].iter().map(|i| (i.key.as_str(), i.color)).collect::<Vec<_>>(), [("a", ui::GREEN), ("f", ui::GREEN), ("h", ui::YELLOW), ("0", ui::NC)]);
         let lines: Vec<_> = view.lines().iter().map(|l| l.to_string()).collect();
         assert!(lines[0].is_empty());
         assert!(!lines.windows(2).any(|w| w[0].starts_with('├') && w[1].starts_with('├')));

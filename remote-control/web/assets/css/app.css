@@ -326,6 +326,8 @@ a.chip:hover { border-color: var(--color-primary); color: var(--color-primary); 
   background: var(--color-base-200); border: 1px solid var(--line); border-radius: var(--radius-box);
 }
 .operation { max-height: 55vh; overflow: auto; font-family: var(--mono); font-size: 13px; padding: .5rem 0; }
+.op-live { display: flex; flex-wrap: wrap; column-gap: .6rem; margin: .4rem 0; font-size: 13px; overflow-wrap: anywhere; }
+.op-live-head { font-weight: 500; font-variant-numeric: tabular-nums; }
 .log-line { white-space: pre-wrap; overflow-wrap: anywhere; padding: .05rem 0; }
 .level-warn { color: var(--color-warning); }
 .level-error { color: var(--color-error); }

@@ -4,9 +4,13 @@
 // argv команд и потоки добавления и изменения ноды поверх `ctx`
 // (`app.js::makeContext`). Применение (`node apply`) — `apply-model.js`.
 import { handleNodeCodes, reviewReply, setFlag, decisionFlag } from '../flows.js';
-import { asList } from '../format.js';
+import { asList, strings } from '../format.js';
 import { applyFlow, applyNamesArgv, offerApplyNodes } from './apply-model.js';
-import { needsDomain, profileRows, domainError, portError as profilePortError } from './profiles-model.js';
+import {
+  needsDomain, profileRows, domainError, domainSuggestion, nameField, addProfileFlow, portError as profilePortError, PORT_INVALID,
+} from './profiles-model.js';
+import { telegramSetArgv } from './nodeops-model.js';
+import { SUBSCRIPTION_HOST, SUBSCRIPTION_DEFAULT_PORT, subscriptionHost, subscriptionSetHost } from './catalog-model.js';
 
 /** Строковое значение поля (`nodes.rs::text`): `null`/`undefined` → ''. */
 export function plain(value) {
@@ -80,14 +84,10 @@ export function hardenAsksPort(argv, reply) {
   return code === 'port_in_use' || (argv.includes('--port') && code === 'invalid');
 }
 
-export const PORT_INVALID = 'Порт должен быть числом от 1 до 65535.';
+export { PORT_INVALID };
 
-/** Проверка SSH-порта: пусто — умолчание 22; иначе число 1…65535. Текст ошибки или `null`. */
-export function portError(value) {
-  const port = plain(value);
-  if (port === '') return null;
-  return /^[0-9]+$/.test(port) && Number(port) >= 1 && Number(port) <= 65535 ? null : PORT_INVALID;
-}
+/** Проверка SSH-порта — правило ядра (`profiles-model.js::portError`): пусто — умолчание 22. Текст ошибки или `null`. */
+export const portError = profilePortError;
 
 /**
  * Проверка формы добавления (`nodes.rs::add_node_with`) с умолчаниями v1.
@@ -154,7 +154,7 @@ export async function addNode(ctx, base, password) {
         ctx.notify('warn', 'Нода сохранена, но требует SSH-настройки: раздел «Ноды» → «Завершить SSH-настройку».');
       }
       const saved = reply.data && typeof reply.data.name === 'string' && reply.data.name ? reply.data.name : base[3];
-      return { status: 'ok', name: saved };
+      return { status: 'ok', name: saved, needsSetup: Boolean(reply.data && reply.data.needs_setup === true) };
     }
     switch (errorCode(reply)) {
       case 'host_key_changed': {
@@ -197,13 +197,14 @@ export async function addNode(ctx, base, password) {
 /**
  * Поля формы добавления (умолчания v1); `values` — прежний ввод без пароля,
  * `profiles` — строки `profile list` (нет профилей — вопроса профиля нет;
- * домен — только если профиль его требует).
+ * домен — только если профиль его требует; домены Telegram Web Proxy и
+ * подписок — необязательные, только с профилем).
  */
-export function addFields(values = {}, profiles = []) {
+export function addFields(values = {}, profiles = [], taken = []) {
   const fields = [
-    { name: 'name', label: 'Название', type: 'text', placeholder: 'vps-1', value: values.name },
+    nameField({ label: 'Название', value: values.name, required: false, placeholder: 'vps-1', taken }),
     { name: 'ip', label: 'IP', type: 'text', required: 'IP не указан.', value: values.ip },
-    { name: 'port', label: 'SSH-порт', type: 'text', placeholder: '22', value: values.port, validate: portError },
+    { name: 'port', label: 'SSH-порт', type: 'text', placeholder: '22', value: values.port, live: true, validate: portError },
     { name: 'user', label: 'Логин', type: 'text', placeholder: 'root', value: values.user },
     { name: 'tag', label: 'Тег', type: 'text', required: 'Тег не может быть пустым.', value: values.tag },
     {
@@ -218,30 +219,42 @@ export function addFields(values = {}, profiles = []) {
   const rows = asList(profiles).filter((row) => row && typeof row.name === 'string');
   if (rows.length > 0) {
     const byName = (name) => rows.find((row) => row.name === name);
+    const profiled = (current) => Boolean(current.profile);
     fields.push(
-      { name: 'profile', label: 'Профиль', type: 'select', value: values.profile || '',
+      { name: 'profile', label: 'Профиль', type: 'select', value: values.profile || '', hint: PROFILE_EXPLAINED,
         options: [{ value: '', label: 'Без профиля' }, ...rows.map((row) => ({ value: row.name, label: row.name }))] },
-      { name: 'domain', label: 'Домен ноды', type: 'text', placeholder: 'node.example.com', value: values.domain,
-        required: 'Домен не указан.', validate: domainError, when: (current) => needsDomain(byName(current.profile)) },
+      { name: 'domain', label: 'Домен ноды (сайт-заглушка, Reality)', type: 'text', placeholder: 'node.example.com', value: values.domain,
+        required: 'Домен не указан.', hint: ROLE_DOMAIN, live: true, validate: domainError, suggest: domainSuggestion,
+        when: (current) => needsDomain(byName(current.profile)) },
+      { name: 'telegram_domain', label: 'Домен для Telegram Web Proxy', type: 'text', placeholder: 'tg.example.com', value: values.telegram_domain,
+        hint: `пусто — не нужен; ${ROLE_TELEGRAM}`, live: true, suggest: domainSuggestion, when: profiled,
+        validate: (value, current) => domainError(value) || roleDomainError(value, [current.domain]) },
+      { name: 'subscription_domain', label: 'Домен для подписок', type: 'text', placeholder: 'sub.example.com', value: values.subscription_domain,
+        hint: `пусто — не нужен; ${ROLE_SUBSCRIPTION}`, live: true, suggest: domainSuggestion, when: profiled,
+        validate: (value, current) => domainError(value) || roleDomainError(value, [current.domain, current.telegram_domain]) },
     );
   }
   return fields;
 }
 
+export const DEFERRED_APPLY = 'Применение отложено: завершите SSH-настройку («Ноды» → «Завершить SSH-настройку»), затем примените ноду.';
+
 /**
  * Добавление ноды одной формой (`nodes.rs::add_node_with`). Сбой добавления
  * открывает форму снова с прежним вводом (кроме пароля); отмена — выход.
- * Нода с профилем сразу применяется (`node apply --name N` под планом).
- * Сохранённая нода открывается через `go(имя)` — экран вызывает переход,
- * только пока смонтирован. `true` — нода добавлена.
+ * Ноде с профилем сразу задаются роли (`telegram set`, `subscription host`
+ * с подтверждением переноса), затем одно `node apply --name N` под планом
+ * ставит всё (и на прежнем хосте подписок). Сохранённая нода открывается
+ * через `go(имя)` — экран вызывает переход, только пока смонтирован.
+ * `true` — нода добавлена.
  */
-export async function addNodeFlow(ctx, go) {
+export async function addNodeFlow(ctx, go, taken = []) {
   // Профили — фоновое чтение: сбой не мешает добавить ноду без профиля.
   const listed = await ctx.request(['profile', 'list'], { quiet: true });
   const profiles = listed.ok ? profileRows(listed.data) : [];
   let previous = {};
   for (;;) {
-    const values = await ctx.form({ title: ADD_TITLE, fields: addFields(previous, profiles), submit: 'Добавить' });
+    const values = await ctx.form({ title: ADD_TITLE, fields: addFields(previous, profiles, taken), submit: 'Добавить' });
     if (values === null) return false;
     previous = { ...values, password: undefined };
     const built = addNodeArgv(values);
@@ -252,7 +265,12 @@ export async function addNodeFlow(ctx, go) {
     const result = await addNode(ctx, built.argv, built.password);
     if (result.status === 'cancel') return false;
     if (result.status === 'ok') {
-      if (values.profile) await applyFlow(ctx, applyNamesArgv([result.name]), result.name);
+      if (values.profile) {
+        const names = await addNodeRoles(ctx, result.name, values);
+        // Отложенная SSH-настройка: нода ещё недоступна — применять нечего.
+        if (result.needsSetup) ctx.notify('warn', DEFERRED_APPLY);
+        else await applyFlow(ctx, applyNamesArgv(names), result.name);
+      }
       go(result.name);
       return true;
     }
@@ -270,7 +288,7 @@ export async function editNode(ctx, node) {
   const values = await ctx.form({
     title: `Изменение ноды: ${name}`,
     fields: [
-      { name: 'name', label: 'Название', type: 'text', value: name, required: true },
+      { ...nameField({ label: 'Название', value: name }), autofocus: undefined },
       { name: 'tag', label: 'Тег', type: 'text', value: tag },
     ],
   });
@@ -432,36 +450,196 @@ export function portChanges(name, node, protocols, values) {
     .map((item) => nodePortArgv(name, item.key, plain(values[item.key]).trim()));
 }
 
-/** «Профиль»: выбор профиля или «Без профиля» → `node profile`. `true` — изменено. */
+export const PROFILE_EXPLAINED = 'Профиль — набор протоколов и настроек сервера; нода с профилем настраивается командой «Применить».';
+
+/**
+ * «Профиль» / «Указать профиль»: выбор профиля или «Без профиля» →
+ * `node profile`; без профилей — предложение сначала создать профиль.
+ * Нода с новым профилем ожидает применения — предложение `node apply`.
+ * `true` — изменено.
+ */
 export async function nodeProfileFlow(ctx, name, node) {
   const listed = await ctx.request(['profile', 'list']);
   if (!listed.ok) { ctx.failed(); return false; }
-  const options = [{ value: '', label: 'Без профиля' }, ...profileRows(listed.data).map((row) => ({ value: row.name, label: row.name }))];
+  const rows = profileRows(listed.data);
   const current = plain(node.profile);
-  const values = await ctx.form({
-    title: `Профиль ноды: ${name}`,
-    fields: [{ name: 'profile', label: 'Профиль', type: 'select', options, value: current }],
-  });
-  if (values === null || values === undefined || values.profile === current) return false;
-  const reply = await ctx.request(nodeProfileArgv(name, values.profile));
+  let chosen;
+  if (rows.length === 0) {
+    const create = await ctx.confirm({ title: `Профиль ноды: ${name}`, context: [PROFILE_EXPLAINED], question: 'Профилей ещё нет. Создать профиль сейчас?' });
+    if (!create) return false;
+    if (!(await addProfileFlow(ctx, (created) => { chosen = created; }))) return false;
+  } else {
+    const options = [{ value: '', label: 'Без профиля' }, ...rows.map((row) => ({ value: row.name, label: row.name }))];
+    const values = await ctx.form({
+      title: `Профиль ноды: ${name}`, context: [PROFILE_EXPLAINED],
+      fields: [{ name: 'profile', label: 'Профиль', type: 'select', options, value: current }],
+    });
+    if (values === null || values === undefined || values.profile === current) return false;
+    chosen = values.profile;
+  }
+  const reply = await ctx.request(nodeProfileArgv(name, chosen));
   if (ctx.isFailure(reply)) ctx.failed();
+  if (reply.ok && chosen) await offerApplyNodes(ctx, [name]);
   return reply.ok;
 }
 
-/** «Домен»: пустое значение снимает домен → `node domain`. `true` — изменено. */
+/** «Домен ноды»: пустое значение снимает домен → `node domain`; нода с профилем — предложение применить. `true` — изменено. */
 export async function nodeDomainFlow(ctx, name, node) {
   const current = plain(node.domain);
   const values = await ctx.form({
     title: `Домен ноды: ${name}`,
-    fields: [{ name: 'domain', label: 'Домен', type: 'text', value: current, placeholder: 'node.example.com',
-      hint: 'пусто — без домена', validate: domainError }],
+    fields: [{ name: 'domain', label: 'Домен ноды (сайт-заглушка, Reality)', type: 'text', value: current, placeholder: 'node.example.com',
+      hint: `пусто — без домена; ${ROLE_DOMAIN}`, live: true, validate: domainError, suggest: domainSuggestion }],
   });
   if (values === null || values === undefined) return false;
   const domain = plain(values.domain).trim();
   if (domain === current) return false;
   const reply = await ctx.request(nodeDomainArgv(name, domain));
   if (ctx.isFailure(reply)) ctx.failed();
+  if (reply.ok && plain(node.profile)) await offerApplyNodes(ctx, [name]);
   return reply.ok;
+}
+
+// ─── Роли и домены ───────────────────────────────────────────────────────────
+
+/** Объяснения доменов ноды в одно предложение (`nodes.rs::ROLE_*`). */
+export const ROLE_DOMAIN = 'адрес сайта-заглушки; DNS этого домена ведёт на IP ноды';
+export const ROLE_TELEGRAM = 'отдельный домен, через который Telegram подключается к ноде';
+export const ROLE_SUBSCRIPTION = 'домен, с которого приложения клиентов скачивают подписки';
+export const DOMAIN_TAKEN = 'Этот домен уже занят другой ролью ноды — нужен отдельный домен (поддомен).';
+
+/**
+ * Домен роли совпадает с другим доменом ноды (`taken`): текст ошибки или
+ * `null`. Имена DNS сравниваются без учёта регистра, как в ядре.
+ */
+export function roleDomainError(value, taken) {
+  const domain = plain(value).trim().toLowerCase();
+  return domain !== '' && strings(taken).map((d) => d.trim().toLowerCase()).includes(domain) ? DOMAIN_TAKEN : null;
+}
+
+/**
+ * «Роли и домены» ноды (`node show`): `{ key, label, value, unset, hint }`;
+ * `value` — домен (у хоста подписок с портом не 443) или `null`.
+ */
+export function nodeRoles(node) {
+  const set = (value) => plain(value) || null;
+  const sub = node && node.subscription && typeof node.subscription === 'object' ? node.subscription : null;
+  const host = sub ? (sub.port === 443 || sub.port === undefined ? plain(sub.hostname) : `${plain(sub.hostname)}:${plain(sub.port)}`) : null;
+  const telegram = node && node.telegram && typeof node.telegram === 'object' ? node.telegram : null;
+  return [
+    { key: 'domain', label: 'Домен ноды (сайт-заглушка, Reality)', value: set(node && node.domain), unset: 'не задан', hint: ROLE_DOMAIN },
+    { key: 'telegram', label: 'Telegram Web Proxy', value: telegram ? set(telegram.hostname) : null, unset: 'выключен', hint: ROLE_TELEGRAM },
+    { key: 'subscription', label: 'Хост подписок', value: host || null, unset: 'не назначен', hint: ROLE_SUBSCRIPTION },
+  ];
+}
+
+/**
+ * argv ролей ноды из формы добавления: `telegram set` и `subscription host`
+ * (порт 443 по умолчанию) для непустых доменов, иначе `null`.
+ */
+export function roleArgvs(name, values) {
+  const telegram = plain(values && values.telegram_domain).trim();
+  const subscription = plain(values && values.subscription_domain).trim();
+  return {
+    telegram: telegram ? telegramSetArgv(name, telegram) : null,
+    subscription: subscription ? subscriptionSetHost(name, subscription, plain(values.subscription_port)) : null,
+  };
+}
+
+/**
+ * `subscription host --name N …` (`argv`): хост на другой ноде называется и
+ * перенос подтверждается. Итог — `{ status: 'saved', old }` (`old` — прежняя
+ * нода-хост, `''` — не было), `{ status: 'declined' }` или `{ status: 'failed' }`.
+ */
+export async function setSubscriptionHost(ctx, name, argv) {
+  const read = await ctx.request(SUBSCRIPTION_HOST);
+  if (!read.ok) { if (ctx.isFailure(read)) ctx.failed(); return { status: 'failed' }; }
+  const host = subscriptionHost(read.data);
+  const old = host && host.node !== name ? host.node : '';
+  if (old) {
+    const move = await ctx.confirm({
+      title: `Хост подписок: ${name}`,
+      context: [{ text: `Сейчас хост подписок — нода «${old}» (${host.hostname}).`, tone: 'warn' },
+        'После переноса обе ноды нужно применить, затем обновить подписки.'],
+      question: `Перенести хост подписок на ноду «${name}»?`,
+    });
+    if (!move) return { status: 'declined' };
+  }
+  const reply = await ctx.request(argv);
+  if (!reply.ok) { if (ctx.isFailure(reply)) ctx.failed(); return { status: 'failed' }; }
+  return { status: 'saved', old };
+}
+
+export const ROLE_LATER = 'Задать позже: карточка ноды → «Роли и домены».';
+
+/**
+ * Сбой команды роли в мастере добавления (`nodes.rs::role_retry`): какая роль
+ * и домен не заданы, где задать позже; «Повторить» — домен снова (прежний
+ * подставлен), «Пропустить» — `null`.
+ */
+export async function roleRetry(ctx, role, domain) {
+  ctx.notify('warn', `Не удалось задать ${role} с доменом «${domain}». ${ROLE_LATER}`);
+  const choice = await ctx.choose({
+    title: `${role}: не задан`, context: [ROLE_LATER],
+    options: [{ value: 'retry', label: 'Повторить' }, { value: 'skip', label: 'Пропустить' }],
+  });
+  if (choice !== 'retry') return null;
+  const values = await ctx.form({
+    title: ADD_TITLE, submit: 'Повторить',
+    fields: [{ name: 'domain', label: `Домен: ${role}`, type: 'text', value: domain, required: true, autofocus: true,
+      live: true, validate: domainError, suggest: domainSuggestion }],
+  });
+  return values === null || values === undefined ? null : plain(values.domain).trim();
+}
+
+/**
+ * Роли новой ноды из формы добавления: `telegram set` и `subscription host`
+ * (сбой — `ctx.failed()` и `roleRetry`); итог — ноды для одного `node apply`
+ * (новая и прежний хост).
+ */
+export async function addNodeRoles(ctx, name, values) {
+  const names = [name];
+  let telegram = plain(values.telegram_domain).trim();
+  while (telegram) {
+    const reply = await ctx.request(telegramSetArgv(name, telegram));
+    if (reply.ok) break;
+    if (ctx.isFailure(reply)) ctx.failed();
+    telegram = (await roleRetry(ctx, 'Telegram Web Proxy', telegram)) || '';
+  }
+  let subscription = plain(values.subscription_domain).trim();
+  while (subscription) {
+    const result = await setSubscriptionHost(ctx, name, subscriptionSetHost(name, subscription));
+    if (result.status === 'saved') { if (result.old) names.push(result.old); break; }
+    if (result.status === 'declined') break;
+    subscription = (await roleRetry(ctx, 'хост подписок', subscription)) || '';
+  }
+  return names;
+}
+
+/**
+ * «Сделать хостом подписок» / «Хост подписок»: домен и порт одной формой
+ * (домен — не занятый сайтом и Telegram ноды) → `subscription host`, затем
+ * предложение применить на ноде и прежнем хосте. `true` — сохранено.
+ */
+export async function subscriptionRoleFlow(ctx, name, node) {
+  const own = node && node.subscription && typeof node.subscription === 'object' ? node.subscription : null;
+  const taken = [plain(node && node.domain), plain(node && node.telegram && node.telegram.hostname)];
+  const values = await ctx.form({
+    title: `Хост подписок: ${name}`,
+    fields: [
+      { name: 'domain', label: 'Домен для подписок', type: 'text', value: own ? plain(own.hostname) : '', placeholder: 'sub.example.com',
+        required: 'Домен не указан.', hint: ROLE_SUBSCRIPTION, autofocus: true, live: true, suggest: domainSuggestion,
+        validate: (value) => domainError(value) || roleDomainError(value, taken) },
+      { name: 'port', label: 'Порт', type: 'text', value: own ? plain(own.port) : '', placeholder: SUBSCRIPTION_DEFAULT_PORT,
+        hint: 'пусто — 443', live: true, validate: profilePortError },
+    ],
+    submit: 'Сохранить',
+  });
+  if (values === null || values === undefined) return false;
+  const result = await setSubscriptionHost(ctx, name, subscriptionSetHost(name, values.domain, values.port));
+  if (result.status !== 'saved') return false;
+  await offerApplyNodes(ctx, result.old ? [name, result.old] : [name]);
+  return true;
 }
 
 /** «Порты»: поле на протокол профиля с портом; пусто — порт профиля. `true` — что-то изменено. */

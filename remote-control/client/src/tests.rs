@@ -80,7 +80,8 @@ fn slow_reply_ticks_while_in_flight() {
         to_client.send(line(json!({"id":1,"ok":true,"data":{}}))).unwrap();
     });
     let mut events = vec![];
-    let reply = send(&mut client, &["status"], &mut |p| events.push(match p { Progress::Log(l) => l.text.clone(), Progress::Tick => "tick".into() })).unwrap();
+    let reply = send(&mut client, &["status"], &mut |p| events.push(match p {
+        Progress::Log(l) => l.text.clone(), Progress::Live(live) => live.text.clone(), Progress::Tick => "tick".into() })).unwrap();
     assert!(reply.ok);
     let first_tick = events.iter().position(|e| e == "tick").expect("ticks while the reply is pending");
     assert_eq!(events[..first_tick], ["working".to_owned()], "the log event is delivered before any wait");
@@ -125,6 +126,36 @@ fn foreign_and_unknown_messages_are_skipped_in_order() {
     assert_eq!(reply.data, json!({"n":1}));
     let error = send(&mut client, &["status"], &mut |_| {}).err().unwrap();
     assert_eq!((error.kind(), error.to_string().as_str()), (io::ErrorKind::InvalidData, "Неверный id ответа демона"));
+    script.join().unwrap();
+}
+
+/// `progress` events of the request reach the caller as live lines in order,
+/// stay out of `logs`, and a foreign request's ones are skipped.
+#[test]
+fn progress_events_are_live_lines_not_journal() {
+    let (mut client, script) = fake(|to_client, from_client| {
+        next(&from_client);
+        for message in [
+            json!({"id":1,"event":"progress","percent":5,"text":"Нода de: 5 % · 0:00"}),
+            json!({"id":7,"event":"progress","percent":50,"text":"foreign"}),
+            json!({"id":1,"event":"log","level":"info","text":"de: установка пакетов"}),
+            json!({"id":1,"event":"progress","percent":12,"text":"Нода de: 12 % · 0:01"}),
+            json!({"id":1,"ok":true,"data":{}}),
+        ] { to_client.send(line(message)).unwrap(); }
+        next(&from_client);
+        to_client.send(line(json!({"id":2,"event":"progress","percent":"x"}))).unwrap();
+    });
+    let mut seen = vec![];
+    let reply = send(&mut client, &["node", "apply"], &mut |p| match p {
+        Progress::Live(live) => seen.push(format!("{} {}", live.percent, live.text)),
+        Progress::Log(l) => seen.push(format!("log {}", l.text)),
+        Progress::Tick => {}
+    }).unwrap();
+    assert_eq!(seen, ["5 Нода de: 5 % · 0:00", "log de: установка пакетов", "12 Нода de: 12 % · 0:01"]);
+    assert_eq!(reply.logs.len(), 1);
+    assert!(reply.live.is_empty(), "the daemon client keeps no live lines");
+    let error = send(&mut client, &["status"], &mut |_| {}).err().unwrap();
+    assert_eq!((error.kind(), error.to_string().as_str()), (io::ErrorKind::InvalidData, "Некорректное событие прогресса"));
     script.join().unwrap();
 }
 

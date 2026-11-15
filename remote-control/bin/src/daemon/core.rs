@@ -117,6 +117,13 @@ impl LogSink for CoreSink {
         }
         self.shared.activity(&json!({"event": "activity", "state": "log", "level": level, "text": text}));
     }
+
+    /// Only to the requester: the live line is not part of the journal.
+    fn progress(&mut self, percent: u8, text: &str) {
+        if let Some((conn, id)) = self.current.borrow().as_ref() {
+            conn.progress(id, percent, &log::sanitize(text));
+        }
+    }
 }
 
 pub fn spawn(
@@ -623,5 +630,34 @@ mod tests {
         // Already authorized before: no second token.
         grant_resume(&shared, &conn, &id, true, true);
         assert!(lines.try_recv().is_err());
+    }
+
+    /// The live line goes only to the requester, sanitized; watchers get
+    /// the journal (`activity log`) but never the live line.
+    #[test]
+    fn progress_reaches_only_the_requester_as_a_progress_event() {
+        use super::super::conn::Out;
+        let (shared, _jobs) = super::super::tests::shared();
+        let (out, mut requester) = mpsc::unbounded_channel();
+        let conn = Arc::new(Conn::new(1, Origin::Local, out));
+        let (watcher_out, mut watcher) = mpsc::unbounded_channel();
+        shared.register(Origin::Local, watcher_out).set_watching(true);
+        let current = Current::default();
+        *current.borrow_mut() = Some((conn, json!(7)));
+        let mut sink = CoreSink { current, shared };
+        let line = |receiver: &mut mpsc::UnboundedReceiver<Out>| match receiver.try_recv() {
+            Ok(Out::Line(text, None)) => Some(serde_json::from_str::<Value>(&text).unwrap()),
+            _ => None,
+        };
+
+        sink.progress(37, "Нода de: 37 % · \u{1b}[31mnginx: распаковка\u{7} · 1:42");
+        assert_eq!(line(&mut requester), Some(json!({"id": 7, "event": "progress", "percent": 37,
+            "text": "Нода de: 37 % · [31mnginx: распаковка · 1:42"})));
+        assert_eq!(line(&mut requester), None);
+        assert_eq!(line(&mut watcher), None, "watchers never see the live line");
+
+        sink.log(Level::Info, "de: установка пакетов");
+        assert_eq!(line(&mut requester).unwrap()["event"], "log");
+        assert_eq!(line(&mut watcher).unwrap()["state"], "log", "the journal still reaches watchers");
     }
 }

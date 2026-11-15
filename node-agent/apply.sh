@@ -43,11 +43,14 @@ FW_DELETED=""
 # поднимает их снова.
 TX_DEACTIVATED=""
 
-# status: запись целиком через tmp + mv.
+# status: запись целиком через tmp + mv. progress= и detail= ведёт
+# steps/progress.sh (до его подключения — 0 и пусто).
 write_status() {
     local tmp="$OP/.status.tmp"
     {
         printf 'stage=%s\n' "$STAGE"
+        printf 'progress=%s\n' "${PROGRESS:-0}"
+        if [[ -n "${DETAIL:-}" ]]; then printf 'detail=%s\n' "$DETAIL"; fi
         if [[ -n "$RESULT" ]]; then printf 'result=%s\n' "$RESULT"; fi
         if [[ -n "$ERROR" ]]; then printf 'error=%s\n' "$ERROR"; fi
         if [[ -n "$HINT" ]]; then printf 'hint=%s\n' "$HINT"; fi
@@ -66,6 +69,7 @@ scrub_op() {
 
 stage() {
     STAGE="$1"
+    progress_stage "$1"
     write_status
     info "Этап: $STAGE"
 }
@@ -142,6 +146,7 @@ source "$OP/spec.sh" || exit 1
 : "${NGINX_STREAM:=false}" "${SITE_NAME:=}" "${SITE_SOURCE:=random}" "${SITE_REQUIRE_200:=false}" "${CERTS:=}"
 : "${ACME_EMAIL:=}" "${DNS_DOMAINS:=}" "${HY2_CERT:=false}" "${HY2_CN:=}" "${UFW_RULES:=}" "${RELEASE_CERTS:=}"
 : "${FEATURES:=}" "${REMOVE_FEATURES:=}" "${WARP:=}"
+progress_plan
 
 exec 9>"$NODE_DIR/lock" || exit 1
 if ! flock -n 9; then
@@ -181,6 +186,8 @@ esac
 # записи committed и на итог не влияет.
 TX_OPEN=false
 RESULT=committed
+PROGRESS=100
+DETAIL=""
 write_status
 scrub_op
 cleanup_committed

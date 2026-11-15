@@ -1,5 +1,5 @@
-//! `profile list|show|add|set|delete|warp-license`: node profiles, the
-//! desired server setup shared by nodes.
+//! `profile list|show|add|set|delete|warp-license|mihomo-versions`: node
+//! profiles, the desired server setup shared by nodes.
 
 use std::collections::BTreeMap;
 
@@ -12,8 +12,8 @@ use crate::dispatch::Session;
 use crate::error::{RcError, Result};
 use crate::log::Level;
 use crate::model::{
-    AmneziaWg, Config, Hysteria2, Ipv6, PortOnly, Profile, RealityMode, SiteSource, Xhttp, XhttpTopology,
-    default_awg_dns,
+    self, AmneziaWg, Config, Hysteria2, Ipv6, MIHOMO_MIN_VERSION, PortOnly, Profile, RealityMode, SiteSource, Xhttp,
+    XhttpTopology, default_awg_dns,
 };
 use crate::nodes::required;
 use crate::nodes::setup::FileBackup;
@@ -25,6 +25,7 @@ use super::keys::{ensure_generated, hex, uniform};
 use super::ports::RESERVED_PORTS;
 
 const MIHOMO_LATEST: &str = "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest";
+const MIHOMO_RELEASES: &str = "https://api.github.com/repos/MetaCubeX/mihomo/releases?per_page=30";
 
 pub async fn route(verb: &str, invocation: &Invocation, secrets: &Secrets, session: &mut Session) -> Result<Value> {
     match verb {
@@ -34,6 +35,7 @@ pub async fn route(verb: &str, invocation: &Invocation, secrets: &Secrets, sessi
         "set" => set(session, invocation),
         "delete" => delete(session, invocation),
         "warp-license" => warp_license(session, invocation, secrets),
+        "mihomo-versions" => mihomo_versions().await,
         _ => Err(RcError::new("usage", "Неизвестная команда.")),
     }
 }
@@ -231,6 +233,35 @@ async fn latest_mihomo() -> Result<String> {
     body.get("tag_name").and_then(Value::as_str).map(str::to_owned).ok_or_else(failed)
 }
 
+/// How many versions `profile mihomo-versions` offers.
+const MIHOMO_OFFERED: usize = 10;
+
+/// Tags of a GitHub `releases` page usable by a profile: published, not
+/// prereleases, `vX.Y.Z` not below [`MIHOMO_MIN_VERSION`]; newest first,
+/// without repeats, at most [`MIHOMO_OFFERED`].
+fn mihomo_release_tags(body: &Value) -> Vec<String> {
+    let mut found: Vec<([u64; 3], String)> = body.as_array().into_iter().flatten()
+        .filter(|release| release["draft"] != true && release["prerelease"] != true)
+        .filter_map(|release| release["tag_name"].as_str())
+        .filter_map(|tag| model::mihomo_version_parts(tag).filter(|parts| *parts >= MIHOMO_MIN_VERSION).map(|parts| (parts, tag.to_owned())))
+        .collect();
+    found.sort_by_key(|(parts, _)| std::cmp::Reverse(*parts));
+    found.dedup_by(|a, b| a.0 == b.0);
+    found.into_iter().take(MIHOMO_OFFERED).map(|(_, tag)| tag).collect()
+}
+
+/// `profile mihomo-versions`: the recent mihomo versions a profile may use
+/// (read-only, GitHub releases API); `latest` is the newest of them.
+async fn mihomo_versions() -> Result<Value> {
+    let failed = || RcError::new("failed", "Не удалось получить список версий mihomo: укажите версию вручную в виде vX.Y.Z, например v1.19.18.");
+    let client = crate::self_manage::metadata_client().map_err(|_| failed())?;
+    let response = client.get(MIHOMO_RELEASES).send().await.and_then(reqwest::Response::error_for_status).map_err(|_| failed())?;
+    let body: Value = response.json().await.map_err(|_| failed())?;
+    let versions = mihomo_release_tags(&body);
+    let latest = versions.first().cloned().ok_or_else(failed)?;
+    Ok(json!({"latest": latest, "versions": versions}))
+}
+
 fn exists(name: &str) -> RcError {
     RcError::new("exists", format!("Профиль «{name}» уже существует.")).with_extra("name", name)
 }
@@ -241,7 +272,9 @@ async fn add(session: &mut Session, invocation: &Invocation) -> Result<Value> {
         return Err(usage("Укажите ровно один из флагов: --acme-email | --random-acme-email.".into()));
     }
     if !v::name_valid(&name) {
-        return Err(RcError::new("invalid", format!("Недопустимое имя профиля «{name}»: латиница, цифры, «.», «_», «-».")));
+        let config = session.state.load_config()?;
+        let taken: Vec<&str> = config.profiles.iter().map(|profile| profile.name.as_str()).collect();
+        return Err(v::name_error("профиля", &name, &taken));
     }
     if session.state.load_config()?.find_profile(&name).is_some() {
         return Err(exists(&name));
@@ -517,5 +550,22 @@ mod tests {
         warp_license(&mut session, &clear, &Secrets::default()).unwrap();
         assert!(session.state.load_config().unwrap().profiles[0].warp_plus.is_none());
         assert!(session.state.secret_store().get("profile:edge:warp-license").unwrap().is_none());
+    }
+
+    #[test]
+    fn mihomo_versions_are_recent_stable_supported_tags() {
+        let release = |tag: &str, prerelease: bool| json!({"tag_name": tag, "prerelease": prerelease, "draft": false});
+        let mut body = vec![
+            release("Prerelease-Alpha", true), release("v1.19.17", false), release("v1.20.0", true),
+            release("v1.19.18", false), json!({"tag_name": "v1.19.30", "draft": true}), release("v1.19.20", false),
+            release("v1.19.20", false), release("1.19.21", false), release("v2.0.0", false), json!({"name": "no tag"}),
+        ];
+        assert_eq!(mihomo_release_tags(&Value::Array(body.clone())), ["v2.0.0", "v1.19.20", "v1.19.18"]);
+        body.extend((0..12).map(|patch| release(&format!("v1.19.{}", 40 + patch), false)));
+        let tags = mihomo_release_tags(&Value::Array(body));
+        assert_eq!((tags.len(), tags[0].as_str(), tags[1].as_str(), tags[9].as_str()), (10, "v2.0.0", "v1.19.51", "v1.19.43"));
+        assert!(mihomo_release_tags(&json!({"message": "rate limited"})).is_empty());
+        let error = run(&mut session(tempfile::tempdir().unwrap().path()).0, &["profile", "add", "--name", "VLESS TCP", "--random-acme-email", "--mihomo-version", "v1.19.18"]).unwrap_err();
+        assert_eq!((error.code, error.extra["suggestion"].clone()), ("invalid", json!("vless-tcp")));
     }
 }

@@ -31,6 +31,19 @@ use super::bundle::{NODE_ROOT, agent_dir, agent_sha, materialize_agent};
 use super::render::{self, Desired, NodeSecrets, RenderedFile};
 
 const POLL_PAUSE: Duration = Duration::from_secs(2);
+/// Between polls the live line (`Session::progress`) is refreshed this often:
+/// its elapsed time ticks even when the status did not change.
+const LIVE_TICK: Duration = Duration::from_secs(1);
+/// Executor stages in order (`stage=` of the status file), for «этап i/n».
+const APPLY_STAGES: [&str; 10] = ["packages", "system", "mihomo", "dns", "site", "certificate", "prepare", "config", "firewall", "cleanup"];
+const TEARDOWN_STAGES: [&str; 3] = ["config", "firewall", "cleanup"];
+/// Longest `detail=` shown (the executor already cuts it to this).
+const DETAIL_MAX: usize = 120;
+/// Log lines read after a failure, and the most of them shown.
+const LOG_READ: usize = 400;
+const LOG_SHOWN: usize = 25;
+/// The executor's warnings and errors shown first, at most.
+const LOG_PROBLEMS: usize = 10;
 const RECONNECT_PAUSES: [u64; 5] = [1, 2, 4, 8, 15];
 const OFFLINE_LIMIT: Duration = Duration::from_secs(10 * 60);
 const OPERATION_LIMIT: Duration = Duration::from_secs(60 * 60);
@@ -91,12 +104,12 @@ fn agent_check() -> String {
         sh_quote(&agent_dir()), agent_sha())
 }
 
-/// One read-only command: OS, systemd, sshd's own port, executor integrity,
-/// listening sockets, hashes of the applied files and the state of a
-/// recorded operation.
+/// One read-only command: OS and its version, systemd, sshd's own port,
+/// executor integrity, listening sockets, hashes of the applied files and
+/// the state of a recorded operation.
 pub fn probe_command(node: &Node) -> String {
     let mut command = format!(
-        ". /etc/os-release; printf 'os=%s\\n' \"$ID\"\n\
+        ". /etc/os-release; printf 'os=%s\\nversion=%s\\n' \"$ID\" \"$VERSION_ID\"\n\
          [ -d /run/systemd/system ] && echo systemd=yes\n\
          printf 'sshd=%s\\n' \"${{SSH_CONNECTION##* }}\"\n\
          ({}) && echo agent=ok\n\
@@ -121,7 +134,77 @@ pub fn status_command(op_id: &str) -> String {
 }
 
 pub fn log_command(op_id: &str) -> String {
-    format!("tail -n 40 {}", sh_quote(&format!("{}/log", ops_dir(op_id))))
+    format!("tail -n {LOG_READ} {}", sh_quote(&format!("{}/log", ops_dir(op_id))))
+}
+
+/// The executor log as shown after a failure: ANSI sequences stripped, PEM
+/// blocks (acme.sh prints the issued certificate) and blank lines dropped,
+/// a `\r`-redrawn line reduced to its last state; then the last
+/// [`LOG_PROBLEMS`] `[!]`/`[✗]` lines followed by the last other lines, up to
+/// [`LOG_SHOWN`] in all. A PEM block ends at its `-----END` line or at the
+/// first line that is not base64, so a cut block hides nothing after it.
+fn log_tail(raw: &str) -> Vec<String> {
+    let base64 = |text: &str| !text.is_empty() && text.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '='));
+    let mut lines: Vec<String> = Vec::new();
+    let mut in_pem = false;
+    for line in raw.lines() {
+        let line = strip_ansi(line.rsplit('\r').find(|part| !part.trim().is_empty()).unwrap_or(""));
+        let line = crate::log::sanitize(&line);
+        let text = line.trim();
+        if text.starts_with("-----BEGIN ") {
+            in_pem = true;
+        } else if text.starts_with("-----END ") {
+            // A block cut by the start of the read: its body is already in.
+            if !in_pem {
+                while lines.last().is_some_and(|last| base64(last)) {
+                    lines.pop();
+                }
+            }
+            in_pem = false;
+        } else if !(in_pem && base64(text)) {
+            in_pem = false;
+            if !text.is_empty() {
+                lines.push(text.to_owned());
+            }
+        }
+    }
+    let problem = |line: &str| line.starts_with("[!]") || line.starts_with("[✗]");
+    let problems: Vec<usize> = lines.iter().enumerate().filter(|(_, line)| problem(line)).map(|(index, _)| index).collect();
+    let problems = &problems[problems.len().saturating_sub(LOG_PROBLEMS)..];
+    let rest: Vec<usize> = (0..lines.len()).filter(|index| !problems.contains(index)).collect();
+    let rest = &rest[rest.len().saturating_sub(LOG_SHOWN - problems.len())..];
+    problems.iter().chain(rest).map(|index| lines[*index].clone()).collect()
+}
+
+/// `text` without ANSI escape sequences (CSI `ESC [ … final`, OSC
+/// `ESC ] … BEL|ESC \`, and two-byte `ESC x`).
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('[') => {
+                for c in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                while let Some(c) = chars.next() {
+                    if c == '\u{7}' || (c == '\u{1b}' && chars.next_if_eq(&'\\').is_some()) {
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Start the executor if its directory is still intact.
@@ -138,6 +221,8 @@ pub fn agent_reset_command() -> String {
 #[derive(Debug, Default)]
 struct Probe {
     os: String,
+    /// `VERSION_ID` of `/etc/os-release`.
+    version: String,
     systemd: bool,
     /// The port sshd accepted this session on (differs from the dialed one behind NAT).
     sshd: Option<u16>,
@@ -153,6 +238,8 @@ fn parse_probe(stdout: &str) -> Probe {
     for line in stdout.lines().map(|line| line.trim_end_matches('\r')) {
         if let Some(os) = line.strip_prefix("os=") {
             probe.os = os.trim_matches('"').to_owned();
+        } else if let Some(version) = line.strip_prefix("version=") {
+            probe.version = version.trim_matches('"').to_owned();
         } else if line == "systemd=yes" {
             probe.systemd = true;
         } else if let Some(port) = line.strip_prefix("sshd=") {
@@ -457,6 +544,10 @@ struct Run<'t, T> {
     operation: Operation,
     started: Instant,
     stage: String,
+    /// `progress=` of the status file, never lower than the last one seen.
+    percent: u8,
+    /// `detail=` of the status file: the current activity, sanitized.
+    detail: String,
     lost: Option<(Instant, usize, Instant)>,
     outcome: Option<Outcome>,
     /// How the executor ended (recorded with a non-timeout failure).
@@ -465,7 +556,10 @@ struct Run<'t, T> {
 
 impl<'t, T: RemoteTransport> Run<'t, T> {
     fn new(node: Node, transport: &'t mut T, operation: Operation) -> Self {
-        Self { node, transport, operation, started: Instant::now(), stage: String::new(), lost: None, outcome: None, end: End::Failed }
+        Self {
+            node, transport, operation, started: Instant::now(), stage: String::new(), percent: 0, detail: String::new(),
+            lost: None, outcome: None, end: End::Failed,
+        }
     }
 
     fn fail(&mut self, failure: Failure) {
@@ -476,7 +570,26 @@ impl<'t, T: RemoteTransport> Run<'t, T> {
     fn current_stage(&self) -> String {
         if self.stage.is_empty() { "start".to_owned() } else { self.stage.clone() }
     }
+}
 
+impl<T> Run<'_, T> {
+    /// The stage for the live line: `init` until the executor reports one.
+    fn stage_or_init(&self) -> &str {
+        if self.stage.is_empty() { "init" } else { &self.stage }
+    }
+
+    /// «этап 3/10 «установка пакетов»» (or just the label outside the list).
+    fn stage_text(&self) -> String {
+        let stages: &[&str] = if self.operation.teardown { &TEARDOWN_STAGES } else { &APPLY_STAGES };
+        let stage = self.stage_or_init();
+        match stages.iter().position(|known| *known == stage) {
+            Some(index) => format!("этап {}/{} «{}»", index + 1, stages.len(), stage_label(stage)),
+            None => format!("«{}»", stage_label(stage)),
+        }
+    }
+}
+
+impl<T: RemoteTransport> Run<'_, T> {
     /// Upload the executor when needed, the operation directory, then start
     /// it. A failure before `systemd-run` means nothing started (`Err`). A
     /// connection lost during `systemd-run` leaves the start uncertain: the
@@ -507,17 +620,16 @@ impl<'t, T: RemoteTransport> Run<'t, T> {
         }
     }
 
-    /// Print the tail of the executor log.
-    async fn show_log(&mut self, session: &mut Session) {
+    /// The cleaned tail of the executor log ([`log_tail`]) into `logs`.
+    async fn show_log(&mut self, logs: &mut Vec<(Level, String)>) {
         if let Ok(log) = self.transport.exec(&log_command(&self.operation.id), b"", COMMAND_TIMEOUT).await {
-            for line in String::from_utf8_lossy(&log.stdout).lines() {
-                session.log(Level::Output, line);
-            }
+            logs.extend(log_tail(&String::from_utf8_lossy(&log.stdout)).into_iter().map(|line| (Level::Output, line)));
         }
     }
 
-    /// One poll: read the status or try to reconnect.
-    async fn poll(&mut self, session: &mut Session) {
+    /// One poll: read the status or try to reconnect. Journal lines go to
+    /// `logs` (the session keeps the live line moving meanwhile, [`drive`]).
+    async fn poll(&mut self, state: &State, logs: &mut Vec<(Level, String)>) {
         let now = Instant::now();
         if now.duration_since(self.started) > OPERATION_LIMIT {
             return self.fail(Failure::new(&self.current_stage(), "timeout", "операция не завершилась за 60 минут"));
@@ -529,7 +641,7 @@ impl<'t, T: RemoteTransport> Run<'t, T> {
             if now < next {
                 return;
             }
-            if nodes::connect(self.transport, &session.state, &self.node).await.is_ok() {
+            if nodes::connect(self.transport, state, &self.node).await.is_ok() {
                 self.lost = None;
             } else {
                 let pause = RECONNECT_PAUSES[(attempt + 1).min(RECONNECT_PAUSES.len() - 1)];
@@ -541,7 +653,7 @@ impl<'t, T: RemoteTransport> Run<'t, T> {
             Ok(result) if result.exit_status == 0 => parse_status(&String::from_utf8_lossy(&result.stdout)),
             Ok(_) => return,
             Err(_) => {
-                session.log(Level::Warn, &format!("{}: связь потеряна, переподключение…", self.node.name));
+                logs.push((Level::Warn, format!("{}: связь потеряна, переподключение…", self.node.name)));
                 self.lost = Some((now, 0, now + Duration::from_secs(RECONNECT_PAUSES[0])));
                 return;
             }
@@ -549,14 +661,21 @@ impl<'t, T: RemoteTransport> Run<'t, T> {
         if let Some(stage) = status.get("stage").filter(|stage| **stage != self.stage) {
             self.stage = stage.clone();
             if stage != "init" {
-                session.log(Level::Info, &format!("{}: {}", self.node.name, stage_label(stage)));
+                logs.push((Level::Info, format!("{}: {}", self.node.name, stage_label(stage))));
             }
         }
+        if let Some(percent) = status.get("progress").and_then(|percent| percent.trim().parse::<u8>().ok()) {
+            self.percent = self.percent.max(percent.min(100));
+        }
+        self.detail = status.get("detail").map(|detail| clean_detail(detail)).unwrap_or_default();
         match status.get("result").map(String::as_str) {
-            Some("committed") => self.outcome = Some(Outcome::Committed),
+            Some("committed") => {
+                self.percent = 100;
+                self.outcome = Some(Outcome::Committed);
+            }
             Some(result) => {
                 let stage = status.get("error").cloned().unwrap_or_else(|| self.current_stage());
-                self.show_log(session).await;
+                self.show_log(logs).await;
                 let failure = match (result, stage.as_str()) {
                     (_, "locked") => Failure::new(&self.current_stage(), "failed", "на ноде выполняется другая операция"),
                     ("rolled_back", _) => Failure::new(&stage, "rolled_back", format!("откат на этапе «{}»", stage_label(&stage))),
@@ -571,7 +690,7 @@ impl<'t, T: RemoteTransport> Run<'t, T> {
                 self.fail(failure);
             }
             None if unit_gone(&status) => {
-                self.show_log(session).await;
+                self.show_log(logs).await;
                 let stage = self.current_stage();
                 self.end = End::Incomplete;
                 self.fail(Failure::new(&stage, "failed",
@@ -595,19 +714,121 @@ impl<'t, T: RemoteTransport> Run<'t, T> {
     }
 }
 
-/// Poll every unfinished run in turn until all finish.
+/// Poll every unfinished run in turn until all finish; the live line is
+/// refreshed every [`LIVE_TICK`] between polls and while polls wait for
+/// their nodes (an SSH reply may take up to [`COMMAND_TIMEOUT`]): the state
+/// is then that of the current poll's start, the elapsed time keeps going.
+/// One ticker serves the whole round, so polls shorter than a second each
+/// still let the line move.
 async fn drive<T: RemoteTransport>(session: &mut Session, runs: &mut [Run<'_, T>]) {
     loop {
         let mut active = false;
-        for run in runs.iter_mut().filter(|run| run.outcome.is_none()) {
-            run.poll(session).await;
-            active |= run.outcome.is_none();
+        let mut tick = tokio::time::interval_at(Instant::now() + LIVE_TICK, LIVE_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        for index in 0..runs.len() {
+            if runs[index].outcome.is_some() {
+                continue;
+            }
+            let live = live_state(runs);
+            let mut logs = Vec::new();
+            {
+                let (state, mut progress) = session.state_and_progress();
+                let mut poll = std::pin::pin!(runs[index].poll(state, &mut logs));
+                loop {
+                    tokio::select! {
+                        biased;
+                        () = &mut poll => break,
+                        _ = tick.tick() => if let Some(live) = &live {
+                            let (percent, text) = live.at(Instant::now());
+                            progress(percent, &text);
+                        },
+                    }
+                }
+            }
+            for (level, text) in logs {
+                session.log(level, &text);
+            }
+            active |= runs[index].outcome.is_none();
         }
         if !active {
             break;
         }
-        tokio::time::sleep(POLL_PAUSE).await;
+        let mut waited = Duration::ZERO;
+        while waited < POLL_PAUSE {
+            if let Some((percent, text)) = live_line(runs, Instant::now()) {
+                session.progress(percent, &text);
+            }
+            tokio::time::sleep(LIVE_TICK).await;
+            waited += LIVE_TICK;
+        }
     }
+}
+
+/// `detail=` as shown: control characters removed, at most [`DETAIL_MAX`]
+/// characters (the executor promises both; the node is not trusted).
+fn clean_detail(detail: &str) -> String {
+    crate::log::sanitize(detail).trim().chars().take(DETAIL_MAX).collect()
+}
+
+/// `m:ss` of an elapsed time.
+fn clock(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    format!("{}:{:02}", seconds / 60, seconds % 60)
+}
+
+/// The live line of the running operations, `(percent, text)`. One node:
+/// «Нода de: 37 % · этап 1/10 «установка пакетов» · nginx: распаковка · 1:42».
+/// Several nodes share one line (a single replaceable line works the same
+/// in the CLI, the menu status line and the web operation window): the mean
+/// percent of the nodes not failed (a committed node counts as 100), how many
+/// are done (committed only), failed nodes separately as «ошибка» (out of the
+/// mean and of «готово»), then each running node's percent and stage —
+/// «Ноды: 54 % · готово 1/3 · ошибка: fi · de 37 % «установка пакетов» ·
+/// nl 71 % «сертификаты» · 1:42». Details stay in the single-node line: with
+/// several nodes the line would not fit.
+fn live_line<T>(runs: &[Run<'_, T>], now: Instant) -> Option<(u8, String)> {
+    live_state(runs).map(|live| live.at(now))
+}
+
+/// [`live_line`] without the elapsed time, which [`LiveState::at`] adds.
+struct LiveState {
+    percent: u8,
+    text: String,
+    started: Instant,
+}
+
+impl LiveState {
+    fn at(&self, now: Instant) -> (u8, String) {
+        (self.percent, format!("{} · {}", self.text, clock(now.duration_since(self.started))))
+    }
+}
+
+fn live_state<T>(runs: &[Run<'_, T>]) -> Option<LiveState> {
+    let started = runs.iter().map(|run| run.started).min()?;
+    if let [run] = runs {
+        let mut parts = vec![format!("Нода {}: {} %", run.node.name, run.percent), run.stage_text()];
+        if run.lost.is_some() {
+            parts.push("нет связи, переподключение".to_owned());
+        } else if !run.detail.is_empty() {
+            parts.push(run.detail.clone());
+        }
+        return Some(LiveState { percent: run.percent, text: parts.join(" · "), started });
+    }
+    let failed: Vec<&str> = runs.iter().filter(|run| matches!(run.outcome, Some(Outcome::Failed(_)))).map(|run| run.node.name.as_str()).collect();
+    let counted: Vec<usize> = runs.iter().filter_map(|run| match run.outcome {
+        Some(Outcome::Committed) => Some(100),
+        Some(Outcome::Failed(_)) => None,
+        None => Some(usize::from(run.percent)),
+    }).collect();
+    let percent = if counted.is_empty() { 100 } else { (counted.iter().sum::<usize>() / counted.len()) as u8 };
+    let done = runs.iter().filter(|run| matches!(run.outcome, Some(Outcome::Committed))).count();
+    let mut parts = vec![format!("Ноды: {percent} %"), format!("готово {done}/{}", runs.len())];
+    if !failed.is_empty() { parts.push(format!("ошибка: {}", failed.join(", "))); }
+    for run in runs.iter().filter(|run| run.outcome.is_none()) {
+        let state = if run.lost.is_some() { "нет связи".to_owned() } else { format!("«{}»", stage_label(run.stage_or_init())) };
+        parts.push(format!("{} {} % {state}", run.node.name, run.percent));
+    }
+    Some(LiveState { percent, text: parts.join(" · "), started })
 }
 
 /// Start a claimed operation; a start that certainly did not happen clears
@@ -639,17 +860,34 @@ struct Planned<T> {
     run: bool,
 }
 
-/// Connect and probe one node.
+/// Connect and probe one node; an OS outside [`super::os::SUPPORTED_OS`] or
+/// without systemd fails it here, before the plan.
 async fn probe<T: RemoteTransport>(session: &Session, transport: &mut T, node: &Node) -> std::result::Result<Probe, Failure> {
     let fail = |error: RcError| Failure::of("probe", error);
     nodes::require_portable(session, node).map_err(fail)?;
     nodes::connect_retrying(transport, &session.state, node).await.map_err(fail)?;
     let result = transport.exec(&probe_command(node), b"", COMMAND_TIMEOUT).await.map_err(fail)?;
     let probe = parse_probe(&String::from_utf8_lossy(&result.stdout));
-    if !matches!(probe.os.as_str(), "debian" | "ubuntu") || !probe.systemd {
-        return Err(Failure::new("probe", "unsupported_os", "нужна Debian или Ubuntu с systemd"));
+    match os_failure(&probe) {
+        Some(failure) => Err(failure),
+        None => Ok(probe),
     }
-    Ok(probe)
+}
+
+/// `unsupported_os` naming what the node runs and what is supported.
+fn os_failure(probe: &Probe) -> Option<Failure> {
+    let wanted = super::os::supported_text();
+    let detected: String = crate::log::sanitize(&format!("{} {}", probe.os, probe.version)).trim().chars().take(40).collect();
+    let message = if detected.is_empty() {
+        format!("не удалось определить ОС ноды: нужна {wanted} с systemd")
+    } else if !super::os::supported(&probe.os, &probe.version) {
+        format!("ОС ноды «{detected}» не поддерживается: нужна {wanted} с systemd")
+    } else if !probe.systemd {
+        format!("на ноде «{detected}» нет systemd: нужна {wanted} с systemd")
+    } else {
+        return None;
+    };
+    Some(Failure::new("probe", "unsupported_os", message))
 }
 
 /// A socket the node does not hold for us yet (firewall ports and the

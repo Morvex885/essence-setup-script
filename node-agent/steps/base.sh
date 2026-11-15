@@ -25,6 +25,7 @@ agent_apt_wait() {
         fi
         if ((waited % 30 == 0)); then
             info "Ожидаю завершения другого процесса apt ($busy)..."
+            progress_detail "ожидание другого процесса apt"
         fi
         sleep 1
         waited=$((waited + 1))
@@ -42,12 +43,15 @@ tx_touches_nginx() {
 
 # ─── packages ───────────────────────────────────────────────────────────────
 stage_packages() {
-    local pkgs=(curl wget unzip ufw openssl dnsutils cron)
+    # bind9-dnsutils: в Debian 13 и Ubuntu 26.04 dnsutils — только виртуальный пакет.
+    local pkgs=(curl wget unzip ufw openssl bind9-dnsutils cron)
     [[ "$NGINX" == true ]] && pkgs+=(nginx)
     [[ "$NGINX_STREAM" == true ]] && pkgs+=(libnginx-mod-stream)
     agent_apt_wait || return 1
-    DEBIAN_FRONTEND=noninteractive apt-get update -q || return 1
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -q "${pkgs[@]}" || return 1
+    progress_detail "обновление списков пакетов"
+    agent_apt 0 30 update -q || return 1
+    progress_detail "установка пакетов"
+    agent_apt 30 95 install -y -q "${pkgs[@]}" || return 1
     if [[ "$NGINX" == true ]]; then
         systemctl enable nginx || return 1
     fi
@@ -82,6 +86,7 @@ stage_mihomo() {
         return 0
     fi
     info "Версия: $latest"
+    progress_detail "загрузка mihomo $latest"
 
     local arch
     case "$(uname -m)" in
@@ -146,6 +151,7 @@ external_ipv4() {
 
 stage_dns() {
     [[ -n "$DNS_DOMAINS" ]] || return 0
+    progress_detail "проверка A-записей доменов"
     local ip domain resolved
     ip=$(external_ipv4) || { warn "Не удалось определить внешний IPv4."; return 1; }
     for domain in $DNS_DOMAINS; do
@@ -302,6 +308,7 @@ stage_site() {
         warn "В /var/www/$SITE_NAME уже есть сайт без отметки Essence — не заменяю."
         return 1
     fi
+    progress_detail "загрузка шаблона сайта"
     site_fetch "$SITE_SOURCE" "$www" || return 1
     (umask 022; : >"$www/.essence-site") || return 1
 }
@@ -326,12 +333,17 @@ parse_cert_entries() {
 
 stage_certificate() {
     [[ -n "$CERTS" ]] || return 0
-    local entry name webroot
+    local entry name webroot i=0
     parse_cert_entries "$CERTS" || return 1
+    progress_detail "установка acme.sh"
     ensure_acme_installed "$ACME_EMAIL" || return 1
     for entry in "${CERT_ENTRIES[@]}"; do
         name="${entry%%:*}"
         webroot="${entry#*:}"
+        # Первые 10 % этапа — acme.sh, остальное поровну на сертификаты.
+        progress_span $((10 + 90 * i / ${#CERT_ENTRIES[@]})) $((10 + 90 * (i + 1) / ${#CERT_ENTRIES[@]}))
+        progress_detail "выпуск сертификата $name"
+        i=$((i + 1))
         (umask 022; mkdir -p "$R$webroot") || return 1
         ensure_cert "$name" "$R$webroot" false "$R/etc/nginx/ssl" \
             "$R/etc/nginx/sites-available" "$R/etc/nginx/sites-enabled" "$R/etc/nginx/nginx.conf" || return 1
@@ -340,9 +352,10 @@ stage_certificate() {
 
 # ─── prepare ────────────────────────────────────────────────────────────────
 stage_prepare() {
-    local hy2="$R/etc/mihomo/certs/hy2" feature
+    local hy2="$R/etc/mihomo/certs/hy2" feature weight total=3 used=3
     if [[ "$HY2_CERT" == true && ! -f "$hy2/server.crt" ]]; then
         [[ -n "$HY2_CN" ]] || { warn "Не задан CN сертификата Hysteria2."; return 1; }
+        progress_detail "сертификат Hysteria2"
         mkdir -p "$hy2" && chmod 0700 "$hy2" || return 1
         openssl req -new -newkey rsa:2048 -days 3650 -nodes -x509 \
             -subj "/C=US/ST=Denial/L=Springfield/O=Dis/CN=$HY2_CN" \
@@ -354,7 +367,14 @@ stage_prepare() {
         }
         chmod 0600 "$hy2/server.key" || return 1
     fi
+    # Доля фичи в этапе — по её весу (progress_feature_weight).
     for feature in $FEATURES; do
+        total=$((total + $(progress_feature_weight "$feature")))
+    done
+    for feature in $FEATURES; do
+        weight=$(progress_feature_weight "$feature")
+        progress_span $((100 * used / total)) $((100 * (used + weight) / total))
+        used=$((used + weight))
         feature_hook "$feature" prepare || return 1
     done
 }
@@ -654,6 +674,7 @@ stage_config() {
     done
     install_mihomo || return 1
 
+    progress_detail "проверка конфигурации"
     sysctl --system >/dev/null || return 1
     "$R$MIHOMO_BIN_REL" -t -d "$R/etc/mihomo" -f "$R/etc/mihomo/config.yaml" || return 1
     if [[ "$NGINX" == true ]]; then
@@ -666,6 +687,7 @@ stage_config() {
     elif tx_touches_nginx && command -v nginx >/dev/null 2>&1; then
         nginx_action=reload
     fi
+    progress_detail "перезапуск служб"
     port_handover "$nginx_action" || return 1
     listen_ready || return 1
     if [[ "$SITE_REQUIRE_200" == true ]]; then

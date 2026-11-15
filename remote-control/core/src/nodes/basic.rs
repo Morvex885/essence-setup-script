@@ -60,6 +60,8 @@ fn node_view(session: &Session, config: &Config, node: &Node, issues: &[crate::m
         "proxies": crate::server::render::proxies(config, node), "warp": warp_state(config, node),
         "telegram": config.telegram.iter().find(|proxy| proxy.node == node.name)
             .map(|proxy| json!({"hostname": proxy.hostname, "tag": proxy.tag_mark.is_some()})),
+        "subscription": config.subscription_host.as_ref().filter(|host| host.node == node.name)
+            .map(|host| json!({"hostname": host.hostname, "port": host.port})),
     })
 }
 
@@ -185,7 +187,9 @@ pub fn rename(session: &mut Session, invocation: &Invocation) -> Result<Value> {
     let old = required(invocation, "name")?.to_owned();
     let new = required(invocation, "new-name")?.to_owned();
     if !v::name_valid(&new) {
-        return Err(RcError::new("invalid", format!("Недопустимое имя ноды «{new}»: латиница, цифры, «.», «_», «-».")));
+        let config = session.state.load_config()?;
+        let taken: Vec<&str> = config.nodes.iter().map(|node| node.name.as_str()).collect();
+        return Err(v::name_error("ноды", &new, &taken));
     }
     session.mutate("rename_node", |state| {
         let mut config = state.load_config()?;

@@ -1,10 +1,11 @@
 //! `web run` и `web open` (план 2.4, П8, П9): клиент локального демона.
 //!
 //! Открытие панели: `web link` → ссылка в stdout → без `--no-open` браузер.
-//! Одноразовая ссылка не попадает в аргументы внешних программ: в каталог
+//! Ссылка с кодом не попадает в аргументы внешних программ: в каталог
 //! времени выполнения пишется `<h>-open-<16 hex>.html` (только владелец) с
 //! `<meta http-equiv="refresh">`, браузер открывает путь к этому файлу;
-//! файл удаляется через 30 с либо при выходе CLI.
+//! файл удаляется через 30 с либо при выходе CLI. Код многоразовый до
+//! остановки панели: напечатанную ссылку можно открыть снова.
 
 use std::fs;
 use std::io::{self, Write};
@@ -106,9 +107,9 @@ fn write_open_file(endpoint: &Endpoint, url: &str) -> io::Result<PathBuf> {
     Ok(path)
 }
 
-/// Запустить программу с отброшенным выводом; сбой игнорируется, процесс
-/// дожидается фоновый поток.
-fn spawn_quiet(program: &str, args: &[String], env: &[(&str, &Path)]) {
+/// Запустить программу с отброшенным выводом; процесс дожидается фоновый
+/// поток.
+fn spawn_quiet(program: &str, args: &[String], env: &[(&str, &Path)]) -> io::Result<()> {
     let mut command = Command::new(program);
     command.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     for (name, value) in env {
@@ -120,11 +121,11 @@ fn spawn_quiet(program: &str, args: &[String], env: &[(&str, &Path)]) {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NO_WINDOW);
     }
-    if let Ok(mut child) = command.spawn() {
-        std::thread::spawn(move || {
-            let _ = child.wait();
-        });
-    }
+    let mut child = command.spawn()?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
 }
 
 /// Удаление файла через 30 с процессом, переживающим CLI (`web open`
@@ -135,29 +136,33 @@ fn remove_later(path: &Path) {
     let env = [("ESSENCE_RC_OPEN_FILE", path)];
     if cfg!(windows) {
         let script = format!("Start-Sleep -Seconds {seconds}; Remove-Item -LiteralPath $env:ESSENCE_RC_OPEN_FILE -Force -ErrorAction SilentlyContinue");
-        spawn_quiet("powershell", &["-NoProfile".into(), "-NonInteractive".into(), "-Command".into(), script], &env);
+        let _ = spawn_quiet("powershell", &["-NoProfile".into(), "-NonInteractive".into(), "-Command".into(), script], &env);
     } else {
         let script = format!("sleep {seconds}; rm -f -- \"$ESSENCE_RC_OPEN_FILE\"");
-        spawn_quiet("sh", &["-c".into(), script], &env);
+        let _ = spawn_quiet("sh", &["-c".into(), script], &env);
     }
 }
 
-/// Открыть ссылку в браузере через файл перенаправления. `keep` — CLI
-/// остаётся жить (`web run`): файл удаляет он сам; иначе — внешний таймер.
-fn launch(endpoint: &Endpoint, url: &str, keep: bool) -> Option<OpenFile> {
-    let path = write_open_file(endpoint, url).ok()?;
+/// Открыть ссылку в браузере через файл перенаправления; `Err` — браузер не
+/// запущен. `keep` — CLI остаётся жить (`web run`): файл удаляет он сам;
+/// иначе — внешний таймер.
+fn launch(endpoint: &Endpoint, url: &str, keep: bool) -> io::Result<Option<OpenFile>> {
+    let path = write_open_file(endpoint, url)?;
     let (program, args) = opener(&path);
-    spawn_quiet(program, &args, &[]);
+    if let Err(error) = spawn_quiet(program, &args, &[]) {
+        let _ = fs::remove_file(&path);
+        return Err(error);
+    }
     if keep {
         let later = path.clone();
         std::thread::spawn(move || {
             std::thread::sleep(OPEN_FILE_LIFETIME);
             let _ = fs::remove_file(later);
         });
-        Some(OpenFile(path))
+        Ok(Some(OpenFile(path)))
     } else {
         remove_later(&path);
-        None
+        Ok(None)
     }
 }
 
@@ -188,7 +193,7 @@ fn open_panel(client: &mut DaemonClient, endpoint: &Endpoint, invocation: &Invoc
         let _ = writeln!(stdout, "{url}");
         let _ = stdout.flush();
     }
-    let file = if invocation.has("no-open") { None } else { launch(endpoint, &url, keep) };
+    let file = if invocation.has("no-open") { None } else { launch(endpoint, &url, keep).ok().flatten() };
     Ok((link, file))
 }
 

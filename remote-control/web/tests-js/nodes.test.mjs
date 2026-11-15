@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import * as model from '../assets/js/screens/nodes-model.js';
 import { isFailure } from '../assets/js/flows.js';
 import * as apply from '../assets/js/screens/apply-model.js';
+import * as profiles from '../assets/js/screens/profiles-model.js';
 
 // Фикстура `nodes.rs::tests::node`.
 const node = () => ({
@@ -385,19 +386,151 @@ test('порты ноды: форма по протоколам профиля, 
   assert.equal(await model.nodePortsFlow(none.ctx, 'n', { name: 'n', profile: null }), false);
 });
 
-test('профиль и домен ноды: без изменений команды нет', async () => {
+test('профиль и домен ноды: без изменений команды нет, после изменения — node apply --name под планом', async () => {
   const node = { name: 'n', profile: 'edge', domain: 'a.example.com' };
-  let s = scripted([[['profile', 'list'], ok({ profiles: [edge, sni] })], [['node', 'profile', '--name', 'n', '--profile', 'sni'], ok({})]], [{ profile: 'sni' }]);
+  const declined = [['node', 'apply', '--name', 'n'], fail('confirmation_required')];
+  let s = scripted([[['profile', 'list'], ok({ profiles: [edge, sni] })], [['node', 'profile', '--name', 'n', '--profile', 'sni'], ok({})], declined],
+    [{ profile: 'sni' }]);
   assert.equal(await model.nodeProfileFlow(s.ctx, 'n', node), true);
   s.done();
   s = scripted([[['profile', 'list'], ok({ profiles: [edge] })]], [{ profile: 'edge' }]);
   assert.equal(await model.nodeProfileFlow(s.ctx, 'n', node), false);
   s.done();
-  s = scripted([[['node', 'domain', '--name', 'n', '--domain', ''], ok({})]], [{ domain: '' }]);
+  s = scripted([[['node', 'domain', '--name', 'n', '--domain', ''], ok({})], declined], [{ domain: '' }]);
   assert.equal(await model.nodeDomainFlow(s.ctx, 'n', node), true);
   s.done();
   s = scripted([], [{ domain: 'a.example.com' }]);
   assert.equal(await model.nodeDomainFlow(s.ctx, 'n', node), false);
+  s.done();
+});
+
+test('«Указать профиль» без профилей: предложение создать профиль, затем node profile', async () => {
+  const versions = { latest: 'v1.19.20', versions: ['v1.19.20', 'v1.19.19'] };
+  const form = { name: 'edge', reality: 'sni', sni_domain: 'www.example.com', protocols: ['vless-tcp'], ipv6: 'default', acme_email: '', mihomo_choice: 'v1.19.20' };
+  const s = scripted([
+    [['profile', 'list'], ok({ profiles: [] })], [['profile', 'mihomo-versions'], ok(versions)],
+    [profiles.profileAddArgv(form), ok({ name: 'edge' })], [['node', 'profile', '--name', 'n', '--profile', 'edge'], ok({})],
+  ], [true, form]);
+  // Затем сразу `node apply --name n`; план здесь отклонён.
+  s.ctx.nodeRequest = async (_n, argv) => { assert.deepEqual(argv, ['node', 'apply', '--name', 'n']); return fail('confirmation_required'); };
+  assert.equal(await model.nodeProfileFlow(s.ctx, 'n', { name: 'n', profile: null }), true);
+  assert.deepEqual(s.record.dialogs.map((d) => d.kind), ['confirm', 'form']);
+  const latest = s.record.dialogs[1].fields.find((f) => f.name === 'mihomo_choice').options[0];
+  assert.equal(latest.value, 'v1.19.20');
+  assert.ok(latest.label.includes('v1.19.20'));
+  s.done();
+  // Отказ — ничего не создаётся.
+  const refused = scripted([[['profile', 'list'], ok({ profiles: [] })]], [false]);
+  assert.equal(await model.nodeProfileFlow(refused.ctx, 'n', { name: 'n' }), false);
+  refused.done();
+});
+
+test('роли и домены: строки карточки, argv ролей и занятые домены', () => {
+  const bare = model.nodeRoles({ name: 'n' });
+  assert.deepEqual(bare.map((r) => [r.key, r.value]), [['domain', null], ['telegram', null], ['subscription', null]]);
+  assert.ok(bare.every((r) => r.hint && r.unset));
+  const full = model.nodeRoles({ domain: 'de.example.com', telegram: { hostname: 'tg.example.com' }, subscription: { hostname: 'sub.example.com', port: 8443 } });
+  assert.deepEqual(full.map((r) => r.value), ['de.example.com', 'tg.example.com', 'sub.example.com:8443']);
+  assert.equal(model.nodeRoles({ subscription: { hostname: 'sub.example.com', port: 443 } })[2].value, 'sub.example.com');
+  assert.deepEqual(model.roleArgvs('n', { telegram_domain: ' tg.example.com ', subscription_domain: 'sub.example.com' }), {
+    telegram: ['telegram', 'set', '--name', 'n', '--domain', 'tg.example.com'],
+    subscription: ['subscription', 'host', '--name', 'n', '--domain', 'sub.example.com'],
+  });
+  assert.deepEqual(model.roleArgvs('n', {}), { telegram: null, subscription: null });
+  assert.equal(model.roleDomainError('de.example.com', ['de.example.com', '']), model.DOMAIN_TAKEN);
+  // Как в ядре: имена DNS без учёта регистра.
+  assert.equal(model.roleDomainError('DE.Example.COM', ['de.example.com']), model.DOMAIN_TAKEN);
+  assert.equal(model.roleDomainError('', ['']), null);
+  // Форма добавления: домены ролей — только с профилем, проверяются по мере ввода и не повторяют домен ноды.
+  const fields = Object.fromEntries(model.addFields({}, [edge]).map((f) => [f.name, f]));
+  for (const name of ['telegram_domain', 'subscription_domain']) {
+    assert.equal(fields[name].live, true);
+    assert.equal(fields[name].when({ profile: '' }), false);
+    assert.equal(fields[name].when({ profile: 'edge' }), true);
+  }
+  assert.equal(fields.telegram_domain.validate('de.example.com', { domain: 'de.example.com' }), model.DOMAIN_TAKEN);
+  assert.equal(fields.subscription_domain.validate('tg.example.com', { domain: 'de.example.com', telegram_domain: 'tg.example.com' }), model.DOMAIN_TAKEN);
+  assert.ok(fields.subscription_domain.validate('bad', {}));
+  assert.equal(fields.subscription_domain.suggest('https://Sub.Example.com/x'), 'sub.example.com');
+  // Имя ноды: живая проверка с предложением.
+  assert.equal(fields.name.live, true);
+  assert.ok(fields.name.validate('my vps'));
+  assert.equal(fields.name.suggest('my vps'), 'my-vps');
+  assert.equal(fields.name.validate(''), null);
+});
+
+test('добавление с ролями: telegram set и хост подписок до одного node apply', async () => {
+  const form = { ...keyForm, profile: 'edge', domain: 'de.example.com', telegram_domain: 'tg.example.com', subscription_domain: 'sub.example.com' };
+  const apply = ['node', 'apply', '--name', 'vps-1', '--name', 'old'];
+  const s = scripted([
+    [addWords('key', ['--profile', 'edge', '--domain', 'de.example.com', '--accept-new-host-key']), ok({ name: 'vps-1' })],
+    [['telegram', 'set', '--name', 'vps-1', '--domain', 'tg.example.com'], ok({})],
+    [['subscription', 'host'], ok({ node: 'old', hostname: 'sub.old.example.com', port: 443 })],
+    [['subscription', 'host', '--name', 'vps-1', '--domain', 'sub.example.com'], ok({})],
+    [apply, ok({ applied: ['vps-1', 'old'], failed: [], unchanged: [] })],
+  ], [form, true, undefined], { profiles: [edge] });
+  const opened = [];
+  assert.equal(await model.addNodeFlow(s.ctx, (name) => opened.push(name)), true);
+  assert.deepEqual(opened, ['vps-1']);
+  // Перенос хоста подписок называет прежнюю ноду.
+  assert.ok(s.record.dialogs[1].context.some((line) => (line.text || line).includes('old')));
+  s.done();
+  // Отказ от переноса: хост не меняется, применяется только новая нода.
+  const refused = scripted([
+    [addWords('key', ['--profile', 'edge', '--domain', 'de.example.com', '--accept-new-host-key']), ok({ name: 'vps-1' })],
+    [['subscription', 'host'], ok({ node: 'old', hostname: 'sub.old.example.com', port: 443 })],
+    [['node', 'apply', '--name', 'vps-1'], ok({ applied: ['vps-1'], failed: [], unchanged: [] })],
+  ], [{ ...form, telegram_domain: '' }, false, undefined], { profiles: [edge] });
+  assert.equal(await model.addNodeFlow(refused.ctx, () => {}), true);
+  refused.done();
+});
+
+test('добавление: сбой роли — «Повторить»/«Пропустить» с подсказкой, отложенная SSH-настройка — без применения', async () => {
+  const words = addWords('key', ['--profile', 'edge', '--domain', 'de.example.com', '--accept-new-host-key']);
+  const form = { ...keyForm, profile: 'edge', domain: 'de.example.com', telegram_domain: 'tg.example.com', subscription_domain: 'sub.example.com' };
+  const applied = ok({ applied: ['vps-1'], failed: [], unchanged: [] });
+  // telegram set не прошёл: «Повторить» с новым доменом; хост подписок не прошёл: «Пропустить»; затем одно применение.
+  const s = scripted([
+    [words, ok({ name: 'vps-1' })],
+    [['telegram', 'set', '--name', 'vps-1', '--domain', 'tg.example.com'], fail('invalid')],
+    [['telegram', 'set', '--name', 'vps-1', '--domain', 'tg2.example.com'], ok({})],
+    [['subscription', 'host'], ok(null)], [['subscription', 'host', '--name', 'vps-1', '--domain', 'sub.example.com'], fail('invalid')],
+    [['node', 'apply', '--name', 'vps-1'], applied],
+  ], [form, 'retry', { domain: 'tg2.example.com' }, 'skip', undefined], { profiles: [edge] });
+  assert.equal(await model.addNodeFlow(s.ctx, () => {}), true);
+  assert.equal(s.record.dialogs[2].fields[0].value, 'tg.example.com');
+  assert.ok(s.record.notices.filter(([, text]) => text.includes(model.ROLE_LATER)).length === 2);
+  // Оба сбоя ролей (telegram set и subscription host) отмечены как сбой действия по одному разу.
+  assert.equal(s.record.failed, 2);
+  s.done();
+  // Нода сохранена с отложенной SSH-настройкой: роли заданы, применения нет, сказано, что осталось.
+  const deferred = scripted([
+    [words, ok({ name: 'vps-1', needs_setup: true })],
+    [['telegram', 'set', '--name', 'vps-1', '--domain', 'tg.example.com'], ok({})],
+  ], [{ ...form, subscription_domain: '' }], { profiles: [edge] });
+  assert.equal(await model.addNodeFlow(deferred.ctx, () => {}), true);
+  assert.ok(deferred.record.notices.some(([, text]) => text === model.DEFERRED_APPLY));
+  deferred.done();
+});
+
+test('имя новой ноды: предложение не совпадает с существующими', () => {
+  const name = model.addFields({}, [], ['my-vps']).find((f) => f.name === 'name');
+  assert.equal(name.suggest('my vps'), 'my-vps-2');
+  // Порт SSH — правило ядра: `080` допустим, `000080` и `0` — нет.
+  assert.equal(model.portError('080'), null);
+  assert.equal(model.portError('000080'), model.PORT_INVALID);
+  assert.equal(model.portError('0'), model.PORT_INVALID);
+});
+
+test('«Сделать хостом подписок» в карточке: домен и порт → subscription host, затем node apply --name', async () => {
+  const node = { name: 'n', profile: 'edge', domain: 'de.example.com' };
+  const s = scripted([
+    [['subscription', 'host'], ok(null)], [['subscription', 'host', '--name', 'n', '--domain', 'sub.example.com', '--port', '8443'], ok({})],
+    [['node', 'apply', '--name', 'n'], fail('confirmation_required')],
+  ], [{ domain: 'sub.example.com', port: '8443' }]);
+  assert.equal(await model.subscriptionRoleFlow(s.ctx, 'n', node), true);
+  const domain = s.record.dialogs[0].fields[0];
+  assert.equal(domain.validate('de.example.com'), model.DOMAIN_TAKEN);
   s.done();
 });
 
@@ -428,7 +561,7 @@ test('применение: состояние, подписи сбоев, от�
     {"name":"de","stage":"config","code":"rolled_back","message":"откат на этапе «конфигурация и проверка»"},
     {"name":"de","stage":"probe","code":"port_busy","message":"порт 443 уже занят","port":443},
     {"name":"de","stage":"probe","code":"remote_failed","message":"Не удалось подключиться к «de»."},
-    {"name":"de","stage":"probe","code":"unsupported_os","message":"нужна Debian или Ubuntu с systemd"},
+    {"name":"de","stage":"probe","code":"unsupported_os","message":"ОС ноды «ubuntu 25.10» не поддерживается: нужна Debian 12/13 или Ubuntu 22.04/24.04/26.04 с systemd"},
   ];
   const partial = fail('partial', { message: 'Применение завершено с ошибками.', applied: ['a'], failed: entries, unchanged: ['c'] });
   const lines = apply.applyLines(apply.applyReport(partial));

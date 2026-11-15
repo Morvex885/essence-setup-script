@@ -101,6 +101,17 @@ fn controlling_terminal(command: &mut Command, slave: RawFd) {
     }
 }
 
+/// HOME and the variables of a case: HTTPS of the daemon (GitHub metadata
+/// such as `profile mihomo-versions`) goes through a closed loopback proxy
+/// port and fails at once — no request leaves the machine.
+fn case_vars(home: &Path) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    let proxy = std::ffi::OsString::from(format!("http://{closed}"));
+    let mut vars = vec![("HOME".into(), home.into()), ("NO_PROXY".into(), "".into()), ("no_proxy".into(), "".into())];
+    vars.extend(["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"].map(|name| (name.into(), proxy.clone())));
+    vars
+}
+
 struct PtySession { child: Child, master: File, slave: File, home: tempfile::TempDir, runtime: tempfile::TempDir, screen: Screen, partial: Vec<u8> }
 
 impl PtySession {
@@ -113,7 +124,7 @@ impl PtySession {
         let (master, slave) = openpty();
         let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
         assert_eq!(unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) }, 0);
-        let ctx = common::Ctx { data: home.path().join("rc"), runtime: runtime.path().to_path_buf(), vars: vec![("HOME".into(), home.path().into())] };
+        let ctx = common::Ctx { data: home.path().join("rc"), runtime: runtime.path().to_path_buf(), vars: case_vars(home.path()) };
         let mut command = ctx.command(BINARY);
         command.env("XDG_DATA_HOME", home.path().join("data")).env("TERM", "xterm-256color")
             .env_remove("VISUAL").env_remove("EDITOR")
@@ -339,7 +350,7 @@ impl Client for Recording {
 fn screens_speak_the_real_v2_grammar() {
     let home = tempfile::tempdir().unwrap();
     let runtime = common::runtime_dir();
-    let ctx = common::Ctx { data: home.path().join("rc"), runtime: runtime.path().to_path_buf(), vars: vec![("HOME".into(), home.path().into())] };
+    let ctx = common::Ctx { data: home.path().join("rc"), runtime: runtime.path().to_path_buf(), vars: case_vars(home.path()) };
     let spawn = SpawnDaemon { exe: BINARY.into(), args: vec!["daemon".into(), "run".into()], env: ctx.spawn_env() };
     let inner = DaemonClient::connect_local(&ctx.endpoint(), Some(&spawn), None, None).unwrap();
     let mut client = Recording { inner, calls: vec![] };
@@ -361,7 +372,10 @@ fn screens_speak_the_real_v2_grammar() {
     for noun in ["session", "source", "status", "group", "client", "template", "generate", "subscription", "node", "conn", "telegram", "profile", "cascade"] {
         assert!(client.calls.iter().any(|(argv, _)| argv[0] == noun), "walk never reached {noun}");
     }
-    // The profile wizard: Self-Steal, random site, VLESS TCP, IPv6 as is, random email, pinned mihomo (no GitHub query).
+    // The profile wizard: Self-Steal, random site, VLESS TCP, IPv6 as is, random email; mihomo — `profile
+    // mihomo-versions` fails (no network: see `case_vars`), «1» is refused by the manual entry's live check
+    // and the pinned v1.19.18 follows.
+    assert!(client.calls.iter().any(|(argv, code)| argv == &["profile", "mihomo-versions"] && code == "failed"), "mihomo versions offline");
     assert!(client.calls.iter().any(|(argv, code)| argv.starts_with(&["profile".to_owned(), "add".to_owned()]) && code == "ok"), "profile add");
     assert!(client.calls.iter().any(|(argv, code)| argv.starts_with(&["template".to_owned(), "show".to_owned()]) && code == "ok"));
     // `g` on default.yaml offers only groups on other templates: none here
@@ -377,7 +391,7 @@ const WALK: &str = "1 \
     g a LAB 1 4 t 1 f _ h 0 0 0 \
     c a alice 4 1 v _ f _ s 0 r bob 0 0 \
     m 1 v _ c _ g x EXPORT 0 0 \
-    n 0 r a edge 1 1 _ 1 _ v1.19.18 0 0 k 0 p 0 t s 0 \
+    n 0 r a edge 1 1 _ 1 _ 1 v1.19.18 0 0 k 0 p 0 t s 0 \
     f a _ 0 \
     s l _ 0 \
     i 0 \

@@ -8,6 +8,7 @@ pub mod awg;
 pub mod bundle;
 pub mod cascade;
 pub mod keys;
+pub mod os;
 pub mod profile;
 pub mod paths;
 pub mod ports;

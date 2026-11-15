@@ -1,4 +1,4 @@
-// Тесты session.js: экран входа по ответу `session open`, одноразовый код,
+// Тесты session.js: экран входа по ответу `session open`, код из ссылки,
 // отклонённый токен возобновления, варианты восстановления GitHub.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -61,7 +61,7 @@ test('openSession: отклонённый токен возобновления 
   ]);
 });
 
-test('openSession: отклонённый одноразовый код не повторяется', async () => {
+test('openSession: отклонённый код из ссылки не повторяется', async () => {
   const connection = fakeConnection([fail('auth_failed', { secret: 'access-token' })]);
   const reply = await openSession(connection, { ticket: 'dead' });
   assert.equal(reply.error.code, 'auth_failed');

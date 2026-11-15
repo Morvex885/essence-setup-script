@@ -88,6 +88,20 @@ export function activityIndicator(command) {
 }
 
 /**
+ * Живая строка окна операции из события `progress` (`{percent, text}`):
+ * `{ percent, head, rest }` — процент полосы (целое 0–100), первая часть
+ * текста («Нода de: 37 %») и остальные через « · » (этап, текущее действие,
+ * время — «этап 3/10 «установка пакетов» · nginx: распаковка · 1:42»). Без
+ * события или с испорченным — `null`: полоса без процента.
+ */
+export function operationLive(live) {
+  if (!live || typeof live.text !== 'string' || !Number.isFinite(live.percent)) return null;
+  const percent = Math.min(100, Math.max(0, Math.round(live.percent)));
+  const [head, ...rest] = live.text.split(' · ');
+  return { percent, head, rest: rest.join(' · ') };
+}
+
+/**
  * «Открытая панель»: слушатель не на loopback и пароль запуска не задан
  * (поле `open` у `web status` / `web start`). Без `web status` вычисляется по
  * `hello.listener` и `status.script_password`.

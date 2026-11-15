@@ -32,6 +32,9 @@ impl Level {
 /// Receives journal entries of the command currently being dispatched.
 pub trait LogSink {
     fn log(&mut self, level: Level, text: &str);
+    /// The live status line of a long command (`progress` event): replaces
+    /// the previous one, is never journaled. `percent` is 0–100.
+    fn progress(&mut self, _percent: u8, _text: &str) {}
 }
 
 /// Tab, printable ASCII and everything from U+00A0 survive; NUL, other C0,

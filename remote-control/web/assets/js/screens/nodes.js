@@ -8,7 +8,7 @@ import { Page, Card, DataTable, MoreMenu, Facts, Badge, Chips, Empty, Button } f
 import { asList } from '../format.js';
 import { useCommand, useBusy, useMounted, Loaded } from './kit.js';
 import { NodeConnections } from './connections.js';
-import { syncAll, nodeCheckArgv } from './nodeops-model.js';
+import { syncAll, nodeCheckArgv, telegramDomainFlow } from './nodeops-model.js';
 import { applyState, applyFlow, pendingNodes, APPLY_PENDING_ARGV } from './apply-model.js';
 import * as model from './nodes-model.js';
 
@@ -23,8 +23,10 @@ function OverviewGroups({ ctx, node }) {
     ${group.name}: ${group.count}</a>`)}</span>`;
 }
 
-function ProfileLink({ ctx, profile }) {
-  return profile ? html`<a class="link" href=${ctx.href('profiles', profile)}>${profile}</a>` : html`<span class="t-dim">—</span>`;
+/** Профиль ноды — ссылка на профиль, без профиля — действие «Указать профиль». */
+function ProfileLink({ ctx, profile, busy = false, onSet = null }) {
+  if (profile) return html`<a class="link" href=${ctx.href('profiles', profile)}>${profile}</a>`;
+  return onSet ? html`<${Button} kind="ghost" icon="layers" disabled=${busy} onClick=${onSet}>Указать профиль<//>` : html`<span class="t-dim">—</span>`;
 }
 
 function NodeList({ ctx }) {
@@ -41,7 +43,7 @@ function NodeList({ ctx }) {
   });
   const go = (name) => { if (mounted.current) ctx.navigate('nodes', name); };
   const add = () => run(async () => {
-    if (!(await model.addNodeFlow(ctx, go))) reload();
+    if (!(await model.addNodeFlow(ctx, go, asList(list.data).map((node) => model.plain(node.name))))) reload();
   });
   const syncNodes = () => run(async () => {
     const nodes = await syncAll(ctx);
@@ -60,7 +62,8 @@ function NodeList({ ctx }) {
     { key: 'name', label: 'Название', search: true },
     { key: 'address', label: 'Адрес', search: true, render: (row) => html`<span class="mono">${row.address}</span>` },
     { key: 'tag', label: 'Тег', search: true },
-    { key: 'profile', label: 'Профиль', search: true, render: (row) => html`<${ProfileLink} ctx=${ctx} profile=${row.profile} />` },
+    { key: 'profile', label: 'Профиль', search: true,
+      render: (row) => html`<${ProfileLink} ctx=${ctx} profile=${row.profile} busy=${busy} onSet=${() => then(() => model.nodeProfileFlow(ctx, row.name, row.node))} />` },
     { key: 'apply', label: 'Применение', render: (row) => html`<${Badge} tone=${row.apply.tone}>${row.apply.label}<//>` },
     { key: 'state', label: 'Состояние', render: (row) => html`<${Badge} tone=${row.state.tone}>${row.state.label}<//>` },
   ];
@@ -107,7 +110,7 @@ const TABS = [
   { id: 'maintenance', label: 'Обслуживание' },
 ];
 
-function Overview({ ctx, node }) {
+function Overview({ ctx, node, busy, act }) {
   const password = model.passwordStatus(node);
   const issues = model.joinedPlain(node.issues);
   const apply = applyState(node);
@@ -119,8 +122,7 @@ function Overview({ ctx, node }) {
       { label: 'Вход', value: model.authLabel(node) },
       { label: 'Пароль SSH', value: password && html`<${Badge} tone=${password.tone}>${password.label}<//>` },
       { label: 'Тег', value: model.plain(node.tag) || '—' },
-      { label: 'Профиль', value: html`<${ProfileLink} ctx=${ctx} profile=${model.plain(node.profile)} />` },
-      { label: 'Домен', value: model.plain(node.domain) || '—' },
+      { label: 'Профиль', value: html`<${ProfileLink} ctx=${ctx} profile=${model.plain(node.profile)} busy=${busy} onSet=${act.profile} />` },
       { label: 'Порты ноды', value: ports.length ? ports.map(([key, value]) => `${key}: ${model.plain(value)}`).join(', ') : 'как в профиле' },
       { label: 'Применение', value: html`<${Badge} tone=${apply.tone}>${apply.label}<//>` },
       { label: 'Подключения', value: model.joinedPlain(node.proxies) || '—' },
@@ -129,6 +131,31 @@ function Overview({ ctx, node }) {
       { label: 'Группы', value: html`<${Chips} items=${asList(node.groups).map((group) => ({ label: model.plain(group), href: ctx.href('groups', model.plain(group)) }))} />` },
       { label: 'Клиентов', value: model.plain(node.clients) },
     ]} />
+  <//>
+  <${Roles} node=${node} busy=${busy} act=${act} />`;
+}
+
+/**
+ * «Роли и домены» (`nodes.rs::card_view`): домен ноды, Telegram Web Proxy и
+ * хост подписок — значение или «не задан», объяснение и действие.
+ */
+function Roles({ node, busy, act }) {
+  const profiled = Boolean(model.plain(node.profile));
+  const action = (role) => {
+    if (role.key === 'domain') return html`<${Button} icon="pencil" disabled=${busy} onClick=${act.domain}>${role.value ? 'Изменить' : 'Задать'}<//>`;
+    if (!profiled) return html`<span class="t-dim">сначала укажите профиль</span>`;
+    if (role.key === 'telegram') {
+      return html`<${Button} icon=${role.value ? 'pencil' : 'plus'} disabled=${busy} onClick=${() => act.telegram(role.value || '')}>${role.value ? 'Сменить домен' : 'Включить'}<//>`;
+    }
+    return html`<${Button} icon=${role.value ? 'pencil' : 'plus'} disabled=${busy} onClick=${act.subscription}>${role.value ? 'Изменить' : 'Сделать хостом подписок'}<//>`;
+  };
+  return html`<${Card} title="Роли и домены">
+    <div class="op-list">
+      ${model.nodeRoles(node).map((role) => html`<${OpRow} key=${role.key} title=${role.label} desc=${role.hint}>
+        ${role.value ? html`<span class="mono">${role.value}</span>` : html`<${Badge} tone="neutral">${role.unset}<//>`}
+        ${action(role)}
+      <//>`)}
+    </div>
   <//>`;
 }
 
@@ -183,6 +210,10 @@ function NodeCard({ ctx, name, tab }) {
     const act = {
       check: () => then(() => ctx.nodeRequest(name, nodeCheckArgv(name))),
       harden: () => then(() => model.harden(ctx, name)),
+      profile: () => then(() => model.nodeProfileFlow(ctx, name, node)),
+      domain: () => then(() => model.nodeDomainFlow(ctx, name, node)),
+      telegram: (current) => then(() => telegramDomainFlow(ctx, name, current)),
+      subscription: () => then(() => model.subscriptionRoleFlow(ctx, name, node)),
     };
     const remove = () => run(async () => {
       if (await model.deleteNode(ctx, name, node)) { go('nodes'); return; }
@@ -196,8 +227,8 @@ function NodeCard({ ctx, name, tab }) {
     const actions = active === 'overview' && html`
       <${Button} kind="primary" icon="check" disabled=${busy || (!hasProfile && node.status !== 'pending')}
         onClick=${() => then(() => model.applyNode(ctx, name))}>Применить<//>
-      <${Button} icon="layers" disabled=${busy} onClick=${() => then(() => model.nodeProfileFlow(ctx, name, node))}>Профиль<//>
-      <${Button} icon="pencil" disabled=${busy} onClick=${() => then(() => model.nodeDomainFlow(ctx, name, node))}>Домен<//>
+      <${Button} icon="layers" disabled=${busy} onClick=${act.profile}>${hasProfile ? 'Профиль' : 'Указать профиль'}<//>
+      <${Button} icon="pencil" disabled=${busy} onClick=${act.domain}>Домен<//>
       <${Button} icon="terminal" disabled=${busy} onClick=${() => then(() => model.interactive(ctx, name))}>Оболочка<//>
       <${MoreMenu} items=${[
         { label: 'Порты', icon: 'settings', disabled: busy || !hasProfile, onClick: () => then(() => model.nodePortsFlow(ctx, name, node)) },
@@ -214,7 +245,7 @@ function NodeCard({ ctx, name, tab }) {
     switch (active) {
       case 'connections': body = html`<${NodeConnections} ctx=${ctx} name=${name} />`; break;
       case 'maintenance': body = html`<${Maintenance} busy=${busy} act=${act} remove=${remove} />`; break;
-      default: body = html`<${Overview} ctx=${ctx} node=${node} />`;
+      default: body = html`<${Overview} ctx=${ctx} node=${node} busy=${busy} act=${act} />`;
     }
     const apply = applyState(node);
     return html`<${Page} title=${name} back=${back} tabs=${tabs} actions=${actions}

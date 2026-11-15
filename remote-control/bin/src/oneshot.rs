@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::io::{self, ErrorKind, Read, Write};
+use std::io::{self, ErrorKind, IsTerminal, Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -19,6 +19,7 @@ use rc_core::request_secrets::Secrets;
 use rc_core::state::StatePaths;
 use rc_core::VERSION;
 use serde_json::{Map, Value, json};
+use unicode_width::UnicodeWidthChar;
 use zeroize::Zeroizing;
 
 use crate::remote::{self, Target};
@@ -28,7 +29,7 @@ use crate::terminal;
 const MAX_SECRET_ATTEMPTS: u8 = 3;
 /// Секреты неявного `session open`; разовый вызов принимает их для любой
 /// команды, которой предшествует открытие сессии. `access-token` — код
-/// доступа сетевого демона (одноразовый: после принятия не повторяется).
+/// доступа сетевого демона (после принятия не повторяется).
 const SESSION_SECRETS: [&str; 3] = ["script-password", "vault-password", "access-token"];
 const ACCESS_TOKEN: &str = "access-token";
 
@@ -275,6 +276,62 @@ fn print_log(entry: &client::Log) {
     let _ = writeln!(io::stderr().lock(), "{}{}", level.prefix(), log::sanitize(&entry.text));
 }
 
+/// Живая строка команды (`progress`) в stderr: одна строка, переписываемая
+/// через `\r`, — только на терминале и без `--json`; иначе ничего. Запись
+/// журнала сначала стирает её (следующее событие нарисует заново), конец
+/// команды — тоже (`Drop`), так что итог печатается с чистой строки.
+struct LiveLine {
+    enabled: bool,
+    shown: bool,
+}
+
+impl LiveLine {
+    fn new(json: bool, stderr_tty: bool, interactive: bool) -> Self {
+        Self { enabled: !json && stderr_tty && !interactive, shown: false }
+    }
+
+    fn show(&mut self, live: &client::Live) {
+        if !self.enabled {
+            return;
+        }
+        let width = crossterm::terminal::size().map_or(80, |(columns, _)| usize::from(columns));
+        let _ = write!(io::stderr().lock(), "{}", live_frame(&live.text, width));
+        self.shown = true;
+    }
+
+    fn clear(&mut self) {
+        if self.shown {
+            let _ = write!(io::stderr().lock(), "\r\x1b[K");
+            self.shown = false;
+        }
+    }
+}
+
+impl Drop for LiveLine {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+/// Кадр живой строки: возврат каретки, стирание строки и текст без
+/// управляющих символов, обрезанный до ширины терминала минус одна колонка
+/// по отображаемой ширине (широкий символ — две колонки): перенос сломал бы
+/// перезапись через `\r`.
+fn live_frame(text: &str, width: usize) -> String {
+    let text = log::sanitize(text).replace('\t', " ");
+    let mut room = width.saturating_sub(1);
+    let mut frame = String::from("\r\x1b[K");
+    for symbol in text.chars() {
+        let columns = symbol.width().unwrap_or(0);
+        if columns > room {
+            break;
+        }
+        room -= columns;
+        frame.push(symbol);
+    }
+    frame
+}
+
 // ─── Разовый CLI ─────────────────────────────────────────────────────────────
 
 /// Перед этими командами неявный `session open` не отправляется. Локальный
@@ -354,12 +411,16 @@ fn execute(argv: &[String], invocation: &Invocation, target: Option<&Target>) ->
     if session {
         open_session(&mut client, &mut secrets, env.as_ref(), &mut prompts, invocation.requires_session())?;
     }
-    let mut print = |progress: Progress<'_>| {
-        if let Progress::Log(entry) = progress {
+    let interactive = invocation.requires_tty() && terminal::console_attached();
+    let mut live = LiveLine::new(invocation.json, io::stderr().is_terminal(), interactive);
+    let mut print = |progress: Progress<'_>| match progress {
+        Progress::Log(entry) => {
+            live.clear();
             print_log(entry);
         }
+        Progress::Live(line) => live.show(line),
+        Progress::Tick => {}
     };
-    let interactive = invocation.requires_tty() && terminal::console_attached();
     let reply = loop {
         let wire = wire_secrets(&secrets, invocation.allowed_secrets());
         let request = Request { argv: &request_argv, secrets: &wire, input: &input, env: env.as_ref() };
@@ -403,8 +464,8 @@ fn open_session(client: &mut DaemonClient, secrets: &mut Secrets, env: Option<&B
     let argv = vec!["session".to_owned(), "open".to_owned()];
     let open = cli::parse(&argv).map_err(local)?;
     let input = client::Input::default();
-    // Принятый код доступа погашен демоном: повтор (после вопроса о пароле)
-    // идёт без него — соединение уже допущено.
+    // Принятый код доступа уже допустил соединение: повтор (после вопроса о
+    // пароле) идёт без него.
     let mut token_spent = false;
     loop {
         let names: &[&str] = if token_spent { &SESSION_SECRETS[..2] } else { &SESSION_SECRETS };
@@ -843,6 +904,22 @@ mod tests {
 
     fn args(words: &[&str]) -> Vec<String> {
         words.iter().map(|word| (*word).to_owned()).collect()
+    }
+
+    #[test]
+    fn live_line_is_one_rewritten_terminal_line_only() {
+        assert_eq!(live_frame("Нода de: 37 % · 1:42", 80), "\r\x1b[KНода de: 37 % · 1:42");
+        assert_eq!(live_frame("a\u{1b}[2Jb\nc\td", 80), "\r\x1b[Ka[2Jbc d", "no control sequence of the daemon reaches the terminal");
+        assert_eq!(live_frame(&"д".repeat(200), 40), format!("\r\x1b[K{}", "д".repeat(39)), "never wraps");
+        assert_eq!(live_frame(&"界".repeat(39), 40), format!("\r\x1b[K{}", "界".repeat(19)), "wide characters take two columns");
+        assert_eq!(live_frame("a界b", 3), "\r\x1b[Ka", "a wide character that does not fit is left out");
+        assert!(LiveLine::new(false, true, false).enabled);
+        assert!(!LiveLine::new(true, true, false).enabled, "--json: nothing extra");
+        assert!(!LiveLine::new(false, false, false).enabled, "not a terminal: nothing extra");
+        assert!(!LiveLine::new(false, true, true).enabled, "a terminal command owns the screen");
+        let mut line = LiveLine::new(false, false, false);
+        line.show(&client::Live { percent: 5, text: "x".into() });
+        assert!(!line.shown);
     }
 
     #[test]

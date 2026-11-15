@@ -4,7 +4,7 @@
 //! The source screen also supplies `Registry::github_wizard` for first-run entry.
 use std::{collections::{BTreeMap, VecDeque}, io::{self, IsTerminal, Write}, process::{Command, ExitCode}, time::Duration};
 use crossterm::{event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers}, execute, terminal::{self, EnterAlternateScreen, LeaveAlternateScreen}};
-use essence_rc_client::{Client, Input, Log, Origin, Progress, Reply, Request, Secrets, TermEvent, TerminalIo, agent_env};
+use essence_rc_client::{Client, Input, Live, Log, Origin, Progress, Reply, Request, Secrets, TermEvent, TerminalIo, agent_env};
 use ratatui::{Terminal, backend::CrosstermBackend, text::Line};
 use zeroize::Zeroizing;
 use crate::ui::{self, Item, View};
@@ -52,6 +52,9 @@ pub trait UserInterface {
     fn busy(&mut self, _status: &str) -> io::Result<()> { Ok(()) }
     /// Timer tick while the request is in flight (spinner, elapsed time).
     fn tick(&mut self) {}
+    /// The live line of the request in flight replaces the previous one in
+    /// the busy status (not the journal).
+    fn live(&mut self, _live: &Live) {}
     /// The request finished: drop the busy status, keep type-ahead.
     fn command_finished(&mut self) -> io::Result<()> { Ok(()) }
     /// Run a local child (template editor) on the cooked terminal.
@@ -117,7 +120,11 @@ impl Context<'_> {
         self.ui.busy(activity(words))?;
         let ui = &mut self.ui;
         let result = self.client.send(request(&self.env, words, secrets, input),
-            &mut |progress| match progress { Progress::Log(entry) => ui.log(entry), Progress::Tick => ui.tick() });
+            &mut |progress| match progress {
+                Progress::Log(entry) => ui.log(entry),
+                Progress::Live(live) => ui.live(live),
+                Progress::Tick => ui.tick(),
+            });
         self.ui.command_finished()?;
         let reply = result?;
         if expected.is_none_or(|code| code != reply.code()) { self.journal_error(&reply); }
@@ -171,14 +178,23 @@ impl Context<'_> {
     }
     /// A selector never reads input when empty, never accepts leading zeroes,
     /// and returns no partial result on cancellation.
-    pub fn select(&mut self, title: &str, labels: &[String]) -> io::Result<Option<usize>> { self.select_current(title, labels, None) }
+    pub fn select(&mut self, title: &str, labels: &[String]) -> io::Result<Option<usize>> { self.select_with_current(title, vec![], labels, None) }
     /// `select` starting at `current`: the item is highlighted and Enter keeps it.
     pub fn select_current(&mut self, title: &str, labels: &[String], current: Option<usize>) -> io::Result<Option<usize>> {
+        self.select_with_current(title, vec![], labels, current)
+    }
+    /// `select` with context lines above the list (plain-language explanations).
+    pub fn select_with(&mut self, title: &str, context: Vec<Line<'static>>, labels: &[String]) -> io::Result<Option<usize>> {
+        self.select_with_current(title, context, labels, None)
+    }
+    /// `select_with` starting at `current` (highlighted, Enter keeps it).
+    pub fn select_with_current(&mut self, title: &str, context: Vec<Line<'static>>, labels: &[String], current: Option<usize>) -> io::Result<Option<usize>> {
         if labels.is_empty() { self.empty_list(title, "Нет объектов для выбора")?; return Ok(None); }
         let current = current.filter(|i| *i < labels.len());
         let mut items: Vec<_> = labels.iter().enumerate().map(|(i,l)| Item::new(i+1,l,ui::CYAN)).collect();
         items.push(Item::new(0,"Отмена",ui::NC));
         let mut view = View::menu(title, items);
+        view.context = context;
         view.mode = ui::Mode::Select;
         view.cursor = current;
         loop {
@@ -192,7 +208,11 @@ impl Context<'_> {
     /// v1 `toggle_select`: Enter commits the flags (indexes of checked labels),
     /// `0`/EOF drop partial changes; an empty list shows `empty` and reads
     /// nothing. Callers preselect only what mirrors the current state.
-    pub fn toggle(&mut self, title: &str, labels: &[String], mut flags: Vec<bool>, empty: &str) -> io::Result<Option<Vec<usize>>> {
+    pub fn toggle(&mut self, title: &str, labels: &[String], flags: Vec<bool>, empty: &str) -> io::Result<Option<Vec<usize>>> {
+        self.toggle_with(title, vec![], labels, flags, empty)
+    }
+    /// `toggle` with context lines above the list.
+    pub fn toggle_with(&mut self, title: &str, context: Vec<Line<'static>>, labels: &[String], mut flags: Vec<bool>, empty: &str) -> io::Result<Option<Vec<usize>>> {
         if labels.is_empty() { self.empty_list(title, empty)?; return Ok(None); }
         flags.resize(labels.len(), false);
         loop {
@@ -201,6 +221,7 @@ impl Context<'_> {
             items.push(Item::new(0, "Отмена", ui::NC));
             let mut view = View::menu(title, items);
             view.mode = ui::Mode::Toggle;
+            view.context = context.clone();
             view.prompt = "Пробел/номер — переключить, Enter — сохранить, 0 — отмена: ".into();
             let Some(choice) = self.choose(&view)? else { return Ok(None); };
             if choice == "0" { return Ok(None); }
@@ -241,6 +262,7 @@ pub fn activity(words: &[String]) -> &'static str {
         ("node" | "conn" | "telegram", _) => "Подключение к серверам…",
         ("subscription", "publish" | "publish-all" | "rotate" | "revoke") => "Публикация подписок на серверах…",
         ("self", "version" | "update") => "Проверка обновлений…",
+        ("profile", "mihomo-versions") => "Получение версий mihomo из GitHub…",
         _ => "Выполняется…",
     }
 }
@@ -506,6 +528,9 @@ impl TerminalUi {
                 }
                 match key.code {
                     key @ (KeyCode::PageUp|KeyCode::PageDown|KeyCode::Home|KeyCode::End|KeyCode::Up|KeyCode::Down)=>self.scroll_view(key)?,
+                    // A failing live check keeps the question open; Tab takes its fix.
+                    KeyCode::Enter if !hidden && ui::problem(view, &input).is_some() => {},
+                    KeyCode::Tab if !hidden => if let Some(fix) = ui::problem(view, &input).and_then(|problem| problem.fix) { *input = fix; },
                     KeyCode::Enter => { self.journal.clear(); return Ok(Some(input)); },
                     KeyCode::Backspace => { input.pop(); },
                     KeyCode::Esc => return Ok(None),
@@ -565,6 +590,12 @@ impl UserInterface for TerminalUi {
         if self.active { self.draw("",false) } else { Ok(()) }
     }
     fn tick(&mut self) { if self.busy.is_some() { self.redraw(); } }
+    fn live(&mut self, live: &Live) {
+        if let Some(busy) = self.busy.as_mut() {
+            busy.live = Some(live.clone());
+            self.redraw();
+        }
+    }
     fn command_finished(&mut self) -> io::Result<()> {
         self.busy=None;
         // Raw-mode Ctrl+C does not signal the child. Discard ONLY those keys,
@@ -588,15 +619,27 @@ impl UserInterface for TerminalUi {
 }
 impl Drop for TerminalUi { fn drop(&mut self) { if self.active { let _ = self.leave(); } } }
 /// Test UI records complete views, but never stores hidden input in those views.
+/// An answer the frame's live check refuses is recorded in `rejected` and
+/// the next answer is read, as the terminal keeps the question open.
 #[derive(Default)]
-pub struct ScriptedUi { pub inputs: VecDeque<Option<String>>, pub views: Vec<View>, pub notices: Vec<Line<'static>>, pub logs: Vec<Log>, pub busy: Vec<String>, pub suspensions: usize, pub suspended_now: bool }
+pub struct ScriptedUi { pub inputs: VecDeque<Option<String>>, pub views: Vec<View>, pub notices: Vec<Line<'static>>, pub logs: Vec<Log>, pub busy: Vec<String>, pub live: Vec<Live>, pub suspensions: usize, pub suspended_now: bool, pub rejected: Vec<String> }
 impl ScriptedUi { pub fn new(inputs: &[&str]) -> Self { Self { inputs: inputs.iter().map(|s|Some((*s).into())).collect(), ..Self::default() } } }
 impl UserInterface for ScriptedUi {
-    fn input(&mut self, view: &View, _: bool) -> io::Result<Option<Zeroizing<String>>> { assert!(!self.suspended_now,"input while suspended"); self.views.push(view.clone()); Ok(self.inputs.pop_front().flatten().map(Zeroizing::new)) }
+    fn input(&mut self, view: &View, hidden: bool) -> io::Result<Option<Zeroizing<String>>> {
+        assert!(!self.suspended_now,"input while suspended");
+        self.views.push(view.clone());
+        loop {
+            match self.inputs.pop_front().flatten() {
+                Some(text) if !hidden && ui::problem(view, &text).is_some() => self.rejected.push(text),
+                answer => return Ok(answer.map(Zeroizing::new)),
+            }
+        }
+    }
     fn show(&mut self, view: &View) -> io::Result<()> { self.views.push(view.clone()); Ok(()) }
     fn log(&mut self, log:&Log) { self.logs.push(log.clone()); }
     fn notice(&mut self, line:Line<'static>) { self.notices.push(line); }
     fn busy(&mut self, status: &str) -> io::Result<()> { self.busy.push(status.to_owned()); Ok(()) }
+    fn live(&mut self, live: &Live) { self.live.push(live.clone()); }
     fn suspended(&mut self, command:&mut Command)->io::Result<std::process::ExitStatus> { command.status() }
     fn suspend(&mut self) -> io::Result<()> { self.suspensions+=1; self.suspended_now=true; Ok(()) }
     fn resume(&mut self) -> io::Result<()> { self.suspended_now=false; Ok(()) }
@@ -857,6 +900,7 @@ mod tests {
         fn notice(&mut self, line: Line<'static>) { self.journal.push(line); }
         fn busy(&mut self, status: &str) -> io::Result<()> { self.busy = Some(ui::Busy::new(status)); self.draw(); Ok(()) }
         fn tick(&mut self) { self.draw(); }
+        fn live(&mut self, live: &Live) { if let Some(busy) = self.busy.as_mut() { busy.live = Some(live.clone()); } self.draw(); }
         fn command_finished(&mut self) -> io::Result<()> { self.busy = None; Ok(()) }
         fn suspended(&mut self, command: &mut Command) -> io::Result<std::process::ExitStatus> { command.status() }
     }
@@ -896,6 +940,45 @@ mod tests {
         let spinners: std::collections::BTreeSet<char> = ui.frames.iter().filter_map(|(_, text)| text.lines().find(|l| l.contains("Подключение к GitHub…")).and_then(|l| l.chars().next())).collect();
         assert!(spinners.len() > 1, "the spinner advances: {spinners:?}");
         assert!(ui.frames.iter().all(|(at, _)| *at <= replied));
+        client.close().unwrap();
+        drop(client);
+        daemon.join().unwrap();
+    }
+    /// `progress` events replace the busy status line live (bar, percent,
+    /// stage, activity, time) and never reach the journal; stage logs do.
+    #[test]
+    fn live_progress_replaces_the_status_line_not_the_journal() {
+        use std::sync::mpsc;
+        let line = |value: serde_json::Value| Zeroizing::new(value.to_string());
+        let (to_client, incoming) = mpsc::channel();
+        let (outgoing, from_client) = mpsc::channel::<Zeroizing<String>>();
+        to_client.send(line(serde_json::json!({"event":"hello","protocol":3,"version":"9","origin":"local"}))).unwrap();
+        let daemon = std::thread::spawn(move || {
+            let request: serde_json::Value = serde_json::from_str(&from_client.recv().unwrap()).unwrap();
+            let id = request["id"].clone();
+            for (percent, text) in [(5, "Нода de: 5 % · этап 1/10 «установка пакетов» · 0:00"),
+                (37, "Нода de: 37 % · этап 1/10 «установка пакетов» · nginx: распаковка · 1:42")] {
+                to_client.send(line(serde_json::json!({"id":id,"event":"progress","percent":percent,"text":text}))).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+            to_client.send(line(serde_json::json!({"id":id,"event":"log","level":"info","text":"de: сертификаты"}))).unwrap();
+            to_client.send(line(serde_json::json!({"id":id,"ok":true,"data":{"applied":["de"],"failed":[],"unchanged":[]}}))).unwrap();
+            let _ = from_client.recv();
+        });
+        let mut client = essence_rc_client::DaemonClient::from_channels(incoming, outgoing).unwrap();
+        let mut ui = DrawnUi { terminal: Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap(), view: View::menu("Ноды", vec![]),
+            journal: vec![], busy: None, frames: vec![] };
+        let registry = Registry { screens: vec![], github_wizard: None };
+        assert!(Context::for_test(&mut client, &mut ui, &registry).call(&["node", "apply", "--name", "de", "--yes"]).unwrap().ok);
+        let prompt = |text: &String| text.lines().rev().find(|row| !row.trim().is_empty()).unwrap_or_default().to_owned();
+        let rows: Vec<String> = ui.frames.iter().map(|(_, text)| prompt(text)).collect();
+        assert!(rows.iter().any(|row| row.contains("░░░░░░░░░░ Нода de: 5 %")), "{rows:#?}");
+        let drawn = ui.frames.iter().find(|(_, text)| text.contains("███░░░░░░░ Нода de: 37 %")).expect("the 37 % line is drawn");
+        // The live line wraps at the frame width like any status line.
+        assert!(drawn.1.contains("nginx:") && drawn.1.contains("распаковка · 1:42"), "{}", drawn.1);
+        assert!(!drawn.1.contains("Нода de: 5 %"), "the newer line replaces the older one");
+        let journal: Vec<String> = ui.journal.iter().map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect()).collect();
+        assert_eq!(journal, ["de: сертификаты"]);
         client.close().unwrap();
         drop(client);
         daemon.join().unwrap();
