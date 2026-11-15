@@ -503,7 +503,7 @@ export function applyNode(ctx, name) {
 
 /**
  * «Перерегистрировать WARP»: `node warp-reregister` под планом; нода после
- * него ожидает применения — вопрос и `node apply --name N`. `true` — выполнено.
+ * него ожидает применения — `node apply --name N` под планом ядра. `true` — выполнено.
  */
 export async function warpReregister(ctx, name) {
   const reply = await ctx.nodeRequest(name, warpReregisterArgv(name), { title: 'Перерегистрация WARP', question: 'Перерегистрировать WARP?' });

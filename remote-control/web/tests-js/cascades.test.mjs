@@ -112,34 +112,36 @@ test('форма: слушатель и подключение выхода — 
   assert.equal(initialValues(only).exit, model.EXIT_URI);
 });
 
-test('добавление: выход на ноду, затем node apply на входной и выходной ноде', async () => {
+test('добавление: выход на ноду, затем сразу node apply на входной и выходной ноде под планом ядра', async () => {
   const added = { name: 'c', entry: 'ru', listener: 'vless-tcp', exit: { node: 'de', proxy: 'VLESS gRPC' } };
   const s = scripted([
     [['node', 'list'], ok(NODES)],
     [['cascade', 'add', '--name', 'c', '--entry', 'ru', '--listener', 'vless-tcp', '--exit-node', 'de', '--exit-proxy', 'VLESS gRPC'], ok(added)],
     [['node', 'apply', '--name', 'ru', '--name', 'de'], APPLIED],
-  ], [{ name: 'c', entry: 'ru', listener_0: 'vless-tcp', exit: 'node', exit_node: 'de', exit_proxy_1: 'VLESS gRPC' }, true, undefined]);
+  ], [{ name: 'c', entry: 'ru', listener_0: 'vless-tcp', exit: 'node', exit_node: 'de', exit_proxy_1: 'VLESS gRPC' }, undefined]);
   assert.equal(await model.addCascadeFlow(s.ctx), true);
-  assert.deepEqual(s.record.dialogs.map((d) => d.kind), ['form', 'confirm', 'show']);
+  // Своего вопроса перед node apply нет: единственное подтверждение — план ядра.
+  assert.deepEqual(s.record.dialogs.map((d) => d.kind), ['form', 'show']);
   assert.deepEqual(s.record.inputs, [null, null, null]);
   s.done();
 });
 
-test('добавление: URI входом file, сбой ядра — форма с прежним вводом, отказ от применения', async () => {
+test('добавление: URI входом file, сбой ядра — форма с прежним вводом, отказ от плана применения', async () => {
   const argv = ['cascade', 'add', '--name', 'c', '--entry', 'de', '--listener', 'vless-grpc'];
   const values = { name: 'c', entry: 'de', listener_1: 'vless-grpc', exit: 'uri', uri: 'vless://u@h:443' };
   const s = scripted([
     [['node', 'list'], ok(NODES)],
     [argv, fail('invalid')],
     [argv, ok({ name: 'c', entry: 'de', listener: 'vless-grpc', exit: { uri: true } })],
-  ], [values, values, false]);
+    [['node', 'apply', '--name', 'de'], fail('confirmation_required')],
+  ], [values, values]);
   assert.equal(await model.addCascadeFlow(s.ctx), true);
   assert.equal(s.record.failed, 1);
-  assert.deepEqual(s.record.inputs.slice(1), [{ file: 'vless://u@h:443' }, { file: 'vless://u@h:443' }]);
+  assert.deepEqual(s.record.inputs.slice(1, 3), [{ file: 'vless://u@h:443' }, { file: 'vless://u@h:443' }]);
   const retry = s.record.dialogs[1];
   assert.equal(retry.fields.find((f) => f.name === 'name').value, 'c');
   assert.equal(retry.fields.find((f) => f.name === 'exit').value, 'uri');
-  assert.ok(s.record.dialogs[2].question.includes('de'));
+  assert.deepEqual(s.record.dialogs.map((d) => d.kind), ['form', 'form']);
   s.done();
 });
 
@@ -157,17 +159,23 @@ test('добавление: без нод входа — предупрежде�
   unread.done();
 });
 
-test('удаление: по плану, затем node apply на нодах каскада; отказ от плана — не сбой', async () => {
+test('удаление: по плану, затем node apply на нодах удалённого каскада из ответа; отказ от плана — не сбой', async () => {
   const row = { name: 'c', entry: 'ru', listener: 'vless-tcp', exit: { node: 'de', proxy: 'VLESS gRPC' } };
+  // Каскад пересоздан после чтения списка: ноды — из ответа удаления, не из строки списка.
+  const deleted = { name: 'c', entry: 'fr', listener: 'vless-tcp', exit: { node: 'nl', proxy: 'VLESS gRPC' } };
   let s = scripted([
-    [['cascade', 'delete', '--name', 'c'], ok({ name: 'c' })],
-    [['node', 'apply', '--name', 'ru', '--name', 'de'], APPLIED],
-  ], [true, undefined]);
+    [['cascade', 'delete', '--name', 'c'], ok(deleted)],
+    [['node', 'apply', '--name', 'fr', '--name', 'nl'], APPLIED],
+  ], [undefined]);
   assert.equal(await model.deleteCascade(s.ctx, row), true);
+  assert.deepEqual(s.record.dialogs.map((d) => d.kind), ['show']);
   s.done();
-  s = scripted([[['cascade', 'delete', '--name', 'c'], ok({ name: 'c' })]], [false]);
-  assert.equal(await model.deleteCascade(s.ctx, { ...row, exit: { uri: true } }), true);
-  assert.ok(s.record.dialogs[0].question.includes('ru'));
+  s = scripted([
+    [['cascade', 'delete', '--name', 'c'], ok({ ...row, exit: { uri: true } })],
+    [['node', 'apply', '--name', 'ru'], fail('confirmation_required')],
+  ], []);
+  assert.equal(await model.deleteCascade(s.ctx, row), true);
+  assert.equal(s.record.failed, 0);
   s.done();
   s = scripted([[['cascade', 'delete', '--name', 'c'], fail('confirmation_required')]], []);
   assert.equal(await model.deleteCascade(s.ctx, row), false);

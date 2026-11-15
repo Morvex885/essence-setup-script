@@ -161,11 +161,14 @@ export async function addCascadeFlow(ctx) {
   }
 }
 
-/** Удаление по плану ядра, затем предложение `node apply` на нодах каскада. `true` — удалён. */
+/**
+ * Удаление по плану ядра, затем `node apply` на нодах фактически удалённого
+ * каскада (ответ `cascade delete`, а не строка списка). `true` — удалён.
+ */
 export async function deleteCascade(ctx, row) {
   const reply = await ctx.runConfirmed('Удаление каскада', 'Удалить каскад?', cascadeDeleteArgv(row.name));
   if (ctx.isFailure(reply)) ctx.failed();
   if (!reply.ok) return false;
-  await offerApplyNodes(ctx, cascadeNodes(row));
+  await offerApplyNodes(ctx, cascadeNodes(reply.data || {}));
   return true;
 }

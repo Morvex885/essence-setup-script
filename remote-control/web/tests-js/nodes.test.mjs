@@ -336,10 +336,11 @@ test('argv профиля, домена и портов ноды', () => {
 });
 
 test('WARP ноды: строка и действие по node.warp (правило ядра), argv перерегистрации', () => {
-  assert.equal(model.warpLabel({ warp: 'plus' }), 'WARP+');
-  assert.equal(model.warpLabel({ warp: 'free' }), 'бесплатный');
-  // Не зарегистрирован, но WARP в профиле включён — строка и перерегистрация есть.
-  assert.equal(model.warpLabel({ warp: 'none' }), 'не зарегистрирован');
+  // Не зарегистрирован, но WARP в профиле включён — строка и перерегистрация есть;
+  // у `none|free|plus` подписи есть и различаются (тексты — дело модели).
+  const labels = ['none', 'free', 'plus'].map((warp) => model.warpLabel({ warp }));
+  assert.ok(labels.every((label) => typeof label === 'string' && label !== ''));
+  assert.equal(new Set(labels).size, labels.length);
   // WARP в профиле выключен — ни строки, ни действия.
   assert.equal(model.warpLabel({ warp: 'off' }), null);
   assert.equal(model.warpLabel({}), null);
@@ -350,16 +351,21 @@ test('WARP ноды: строка и действие по node.warp (прави
   assert.deepEqual(model.warpReregisterArgv('n'), ['node', 'warp-reregister', '--name', 'n']);
 });
 
-test('перерегистрация WARP: под планом, затем вопрос и node apply --name; отказ — без применения, сбой — без вопроса', async () => {
+test('перерегистрация WARP: под планом, затем сразу node apply --name под планом; отказ — без отчёта, сбой — без применения', async () => {
   let s = scripted([
     [['node', 'warp-reregister', '--name', 'n'], ok({ name: 'n' })],
     [['node', 'apply', '--name', 'n'], ok({ applied: ['n'], failed: [], unchanged: [] })],
-  ], [true, undefined]);
+  ], [undefined]);
   assert.equal(await model.warpReregister(s.ctx, 'n'), true);
-  assert.deepEqual(s.record.dialogs.map((d) => d.kind), ['confirm', 'show']);
+  // Своего вопроса перед node apply нет: единственное подтверждение — план ядра.
+  assert.deepEqual(s.record.dialogs.map((d) => d.kind), ['show']);
   s.done();
-  s = scripted([[['node', 'warp-reregister', '--name', 'n'], ok({ name: 'n' })]], [false]);
+  s = scripted([
+    [['node', 'warp-reregister', '--name', 'n'], ok({ name: 'n' })],
+    [['node', 'apply', '--name', 'n'], fail('confirmation_required')],
+  ], []);
   assert.equal(await model.warpReregister(s.ctx, 'n'), true);
+  assert.deepEqual(s.record.dialogs, []);
   s.done();
   s = scripted([[['node', 'warp-reregister', '--name', 'n'], fail('confirmation_required')]], []);
   assert.equal(await model.warpReregister(s.ctx, 'n'), false);

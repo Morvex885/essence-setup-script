@@ -116,13 +116,12 @@ export function profiledNodes(list) {
 }
 
 /**
- * Предложение применить на названных нодах после правки, которая их
- * затрагивает (WARP, каскад, хост подписок): вопрос → `node apply --name N…`.
+ * Применение на названных нодах после правки, которая их затрагивает
+ * (WARP, каскад, хост подписок): сразу `node apply --name N…` с планом
+ * ядра (его подтверждение — единственный вопрос).
  */
 export async function offerApplyNodes(ctx, names) {
   const nodes = [...new Set(strings(names))];
   if (nodes.length === 0) return;
-  const question = nodes.length === 1 ? `Применить изменения на ноде ${nodes[0]}?` : `Применить изменения на нодах ${nodes.join(', ')}?`;
-  const yes = await ctx.confirm({ title: 'Применение на нодах', plan: [], question });
-  if (yes) await applyFlow(ctx, applyNamesArgv(nodes), nodes.length === 1 ? nodes[0] : null);
+  await applyFlow(ctx, applyNamesArgv(nodes), nodes.length === 1 ? nodes[0] : null);
 }

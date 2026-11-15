@@ -209,6 +209,14 @@ test('ключ WARP+: argv без ключа, ключ — секретом pass
   assert.equal(s.record.dialogs[0].fields[0].type, 'secret');
   assert.deepEqual(s.record.calls[0][1], { secrets: { password: 'KEY-1' } });
   assert.ok(!s.record.calls[0][0].includes('KEY-1'));
+  // Формат ключа — проверкой поля (как `warp_license_valid` ядра), не сбоем после закрытия формы.
+  const validate = s.record.dialogs[0].fields[0].validate;
+  assert.equal(validate, model.warpLicenseError);
+  assert.equal(validate('KEY-1'), null);
+  assert.equal(validate('a'.repeat(64)), null);
+  assert.equal(validate('KEY!'), model.WARP_LICENSE_INVALID);
+  assert.equal(validate('a'.repeat(65)), model.WARP_LICENSE_INVALID);
+  assert.equal(validate(' KEY-1'), model.WARP_LICENSE_INVALID);
   s.done();
   s = scripted([], [null]);
   assert.equal(await model.warpLicenseFlow(s.ctx, 'edge'), false);

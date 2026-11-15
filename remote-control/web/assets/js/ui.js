@@ -480,8 +480,9 @@ export function Checkbox({ label, checked, onChange }) {
 }
 
 /**
- * Кнопка копирования: буфер обмена; при отказе — видимое поле с выделенным
- * текстом (`execCommand('copy')`). «Скопировано» — только при успехе.
+ * Кнопка копирования: буфер обмена; при отказе — видимое поле `textarea`
+ * (сохраняет переводы строк конфига или журнала) с выделенным текстом
+ * (`execCommand('copy')`). «Скопировано» — только при успехе.
  */
 export function CopyButton({ text, label = 'Копировать', kind = 'neutral' }) {
   const [done, setDone] = useState(false);
@@ -510,8 +511,9 @@ export function CopyButton({ text, label = 'Копировать', kind = 'neutr
   return html`
     <span class="copy">
       <${Button} kind=${kind} icon=${done ? 'check' : 'copy'} onClick=${copy}>${done ? 'Скопировано' : label}<//>
-      ${manual && html`<input ref=${field} class="input input-sm copy-manual mono" type="text" readonly value=${text}
-        aria-label="Текст для копирования" onFocus=${(event) => event.target.select()} />`}
+      ${manual && html`<textarea ref=${field} class="textarea textarea-sm copy-manual mono" readonly
+        rows=${Math.min(String(text).split('\n').length, 8)} value=${text}
+        aria-label="Текст для копирования" onFocus=${(event) => event.target.select()}></textarea>`}
       ${manual && !done && html`<span class="t-dim">Текст выделен: скопируйте его (Ctrl+C).</span>`}
     </span>
   `;

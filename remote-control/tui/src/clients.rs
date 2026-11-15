@@ -1740,35 +1740,37 @@ mod tests {
         json!({"node":"ru","hostname":"sub.example.com","port":port,"base_url":format!("https://sub.example.com:{port}"),"sub_dir":"/var/www/sub","nginx_group":"www-data"})
     }
     #[test]
-    fn host_is_set_on_a_profiled_node_and_offers_apply_on_the_new_and_old_node() {
+    fn host_is_set_on_a_profiled_node_and_applies_on_the_new_and_old_node() {
         let profiled = || ok(&["node", "list"], json!([
             {"name":"de","ip":"127.0.0.1","port":22,"profile":"edge"},{"name":"bare","ip":"10.0.0.3","port":22,"profile":null},
             {"name":"ru","ip":"10.0.0.2","port":2222,"profile":"edge"}]));
         let apply = ["node", "apply", "--name", "ru", "--name", "de"];
+        let apply_ru = ["node", "apply", "--name", "ru"];
+        // `node apply` under the core's plan at once (no own question); the second plan is refused.
         let (core, ui) = drive(vec![
             ok(&["subscription", "host"], host()), profiled(),
             ok(&["subscription", "host", "--name", "ru", "--domain", "sub.example.com"], moved(443)),
             step(&apply, plan()), yes(&apply, json!({"applied":["ru","de"],"failed":[],"unchanged":[]})),
             ok(&["subscription", "host"], moved(443)), profiled(),
             ok(&["subscription", "host", "--name", "ru", "--domain", "sub.example.com", "--port", "8443"], moved(8443)),
+            step(&apply_ru, plan()),
             ok(&["subscription", "host"], moved(8443)),
-        ], &["h", "2", "sub.example.com", "", "y", "y", "H", "2", "sub.example.com", "8443", "n", "0"], subscriptions);
-        assert!(!sent(&core, &["node", "apply", "--name", "ru"]), "the refused offer applies nothing");
+        ], &["h", "2", "sub.example.com", "", "y", "H", "2", "sub.example.com", "8443", "n", "0"], subscriptions);
+        assert!(!sent(&core, &["node", "apply", "--name", "ru", "--yes", "--plan-token", "T"]), "the refused plan applies nothing");
         assert_eq!(notices(&ui, "Применено: ru, de"), 1);
         assert!(!content(view(&ui, "Нода хоста подписок")).contains("bare"));
-        assert!(ui.views.iter().any(|v| v.prompt.contains("на нодах ru, de сейчас?")));
-        assert!(ui.views.iter().any(|v| v.title == "Нода: ru" && v.prompt.contains("на ноде сейчас?")));
+        assert!(!ui.views.iter().any(|v| v.prompt.contains("сейчас?")), "no question before the core's plan");
         assert!(ui.views.iter().any(|v| content(v).contains("Хост подписок: sub.example.com:8443 (нода ru)")));
     }
     #[test]
-    fn host_removal_is_plan_gated_and_offers_apply_on_the_old_node() {
+    fn host_removal_is_plan_gated_and_applies_on_the_old_node() {
         let remove = ["subscription", "host", "--remove"];
         let apply = ["node", "apply", "--name", "de"];
         let (core, ui) = drive(vec![
             ok(&["subscription", "host"], host()), step(&remove, plan()), yes(&remove, Value::Null),
             step(&apply, plan()), yes(&apply, json!({"applied":["de"],"failed":[],"unchanged":[]})),
             ok(&["subscription", "host"], Value::Null), ok(&["subscription", "host"], Value::Null),
-        ], &["X", "y", "y", "y", "x", "0"], subscriptions);
+        ], &["X", "y", "y", "x", "0"], subscriptions);
         assert!(sent(&core, &["subscription", "host", "--remove", "--yes", "--plan-token", "T"]));
         assert_eq!(notices(&ui, "Применено: de"), 1);
         assert_eq!(notices(&ui, "Неверный выбор."), 1, "no host — nothing to remove");

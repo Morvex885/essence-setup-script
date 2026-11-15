@@ -944,23 +944,16 @@ pub(crate) fn offer_apply(ctx: &mut Context<'_>) -> io::Result<()> {
     apply(ctx, &argv(&["node", "apply", "--pending"]), "")?;
     Ok(())
 }
-/// «Применить изменения сейчас?» after a change that leaves `nodes` waiting
-/// for `node apply` → one `node apply --name …` for all of them (no
-/// question without a node).
+/// After a change that leaves `nodes` waiting for `node apply`: one
+/// `node apply --name …` for all of them under the core's plan (its
+/// confirmation is the only question; nothing without a node).
 pub(crate) fn offer_apply_on(ctx: &mut Context<'_>, nodes: &[String]) -> io::Result<()> {
     let mut targets: Vec<&str> = vec![];
     for node in nodes { if !node.is_empty() && !targets.contains(&node.as_str()) { targets.push(node); } }
     let Some(&first) = targets.first() else { return Ok(()); };
-    let (view, question, name) = if targets.len() == 1 {
-        (View::new(format!("Нода: {first}")), "Применить изменения на ноде сейчас?".to_owned(), first)
-    } else {
-        (View::new("Применение на нодах"), format!("Применить изменения на нодах {} сейчас?", targets.join(", ")), "")
-    };
-    if ctx.confirm(view, &question)? {
-        let mut words = argv(&["node", "apply"]);
-        for node in &targets { words.extend(argv(&["--name", node])); }
-        apply(ctx, &words, name)?;
-    }
+    let mut words = argv(&["node", "apply"]);
+    for node in &targets { words.extend(argv(&["--name", node])); }
+    apply(ctx, &words, if targets.len() == 1 { first } else { "" })?;
     Ok(())
 }
 
@@ -1485,14 +1478,15 @@ fn add_cascade(ctx: &mut Context<'_>) -> io::Result<()> {
     if !reply.ok { outcome(ctx, &reply); return Ok(()); }
     offer_apply_on(ctx, &cascade_nodes(&reply.data))
 }
-/// A cascade of the list → `cascade delete` under its plan.
+/// A cascade of the list → `cascade delete` under its plan; `node apply` on
+/// the nodes of the cascade actually deleted (the reply, not the list row).
 fn delete_cascade(ctx: &mut Context<'_>, list: &[Value]) -> io::Result<()> {
     let labels: Vec<String> = list.iter().map(cascade_line).collect();
     let Some(i) = ctx.select("Удаление каскада", &labels)? else { return Ok(()); };
     let words = argv(&["cascade", "delete", "--name", &text(&list[i]["name"])]);
     let reply = confirm::run_confirmed(ctx, "Удаление каскада", "Удалить каскад?", &words, &Secrets::default())?;
     if !reply.ok { outcome(ctx, &reply); return Ok(()); }
-    offer_apply_on(ctx, &cascade_nodes(&list[i]))
+    offer_apply_on(ctx, &cascade_nodes(&reply.data))
 }
 
 #[cfg(test)]
@@ -1841,9 +1835,9 @@ mod tests {
         };
         let words = argv(&["node", "warp-reregister", "--name", "n"]);
         let apply_words = argv(&["node", "apply", "--name", "n"]);
-        // Consent → reregistration → the node waits: «apply now?» → `node apply --name n`;
-        // a refused plan sends nothing more and offers no apply.
-        let (client, ui) = screen(&mut NodeCard("n".into()), &["G", "y", "y", "y", "g", "n", "0"], vec![
+        // Consent → reregistration → the node waits: `node apply --name n` under its plan at once
+        // (no own question); a refused plan sends nothing more and offers no apply.
+        let (client, ui) = screen(&mut NodeCard("n".into()), &["G", "y", "y", "g", "n", "0"], vec![
             shown("plus"),
             (words.clone(), plan("confirmation_required", "w")), (with_yes(&words, "w"), ok(json!({"name": "n"}))),
             (apply_words.clone(), plan("confirmation_required", "a")), (with_yes(&apply_words, "a"), ok(json!({"applied": ["n"], "failed": [], "unchanged": []}))),
@@ -2443,8 +2437,8 @@ mod tests {
     fn cascade_add_through_a_node_exit_offers_apply_on_both_nodes() {
         let add = argv(&["cascade", "add", "--name", "eu", "--entry", "de", "--listener", "hysteria2", "--exit-node", "ru", "--exit-proxy", "VLESS gRPC"]);
         let apply = argv(&["node", "apply", "--name", "de", "--name", "ru"]);
-        // Name, entry de, listener Hysteria2, «Нода из списка», exit ru, VLESS gRPC, apply now, its plan.
-        let (client, ui) = screen(&mut Cascades, &["a", "eu", "1", "2", "1", "1", "2", "y", "y", "0"], vec![
+        // Name, entry de, listener Hysteria2, «Нода из списка», exit ru, VLESS gRPC, the apply plan (no own question).
+        let (client, ui) = screen(&mut Cascades, &["a", "eu", "1", "2", "1", "1", "2", "y", "0"], vec![
             cascades(json!([])), cascade_nodes_list(), (add, ok(via_ru())),
             (apply.clone(), plan("confirmation_required", "a")), (with_yes(&apply, "a"), ok(json!({"applied": ["de", "ru"], "failed": [], "unchanged": []}))),
             cascades(json!([via_ru()])),
@@ -2457,7 +2451,7 @@ mod tests {
         assert_eq!(labels(titled("Подключение входа: de")), ["VLESS TCP", "Hysteria2", "Отмена"]);
         assert_eq!(labels(titled("Выходная нода каскада")), ["ru  192.0.2.3:22", "Отмена"]);
         assert_eq!(labels(titled("Подключение выхода: ru")), ["VLESS xHTTP", "VLESS gRPC", "Отмена"]);
-        assert!(ui.views.iter().any(|v| v.prompt.contains("на нодах de, ru сейчас?")));
+        assert!(!ui.views.iter().any(|v| v.prompt.contains("сейчас?")), "no question before the core's plan");
         let last = ui.views.last().unwrap();
         assert!(last.context.iter().any(|l| l.to_string() == "eu  de (Hysteria2) → ru (VLESS gRPC)"));
     }
@@ -2471,15 +2465,15 @@ mod tests {
             cascade_nodes_list(), (add, ok(via_uri())),
             (apply.clone(), plan("confirmation_required", "a")), (with_yes(&apply, "a"), ok(json!({"applied": ["de"], "failed": [], "unchanged": []}))),
         ]);
-        let mut ui = HiddenUi { script: ScriptedUi::new(&["ext", "1", "1", "2", URI, "y", "y"]), hidden: vec![] };
+        let mut ui = HiddenUi { script: ScriptedUi::new(&["ext", "1", "1", "2", URI, "y"]), hidden: vec![] };
         add_cascade(&mut Context::for_test(&mut client, &mut ui, &registry)).unwrap();
         client.assert_finished();
-        assert_eq!(ui.hidden, [false, false, false, false, true, false, false]);
+        assert_eq!(ui.hidden, [false, false, false, false, true, false]);
         assert_eq!(client.input_names[1], ["file"]);
         assert!(client.secret_names.iter().all(Vec::is_empty));
         assert!(!client.calls.iter().flatten().any(|w| w.contains("SECRET-UUID")));
         assert!(!ui.script.views.iter().flat_map(View::lines).any(|l| l.to_string().contains("SECRET-UUID")));
-        assert!(ui.script.views.iter().any(|v| v.title == "Нода: de" && v.prompt.contains("на ноде сейчас?")));
+        assert!(noticed(&ui.script, "Применено: de"));
         // Enter at the URI cancels without a request.
         let (_, client, _) = run(vec![cascade_nodes_list()], &["ext", "1", "1", "2", ""], add_cascade);
         assert_eq!(client.calls.len(), 1);
@@ -2494,16 +2488,20 @@ mod tests {
         assert!(!ui.views.iter().any(|v| v.title == "Входная нода каскада"));
     }
     #[test]
-    fn cascade_delete_is_plan_gated_and_offers_apply_on_its_nodes() {
+    fn cascade_delete_is_plan_gated_and_applies_on_the_nodes_of_the_deleted_cascade() {
         let delete = argv(&["cascade", "delete", "--name", "eu"]);
-        // A refused plan deletes nothing; a confirmed one offers apply on de and ru (refused here).
+        // Recreated after the list was read: the deleted cascade (the reply) runs fr → nl, not de → ru.
+        let deleted = json!({"name": "eu", "entry": "fr", "listener": "hysteria2", "exit": {"node": "nl", "proxy": "VLESS gRPC"}});
+        let apply = argv(&["node", "apply", "--name", "fr", "--name", "nl"]);
+        // A refused plan deletes nothing; a confirmed one goes straight to the apply plan (refused here).
         let (client, ui) = screen(&mut Cascades, &["D", "2", "n", "d", "2", "y", "n", "0"], vec![
             cascades(json!([via_uri(), via_ru()])), (delete.clone(), plan("confirmation_required", "d")),
-            cascades(json!([via_uri(), via_ru()])), (delete.clone(), plan("confirmation_required", "d")), (with_yes(&delete, "d"), ok(json!({"name": "eu"}))),
+            cascades(json!([via_uri(), via_ru()])), (delete.clone(), plan("confirmation_required", "d")), (with_yes(&delete, "d"), ok(deleted)),
+            (apply, plan("confirmation_required", "a")),
             cascades(json!([via_uri()])),
         ]);
-        assert!(!client.calls.iter().any(|call| call[0] == "node"), "a refused offer applies nothing");
-        assert!(ui.views.iter().any(|v| v.prompt.contains("на нодах de, ru сейчас?")));
+        assert!(!client.calls.iter().any(|call| call.contains(&"--yes".to_owned()) && call[0] == "node"), "a refused plan applies nothing");
+        assert!(!ui.views.iter().any(|v| v.prompt.contains("сейчас?")), "no question before the core's plan");
         assert_eq!(confirms(&ui), 3);
         assert!(ui.views[0].context.iter().any(|l| l.to_string() == "ext  de (VLESS TCP) → внешний сервер"));
         let actions: Vec<_> = ui.views[0].sections.iter().flatten().map(|i| (i.key.clone(), i.color)).collect();

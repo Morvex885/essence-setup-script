@@ -502,23 +502,24 @@ test('хост подписок: ноды с профилем, домен и п�
   const current = { node: 'de', hostname: 'old.example.com', port: '8443', baseUrl: 'https://old.example.com:8443' };
   const applied = okReply({ applied: ['ru', 'de'], failed: [], unchanged: [] });
   const moved = fakeCtx({ replies: [profiled, okReply({ node: 'ru' }), applied],
-    answers: [{ node: 'ru', domain: 'sub.example.com', port: '443' }, true] });
+    answers: [{ node: 'ru', domain: 'sub.example.com', port: '443' }] });
   assert.equal(await m.subscriptionHostFlow(moved, current), true);
   const form = moved.calls[1][1];
   assert.deepEqual(form.fields[0].options.map((o) => o.value), ['de', 'ru'], 'только ноды с профилем');
   assert.deepEqual(form.fields.map((f) => f.value), ['de', 'old.example.com', '8443']);
-  assert.deepEqual(kinds(moved), ['request', 'form', 'request', 'confirm', 'node', 'show']);
+  // Своего вопроса перед node apply нет: единственное подтверждение — план ядра.
+  assert.deepEqual(kinds(moved), ['request', 'form', 'request', 'node', 'show']);
   assert.deepEqual(commands(moved), [['node', 'list'], ['subscription', 'host', '--name', 'ru', '--domain', 'sub.example.com'],
     ['node', 'apply', '--name', 'ru', '--name', 'de']]);
 
-  // Сбой ядра — та же форма с прежним вводом; отказ от применения — без node apply.
-  const retried = fakeCtx({ replies: [profiled, failure('invalid'), okReply({ node: 'de' })],
-    answers: [{ node: 'de', domain: 'x.example.com', port: '8443' }, { node: 'de', domain: 'y.example.com', port: '8443' }, false] });
+  // Сбой ядра — та же форма с прежним вводом; отказ от плана применения — без отчёта.
+  const retried = fakeCtx({ replies: [profiled, failure('invalid'), okReply({ node: 'de' }), PLAN],
+    answers: [{ node: 'de', domain: 'x.example.com', port: '8443' }, { node: 'de', domain: 'y.example.com', port: '8443' }] });
   assert.equal(await m.subscriptionHostFlow(retried, current), true);
-  assert.deepEqual(kinds(retried), ['request', 'form', 'request', 'failed', 'form', 'request', 'confirm']);
+  assert.deepEqual(kinds(retried), ['request', 'form', 'request', 'failed', 'form', 'request', 'node']);
   assert.equal(retried.calls[4][1].fields[1].value, 'x.example.com');
-  assert.deepEqual(commands(retried).at(-1), ['subscription', 'host', '--name', 'de', '--domain', 'y.example.com', '--port', '8443']);
-  assert.equal(retried.calls.at(-1)[1].question.includes('de'), true);
+  assert.deepEqual(commands(retried).at(-2), ['subscription', 'host', '--name', 'de', '--domain', 'y.example.com', '--port', '8443']);
+  assert.deepEqual(commands(retried).at(-1), ['node', 'apply', '--name', 'de']);
 
   const fresh = fakeCtx({ replies: [profiled], answers: [null] });
   assert.equal(await m.subscriptionHostFlow(fresh, null), false);
@@ -533,7 +534,7 @@ test('хост подписок: ноды с профилем, домен и п�
 
 test('убрать хост подписок: по плану, затем node apply на прежней ноде; отказ от плана — не сбой', async () => {
   const current = { node: 'de', hostname: 'sub.example.com', port: '443', baseUrl: 'https://sub.example.com' };
-  const removed = fakeCtx({ replies: [okReply(null), okReply({ applied: ['de'], failed: [], unchanged: [] })], answers: [true] });
+  const removed = fakeCtx({ replies: [okReply(null), okReply({ applied: ['de'], failed: [], unchanged: [] })] });
   assert.equal(await m.removeHostFlow(removed, current), true);
   assert.deepEqual(commands(removed), [['subscription', 'host', '--remove'], ['node', 'apply', '--name', 'de']]);
   const declined = fakeCtx({ replies: [PLAN] });

@@ -41,6 +41,7 @@ export const PORT_INVALID = 'Порт — число от 1 до 65535.';
 export const DOMAIN_INVALID = 'Некорректный домен.';
 export const EMAIL_INVALID = 'Некорректный email.';
 export const VERSION_INVALID = 'Версия в виде vX.Y.Z.';
+export const WARP_LICENSE_INVALID = 'Ключ WARP+ состоит из латинских букв, цифр и дефисов (до 64 символов).';
 
 const DOMAIN_RE = /^(?=.{1,253}$)[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$/;
 const EMAIL_RE = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/;
@@ -62,6 +63,11 @@ export function domainValid(value) {
 export const domainError = (value) => (text(value) === '' || domainValid(value) ? null : DOMAIN_INVALID);
 export const emailError = (value) => (text(value) === '' || EMAIL_RE.test(text(value)) ? null : EMAIL_INVALID);
 export const versionError = (value) => (text(value) === '' || /^v[0-9]+\.[0-9]+\.[0-9]+$/.test(text(value)) ? null : VERSION_INVALID);
+/** Ключ WARP+ (`validation::warp_license_valid` ядра): латиница, цифры, дефисы, до 64 символов; без обрезки — ядру уходит как есть. */
+export const warpLicenseError = (value) => {
+  const key = typeof value === 'string' ? value : '';
+  return key === '' || /^[A-Za-z0-9-]{1,64}$/.test(key) ? null : WARP_LICENSE_INVALID;
+};
 
 /** Случайный ACME email формата ядра `user<8 hex>@<6 hex>.com`; `random(n)` — n байт. */
 export function randomAcmeEmail(random = (n) => globalThis.crypto.getRandomValues(new Uint8Array(n))) {
@@ -305,7 +311,7 @@ export const warpLicenseClearArgv = (name) => ['profile', 'warp-license', '--nam
 export async function warpLicenseFlow(ctx, name) {
   const values = await ctx.form({
     title: `Ключ WARP+: ${name}`,
-    fields: [{ name: 'password', label: 'Ключ WARP+', type: 'secret', required: true, autofocus: true }],
+    fields: [{ name: 'password', label: 'Ключ WARP+', type: 'secret', required: true, validate: warpLicenseError, autofocus: true }],
     submit: 'Сохранить',
   });
   if (values === null || values === undefined) return false;
