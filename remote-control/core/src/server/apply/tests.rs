@@ -737,6 +737,82 @@ async fn warp_is_registered_before_the_render_and_with_a_new_key_again() {
     assert_eq!(hosts.uploads(), 0);
 }
 
+/// A node transport during whose WARP registration another local process
+/// saves a new domain of the node (`config save`).
+struct Racing {
+    inner: FakeTransport,
+    root: std::path::PathBuf,
+}
+
+impl crate::transport::RemoteSession for Racing {
+    async fn exec(&self, command: &str, stdin: &[u8], timeout: std::time::Duration) -> Result<ExecResult> {
+        if command.contains("essence-warp") {
+            let state = crate::state::State::new(crate::state::StatePaths::new(&self.root));
+            let mut config = state.load_config()?;
+            config.nodes[0].domain = Some("other.example.com".into());
+            state.save_config(&config)?;
+        }
+        self.inner.exec(command, stdin, timeout).await
+    }
+
+    async fn upload(&self, local_dir: &std::path::Path, remote_dir: &str, timeout: std::time::Duration) -> Result<()> {
+        self.inner.upload(local_dir, remote_dir, timeout).await
+    }
+
+    async fn upload_private(&self, local_dir: &std::path::Path, remote_dir: &str, timeout: std::time::Duration) -> Result<()> {
+        self.inner.upload_private(local_dir, remote_dir, timeout).await
+    }
+}
+
+impl crate::transport::RemoteTransport for Racing {
+    type Held = crate::fake_transport::FakeHeldSession;
+
+    async fn connect(&mut self, options: crate::transport::ConnectOptions) -> Result<()> {
+        self.inner.connect(options).await
+    }
+
+    fn hold(&self) -> Result<Self::Held> {
+        self.inner.hold()
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_change_during_the_warp_registration_is_a_changed_plan_of_the_command() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut session, _journal) = fixture(root.path());
+    session.mutate("t", |state| {
+        let mut config = state.load_config()?;
+        config.profiles[0].warp = true;
+        state.save_config(&config)
+    }).unwrap();
+    let de = node(1, "de");
+    let script = |register: bool| {
+        let mut steps = vec![connect_step(&de, Ok(())), probe_step(&de, DEBIAN)];
+        if register {
+            steps.push(ScriptStep::exec(super::super::warp::register_command(false), 1, LONG_TIMEOUT, ok(&warp_output(false))));
+        }
+        FakeTransport::new(steps)
+    };
+    let racing = RefCell::new(Some(Racing { inner: script(false), root: root.path().to_path_buf() }));
+    let connect = || racing.borrow_mut().take().unwrap();
+    let error = apply(&mut session, &invocation(&["node", "apply", "--name", "de"]), &connect).await.unwrap_err();
+    let token = error.extra["plan_token"].as_str().unwrap().to_owned();
+
+    let transport = script(true);
+    let finished = transport.script();
+    let racing = RefCell::new(Some(Racing { inner: transport, root: root.path().to_path_buf() }));
+    let connect = || racing.borrow_mut().take().unwrap();
+    let error = apply(&mut session, &invocation(&["node", "apply", "--name", "de", "--yes", "--plan-token", &token]), &connect)
+        .await.unwrap_err();
+    finished.assert_finished();
+    assert_eq!((error.code, error.exit), ("plan_changed", 2));
+    assert!(error.extra["plan"].is_array() && error.extra["plan_token"].is_string() && error.extra.get("failed").is_none(), "{error:?}");
+    // The registration saved nothing under the lock: the other change stays alone.
+    let saved = config(&session);
+    assert_eq!(saved.nodes[0].domain.as_deref(), Some("other.example.com"));
+    assert!(saved.nodes[0].params.warp.is_none() && saved.nodes[0].operation.is_none());
+}
+
 #[test]
 fn a_warp_registration_may_change_only_the_warp_parameters_of_the_confirmed_state() {
     let root = tempfile::tempdir().unwrap();

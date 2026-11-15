@@ -800,6 +800,9 @@ pub async fn apply<T: RemoteTransport>(session: &mut Session, invocation: &Invoc
                 let current = session.state.load_config()?;
                 item.digest = registered_digest(&config, &current, &node.id).ok_or_else(|| plan.changed(invocation))?;
             }
+            // A changed plan is the whole command's answer (code 2, plan and
+            // token), not a failure of this node.
+            Err(error) if error.code == "plan_changed" => return Err(error),
             Err(error) => {
                 report.fail(session, &item.name, &Failure::of("warp", error));
                 excluded.push(item.name.clone());

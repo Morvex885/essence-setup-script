@@ -58,11 +58,9 @@ fn the_license_reaches_wgcf_update_only_through_the_account_file() {
     let block = script_part("if [[ -n \"$key\" ]]; then\n", "rm -f wgcf-profile.conf\n");
     let script = format!("set -u\numask 077\nkey='KEY-1'\nplus=false\nrestore() {{ echo restore-called >&2; }}\n{block}printf '%s' \"$plus\"\n");
     let account = "access_token = 'a'\nlicense_key = 'OLD'\nprivate_key = 'p'\n";
-    // The fake wgcf fails when the key is in its argv or environment;
-    // `FAKE_BREAK` puts a directory where the copy was, so moving it back fails.
+    // The fake wgcf fails when the key is in its argv or environment.
     let fake = "#!/bin/sh\n[ \"$*\" = update ] || exit 2\nenv | grep -q KEY-1 && exit 3\n\
         [ \"$(grep -c license_key wgcf-account.toml)\" = 1 ] && grep -qx \"license_key = 'KEY-1'\" wgcf-account.toml || exit 4\n\
-        [ -n \"${FAKE_BREAK:-}\" ] && { rm -f wgcf-account.toml.prev; mkdir wgcf-account.toml.prev; }\n\
         exit \"${FAKE_EXIT:-0}\"\n";
     for (exit, plus) in [("0", "true"), ("1", "false")] {
         let dir = tempfile::tempdir().unwrap();
@@ -82,17 +80,19 @@ fn the_license_reaches_wgcf_update_only_through_the_account_file() {
         let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|entry| entry.unwrap().file_name()).collect();
         assert_eq!(names.len(), 2, "{names:?}");
     }
-    // Moving the previous file back fails: the copy stays, the script fails.
+    // Only moving the previous file back fails (a `mv` that refuses this one
+    // move): the copy stays intact, the script fails and names it.
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("wgcf"), fake).unwrap();
     std::fs::set_permissions(dir.path().join("wgcf"), std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::write(dir.path().join("wgcf-account.toml"), account).unwrap();
-    let output = bash(dir.path(), &script, &[("FAKE_EXIT", "1"), ("FAKE_BREAK", "1")]);
+    let failing = format!("mv() {{ [[ \"$2\" == wgcf-account.toml.prev ]] && return 1; command mv \"$@\"; }}\n{script}");
+    let output = bash(dir.path(), &failing, &[("FAKE_EXIT", "1")]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success() && output.stdout.is_empty(), "{output:?}");
     assert!(stderr.contains("Прежний файл аккаунта WARP не восстановлен: копия сохранена в ")
         && stderr.contains("/wgcf-account.toml.prev") && stderr.contains("restore-called"), "{stderr}");
-    assert!(dir.path().join("wgcf-account.toml.prev").exists());
+    assert_eq!(std::fs::read_to_string(dir.path().join("wgcf-account.toml.prev")).unwrap(), account);
 }
 
 #[cfg(unix)]
