@@ -2643,8 +2643,11 @@ TCP и UDP; иначе `invalid`. `config.json` схемы 2 при чтении
 не открываются. Необязательное поле `minimum_remote_control_version` задаёт
 минимальную версию `essence-rc`.
 
-Секреты хранятся не в `config.json`, а в `secrets.json` (`schema_version: 1`,
-карта `node_passwords`) под идентификаторами:
+Учётные данные клиентов — UUID VLESS, пароль Hysteria2 и ключи AmneziaWG
+(`awg_private_key`, `awg_preshared_key`) — хранятся в `config.json`, поэтому
+этот файл тоже секретный: не публикуйте его и не храните без защиты. Серверные
+секреты нод и профилей хранятся не в `config.json`, а в `secrets.json`
+(`schema_version: 1`, карта `node_passwords`) под идентификаторами:
 
 | Идентификатор | Что |
 |---|---|

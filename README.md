@@ -146,7 +146,7 @@ essence-rc profile add --name main --random-acme-email --reality self-steal --hy
 `n` → `a` — IP ноды, SSH-порт, логин и способ авторизации (ключ или пароль), затем профиль и, если профиль требует, домен ноды (A-запись на IP сервера). Для усиления защиты сначала выбирается новый порт, затем показываются нода и последствия; один вопрос с ответом «нет» по умолчанию разрешает установку ключа и отключение пароля. В конце мастер предлагает применить профиль: RC покажет план и после подтверждения настроит сервер. То же из командной строки:
 
 ```bash
-essence-rc node add --name de --ip 203.0.113.10 --auth password --tag "" --profile main --domain de.example.com
+essence-rc node add --name de --ip 203.0.113.10 --auth password --tag "" --accept-new-host-key --profile main --domain de.example.com
 essence-rc node apply --name de --yes
 ```
 
