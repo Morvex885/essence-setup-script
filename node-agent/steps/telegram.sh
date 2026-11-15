@@ -37,6 +37,8 @@ TG_UNIT_REFRESH="refresh-mtproxy-config.service"
 TG_UNIT_TIMER="refresh-mtproxy-config.timer"
 TG_NFT_TABLE="tproxy_backend"
 TG_READY_ATTEMPTS="${TG_READY_ATTEMPTS:-20}"
+# telegram_activate начал перезапуск служб в этой операции (см. telegram_rollback).
+TG_ACTIVATED=false
 
 # ─── Проверки upstream (telegram-proxy.sh:402-444, 497-515) ─────────────────
 
@@ -372,12 +374,26 @@ _tg_wait_ready() {
 }
 
 telegram_activate() {
+    TG_ACTIVATED=true
     systemctl daemon-reload || return 1
     systemctl enable --now "$TG_UNIT_FIREWALL" "$TG_UNIT_MTPROXY" "$TG_UNIT_TIMER" "$TG_UNIT_RELAY" || return 1
     systemctl restart "$TG_UNIT_MTPROXY" "$TG_UNIT_RELAY" || return 1
     systemctl reload-or-restart "$TG_UNIT_FIREWALL" || return 1
     _tg_wait_backend || return 1
     _tg_wait_ready
+}
+
+# Юниты роли, файлы которых на месте, выключаются и останавливаются:
+# `systemctl disable --now` отказывает целиком, если хоть одного юнита нет
+# (неполная установка — бэкенд поставлен, реле ещё нет).
+_tg_disable_units() {
+    local unit units=""
+    for unit in "$TG_UNIT_TIMER" "$TG_UNIT_RELAY" "$TG_UNIT_MTPROXY" "$TG_UNIT_FIREWALL"; do
+        [[ -f "$TG_SYSTEMD/$unit" ]] && units="$units $unit"
+    done
+    [[ -n "$units" ]] || return 0
+    # shellcheck disable=SC2086 # имена юнитов без пробелов
+    systemctl disable --now $units
 }
 
 # Файлы роли, которые ставит транзакция `config`.
@@ -391,15 +407,18 @@ TG_ROLE_FILES=(/etc/mtproxy/mtproxy.env /etc/tproxy-server/firewall.nft /etc/tpr
 #   незафиксированной роли (adopt_feature_leftovers) — остаются выключенными;
 # - первая установка (mtproxy.env до транзакции не было, .absent) — службы
 #   останавливаются и выключаются;
+# - telegram_activate начинал перезапуск (даже с теми же файлами роли: его
+#   могла вызвать правка mihomo) — службы поднимаются заново с прежними
+#   файлами и проверяется их готовность;
 # - файл роли в транзакции и изменён ею (cmp с копией) — перезапуск с прежними;
-# - иначе (откат по чужой причине, файлы роли те же) — ничего.
+# - иначе (откат по чужой причине до активации, файлы роли те же) — ничего.
 telegram_rollback() {
     local path touched=false changed=false
     # Явный код: в обработчике trap (finish) голый `return` вернул бы код
     # команды до trap, сбой хука даёт rollback_failed.
     if [[ " $TX_DEACTIVATED " == *" telegram "* ]]; then
         if [[ ! -f "$R/etc/mtproxy/mtproxy.env" ]]; then
-            systemctl disable --now "$TG_UNIT_TIMER" "$TG_UNIT_RELAY" "$TG_UNIT_MTPROXY" "$TG_UNIT_FIREWALL"; return $?
+            _tg_disable_units; return $?
         fi
         systemctl daemon-reload &&
             systemctl enable --now "$TG_UNIT_FIREWALL" "$TG_UNIT_MTPROXY" "$TG_UNIT_TIMER" "$TG_UNIT_RELAY" &&
@@ -413,9 +432,12 @@ telegram_rollback() {
             changed=true
         fi
     done
-    [[ "$touched" == true ]] || return 0
+    [[ "$touched" == true || "$TG_ACTIVATED" == true ]] || return 0
     if [[ -e "$OP/backup/etc/mtproxy/mtproxy.env.absent" ]]; then
-        systemctl disable --now "$TG_UNIT_TIMER" "$TG_UNIT_RELAY" "$TG_UNIT_MTPROXY" "$TG_UNIT_FIREWALL"; return $?
+        _tg_disable_units; return $?
+    fi
+    if [[ "$TG_ACTIVATED" == true ]]; then
+        telegram_activate; return $?
     fi
     [[ "$changed" == true ]] || return 0
     systemctl daemon-reload &&
@@ -424,10 +446,11 @@ telegram_rollback() {
 }
 
 # Снятие роли до того, как транзакция `config` удалит её файлы: службы
-# останавливаются и выключаются (юниты ещё на месте), таблица nft снимается.
+# останавливаются и выключаются (юниты ещё на месте; только существующие),
+# таблица nft снимается.
 telegram_deactivate() {
     [[ -f "$TG_SYSTEMD/$TG_UNIT_MTPROXY" || -f "$TG_SYSTEMD/$TG_UNIT_RELAY" ]] || return 0
-    systemctl disable --now "$TG_UNIT_TIMER" "$TG_UNIT_RELAY" "$TG_UNIT_MTPROXY" "$TG_UNIT_FIREWALL" || return 1
+    _tg_disable_units || return 1
     if nft list table inet "$TG_NFT_TABLE" >/dev/null 2>&1; then
         nft delete table inet "$TG_NFT_TABLE" || return 1
     fi

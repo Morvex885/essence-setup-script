@@ -938,6 +938,11 @@ fn telegram_behind_the_stream_and_on_a_free_443() {
     assert_eq!(tg_listen(&stream), ["    listen 127.0.0.1:8446 ssl http2;"]);
     assert!(content(&stream, STREAM_PATH).contains("        tg.example.com telegram_proxy;\n"));
     assert_eq!(spec(&stream, "LISTEN_TCP"), "443 8444 8446");
+    // The vhost's internal port is taken by SSH: refused before apply.
+    config.nodes[0].port = 8446;
+    let error = desired_error(&config);
+    assert_eq!((error.code, error.extra["port"].clone()), ("invalid", json!(8446)));
+    config.nodes[0].port = 22;
 
     config.profiles[0].vless_tcp = false;
     config.profiles[0].hysteria2 = Some(Hysteria2 { port: 20443, obfs: false });

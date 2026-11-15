@@ -151,6 +151,14 @@ installed_revision() {
     tg_call telegram_deactivate
     assert_success
     [[ ! -s "$CALLS" ]]
+    # Неполная установка (бэкенд поставлен, реле — нет): выключаются только существующие юниты.
+    installed_revision "$REV"
+    rm -f "$ROOT/etc/systemd/system/tproxy-server.service"
+    : >"$CALLS"
+    tg_call telegram_deactivate
+    assert_success
+    grep -qx "systemctl disable --now refresh-mtproxy-config.timer mtproxy.service tproxy-firewall.service" "$CALLS"
+    grep -qx "nft delete table inet tproxy_backend" "$CALLS"
 }
 
 @test "telegram_remove: без записей Essence пользователи и чужой Go не трогаются" {
@@ -165,6 +173,7 @@ installed_revision() {
 # rollback_with <пути транзакции> <first|changed|same> [deactivated]: откат с
 # TX_PATHS. Копия config.json (и mtproxy.env, кроме first) — old; файл операции —
 # new (changed) или такой же (same). first — mtproxy.env до транзакции не было.
+# ROLLBACK_PRE — код перед откатом (например, начатая активация).
 rollback_with() {
     local backup="$BATS_TEST_TMPDIR/backup" files="$BATS_TEST_TMPDIR/files" path
     rm -rf "$backup" "$files"
@@ -175,10 +184,11 @@ rollback_with() {
     done
     if [[ "$2" == first ]]; then rm "$backup/etc/mtproxy/mtproxy.env"; : >"$backup/etc/mtproxy/mtproxy.env.absent"; fi
     : >"$CALLS"
-    tg_call "TX_PATHS=($1); TX_DEACTIVATED='${3:-}'; telegram_rollback"
+    tg_call "TX_PATHS=($1); TX_DEACTIVATED='${3:-}'; ${ROLLBACK_PRE:-} telegram_rollback"
 }
 
 @test "telegram_rollback: первая установка выключает службы, изменённые файлы — перезапуск, чужой откат не трогает" {
+    installed_revision "$REV"
     rollback_with "/etc/mihomo/config.yaml /etc/mtproxy/mtproxy.env" first
     assert_success
     grep -qx "systemctl disable --now refresh-mtproxy-config.timer tproxy-server.service mtproxy.service tproxy-firewall.service" "$CALLS"
@@ -193,6 +203,27 @@ rollback_with() {
 
 @test "telegram_rollback: файлы роли в транзакции, но не изменены — службы не трогаются" {
     rollback_with "/etc/mihomo/config.yaml /etc/mtproxy/mtproxy.env /etc/tproxy-server/config.json" same
+    assert_success
+    [[ ! -s "$CALLS" ]]
+}
+
+@test "telegram_rollback: начатая активация с теми же файлами роли — службы поднимаются заново и проверяется готовность" {
+    # Правка только mihomo: файлы роли те же, но telegram_activate уже перезапускал службы.
+    ROLLBACK_PRE='TG_ACTIVATED=true; _tg_wait_backend() { echo backend-ready >>"$CALLS"; };'
+    rollback_with "/etc/mihomo/config.yaml /etc/mtproxy/mtproxy.env /etc/tproxy-server/config.json" same
+    assert_success
+    grep -qx "systemctl enable --now tproxy-firewall.service mtproxy.service refresh-mtproxy-config.timer tproxy-server.service" "$CALLS"
+    grep -qx "systemctl restart mtproxy.service tproxy-server.service" "$CALLS"
+    grep -qx "backend-ready" "$CALLS"
+    grep -q "^curl .*127.0.0.1:8081/readyz" "$CALLS"
+    # Готовность не достигнута — откат не завершён (rollback_failed), а не rolled_back.
+    stub curl 'exit 7'
+    ROLLBACK_PRE='TG_ACTIVATED=true; TG_READY_ATTEMPTS=1; _tg_wait_backend() { :; }; sleep() { :; };'
+    rollback_with "/etc/mihomo/config.yaml" same
+    assert_failure
+    # Сбой до активации с теми же файлами — службы не трогаются.
+    ROLLBACK_PRE='TG_ACTIVATED=false;'
+    rollback_with "/etc/mihomo/config.yaml /etc/mtproxy/mtproxy.env" same
     assert_success
     [[ ! -s "$CALLS" ]]
 }
@@ -217,11 +248,17 @@ rollback_with() {
 
 @test "telegram_rollback: откат снятия незафиксированных остатков — службы остаются выключенными" {
     # adopt_feature_leftovers: роль не была зафиксирована, файлов роли нет и после возврата.
+    installed_revision "$REV"
     rm -f "$ROOT/etc/mtproxy/mtproxy.env"
     rollback_with "/etc/mihomo/config.yaml" same telegram
     assert_success
     grep -qx "systemctl disable --now refresh-mtproxy-config.timer tproxy-server.service mtproxy.service tproxy-firewall.service" "$CALLS"
     refute_call "enable --now\|restart"
+    # Остатки неполной установки (реле не собрано): только существующие юниты.
+    rm -f "$ROOT/etc/systemd/system/tproxy-server.service"
+    rollback_with "/etc/mihomo/config.yaml" same telegram
+    assert_success
+    grep -qx "systemctl disable --now refresh-mtproxy-config.timer mtproxy.service tproxy-firewall.service" "$CALLS"
 }
 
 @test "юниты upstream закреплённой ревизии проходят проверки и рендер" {

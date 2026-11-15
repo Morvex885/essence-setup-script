@@ -8,7 +8,7 @@ import {
   TELEGRAM_STATUS_ARGV, telegramSetArgv, telegramRemoveArgv, telegramLinkArgv, telegramRotateArgv, telegramTagArgv,
   telegramTagClearArgv, telegramRestartArgv, telegramDiagnosticsArgv, tagError, telegramRows, telegramCandidates,
   telegramResults, telegramStatus, enableTelegram, telegramDomainFlow, rotateTelegramSecret, removeTelegram,
-  telegramTagFlow, clearTelegramTag, telegramLink, restartTelegram, telegramDiagnostics,
+  telegramTagFlow, clearTelegramTag, telegramLink, restartTelegram, telegramDiagnostics, statusAfter,
 } from '../assets/js/screens/nodeops-model.js';
 import { isFailure } from '../assets/js/flows.js';
 
@@ -260,7 +260,7 @@ test('assignConnections: группа, удалённая после чтени�
  * ответы `form`, `apply` — ответ на предложение применить.
  */
 function telegramCtx(steps, answers = [], apply = false) {
-  const record = { calls: [], options: [], forms: [], offers: [], planned: [], nodes: [], notices: [], shown: 0 };
+  const record = { calls: [], options: [], forms: [], offers: [], planned: [], nodes: [], reviews: [], notices: [], shown: 0 };
   const ctx = {
     async request(argv, options = {}) {
       assert.ok(steps.length > 0, `лишний запрос ${argv.join(' ')}`);
@@ -275,7 +275,11 @@ function telegramCtx(steps, answers = [], apply = false) {
     async confirm(props) { record.offers.push(props.question); return apply; },
     async show() { record.shown += 1; },
     async runConfirmed(title, question, argv) { record.planned.push(argv); return ctx.request(argv); },
-    async nodeRequest(name, argv, review, options = {}) { record.nodes.push([name, options.operation ? 'operation' : null]); return ctx.request(argv, options); },
+    async nodeRequest(name, argv, review, options = {}) {
+      record.nodes.push([name, options.operation ? 'operation' : null]);
+      record.reviews.push(review ? review.title : null);
+      return ctx.request(argv, options);
+    },
     notify: (level, text) => record.notices.push(level),
     failed: () => record.notices.push('failed'),
     isFailure,
@@ -333,6 +337,13 @@ test('telegram status: строки с доменом и сводкой, оши�
   assert.deepEqual(s.record.notices, ['failed']);
 });
 
+test('telegram status: изменённая роль сбрасывает результат проверки, прочие действия — нет', () => {
+  const table = [{ node: 'de', hostname: 'tg.de.example', status: 'готово' }];
+  assert.equal(statusAfter(table, true), null);
+  assert.equal(statusAfter(table, false), table);
+  assert.equal(statusAfter(null, true), null);
+});
+
 // После изменения роли — сразу `node apply --name N` под планом ядра (его
 // подтверждение — единственный вопрос); здесь план отклонён.
 const applyDeclined = (name) => [['node', 'apply', '--name', name], err('confirmation_required')];
@@ -358,6 +369,9 @@ test('telegram: «Включить на ноде» — форма из нод б
   s = telegramCtx([[telegramSetArgv('nl', 'x'), err('invalid')]], [{ node: 'nl', domain: 'x' }]);
   assert.equal(await enableTelegram(s.ctx, NODES), false);
   assert.deepEqual([s.record.nodes, s.record.notices], [[], ['failed']]);
+  // Формат домена — проверкой поля, как `domain_valid` ядра.
+  const domain = s.record.forms[0].fields.find((f) => f.name === 'domain');
+  assert.deepEqual([domain.required, domain.validate('x') !== null, domain.validate('tg.example.com')], [true, true, null]);
   s.done();
   // Нет нод без роли — без формы.
   s = telegramCtx([], []);
@@ -369,6 +383,7 @@ test('telegram: «Сменить домен» — текущий домен в �
   let s = telegramCtx([], [{ domain: 'tg.de.example' }]);
   assert.equal(await telegramDomainFlow(s.ctx, 'de', 'tg.de.example'), false);
   assert.equal(s.record.forms[0].fields[0].value, 'tg.de.example');
+  assert.deepEqual([s.record.forms[0].fields[0].validate('bad domain') !== null, s.record.forms[0].fields[0].validate('new.example')], [true, null]);
   s = telegramCtx([[telegramSetArgv('de', 'new.example'), ok({ node: 'de', hostname: 'new.example', tag: true })], applyDeclined('de')],
     [{ domain: 'new.example' }]);
   assert.equal(await telegramDomainFlow(s.ctx, 'de', 'tg.de.example'), true);
@@ -414,6 +429,7 @@ test('telegram: ссылка, перезапуск и диагностика (о
   assert.equal(await restartTelegram(s.ctx, 'de'), true);
   assert.equal(await telegramDiagnostics(s.ctx, 'de'), true);
   assert.deepEqual(s.record.nodes, [['de', 'operation'], ['de', 'operation']]);
+  assert.deepEqual(s.record.reviews, ['Перезапуск Telegram Proxy', null], 'перезапуск — по плану ядра, диагностика только читает');
   assert.deepEqual(s.record.offers, []);
   s.done();
 });

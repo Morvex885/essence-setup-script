@@ -335,6 +335,15 @@ impl Layout<'_> {
         self.config.telegram.iter().find(|proxy| proxy.node == self.node.name)
     }
 
+    /// TCP port of the Telegram vhost: an internal one behind the 443 front.
+    fn telegram_port(&self) -> u16 {
+        match self.front {
+            Front::SelfSteal => SITE_PORT,
+            Front::Stream => TG_INNER_PORT,
+            _ => 443,
+        }
+    }
+
     /// The Telegram vhost (`_telegram_proxy_render_nginx_site`) behind the node's front.
     fn telegram_site(&self, hostname: &str) -> String {
         let listen = match self.front {
@@ -412,6 +421,9 @@ impl Layout<'_> {
             }
             // On 443 the vhost may sit behind the front on an internal port.
             tcp.insert(self.sub_port(host));
+        }
+        if self.telegram().is_some() {
+            tcp.insert(self.telegram_port());
         }
         if tcp.contains(&self.node.port) {
             return Err(invalid(format!("Порт {} ноды «{}» занят SSH.", self.node.port, self.node.name)).with_extra("port", self.node.port));
@@ -733,11 +745,7 @@ impl Layout<'_> {
             ports.insert(self.sub_port(host));
         }
         if self.telegram().is_some() {
-            ports.insert(match self.front {
-                Front::SelfSteal => SITE_PORT,
-                Front::Stream => TG_INNER_PORT,
-                _ => 443,
-            });
+            ports.insert(self.telegram_port());
         }
         ports.into_iter().collect()
     }

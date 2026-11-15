@@ -878,7 +878,10 @@ fn telegram_card(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
                 let reply = ctx.call(&["telegram", "tag", "--name", name, "--clear"])?;
                 telegram_changed(ctx, name, &reply)?;
             }
-            "r" | "R" => { node_request(ctx, name, &argv(&["telegram", "restart", "--name", name]), None)?; }
+            "r" | "R" => {
+                let words = argv(&["telegram", "restart", "--name", name]);
+                node_request(ctx, name, &words, Some(("Перезапуск Telegram Proxy", "Перезапустить службы?")))?;
+            }
             "x" | "X" => {
                 let words = argv(&["telegram", "remove", "--name", name]);
                 let reply = confirm::run_confirmed(ctx, "Отключение Telegram Proxy", "Убрать Telegram Proxy с ноды?", &words, &Secrets::default())?;
@@ -2232,12 +2235,21 @@ mod tests {
             assert_eq!(confirms(&ui), 1, "the apply plan, refused");
         }
         for key in ["r", "R"] {
+            // The core's plan first; a missing password after consent → saved → the plan again.
             let restart = argv(&["telegram", "restart", "--name", "n1"]);
-            let (client, _) = screen(&mut Telegram, &["1", key, "y", "pw", "0", "0"], vec![
-                tg_list(), tg_list(), (restart.clone(), err("missing_secret", json!({"name": "n1", "secret": "password"}))),
-                step(&["node", "password", "--name", "n1"], ok(json!({"name": "n1"}))), (restart, ok(json!({"node": "n1"}))), tg_list(), tg_list(),
+            let (client, ui) = screen(&mut Telegram, &["1", key, "y", "y", "pw", "y", "0", "0"], vec![
+                tg_list(), tg_list(), (restart.clone(), plan("confirmation_required", "r")),
+                (with_yes(&restart, "r"), err("missing_secret", json!({"name": "n1", "secret": "password"}))),
+                step(&["node", "password", "--name", "n1"], ok(json!({"name": "n1"}))),
+                (restart.clone(), plan("confirmation_required", "r")), (with_yes(&restart, "r"), ok(json!({"node": "n1"}))), tg_list(), tg_list(),
             ]);
-            assert_eq!(client.secret_names[3], ["password"]);
+            assert_eq!(client.secret_names[4], ["password"]);
+            assert_eq!(confirms(&ui), 3, "the plan twice and the password question");
+            // A refused plan sends nothing more.
+            let (client, _) = screen(&mut Telegram, &["1", key, "n", "0", "0"], vec![
+                tg_list(), tg_list(), (restart.clone(), plan("confirmation_required", "r")), tg_list(), tg_list(),
+            ]);
+            assert_eq!(client.calls.iter().filter(|call| call[..2] == ["telegram", "restart"]).count(), 1);
         }
         for key in ["d", "D"] {
             let journal = Reply { logs: vec![Log { level: "info".into(), text: "telegram-web: started".into() }], ..ok(json!({"node": "n1"})) };

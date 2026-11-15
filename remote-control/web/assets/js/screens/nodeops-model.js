@@ -9,6 +9,7 @@ import { asList, proxyLabel, strings, unlisted } from '../format.js';
 import { refill } from '../form-model.js';
 import { NODE_CODES, retryable } from '../flows.js';
 import { nodeLabel } from './nodes-model.js';
+import { domainError } from './profiles-model.js';
 import { applyState, offerApply, offerApplyNodes, profiledNodes } from './apply-model.js';
 
 /** Пустой выбор (`nodes.rs::EMPTY`). */
@@ -306,6 +307,11 @@ export async function telegramStatus(ctx) {
   return table || [];
 }
 
+/** Таблица `telegram status` после действия экрана: роль изменена (`true`) — результат устарел и сбрасывается. */
+export function statusAfter(table, changed) {
+  return changed === true ? null : table;
+}
+
 /** Итог правки роли: успех — предложение `node apply --name N`, сбой — `failed`. `true` — сохранено. */
 async function changed(ctx, name, reply) {
   if (ctx.isFailure(reply)) ctx.failed();
@@ -314,8 +320,9 @@ async function changed(ctx, name, reply) {
   return true;
 }
 
+/** Поле домена: формат — как `validation::domain_valid` ядра, ошибка — под полем, без отправки. */
 const domainField = (value = '') => ({
-  name: 'domain', label: 'Домен', type: 'text', value, required: true, placeholder: 'tg.example.com',
+  name: 'domain', label: 'Домен', type: 'text', value, required: true, validate: domainError, placeholder: 'tg.example.com',
   hint: 'Домен, указывающий на ноду.',
 });
 
@@ -386,9 +393,10 @@ export async function telegramLink(ctx, name) {
   return link === '' ? null : link;
 }
 
-/** «Перезапустить» (SSH, коды нод разрешаются). `true` — перезапущено. */
+/** «Перезапустить» по плану ядра (SSH, коды нод разрешаются). `true` — перезапущено. */
 export async function restartTelegram(ctx, name) {
-  const reply = await ctx.nodeRequest(name, telegramRestartArgv(name), null, { operation: `Перезапуск Telegram Proxy: ${name}` });
+  const reply = await ctx.nodeRequest(name, telegramRestartArgv(name),
+    { title: 'Перезапуск Telegram Proxy', question: 'Перезапустить службы?' }, { operation: `Перезапуск Telegram Proxy: ${name}` });
   return reply.ok;
 }
 

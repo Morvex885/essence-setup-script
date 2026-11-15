@@ -30,8 +30,15 @@ export function TelegramScreen({ ctx }) {
     const rows = await model.telegramStatus(ctx);
     if (rows !== null && mounted.current) setTable(rows);
   };
-  /** Действие и перечитывание списка (правки меняют роль и состояние применения). */
-  const act = (action) => run(async () => { await action(); await list.reload(); });
+  /**
+   * Правка роли и перечитывание списка (правки меняют роль и состояние
+   * применения); изменённая роль сбрасывает устаревший результат проверки.
+   */
+  const act = (action) => run(async () => {
+    const changed = await action();
+    if (mounted.current) setTable((current) => model.statusAfter(current, changed));
+    await list.reload();
+  });
   const enable = () => act(() => model.enableTelegram(ctx, list.data));
 
   const enableButton = (kind = 'primary') => html`<${Button} kind=${kind} icon="plus"

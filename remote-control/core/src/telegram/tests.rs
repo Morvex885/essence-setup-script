@@ -65,6 +65,8 @@ fn set_link_rotate_tag_and_remove() {
         (&["telegram", "set", "--name", "bare", "--domain", "tg.example.com"], "invalid"),
         (&["telegram", "set", "--name", "de", "--domain", "bad domain"], "invalid"),
         (&["telegram", "set", "--name", "de", "--domain", "de.example.com"], "invalid"),
+        // Domains compare case-insensitively: the node's own site in capitals.
+        (&["telegram", "set", "--name", "de", "--domain", "DE.Example.COM"], "invalid"),
         (&["telegram", "set", "--name", "ghost", "--domain", "tg.example.com"], "not_found"),
         (&["telegram", "link", "--name", "de"], "not_found"),
         (&["telegram", "rotate-secret", "--name", "de", "--yes"], "not_found"),
@@ -81,8 +83,10 @@ fn set_link_rotate_tag_and_remove() {
     assert_eq!(crate::server::render::status(&config, &config.nodes[0]), "pending");
     assert_eq!(run(&mut session, &["telegram", "link", "--name", "de"], &none()).unwrap(),
         json!({"link": format!("tg://webproxy?server=tg.example.com&port=443&secret={secret}")}));
-    assert_eq!(run(&mut session, &["telegram", "set", "--name", "nl", "--domain", "tg.example.com"], &none()).unwrap_err().code, "invalid",
-        "one hostname per proxy");
+    for taken in ["tg.example.com", "TG.EXAMPLE.COM"] {
+        assert_eq!(run(&mut session, &["telegram", "set", "--name", "nl", "--domain", taken], &none()).unwrap_err().code, "invalid",
+            "one hostname per proxy: {taken}");
+    }
 
     // A domain change keeps the secret.
     run(&mut session, &["telegram", "set", "--name", "de", "--domain", "tg2.example.com"], &none()).unwrap();
@@ -91,7 +95,7 @@ fn set_link_rotate_tag_and_remove() {
     let before = fingerprint(root.path());
     let error = run(&mut session, &["telegram", "rotate-secret", "--name", "de"], &none()).unwrap_err();
     assert_eq!((error.code, error.extra["plan"].clone()), ("confirmation_required",
-        json!(["Секрет Telegram Proxy ноды «de» будет заменён: прежние ссылки перестанут работать."])));
+        json!(["Секрет Telegram Proxy ноды «de» (tg2.example.com) будет заменён: прежние ссылки перестанут работать."])));
     assert_eq!(fingerprint(root.path()), before);
     let mark = session.state.load_config().unwrap().telegram[0].secret_mark.clone();
     run(&mut session, &["telegram", "rotate-secret", "--name", "de", "--yes"], &none()).unwrap();
@@ -137,9 +141,18 @@ fn remove_and_rotate_recheck_the_plan_under_the_lock() {
     let mut rotated = config.clone();
     rotated.telegram[0].secret_mark = "other".into();
     assert_eq!(planned(&rotated, "de", &rotate, rotate_plan, &confirmed).unwrap_err().code, "plan_changed");
+    // `remove` confirmed before a rotation or a new tag does not drop the changed role.
+    assert_eq!(planned(&rotated, "de", &remove, remove_plan, &confirmed).unwrap_err().code, "plan_changed");
+    let mut tagged = config.clone();
+    tagged.telegram[0].tag_mark = Some("tag".into());
+    assert_eq!(planned(&tagged, "de", &remove, remove_plan, &confirmed).unwrap_err().code, "plan_changed");
     let mut moved = config.clone();
     moved.telegram[0].hostname = "tg2.example.com".into();
     let error = planned(&moved, "de", &remove, remove_plan, &confirmed).unwrap_err();
+    assert_eq!(error.code, "plan_changed");
+    assert!(error.extra["plan"].to_string().contains("tg2.example.com"), "{error:?}");
+    // `rotate-secret` confirmed before a domain change does not rotate the moved role.
+    let error = planned(&moved, "de", &rotate, rotate_plan, &confirmed).unwrap_err();
     assert_eq!(error.code, "plan_changed");
     assert!(error.extra["plan"].to_string().contains("tg2.example.com"), "{error:?}");
     let mut gone = config.clone();
@@ -229,8 +242,12 @@ fn restart_and_diagnostics_reach_the_node_and_redact() {
         vec![connect_step(0), exec(RESTART_COMMAND, RESTART_TIMEOUT, 1, "")],
         vec![connect_step(0), exec(DIAGNOSTICS_COMMAND, COMMAND_TIMEOUT, 0, &format!("-- Журнал --\nstarted with secret={secret}\n\n\u{1b}[1mok\u{1b}[0m\n"))],
     ]);
-    assert_eq!(run_with(&mut session, &["telegram", "restart", "--name", "de"], &none(), &connect).unwrap(), json!({"node": "de"}));
-    assert_eq!(run_with(&mut session, &["telegram", "restart", "--name", "de"], &none(), &connect).unwrap_err().code, "remote_failed");
+    // Without consent: the plan, no connection.
+    let error = run(&mut session, &["telegram", "restart", "--name", "de"], &none()).unwrap_err();
+    assert_eq!((error.code, error.extra["plan"].clone()), ("confirmation_required",
+        json!(["Службы MTProxy и tproxy-server ноды «de» (tg.example.com) будут перезапущены: текущие подключения прервутся."])));
+    assert_eq!(run_with(&mut session, &["telegram", "restart", "--name", "de", "--yes"], &none(), &connect).unwrap(), json!({"node": "de"}));
+    assert_eq!(run_with(&mut session, &["telegram", "restart", "--name", "de", "--yes"], &none(), &connect).unwrap_err().code, "remote_failed");
     assert_eq!(run_with(&mut session, &["telegram", "diagnostics", "--name", "de"], &none(), &connect).unwrap(), json!({"node": "de"}));
     observers.iter().for_each(FakeScript::assert_finished);
     let output: Vec<String> = journal.borrow().iter().filter(|(level, _)| *level == Level::Output).map(|(_, line)| line.clone()).collect();

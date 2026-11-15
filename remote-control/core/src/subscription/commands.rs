@@ -38,8 +38,10 @@ fn require_profiled(config: &Config, name: &str) -> Result<()> {
 /// The host record: the domain must not be another vhost of the node.
 fn host_record(config: &Config, node: &str, hostname: &str, port: u16) -> Result<SubscriptionHost> {
     require_profiled(config, node)?;
-    let taken = nodes::find(config, node)?.domain.as_deref() == Some(hostname)
-        || config.telegram.iter().any(|proxy| proxy.node == node && proxy.hostname == hostname);
+    // DNS names are case-insensitive: `NEW.EXAMPLE.COM` is the node's `new.example.com`.
+    let same = |other: &str| other.eq_ignore_ascii_case(hostname);
+    let taken = nodes::find(config, node)?.domain.as_deref().is_some_and(same)
+        || config.telegram.iter().any(|proxy| proxy.node == node && same(&proxy.hostname));
     if taken {
         return Err(RcError::new("invalid", format!("Домен «{hostname}» уже занят сайтом или Telegram Proxy ноды «{node}»."))
             .with_extra("name", node));

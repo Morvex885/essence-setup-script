@@ -121,9 +121,11 @@ fn check_domain(config: &Config, node: &Node, domain: &str) -> Result<()> {
     if !domain_valid(domain) {
         return Err(RcError::new("invalid", format!("Некорректный домен «{domain}».")));
     }
-    let taken = node.domain.as_deref() == Some(domain)
-        || config.subscription_host.as_ref().is_some_and(|host| host.node == node.name && host.hostname == domain)
-        || config.telegram.iter().any(|proxy| proxy.node != node.name && proxy.hostname == domain);
+    // DNS names are case-insensitive: `DE.EXAMPLE.COM` is the node's `de.example.com`.
+    let same = |other: &str| other.eq_ignore_ascii_case(domain);
+    let taken = node.domain.as_deref().is_some_and(same)
+        || config.subscription_host.as_ref().is_some_and(|host| host.node == node.name && same(&host.hostname))
+        || config.telegram.iter().any(|proxy| proxy.node != node.name && same(&proxy.hostname));
     if taken {
         return Err(RcError::new("invalid", format!("Домен «{domain}» уже занят сайтом, хостом подписок или другим Telegram Proxy."))
             .with_extra("name", node.name.clone()));
@@ -170,15 +172,15 @@ fn remove_plan(config: &Config, name: &str) -> Result<Plan> {
     Ok(Plan::new(vec![
         format!("Telegram Proxy на ноде «{name}» ({}) будет убран; его службы и файлы удалит node apply.", proxy.hostname),
         "Ссылки подключения перестанут работать.".to_owned(),
-    ], format!("{}\n{}", node.id, proxy.hostname)))
+    ], format!("{}\n{}\n{}\n{}", node.id, proxy.hostname, proxy.secret_mark, proxy.tag_mark.as_deref().unwrap_or(""))))
 }
 
-/// The plan of `telegram rotate-secret`: the role's node and its current
+/// The plan of `telegram rotate-secret`: the role's node, domain and current
 /// secret (by mark — a concurrent rotation changes the plan).
 fn rotate_plan(config: &Config, name: &str) -> Result<Plan> {
     let (node, proxy) = role(config, name)?;
-    Ok(Plan::new(vec![format!("Секрет Telegram Proxy ноды «{name}» будет заменён: прежние ссылки перестанут работать.")],
-        format!("{}\n{}", node.id, proxy.secret_mark)))
+    Ok(Plan::new(vec![format!("Секрет Telegram Proxy ноды «{name}» ({}) будет заменён: прежние ссылки перестанут работать.", proxy.hostname)],
+        format!("{}\n{}\n{}", node.id, proxy.hostname, proxy.secret_mark)))
 }
 
 /// The confirmed plan against `config` (under the lock): the same plan →
@@ -294,9 +296,18 @@ async fn open<T: RemoteTransport>(session: &mut Session, name: &str, connect: &d
     Ok(transport)
 }
 
-/// `telegram restart --name N`.
+/// The plan of `telegram restart`: the role's node and its SSH address.
+fn restart_plan(config: &Config, name: &str) -> Result<Plan> {
+    let (node, proxy) = role(config, name)?;
+    Ok(Plan::new(vec![format!(
+        "Службы MTProxy и tproxy-server ноды «{name}» ({}) будут перезапущены: текущие подключения прервутся.", proxy.hostname)],
+        format!("{}\n{}@{}:{}", node.id, node.user, node.ip, node.port)))
+}
+
+/// `telegram restart --name N`: by the plan, before any remote change.
 async fn restart<T: RemoteTransport>(session: &mut Session, invocation: &Invocation, connect: &dyn Fn() -> T) -> Result<Value> {
     let name = required(invocation, "name")?.to_owned();
+    restart_plan(&session.state.load_config()?, &name)?.confirm(invocation)?;
     let transport = open(session, &name, connect).await?;
     let result = transport.exec(RESTART_COMMAND, b"", RESTART_TIMEOUT).await?;
     if result.exit_status != 0 {
