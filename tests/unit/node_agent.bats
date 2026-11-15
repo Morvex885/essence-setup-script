@@ -1076,11 +1076,13 @@ exit 0'
     assert_success
     ! grep -q "systemctl stop" "$CALLS" || return 1
     [[ ! -L "$wants/essence-sub-cleanup.timer" ]]
-    # Ссылку не удалить — откат не завершён, даже если stop прошёл.
+    # Ссылку не удалить — откат не завершён, даже если stop прошёл. Отказ rm —
+    # заглушкой (права каталога не останавливают root).
     ln -s /etc/systemd/system/essence-sub-cleanup.timer "$wants/essence-sub-cleanup.timer"
-    chmod 555 "$wants"
+    stub rm "[[ \"\$*\" == *timers.target.wants/essence-sub-cleanup.timer ]] && exit 1
+exec '$(command -v rm)' \"\$@\""
     awg_call sub_rollback
-    chmod 755 "$wants"
+    "$(command -v -p rm)" -f "$STUBS/rm"
     assert_failure
     grep -qx "systemctl stop essence-sub-cleanup.timer" "$CALLS"
     [[ -L "$wants/essence-sub-cleanup.timer" ]]

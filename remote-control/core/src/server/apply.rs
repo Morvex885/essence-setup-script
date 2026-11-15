@@ -715,12 +715,16 @@ impl<T: RemoteTransport> Run<'_, T> {
 }
 
 /// Poll every unfinished run in turn until all finish; the live line is
-/// refreshed every [`LIVE_TICK`] between polls and while a poll waits for
-/// its node (an SSH reply may take up to [`COMMAND_TIMEOUT`]): the state is
-/// then that of the poll's start, the elapsed time keeps going.
+/// refreshed every [`LIVE_TICK`] between polls and while polls wait for
+/// their nodes (an SSH reply may take up to [`COMMAND_TIMEOUT`]): the state
+/// is then that of the current poll's start, the elapsed time keeps going.
+/// One ticker serves the whole round, so polls shorter than a second each
+/// still let the line move.
 async fn drive<T: RemoteTransport>(session: &mut Session, runs: &mut [Run<'_, T>]) {
     loop {
         let mut active = false;
+        let mut tick = tokio::time::interval_at(Instant::now() + LIVE_TICK, LIVE_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         for index in 0..runs.len() {
             if runs[index].outcome.is_some() {
                 continue;
@@ -730,7 +734,6 @@ async fn drive<T: RemoteTransport>(session: &mut Session, runs: &mut [Run<'_, T>
             {
                 let (state, mut progress) = session.state_and_progress();
                 let mut poll = std::pin::pin!(runs[index].poll(state, &mut logs));
-                let mut tick = tokio::time::interval_at(Instant::now() + LIVE_TICK, LIVE_TICK);
                 loop {
                     tokio::select! {
                         biased;

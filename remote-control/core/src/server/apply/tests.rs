@@ -975,20 +975,23 @@ async fn status_progress_becomes_a_live_line_without_journal_spam() {
     assert!(journal.iter().all(|(_, text)| !text.contains('%') && !text.contains("распаковка")), "{journal:?}");
 }
 
-/// A node transport whose first status reply takes [`Slow::DELAY`].
+/// A node transport whose first status reply (operation [`OP`]) takes `delay`.
 struct Slow {
     inner: FakeTransport,
+    delay: std::time::Duration,
     delayed: std::cell::Cell<bool>,
 }
 
 impl Slow {
-    const DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+    fn new(inner: FakeTransport, delay: std::time::Duration) -> Self {
+        Self { inner, delay, delayed: std::cell::Cell::new(false) }
+    }
 }
 
 impl crate::transport::RemoteSession for Slow {
     async fn exec(&self, command: &str, stdin: &[u8], timeout: std::time::Duration) -> Result<ExecResult> {
         if command == status_command(OP) && !self.delayed.replace(true) {
-            tokio::time::sleep(Self::DELAY).await;
+            tokio::time::sleep(self.delay).await;
         }
         self.inner.exec(command, stdin, timeout).await
     }
@@ -1028,7 +1031,7 @@ async fn the_live_line_ticks_while_a_status_reply_is_awaited() {
     steps.push(exec(status_command(OP), "unit=inactive\nstage=cleanup\nprogress=100\nresult=committed\n"));
     let transport = FakeTransport::new(steps);
     let script = transport.script();
-    let slow = RefCell::new(Some(Slow { inner: transport, delayed: std::cell::Cell::new(false) }));
+    let slow = RefCell::new(Some(Slow::new(transport, Duration::from_secs(5))));
     let connect = || slow.borrow_mut().take().unwrap();
     apply(&mut session, &invocation(&["node", "apply", "--name", "de", "--yes"]), &connect).await.unwrap();
     script.assert_finished();
@@ -1041,6 +1044,32 @@ async fn the_live_line_ticks_while_a_status_reply_is_awaited() {
     assert_eq!(clocks, ["0:01", "0:02", "0:03", "0:04"]);
     assert!(waiting.iter().all(|text| text.starts_with("Нода de: 0 %")), "{waiting:?}");
     assert_eq!(texts[4].rsplit(" · ").next(), Some("0:05"), "{texts:#?}");
+}
+
+/// One ticker serves a whole round of polls: replies shorter than a second
+/// each, longer than a second together, still move the live line.
+#[tokio::test(start_paused = true)]
+async fn the_live_line_ticks_across_polls_shorter_than_a_second() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut session, _journal, live) = fixture_live(root.path());
+    let (de, nl) = (node(1, "de"), node(2, "nl"));
+    let committed = "unit=inactive\nstage=cleanup\nprogress=100\nresult=committed\n";
+    let transport = |node: &Node| FakeTransport::new(vec![connect_step(node, Ok(())), exec(status_command(OP), committed)]);
+    let (first, second) = (transport(&de), transport(&nl));
+    let scripts = [first.script(), second.script()];
+    let (mut first, mut second) = (Slow::new(first, Duration::from_millis(900)), Slow::new(second, Duration::from_millis(900)));
+    nodes::connect(&mut first, &session.state, &de).await.unwrap();
+    nodes::connect(&mut second, &session.state, &nl).await.unwrap();
+    let operation = || crate::model::Operation { id: OP.into(), ..Default::default() };
+    let mut runs = vec![Run::new(de, &mut first, operation()), Run::new(nl, &mut second, operation())];
+    drive(&mut session, &mut runs).await;
+    assert!(runs.iter().all(|run| matches!(run.outcome, Some(Outcome::Committed))));
+    drop(runs);
+    scripts.iter().for_each(FakeScript::assert_finished);
+    // de answers at 0.9 s, nl at 1.8 s: the line of the first second comes during nl's poll.
+    let lines = live.borrow().clone();
+    let clocks: Vec<&str> = lines.iter().map(|(_, _, text)| text.rsplit(" · ").next().unwrap()).collect();
+    assert_eq!(clocks, ["0:01"], "{lines:#?}");
 }
 
 #[test]
