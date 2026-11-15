@@ -1093,7 +1093,7 @@ exit 0'
     assert_failure
     awg_call 'release_cert() { printf "release %s\n" "$1" >>"$CALLS"; }
         AGENT_DIR="$3"; NODE_DIR="$R/root/essence-node"; OP_MODE=apply; HY2_CERT=true; WARP=""; REMOVE_FEATURES=""
-        RELEASE_CERTS="tg.example:/var/www/tg.example shop.example:/var/www/shop.example"; stage_cleanup'
+        RELEASE_CERTS="tg.example:/var/www/tg.example shop.example:/var/www/shop.example"; stage_cleanup && cleanup_committed'
     assert_success
     grep -qx "release tg.example" "$CALLS"
     if grep -qx "release shop.example" "$CALLS"; then return 1; fi

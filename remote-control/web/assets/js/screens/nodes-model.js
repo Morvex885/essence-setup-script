@@ -366,9 +366,7 @@ function deps(ctx) {
 /**
  * `node shell` в оверлее терминала (`nodes.rs::interactive`).
  * Состояния ноды разрешаются и команда повторяется; `conflict` — терминал
- * этой ноды уже открыт. `telegram menu` на ноде с отсутствующими или
- * устаревшими скриптами отвечает планом загрузки: план показывается
- * (`reviewReply`), после согласия терминал открывается с `--yes --plan-token`.
+ * этой ноды уже открыт.
  */
 export async function interactive(ctx, name) {
   const argv = interactiveArgv(name);

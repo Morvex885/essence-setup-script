@@ -175,7 +175,7 @@ rollback_with() {
     done
     if [[ "$2" == first ]]; then rm "$backup/etc/mtproxy/mtproxy.env"; : >"$backup/etc/mtproxy/mtproxy.env.absent"; fi
     : >"$CALLS"
-    tg_call "TX_PATHS=($1); TX_DEACTIVATED=(${3:-}); telegram_rollback"
+    tg_call "TX_PATHS=($1); TX_DEACTIVATED='${3:-}'; telegram_rollback"
 }
 
 @test "telegram_rollback: первая установка выключает службы, изменённые файлы — перезапуск, чужой откат не трогает" {
@@ -195,6 +195,16 @@ rollback_with() {
     rollback_with "/etc/mihomo/config.yaml /etc/mtproxy/mtproxy.env /etc/tproxy-server/config.json" same
     assert_success
     [[ ! -s "$CALLS" ]]
+}
+
+@test "telegram_rollback: код — код его команд, а не упавшей до отката команды" {
+    mkdir -p "$ROOT/etc/mtproxy" && echo old >"$ROOT/etc/mtproxy/mtproxy.env"
+    # В trap finish откату предшествует упавшая команда (mihomo -t): её код не возвращается.
+    tg_call 'false; TX_PATHS=(); TX_DEACTIVATED=telegram; telegram_rollback; echo "rc=$?"'
+    assert_line "rc=0"
+    stub systemctl '[[ "$1" == restart ]] && exit 5; exit 0'
+    tg_call 'TX_PATHS=(); TX_DEACTIVATED=telegram; telegram_rollback; echo "rc=$?"'
+    assert_line "rc=5"
 }
 
 @test "telegram_rollback: снятие роли в этой операции откатывается — службы снова включаются" {

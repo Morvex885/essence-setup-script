@@ -2171,23 +2171,24 @@ mod tests {
         assert_eq!(ui.notices.len(), 1);
     }
     #[test]
-    fn telegram_enable_offers_profiled_nodes_without_the_role_then_apply() {
+    fn telegram_enable_offers_profiled_nodes_without_the_role_then_applies() {
         for key in ["a", "A"] {
-            let (client, ui) = screen(&mut Telegram, &[key, "1", "bad", "t2.example.com", "y", "0"], vec![
+            let (client, ui) = screen(&mut Telegram, &[key, "1", "bad", "t2.example.com", "0"], vec![
                 tg_list(), step(&["telegram", "set", "--name", "n2", "--domain", "t2.example.com"], ok(json!({"node": "n2", "hostname": "t2.example.com", "tag": false}))),
                 applied("n2"), tg_list(),
             ]);
             let select = ui.views.iter().find(|v| v.title == "Включение Telegram Proxy").unwrap();
             assert_eq!(select.sections[0].iter().map(|i| i.label.clone()).collect::<Vec<_>>(), ["n2  192.0.2.2:22", "Отмена"]);
             assert!(noticed(&ui, DOMAIN_INVALID));
-            assert_eq!(confirms(&ui), 1);
+            assert_eq!(confirms(&ui), 0, "node apply runs at once; its plan is the only question");
             assert!(client.secret_names.iter().all(Vec::is_empty));
         }
-        // Enter cancels the domain; a refused offer applies nothing.
+        // Enter cancels the domain; a refused apply plan applies nothing.
         screen(&mut Telegram, &["a", "1", "", "0"], vec![tg_list(), tg_list()]);
         screen(&mut Telegram, &["a", "0", "0"], vec![tg_list(), tg_list()]);
         screen(&mut Telegram, &["a", "1", "t2.example.com", "n", "0"], vec![
-            tg_list(), step(&["telegram", "set", "--name", "n2", "--domain", "t2.example.com"], ok(json!({"node": "n2", "hostname": "t2.example.com", "tag": false}))), tg_list(),
+            tg_list(), step(&["telegram", "set", "--name", "n2", "--domain", "t2.example.com"], ok(json!({"node": "n2", "hostname": "t2.example.com", "tag": false}))),
+            step(&["node", "apply", "--name", "n2"], plan("confirmation_required", "a")), tg_list(),
         ]);
     }
     #[test]
@@ -2218,16 +2219,17 @@ mod tests {
         assert!(!item_keys(ui.views.iter().find(|v| v.title == "Telegram Proxy: n4").unwrap()).contains(&"u".to_owned()));
         assert!(noticed(&ui, "Неверный выбор."));
         for key in ["m", "M"] {
-            screen(&mut Telegram, &["1", key, "new.example.com", "y", "0", "0"], vec![
+            screen(&mut Telegram, &["1", key, "new.example.com", "0", "0"], vec![
                 tg_list(), tg_list(), step(&["telegram", "set", "--name", "n1", "--domain", "new.example.com"], ok(json!({"node": "n1", "hostname": "new.example.com", "tag": true}))),
                 applied("n1"), tg_list(), tg_list(),
             ]);
         }
         for key in ["u", "U"] {
             let (_, ui) = screen(&mut Telegram, &["1", key, "n", "0", "0"], vec![
-                tg_list(), tg_list(), step(&["telegram", "tag", "--name", "n1", "--clear"], ok(json!({"node": "n1", "tag": false}))), tg_list(), tg_list(),
+                tg_list(), tg_list(), step(&["telegram", "tag", "--name", "n1", "--clear"], ok(json!({"node": "n1", "tag": false}))),
+                step(&["node", "apply", "--name", "n1"], plan("confirmation_required", "a")), tg_list(), tg_list(),
             ]);
-            assert_eq!(confirms(&ui), 1, "the apply offer");
+            assert_eq!(confirms(&ui), 1, "the apply plan, refused");
         }
         for key in ["r", "R"] {
             let restart = argv(&["telegram", "restart", "--name", "n1"]);
@@ -2247,7 +2249,7 @@ mod tests {
     fn telegram_sponsor_tag_is_sent_only_as_the_password_secret() {
         const TAG: &str = "0123456789abcdef0123456789ABCDEF";
         for key in ["g", "G"] {
-            let (client, ui) = screen(&mut Telegram, &["1", key, "not-hex", TAG, "y", "0", "0"], vec![
+            let (client, ui) = screen(&mut Telegram, &["1", key, "not-hex", TAG, "0", "0"], vec![
                 tg_list(), tg_list(), step(&["telegram", "tag", "--name", "n1"], ok(json!({"node": "n1", "tag": true}))), applied("n1"), tg_list(), tg_list(),
             ]);
             assert_eq!(client.secret_names[2], ["password"]);
@@ -2263,11 +2265,11 @@ mod tests {
     fn telegram_rotate_and_remove_go_through_the_plan_then_offer_apply() {
         for key in ["k", "K"] {
             let words = argv(&["telegram", "rotate-secret", "--name", "n1"]);
-            let (_, ui) = screen(&mut Telegram, &["1", key, "y", "y", "0", "0"], vec![
+            let (_, ui) = screen(&mut Telegram, &["1", key, "y", "0", "0"], vec![
                 tg_list(), tg_list(), (words.clone(), plan("confirmation_required", "rot")), (with_yes(&words, "rot"), ok(json!({"node": "n1"}))),
                 applied("n1"), tg_list(), tg_list(),
             ]);
-            assert_eq!(confirms(&ui), 2, "the plan, then the apply offer");
+            assert_eq!(confirms(&ui), 1, "the plan; node apply follows at once");
             // A refused plan is no failure and offers nothing.
             let (_, ui) = screen(&mut Telegram, &["1", key, "n", "0", "0"], vec![tg_list(), tg_list(), (words.clone(), plan("confirmation_required", "rot")), tg_list(), tg_list()]);
             assert!(ui.notices.is_empty());
@@ -2275,11 +2277,11 @@ mod tests {
         for key in ["x", "X"] {
             let words = argv(&["telegram", "remove", "--name", "n1"]);
             let gone = || step(&["node", "list"], ok(tg_nodes(false)));
-            let (_, ui) = screen(&mut Telegram, &["1", key, "y", "y", "0"], vec![
+            let (_, ui) = screen(&mut Telegram, &["1", key, "y", "0"], vec![
                 tg_list(), tg_list(), (words.clone(), plan("confirmation_required", "rm")), (with_yes(&words, "rm"), ok(json!({"node": "n1"}))),
                 applied("n1"), gone(), gone(),
             ]);
-            assert_eq!(confirms(&ui), 2);
+            assert_eq!(confirms(&ui), 1);
             assert_eq!(ui.views.last().unwrap().title, "Telegram Proxy", "the card closes once the role is gone");
         }
     }

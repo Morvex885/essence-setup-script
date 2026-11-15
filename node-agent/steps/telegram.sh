@@ -394,18 +394,18 @@ TG_ROLE_FILES=(/etc/mtproxy/mtproxy.env /etc/tproxy-server/firewall.nft /etc/tpr
 # - файл роли в транзакции и изменён ею (cmp с копией) — перезапуск с прежними;
 # - иначе (откат по чужой причине, файлы роли те же) — ничего.
 telegram_rollback() {
-    local path feature touched=false changed=false
-    for feature in "${TX_DEACTIVATED[@]}"; do
-        [[ "$feature" == telegram ]] || continue
+    local path touched=false changed=false
+    # Явный код: в обработчике trap (finish) голый `return` вернул бы код
+    # команды до trap, сбой хука даёт rollback_failed.
+    if [[ " $TX_DEACTIVATED " == *" telegram "* ]]; then
         if [[ ! -f "$R/etc/mtproxy/mtproxy.env" ]]; then
-            systemctl disable --now "$TG_UNIT_TIMER" "$TG_UNIT_RELAY" "$TG_UNIT_MTPROXY" "$TG_UNIT_FIREWALL"
-            return 0
+            systemctl disable --now "$TG_UNIT_TIMER" "$TG_UNIT_RELAY" "$TG_UNIT_MTPROXY" "$TG_UNIT_FIREWALL"; return $?
         fi
-        systemctl daemon-reload
-        systemctl enable --now "$TG_UNIT_FIREWALL" "$TG_UNIT_MTPROXY" "$TG_UNIT_TIMER" "$TG_UNIT_RELAY"
-        systemctl restart "$TG_UNIT_MTPROXY" "$TG_UNIT_RELAY"
-        return 0
-    done
+        systemctl daemon-reload &&
+            systemctl enable --now "$TG_UNIT_FIREWALL" "$TG_UNIT_MTPROXY" "$TG_UNIT_TIMER" "$TG_UNIT_RELAY" &&
+            systemctl restart "$TG_UNIT_MTPROXY" "$TG_UNIT_RELAY"
+        return $?
+    fi
     for path in "${TG_ROLE_FILES[@]}"; do
         [[ " ${TX_PATHS[*]} " == *" $path "* ]] || continue
         touched=true
@@ -415,13 +415,12 @@ telegram_rollback() {
     done
     [[ "$touched" == true ]] || return 0
     if [[ -e "$OP/backup/etc/mtproxy/mtproxy.env.absent" ]]; then
-        systemctl disable --now "$TG_UNIT_TIMER" "$TG_UNIT_RELAY" "$TG_UNIT_MTPROXY" "$TG_UNIT_FIREWALL"
-        return 0
+        systemctl disable --now "$TG_UNIT_TIMER" "$TG_UNIT_RELAY" "$TG_UNIT_MTPROXY" "$TG_UNIT_FIREWALL"; return $?
     fi
     [[ "$changed" == true ]] || return 0
-    systemctl daemon-reload
-    systemctl restart "$TG_UNIT_MTPROXY" "$TG_UNIT_RELAY"
-    systemctl reload-or-restart "$TG_UNIT_FIREWALL"
+    systemctl daemon-reload &&
+        systemctl restart "$TG_UNIT_MTPROXY" "$TG_UNIT_RELAY" &&
+        systemctl reload-or-restart "$TG_UNIT_FIREWALL"
 }
 
 # Снятие роли до того, как транзакция `config` удалит её файлы: службы
