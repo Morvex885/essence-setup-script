@@ -58,6 +58,8 @@ fn node_view(session: &Session, config: &Config, node: &Node, issues: &[crate::m
         "profile": node.profile, "domain": node.domain, "ports": node.ports,
         "status": crate::server::render::status(config, node),
         "proxies": crate::server::render::proxies(config, node), "warp": warp_state(config, node),
+        "telegram": config.telegram.iter().find(|proxy| proxy.node == node.name)
+            .map(|proxy| json!({"hostname": proxy.hostname, "tag": proxy.tag_mark.is_some()})),
     })
 }
 

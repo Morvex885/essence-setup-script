@@ -1,20 +1,26 @@
-//! Telegram Proxy status evaluation (v1 `_telegram_proxy_status_result`):
-//! the server answers one JSON object; the client adds its own external
-//! reachability checks (HTTPS/TLS of the WEB hostname over IPv4 and IPv6,
-//! TCP/2398 of the MTProto address) and folds everything into one row
-//! code — 0 ok, 3 not installed, 4 degraded. Also the redaction applied to
-//! every server-provided text that reaches a result row or the journal.
+//! Telegram Web Proxy status: one read-only probe on the node (`key=value`
+//! lines: units, readiness, certificate date) plus the operator-side HTTPS
+//! check of the hostname over IPv4 and IPv6, folded into one row code —
+//! 0 ok, 3 not installed, 4 degraded. Also the redaction applied to every
+//! server-provided text that reaches a result row or the journal.
 
+use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::time::Duration;
 
-use serde_json::{Map, Value};
+use crate::nodes::sh_quote;
 
 const UNCHECKED: &str = "не проверено";
-const SERVICE: &[&str] = &["active", "inactive", "failed"];
-const PROBE: &[&str] = &["ok", "failed"];
 
-/// IPv6 reachability of the WEB hostname.
+/// Units of the role, in probe order, with their Russian labels.
+const UNITS: [(&str, &str); 4] = [
+    ("mtproxy", "Служба MTProxy"),
+    ("tproxy-server", "Web Proxy (tproxy-server)"),
+    ("tproxy-firewall", "Межсетевой экран"),
+    ("refresh-mtproxy-config.timer", "Автоматическое обновление"),
+];
+
+/// IPv6 reachability of the hostname.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Ipv6 {
     Ok,
@@ -41,11 +47,9 @@ pub(crate) trait Reach {
     /// `https://<hostname>/` answers without an HTTP error over IPv4 with a
     /// valid certificate, plus the IPv6 verdict.
     async fn https(&self, hostname: &str) -> (bool, Ipv6);
-    /// TCP/2398 accepts a connection within five seconds.
-    async fn mtproto(&self, address: Ipv4Addr) -> bool;
 }
 
-/// Real network checks (v1 used curl, `openssl s_client` and `/dev/tcp`).
+/// Real network checks.
 pub(crate) struct Network;
 
 async fn https_ok(hostname: &str, local: IpAddr) -> bool {
@@ -76,10 +80,26 @@ impl Reach for Network {
         };
         (ipv4, ipv6)
     }
+}
 
-    async fn mtproto(&self, address: Ipv4Addr) -> bool {
-        matches!(tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect((address, 2398))).await, Ok(Ok(_)))
+/// One read-only command: whether the role is installed, the state of each
+/// unit, relay readiness and the certificate expiry of `hostname`.
+pub(crate) fn probe_command(hostname: &str) -> String {
+    let mut command = String::from("[ -f /etc/systemd/system/tproxy-server.service ] && echo installed=yes || echo installed=no\n");
+    for (unit, _) in UNITS {
+        command.push_str(&format!("printf '{unit}=%s\\n' \"$(systemctl is-active {unit} 2>/dev/null)\"\n"));
     }
+    command.push_str("curl -fsS --max-time 5 -o /dev/null http://127.0.0.1:8081/readyz 2>/dev/null && echo readiness=ok || echo readiness=failed\n");
+    command.push_str(&format!("printf 'certificate=%s\\n' \"$(openssl x509 -enddate -noout -in {} 2>/dev/null | cut -d= -f2)\"\ntrue",
+        sh_quote(&format!("/etc/nginx/ssl/{hostname}/fullchain.pem"))));
+    command
+}
+
+/// `key=value` lines of the probe.
+pub(crate) fn parse_probe(stdout: &[u8]) -> BTreeMap<String, String> {
+    String::from_utf8_lossy(stdout).lines()
+        .filter_map(|line| line.trim_end_matches('\r').split_once('='))
+        .map(|(key, value)| (key.to_owned(), value.to_owned())).collect()
 }
 
 /// Evaluated status of one node.
@@ -90,130 +110,42 @@ pub(crate) struct Evaluation {
     pub summary: Vec<String>,
 }
 
-fn observation<'a>(json: &'a Map<String, Value>, key: &str, allowed: &[&str]) -> &'a str {
-    let value = match json.get(key) {
-        Some(Value::String(value)) => value.as_str(),
-        Some(Value::Bool(true)) => "true",
-        Some(Value::Bool(false)) => "false",
-        _ => "",
-    };
-    if !value.is_empty() && allowed.contains(&value) { value } else { UNCHECKED }
-}
-
-fn human(value: &str) -> &'static str {
-    match value {
+fn unit_human(state: &str) -> &'static str {
+    match state {
         "active" => "работает",
         "inactive" => "остановлена",
-        "failed" | "FAILED" => "ошибка",
-        "ok" | "OK" => "успешно",
-        "true" => "доступен",
-        "false" => "недоступен",
-        "current" => "актуален",
-        "changed" => "изменился — обновите IP",
-        "NOT_PRESENT" => "отсутствует",
+        "failed" => "ошибка",
+        "activating" | "reloading" => "запускается",
         _ => UNCHECKED,
     }
 }
 
-fn first_string<'a>(json: &'a Map<String, Value>, keys: &[&str]) -> Option<&'a str> {
-    keys.iter().find_map(|key| json.get(*key).and_then(Value::as_str))
-}
-
-fn valid_hostname(hostname: &str) -> bool {
-    (1..=253).contains(&hostname.len()) && hostname.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
-}
-
-/// Exactly one JSON object, nothing else (v1 `_telegram_proxy_status_object`):
-/// noisy or malformed output is a failure, never a healthy node.
-pub(crate) fn status_object(stdout: &[u8]) -> Option<Map<String, Value>> {
-    let mut values = serde_json::Deserializer::from_slice(stdout).into_iter::<Value>();
-    let first = values.next()?.ok()?;
-    if values.next().is_some() {
-        return None;
+/// Fold the probe and the external check of `hostname` into a row.
+pub(crate) async fn evaluate<R: Reach>(probe: &BTreeMap<String, String>, hostname: &str, reach: &R) -> Evaluation {
+    let value = |key: &str| probe.get(key).map(String::as_str).unwrap_or_default();
+    if value("installed") == "no" {
+        return Evaluation { code: 3, reason: Some("не установлен: выполните node apply".into()),
+            summary: vec!["Состояние на ноде: Web Proxy не установлен.".into()] };
     }
-    match first {
-        Value::Object(object) => Some(object),
-        _ => None,
-    }
-}
-
-/// `None` is a protocol error: flags missing or inconsistent with the exit code.
-pub(crate) async fn evaluate<R: Reach>(json: &Map<String, Value>, server_rc: u32, reach: &R) -> Option<Evaluation> {
-    let flag = |key: &str| json.get(key).and_then(Value::as_bool);
-    let (installed, web, mtproto) = (flag("installed")?, flag("web_enabled")?, flag("mtproto_enabled")?);
-    let services = [observation(json, "backend", SERVICE), observation(json, "firewall", SERVICE), observation(json, "timer", SERVICE)];
-    let mut summary = vec![
-        "Состояние на ноде:".to_owned(),
-        format!("  Служба MTProxy: {}", human(services[0])),
-        format!("  Межсетевой экран: {}", human(services[1])),
-        format!("  Автоматическое обновление: {}", human(services[2])),
-    ];
-    if server_rc == 3 {
-        if installed || web || mtproto {
-            return None;
-        }
-        summary.extend(["  Web Proxy: выключен", "  MTProto Proxy: выключен", "Внешняя доступность:",
-            "  Web Proxy: не проверено (выключен)", "  MTProto Proxy: не проверено (выключен)"].map(str::to_owned));
-        return Some(Evaluation { code: 3, reason: Some("не установлен".into()), summary });
-    }
-    if server_rc != 0 || !installed || !(web || mtproto) {
-        return None;
-    }
-    let (mut degraded, mut unverified) = (false, false);
-    let mut mark = |state: &str| {
+    let (mut degraded, mut unverified) = (value("installed") != "yes", false);
+    let mut summary = vec!["Состояние на ноде:".to_owned()];
+    for (unit, label) in UNITS {
+        let state = value(unit);
         degraded |= matches!(state, "inactive" | "failed");
-        unverified |= state == UNCHECKED;
-    };
-    services.iter().for_each(|state| mark(state));
-    let mut external = Vec::new();
-    if web {
-        let checks = [observation(json, "relay", SERVICE), observation(json, "health", PROBE), observation(json, "readiness", PROBE)];
-        summary.push(format!("  Web Proxy: включён; служба: {}; проверка работы: {}; готовность: {}",
-            human(checks[0]), human(checks[1]), human(checks[2])));
-        checks.iter().for_each(|state| mark(state));
-        match first_string(json, &["web_hostname", "hostname"]).filter(|hostname| valid_hostname(hostname)) {
-            Some(hostname) => {
-                let (ipv4, ipv6) = reach.https(hostname).await;
-                degraded |= !ipv4 || ipv6 == Ipv6::Failed;
-                unverified |= ipv6 == Ipv6::Unverified;
-                let verdict = if ipv4 { "успешно" } else { "недоступен" };
-                external.push(format!("  Web Proxy: HTTPS/TLS {verdict}; IPv6: {}", ipv6.human()));
-            }
-            None => {
-                unverified = true;
-                external.push(format!("  Web Proxy: HTTPS/TLS {UNCHECKED}; IPv6: {UNCHECKED}"));
-            }
-        }
-    } else {
-        summary.push("  Web Proxy: выключен".into());
-        external.push("  Web Proxy: не проверено (выключен)".into());
+        unverified |= unit_human(state) == UNCHECKED;
+        summary.push(format!("  {label}: {}", unit_human(state)));
     }
-    if mtproto {
-        let listener = observation(json, "mtproto_listener", &["true", "false"]);
-        let ip_state = match observation(json, "mtproto_ip_state", &["current", "changed", "unknown"]) {
-            "unknown" => UNCHECKED,
-            state => state,
-        };
-        summary.push(format!("  MTProto Proxy: включён; приём подключений: {}; IPv4: {}", human(listener), human(ip_state)));
-        degraded |= listener == "false" || ip_state == "changed";
-        unverified |= listener == UNCHECKED || ip_state == UNCHECKED;
-        match first_string(json, &["mtproto_ipv4", "mtproto_ip"]).and_then(|ip| ip.parse::<Ipv4Addr>().ok()) {
-            Some(address) => {
-                let reachable = reach.mtproto(address).await;
-                degraded |= !reachable;
-                external.push(format!("  MTProto Proxy: TCP/2398 {}", if reachable { "успешно" } else { "недоступен" }));
-            }
-            None => {
-                unverified = true;
-                external.push(format!("  MTProto Proxy: TCP/2398 {UNCHECKED}"));
-            }
-        }
-    } else {
-        summary.push("  MTProto Proxy: выключен".into());
-        external.push("  MTProto Proxy: не проверено (выключен)".into());
-    }
+    let ready = value("readiness") == "ok";
+    degraded |= !ready;
+    summary.push(format!("  Готовность Web Proxy: {}", if ready { "успешно" } else { "ошибка" }));
+    let certificate = value("certificate");
+    summary.push(format!("  Сертификат {hostname}: {}", if certificate.is_empty() { "не найден" } else { certificate }));
+    degraded |= certificate.is_empty();
+    let (ipv4, ipv6) = reach.https(hostname).await;
+    degraded |= !ipv4 || ipv6 == Ipv6::Failed;
+    unverified |= ipv6 == Ipv6::Unverified;
     summary.push("Внешняя доступность:".into());
-    summary.extend(external);
+    summary.push(format!("  HTTPS/TLS {hostname}: {}; IPv6: {}", if ipv4 { "успешно" } else { "недоступен" }, ipv6.human()));
     let unchecked = "не проверено: часть проверок не выполнена";
     let (code, reason) = match (degraded, unverified) {
         (true, true) => (4, Some(format!("неисправность на ноде или внешняя недоступность; {unchecked}"))),
@@ -221,7 +153,7 @@ pub(crate) async fn evaluate<R: Reach>(json: &Map<String, Value>, server_rc: u32
         (false, true) => (0, Some(unchecked.to_owned())),
         (false, false) => (0, None),
     };
-    Some(Evaluation { code, reason, summary })
+    Evaluation { code, reason, summary }
 }
 
 const KEYS: [&str; 9] = ["secret", "tag", "bridge", "query", "header", "credential", "token", "password", "uuid"];
@@ -310,20 +242,17 @@ pub(crate) fn plain(line: &str) -> String {
 pub(crate) mod tests {
     use std::cell::RefCell;
 
-    use serde_json::json;
-
     use super::*;
 
     /// Scripted reachability: records every check it was asked for.
     pub(crate) struct FakeReach {
         pub https: (bool, Ipv6),
-        pub mtproto: bool,
         pub calls: RefCell<Vec<String>>,
     }
 
     impl FakeReach {
-        pub(crate) fn new(https: (bool, Ipv6), mtproto: bool) -> Self {
-            Self { https, mtproto, calls: RefCell::default() }
+        pub(crate) fn new(https: (bool, Ipv6)) -> Self {
+            Self { https, calls: RefCell::default() }
         }
     }
 
@@ -332,78 +261,57 @@ pub(crate) mod tests {
             self.calls.borrow_mut().push(format!("https:{hostname}"));
             self.https
         }
-        async fn mtproto(&self, address: Ipv4Addr) -> bool {
-            self.calls.borrow_mut().push(format!("mtproto:{address}"));
-            self.mtproto
-        }
     }
 
-    fn object(value: Value) -> Map<String, Value> {
-        value.as_object().unwrap().clone()
-    }
+    pub(crate) const HEALTHY: &str = "installed=yes\nmtproxy=active\ntproxy-server=active\ntproxy-firewall=active\n\
+        refresh-mtproxy-config.timer=active\nreadiness=ok\ncertificate=Feb  1 00:00:00 2027 GMT\n";
 
-    fn run(json: Value, rc: u32, reach: &FakeReach) -> Option<Evaluation> {
-        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(evaluate(&object(json), rc, reach))
+    fn run(stdout: &str, reach: &FakeReach) -> Evaluation {
+        tokio::runtime::Builder::new_current_thread().build().unwrap()
+            .block_on(evaluate(&parse_probe(stdout.as_bytes()), "tg.example.com", reach))
     }
 
     #[test]
-    fn protocol_requires_consistent_boolean_flags() {
-        let reach = FakeReach::new((true, Ipv6::Ok), true);
-        for invalid in [json!({}), json!({"installed": "true", "web_enabled": false, "mtproto_enabled": false})] {
-            assert_eq!(run(invalid, 0, &reach), None);
+    fn probe_lists_units_readiness_and_certificate() {
+        let command = probe_command("tg.example.com");
+        for part in ["systemctl is-active mtproxy ", "systemctl is-active refresh-mtproxy-config.timer ",
+            "http://127.0.0.1:8081/readyz", "-in '/etc/nginx/ssl/tg.example.com/fullchain.pem'"] {
+            assert!(command.contains(part), "{part} in {command}");
         }
-        assert_eq!(run(json!({"installed": true, "web_enabled": false, "mtproto_enabled": false}), 0, &reach), None);
-        assert_eq!(run(json!({"installed": false, "web_enabled": false, "mtproto_enabled": false}), 0, &reach), None);
-        assert_eq!(run(json!({"installed": false, "web_enabled": false, "mtproto_enabled": true}), 3, &reach), None);
-        let absent = run(json!({"installed": false, "web_enabled": false, "mtproto_enabled": false, "backend": "inactive"}), 3, &reach).unwrap();
-        assert_eq!((absent.code, absent.reason.as_deref()), (3, Some("не установлен")));
-        assert_eq!(absent.summary[1], "  Служба MTProxy: остановлена");
-        assert!(reach.calls.borrow().is_empty(), "absent installation never probes endpoints");
-        assert_eq!(status_object(b"{\"a\":1}\n{\"b\":2}"), None);
-        assert_eq!(status_object(b"noise {\"a\":1}"), None);
-        assert_eq!(status_object(b"[1]"), None);
-        assert_eq!(status_object(b" {\"a\":1}\n"), Some(object(json!({"a": 1}))));
+        assert!(!command.contains("2398"));
+        assert_eq!(parse_probe(b"a=1\r\nnoise\nb=x=y\n"), BTreeMap::from([("a".into(), "1".into()), ("b".into(), "x=y".into())]));
     }
 
     #[test]
-    fn degraded_unverified_and_healthy_verdicts() {
-        let healthy = json!({"installed": true, "web_enabled": true, "mtproto_enabled": true, "backend": "active",
-            "firewall": "active", "timer": "active", "relay": "active", "health": "ok", "readiness": "ok",
-            "web_hostname": "web.example.com", "mtproto_ipv4": "203.0.113.4", "mtproto_listener": true, "mtproto_ip_state": "current"});
-        let reach = FakeReach::new((true, Ipv6::NotPresent), true);
-        let ok = run(healthy.clone(), 0, &reach).unwrap();
-        assert_eq!((ok.code, ok.reason), (0, None));
-        assert_eq!(*reach.calls.borrow(), ["https:web.example.com", "mtproto:203.0.113.4"]);
+    fn verdicts() {
+        let reach = FakeReach::new((true, Ipv6::NotPresent));
+        let ok = run(HEALTHY, &reach);
+        assert_eq!((ok.code, ok.reason.as_deref()), (0, None));
+        assert_eq!(*reach.calls.borrow(), ["https:tg.example.com"]);
         assert_eq!(ok.summary, [
-            "Состояние на ноде:", "  Служба MTProxy: работает", "  Межсетевой экран: работает", "  Автоматическое обновление: работает",
-            "  Web Proxy: включён; служба: работает; проверка работы: успешно; готовность: успешно",
-            "  MTProto Proxy: включён; приём подключений: доступен; IPv4: актуален",
-            "Внешняя доступность:", "  Web Proxy: HTTPS/TLS успешно; IPv6: отсутствует", "  MTProto Proxy: TCP/2398 успешно",
+            "Состояние на ноде:", "  Служба MTProxy: работает", "  Web Proxy (tproxy-server): работает",
+            "  Межсетевой экран: работает", "  Автоматическое обновление: работает", "  Готовность Web Proxy: успешно",
+            "  Сертификат tg.example.com: Feb  1 00:00:00 2027 GMT", "Внешняя доступность:",
+            "  HTTPS/TLS tg.example.com: успешно; IPv6: отсутствует",
         ]);
-        let mut stopped = healthy.clone();
-        stopped["backend"] = json!("inactive");
-        assert_eq!(run(stopped, 0, &reach).unwrap().code, 4);
-        let failed_v6 = run(healthy.clone(), 0, &FakeReach::new((true, Ipv6::Failed), true)).unwrap();
-        assert_eq!(failed_v6.code, 4);
-        let unverified = run(healthy.clone(), 0, &FakeReach::new((true, Ipv6::Unverified), true)).unwrap();
+        let absent = run("installed=no\n", &FakeReach::new((true, Ipv6::Ok)));
+        assert_eq!(absent.code, 3);
+        assert_eq!(run(&HEALTHY.replace("mtproxy=active", "mtproxy=failed"), &reach).code, 4);
+        assert_eq!(run(&HEALTHY.replace("readiness=ok", "readiness=failed"), &reach).code, 4);
+        assert_eq!(run(HEALTHY, &FakeReach::new((false, Ipv6::Ok))).code, 4);
+        assert_eq!(run(HEALTHY, &FakeReach::new((true, Ipv6::Failed))).code, 4);
+        let unverified = run(HEALTHY, &FakeReach::new((true, Ipv6::Unverified)));
         assert_eq!((unverified.code, unverified.reason.as_deref()), (0, Some("не проверено: часть проверок не выполнена")));
-        let mut changed = healthy;
-        changed["mtproto_ip_state"] = json!("changed");
-        changed["timer"] = json!("bogus");
-        let both = run(changed, 0, &reach).unwrap();
-        assert_eq!(both.code, 4);
-        assert_eq!(both.reason.as_deref(), Some("неисправность на ноде или внешняя недоступность; не проверено: часть проверок не выполнена"));
-        let web_only = run(json!({"installed": true, "web_enabled": true, "mtproto_enabled": false, "backend": "inactive",
-            "firewall": "active", "timer": "active", "relay": "active", "health": "ok", "readiness": "ok", "web_hostname": "web.example.com"}),
-            0, &FakeReach::new((true, Ipv6::Ok), false)).unwrap();
-        assert_eq!(web_only.code, 4, "an inactive backend degrades WEB-only installs too");
+        let noisy = run(&HEALTHY.replace("tproxy-firewall=active", "tproxy-firewall=bogus"), &reach);
+        assert_eq!((noisy.code, noisy.reason.as_deref()), (0, Some("не проверено: часть проверок не выполнена")));
+        assert_eq!(run("garbage", &reach).code, 4, "an unreadable probe is never healthy");
     }
 
     #[test]
     fn redaction_and_plain_lines() {
         let secret = "0123456789abcdef0123456789abcdef";
         assert_eq!(redact(&format!("secret={secret} ok")), "secret=[REDACTED] ok");
-        assert_eq!(redact(&format!("tg://proxy?server=a&port=2398&secret=ee{secret}&x=1")), "tg://proxy?server=a&port=2398&secret=[REDACTED]&x=1");
+        assert_eq!(redact(&format!("tg://webproxy?server=a&port=443&secret={secret}&x=1")), "tg://webproxy?server=a&port=443&secret=[REDACTED]&x=1");
         assert_eq!(redact("\"password\": \"hunter2\", user"), "\"password\": \"[REDACTED]\", user");
         assert_eq!(redact(&format!("raw {secret}.")), "raw [REDACTED].");
         assert_eq!(redact("Token: abc,def"), "Token: [REDACTED],def");

@@ -219,9 +219,7 @@ fn terminal_requests_need_a_terminal_field_and_a_known_node() {
     assert!(ok(&conn.request("open", &["session", "open"], json!({})).1));
     let (_, plain) = conn.request("plain", &["node", "shell", "--name", "ghost"], json!({}));
     assert_eq!((code(&plain), plain["error"]["message"].clone(), plain["exit"].clone()),
-        ("tty_required", json!("Меню сервера требует терминала."), json!(2)), "{plain}");
-    let (_, menu) = conn.request("menu", &["telegram", "menu", "--name", "ghost"], json!({}));
-    assert_eq!(menu["error"]["message"], "Меню Telegram Proxy требует терминала.");
+        ("tty_required", json!("Оболочке ноды нужен терминал."), json!(2)), "{plain}");
     conn.send(&json!({"id": "term", "argv": ["node", "shell", "--name", "ghost"], "terminal": {"term": "xterm", "cols": 80, "rows": 24}}));
     let (events, reply) = conn.reply("term", Duration::from_secs(30));
     assert_eq!(code(&reply), "not_found", "{reply}");

@@ -88,10 +88,15 @@ pub fn secret_value_valid(id: &str, value: &str) -> bool {
         Some("reality-key") => value.len() == 43
             && value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
         Some("awg-key" | "warp-key") => wg_key_valid(value),
-        Some("telegram-secret" | "telegram-tag") => value.len() == 32 && value.bytes().all(|b| b.is_ascii_hexdigit()),
+        Some("telegram-secret" | "telegram-tag") => telegram_hex_valid(value),
         Some("warp-license") => warp_license_valid(value),
         _ => !value.is_empty() && !value.contains('\0'),
     }
+}
+
+/// A Telegram Proxy secret or sponsor tag: 32 hex digits.
+pub fn telegram_hex_valid(value: &str) -> bool {
+    value.len() == 32 && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// A WireGuard key: 32 bytes in padded standard base64 (44 characters).

@@ -18,25 +18,48 @@ pub const SUB_LIMIT_PATH: &str = "/etc/nginx/conf.d/essence-sub-limit.conf";
 pub const SUB_CLEANUP_PATH: &str = "/usr/local/bin/essence-sub-cleanup";
 pub const SUB_CLEANUP_SERVICE_PATH: &str = "/etc/systemd/system/essence-sub-cleanup.service";
 pub const SUB_CLEANUP_TIMER_PATH: &str = "/etc/systemd/system/essence-sub-cleanup.timer";
-const SUB_MARKER: &str = ".essence-sub";
 
-/// Empty marker in the subscription webroot: the applied file set names the
-/// hostname whose certificate goes when the host moves.
-pub fn sub_marker(hostname: &str) -> String {
-    format!("/var/www/{hostname}/{SUB_MARKER}")
+/// Telegram Web Proxy files (`telegram-proxy.sh`); the role directories are
+/// created by `node-agent/steps/telegram.sh`.
+pub const TG_SITE: &str = "essence-telegram-proxy";
+pub const TG_ENV_PATH: &str = "/etc/mtproxy/mtproxy.env";
+pub const TG_FIREWALL_PATH: &str = "/etc/tproxy-server/firewall.nft";
+pub const TG_CONFIG_PATH: &str = "/etc/tproxy-server/config.json";
+pub const TG_PROFILES_PATH: &str = "/etc/tproxy-server/profiles.json";
+
+/// A role that owns a certificate of its own hostname.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role { Sub, Telegram }
+
+impl Role {
+    fn marker(self) -> &'static str {
+        match self {
+            Self::Sub => ".essence-sub",
+            Self::Telegram => ".essence-telegram",
+        }
+    }
 }
 
-/// The hostname of a subscription webroot marker path.
-pub fn sub_marker_host(path: &str) -> Option<&str> {
-    path.strip_prefix("/var/www/")?.strip_suffix(SUB_MARKER)?.strip_suffix('/').filter(|host| domain_valid(host))
+/// Empty marker in a role's webroot: the applied file set names the
+/// hostname whose certificate goes when the role moves.
+pub fn role_marker(role: Role, hostname: &str) -> String {
+    format!("/var/www/{hostname}/{}", role.marker())
+}
+
+/// The hostname of a role webroot marker path.
+pub fn marker_host(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("/var/www/")?;
+    [Role::Sub, Role::Telegram].into_iter().find_map(|role| rest.strip_suffix(role.marker()))?
+        .strip_suffix('/').filter(|host| domain_valid(host))
 }
 
 /// A path the renderer can record in `applied.files`.
 pub fn managed_file(path: &str) -> bool {
     matches!(path, MIHOMO_CONFIG_PATH | MIHOMO_SERVICE_PATH | SYSCTL_PATH | STREAM_PATH | AWG_CONF_PATH | SUB_LIMIT_PATH
-        | SUB_CLEANUP_PATH | SUB_CLEANUP_SERVICE_PATH | SUB_CLEANUP_TIMER_PATH)
-        || path.strip_prefix(SITES_AVAILABLE).is_some_and(|site| site == SUB_SITE || domain_valid(site))
-        || sub_marker_host(path).is_some()
+        | SUB_CLEANUP_PATH | SUB_CLEANUP_SERVICE_PATH | SUB_CLEANUP_TIMER_PATH | TG_ENV_PATH | TG_FIREWALL_PATH
+        | TG_CONFIG_PATH | TG_PROFILES_PATH)
+        || path.strip_prefix(SITES_AVAILABLE).is_some_and(|site| site == SUB_SITE || site == TG_SITE || domain_valid(site))
+        || marker_host(path).is_some()
 }
 
 #[cfg(test)]
@@ -47,12 +70,15 @@ mod tests {
     fn only_rendered_paths_are_managed() {
         for path in [MIHOMO_CONFIG_PATH, MIHOMO_SERVICE_PATH, SYSCTL_PATH, STREAM_PATH, AWG_CONF_PATH, SUB_LIMIT_PATH,
             SUB_CLEANUP_PATH, SUB_CLEANUP_SERVICE_PATH, SUB_CLEANUP_TIMER_PATH, "/etc/nginx/sites-available/essence-sub",
-            "/var/www/sub.example.com/.essence-sub", "/etc/nginx/sites-available/de.example.com"] {
+            "/var/www/sub.example.com/.essence-sub", "/etc/nginx/sites-available/de.example.com", TG_ENV_PATH,
+            TG_FIREWALL_PATH, TG_CONFIG_PATH, TG_PROFILES_PATH, "/etc/nginx/sites-available/essence-telegram-proxy",
+            "/var/www/tg.example.com/.essence-telegram"] {
             assert!(managed_file(path), "{path}");
         }
         for path in ["/", "/etc", "/root/.ssh", "/etc/mihomo", "/etc/nginx/sites-available/../../../home",
             "/etc/nginx/sites-available/a b", "/etc/nginx/sites-available/", "/etc/nginx/sites-enabled/de.example.com",
-            "/etc/mihomo/config.yaml\n/etc", "/var/www/../.essence-sub", "/var/www/a/b/.essence-sub", "/var/www/x.essence-sub"] {
+            "/etc/mihomo/config.yaml\n/etc", "/var/www/../.essence-sub", "/var/www/a/b/.essence-sub", "/var/www/x.essence-sub",
+            "/etc/tproxy-server/token.key", "/etc/mtproxy/proxy-secret"] {
             assert!(!managed_file(path), "{path:?}");
         }
     }

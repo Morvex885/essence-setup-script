@@ -43,7 +43,7 @@ const fn spec(noun: &'static str, verb: &'static str, tokens: &'static str,
 }
 
 const VAULT: &[&str] = &["vault-password", "new-vault-password"];
-const TELEGRAM: &str = "name+ all component=";
+const TELEGRAM: &str = "name+ all";
 /// Listener flags of `web start` (and, after `--web`, of `daemon run|start`).
 const WEB: &str = "bind= port= tls-cert= tls-key= no-tls";
 /// `daemon run|start`: the listener and the data directory (`--data-dir`
@@ -125,14 +125,13 @@ static CATALOG: &[Spec] = &[
     spec("conn", "set", "name= assign+", &[], 0),
     spec("conn", "sync", "name=", &[], 0),
     spec("telegram", "status", TELEGRAM, &[], 0),
-    spec("telegram", "install", TELEGRAM, &[], 0),
-    spec("telegram", "refresh-ip", TELEGRAM, &[], 0),
-    spec("telegram", "web-update", TELEGRAM, &[], 0),
-    spec("telegram", "web-restart", TELEGRAM, &[], 0),
-    spec("telegram", "backend-restart", TELEGRAM, &[], 0),
-    spec("telegram", "remove", TELEGRAM, &[], 0),
-    spec("telegram", "remove-all", TELEGRAM, &[], 0),
-    spec("telegram", "menu", "name=", &[], TTY),
+    spec("telegram", "set", "name= domain=", &[], 0),
+    spec("telegram", "remove", "name=", &[], 0),
+    spec("telegram", "link", "name=", &[], 0),
+    spec("telegram", "rotate-secret", "name=", &[], 0),
+    spec("telegram", "tag", "name= clear", &["password"], 0),
+    spec("telegram", "restart", "name=", &[], 0),
+    spec("telegram", "diagnostics", "name=", &[], 0),
     spec("group", "list", "", &[], 0),
     spec("group", "add", "name= template=", &[], 0),
     spec("group", "delete", "name=", &[], 0),
@@ -285,15 +284,14 @@ static HELP: &[(&str, &[(&str, &str)])] = &[
         ("subscription revoke --name C [--yes]", "Отозвать подписку"),
     ]),
     ("telegram", &[
-        ("telegram status [--name N… | --all]", "Состояние Telegram Proxy"),
-        ("telegram install (--name N… | --all) [--yes]", "Действия Telegram Proxy: установить"),
-        ("telegram refresh-ip (--name N… | --all) [--yes]", "Действия Telegram Proxy: обновить IP"),
-        ("telegram web-update (--name N… | --all) [--yes]", "Действия Telegram Proxy: обновить веб-часть"),
-        ("telegram web-restart (--name N… | --all) [--yes]", "Действия Telegram Proxy: перезапустить веб-часть"),
-        ("telegram backend-restart (--name N… | --all) [--yes]", "Действия Telegram Proxy: перезапустить backend"),
-        ("telegram remove --component web|mtproto (--name N… | --all) [--yes]", "Удалить компонент Telegram Proxy"),
-        ("telegram remove-all (--name N… | --all) [--yes]", "Удалить Telegram Proxy целиком"),
-        ("telegram menu --name N [--yes]", "Серверное меню Telegram Proxy одной ноды (нужен терминал)"),
+        ("telegram status [--name N… | --all]", "Состояние Telegram Web Proxy (по умолчанию — все ноды с ролью)"),
+        ("telegram set --name N --domain D", "Включить Telegram Web Proxy на ноде или сменить домен (затем node apply)"),
+        ("telegram remove --name N [--yes]", "Убрать Telegram Web Proxy с ноды (затем node apply)"),
+        ("telegram link --name N", "Ссылка подключения tg://webproxy (с секретом)"),
+        ("telegram rotate-secret --name N [--yes]", "Новый секрет: прежние ссылки перестанут работать (затем node apply)"),
+        ("telegram tag --name N [--clear]", "Спонсорский тег (секрет password, 32 hex; затем node apply)"),
+        ("telegram restart --name N", "Перезапустить MTProxy и tproxy-server"),
+        ("telegram diagnostics --name N", "Журналы служб за 30 минут и метрики Web Proxy"),
     ]),
     ("template", &[
         ("template list", "Список шаблонов"),
@@ -423,7 +421,7 @@ impl Invocation {
         self.session
     }
 
-    /// `!tty` commands need an interactive console (`node shell`, `telegram menu`).
+    /// `!tty` commands need an interactive console (`node shell`).
     pub fn requires_tty(&self) -> bool {
         self.tty
     }

@@ -238,6 +238,7 @@ async fn host_sets_shows_and_removes_the_record_without_connecting() {
         ([&set[..], &["sub.example.com", "--port", "0"]].concat(), "invalid"),
         ([&set[..], &["sub.example.com", "--port", "8445"]].concat(), "invalid"),
         ([&set[..], &["new.example.com"]].concat(), "invalid"),
+        ([&set[..], &["NEW.Example.com"]].concat(), "invalid"),
         (vec!["subscription", "host", "--name", "ghost", "--domain", "sub.example.com"], "not_found"),
     ] {
         assert_eq!(run(&mut session, &none, &argv).await.unwrap_err().code, code, "{argv:?}");

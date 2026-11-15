@@ -3,16 +3,18 @@
 //! next to its `MANIFEST` (`sha256sum` format), so another RC version simply
 //! uses another directory and a damaged copy fails `sha256sum -c`.
 
+use std::path::Path;
 use std::sync::LazyLock;
+use std::{fs, io};
 
 use include_dir::{Dir, include_dir};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
-use crate::bundle::{COMMON, write_file};
 use crate::error::Result;
 
 static AGENT: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../node-agent");
+static COMMON: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../common");
 
 /// Libraries of `common/` the executor sources.
 const COMMON_FILES: [&str; 2] = ["common.sh", "cert.sh"];
@@ -77,6 +79,18 @@ pub fn materialize_agent() -> Result<TempDir> {
     }
     write_file(&directory.path().join("MANIFEST"), manifest().as_bytes())?;
     Ok(directory)
+}
+
+/// Write one executor file; shell files are 0700 on Unix (the upload keeps
+/// modes, Windows has no executable bit and the transport sets it).
+fn write_file(path: &Path, contents: &[u8]) -> io::Result<()> {
+    fs::write(path, contents)?;
+    #[cfg(unix)]
+    if path.extension().is_some_and(|extension| extension == "sh") {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

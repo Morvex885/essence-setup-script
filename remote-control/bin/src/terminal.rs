@@ -1,5 +1,5 @@
 //! Console access for the one-shot CLI and the menu: hidden secret input and
-//! the raw terminal of interactive commands (`node shell`, `telegram menu`).
+//! the raw terminal of interactive commands (`node shell`).
 //!
 //! Cross-platform through crossterm raw mode on the controlling console
 //! (Unix `/dev/tty`, Windows console API — never `/dev/tty` paths on Windows).

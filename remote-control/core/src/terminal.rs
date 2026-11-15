@@ -1,18 +1,17 @@
-//! Terminal jobs: `node shell` and `telegram menu` split into a preparation
-//! inside the session (lookup, connect, script checks, journal) and a run on
-//! the requester's console that needs no session. The daemon prepares in its
-//! core thread and runs the job on a terminal thread.
+//! Terminal jobs: `node shell` split into a preparation inside the session
+//! (lookup, connect, journal) and a run on the requester's console that
+//! needs no session. The daemon prepares in its core thread and runs the
+//! job on a terminal thread.
 
 use serde_json::{Value, json};
 
 use crate::error::{RcError, Result};
 use crate::transport::{PtyRequest, RawConsole, RemoteTransport};
 
-/// `tty_required` for a command that needs a console (`node shell`,
-/// `telegram menu`) but the request carried none.
-pub fn tty_required(noun: &str) -> RcError {
-    let message = if noun == "telegram" { "Меню Telegram Proxy требует терминала." } else { "Меню сервера требует терминала." };
-    RcError::new("tty_required", message)
+/// `tty_required` for a command that needs a console (`node shell`) but the
+/// request carried none.
+pub fn tty_required() -> RcError {
+    RcError::new("tty_required", "Оболочке ноды нужен терминал.")
 }
 
 /// A connected remote command waiting for a console.
@@ -56,10 +55,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tty_required_names_the_menu() {
-        let node = tty_required("node");
-        assert_eq!((node.code, node.message.as_str(), node.exit_code()), ("tty_required", "Меню сервера требует терминала.", 2));
-        assert_eq!(tty_required("telegram").message, "Меню Telegram Proxy требует терминала.");
+    fn tty_required_names_the_node_shell() {
+        let node = tty_required();
+        assert_eq!((node.code, node.message.as_str(), node.exit_code()), ("tty_required", "Оболочке ноды нужен терминал.", 2));
     }
 
     #[test]

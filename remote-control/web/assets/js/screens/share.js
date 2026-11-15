@@ -1,9 +1,11 @@
 // Окна с QR-кодом: ссылка подписки (`clients.rs::share`, `share_view`): URL,
-// срок, заголовки, curl, JSON и QR-код; конфиг AmneziaWG клиента на ноде.
-// Разметка окон — здесь; данные — `shareModel`, `awgConfigFlow`.
+// срок, заголовки, curl, JSON и QR-код; конфиг AmneziaWG клиента на ноде;
+// ссылка Telegram Proxy (`tg://webproxy…`, с секретом — нигде не пишется).
+// Разметка окон — здесь; данные — `shareModel`, `awgConfigFlow`, `telegramLink`.
 import { html, useEffect, useRef, useState } from '../../vendor/preact-htm.js';
 import { Button, CopyButton, downloadText } from '../ui.js';
 import { awgConfigFile, awgConfigFlow, fetchData, shareModel } from './clients-model.js';
+import { telegramLink } from './nodeops-model.js';
 
 /** QR-код текста на `<canvas>`; без `window.qrcode` или при сбое — не рисуется. */
 function QrCode({ text, label = 'QR-код ссылки подписки' }) {
@@ -89,4 +91,21 @@ export async function showAwgConfig(ctx, name) {
     title: `AmneziaWG: ${name} — ${result.node}`, wide: true,
     body: html`<${AwgConfigView} name=${name} node=${result.node} config=${result.config} />`,
   });
+}
+
+/** Окно ссылки Telegram Proxy: ссылка, копирование и QR. */
+function TelegramLinkView({ link }) {
+  return html`<div class="share">
+    <div class="share-label">Ссылка</div>
+    <div class="share-value mono">${link}</div>
+    <div class="row"><${CopyButton} text=${link} label="Копировать ссылку" kind="primary" /></div>
+    <${QrCode} text=${link} label="QR-код ссылки Telegram Proxy" />
+  </div>`;
+}
+
+/** «Ссылка» Telegram Proxy: `telegram link` и окно ссылки. */
+export async function showTelegramLink(ctx, name) {
+  const link = await telegramLink(ctx, name);
+  if (link === null) return;
+  await ctx.show({ title: `Telegram Proxy: ${name}`, wide: true, body: html`<${TelegramLinkView} link=${link} />` });
 }

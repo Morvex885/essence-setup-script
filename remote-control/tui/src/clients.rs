@@ -60,7 +60,7 @@ fn required(ctx: &mut Context<'_>, title: &str, missing: &str) -> io::Result<Opt
     Ok(answer)
 }
 /// Read-only frame: kept until Enter/0/EOF, without pseudo-hotkeys.
-fn present(ctx: &mut Context<'_>, view: &View) -> io::Result<()> {
+pub(crate) fn present(ctx: &mut Context<'_>, view: &View) -> io::Result<()> {
     let mut view = view.clone();
     view.prompt = "Enter — продолжить: ".into();
     loop {
@@ -458,22 +458,27 @@ fn share_view(data: &Value, qr: &[String]) -> View {
     view.context.push(Line::default());
     view.context.push(ui::text(format!("curl '{}'", url.replace('\'', "'\\''")), ui::NC));
     view.context.push(ui::text(serde_json::json!({ "url": url }).to_string(), ui::NC));
-    if !qr.is_empty() {
-        view.context.push(Line::default());
-        if qr.iter().all(|line| line.width() <= ui::CONTENT_WIDTH) {
-            view.context.extend(qr.iter().map(|line| Line::raw(line.clone())));
-        } else {
-            view.context.push(ui::text("QR-код не помещается в рамку — используйте ссылку выше.", ui::YELLOW));
-        }
-    }
+    push_qr(&mut view, qr);
     view
+}
+/// The QR code of a share link under it: rows are never wrapped; a code
+/// wider than the frame is replaced by a note (the link is shown above).
+pub(crate) fn push_qr(view: &mut View, qr: &[String]) {
+    if qr.is_empty() { return; }
+    view.context.push(Line::default());
+    if qr.iter().all(|line| line.width() <= ui::CONTENT_WIDTH) {
+        view.context.extend(qr.iter().map(|line| Line::raw(line.clone())));
+    } else {
+        view.context.push(ui::text("QR-код не помещается в рамку — используйте ссылку выше.", ui::YELLOW));
+    }
+}
+/// `qrencode -t UTF8` of `url` when installed; empty otherwise.
+pub(crate) fn qr_code(url: &str) -> Vec<String> {
+    if executable("qrencode") { qr_lines(Command::new("qrencode").args(["-t", "UTF8"]), url) } else { vec![] }
 }
 fn share(ctx: &mut Context<'_>, name: &str) -> io::Result<()> {
     let Some(data) = fetch(ctx, &["subscription", "show", "--name", name])? else { return Ok(()); };
-    let qr = match data["url"].as_str() {
-        Some(url) if executable("qrencode") => qr_lines(Command::new("qrencode").args(["-t", "UTF8"]), url),
-        _ => vec![],
-    };
+    let qr = data["url"].as_str().map(qr_code).unwrap_or_default();
     present(ctx, &share_view(&data, &qr))
 }
 fn header_line(row: &Value, with_source: bool) -> Line<'static> {

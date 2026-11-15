@@ -1,15 +1,16 @@
 // Модель обзора подключений нод, вкладки ноды «Подключения» и
 // экрана «Telegram Proxy» — перенос чистой логики `tui/src/nodes.rs`
 // (`Connections::run`, `synced_node`, `sync_problem`, `assign_connections`,
-// argv команд, таблица `telegram_table`) и потоки Telegram
-// (`telegram_batch`) поверх `ctx`. Без DOM и вендоренных файлов: окно
-// результатов экран передаёт функцией. Тоны: `ok` (GREEN), `warn` (YELLOW),
-// `error` (RED), `neutral` (DIM).
-import { asList, proxyLabel, unlisted } from '../format.js';
+// argv команд, таблица `telegram status`) и потоки роли Telegram Web Proxy
+// поверх `ctx`. Без DOM и вендоренных файлов: окна с разметкой экран
+// передаёт функцией. Тоны: `ok` (GREEN), `warn` (YELLOW), `error` (RED),
+// `neutral` (DIM).
+import { asList, proxyLabel, strings, unlisted } from '../format.js';
 import { refill } from '../form-model.js';
 import { NODE_CODES, retryable } from '../flows.js';
-import { interactive, nodeLabel } from './nodes-model.js';
-import { offerApply } from './apply-model.js';
+import { nodeLabel } from './nodes-model.js';
+import { domainError } from './profiles-model.js';
+import { applyState, offerApply, offerApplyNodes, profiledNodes } from './apply-model.js';
 
 /** Пустой выбор (`nodes.rs::EMPTY`). */
 export const EMPTY = 'Нет объектов для выбора';
@@ -237,38 +238,49 @@ export async function syncConnections(ctx, name) {
 // ─── Telegram ────────────────────────────────────────────────────────────────
 
 export const TELEGRAM_TITLE = 'Telegram Proxy';
-export const TELEGRAM_RESULT_TITLE = 'Результат Telegram Proxy';
-export const TELEGRAM_SELECT_TITLE = 'Управление Telegram Proxy';
-export const TELEGRAM_STATUS_ARGV = ['telegram', 'status', '--all'];
-export const TELEGRAM_COMPONENTS = [
-  { value: 'web', label: 'Web Proxy' },
-  { value: 'mtproto', label: 'MTProto Proxy' },
-];
+export const TELEGRAM_RESULT_TITLE = 'Статус Telegram Proxy';
 
-/**
- * Пакетные действия (меню «Действия») в порядке TUI: `title` — заголовок
- * формы выбора нод и плана, `argv` — команда без `--name`. `component` —
- * в форме ещё и способ доступа (`telegram remove --component`).
- */
-export const TELEGRAM_BATCH = [
-  { id: 'install', label: 'Включить MTProto Proxy', title: 'Включение MTProto Proxy', argv: ['telegram', 'install'] },
-  { id: 'refresh-ip', label: 'Обновить IP-адрес MTProto', title: 'Обновление IP-адреса MTProto', argv: ['telegram', 'refresh-ip'] },
-  { id: 'web-update', label: 'Обновить Web Proxy', title: 'Обновление Web Proxy', argv: ['telegram', 'web-update'] },
-  { id: 'web-restart', label: 'Перезапустить Web Proxy', title: 'Перезапуск Web Proxy', argv: ['telegram', 'web-restart'] },
-  { id: 'backend-restart', label: 'Перезапустить службу MTProxy', title: 'Перезапуск службы MTProxy', argv: ['telegram', 'backend-restart'] },
-  { id: 'remove', label: 'Отключить способ доступа', danger: true, title: 'Отключение способа доступа', argv: ['telegram', 'remove'], component: true },
-  { id: 'remove-all', label: 'Отключить Telegram Proxy полностью', danger: true, title: 'Полное отключение Telegram Proxy', argv: ['telegram', 'remove-all'] },
-];
+/** `telegram status` без флагов — все ноды с ролью. */
+export const TELEGRAM_STATUS_ARGV = ['telegram', 'status'];
+export const telegramSetArgv = (name, domain) => ['telegram', 'set', '--name', name, '--domain', domain];
+export const telegramRemoveArgv = (name) => ['telegram', 'remove', '--name', name];
+export const telegramLinkArgv = (name) => ['telegram', 'link', '--name', name];
+export const telegramRotateArgv = (name) => ['telegram', 'rotate-secret', '--name', name];
+/** Спонсорский тег — секретом `password`, в argv его нет. */
+export const telegramTagArgv = (name) => ['telegram', 'tag', '--name', name];
+export const telegramTagClearArgv = (name) => ['telegram', 'tag', '--name', name, '--clear'];
+export const telegramRestartArgv = (name) => ['telegram', 'restart', '--name', name];
+export const telegramDiagnosticsArgv = (name) => ['telegram', 'diagnostics', '--name', name];
 
-/** argv пакета: `telegram remove --component C` и по одному `--name` на ноду. */
-export function telegramArgv(base, names, component = null) {
-  const argv = [...base];
-  if (component !== null) argv.push('--component', component);
-  for (const name of names) argv.push('--name', name);
-  return argv;
+/** Спонсорский тег: ровно 32 шестнадцатеричных символа. */
+export const TELEGRAM_TAG = /^[0-9a-fA-F]{32}$/;
+export const TAG_HINT = '32 шестнадцатеричных символа (от @MTProxybot).';
+
+/** Ошибка поля тега или `null`. */
+export function tagError(value) {
+  return TELEGRAM_TAG.test(String(value || '').trim()) ? null : TAG_HINT;
 }
 
-/** Строки таблицы `telegram_table` (`results` из данных или ошибки); `null` — таблицы нет. */
+/** Ноды с ролью (`node list .telegram` не `null`): имя, хост, тег и состояние применения. */
+export function telegramRows(list) {
+  return asList(list)
+    .filter((node) => node && typeof node.name === 'string' && node.telegram && typeof node.telegram === 'object')
+    .map((node) => ({
+      name: node.name,
+      hostname: nodeText(node.telegram.hostname),
+      tag: node.telegram.tag === true,
+      state: applyState(node),
+    }));
+}
+
+/** Ноды с профилем без роли — варианты формы «Включить на ноде». */
+export function telegramCandidates(list) {
+  return profiledNodes(list)
+    .filter((node) => !node.telegram)
+    .map((node) => ({ value: node.name, label: nodeLabel(node) }));
+}
+
+/** Строки таблицы `telegram status` (`results` из данных или ошибки); `null` — таблицы нет. */
 export function telegramResults(reply) {
   const source = reply.ok ? reply.data : reply.error;
   const results = asList(source && source.results);
@@ -277,78 +289,14 @@ export function telegramResults(reply) {
     const [status, tone] = row.status === 'ok' ? ['готово', 'ok']
       : row.status === 'not_installed' ? ['не установлено', 'warn']
         : row.status === 'partial' ? ['частично', 'warn'] : ['ошибка', 'error'];
-    return { node: nodeText(row.node), status, reason: nodeText(row.reason), tone };
+    return {
+      node: nodeText(row.node), hostname: nodeText(row.hostname), status, tone,
+      reason: nodeText(row.reason), summary: strings(row.summary),
+    };
   });
 }
 
-/** Ноды (`node list`) как варианты формы; сбой или пустой список — сообщение и `null`. */
-export async function telegramNodes(ctx) {
-  const listed = await ctx.call('node', 'list');
-  if (!listed.ok) {
-    if (ctx.isFailure(listed)) ctx.failed();
-    return null;
-  }
-  const nodes = asList(listed.data).map((row) => ({ value: nodeText(row.name), label: nodeLabel(row) }));
-  if (nodes.length === 0) {
-    ctx.notify('warn', EMPTY);
-    return null;
-  }
-  return nodes;
-}
-
-/**
- * «Управление нодой…»: выбор ноды → `telegram menu` в терминале (`interactive`).
- * Сеанс меняет состояние ноды (перезапуск, секрет, отключение частей), поэтому
- * после открытого сеанса — и при его сбое — вызывается `after()` (экран
- * перечитывает статус); отмена выбора ничего не перечитывает.
- */
-export async function telegramMenu(ctx, after = null) {
-  const nodes = await telegramNodes(ctx);
-  if (nodes === null) return;
-  const values = await ctx.form({
-    title: TELEGRAM_SELECT_TITLE,
-    fields: [{ name: 'node', label: 'Нода', type: 'select', options: nodes }],
-    submit: 'Открыть',
-  });
-  if (values === null || values === undefined) return;
-  try {
-    await interactive(ctx, values.node, true);
-  } finally {
-    if (after !== null) await after();
-  }
-}
-
-/**
- * Пакетное действие (`telegram_batch`): ноды и способ доступа одной формой,
- * план ядра, таблица результатов — `present(строки)` (экран показывает окно).
- * Сбой команды без таблицы открывает форму снова с выбранным.
- * `true` — команда отправлена (отказ от плана и отмена формы ничего не меняли).
- */
-export async function telegramBatch(ctx, action, present) {
-  const nodes = await telegramNodes(ctx);
-  if (nodes === null) return false;
-  const fields = [{ name: 'nodes', label: 'Ноды', type: 'multi', options: nodes, required: true }];
-  if (action.component) {
-    fields.push({ name: 'component', label: 'Способ доступа', type: 'radio', options: TELEGRAM_COMPONENTS, required: true });
-  }
-  let draft = null;
-  for (;;) {
-    const values = await ctx.form({ title: action.title, fields: refill(fields, draft), submit: 'Далее', tone: action.danger ? 'danger' : 'primary' });
-    if (values === null || values === undefined) return draft !== null;
-    const argv = telegramArgv(action.argv, values.nodes, action.component ? values.component : null);
-    const reply = await ctx.runConfirmed(action.title, 'Выполнить?', argv);
-    const table = telegramResults(reply);
-    if (table !== null) {
-      await present(table);
-      return true;
-    }
-    if (ctx.isFailure(reply)) ctx.failed();
-    if (!retryable(reply)) return reply.ok || ctx.isFailure(reply) || draft !== null;
-    draft = values;
-  }
-}
-
-/** `telegram status --all`: строки таблицы или `null` — сбой без таблицы (сообщён). */
+/** `telegram status`: строки таблицы или `null` — сбой без таблицы (сообщён). */
 export async function telegramStatus(ctx) {
   const reply = await ctx.call(...TELEGRAM_STATUS_ARGV);
   const table = telegramResults(reply);
@@ -357,4 +305,103 @@ export async function telegramStatus(ctx) {
     return null;
   }
   return table || [];
+}
+
+/** Таблица `telegram status` после действия экрана: роль изменена (`true`) — результат устарел и сбрасывается. */
+export function statusAfter(table, changed) {
+  return changed === true ? null : table;
+}
+
+/** Итог правки роли: успех — предложение `node apply --name N`, сбой — `failed`. `true` — сохранено. */
+async function changed(ctx, name, reply) {
+  if (ctx.isFailure(reply)) ctx.failed();
+  if (!reply.ok) return false;
+  await offerApplyNodes(ctx, [name]);
+  return true;
+}
+
+/** Поле домена: формат — как `validation::domain_valid` ядра, ошибка — под полем, без отправки. */
+const domainField = (value = '') => ({
+  name: 'domain', label: 'Домен', type: 'text', value, required: true, validate: domainError, placeholder: 'tg.example.com',
+  hint: 'Домен, указывающий на ноду.',
+});
+
+/**
+ * «Включить на ноде»: нода с профилем без роли и домен одной формой →
+ * `telegram set`, затем предложение применить. `list` — `node list`.
+ */
+export async function enableTelegram(ctx, list) {
+  const nodes = telegramCandidates(list);
+  if (nodes.length === 0) {
+    ctx.notify('warn', 'Нет нод с профилем без Telegram Proxy.');
+    return false;
+  }
+  const values = await ctx.form({
+    title: 'Включение Telegram Proxy',
+    fields: [{ name: 'node', label: 'Нода', type: 'select', options: nodes }, domainField()],
+    submit: 'Включить',
+  });
+  if (values === null || values === undefined) return false;
+  return changed(ctx, values.node, await ctx.request(telegramSetArgv(values.node, values.domain.trim())));
+}
+
+/** «Сменить домен»: форма с текущим доменом → `telegram set`, затем предложение применить. */
+export async function telegramDomainFlow(ctx, name, current = '') {
+  const values = await ctx.form({
+    title: `Домен Telegram Proxy: ${name}`, fields: [{ ...domainField(current), autofocus: true }], submit: 'Сохранить',
+  });
+  if (values === null || values === undefined) return false;
+  const domain = values.domain.trim();
+  if (domain === current) return false;
+  return changed(ctx, name, await ctx.request(telegramSetArgv(name, domain)));
+}
+
+/** «Сменить секрет» по плану ядра, затем предложение применить. */
+export async function rotateTelegramSecret(ctx, name) {
+  return changed(ctx, name, await ctx.runConfirmed('Смена секрета Telegram Proxy', 'Сменить секрет?', telegramRotateArgv(name)));
+}
+
+/** «Убрать» роль по плану ядра, затем предложение применить. */
+export async function removeTelegram(ctx, name) {
+  return changed(ctx, name, await ctx.runConfirmed('Отключение Telegram Proxy', 'Убрать Telegram Proxy с ноды?', telegramRemoveArgv(name)));
+}
+
+/** «Спонсорский тег»: скрытый ввод (32 hex) → `telegram tag` с секретом `password`, затем предложение применить. */
+export async function telegramTagFlow(ctx, name) {
+  const values = await ctx.form({
+    title: `Спонсорский тег: ${name}`,
+    fields: [{ name: 'password', label: 'Спонсорский тег', type: 'secret', required: true, autofocus: true, hint: TAG_HINT, validate: tagError }],
+    submit: 'Сохранить',
+  });
+  if (values === null || values === undefined) return false;
+  return changed(ctx, name, await ctx.request(telegramTagArgv(name), { secrets: { password: values.password.trim() } }));
+}
+
+/** «Убрать тег» → `telegram tag --clear`, затем предложение применить. */
+export async function clearTelegramTag(ctx, name) {
+  return changed(ctx, name, await ctx.request(telegramTagClearArgv(name)));
+}
+
+/** «Ссылка»: `telegram link` → строка `tg://…` или `null` (сбой сообщён). Ссылка с секретом нигде не пишется. */
+export async function telegramLink(ctx, name) {
+  const reply = await ctx.request(telegramLinkArgv(name));
+  if (!reply.ok) {
+    if (ctx.isFailure(reply)) ctx.failed();
+    return null;
+  }
+  const link = reply.data && typeof reply.data.link === 'string' ? reply.data.link : '';
+  return link === '' ? null : link;
+}
+
+/** «Перезапустить» по плану ядра (SSH, коды нод разрешаются). `true` — перезапущено. */
+export async function restartTelegram(ctx, name) {
+  const reply = await ctx.nodeRequest(name, telegramRestartArgv(name),
+    { title: 'Перезапуск Telegram Proxy', question: 'Перезапустить службы?' }, { operation: `Перезапуск Telegram Proxy: ${name}` });
+  return reply.ok;
+}
+
+/** «Диагностика»: журнал служб — строками окна операции. */
+export async function telegramDiagnostics(ctx, name) {
+  const reply = await ctx.nodeRequest(name, telegramDiagnosticsArgv(name), null, { operation: `Диагностика Telegram Proxy: ${name}` });
+  return reply.ok;
 }

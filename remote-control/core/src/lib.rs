@@ -10,7 +10,6 @@ pub mod cli;
 pub mod clients;
 pub mod confirmation;
 pub mod dispatch;
-pub mod bundle;
 pub mod error;
 pub mod log;
 pub mod fake_transport;

@@ -39,7 +39,7 @@ const JOURNAL_LIMIT = 2000;
 const SNACK_LIMIT = 3;
 
 /** Команда могла изменить состояние: шапка перечитывает `status`. */
-const READ_VERBS = new Set(['status', 'list', 'show', 'accounts', 'version', 'headers', 'aliases', 'check']);
+const READ_VERBS = new Set(['status', 'list', 'show', 'accounts', 'version', 'headers', 'aliases', 'check', 'link', 'diagnostics']);
 function changes(command) {
   const [noun = '', verb = ''] = String(command || '').split(' ');
   return noun !== 'status' && !READ_VERBS.has(verb);

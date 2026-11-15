@@ -149,9 +149,6 @@ function Maintenance({ busy, act, remove }) {
         <${OpRow} title="Усилить защиту SSH" desc="Перенести SSH на другой порт и закрыть вход по паролю — по плану ядра.">
           <${Button} icon="shield" disabled=${busy} onClick=${act.harden}>Усилить<//>
         <//>
-        <${OpRow} title="Telegram Proxy на ноде" desc="Меню Telegram Proxy этой ноды в терминале.">
-          <${Button} icon="send" disabled=${busy} onClick=${act.telegram}>Открыть<//>
-        <//>
       </div>
     <//>
     <${Card} title="Опасная зона" className="danger-zone">
@@ -186,7 +183,6 @@ function NodeCard({ ctx, name, tab }) {
     const act = {
       check: () => then(() => ctx.nodeRequest(name, nodeCheckArgv(name))),
       harden: () => then(() => model.harden(ctx, name)),
-      telegram: () => then(() => model.interactive(ctx, name, true)),
     };
     const remove = () => run(async () => {
       if (await model.deleteNode(ctx, name, node)) { go('nodes'); return; }
@@ -202,7 +198,7 @@ function NodeCard({ ctx, name, tab }) {
         onClick=${() => then(() => model.applyNode(ctx, name))}>Применить<//>
       <${Button} icon="layers" disabled=${busy} onClick=${() => then(() => model.nodeProfileFlow(ctx, name, node))}>Профиль<//>
       <${Button} icon="pencil" disabled=${busy} onClick=${() => then(() => model.nodeDomainFlow(ctx, name, node))}>Домен<//>
-      <${Button} icon="terminal" disabled=${busy} onClick=${() => then(() => model.interactive(ctx, name, false))}>Оболочка<//>
+      <${Button} icon="terminal" disabled=${busy} onClick=${() => then(() => model.interactive(ctx, name))}>Оболочка<//>
       <${MoreMenu} items=${[
         { label: 'Порты', icon: 'settings', disabled: busy || !hasProfile, onClick: () => then(() => model.nodePortsFlow(ctx, name, node)) },
         { label: 'Изменить', icon: 'pencil', disabled: busy, onClick: edit },
