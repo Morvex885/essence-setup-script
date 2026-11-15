@@ -150,7 +150,7 @@ essence-rc node add --name de --ip 203.0.113.10 --auth key --tag DE --accept-new
 essence-rc node apply --name de --yes
 
 # Вход по паролю: пароль — JSON через stdin (нужен jq), ни в каком argv
-read -rs SSH_PASSWORD && export SSH_PASSWORD   # ввод пароля без отображения
+IFS= read -rs SSH_PASSWORD && export SSH_PASSWORD   # ввод пароля без отображения, пробелы по краям сохраняются
 jq -n '{password: env.SSH_PASSWORD}' \
   | essence-rc node add --name nl --ip 203.0.113.11 --auth password --tag NL --accept-new-host-key --profile main --domain nl.example.com --secrets-stdin
 unset SSH_PASSWORD
