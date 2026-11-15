@@ -1,8 +1,14 @@
 #!/bin/bash
 # ─── Test runner: BATS (common/, node-agent/) and the Rust workspace ──────────
+# The runner itself needs Bash 3.2+. The executor (node-agent/) is Bash 4+ on
+# Debian/Ubuntu: its BATS (node_agent.bats, telegram.bats) run only on Linux
+# with Bash 4+ as `bash` in PATH and are skipped with a message elsewhere.
 if (( BASH_VERSINFO[0] < 3 || ( BASH_VERSINFO[0] == 3 && BASH_VERSINFO[1] < 2) )); then
     printf '  [✗] Требуется Bash 3.2 или новее.\n' >&2
     exit 1
+fi
+if [[ "$(uname -s)" != Linux ]] || (( $(bash -c 'echo "${BASH_VERSINFO[0]}"') < 4 )); then
+    printf '  [!] Тесты исполнителя node-agent будут пропущены: нужны Linux и Bash 4+ в PATH.\n' >&2
 fi
 
 set -euo pipefail

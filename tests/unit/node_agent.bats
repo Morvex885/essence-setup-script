@@ -4,6 +4,7 @@
 setup() {
     load '../helpers/test_helper'
     setup_test_env
+    require_executor_env
     ROOT="$BATS_TEST_TMPDIR/node"
     STUBS="$BATS_TEST_TMPDIR/stubs"
     CALLS="$BATS_TEST_TMPDIR/calls"

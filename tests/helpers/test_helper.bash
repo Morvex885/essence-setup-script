@@ -14,20 +14,19 @@ load "$TESTS_DIR/lib/bats-assert/load"
 # ─── Setup temp environment ───────────────────────────────────────────────────
 
 setup_test_env() {
-    export BATS_TEST_TMPDIR="$(mktemp -d)"
-    export CONFIG_DIR="$BATS_TEST_TMPDIR"
-    export CONFIG_JSON="$BATS_TEST_TMPDIR/config.json"
-    export TEMPLATES_DIR="$BATS_TEST_TMPDIR/templates"
-    export GENERATED_DIR="$BATS_TEST_TMPDIR/generated"
-    export SCRIPT_DIR="$BATS_TEST_TMPDIR"
-    mkdir -p "$TEMPLATES_DIR" "$GENERATED_DIR"
-
-    # Write minimal schema-v2 config matching production defaults.
-    cat > "$CONFIG_JSON" <<'EOF'
-{"schema_version":2,"nodes":[],"groups":[{"name":"ROUTER","template":"default.yaml"},{"name":"PC","template":"default.yaml"},{"name":"MOBILE","template":"default.yaml"}],"clients":[],"connections":[]}
-EOF
-
+    BATS_TEST_TMPDIR="$(mktemp -d)"
+    export BATS_TEST_TMPDIR
 }
+
+# The executor (node-agent/) is Bash 4+ with a GNU userland on Debian/Ubuntu:
+# its tests skip elsewhere instead of failing on `mapfile`/`local -A`.
+require_executor_env() {
+    [[ "$(uname -s)" == Linux ]] || skip "Исполнитель node-agent проверяется только на Linux"
+    local major
+    major=$(bash -c 'echo "${BASH_VERSINFO[0]}"')
+    (( major >= 4 )) || skip "Исполнитель node-agent требует Bash 4+ (bash в PATH — версия ${major})"
+}
+
 teardown_test_env() {
     [[ -d "${BATS_TEST_TMPDIR:-}" ]] && rm -rf "$BATS_TEST_TMPDIR"
 }
@@ -39,12 +38,4 @@ source_common() {
     source "$PROJECT_ROOT/common/common.sh"
     # Override error() to not exit the test runner
     error() { echo -e "  ${RED}[✗]${NC} $*" >&2; return 1; }
-}
-
-# ─── Fixture loading ──────────────────────────────────────────────────────────
-
-FIXTURES_DIR="$TESTS_DIR/fixtures"
-
-load_fixture_config() {
-    cp "$FIXTURES_DIR/sample_config.json" "$CONFIG_JSON"
 }

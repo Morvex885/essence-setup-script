@@ -74,6 +74,37 @@ jobs:
       - name: Test against isolated OpenSSH
         run: bash tests/ci/ssh_e2e.sh
 
+  # Rendered node configs against the real binaries: mihomo at the minimum
+  # version profiles accept, nginx and its stream module from Ubuntu. Not a
+  # required check.
+  render-check:
+    name: Rendered configs (mihomo -t, nginx -t)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      MIHOMO_ASSET: mihomo-linux-amd64-compatible-v1.19.18.gz
+      MIHOMO_URL: https://github.com/MetaCubeX/mihomo/releases/download/v1.19.18/mihomo-linux-amd64-compatible-v1.19.18.gz
+      MIHOMO_SHA256: f4bab249dabc7200db8408ca3af94ba5e8d68a62e13f22228dfc13d212cb4596
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+      - name: Install nginx and mihomo
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nginx libnginx-mod-stream openssl
+          curl -fsSL "$MIHOMO_URL" -o "$RUNNER_TEMP/$MIHOMO_ASSET"
+          echo "$MIHOMO_SHA256  $RUNNER_TEMP/$MIHOMO_ASSET" | sha256sum -c -
+          gzip -dc "$RUNNER_TEMP/$MIHOMO_ASSET" > "$RUNNER_TEMP/mihomo"
+          chmod +x "$RUNNER_TEMP/mihomo"
+          "$RUNNER_TEMP/mihomo" -v
+      - name: Render representative nodes
+        working-directory: remote-control
+        run: ESSENCE_RENDER_DUMP="$RUNNER_TEMP/render" cargo test -p rc-core --lib --locked dump_representative_renders
+      - name: Validate with mihomo -t and nginx -t
+        run: sudo bash tests/ci/validate_render.sh "$RUNNER_TEMP/render" "$RUNNER_TEMP/mihomo"
+
   rust-build:
     name: Rust build (${{ matrix.target }})
     strategy:

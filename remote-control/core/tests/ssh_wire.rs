@@ -710,14 +710,14 @@ async fn sftp_preserves_nested_bytes_modes_and_publishes_version_last_without_ro
         let fixture = Fixture::start(&key()).await;
         let ssh = fixture.password().await;
         let source = tempfile::tempdir().unwrap();
-        fs::create_dir_all(source.path().join("modules")).unwrap();
-        fs::create_dir_all(source.path().join("common/protocols")).unwrap();
+        fs::create_dir_all(source.path().join("steps")).unwrap();
+        fs::create_dir_all(source.path().join("common/nested")).unwrap();
         let binary: Vec<u8> = (0..180_000).map(|i| (i % 256) as u8).collect();
         for (path, data) in [
-            ("setup-essence.sh", b"#!/bin/sh\nentry\n".as_slice()),
-            ("modules/native.sh", b"#!/bin/sh\nmodule\n".as_slice()),
+            ("apply.sh", b"#!/bin/sh\nentry\n".as_slice()),
+            ("steps/native.sh", b"#!/bin/sh\nmodule\n".as_slice()),
             ("common/common.sh", b"common\0\xff".as_slice()),
-            ("common/protocols/nested.bin", binary.as_slice()),
+            ("common/nested/nested.bin", binary.as_slice()),
             ("VERSION", b"2.0.0\n".as_slice()),
         ] { fs::write(source.path().join(path), data).unwrap(); }
         let remote = fixture.shared.path(REMOTE).unwrap();
@@ -725,7 +725,7 @@ async fn sftp_preserves_nested_bytes_modes_and_publishes_version_last_without_ro
         fs::write(remote.join("VERSION"), b"1.0.0\n").unwrap();
         fs::write(remote.join("user-data.keep"), b"never delete me").unwrap();
         ssh.upload(source.path(), REMOTE, WAIT).await.unwrap();
-        for path in ["setup-essence.sh", "modules/native.sh", "common/common.sh", "common/protocols/nested.bin", "VERSION"] {
+        for path in ["apply.sh", "steps/native.sh", "common/common.sh", "common/nested/nested.bin", "VERSION"] {
             assert_eq!(fs::read(remote.join(path)).unwrap(), fs::read(source.path().join(path)).unwrap());
         }
         assert_eq!(fs::read(remote.join("user-data.keep")).unwrap(), b"never delete me");
@@ -734,7 +734,7 @@ async fn sftp_preserves_nested_bytes_modes_and_publishes_version_last_without_ro
         assert!(!journal.contains(&format!("open:{REMOTE}/VERSION")), "VERSION must be staged, not truncated in place");
         assert!(!journal.contains(&format!("remove:{REMOTE}/VERSION")), "publication must not remove the previous VERSION first");
         let modes = fixture.shared.modes.lock().unwrap();
-        for path in ["setup-essence.sh", "modules/native.sh"] {
+        for path in ["apply.sh", "steps/native.sh"] {
             assert_eq!(modes[&format!("{REMOTE}/{path}")] & 0o111, 0o111);
             #[cfg(unix)] {
                 use std::os::unix::fs::PermissionsExt;
@@ -745,18 +745,18 @@ async fn sftp_preserves_nested_bytes_modes_and_publishes_version_last_without_ro
 
         // A refused commit leaves the old version visible, retains earlier replacements,
         // and removes only the uploader's own temporary VERSION, never user data.
-        fs::write(source.path().join("setup-essence.sh"), b"replacement survives failed publication\n").unwrap();
+        fs::write(source.path().join("apply.sh"), b"replacement survives failed publication\n").unwrap();
         fs::write(source.path().join("VERSION"), b"3.0.0\n").unwrap();
         fixture.shared.refuse_publication.store(true, Ordering::SeqCst);
         let error = ssh.upload(source.path(), REMOTE, WAIT).await.unwrap_err();
         assert_eq!(error.code, "remote_failed");
         private_error(&error);
         assert_eq!(fs::read(remote.join("VERSION")).unwrap(), b"2.0.0\n");
-        assert_eq!(fs::read(remote.join("setup-essence.sh")).unwrap(), b"replacement survives failed publication\n");
+        assert_eq!(fs::read(remote.join("apply.sh")).unwrap(), b"replacement survives failed publication\n");
         assert_eq!(fs::read(remote.join("user-data.keep")).unwrap(), b"never delete me");
         let mut entries: Vec<_> = fs::read_dir(&remote).unwrap().map(|entry| entry.unwrap().file_name()).collect();
         entries.sort();
-        assert_eq!(entries, ["VERSION", "common", "modules", "setup-essence.sh", "user-data.keep"].map(std::ffi::OsString::from));
+        assert_eq!(entries, ["VERSION", "apply.sh", "common", "steps", "user-data.keep"].map(std::ffi::OsString::from));
         drop(ssh);
         fixture.finish().await;
     }).await.expect("SFTP publication scenario exceeded its deadline");
