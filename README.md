@@ -147,9 +147,12 @@ essence-rc profile add --name main --random-acme-email --reality self-steal --hy
 
 ```bash
 essence-rc node add --name de --ip 203.0.113.10 --auth key --tag DE --accept-new-host-key --profile main --domain de.example.com
-# вход по паролю: --auth password, пароль — через stdin, не в argv
-printf '{"password":"%s"}' "$SSH_PASSWORD" | essence-rc node add --name nl --ip 203.0.113.11 --auth password --tag NL --accept-new-host-key --profile main --secrets-stdin
 essence-rc node apply --name de --yes
+
+# Вход по паролю: пароль — JSON через stdin (jq экранирует его), не в argv
+jq -n --arg password "$SSH_PASSWORD" '{password: $password}' \
+  | essence-rc node add --name nl --ip 203.0.113.11 --auth password --tag NL --accept-new-host-key --profile main --domain nl.example.com --secrets-stdin
+essence-rc node apply --name nl --yes
 ```
 
 Состояние ноды видно в списке: «ожидает применения», «применяется…», «применено».
