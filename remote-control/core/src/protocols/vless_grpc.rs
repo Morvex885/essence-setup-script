@@ -2,7 +2,7 @@
 
 use super::uri::percent_encode;
 use super::vless_tcp::{push_reality_opts, reality_config};
-use super::{line, or, uri_host, yaml_escape, yaml_host, yaml_plain, Vless, VlessListener};
+use super::{line, or, uri_host, yaml_escape, yaml_host, yaml_name, yaml_plain, yaml_port, Vless, VlessListener};
 
 /// Users block of a listener without flow (gRPC, xHTTP).
 pub(super) fn listener_head(listener_name: &str, listen: &str, port: &str, username: &str, uuid: &str) -> String {
@@ -54,9 +54,9 @@ pub fn uri(vless: &Vless, service: &str) -> String {
 pub fn exit_yaml(vless: &Vless, service: &str, fingerprint: &str) -> String {
     let mut out = format!(
         "  - name: {}\n    type: vless\n    server: {}\n    port: {}\n    uuid: {}\n    network: grpc\n    udp: true\n    grpc-opts:\n      grpc-service-name: \"{}\"\n    tls: true\n    servername: \"{}\"\n",
-        vless.name,
+        yaml_name(vless.name),
         yaml_host(vless.server),
-        yaml_plain(vless.port),
+        yaml_port(vless.port),
         yaml_plain(vless.uuid),
         yaml_escape(service),
         yaml_escape(vless.sni)

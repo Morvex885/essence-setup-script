@@ -659,6 +659,18 @@ fn busy_port(probe: &Probe, node: &Node, desired: &Desired) -> Option<Failure> {
     })
 }
 
+/// The node's digest after its WARP registration (outside the lock), when the
+/// registration — the node's `params.warp` — is the only change of the node's
+/// render since the `confirmed` state; `None` — the plan changed.
+fn registered_digest(confirmed: &Config, current: &Config, id: &str) -> Option<String> {
+    let registered = current.nodes.iter().find(|node| node.id == id)?;
+    let mut expected = confirmed.clone();
+    expected.nodes.iter_mut().find(|node| node.id == id)?.params.warp = registered.params.warp.clone();
+    let digest = |config: &Config| config.nodes.iter().find(|node| node.id == id)
+        .and_then(|node| render::desired(config, node, None).ok()).map(|desired| desired.digest);
+    digest(current).filter(|now| Some(now) == digest(&expected).as_ref())
+}
+
 /// `node apply (--name N… | --profile P | --pending) [--yes]`.
 pub async fn apply<T: RemoteTransport>(session: &mut Session, invocation: &Invocation, connect: &dyn Fn() -> T) -> Result<Value> {
     let config = session.state.load_config()?;
@@ -779,8 +791,8 @@ pub async fn apply<T: RemoteTransport>(session: &mut Session, invocation: &Invoc
             .and_then(|profile| super::warp::registration(profile, &node)) else { continue };
         match super::warp::register(session, &node, &item.transport, reregister).await {
             Ok(()) => {
-                let config = session.state.load_config()?;
-                item.digest = render::desired(&config, nodes::find(&config, &item.name)?, None)?.digest;
+                let current = session.state.load_config()?;
+                item.digest = registered_digest(&config, &current, &node.id).ok_or_else(|| plan.changed(invocation))?;
             }
             Err(error) => {
                 report.fail(session, &item.name, &Failure::of("warp", error));

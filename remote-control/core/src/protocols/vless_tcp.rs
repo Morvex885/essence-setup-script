@@ -1,7 +1,7 @@
 //! VLESS TCP + Reality builders (`common/protocols/vless-tcp.sh`).
 
 use super::uri::percent_encode;
-use super::{line, or, uri_host, yaml_escape, yaml_host, yaml_plain, Vless, VlessListener};
+use super::{line, or, uri_host, yaml_escape, yaml_host, yaml_name, yaml_plain, yaml_port, Vless, VlessListener};
 
 /// Flow used by every TCP Reality client.
 pub const FLOW: &str = "xtls-rprx-vision";
@@ -66,7 +66,7 @@ pub fn uri(vless: &Vless) -> String {
 pub fn exit_yaml(vless: &Vless, flow: &str, fingerprint: &str) -> String {
     let mut out = format!(
         "  - name: {}\n    type: vless\n    server: {}\n    port: {}\n    uuid: {}\n    network: tcp\n    udp: true\n",
-        vless.name, yaml_host(vless.server), yaml_plain(vless.port), yaml_plain(vless.uuid)
+        yaml_name(vless.name), yaml_host(vless.server), yaml_port(vless.port), yaml_plain(vless.uuid)
     );
     if !flow.is_empty() {
         line(&mut out, &format!("    flow: {}", yaml_plain(flow)));

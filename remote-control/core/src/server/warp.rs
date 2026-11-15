@@ -11,8 +11,10 @@ use crate::confirmation::Plan;
 use crate::dispatch::Session;
 use crate::error::{RcError, Result};
 use crate::log::Level;
-use crate::model::{Node, NodeWarp, Profile};
+use crate::model::{Config, Node, NodeWarp, Profile};
+use crate::nodes::setup::FileBackup;
 use crate::nodes::{self, LONG_TIMEOUT, required, sh_quote};
+use crate::state::State;
 use crate::transport::RemoteTransport;
 
 /// The pinned wgcf release.
@@ -98,8 +100,11 @@ backup=""
 restore() {
     [[ -n "$backup" ]] || return 0
     rm -f wgcf-account.toml wgcf-profile.conf
-    cp -a "$backup"/. . 2>/dev/null
-    rm -rf "$backup"
+    if cp -a "$backup"/. .; then
+        rm -rf "$backup"
+    else
+        printf 'Откат аккаунта WARP не завершён: прежние файлы сохранены в %s\n' "$backup" >&2
+    fi
 }
 if [[ "$reregister" == 1 && -f wgcf-account.toml ]]; then
     backup=$(mktemp -d) || exit 1
@@ -112,9 +117,20 @@ if [[ ! -f wgcf-account.toml ]]; then
 fi
 plus=false
 # Also on an existing account (re-added node): `update` rebinds only a
-# different key. The key goes through the environment (viper `WGCF_*`), not argv.
+# different key. The key reaches wgcf through its account file (0600 under
+# umask 077; wgcf reads `license_key` from it), not argv or the environment;
+# a failed bind puts the previous file back.
 if [[ -n "$key" ]]; then
-    WGCF_LICENSE_KEY="$key" ./wgcf update >&2 && plus=true
+    if [[ "$key" =~ ^[A-Za-z0-9-]{1,64}$ ]] && cp -a wgcf-account.toml wgcf-account.toml.prev \
+        && { printf "license_key = '%s'\n" "$key"; grep -v -E '^[[:space:]]*license_key[[:space:]]*=' wgcf-account.toml.prev || [[ $? -eq 1 ]]; } > wgcf-account.toml.new \
+        && mv -f wgcf-account.toml.new wgcf-account.toml; then
+        if ./wgcf update >&2; then
+            plus=true
+        else
+            cp -a wgcf-account.toml.prev wgcf-account.toml
+        fi
+    fi
+    rm -f wgcf-account.toml.prev wgcf-account.toml.new
 fi
 rm -f wgcf-profile.conf
 ./wgcf generate >&2 && [[ -s wgcf-profile.conf ]] || { restore; exit 1; }
@@ -242,34 +258,61 @@ pub async fn register<T: RemoteTransport>(session: &mut Session, node: &Node, tr
     // Only a key that was actually tried counts as an attempt.
     let attempt = profile.warp_plus.clone().filter(|_| license.is_some());
     let id = node.id.clone();
-    session.mutate("warp register", |state| {
-        let mut config = state.load_config()?;
-        let node = config.nodes.iter_mut().find(|candidate| candidate.id == id).ok_or_else(|| nodes::not_found(&id))?;
-        state.secret_store().set(&format!("node:{id}:warp-key"), registered.private_key.clone())?;
-        node.params.warp = Some(NodeWarp {
-            public_key: registered.public_key.clone(), ipv4: registered.ipv4.clone(), ipv6: registered.ipv6.clone(),
-            plus: registered.plus, plus_attempt: attempt.clone(),
-        });
-        state.save_config(&config)
-    })?;
+    session.mutate("warp register", |state| store(state, &id, &registered, attempt))?;
     session.log(Level::Success, &format!("{}: WARP {}", node.name, if registered.plus { "WARP+" } else { "бесплатный" }));
     Ok(())
 }
 
-/// `node warp-reregister --name N [--yes]`: a new account on the node.
+/// Keeps the registered account: secret `warp-key` and `params.warp` change
+/// together or not at all (a local `mutate` does not restore after a failed
+/// closure, and a key without its addresses would be rendered as is).
+fn store(state: &State, id: &str, registered: &Registered, attempt: Option<String>) -> Result<()> {
+    let mut config = state.load_config()?;
+    let node = config.nodes.iter_mut().find(|candidate| candidate.id == id).ok_or_else(|| nodes::not_found(id))?;
+    let name = node.name.clone();
+    node.params.warp = Some(NodeWarp {
+        public_key: registered.public_key.clone(), ipv4: registered.ipv4.clone(), ipv6: registered.ipv6.clone(),
+        plus: registered.plus, plus_attempt: attempt,
+    });
+    let paths = state.paths();
+    let backup = FileBackup::take([paths.config(), paths.secrets(), paths.secret_key()].map(std::path::Path::to_path_buf))?;
+    let saved = state.secret_store().set(&format!("node:{id}:warp-key"), registered.private_key.clone())
+        .and_then(|()| state.save_config(&config));
+    let Err(error) = saved else { return Ok(()) };
+    if backup.restore().is_ok() {
+        return Err(error);
+    }
+    Err(RcError::new("failed", format!("Аккаунт WARP ноды «{name}» не сохранён, прежнее локальное состояние восстановить не удалось."))
+        .with_extra("name", name).with_extra("cause", error.message))
+}
+
+/// `node warp-reregister` plan of the node as it is now. The token covers the
+/// node itself (id, SSH address) and its WARP profile (name, WARP+ key mark):
+/// a node re-added under the same name or a changed key is a new plan.
+fn reregister_plan(config: &Config, name: &str) -> Result<(Plan, Node)> {
+    let node = nodes::find(config, name)?.clone();
+    let profile = node.profile.as_deref().and_then(|profile| config.find_profile(profile)).filter(|profile| profile.warp)
+        .ok_or_else(|| RcError::new("invalid", format!("У профиля ноды «{name}» WARP выключен.")).with_extra("name", name))?;
+    let extra = format!("{}\n{}@{}:{}\n{}\n{}", node.id, node.user, node.ip, node.port, profile.name,
+        profile.warp_plus.as_deref().unwrap_or_default());
+    let plan = Plan::new(vec![format!(
+        "Нода «{name}»: аккаунт WARP будет создан заново; прежнее устройство останется привязанным к подписке, пока его не удалят в приложении 1.1.1.1.")], extra);
+    Ok((plan, node))
+}
+
+/// `node warp-reregister --name N [--yes]`: a new account on the node. The
+/// plan is rebuilt right before the remote effect; the result is kept by the
+/// node's id (`store`), so it never lands on another node.
 pub async fn reregister<T: RemoteTransport>(session: &mut Session, invocation: &Invocation, transport: &mut T) -> Result<Value> {
     let name = required(invocation, "name")?;
-    let config = session.state.load_config()?;
-    let node = nodes::find(&config, name)?.clone();
-    let warp = node.profile.as_deref().and_then(|profile| config.find_profile(profile)).is_some_and(|profile| profile.warp);
-    if !warp {
-        return Err(RcError::new("invalid", format!("У профиля ноды «{name}» WARP выключен.")).with_extra("name", name));
-    }
-    Plan::new(vec![format!(
-        "Нода «{name}»: аккаунт WARP будет создан заново; прежнее устройство останется привязанным к подписке, пока его не удалят в приложении 1.1.1.1.")], "")
-        .confirm(invocation)?;
+    let (plan, node) = reregister_plan(&session.state.load_config()?, name)?;
+    plan.confirm(invocation)?;
     nodes::require_portable(session, &node)?;
     nodes::connect(transport, &session.state, &node).await?;
+    let (current, _) = reregister_plan(&session.state.load_config()?, name)?;
+    if current.lines != plan.lines || current.extra != plan.extra {
+        return Err(current.changed(invocation));
+    }
     register(session, &node, &*transport, true).await?;
     session.log(Level::Info, &format!("Примените изменения: node apply --name {name}"));
     Ok(json!({"name": name}))

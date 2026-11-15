@@ -18,7 +18,7 @@ use crate::model::{
 };
 use crate::protocols::uri::parse_exit_uri;
 use crate::protocols::vless_xhttp::NginxListener;
-use crate::protocols::{Vless, VlessListener, hy2, listener_users, vless_grpc, vless_tcp, vless_xhttp, yaml_escape};
+use crate::protocols::{Vless, VlessListener, hy2, listener_users, vless_grpc, vless_tcp, vless_xhttp, yaml_escape, yaml_name};
 
 use super::awg;
 use super::cascade;
@@ -358,12 +358,13 @@ impl Layout<'_> {
         if self.site.is_some() && self.front == Front::SelfSteal {
             tcp.insert(SITE_PORT);
         }
-        if let Some(host) = self.sub_host().filter(|host| host.port != 443) {
-            if tcp.contains(&host.port) {
+        if let Some(host) = self.sub_host() {
+            if host.port != 443 && tcp.contains(&host.port) {
                 return Err(invalid(format!("Порт {} хоста подписок на ноде «{}» занят подключением профиля.", host.port, self.node.name))
                     .with_extra("port", host.port));
             }
-            tcp.insert(host.port);
+            // On 443 the vhost may sit behind the front on an internal port.
+            tcp.insert(self.sub_port(host));
         }
         if tcp.contains(&self.node.port) {
             return Err(invalid(format!("Порт {} ноды «{}» занят SSH.", self.node.port, self.node.name)).with_extra("port", self.node.port));
@@ -666,21 +667,26 @@ impl Layout<'_> {
             ports.insert(awg.tproxy_port);
         }
         if let Some(host) = self.sub_host() {
-            ports.insert(match (host.port, self.front) {
-                (443, Front::SelfSteal) => SITE_PORT,
-                (443, Front::Stream) => SUB_INNER_PORT,
-                (port, _) => port,
-            });
+            ports.insert(self.sub_port(host));
         }
         ports.into_iter().collect()
+    }
+
+    /// TCP port of the subscription vhost: an internal one behind the 443
+    /// front, otherwise its own.
+    fn sub_port(&self, host: &SubscriptionHost) -> u16 {
+        match (host.port, self.front) {
+            (443, Front::SelfSteal) => SITE_PORT,
+            (443, Front::Stream) => SUB_INNER_PORT,
+            (port, _) => port,
+        }
     }
 
     /// The subscription vhost: on 443 behind the node's front, otherwise on
     /// its own port.
     fn sub_site(&self, host: &SubscriptionHost) -> String {
         let listen = match (host.port, self.front) {
-            (443, Front::SelfSteal) => format!("    listen 127.0.0.1:{SITE_PORT} ssl http2;"),
-            (443, Front::Stream) => format!("    listen 127.0.0.1:{SUB_INNER_PORT} ssl http2;"),
+            (443, Front::SelfSteal | Front::Stream) => format!("    listen 127.0.0.1:{} ssl http2;", self.sub_port(host)),
             (443, _) => "    listen 443 ssl http2;\n    listen [::]:443 ssl http2;".to_owned(),
             (port, _) => format!("    listen 0.0.0.0:{port} ssl http2;"),
         };
@@ -749,10 +755,11 @@ pub const INBOUND_REJECT: [&str; 9] = [
     "IP-CIDR,192.168.0.0/16", "IP-CIDR,100.64.0.0/10", "IP-CIDR6,fc00::/7", "IP-CIDR6,fe80::/10",
 ];
 
-/// The `<C>-outbound` group of a cascade: its exit, else direct.
+/// The `<C>-outbound` group of a cascade: its exit, else direct. The exit
+/// proxy is named after the cascade and quoted like its `name:` (`-`, `null`).
 fn cascade_group(name: &str) -> String {
-    format!("  - name: {name}-outbound\n    type: fallback\n    proxies:\n      - {name}\n      - DIRECT\n\
-        \x20   url: https://www.gstatic.com/generate_204\n    interval: 10\n    timeout: 3000\n    lazy: false\n")
+    format!("  - name: {name}-outbound\n    type: fallback\n    proxies:\n      - {}\n      - DIRECT\n\
+        \x20   url: https://www.gstatic.com/generate_204\n    interval: 10\n    timeout: 3000\n    lazy: false\n", yaml_name(name))
 }
 
 /// The exit proxy (named after the cascade) on its entry node: the external

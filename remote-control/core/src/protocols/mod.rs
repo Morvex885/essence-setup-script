@@ -83,18 +83,85 @@ pub(crate) fn yaml_escape(name: &str) -> std::borrow::Cow<'_, str> {
     escaped.into()
 }
 
-/// An unquoted exit-proxy value (uuid, flow, keys, fingerprint, mode, port):
-/// kept as is when plain-safe — word characters and inner spaces, no `:`,
-/// `#` or quotes (Bash output for every normal value) — else double-quoted
-/// with [`yaml_escape`].
+/// An unquoted exit-proxy string value (uuid, flow, keys, short id,
+/// fingerprint, mode): kept as is when plain-safe — word characters and inner
+/// spaces, no `:`, `#` or quotes, read back by YAML as this same string (Bash
+/// output for every normal value) — else double-quoted with [`yaml_escape`].
+/// So `01` stays the string `01` instead of the number 1. An empty value stays
+/// empty (Bash output; mihomo reads the null as an empty string).
 fn yaml_plain(value: &str) -> std::borrow::Cow<'_, str> {
     let safe = value.bytes().all(|b| b.is_ascii_alphanumeric() || b"._/+=- ".contains(&b))
-        && !value.starts_with(' ') && !value.ends_with(' ');
+        && !value.starts_with(' ') && !value.ends_with(' ') && !yaml_non_string(value);
     if safe {
         value.into()
     } else {
         format!("\"{}\"", yaml_escape(value)).into()
     }
+}
+
+/// An exit-proxy `port:`: digits stay a plain YAML integer, anything else is
+/// a [`yaml_plain`] string.
+fn yaml_port(value: &str) -> std::borrow::Cow<'_, str> {
+    if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+        value.into()
+    } else {
+        yaml_plain(value)
+    }
+}
+
+/// A proxy name in exit YAML and group `proxies:` lists: as is (Bash output),
+/// double-quoted when a plain scalar would not read back as this string —
+/// `null`, `true`, `123`, `-`, a leading indicator, `: `/` #`, outer spaces.
+pub(crate) fn yaml_name(value: &str) -> std::borrow::Cow<'_, str> {
+    let indicator = |c: char| ",[]{}#&*!|>'\"%@`".contains(c);
+    let mut chars = value.chars();
+    let lead = match (chars.next(), chars.next()) {
+        (Some(first), _) if indicator(first) => false,
+        (Some('-' | '?' | ':'), next) => next.is_some_and(|c| c != ' '),
+        (Some(first), _) => first != ' ',
+        (None, _) => false,
+    };
+    let plain = lead
+        && !value.ends_with([' ', ':'])
+        && !value.contains(": ")
+        && !value.contains(" #")
+        && !value.chars().any(char::is_control)
+        && !yaml_non_string(value);
+    if plain {
+        value.into()
+    } else {
+        format!("\"{}\"", yaml_escape(value)).into()
+    }
+}
+
+/// A non-empty plain scalar YAML (1.1 or 1.2 core, as mihomo's go-yaml) reads
+/// as something other than this string: `~`/`null`, a boolean word, a number
+/// (decimal, `0x`/`0o`/`0b`, float, `.inf`/`.nan`, `_` separators), or a lone
+/// `-` (a sequence entry). Errs on the side of quoting.
+fn yaml_non_string(value: &str) -> bool {
+    const WORDS: [&str; 26] = [
+        "~", "null", "Null", "NULL", "true", "True", "TRUE", "false", "False", "FALSE", "y", "Y", "yes", "Yes", "YES",
+        "n", "N", "no", "No", "NO", "on", "On", "ON", "off", "Off", "OFF",
+    ];
+    if value == "-" || value.starts_with("- ") || WORDS.contains(&value) {
+        return true;
+    }
+    let unsigned = value.strip_prefix(['+', '-']).unwrap_or(value).to_ascii_lowercase().replace('_', "");
+    if matches!(unsigned.as_str(), ".inf" | ".nan") {
+        return true;
+    }
+    if let Some(rest) = ["0x", "0o", "0b"].iter().find_map(|prefix| unsigned.strip_prefix(prefix)) {
+        return !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_hexdigit());
+    }
+    let (mantissa, exponent) = unsigned.split_once('e').map_or((unsigned.as_str(), None), |(m, e)| (m, Some(e)));
+    let exponent_ok = exponent.is_none_or(|e| {
+        let e = e.strip_prefix(['+', '-']).unwrap_or(e);
+        !e.is_empty() && e.bytes().all(|b| b.is_ascii_digit())
+    });
+    mantissa.bytes().any(|b| b.is_ascii_digit())
+        && mantissa.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        && mantissa.matches('.').count() <= 1
+        && exponent_ok
 }
 
 /// Address for a YAML `server:`/`listen:` value. A bracketed IPv6 `[addr]`
@@ -152,5 +219,27 @@ mod tests {
         ] {
             assert!(yaml.starts_with(quoted), "{yaml:?}");
         }
+    }
+
+    #[test]
+    fn values_yaml_would_retype_are_quoted() {
+        for value in ["01", "1", "-1", "+1", "1_0", "0x1F", "0o7", "1e5", "1.5", ".5", "1E-3", ".inf", "-.Inf", ".NaN", "null", "~", "true", "No", "off", "-"] {
+            assert_eq!(yaml_plain(value), format!("\"{value}\""), "{value}");
+            assert_eq!(yaml_name(value), format!("\"{value}\""), "{value}");
+        }
+        assert_eq!(yaml_plain(""), "");
+        assert_eq!(yaml_name(""), "\"\"");
+        for value in ["abcd", "0e5f", "1.2.3", "1e", "xtls-rprx-vision", "chrome", "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "a1", "nullx"] {
+            assert_eq!(yaml_plain(value), value);
+            assert_eq!(yaml_name(value), value);
+        }
+        for name in ["- a", "?", "a: b", "a #b", "a:", " a", "&a", "*a", "!a", "#a", "'a", "[a", "{a", "|", ">", "%a", "@a", "`a"] {
+            assert!(yaml_name(name).starts_with('"'), "{name}");
+        }
+        for name in ["-a", "?a", ":a", "a:b", "a#b", "Выход 1", "my-proxy"] {
+            assert_eq!(yaml_name(name), name);
+        }
+        assert_eq!(yaml_port("443"), "443");
+        assert_eq!(yaml_port("4:43"), "\"4:43\"");
     }
 }

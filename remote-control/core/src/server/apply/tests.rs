@@ -738,6 +738,29 @@ async fn warp_is_registered_before_the_render_and_with_a_new_key_again() {
 }
 
 #[test]
+fn a_warp_registration_may_change_only_the_warp_parameters_of_the_confirmed_state() {
+    let root = tempfile::tempdir().unwrap();
+    let (session, _journal) = fixture(root.path());
+    let mut confirmed = config(&session);
+    confirmed.profiles[0].warp = true;
+    let id = confirmed.nodes[0].id.clone();
+    let mut registered = confirmed.clone();
+    registered.nodes[0].params.warp = Some(crate::model::NodeWarp {
+        public_key: format!("{}=", "B".repeat(43)), ipv4: "172.16.0.2".into(), ipv6: None, plus: false, plus_attempt: None,
+    });
+    let digest = render::desired(&registered, &registered.nodes[0], None).unwrap().digest;
+    assert_ne!(digest, render::desired(&confirmed, &confirmed.nodes[0], None).unwrap().digest);
+    assert_eq!(registered_digest(&confirmed, &registered, &id), Some(digest));
+    // `config save` of another domain while the registration ran: a new plan.
+    let mut changed = registered.clone();
+    changed.nodes[0].domain = Some("other.example.com".into());
+    assert_eq!(registered_digest(&confirmed, &changed, &id), None);
+    let mut gone = registered;
+    gone.nodes.clear();
+    assert_eq!(registered_digest(&confirmed, &gone, &id), None);
+}
+
+#[test]
 fn probe_output_parses() {
     let probe = parse_probe("os=\"ubuntu\"\r\nsystemd=yes\nsshd=2222\nagent=ok\nlisten udp 0.0.0.0:51820\nlisten tcp [::]:443\n\
         missing /etc/x\nabababababababababababababababababababababababababababababababab  /etc/y\nunit=active\nstage=config\n");

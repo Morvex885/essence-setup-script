@@ -32,12 +32,132 @@ fn script_output_is_parsed_from_its_tail() {
 }
 
 #[test]
-fn the_warp_plus_key_stays_out_of_argv_and_is_bound_on_any_account() {
-    // wgcf reads `license_key` from `WGCF_LICENSE_KEY` (viper, prefix `WGCF`).
-    assert!(REGISTER.contains("\nif [[ -n \"$key\" ]]; then\n    WGCF_LICENSE_KEY=\"$key\" ./wgcf update >&2 && plus=true\nfi\n"));
-    assert!(!REGISTER.contains("--license-key") && !REGISTER.contains("new=1"));
+fn the_warp_plus_key_stays_out_of_argv_and_env_and_is_bound_on_any_account() {
+    // wgcf reads `license_key` from its account file (viper config).
+    assert!(!REGISTER.contains("WGCF_LICENSE_KEY") && !REGISTER.contains("--license-key") && !REGISTER.contains("new=1"));
     let umask = REGISTER.find("umask 077\n").unwrap();
     assert!(umask < REGISTER.find("mkdir -p /root/wgcf").unwrap());
+}
+
+/// The part of [`REGISTER`] from `start` up to (without) `end`.
+#[cfg(unix)]
+fn script_part(start: &str, end: &str) -> &'static str {
+    let from = REGISTER.find(start).unwrap();
+    &REGISTER[from..from + REGISTER[from..].find(end).unwrap()]
+}
+
+#[cfg(unix)]
+fn bash(dir: &std::path::Path, script: &str, env: &[(&str, &str)]) -> std::process::Output {
+    std::process::Command::new("bash").arg("-c").arg(script).current_dir(dir).envs(env.iter().copied()).output().unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn the_license_reaches_wgcf_update_only_through_the_account_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let block = script_part("if [[ -n \"$key\" ]]; then\n", "rm -f wgcf-profile.conf\n");
+    let script = format!("set -u\numask 077\nkey='KEY-1'\nplus=false\n{block}printf '%s' \"$plus\"\n");
+    let account = "access_token = 'a'\nlicense_key = 'OLD'\nprivate_key = 'p'\n";
+    // The fake wgcf fails when the key is in its argv or environment.
+    let fake = "#!/bin/sh\n[ \"$*\" = update ] || exit 2\nenv | grep -q KEY-1 && exit 3\n\
+        [ \"$(grep -c license_key wgcf-account.toml)\" = 1 ] && grep -qx \"license_key = 'KEY-1'\" wgcf-account.toml || exit 4\n\
+        exit \"${FAKE_EXIT:-0}\"\n";
+    for (exit, plus) in [("0", "true"), ("1", "false")] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("wgcf"), fake).unwrap();
+        std::fs::set_permissions(dir.path().join("wgcf"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(dir.path().join("wgcf-account.toml"), account).unwrap();
+        let output = bash(dir.path(), &script, &[("FAKE_EXIT", exit)]);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), plus, "{}", String::from_utf8_lossy(&output.stderr));
+        let file = dir.path().join("wgcf-account.toml");
+        let saved = std::fs::read_to_string(&file).unwrap();
+        if plus == "true" {
+            assert_eq!(saved, "license_key = 'KEY-1'\naccess_token = 'a'\nprivate_key = 'p'\n");
+            assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+        } else {
+            assert_eq!(saved, account, "a failed bind keeps the previous account file");
+        }
+        let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+        assert_eq!(names.len(), 2, "{names:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_restore_keeps_the_backup() {
+    let function = script_part("restore() {\n", "if [[ \"$reregister\" == 1");
+    let dir = tempfile::tempdir().unwrap();
+    let backup = dir.path().join("backup");
+    std::fs::create_dir(&backup).unwrap();
+    std::fs::write(backup.join("wgcf-account.toml"), "old").unwrap();
+    // A directory in the way: `cp` fails (as root too).
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(work.join("wgcf-account.toml/x")).unwrap();
+    let script = format!("backup={}\n{function}restore\n", sh_quote(backup.to_str().unwrap()));
+    let output = bash(&work, &script, &[]);
+    assert!(backup.join("wgcf-account.toml").exists());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Откат аккаунта WARP не завершён"), "{output:?}");
+    // A successful restore removes it.
+    std::fs::remove_dir_all(work.join("wgcf-account.toml")).unwrap();
+    bash(&work, &script, &[]);
+    assert_eq!(std::fs::read_to_string(work.join("wgcf-account.toml")).unwrap(), "old");
+    assert!(!backup.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_save_keeps_the_previous_warp_key_and_parameters() {
+    let root = tempfile::tempdir().unwrap();
+    let (session, _) = crate::nodes::testing::session(root.path());
+    let mut config = session.state.load_config().unwrap();
+    let old = NodeWarp { public_key: key(PUBLIC), ..registered(false, None) };
+    config.nodes = vec![Node {
+        id: "a".repeat(32), name: "de".into(), ip: "198.51.100.7".into(), port: 22, user: "root".into(),
+        ..node(Some(old.clone()))
+    }];
+    session.state.save_config(&config).unwrap();
+    let id = "a".repeat(32);
+    let secret = format!("node:{id}:warp-key");
+    session.state.secret_store().set(&secret, Zeroizing::new(key(PRIVATE))).unwrap();
+    let new = Registered {
+        private_key: Zeroizing::new(key(PUBLIC)), public_key: key(PUBLIC), ipv4: "172.16.0.9".into(), ipv6: None, plus: true,
+    };
+    // The configuration stays readable but can no longer be replaced.
+    let path = session.state.paths().config().to_path_buf();
+    let real = path.with_extension("real");
+    std::fs::rename(&path, &real).unwrap();
+    std::os::unix::fs::symlink(&real, &path).unwrap();
+    assert!(store(&session.state, &id, &new, None).is_err());
+    assert_eq!(session.state.secret_store().get(&secret).unwrap().unwrap().as_str(), key(PRIVATE));
+    assert_eq!(session.state.load_config().unwrap().nodes[0].params.warp, Some(old));
+    std::fs::remove_file(&path).unwrap();
+    std::fs::rename(&real, &path).unwrap();
+    store(&session.state, &id, &new, Some("0123abcd".into())).unwrap();
+    assert_eq!(session.state.secret_store().get(&secret).unwrap().unwrap().as_str(), key(PUBLIC));
+    assert_eq!(session.state.load_config().unwrap().nodes[0].params.warp.as_ref().unwrap().ipv4, "172.16.0.9");
+}
+
+#[test]
+fn the_reregister_plan_is_bound_to_the_node_and_its_warp_key() {
+    let mut config = Config { profiles: vec![profile(true, None)], ..Config::default() };
+    config.nodes = vec![Node {
+        id: "a".repeat(32), name: "de".into(), ip: "198.51.100.7".into(), port: 22, user: "root".into(),
+        profile: Some("main".into()), ..Node::default()
+    }];
+    let (plan, _) = reregister_plan(&config, "de").unwrap();
+    let mut readded = config.clone();
+    readded.nodes[0].id = "b".repeat(32);
+    let mut moved = config.clone();
+    moved.nodes[0].ip = "198.51.100.8".into();
+    let mut keyed = config.clone();
+    keyed.profiles[0].warp_plus = Some("0123abcd".into());
+    for changed in [readded, moved, keyed] {
+        let (other, _) = reregister_plan(&changed, "de").unwrap();
+        assert_eq!(other.lines, plan.lines);
+        assert_ne!(other.extra, plan.extra);
+    }
+    config.profiles[0].warp = false;
+    assert_eq!(reregister_plan(&config, "de").unwrap_err().code, "invalid");
 }
 
 #[test]

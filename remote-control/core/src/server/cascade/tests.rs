@@ -142,16 +142,75 @@ fn add_validates_before_any_change() {
 fn delete_is_gated_and_removes_the_assignments() {
     let root = tempfile::tempdir().unwrap();
     let mut session = setup(root.path());
-    run(&mut session, &with(&["--exit-node", "nl", "--exit-proxy", "VLESS TCP"]), None).unwrap();
+    let added = run(&mut session, &with(&["--exit-node", "nl", "--exit-proxy", "VLESS TCP"]), None).unwrap();
     let before = fingerprint(root.path());
     let error = run(&mut session, &["cascade", "delete", "--name", "hop"], None).unwrap_err();
-    assert_eq!((error.code, error.extra["plan"].clone()), ("confirmation_required",
-        json!(["Каскад «hop» будет удалён; назначения подключения «hop» группам и клиентам будут сняты."])));
+    assert_eq!((error.code, error.extra["plan"].clone()), ("confirmation_required", json!([
+        "Каскад «hop» будет удалён: вход — нода «de» (VLESS TCP), выход — нода «nl» (VLESS TCP).",
+        "Группа «PC»: подключение «hop» на ноде «de» будет снято; останутся: VLESS TCP.",
+        "Клиент «alpha»: подключение «hop» на ноде «de» будет снято.",
+    ])));
     assert_eq!(fingerprint(root.path()), before);
-    assert_eq!(run(&mut session, &["cascade", "delete", "--name", "hop", "--yes"], None).unwrap(), json!({"name": "hop"}));
+    assert_eq!(run(&mut session, &["cascade", "delete", "--name", "hop", "--yes"], None).unwrap(), added);
     let config = session.state.load_config().unwrap();
     assert!(config.cascades.is_empty());
     assert_eq!(config.connections[0].groups[0].proxies, ["VLESS TCP"]);
     assert_eq!(config.clients[0].connections.as_ref().unwrap()[0].proxies, ["VLESS TCP"]);
     assert_eq!(run(&mut session, &["cascade", "delete", "--name", "hop", "--yes"], None).unwrap_err().code, "not_found");
+}
+
+#[test]
+fn delete_token_is_bound_to_the_cascade_instance() {
+    let root = tempfile::tempdir().unwrap();
+    let mut session = setup(root.path());
+    let exit = with(&["--exit-node", "nl", "--exit-proxy", "VLESS TCP"]);
+    // Without assignments the plan names only the cascade.
+    session.state.save_config(&Config { connections: Vec::new(), clients: Vec::new(), ..session.state.load_config().unwrap() }).unwrap();
+    run(&mut session, &exit, None).unwrap();
+    let error = run(&mut session, &["cascade", "delete", "--name", "hop"], None).unwrap_err();
+    let (plan, token) = (error.extra["plan"].clone(), error.extra["plan_token"].as_str().unwrap().to_owned());
+    // Re-created with the same entry and exit: same plan text, another instance.
+    run(&mut session, &["cascade", "delete", "--name", "hop", "--yes"], None).unwrap();
+    run(&mut session, &exit, None).unwrap();
+    let stale = run(&mut session, &["cascade", "delete", "--name", "hop", "--yes", "--plan-token", &token], None).unwrap_err();
+    assert_eq!((stale.code, stale.extra["plan"].clone()), ("plan_changed", plan));
+    assert_eq!(session.state.load_config().unwrap().cascades.len(), 1);
+    // Under the lock: the confirmed plan of the previous instance is rejected.
+    let config = session.state.load_config().unwrap();
+    let (current, _) = delete_plan(&config, "hop").unwrap();
+    let previous = Plan::new(current.lines.clone(), "other-uuid");
+    let invocation = invocation(&["cascade", "delete", "--name", "hop", "--yes"]);
+    assert_eq!(delete_planned(&session.state, "hop", &previous, &invocation).unwrap_err().code, "plan_changed");
+    assert_eq!(session.state.load_config().unwrap(), config);
+    assert_eq!(delete_planned(&session.state, "hop", &current, &invocation).unwrap().name, "hop");
+    assert!(session.state.load_config().unwrap().cascades.is_empty());
+}
+
+#[test]
+fn delete_of_the_last_selected_connection_unassigns_the_group_and_names_wider_access() {
+    let root = tempfile::tempdir().unwrap();
+    let mut session = setup(root.path());
+    run(&mut session, &with(&["--exit-node", "nl", "--exit-proxy", "VLESS TCP"]), None).unwrap();
+    let mut config = session.state.load_config().unwrap();
+    config.connections[0].groups[0].proxies = vec!["hop".into()];
+    config.clients[0].connections = None;
+    config.clients.push(Client {
+        name: "beta".into(), group: "PC".into(), inherit_nodes_from_group: false, nodes: Some(vec!["de".into()]),
+        ..Client::default()
+    });
+    session.state.save_config(&config).unwrap();
+    let error = run(&mut session, &["cascade", "delete", "--name", "hop"], None).unwrap_err();
+    assert_eq!(error.extra["plan"], json!([
+        "Каскад «hop» будет удалён: вход — нода «de» (VLESS TCP), выход — нода «nl» (VLESS TCP).",
+        "Группа «PC»: других подключений на ноде «de» нет — назначение группы ноде будет снято.",
+        "Клиент «beta» останется без выбранных подключений на ноде «de» и получит все её подключения.",
+    ]));
+    run(&mut session, &["cascade", "delete", "--name", "hop", "--yes"], None).unwrap();
+    let config = session.state.load_config().unwrap();
+    // No empty PC entry: alpha (nodes from the group) leaves `de` instead of
+    // getting every connection; beta keeps `de` with all its connections.
+    assert!(config.connections.is_empty());
+    let de = &config.nodes[0];
+    assert!(!on_node(&config, &config.clients[0], &de.name));
+    assert!(on_node(&config, &config.clients[1], &de.name));
 }

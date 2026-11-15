@@ -644,6 +644,25 @@ fn cascade_config(exit: crate::model::ExitProxy) -> Config {
 }
 
 #[test]
+fn cascade_names_and_short_ids_stay_yaml_strings() {
+    for name in ["-", "null", "1e5"] {
+        let mut config = cascade_config(crate::model::ExitProxy::VlessTcp);
+        config.nodes[1].params.reality.as_mut().unwrap().short_id = "0123456789012345".into();
+        config.cascades[0].name = name.into();
+        *config.connections[0].groups[0].proxies.last_mut().unwrap() = name.into();
+        let entry = render(&config);
+        let mihomo = content(&entry, MIHOMO_CONFIG_PATH);
+        let document = yaml(mihomo);
+        let exit = document["proxies"].as_vec().unwrap().iter().find(|proxy| proxy["server"].as_str() == Some("nl.example.com")).unwrap();
+        assert_eq!(exit["name"].as_str(), Some(name), "{mihomo}");
+        assert_eq!(exit["reality-opts"]["short-id"].as_str(), Some("0123456789012345"), "{mihomo}");
+        let group = document["proxy-groups"].as_vec().unwrap().iter()
+            .find(|group| group["name"].as_str() == Some(format!("{name}-outbound").as_str())).unwrap();
+        assert_eq!(group["proxies"][0].as_str(), Some(name), "{mihomo}");
+    }
+}
+
+#[test]
 fn a_cascade_routes_its_users_on_the_entry_node_to_the_exit_node() {
     let mut config = cascade_config(crate::model::ExitProxy::VlessTcp);
     let entry = render(&config);
@@ -779,6 +798,11 @@ fn subscription_host_behind_the_stream_and_on_a_free_443() {
     assert!(content(&stream, MIHOMO_CONFIG_PATH).contains("    listen: 127.0.0.1\n    port: 8444\n"));
     assert_eq!((spec(&stream, "NGINX_STREAM"), spec(&stream, "CERTS")), ("true", "sub.example.com:/var/www/sub.example.com"));
     assert_eq!(spec(&stream, "LISTEN_TCP"), "443 8444 8445");
+    // The vhost's internal port is taken by SSH: refused before apply.
+    config.nodes[0].port = 8445;
+    let error = desired_error(&config);
+    assert_eq!((error.code, error.extra["port"].clone()), ("invalid", json!(8445)));
+    config.nodes[0].port = 22;
 
     // Without Reality nginx owns 443 itself.
     config.profiles[0].vless_tcp = false;

@@ -229,15 +229,29 @@ pub fn parse_proxy_uri(name: &str, input: &str) -> Result<ExitProxy, UriError> {
 
 /// A cascade exit link: [`parse_proxy_uri`] after a strict check of every
 /// field it renders (the v1 parser above keeps Bash parity and accepts more).
-/// Server — a host name or IP; port — 1–65535; VLESS — a UUID, `flow`/`fp`/
-/// `mode` as lower-case words, `pbk` as base64, `sid` as hex, `sni` as a host
-/// name, `path`/`serviceName` as URI path characters; Hysteria2 — a password
-/// and obfs password without control characters, `sni` as a host name.
+/// The empty path `/` after the authority (`hy2://p@h:443/?sni=s`, as the
+/// Hysteria2 URI scheme writes it) is dropped first.
+/// Server — a host name or IP; port — 1–65535; VLESS — a UUID, `security`
+/// `reality` or `tls` (the exit always speaks TLS), `flow`/`fp`/`mode` as
+/// lower-case words, `pbk` as base64, `sid` as hex, `sni` as a host name,
+/// `path`/`serviceName` as URI path characters; Hysteria2 — a password and
+/// obfs password without control characters, `sni` as a host name.
 pub fn parse_exit_uri(name: &str, input: &str) -> Result<ExitProxy, UriError> {
     let line = input.split('\n').next().unwrap_or_default();
-    let line = line.strip_suffix('\r').unwrap_or(line);
-    check_exit_fields(line)?;
-    parse_proxy_uri(name, line)
+    let line = strip_root_path(line.strip_suffix('\r').unwrap_or(line));
+    check_exit_fields(&line)?;
+    parse_proxy_uri(name, &line)
+}
+
+/// `scheme://authority/?query#fragment` without the empty path `/`; any other
+/// path is kept (and then fails the port check).
+fn strip_root_path(line: &str) -> std::borrow::Cow<'_, str> {
+    let Some((scheme, rest)) = line.split_once("://") else { return line.into() };
+    let end = rest.find(['?', '#']).unwrap_or(rest.len());
+    match rest[..end].strip_suffix('/') {
+        Some(authority) if !authority.contains('/') => format!("{scheme}://{authority}{}", &rest[end..]).into(),
+        _ => line.into(),
+    }
 }
 
 fn chars_in(value: &str, max: usize, allowed: impl Fn(char) -> bool) -> bool {
@@ -276,6 +290,7 @@ fn check_exit_fields(line: &str) -> Result<(), UriError> {
         let checked: Option<(&'static str, bool)> = match (vless, key) {
             (_, "sni") => Some(("sni", value.is_empty() || host_name(&value))),
             (true, "flow") => Some(("flow", word(&value))),
+            (true, "security") => Some(("security", matches!(value.as_str(), "reality" | "tls"))),
             (true, "fp") => Some(("fp", word(&value))),
             (true, "mode") => Some(("mode", word(&value))),
             (true, "pbk") => Some(("pbk", chars_in(&value, 64, |c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '+' | '/' | '=')))),
@@ -352,6 +367,31 @@ mod tests {
         assert!(parsed.yaml.contains("    uuid: 11111111-2222\n"), "{}", parsed.yaml);
         for uri in ["vless://u%ZZ@h:443", "vless://u%2@h:443", "vless://u%00@h:443", "vless://u%0A@h:443"] {
             assert_eq!(parse_vless_uri("p", uri), Err(UriError::VlessPercent), "{uri}");
+        }
+    }
+
+    #[test]
+    fn exit_link_accepts_root_path_and_keeps_string_values() {
+        let parsed = parse_exit_uri("x", "hy2://p@exit.example:443/?sni=exit.example#f").unwrap();
+        assert!(parsed.yaml.contains("    port: 443\n"), "{}", parsed.yaml);
+        assert!(parse_exit_uri("x", "hysteria2://p@exit.example:443/").is_ok());
+        assert_eq!(parse_exit_uri("x", "hy2://p@exit.example:443/x?sni=s"), Err(UriError::Field { field: "port" }));
+        let uuid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let parsed = parse_exit_uri("null", &format!("vless://{uuid}@h.example:443/?security=reality&pbk=k&sid=01")).unwrap();
+        assert!(parsed.yaml.starts_with("  - name: \"null\"\n"), "{}", parsed.yaml);
+        assert!(parsed.yaml.contains("    port: 443\n"), "{}", parsed.yaml);
+        assert!(parsed.yaml.contains("      short-id: \"01\"\n"), "{}", parsed.yaml);
+    }
+
+    #[test]
+    fn exit_link_requires_tls_or_reality_security() {
+        let uuid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        for security in ["none", "", "xtls"] {
+            let link = format!("vless://{uuid}@h.example:443?security={security}&type=tcp");
+            assert_eq!(parse_exit_uri("x", &link), Err(UriError::Field { field: "security" }), "{security}");
+        }
+        for security in ["reality", "tls"] {
+            assert!(parse_exit_uri("x", &format!("vless://{uuid}@h.example:443?security={security}")).is_ok());
         }
     }
 }

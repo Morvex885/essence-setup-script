@@ -7,15 +7,17 @@ use serde_json::{Value, json};
 
 use crate::cli::Invocation;
 use crate::clients::client::uuid_v4;
+use crate::clients::generate::{effective_connections, group_connections};
 use crate::confirmation::Plan;
 use crate::dispatch::Session;
 use crate::error::{RcError, Result};
 use crate::github::random_hex;
 use crate::log::Level;
-use crate::model::{Cascade, CascadeExit, CascadeListener, Config, ExitProxy, NodeExit, UriExit, cascade_name_reserved, cascade_user_clash};
+use crate::model::{Cascade, CascadeExit, CascadeListener, Client, Config, ExitProxy, NodeExit, UriExit, cascade_name_reserved, cascade_user_clash};
 use crate::nodes::required;
 use crate::protocols::uri::parse_exit_uri;
 use crate::request_input::Input;
+use crate::state::State;
 use crate::validation as v;
 
 use super::keys::ensure_generated;
@@ -171,34 +173,102 @@ fn add(session: &mut Session, invocation: &Invocation, input: &Input) -> Result<
     Ok(view(&cascade))
 }
 
-/// Removes the cascade name from the entry node's group and client connections.
-fn unassign(config: &mut Config, cascade: &Cascade) {
+/// The configuration without the cascade: its name leaves the entry node's
+/// group and client selections. A group left without connections there is
+/// unassigned from the node (as `conn set --assign G=`), not kept empty — an
+/// empty group selection would give its clients every connection of the node.
+fn deleted(config: &Config, cascade: &Cascade) -> Config {
+    let mut config = config.clone();
+    config.cascades.retain(|other| other.name != cascade.name);
     for connection in config.connections.iter_mut().filter(|connection| connection.node == cascade.entry) {
-        connection.groups.iter_mut().for_each(|group| group.proxies.retain(|proxy| *proxy != cascade.name));
+        connection.groups.retain_mut(|group| {
+            let used = group.proxies.contains(&cascade.name);
+            group.proxies.retain(|proxy| *proxy != cascade.name);
+            !used || !group.proxies.is_empty()
+        });
     }
+    config.connections.retain(|connection| connection.node != cascade.entry || !connection.groups.is_empty());
     for client in &mut config.clients {
         for connection in client.connections.iter_mut().flatten().filter(|connection| connection.node == cascade.entry) {
             connection.proxies.retain(|proxy| *proxy != cascade.name);
         }
     }
+    config
+}
+
+/// Whether the client's configuration includes the node (`node_users`).
+fn on_node(config: &Config, client: &Client, node: &str) -> bool {
+    if client.inherit_nodes_from_group {
+        config.connections.iter().any(|c| c.node == node && c.groups.iter().any(|group| group.name == client.group))
+    } else {
+        client.nodes.iter().flatten().any(|name| name == node)
+    }
+}
+
+/// `cascade delete` plan: the cascade instance (its uuid, new on every `add`,
+/// is the token extra) and every selection on the entry node that loses it.
+/// A client still on the node whose selection ends up empty gets every
+/// connection of the node — the plan says so explicitly.
+fn delete_plan(config: &Config, name: &str) -> Result<(Plan, Cascade)> {
+    let cascade = config.cascades.iter().find(|cascade| cascade.name == name).ok_or_else(|| not_found(name))?.clone();
+    let after = deleted(config, &cascade);
+    let entry = cascade.entry.as_str();
+    let exit = match &cascade.exit {
+        CascadeExit::Node(exit) => format!("нода «{}» ({})", exit.node, exit_proxy_name(exit.proxy)),
+        CascadeExit::Uri(_) => "внешний сервер по ссылке".to_owned(),
+    };
+    let mut lines = vec![format!("Каскад «{name}» будет удалён: вход — нода «{entry}» ({}), выход — {exit}.", listener_name(cascade.listener))];
+    let mut groups: Vec<&str> = Vec::new();
+    for group in config.connections.iter().filter(|c| c.node == entry).flat_map(|c| &c.groups) {
+        if group.proxies.contains(&cascade.name) && !groups.contains(&group.name.as_str()) {
+            groups.push(&group.name);
+        }
+    }
+    for group in groups {
+        let unassigned = !after.connections.iter().any(|c| c.node == entry && c.groups.iter().any(|g| g.name == group));
+        lines.push(if unassigned {
+            format!("Группа «{group}»: других подключений на ноде «{entry}» нет — назначение группы ноде будет снято.")
+        } else {
+            format!("Группа «{group}»: подключение «{name}» на ноде «{entry}» будет снято; останутся: {}.",
+                group_connections(&after, group, entry).join(", "))
+        });
+    }
+    for client in &config.clients {
+        if client.connections.iter().flatten().any(|c| c.node == entry && c.proxies.contains(&cascade.name)) {
+            lines.push(format!("Клиент «{}»: подключение «{name}» на ноде «{entry}» будет снято.", client.name));
+        }
+        if effective_connections(config, client, entry).contains(&cascade.name)
+            && on_node(&after, client, entry)
+            && effective_connections(&after, client, entry).is_empty()
+        {
+            lines.push(format!("Клиент «{}» останется без выбранных подключений на ноде «{entry}» и получит все её подключения.",
+                client.name));
+        }
+    }
+    Ok((Plan::new(lines, cascade.uuid.clone()), cascade))
+}
+
+/// Under the lock: the plan rebuilt from the current state must be the
+/// confirmed one (a cascade re-created under the same name differs by its
+/// uuid). Returns the deleted cascade.
+fn delete_planned(state: &State, name: &str, planned: &Plan, invocation: &Invocation) -> Result<Cascade> {
+    let config = state.load_config()?;
+    let (plan, cascade) = delete_plan(&config, name)?;
+    if plan.lines != planned.lines || plan.extra != planned.extra {
+        return Err(plan.changed(invocation));
+    }
+    state.save_config(&deleted(&config, &cascade))?;
+    Ok(cascade)
 }
 
 fn delete(session: &mut Session, invocation: &Invocation) -> Result<Value> {
     let name = required(invocation, "name")?.to_owned();
-    let config = session.state.load_config()?;
-    let cascade = config.cascades.iter().find(|cascade| cascade.name == name).ok_or_else(|| not_found(&name))?.clone();
-    Plan::new(vec![format!("Каскад «{name}» будет удалён; назначения подключения «{name}» группам и клиентам будут сняты.")], "")
-        .confirm(invocation)?;
-    session.mutate("cascade delete", |state| {
-        let mut config = state.load_config()?;
-        let cascade = config.cascades.iter().find(|cascade| cascade.name == name).ok_or_else(|| not_found(&name))?.clone();
-        config.cascades.retain(|other| other.name != name);
-        unassign(&mut config, &cascade);
-        state.save_config(&config)
-    })?;
+    let (plan, _) = delete_plan(&session.state.load_config()?, &name)?;
+    plan.confirm(invocation)?;
+    let cascade = session.mutate("cascade delete", |state| delete_planned(state, &name, &plan, invocation))?;
     session.log(Level::Success, &format!("Каскад «{name}» удалён"));
     apply_hint(session, &cascade);
-    Ok(json!({"name": name}))
+    Ok(view(&cascade))
 }
 
 #[cfg(test)]
