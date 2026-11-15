@@ -594,13 +594,16 @@ export async function roleRetry(ctx, role, domain) {
 
 /**
  * Роли новой ноды из формы добавления: `telegram set` и `subscription host`
- * (сбой — `roleRetry`); итог — ноды для одного `node apply` (новая и прежний хост).
+ * (сбой — `ctx.failed()` и `roleRetry`); итог — ноды для одного `node apply`
+ * (новая и прежний хост).
  */
 export async function addNodeRoles(ctx, name, values) {
   const names = [name];
   let telegram = plain(values.telegram_domain).trim();
   while (telegram) {
-    if ((await ctx.request(telegramSetArgv(name, telegram))).ok) break;
+    const reply = await ctx.request(telegramSetArgv(name, telegram));
+    if (reply.ok) break;
+    if (ctx.isFailure(reply)) ctx.failed();
     telegram = (await roleRetry(ctx, 'Telegram Web Proxy', telegram)) || '';
   }
   let subscription = plain(values.subscription_domain).trim();

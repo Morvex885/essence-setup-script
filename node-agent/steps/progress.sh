@@ -8,9 +8,10 @@
 # (packages, prepare с AmneziaWG и Telegram, certificate) — больше. Внутри
 # этапа шаг выбирает долю диапазона (progress_span) и движется по ней
 # (progress_in); apt сообщает свой процент через APT::Status-Fd (agent_apt).
-# Одни проценты пишутся не чаще раза в секунду, смена действия — сразу (их
-# столько, сколько шагов). Запись — write_status из apply.sh (tmp + mv); без
-# него (этап подключён отдельно, тесты) значения только запоминаются.
+# Одни проценты пишутся не чаще раза в секунду (по $SECONDS — Bash 3.2 без
+# printf '%(…)T'), смена действия — сразу (их столько, сколько шагов). Запись
+# — write_status из apply.sh (tmp + mv); без него (этап подключён отдельно,
+# тесты) значения только запоминаются.
 
 PROGRESS=0
 DETAIL=""
@@ -83,9 +84,7 @@ _progress_clean() {
 } 2>/dev/null
 
 _progress_write() {
-    local now
-    printf -v now '%(%s)T' -1
-    PROGRESS_WRITTEN="$now"
+    PROGRESS_WRITTEN="$SECONDS"
     PROGRESS_DIRTY=false
     if declare -F write_status >/dev/null; then
         write_status
@@ -130,12 +129,11 @@ progress_span() {
 # progress_in <процент шага> — процент внутри текущего шага; запись не чаще
 # раза в секунду (пропущенное запишет следующая запись или progress_flush).
 progress_in() {
-    local pct="$1" now
+    local pct="$1"
     ((pct < 0)) && pct=0
     ((pct > 100)) && pct=100
     _progress_raise $((PROGRESS_SPAN_LO + (PROGRESS_SPAN_HI - PROGRESS_SPAN_LO) * pct / 100))
-    printf -v now '%(%s)T' -1
-    if [[ "$now" != "$PROGRESS_WRITTEN" ]]; then
+    if [[ "$SECONDS" != "$PROGRESS_WRITTEN" ]]; then
         _progress_write
     else
         PROGRESS_DIRTY=true

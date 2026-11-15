@@ -32,16 +32,21 @@ sub_activate() {
 }
 
 # Откат: юнит таймера восстановлен (роль была) — таймер включается снова,
-# в том числе после sub_deactivate; первой установки — файла уже нет: таймер
-# останавливается и ссылка в timers.target.wants убирается вручную
-# (systemctl disable без файла юнита отказывает).
+# в том числе после sub_deactivate; первой установки — файла уже нет: запущенный
+# таймер останавливается (stop незапущенного без файла юнита отказывает) и
+# ссылка в timers.target.wants убирается вручную (systemctl disable без файла
+# юнита отказывает). Код — первая ошибка stop или rm.
 sub_rollback() {
     if [[ -f "$SUB_TIMER_UNIT" ]]; then
         systemctl enable --now essence-sub-cleanup.timer
     else
         local rc=0
-        systemctl stop essence-sub-cleanup.timer || rc=$?
-        rm -f -- "$R/etc/systemd/system/timers.target.wants/essence-sub-cleanup.timer"
+        if systemctl is-active --quiet essence-sub-cleanup.timer; then
+            systemctl stop essence-sub-cleanup.timer || rc=$?
+        fi
+        if ! rm -f -- "$R/etc/systemd/system/timers.target.wants/essence-sub-cleanup.timer"; then
+            ((rc)) || rc=1
+        fi
         return "$rc"
     fi
 }

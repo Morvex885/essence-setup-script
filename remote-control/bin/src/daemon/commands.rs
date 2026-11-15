@@ -119,8 +119,7 @@ pub(super) async fn start(shared: &Arc<Shared>, invocation: &Invocation) -> Resu
 pub async fn stop(shared: &Shared) -> Value {
     let mut slot = shared.web.lock().await;
     if let Some(listener) = slot.take() {
-        *lock(&shared.web_info) = None;
-        lock(&shared.tokens).drop_ticket();
+        forget_panel(shared);
         for conn in shared.connections().iter().filter(|conn| conn.origin == Origin::Network) {
             shared.disconnect(conn);
         }
@@ -129,17 +128,28 @@ pub async fn stop(shared: &Shared) -> Value {
     json!({"enabled": false})
 }
 
+/// The panel is gone for `link`: no address, and its code is void. Under the
+/// `web_info` lock first, as `link` takes it — a code issued concurrently is
+/// dropped here, not left for the next start.
+fn forget_panel(shared: &Shared) {
+    *lock(&shared.web_info) = None;
+    lock(&shared.tokens).drop_ticket();
+}
+
 /// `web link [--new]`: the panel's address; without a script password — with
 /// the panel's code, the same until the panel stops (`--new` replaces it).
+/// The code is issued under the `web_info` lock: a concurrent `stop` voids
+/// it after this, never before.
 fn link(shared: &Shared, invocation: &Invocation) -> Result<Value> {
-    let Some(info) = shared.web_info() else {
+    let info = lock(&shared.web_info);
+    let Some(url) = info.as_ref().map(WebInfo::url) else {
         return Err(RcError::new("not_configured", "Веб-панель не запущена: essence-rc web run."));
     };
-    let url = info.url();
     if shared.snapshot.borrow().password_set {
         return Ok(json!({"url": format!("{url}/")}));
     }
     let ticket = lock(&shared.tokens).ticket(invocation.has("new"));
+    drop(info);
     let link = Zeroizing::new(format!("{url}/#ticket={}", ticket.as_str()));
     Ok(json!({"url": link.as_str()}))
 }
@@ -370,6 +380,38 @@ mod tests {
         assert_eq!(url("::1", false), "http://[::1]:8377");
         assert_eq!(url("::", true), "https://[::1]:8377");
         assert_eq!(url("2001:db8::7", true), "https://[2001:db8::7]:8377");
+    }
+
+    /// `link` holds the panel's info while it issues a code, so a `stop`
+    /// that starts meanwhile voids that code instead of leaving it for the
+    /// next start.
+    #[test]
+    fn a_code_issued_during_stop_is_void() {
+        let (shared, _jobs) = super::super::tests::shared();
+        *lock(&shared.web_info) = Some(WebInfo { bind: Ipv4Addr::LOCALHOST.into(), port: 8377, tls: false, fingerprint: None, flags: Vec::new() });
+        let tokens = lock(&shared.tokens);
+        let linking = {
+            let shared = shared.clone();
+            std::thread::spawn(move || {
+                let invocation = rc_core::cli::parse(&["web".to_owned(), "link".to_owned()]).unwrap();
+                link(&shared, &invocation).unwrap()["url"].as_str().unwrap().to_owned()
+            })
+        };
+        // `link` waits for the codes with the panel's info locked.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while shared.web_info.try_lock().is_ok() {
+            assert!(std::time::Instant::now() < deadline, "link must hold web_info while it issues the code");
+            std::thread::yield_now();
+        }
+        let stopping = {
+            let shared = shared.clone();
+            std::thread::spawn(move || forget_panel(&shared))
+        };
+        drop(tokens);
+        let url = linking.join().unwrap();
+        stopping.join().unwrap();
+        let code = url.split_once("#ticket=").unwrap().1;
+        assert_eq!(lock(&shared.tokens).check(code, std::time::Instant::now()), super::super::access::Token::Invalid);
     }
 
     #[test]

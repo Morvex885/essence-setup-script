@@ -19,6 +19,7 @@ use rc_core::request_secrets::Secrets;
 use rc_core::state::StatePaths;
 use rc_core::VERSION;
 use serde_json::{Map, Value, json};
+use unicode_width::UnicodeWidthChar;
 use zeroize::Zeroizing;
 
 use crate::remote::{self, Target};
@@ -314,10 +315,21 @@ impl Drop for LiveLine {
 
 /// Кадр живой строки: возврат каретки, стирание строки и текст без
 /// управляющих символов, обрезанный до ширины терминала минус одна колонка
-/// (перенос сломал бы перезапись через `\r`).
+/// по отображаемой ширине (широкий символ — две колонки): перенос сломал бы
+/// перезапись через `\r`.
 fn live_frame(text: &str, width: usize) -> String {
-    let text: String = log::sanitize(text).replace('\t', " ").chars().take(width.saturating_sub(1)).collect();
-    format!("\r\x1b[K{text}")
+    let text = log::sanitize(text).replace('\t', " ");
+    let mut room = width.saturating_sub(1);
+    let mut frame = String::from("\r\x1b[K");
+    for symbol in text.chars() {
+        let columns = symbol.width().unwrap_or(0);
+        if columns > room {
+            break;
+        }
+        room -= columns;
+        frame.push(symbol);
+    }
+    frame
 }
 
 // ─── Разовый CLI ─────────────────────────────────────────────────────────────
@@ -899,6 +911,8 @@ mod tests {
         assert_eq!(live_frame("Нода de: 37 % · 1:42", 80), "\r\x1b[KНода de: 37 % · 1:42");
         assert_eq!(live_frame("a\u{1b}[2Jb\nc\td", 80), "\r\x1b[Ka[2Jbc d", "no control sequence of the daemon reaches the terminal");
         assert_eq!(live_frame(&"д".repeat(200), 40), format!("\r\x1b[K{}", "д".repeat(39)), "never wraps");
+        assert_eq!(live_frame(&"界".repeat(39), 40), format!("\r\x1b[K{}", "界".repeat(19)), "wide characters take two columns");
+        assert_eq!(live_frame("a界b", 3), "\r\x1b[Ka", "a wide character that does not fit is left out");
         assert!(LiveLine::new(false, true, false).enabled);
         assert!(!LiveLine::new(true, true, false).enabled, "--json: nothing extra");
         assert!(!LiveLine::new(false, false, false).enabled, "not a terminal: nothing extra");

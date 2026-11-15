@@ -6,6 +6,7 @@
 import { asList, strings } from '../format.js';
 import { applyFlow, applyProfileArgv } from './apply-model.js';
 import { retryable } from '../flows.js';
+import { refill } from '../form-model.js';
 
 /**
  * Протоколы формы: значение поля `protocols` → подпись, сокращение списка и
@@ -288,21 +289,24 @@ export async function loadVersions(ctx) {
 /**
  * Поля версии: выбор из списка (по умолчанию — текущая при правке, иначе
  * последняя) и ручной ввод с подсказкой формата, видимый при «Ввести
- * вручную» или без списка.
+ * вручную» или без списка. `draft` — значения прежней отправки формы: её
+ * выбор (`mihomo_choice`) и ручной ввод возвращаются в поля (`refill`).
  */
-export function versionFields(listing, current = '') {
+export function versionFields(listing, current = '', draft = null) {
   const options = versionOptions(listing, current);
   const manual = {
     name: 'mihomo_version', label: options.length ? 'Версия mihomo вручную' : 'Версия mihomo', type: 'text',
     placeholder: current ? text(current) : 'пусто — последняя', value: options.length ? '' : text(current),
     hint: 'в виде vX.Y.Z, например v1.19.18 (не ниже)', live: true, validate: versionError, suggest: versionSuggestion,
   };
-  if (options.length === 0) return [manual];
+  if (options.length === 0) return refill([manual], draft);
   const value = text(current) || options[0].value;
-  return [
+  const fields = [
     { name: 'mihomo_choice', label: 'Версия mihomo', type: 'select', options, value, hint: MIHOMO_EXPLAINED },
     { ...manual, required: 'Укажите версию.', when: (v) => v.mihomo_choice === MANUAL_VERSION },
   ];
+  // Без выбора списка в `draft` (значения профиля, а не формы) — поля как есть.
+  return draft && Object.hasOwn(draft, 'mihomo_choice') ? refill(fields, draft) : fields;
 }
 
 /**
@@ -339,11 +343,15 @@ export const profileShowArgv = (name) => ['profile', 'show', '--name', name];
 
 /**
  * Поля формы профиля (одна форма вместо вопросов мастера TUI): `values` —
- * текущие значения (`profileValues`) или пусто для нового; `editing` прячет
- * имя; `versions` — ответ `profile mihomo-versions` (`null` — ручной ввод).
+ * текущие значения (`profileValues`), введённое прежней отправкой формы или
+ * пусто для нового; `editing` прячет имя; `versions` — ответ `profile
+ * mihomo-versions` (`null` — ручной ввод); `version` — сохранённая версия
+ * mihomo профиля (по умолчанию при правке — из `values`).
  * Каждый технический выбор объясняет варианты (`hint`).
  */
-export function profileFields(values = {}, { editing = false, random = randomAcmeEmail, versions = null, taken = [] } = {}) {
+export function profileFields(values = {}, {
+  editing = false, random = randomAcmeEmail, versions = null, taken = [], version = editing ? values.mihomo_version : '',
+} = {}) {
   const on = (current, protocol) => asList(current.protocols).includes(protocol);
   const fields = [];
   if (!editing) fields.push({ ...nameField({ label: 'Имя профиля', value: values.name, taken }), required: 'Имя профиля не указано.' });
@@ -374,7 +382,7 @@ export function profileFields(values = {}, { editing = false, random = randomAcm
     { name: 'acme_email', label: 'Email для Let\'s Encrypt', type: 'text', placeholder: 'пусто — случайный адрес', value: values.acme_email,
       hint: 'на него приходят уведомления о сертификатах', live: true, validate: emailError,
       action: { label: 'Случайный адрес', value: () => random() } },
-    ...versionFields(versions, editing ? values.mihomo_version : ''),
+    ...versionFields(versions, version, values),
   );
   return fields;
 }
@@ -417,7 +425,7 @@ export async function editProfileFlow(ctx, profile) {
   let previous = profileValues(profile);
   for (;;) {
     const values = await ctx.form({
-      title: `Профиль: ${name}`, fields: profileFields(previous, { editing: true, versions }), wide: true,
+      title: `Профиль: ${name}`, fields: profileFields(previous, { editing: true, versions, version: text(current.mihomo_version) }), wide: true,
     });
     if (values === null || values === undefined) return false;
     const argv = profileSetArgv(name, values, current);

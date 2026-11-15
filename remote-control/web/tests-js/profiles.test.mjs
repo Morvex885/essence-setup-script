@@ -156,7 +156,9 @@ test('изменение профиля: profile set только с измен�
   // Текущая версия выбрана в списке.
   const choice = s.record.dialogs[0].fields.find((f) => f.name === 'mihomo_choice');
   assert.equal(choice.value, 'v1.19.18');
-  assert.equal(choice.options.find((o) => o.value === 'v1.19.18').label, 'v1.19.18 (сейчас)');
+  const now = choice.options.find((o) => o.value === 'v1.19.18').label;
+  assert.ok(now.includes('v1.19.18'));
+  assert.notEqual(now, model.versionOptions(listing).find((o) => o.value === 'v1.19.18').label, 'текущая версия отмечена');
   s.done();
   s = scripted([[VERSIONS, ok(listing)]], [current]);
   assert.equal(await model.editProfileFlow(s.ctx, edge), false);
@@ -201,12 +203,16 @@ test('изменение профиля: сбой profile set — форма с�
 });
 
 test('версии mihomo: «Последняя», список, текущая, «Ввести вручную»; выбор и ручной ввод', () => {
-  assert.deepEqual(model.versionOptions(listing).map((o) => [o.value, o.label]), [
-    ['v1.19.20', 'Последняя (v1.19.20)'], ['v1.19.19', 'v1.19.19'], ['v1.19.18', 'v1.19.18'], [model.MANUAL_VERSION, 'Ввести вручную'],
-  ]);
-  // Текущая версия, которой нет в списке, — сразу после последней.
-  assert.deepEqual(model.versionOptions({ latest: 'v1.19.30', versions: ['v1.19.30'] }, 'v1.19.18').map((o) => o.label),
-    ['Последняя (v1.19.30)', 'v1.19.18 (сейчас)', 'Ввести вручную']);
+  const options = model.versionOptions(listing);
+  assert.deepEqual(options.map((o) => o.value), ['v1.19.20', 'v1.19.19', 'v1.19.18', model.MANUAL_VERSION]);
+  for (const option of options.slice(0, -1)) assert.ok(option.label.includes(option.value), option.value);
+  assert.notEqual(options[0].label, options[0].value, 'последняя отмечена');
+  assert.equal(new Set(options.map((o) => o.label)).size, options.length);
+  // Текущая версия, которой нет в списке, — сразу после последней, подпись отличается от обычной.
+  const withCurrent = model.versionOptions({ latest: 'v1.19.30', versions: ['v1.19.30'] }, 'v1.19.18');
+  assert.deepEqual(withCurrent.map((o) => o.value), ['v1.19.30', 'v1.19.18', model.MANUAL_VERSION]);
+  assert.ok(withCurrent[1].label.includes('v1.19.18'));
+  assert.notEqual(withCurrent[1].label, options.find((o) => o.value === 'v1.19.18').label);
   assert.deepEqual(model.versionOptions(null), []);
   assert.deepEqual(model.versionOptions({ message: 'x' }), []);
   const fields = Object.fromEntries(model.versionFields(listing).map((f) => [f.name, f]));
@@ -224,6 +230,40 @@ test('версии mihomo: «Последняя», список, текущая,
   for (const good of ['', 'v1.19.18', 'v1.20.0', 'v2.0.0']) assert.equal(model.versionError(good), null, good);
   assert.equal(model.versionSuggestion('1.19.20'), 'v1.19.20');
   assert.equal(model.versionSuggestion('1.19.1'), null);
+});
+
+test('версия mihomo после сбоя: выбор списка и ручной ввод возвращаются в форму, повтор не меняет версию', async () => {
+  // Повтор отправляет форму без правок: значения — из полей второго окна.
+  const resubmit = (s, first) => {
+    s.ctx.form = async (props) => {
+      s.record.dialogs.push({ kind: 'form', ...props });
+      return s.record.dialogs.length === 1 ? first : submitted(props.fields, {});
+    };
+  };
+  const choose = (patch) => submitted(model.profileFields({}, { versions: listing }), { name: 'edge', ...patch });
+  for (const [patch, version] of [
+    [{ mihomo_choice: 'v1.19.19' }, 'v1.19.19'],
+    [{ mihomo_choice: model.MANUAL_VERSION, mihomo_version: 'v1.19.25' }, 'v1.19.25'],
+  ]) {
+    const argv = model.profileAddArgv(choose(patch));
+    assert.deepEqual(argv.slice(-2), ['--mihomo-version', version]);
+    const s = scripted([[VERSIONS, ok(listing)], [argv, fail('exists')], [argv, ok({ name: 'edge' })]], []);
+    resubmit(s, choose(patch));
+    assert.equal(await model.addProfileFlow(s.ctx, () => {}), true);
+    assert.equal(s.record.dialogs[1].fields.find((f) => f.name === 'mihomo_choice').value, patch.mihomo_choice);
+    s.done();
+  }
+  // Правка: выбранная непоследняя версия остаётся выбранной, текущая — отмеченной.
+  const edited = { ...submitted(model.profileFields(model.profileValues(edge), { editing: true, versions: listing }), {}), mihomo_choice: 'v1.19.19' };
+  const argv = model.profileSetArgv('edge', edited, edge);
+  assert.deepEqual(argv, ['profile', 'set', '--name', 'edge', '--mihomo-version', 'v1.19.19']);
+  const s = scripted([[VERSIONS, ok(listing)], [argv, fail('locked')], [['profile', 'show', '--name', 'edge'], ok(edge)], [argv, ok()]], []);
+  resubmit(s, edited);
+  assert.equal(await model.editProfileFlow(s.ctx, edge), true);
+  const choice = s.record.dialogs[1].fields.find((f) => f.name === 'mihomo_choice');
+  assert.equal(choice.value, 'v1.19.19');
+  assert.notEqual(choice.options.find((o) => o.value === 'v1.19.18').label, model.versionOptions(listing).find((o) => o.value === 'v1.19.18').label);
+  s.done();
 });
 
 test('имя профиля: живая проверка, понятное правило и предложение верного имени', () => {
@@ -255,7 +295,9 @@ test('объяснения выборов: Reality, сайт-заглушка, �
   }
   assert.equal(fields.site_source.type, 'radio');
   assert.ok(fields.hysteria2_obfs.hint);
-  assert.deepEqual(model.XHTTP_TOPOLOGIES.map((o) => o.label), ['Reality — отдельный порт', 'Через ваш сайт (nginx, порт 443)']);
+  assert.deepEqual(model.XHTTP_TOPOLOGIES.map((o) => o.value), ['reality', 'nginx']);
+  assert.ok(model.XHTTP_TOPOLOGIES.every((o) => o.label) && model.XHTTP_TOPOLOGIES[0].label !== model.XHTTP_TOPOLOGIES[1].label);
+  assert.ok(model.XHTTP_TOPOLOGIES[1].label.includes('nginx'));
   assert.equal(model.domainSuggestion('https://WWW.Example.com/path'), 'www.example.com');
   assert.equal(model.domainSuggestion('www.example.com'), null);
 });

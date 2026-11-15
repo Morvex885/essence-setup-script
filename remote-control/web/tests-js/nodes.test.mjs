@@ -415,7 +415,9 @@ test('«Указать профиль» без профилей: предлож�
   s.ctx.nodeRequest = async (_n, argv) => { assert.deepEqual(argv, ['node', 'apply', '--name', 'n']); return fail('confirmation_required'); };
   assert.equal(await model.nodeProfileFlow(s.ctx, 'n', { name: 'n', profile: null }), true);
   assert.deepEqual(s.record.dialogs.map((d) => d.kind), ['confirm', 'form']);
-  assert.equal(s.record.dialogs[1].fields.find((f) => f.name === 'mihomo_choice').options[0].label, 'Последняя (v1.19.20)');
+  const latest = s.record.dialogs[1].fields.find((f) => f.name === 'mihomo_choice').options[0];
+  assert.equal(latest.value, 'v1.19.20');
+  assert.ok(latest.label.includes('v1.19.20'));
   s.done();
   // Отказ — ничего не создаётся.
   const refused = scripted([[['profile', 'list'], ok({ profiles: [] })]], [false]);
@@ -498,6 +500,8 @@ test('добавление: сбой роли — «Повторить»/«Пр�
   assert.equal(await model.addNodeFlow(s.ctx, () => {}), true);
   assert.equal(s.record.dialogs[2].fields[0].value, 'tg.example.com');
   assert.ok(s.record.notices.filter(([, text]) => text.includes(model.ROLE_LATER)).length === 2);
+  // Оба сбоя ролей (telegram set и subscription host) отмечены как сбой действия по одному разу.
+  assert.equal(s.record.failed, 2);
   s.done();
   // Нода сохранена с отложенной SSH-настройкой: роли заданы, применения нет, сказано, что осталось.
   const deferred = scripted([

@@ -620,17 +620,16 @@ impl<T: RemoteTransport> Run<'_, T> {
         }
     }
 
-    /// Print the cleaned tail of the executor log ([`log_tail`]).
-    async fn show_log(&mut self, session: &mut Session) {
+    /// The cleaned tail of the executor log ([`log_tail`]) into `logs`.
+    async fn show_log(&mut self, logs: &mut Vec<(Level, String)>) {
         if let Ok(log) = self.transport.exec(&log_command(&self.operation.id), b"", COMMAND_TIMEOUT).await {
-            for line in log_tail(&String::from_utf8_lossy(&log.stdout)) {
-                session.log(Level::Output, &line);
-            }
+            logs.extend(log_tail(&String::from_utf8_lossy(&log.stdout)).into_iter().map(|line| (Level::Output, line)));
         }
     }
 
-    /// One poll: read the status or try to reconnect.
-    async fn poll(&mut self, session: &mut Session) {
+    /// One poll: read the status or try to reconnect. Journal lines go to
+    /// `logs` (the session keeps the live line moving meanwhile, [`drive`]).
+    async fn poll(&mut self, state: &State, logs: &mut Vec<(Level, String)>) {
         let now = Instant::now();
         if now.duration_since(self.started) > OPERATION_LIMIT {
             return self.fail(Failure::new(&self.current_stage(), "timeout", "операция не завершилась за 60 минут"));
@@ -642,7 +641,7 @@ impl<T: RemoteTransport> Run<'_, T> {
             if now < next {
                 return;
             }
-            if nodes::connect(self.transport, &session.state, &self.node).await.is_ok() {
+            if nodes::connect(self.transport, state, &self.node).await.is_ok() {
                 self.lost = None;
             } else {
                 let pause = RECONNECT_PAUSES[(attempt + 1).min(RECONNECT_PAUSES.len() - 1)];
@@ -654,7 +653,7 @@ impl<T: RemoteTransport> Run<'_, T> {
             Ok(result) if result.exit_status == 0 => parse_status(&String::from_utf8_lossy(&result.stdout)),
             Ok(_) => return,
             Err(_) => {
-                session.log(Level::Warn, &format!("{}: связь потеряна, переподключение…", self.node.name));
+                logs.push((Level::Warn, format!("{}: связь потеряна, переподключение…", self.node.name)));
                 self.lost = Some((now, 0, now + Duration::from_secs(RECONNECT_PAUSES[0])));
                 return;
             }
@@ -662,7 +661,7 @@ impl<T: RemoteTransport> Run<'_, T> {
         if let Some(stage) = status.get("stage").filter(|stage| **stage != self.stage) {
             self.stage = stage.clone();
             if stage != "init" {
-                session.log(Level::Info, &format!("{}: {}", self.node.name, stage_label(stage)));
+                logs.push((Level::Info, format!("{}: {}", self.node.name, stage_label(stage))));
             }
         }
         if let Some(percent) = status.get("progress").and_then(|percent| percent.trim().parse::<u8>().ok()) {
@@ -676,7 +675,7 @@ impl<T: RemoteTransport> Run<'_, T> {
             }
             Some(result) => {
                 let stage = status.get("error").cloned().unwrap_or_else(|| self.current_stage());
-                self.show_log(session).await;
+                self.show_log(logs).await;
                 let failure = match (result, stage.as_str()) {
                     (_, "locked") => Failure::new(&self.current_stage(), "failed", "на ноде выполняется другая операция"),
                     ("rolled_back", _) => Failure::new(&stage, "rolled_back", format!("откат на этапе «{}»", stage_label(&stage))),
@@ -691,7 +690,7 @@ impl<T: RemoteTransport> Run<'_, T> {
                 self.fail(failure);
             }
             None if unit_gone(&status) => {
-                self.show_log(session).await;
+                self.show_log(logs).await;
                 let stage = self.current_stage();
                 self.end = End::Incomplete;
                 self.fail(Failure::new(&stage, "failed",
@@ -715,14 +714,38 @@ impl<T: RemoteTransport> Run<'_, T> {
     }
 }
 
-/// Poll every unfinished run in turn until all finish; between polls the
-/// live line is refreshed every [`LIVE_TICK`].
+/// Poll every unfinished run in turn until all finish; the live line is
+/// refreshed every [`LIVE_TICK`] between polls and while a poll waits for
+/// its node (an SSH reply may take up to [`COMMAND_TIMEOUT`]): the state is
+/// then that of the poll's start, the elapsed time keeps going.
 async fn drive<T: RemoteTransport>(session: &mut Session, runs: &mut [Run<'_, T>]) {
     loop {
         let mut active = false;
-        for run in runs.iter_mut().filter(|run| run.outcome.is_none()) {
-            run.poll(session).await;
-            active |= run.outcome.is_none();
+        for index in 0..runs.len() {
+            if runs[index].outcome.is_some() {
+                continue;
+            }
+            let live = live_state(runs);
+            let mut logs = Vec::new();
+            {
+                let (state, mut progress) = session.state_and_progress();
+                let mut poll = std::pin::pin!(runs[index].poll(state, &mut logs));
+                let mut tick = tokio::time::interval_at(Instant::now() + LIVE_TICK, LIVE_TICK);
+                loop {
+                    tokio::select! {
+                        biased;
+                        () = &mut poll => break,
+                        _ = tick.tick() => if let Some(live) = &live {
+                            let (percent, text) = live.at(Instant::now());
+                            progress(percent, &text);
+                        },
+                    }
+                }
+            }
+            for (level, text) in logs {
+                session.log(level, &text);
+            }
+            active |= runs[index].outcome.is_none();
         }
         if !active {
             break;
@@ -761,8 +784,24 @@ fn clock(elapsed: Duration) -> String {
 /// nl 71 % «сертификаты» · 1:42». Details stay in the single-node line: with
 /// several nodes the line would not fit.
 fn live_line<T>(runs: &[Run<'_, T>], now: Instant) -> Option<(u8, String)> {
+    live_state(runs).map(|live| live.at(now))
+}
+
+/// [`live_line`] without the elapsed time, which [`LiveState::at`] adds.
+struct LiveState {
+    percent: u8,
+    text: String,
+    started: Instant,
+}
+
+impl LiveState {
+    fn at(&self, now: Instant) -> (u8, String) {
+        (self.percent, format!("{} · {}", self.text, clock(now.duration_since(self.started))))
+    }
+}
+
+fn live_state<T>(runs: &[Run<'_, T>]) -> Option<LiveState> {
     let started = runs.iter().map(|run| run.started).min()?;
-    let time = clock(now.duration_since(started));
     if let [run] = runs {
         let mut parts = vec![format!("Нода {}: {} %", run.node.name, run.percent), run.stage_text()];
         if run.lost.is_some() {
@@ -770,8 +809,7 @@ fn live_line<T>(runs: &[Run<'_, T>], now: Instant) -> Option<(u8, String)> {
         } else if !run.detail.is_empty() {
             parts.push(run.detail.clone());
         }
-        parts.push(time);
-        return Some((run.percent, parts.join(" · ")));
+        return Some(LiveState { percent: run.percent, text: parts.join(" · "), started });
     }
     let failed: Vec<&str> = runs.iter().filter(|run| matches!(run.outcome, Some(Outcome::Failed(_)))).map(|run| run.node.name.as_str()).collect();
     let counted: Vec<usize> = runs.iter().filter_map(|run| match run.outcome {
@@ -787,8 +825,7 @@ fn live_line<T>(runs: &[Run<'_, T>], now: Instant) -> Option<(u8, String)> {
         let state = if run.lost.is_some() { "нет связи".to_owned() } else { format!("«{}»", stage_label(run.stage_or_init())) };
         parts.push(format!("{} {} % {state}", run.node.name, run.percent));
     }
-    parts.push(time);
-    Some((percent, parts.join(" · ")))
+    Some(LiveState { percent, text: parts.join(" · "), started })
 }
 
 /// Start a claimed operation; a start that certainly did not happen clears

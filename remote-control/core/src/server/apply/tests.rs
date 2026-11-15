@@ -975,6 +975,74 @@ async fn status_progress_becomes_a_live_line_without_journal_spam() {
     assert!(journal.iter().all(|(_, text)| !text.contains('%') && !text.contains("распаковка")), "{journal:?}");
 }
 
+/// A node transport whose first status reply takes [`Slow::DELAY`].
+struct Slow {
+    inner: FakeTransport,
+    delayed: std::cell::Cell<bool>,
+}
+
+impl Slow {
+    const DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+}
+
+impl crate::transport::RemoteSession for Slow {
+    async fn exec(&self, command: &str, stdin: &[u8], timeout: std::time::Duration) -> Result<ExecResult> {
+        if command == status_command(OP) && !self.delayed.replace(true) {
+            tokio::time::sleep(Self::DELAY).await;
+        }
+        self.inner.exec(command, stdin, timeout).await
+    }
+
+    async fn upload(&self, local_dir: &std::path::Path, remote_dir: &str, timeout: std::time::Duration) -> Result<()> {
+        self.inner.upload(local_dir, remote_dir, timeout).await
+    }
+
+    async fn upload_private(&self, local_dir: &std::path::Path, remote_dir: &str, timeout: std::time::Duration) -> Result<()> {
+        self.inner.upload_private(local_dir, remote_dir, timeout).await
+    }
+}
+
+impl crate::transport::RemoteTransport for Slow {
+    type Held = crate::fake_transport::FakeHeldSession;
+
+    async fn connect(&mut self, options: crate::transport::ConnectOptions) -> Result<()> {
+        self.inner.connect(options).await
+    }
+
+    fn hold(&self) -> Result<Self::Held> {
+        self.inner.hold()
+    }
+}
+
+/// While a status request waits for the node, the live line still comes
+/// every second: the elapsed time moves, the state is the last one seen.
+#[tokio::test(start_paused = true)]
+async fn the_live_line_ticks_while_a_status_reply_is_awaited() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut session, _journal, live) = fixture_live(root.path());
+    let de = node(1, "de");
+    NEXT_OP_ID.with(|next| *next.borrow_mut() = Some(OP.into()));
+    let mut steps = vec![connect_step(&de, Ok(())), probe_step(&de, DEBIAN)];
+    steps.extend(start_steps(OP));
+    steps.push(exec(status_command(OP), &format!("{LIVE}stage=packages\nprogress=5\n")));
+    steps.push(exec(status_command(OP), "unit=inactive\nstage=cleanup\nprogress=100\nresult=committed\n"));
+    let transport = FakeTransport::new(steps);
+    let script = transport.script();
+    let slow = RefCell::new(Some(Slow { inner: transport, delayed: std::cell::Cell::new(false) }));
+    let connect = || slow.borrow_mut().take().unwrap();
+    apply(&mut session, &invocation(&["node", "apply", "--name", "de", "--yes"]), &connect).await.unwrap();
+    script.assert_finished();
+
+    let lines = live.borrow().clone();
+    let texts: Vec<&str> = lines.iter().map(|(_, _, text)| text.as_str()).collect();
+    let waiting: Vec<&str> = texts.iter().take_while(|text| !text.contains("5 %")).copied().collect();
+    assert_eq!(waiting.len(), 4, "a line per second of the 5 s wait: {texts:#?}");
+    let clocks: Vec<&str> = waiting.iter().map(|text| text.rsplit(" · ").next().unwrap()).collect();
+    assert_eq!(clocks, ["0:01", "0:02", "0:03", "0:04"]);
+    assert!(waiting.iter().all(|text| text.starts_with("Нода de: 0 %")), "{waiting:?}");
+    assert_eq!(texts[4].rsplit(" · ").next(), Some("0:05"), "{texts:#?}");
+}
+
 #[test]
 fn several_nodes_share_one_live_line() {
     let operation = |teardown| crate::model::Operation { id: OP.into(), teardown, ..Default::default() };

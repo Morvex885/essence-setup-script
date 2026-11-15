@@ -93,6 +93,13 @@ impl Session {
         self.sink.progress(percent.min(100), text);
     }
 
+    /// The state and [`Session::progress`] at once: a remote wait that reads
+    /// the state keeps the live line moving.
+    pub(crate) fn state_and_progress(&mut self) -> (&State, impl FnMut(u8, &str) + '_) {
+        let sink = &mut self.sink;
+        (&self.state, move |percent: u8, text: &str| sink.progress(percent.min(100), text))
+    }
+
     /// Sync status of an open GitHub source (envelope `sync`).
     pub fn sync(&self) -> Option<&'static str> {
         self.github.as_ref().filter(|_| self.open).map(|github| github.sync.as_str())

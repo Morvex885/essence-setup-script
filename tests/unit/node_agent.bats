@@ -1036,10 +1036,16 @@ exit 0'
 }
 
 # sub_timer_stub — systemctl, как настоящий, не включает и не отключает таймер
-# без файла юнита.
+# без файла юнита и не останавливает незапущенный (TIMER_INACTIVE=1) без него.
 sub_timer_stub() {
     stub systemctl 'if [[ "$*" == *able*essence-sub-cleanup.timer && ! -f "$ESSENCE_NODE_ROOT/etc/systemd/system/essence-sub-cleanup.timer" ]]; then
     echo "FAILED $*" >>"$CALLS"; exit 1
+fi
+if [[ "$*" == *essence-sub-cleanup.timer && -n "${TIMER_INACTIVE:-}" ]]; then
+    [[ "$1" == is-active ]] && exit 3
+    if [[ "$1" == stop && ! -f "$ESSENCE_NODE_ROOT/etc/systemd/system/essence-sub-cleanup.timer" ]]; then
+        echo "FAILED $*" >>"$CALLS"; exit 5
+    fi
 fi
 exit 0'
 }
@@ -1059,6 +1065,25 @@ exit 0'
     grep -qx "systemctl stop essence-sub-cleanup.timer" "$CALLS"
     ! grep -q "^FAILED" "$CALLS" || return 1
     [[ ! -L "$ROOT/etc/systemd/system/timers.target.wants/essence-sub-cleanup.timer" ]]
+}
+
+@test "откат первой установки sub: незапущенный таймер не останавливается, ошибка rm возвращается" {
+    sub_timer_stub
+    local wants="$ROOT/etc/systemd/system/timers.target.wants"
+    mkdir -p "$wants"
+    ln -s /etc/systemd/system/essence-sub-cleanup.timer "$wants/essence-sub-cleanup.timer"
+    TIMER_INACTIVE=1 awg_call sub_rollback
+    assert_success
+    ! grep -q "systemctl stop" "$CALLS" || return 1
+    [[ ! -L "$wants/essence-sub-cleanup.timer" ]]
+    # Ссылку не удалить — откат не завершён, даже если stop прошёл.
+    ln -s /etc/systemd/system/essence-sub-cleanup.timer "$wants/essence-sub-cleanup.timer"
+    chmod 555 "$wants"
+    awg_call sub_rollback
+    chmod 755 "$wants"
+    assert_failure
+    grep -qx "systemctl stop essence-sub-cleanup.timer" "$CALLS"
+    [[ -L "$wants/essence-sub-cleanup.timer" ]]
 }
 
 @test "снятие sub: таймер отключается до удаления юнитов, каталоги удаляются" {
@@ -1364,4 +1389,11 @@ exit 7'
     local before="${output% *}" percent="${output#* }"
     ((before <= 2))
     [[ "$(tail -n1 "$WRITES" | cut -d'|' -f1)" == "$percent" ]]
+}
+
+@test "прогресс: секунда записи — по SECONDS (Bash 3.2, без printf с форматом времени)" {
+    # SECONDS=N сдвигает счётчик: следующая секунда наступает без ожидания.
+    progress_call 'progress_stage packages; SECONDS=0; progress_in 10; progress_in 20; a=$(wc -l <"$WRITES"); SECONDS=5; progress_in 30; b=$(wc -l <"$WRITES"); echo "$a $b"'
+    assert_success
+    assert_output "1 2"
 }

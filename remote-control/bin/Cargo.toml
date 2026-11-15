@@ -20,6 +20,7 @@ serde_json = { workspace = true, features = ["raw_value"] }
 sha2.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
+unicode-width.workspace = true
 zeroize.workspace = true
 
 [target.'cfg(unix)'.dependencies]
